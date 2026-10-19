@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 18 Oct 2026 12:00:00 +0800
+Subject: [PATCH] Narrow a serving process and take its limits from each Worker
+
+Coworkerd v49, the workerd side of the process sandbox (docs/process-isolation.md sections 27-29) and of the
+per-Worker limits of v47. Depends on the CPU limit patch (v29) and the memory limit patch (v33). Fixed
+upstream v1.20261012.1. Upstream status: Coworkerd-specific; not submitted.
+
+Two things only the process itself can do, both at its first request -- the node's readiness probe, before it
+has answered anything -- in coworkerd-steady.{h,c++}, with one call from Server::WorkerService::startRequest:
+
+  * the steady-state system call filter. The launcher (v44, v45) has to execve workerd, so its own table must
+    hold execve and everything else only the startup needs, and a seccomp filter can only ever be narrowed,
+    never replaced: the narrower table of the same build (coworkerd-syscalls-steady.txt, 40 of the startup
+    table's 62 calls on x86_64) can only go on from in here. COWORKERD_SECCOMP_STEADY_MODE picks off, observe
+    or enforce, as for the startup table, and COWORKERD_SECCOMP_STEADY_FILE is the file, which the node binds
+    into the process's mount namespace. The layout is the launcher's, so both tables are the same program
+    shape. In observe mode the process answers its own notifications -- by then it has no channel to the node
+    that could carry a notification listener -- from a thread that exists before the filter does and makes
+    only calls the table holds (ioctl, write; the kernel's receive blocks, so it needs no poll, which a
+    serving process no longer has), which is why production runs enforce, with no thread at all. Either way
+    one [coworkerd-seccomp] row says what was installed;
+  * PR_SET_DUMPABLE 0, which the launcher sets before the execve and the kernel then undoes for a readable,
+    same-owner binary (v44's ruling: the state endpoint reported the truth, and this is the fix).
+
+The limits of a dynamic Worker are now that Worker's own where it names them (v47 stores them per Worker; the
+node's runtime bridge puts them in the loader key, so an isolate is created under its Worker's limits and a
+change of them loads another isolate): the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` is read
+in coworkerd-cpu-limit, and a limit it does not name stays the process's (COWORKERD_CPU_LIMIT_MS,
+COWORKERD_MEMORY_LIMIT_MIB), which is the behaviour before this patch. Every limit event row already carries
+the limit it was measured against, so the node reads them per Worker. The memory execution identity (v33)
+now follows the isolate's own memory limit as well as the process's, so an isolate limited on its own keeps
+reporting who was executing when it died.
+
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index 7904457966da8ec2f2a44e9cde327da041df08c3..b3b317313830458c627718efbe082ca93f31d7e5 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -337,11 +337,13 @@ wd_cc_library(
+         "server.c++",
+         "coworkerd-cpu-limit.c++",
+         "coworkerd-idle-eviction.c++",
++        "coworkerd-steady.c++",
+     ],
+     hdrs = [
+         "server.h",
+         "coworkerd-cpu-limit.h",
+         "coworkerd-idle-eviction.h",
++        "coworkerd-steady.h",
+     ],
+     deps = [
+         ":coworkerd-memory-limit",
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index 3171ec4aa37f18a6e3a6ad2c0b2b70b97a8b7c57..b34935b0ccb041ab9551ae4aa217250d7d0204d1 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -106,6 +106,25 @@ uint32_t cpuLimitFromEnvironment() {
+   }
+   return static_cast<uint32_t>(value);
+ }
++CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName) {
++  // The loader key's last segment, written by the node's runtime bridge only: `limits=<cpuMs>:<memoryMiB>`.
++  // Anything else -- another segment, a number that does not fit, a name of any other shape -- names no limit.
++  const auto text = isolateName.asArray();
++  size_t at = text.size();
++  while (at > 0 && text[at - 1] != '#') --at;
++  const kj::StringPtr marker = "limits="_kj;
++  if (at == 0 || text.size() - at <= marker.size()) return {};
++  for (size_t i = 0; i < marker.size(); ++i) if (text[at + i] != marker[i]) return {};
++  uint64_t values[2] = {0, 0};
++  size_t field = 0;
++  for (size_t p = at + marker.size(); p < text.size(); ++p) {
++    if (text[p] == ':' && field == 0) { ++field; continue; }
++    if (text[p] < '0' || text[p] > '9') return {};
++    values[field] = values[field] * 10 + static_cast<uint64_t>(text[p] - '0');
++    if (values[field] > std::numeric_limits<uint32_t>::max()) return {};
++  }
++  return {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1])};
++}
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
+   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
+       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
+@@ -213,7 +232,7 @@ class RequestLimits final: public LimitEnforcer {
+     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
+       if (limits->publish()) abortIsolate();
+       limits->requireNotExceeded();
+-      if (memoryLimitFromEnvironment()) return kj::heap<IdentityScope>(lock, *this);
++      if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
+       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
+     }
+     void topUpActor() override {}
+@@ -249,7 +268,7 @@ class RequestLimits final: public LimitEnforcer {
+ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
+     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
+     kj::Function<void()> abortIsolate) {
+-  if (!limits.isEnabled() && !memoryLimitFromEnvironment() && !limits.reportsCompletion()) return fallback;
++  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
+   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
+ }
+ kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index 45429a4b417fecb6a42cbfdecc8310ae862541e7..430257403180e532290f84b942728e034a01274f 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -23,6 +23,16 @@
+ 
+ namespace workerd::server {
+ uint32_t cpuLimitFromEnvironment();
++// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
++// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
++// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
++// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
++// fixed when it is created, and a Worker's limits are part of the key it is loaded under, so a Worker whose
++// limits change is loaded as another isolate rather than kept at the old ones.
++struct CoworkerdNamedLimits {
++  uint32_t cpuMs = 0, memoryMiB = 0;
++};
++CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName);
+ kj::String escapeCpuJsonString(kj::StringPtr text);
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
+ kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
+@@ -92,12 +102,12 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
+       IdleWorkerRef idleWorker = nullptr, kj::StringPtr startupIdentity = "")
+-      : fallback(kj::mv(fallback)), name(kj::str(name)),
+-        cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
++      : fallback(kj::mv(fallback)), name(kj::str(name)), named(coworkerdNamedLimits(name)),
++        cpuNs(uint64_t(named.cpuMs ? named.cpuMs : cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
+         dynamic(dynamic), idleWorker(kj::mv(idleWorker)),
+         startupIdentity(kj::str(startupIdentity)) {
+     if (dynamic) {
+-      auto limit = memoryLimitFromEnvironment();
++      auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
+       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
+     }
+     if (isEnabled()) watchdog = &LimitWatchdog::start();
+@@ -148,6 +158,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     if (memory) memory->customize(value);
+   }
+   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
++  // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
++  // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
++  // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
++  // keeps reporting who was executing.
++  bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
++  // The limits in force here, whichever named them: what the state endpoint shows as applied.
++  CoworkerdNamedLimits applied() const {
++    return {static_cast<uint32_t>(cpuNs / 1000000), memory ? static_cast<uint32_t>(memory->limitBytes >> 20) : 0};
++  }
+   // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
+   bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
+   const IdleWorkerRef& activity() const { return idleWorker; }
+@@ -365,6 +384,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  private:
+   kj::Own<IsolateLimitEnforcer> fallback;
+   kj::String name;
++  CoworkerdNamedLimits named;
+   uint64_t cpuNs;
+   bool dynamic;
+   IdleWorkerRef idleWorker;
+diff --git a/src/workerd/server/coworkerd-steady.c++ b/src/workerd/server/coworkerd-steady.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc61d97109
+--- /dev/null
++++ b/src/workerd/server/coworkerd-steady.c++
+@@ -0,0 +1,281 @@
++#include "coworkerd-steady.h"
++
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <unistd.h>
++#if __linux__
++#include <fcntl.h>
++#include <linux/audit.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/ioctl.h>
++#include <sys/prctl.h>
++#include <sys/syscall.h>
++#include <thread>
++#include <vector>
++#endif
++
++namespace workerd::server {
++namespace {
++
++// Every row this file writes is built in a fixed buffer and written with one write(2): after the steady-state
++// filter is on, the only calls left to this process are the ones that table holds, and nothing here may
++// depend on an allocator reaching for more memory.
++void writeRow(const char* row, size_t length) {
++  for (size_t done = 0; done < length;) {
++    const auto written = write(STDERR_FILENO, row + done, length - done);
++    if (written < 0 && errno == EINTR) continue;
++    if (written <= 0) break;
++    done += static_cast<size_t>(written);
++  }
++}
++
++#if __linux__
++constexpr size_t MAX_CALLS = 512;
++
++// The steady-state allowlist as the node hands it over: the file scripts/syscall-allowlist.py generated for
++// these bytes (coworkerd-syscalls-steady.txt), read through the one path the launcher bound for it. Only the
++// numbers are read here; the `# name` table and the digest are the node's business, and it reports them.
++// Read before the filter goes on, so openat/read/close are still the startup table's.
++size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
++  const int fd = open(path, O_RDONLY | O_CLOEXEC);
++  if (fd < 0) { failure = errno; return 0; }
++  size_t count = 0, held = 0;
++  bool comment = false, digits = false;
++  int value = 0;
++  char buffer[8192];
++  for (;;) {
++    const auto n = read(fd, buffer, sizeof buffer);
++    if (n < 0 && errno == EINTR) continue;
++    if (n < 0) { failure = errno; close(fd); return 0; }
++    if (n == 0) break;
++    held += static_cast<size_t>(n);
++    // A line that does not begin with a digit is a comment, as in the file the launcher reads; a line that does
++    // begin with one is that call, and whatever follows the number on it (the generator writes `21\t# epoll_ctl`)
++    // is a comment too.
++    for (ssize_t i = 0; i < n; ++i) {
++      const char c = buffer[i];
++      if (c == '\n') {
++        if (digits && count < MAX_CALLS) numbers[count++] = value;
++        comment = digits = false;
++        value = 0;
++        continue;
++      }
++      if (comment) continue;
++      if (c >= '0' && c <= '9') { digits = true; value = value * 10 + (c - '0'); continue; }
++      if (digits) {  // the number ended; the rest of the line says what it is called
++        if (count < MAX_CALLS) numbers[count++] = value;
++        digits = false;
++        value = 0;
++      }
++      if (c != ' ' && c != '\t') comment = true;
++    }
++    if (held > (1u << 20)) { failure = EFBIG; close(fd); return 0; }
++  }
++  if (digits && count < MAX_CALLS) numbers[count++] = value;
++  close(fd);
++  return count;
++}
++
++// The launcher's filter layout (launcher/launcher.c, spike 21 PROTOCOL 4.4), so that both tables are
++// installed by the same program shape: the architecture is checked, the x32 range is rejected, each allowed
++// call is one equality test, and everything else takes `action`. Every jump is forward -- the kernel refuses
++// a filter with a backward one -- so the refusal is repeated rather than jumped back to.
++size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_filter* program) {
++#if defined(__x86_64__)
++  const __u32 arch = AUDIT_ARCH_X86_64;
++#elif defined(__aarch64__)
++  const __u32 arch = AUDIT_ARCH_AARCH64;
++#else
++#error "the steady-state system call filter needs this architecture's audit arch"
++#endif
++  size_t at = 0;
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
++  program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, arch, 1, 0);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
++#if defined(__x86_64__)
++  // An x32 call carries bit 30; reject the whole range rather than letting it alias an allowed number.
++  program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 1, 0);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++#endif
++  for (size_t i = 0; i < count; ++i)
++    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
++        static_cast<__u8>(count - i), 0);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, action);
++  program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
++  return at;
++}
++
++// The observe mode's supervisor, inside this process. The launcher's own observe mode hands its listener to
++// the node, which still has a socket to it; this filter is installed long after that socket is closed, so
++// the process that narrowed itself answers its own notifications: every call outside the steady table is let
++// through (SECCOMP_USER_NOTIF_FLAG_CONTINUE), so behaviour is as it is without the filter, and the first
++// notification of each call number writes a row into the node's workerd.log.
++//
++// Two things keep this from waiting on itself. The thread exists before the filter is installed -- the
++// steady table of a serving process holds no `clone` -- and waits for the listener on a condition variable
++// (futex, which it does hold). After that it makes only ioctl and write calls, both in the table, and never
++// allocates: a call of its own outside the table would be sent to this thread, which is inside it. The
++// receive blocks, as the kernel's receive always does, so it needs no poll -- which the table does not hold
++// either -- and the thread ends with the process. This is also why `enforce`, with no supervisor at all, is
++// the mode for production.
++class SteadySupervisor final {
++ public:
++  void start() { std::thread([this] { loop(); }).detach(); }
++  void supervise(int fd) {
++    {
++      std::lock_guard<std::mutex> lock(mutex);
++      listener = fd;
++    }
++    ready.notify_one();
++  }
++
++ private:
++  std::mutex mutex;
++  std::condition_variable ready;
++  int listener = -1;
++  bool reported[MAX_CALLS] = {};
++  uint64_t notifications = 0;
++
++  void loop() {
++    // Process-directed signals go to other threads (the limit watchdog does the same).
++    sigset_t signals;
++    sigfillset(&signals);
++    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
++    pthread_setname_np(pthread_self(), "coworkerd-steady");
++    int fd = -1;
++    {
++      std::unique_lock<std::mutex> lock(mutex);
++      ready.wait(lock, [this] { return listener >= 0; });
++      fd = listener;
++    }
++    for (;;) {
++      struct seccomp_notif request;
++      memset(&request, 0, sizeof request);
++      if (ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &request) != 0) {
++        if (errno == EINTR || errno == ENOENT) continue;  // ENOENT: that thread was signalled meanwhile
++        return;                                          // the filter is gone with this process
++      }
++      struct seccomp_notif_resp response;
++      memset(&response, 0, sizeof response);
++      response.id = request.id;
++      response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
++      const bool answered = ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &response) == 0 || errno == ENOENT;
++      ++notifications;
++      const auto number = static_cast<size_t>(request.data.nr);
++      if (request.data.nr >= 0 && number < MAX_CALLS && !reported[number]) {
++        reported[number] = true;
++        char row[256];
++        const auto length = snprintf(row, sizeof row,
++            "[coworkerd-seccomp] {\"event\":\"steady-observed\",\"call\":%d,\"pid\":%u,\"answered\":%s,"
++            "\"notifications\":%llu}\n", static_cast<int>(request.data.nr), request.pid,
++            answered ? "true" : "false", static_cast<unsigned long long>(notifications));
++        if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
++      }
++    }
++  }
++};
++
++// Everything this process does once it serves: the dumpable bit the launcher cleared before it executed us
++// (the kernel sets it again for a readable, same-owner binary -- which is why v44's state endpoint reported
++// `nonDumpable` false and why this is done from here), and the steady-state filter.
++void narrow() {
++  const char* modeText = std::getenv("COWORKERD_SECCOMP_STEADY_MODE");
++  const char* path = std::getenv("COWORKERD_SECCOMP_STEADY_FILE");
++  const char* dumpableText = std::getenv("COWORKERD_NON_DUMPABLE");
++  const char* mode = modeText == nullptr || *modeText == '\0' ? "off" : modeText;
++  const bool observe = strcmp(mode, "observe") == 0, enforce = strcmp(mode, "enforce") == 0;
++  const bool wantNonDumpable = dumpableText != nullptr && *dumpableText == '1';
++  const int dumpable = wantNonDumpable ? prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) : 0;
++  const int dumpableErrno = dumpable == 0 ? 0 : errno;
++  if (!wantNonDumpable && !observe && !enforce) return;  // nothing asked of this process
++  int numbers[MAX_CALLS];
++  size_t count = 0;
++  int failure = 0;
++  bool installed = false;
++  size_t instructions = 0;
++  if ((observe || enforce) && path != nullptr && *path != '\0') {
++    count = readTable(path, numbers, failure);
++    if (count == 0 && failure == 0) failure = EINVAL;  // a table without a call is a configuration error
++  } else if (observe || enforce) {
++    failure = ENOENT;
++  }
++  if (count > 0) {
++    std::vector<struct sock_filter> program(count + 8);
++    instructions = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
++        program.data());
++    struct sock_fprog filter = {static_cast<unsigned short>(instructions), program.data()};
++    // no_new_privs is seccomp(2)'s precondition for an unprivileged process. The launcher set it and it
++    // survives the execve; setting it again keeps this independent of how the process was started.
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
++      failure = errno;
++    } else if (observe) {
++      // The supervisor exists before the filter does: from the moment it is installed, a call outside the
++      // table waits for an answer, and only this thread can give one.
++      auto* supervisor = new SteadySupervisor();
++      supervisor->start();
++      const long fd = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &filter);
++      if (fd < 0) failure = errno;
++      else { supervisor->supervise(static_cast<int>(fd)); installed = true; }
++    } else if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &filter) != 0) {
++      failure = errno;
++    } else {
++      installed = true;
++    }
++  }
++  // Test only: a call this process no longer has (v49's acceptance 3.1). The startup table holds the calls only
++  // the startup needs -- execve above all, since the launcher has to execve this program -- and the steady table
++  // does not; with the narrow filter in force, making one of them must end the process. Honoured in `enforce`
++  // alone: in `observe` the call would be let through, and an execve of this process is not something to let
++  // through. COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST=execve|seccomp.
++  if (installed && enforce) {
++    const char* probe = std::getenv("COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST");
++    if (probe != nullptr && strcmp(probe, "execve") == 0) {
++      char row[160];
++      const auto length = snprintf(row, sizeof row,
++          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"execve\",\"pid\":%d}\n", getpid());
++      if (length > 0) writeRow(row, static_cast<size_t>(length));
++      char* const argv[] = {const_cast<char*>("/proc/self/exe"), nullptr};
++      char* const envp[] = {nullptr};
++      execve("/proc/self/exe", argv, envp);
++    } else if (probe != nullptr && strcmp(probe, "seccomp") == 0) {
++      char row[160];
++      const auto length = snprintf(row, sizeof row,
++          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"seccomp\",\"pid\":%d}\n", getpid());
++      if (length > 0) writeRow(row, static_cast<size_t>(length));
++      syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, nullptr);
++    }
++  }
++  // One row either way, through this process's standard error into the node's workerd.log: what it narrowed
++  // to, whether it is non-dumpable, and the reason when it is neither. The node reports what /proc shows of
++  // the process itself (`Seccomp_filters`, the dumpable owner of its environ), not this row.
++  char row[512];
++  const auto length = snprintf(row, sizeof row,
++      "[coworkerd-seccomp] {\"event\":\"steady\",\"mode\":\"%s\",\"installed\":%s,\"calls\":%zu,"
++      "\"instructions\":%zu,\"errno\":%d,\"nonDumpable\":%s,\"dumpableErrno\":%d,\"pid\":%d}\n",
++      mode, installed ? "true" : "false", count, instructions, failure,
++      wantNonDumpable && dumpable == 0 ? "true" : "false", dumpableErrno, getpid());
++  if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
++}
++#endif
++
++}  // namespace
++
++void coworkerdServing() {
++#if __linux__
++  static std::atomic<bool> done{false};
++  bool expected = false;
++  if (done.compare_exchange_strong(expected, true)) narrow();
++#endif
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/coworkerd-steady.h b/src/workerd/server/coworkerd-steady.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9bcb7d8629e65dec163f9e7449c6f47b4753a90
+--- /dev/null
++++ b/src/workerd/server/coworkerd-steady.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++namespace workerd::server {
++// Coworkerd v49: the moment this process starts serving. Called at the start of every request; the first
++// call -- the node's first readiness probe, before anything has been answered -- makes the process
++// non-dumpable and installs the steady-state system call filter, as the node's environment asks. Nothing
++// happens without that environment, and nothing happens outside Linux.
++void coworkerdServing();
++}  // namespace workerd::server
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 40193b637bac835fb1e098641e2e9c6f752f605a..2b94d22e581c697d95ca0384b1079eb5b4e11fcf 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -7,6 +7,7 @@
+ #include "alarm-scheduler.h"
+ #include "container-client.h"
+ #include "coworkerd-cpu-limit.h"
++#include "coworkerd-steady.h"
+ #include "pyodide.h"
+ #include "workerd-api.h"
+ 
+@@ -4131,6 +4132,10 @@ class Server::WorkerService final: public Service,
+       }
+     }
+ 
++    // The first request of this process -- the node's readiness probe, before it has answered anything --
++    // is the moment it serves: from here on it is non-dumpable and runs under the steady-state system call
++    // filter (Coworkerd v49, coworkerd-steady.h).
++    coworkerdServing();
+     auto requestLimits = wrapCpuRequestLimits(
+         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+         *cpuLimits, metadata.cfBlobJson, [this]() {

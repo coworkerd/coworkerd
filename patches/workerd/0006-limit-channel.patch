@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 00:10:40 +0800
+Subject: [PATCH] Open the limit event channel once and write each event in one
+ call
+
+Coworkerd v35, depends on v27 CPU limit events and v33 memory limit events. Fixed upstream v1.20261012.1. The limit enforcer appends each event row to <state>.events through one process-wide O_APPEND descriptor, opened when the first enabled enforcer is created, with a single unbuffered write; it no longer opens and closes the file per event. Rows, event kinds, the [cpu-limit] stderr line, the culprit file and the OOM identity files are unchanged.
+
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index 04670f4fed6209799ef956fefcb6aea038f041df..9e3a17b29ec7eb6a0972bf4183df3600b1312c9f 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -1,6 +1,7 @@
+ #include "coworkerd-cpu-limit.h"
+ #include <workerd/util/autogate.h>
+ #include <cstdlib>
++#include <fcntl.h>
+ #include <limits>
+ #include <v8-isolate.h>
+ 
+@@ -43,6 +44,18 @@ kj::String cpuStateFromEnvironment() {
+   KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
+   return kj::str(value);
+ }
++int cpuEventsDescriptor() {
++  // Opened once per process, when the first enabled limit enforcer is created.
++  static const int descriptor = []() {
++    auto state = cpuStateFromEnvironment();
++    if (state.size() == 0) return -1;
++    auto path = kj::str(state, ".events");
++    int fd;
++    do { fd = open(path.cStr(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600); } while (fd < 0 && errno == EINTR);
++    return fd;
++  }();
++  return descriptor;
++}
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
+   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
+       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index c139a363a45e4ebe01071f206a0ab5d8ce27ba14..b77d001db3cd62ef1cd54dd2b7dd7b1a4cd476b9 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -23,6 +23,8 @@
+ namespace workerd::server {
+ uint32_t cpuLimitFromEnvironment();
+ kj::String cpuStateFromEnvironment();
++// The process-wide append-only descriptor of <state>.events, opened on first use; -1 without state.
++int cpuEventsDescriptor();
+ kj::String escapeCpuJsonString(kj::StringPtr text);
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
+ kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
+@@ -49,6 +51,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       auto limit = memoryLimitFromEnvironment();
+       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
+     }
++    if (state.size() && isEnabled()) events = cpuEventsDescriptor();
+     recordPlatformFacts(name, dynamic);
+     auto paf = kj::newPromiseAndFulfiller<void>();
+     failure = paf.promise.fork();
+@@ -147,11 +150,13 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     auto log = kj::str("[cpu-limit] ", row);
+     ssize_t written;
+     do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+-    if (state.size() == 0) return;
+-    auto path = kj::str(state, ".events");
+-    if (auto* file = fopen(path.cStr(), "a")) {
+-      fwrite(row.cStr(), 1, row.size(), file);
+-      fclose(file);
++    // One unbuffered write() per row on the descriptor opened once: the row reaches the
++    // file before record() returns, so a later SIGKILL cannot lose it.
++    for (size_t done = 0; events >= 0 && done < row.size();) {
++      written = write(events, row.cStr() + done, row.size() - done);
++      if (written < 0 && errno == EINTR) continue;
++      if (written <= 0) break;
++      done += written;
+     }
+   }
+   void culprit(kj::StringPtr identity, uint64_t used) {
+@@ -296,6 +301,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::String name;
+   uint64_t cpuNs;
+   kj::String state;
++  int events = -1;
+   IdleWorkerRef idleWorker;
+   kj::String startupIdentity;
+   v8::Isolate* isolate = nullptr;

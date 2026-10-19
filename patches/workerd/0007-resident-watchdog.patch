@@ -1,0 +1,349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 10:43:29 +0800
+Subject: [PATCH] Watch CPU limits from one resident thread instead of one per
+ JS entry
+
+Coworkerd v36, depends on v27 CPU limits, v33 memory limits and v35 limit events. Fixed upstream v1.20261012.1. The first enabled limit enforcer starts one process-wide watchdog thread; every JS entry, nested auxiliary entries included, registers with it on entry and unregisters on exit instead of creating and joining a thread of its own. The thread sleeps toward the earliest time an entry needs a check (the earliest moment its CPU deadline can arrive, or the end of a termination grace period) in halving steps whose last step is at most 1 ms, and is woken when a new entry needs an earlier check or a limit state leaves NONE; the memory limit reports its transitions through an observer. A check does what the per-entry thread did: terminate the isolate once the budget is spent or the state left NONE, and after the 100 ms grace write the culprit file if the termination has not taken effect. Deadline arithmetic, termination, events, invalidation, culprit attribution and the memory limit callbacks are unchanged. The thread is named limit-watchdog, blocks signals, and is stopped and joined at exit; without an enabled limit it is never created.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index 9e3a17b29ec7eb6a0972bf4183df3600b1312c9f..1d152a774a1404021fa714e8152d433b3105fbd9 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -1,5 +1,6 @@
+ #include "coworkerd-cpu-limit.h"
+ #include <workerd/util/autogate.h>
++#include <csignal>
+ #include <cstdlib>
+ #include <fcntl.h>
+ #include <limits>
+@@ -8,6 +9,73 @@
+ namespace workerd::server {
+ namespace {
+ thread_local kj::StringPtr startupExecutionIdentity;
++void wakeLimitWatchdog() { LimitWatchdog::start().wake(); }
++}
++
++LimitWatchdog& LimitWatchdog::start() {
++  // Destroyed at exit, which stops and joins the thread.
++  static LimitWatchdog watchdog;
++  return watchdog;
++}
++LimitWatchdog::LimitWatchdog(): thread([this]() { run(); }) {
++  setLimitStateObserver(&wakeLimitWatchdog);
++}
++LimitWatchdog::~LimitWatchdog() noexcept(false) {
++  setLimitStateObserver(nullptr);
++  state.lockExclusive()->stopping = true;
++}
++void LimitWatchdog::add(Entry& entry, kj::Maybe<kj::TimePoint> due) {
++  auto lock = state.lockExclusive();
++  lock->entries.add(&entry);
++  KJ_IF_SOME(time, due) {
++    KJ_IF_SOME(planned, lock->sleepUntil) {
++      if (time < planned) lock->woken = true;
++    } else {
++      lock->woken = true;
++    }
++  }
++}
++void LimitWatchdog::wake() { state.lockExclusive()->woken = true; }
++void LimitWatchdog::run() {
++  // Process-directed signals go to other threads.
++  sigset_t signals;
++  sigfillset(&signals);
++  pthread_sigmask(SIG_BLOCK, &signals, nullptr);
++#if __APPLE__
++  pthread_setname_np("limit-watchdog");
++#else
++  pthread_setname_np(pthread_self(), "limit-watchdog");
++#endif
++  auto lock = state.lockExclusive();
++  while (!lock->stopping) {
++    lock->woken = false;
++    auto now = LimitWatchdog::now();
++    kj::Maybe<kj::TimePoint> next;
++    for (auto* entry: lock->entries) {
++      KJ_IF_SOME(due, entry->watch(now)) {
++        KJ_IF_SOME(earliest, next) {
++          if (due < earliest) next = due;
++        } else {
++          next = due;
++        }
++      }
++    }
++    auto ready = [](const State& s) { return s.stopping || s.woken; };
++    KJ_IF_SOME(due, next) {
++      // A long sleep can end late by an amount that grows with its length (timer coalescing, as
++      // on macOS hosts and their virtual machines), so a due time is approached in halving steps
++      // and only the last one, at most 1 ms, sleeps until it.
++      auto from = LimitWatchdog::now();
++      auto remaining = due - from;
++      if (remaining > 1 * kj::MILLISECONDS) remaining = remaining / 2;
++      if (remaining < 0 * kj::NANOSECONDS) remaining = 0 * kj::NANOSECONDS;
++      lock->sleepUntil = from + remaining;
++      lock.wait(ready, remaining);
++    } else {
++      lock->sleepUntil = kj::none;
++      lock.wait(ready);
++    }
++  }
+ }
+ MemoryStartupIdentityScope::MemoryStartupIdentityScope(kj::StringPtr identity)
+     : previous(startupExecutionIdentity) { startupExecutionIdentity = identity; }
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index b77d001db3cd62ef1cd54dd2b7dd7b1a4cd476b9..39181fd854456ecfb1f39c10dc90e21342e07689 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -11,6 +11,7 @@
+ #include <kj/function.h>
+ #include <kj/mutex.h>
+ #include <kj/thread.h>
++#include <kj/time.h>
+ #include <kj/vector.h>
+ #include <atomic>
+ #include <cstdio>
+@@ -38,6 +39,57 @@ class MemoryStartupIdentityScope {
+ };
+ kj::String captureMemoryStartupIdentity();
+ 
++// The process's one limit watchdog thread, started by the first enabled limit enforcer. A JS
++// entry registers for as long as it runs. The thread sleeps toward the earliest time a registered
++// entry needs a check: when its CPU deadline can first arrive (thread CPU time never advances
++// faster than the monotonic clock), when a termination grace period ends, or when a limit state
++// leaves NONE elsewhere and wakes it. Registering and unregistering make no system call unless
++// the new entry needs a check before the thread's planned wake-up.
++class LimitWatchdog {
++ public:
++  class Entry {
++   public:
++    // Called on the watchdog thread with the registry locked. Returns when the entry next needs a
++    // call; none if only a wake-up can make it need one.
++    virtual kj::Maybe<kj::TimePoint> watch(kj::TimePoint now) = 0;
++
++   protected:
++    ~Entry() = default;
++  };
++  static LimitWatchdog& start();
++  static kj::TimePoint now() { return kj::systemPreciseMonotonicClock().now(); }
++  void add(Entry& entry, kj::Maybe<kj::TimePoint> due);
++  // `underLock` runs after removal with the registry still locked.
++  template <typename Func>
++  void remove(Entry& entry, Func&& underLock) {
++    auto lock = state.lockExclusive();
++    auto& entries = lock->entries;
++    for (size_t i = 0; i < entries.size(); ++i) {
++      if (entries[i] == &entry) {
++        entries[i] = entries.back();
++        entries.removeLast();
++        break;
++      }
++    }
++    underLock();
++  }
++  // Some limit state left NONE: entries may need a check before their due time.
++  void wake();
++  ~LimitWatchdog() noexcept(false);
++
++ private:
++  struct State {
++    kj::Vector<Entry*> entries;
++    kj::Maybe<kj::TimePoint> sleepUntil;  // none: until woken
++    bool woken = false;
++    bool stopping = false;
++  };
++  kj::MutexGuarded<State> state;
++  kj::Thread thread;
++  LimitWatchdog();
++  void run();
++};
++
+ // CPU accounting stays on the isolate thread; only termination and file writes cross threads.
+ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+@@ -52,6 +104,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
+     }
+     if (state.size() && isEnabled()) events = cpuEventsDescriptor();
++    if (isEnabled()) watchdog = &LimitWatchdog::start();
+     recordPlatformFacts(name, dynamic);
+     auto paf = kj::newPromiseAndFulfiller<void>();
+     failure = paf.promise.fork();
+@@ -194,15 +247,20 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #endif
+   };
+ 
+-  struct Scope {
++  // One JS entry, registered with the watchdog while it runs. Its watch state is touched only by
++  // the watchdog thread with the registry locked, and read here after unregistering.
++  struct Scope final: public LimitWatchdog::Entry {
++    // Below the remaining budget, the watchdog rechecks at this interval rather than sooner.
++    static constexpr uint64_t MIN_RECHECK_NS = 100000;
+     CpuIsolateLimitEnforcer& owner;
+     uint64_t& used;
+     kj::String identity;
+     kj::Function<void()> onExit;
+     CpuClock clock;
+     uint64_t started = clock.now();
+-    kj::MutexGuarded<bool> stopped{false};
+-    kj::Maybe<kj::Thread> watchdog;
++    bool terminated = false;
++    bool finished = false;
++    kj::TimePoint graceEnd = kj::origin<kj::TimePoint>();
+     bool reported = false;
+     kj::String oomReport;
+     MemoryExecution previousMemory;
+@@ -214,37 +272,56 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+         oomReport = owner.report("memory-culprit", this->identity, 0);
+         previousMemory = owner.memory->enter(oomReport);
+       }
+-      watchdog.emplace([this]() {
+-        auto lock = stopped.lockExclusive();
+-        while (!*lock) {
+-          auto consumed = clock.now() - started + this->used;
+-          if ((this->owner.cpuNs && consumed >= this->owner.cpuNs) ||
+-              this->owner.exceeded->load() != IsolateLimitCause::NONE) {
+-            if (this->owner.cpuNs && consumed >= this->owner.cpuNs) {
+-              auto expected = IsolateLimitCause::NONE;
+-              this->owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
+-            }
+-            this->owner.isolate->TerminateExecution();
+-            // 100 ms exceeds observed interrupt jitter, and leaves ample time before 3 s kill.
+-            lock.wait([](bool stopped) { return stopped; }, 100 * kj::MILLISECONDS);
+-            auto finalConsumed = clock.now() - started + this->used;
+-            if (!*lock && this->owner.cpuNs && finalConsumed >= this->owner.cpuNs) {
+-              this->owner.culprit(this->identity, finalConsumed);
+-              reported = true;
+-            }
+-            if (*lock || !this->owner.cpuNs || reported) break;
+-          }
+-          lock.wait([](bool stopped) { return stopped; }, 1 * kj::MILLISECONDS);
++      // Last: from here on the watchdog thread may call watch().
++      owner.watchdog->add(*this, firstCheck());
++    }
++    kj::Maybe<kj::TimePoint> firstCheck() const {
++      auto now = LimitWatchdog::now();
++      if (owner.exceeded->load() != IsolateLimitCause::NONE) return now;
++      if (!owner.cpuNs) return kj::none;
++      return now + static_cast<int64_t>(used < owner.cpuNs ? owner.cpuNs - used : 0) * kj::NANOSECONDS;
++    }
++    // One check of this entry: terminate once the CPU budget is spent or the limit state left
++    // NONE; when the grace period ends, report the culprit if the termination has not taken effect.
++    kj::Maybe<kj::TimePoint> watch(kj::TimePoint now) override {
++      if (finished) return kj::none;
++      if (terminated) {
++        if (now < graceEnd) return graceEnd;
++        auto finalConsumed = clock.now() - started + used;
++        if (owner.cpuNs && finalConsumed >= owner.cpuNs) {
++          owner.culprit(identity, finalConsumed);
++          reported = true;
++        }
++        if (!owner.cpuNs || reported) {
++          finished = true;
++          return kj::none;
+         }
+-      });
++        terminated = false;
++        return now + 1 * kj::MILLISECONDS;
++      }
++      auto consumed = clock.now() - started + used;
++      if ((owner.cpuNs && consumed >= owner.cpuNs) ||
++          owner.exceeded->load() != IsolateLimitCause::NONE) {
++        if (owner.cpuNs && consumed >= owner.cpuNs) {
++          auto expected = IsolateLimitCause::NONE;
++          owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
++        }
++        owner.isolate->TerminateExecution();
++        terminated = true;
++        // 100 ms exceeds observed interrupt jitter, and leaves ample time before 3 s kill.
++        graceEnd = now + 100 * kj::MILLISECONDS;
++        return graceEnd;
++      }
++      if (!owner.cpuNs) return kj::none;
++      return now + static_cast<int64_t>(kj::max(owner.cpuNs - consumed, MIN_RECHECK_NS)) * kj::NANOSECONDS;
+     }
+     ~Scope() noexcept(false) {
+-      { auto lock = stopped.lockExclusive(); *lock = true; }
+-      watchdog = kj::none;
+-      used += clock.now() - started;
++      owner.watchdog->remove(*this, [this]() { used += clock.now() - started; });
+       if (owner.cpuNs && used >= owner.cpuNs) {
+         auto expected = IsolateLimitCause::NONE;
+-        owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
++        if (owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU)) {
++          owner.watchdog->wake();
++        }
+       }
+       if (owner.memory) owner.memory->leave(previousMemory);
+       if (reported && owner.state.size()) unlink(owner.state.cStr());
+@@ -306,6 +383,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::String startupIdentity;
+   v8::Isolate* isolate = nullptr;
+   uint64_t startupUsed = 0;
++  LimitWatchdog* watchdog = nullptr;
+   IsolateLimitState exceeded = std::make_shared<std::atomic<IsolateLimitCause>>(IsolateLimitCause::NONE);
+   std::shared_ptr<IsolateMemoryLimit> memory;
+   bool published = false;
+diff --git a/src/workerd/server/coworkerd-memory-limit.c++ b/src/workerd/server/coworkerd-memory-limit.c++
+index c235a5fec3649c9effd9430cea39ff5824be28ba..bf73843f7a00294d498ce1790fe6ec1445304dba 100644
+--- a/src/workerd/server/coworkerd-memory-limit.c++
++++ b/src/workerd/server/coworkerd-memory-limit.c++
+@@ -16,6 +16,14 @@ thread_local MemoryExecution executingMemory;
+ char oomPath[4096] = {}, oomTemporaryPath[4112] = {}, unknownOomReport[256] = {};
+ int oomSignalFd = -1;
+ std::atomic<bool> oomReportReady{false};
++std::atomic<void (*)()> limitStateObserver{nullptr};
++
++void raiseLimitState(const IsolateLimitState& state) {
++  auto expected = IsolateLimitCause::NONE;
++  if (state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY)) {
++    if (auto observer = limitStateObserver.load()) observer();
++  }
++}
+ 
+ void raisePeak(std::atomic<size_t>& peak, size_t value) {
+   auto old = peak.load();
+@@ -53,6 +61,7 @@ uint32_t memoryLimitFromEnvironment() {
+   }
+   return value;
+ }
++void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
+ 
+ IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath)
+     : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
+@@ -76,8 +85,7 @@ bool IsolateMemoryLimit::charge(size_t bytes) {
+     auto base = heapBytes.load() + otherBytes.load();
+     if (bytes > limitBytes || base > limitBytes - bytes || used > limitBytes - bytes - base) {
+       raisePeak(deniedBytes, bytes);
+-      auto expected = IsolateLimitCause::NONE;
+-      state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
++      raiseLimitState(state);
+       return false;
+     }
+     if (ownedBytes.compare_exchange_weak(used, used + bytes)) {
+@@ -124,8 +132,7 @@ void IsolateMemoryLimit::observe() {
+   if (total >= limitBytes) terminate();
+ }
+ void IsolateMemoryLimit::terminate() {
+-  auto expected = IsolateLimitCause::NONE;
+-  state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
++  raiseLimitState(state);
+   isolate->TerminateExecution();
+ }
+ size_t IsolateMemoryLimit::nearHeap(void* data, size_t current, size_t initial) {
+diff --git a/src/workerd/server/coworkerd-memory-limit.h b/src/workerd/server/coworkerd-memory-limit.h
+index 5e7cc9b616061bf9253849f7696634c8d874f2e4..1d337e4b7cd1496d49159fd649ec7d047cc7156c 100644
+--- a/src/workerd/server/coworkerd-memory-limit.h
++++ b/src/workerd/server/coworkerd-memory-limit.h
+@@ -12,6 +12,9 @@ namespace workerd::server {
+ enum class IsolateLimitCause { NONE, CPU, MEMORY };
+ using IsolateLimitState = std::shared_ptr<std::atomic<IsolateLimitCause>>;
+ uint32_t memoryLimitFromEnvironment();
++// Called after a memory limit moves a limit state from NONE, so that the limit watchdog
++// terminates the isolate without waiting for a CPU deadline. Set by the watchdog; may be null.
++void setLimitStateObserver(void (*observer)());
+ 
+ struct MemoryExecution {
+   class IsolateMemoryLimit* owner = nullptr;

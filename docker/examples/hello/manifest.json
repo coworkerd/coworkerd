@@ -1,0 +1,11 @@
+{
+  "compatibilityDate": "2026-10-01",
+  "routes": [{ "host": "*", "pathPrefix": "/", "workerId": "hello" }],
+  "workers": [
+    {
+      "workerId": "hello",
+      "activeVersion": "v1",
+      "versions": [{ "versionId": "v1", "mainModule": "index.js", "contentHash": "4cc0529824afc9c7f1a1f204c82253d9f8e2da769c0ad7e0934c9ca3117ab11e" }]
+    }
+  ]
+}

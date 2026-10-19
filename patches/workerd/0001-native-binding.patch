@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 12 Oct 2026 16:36:23 +0800
+Subject: [PATCH] Add native Cap'n Proto external Binding transport
+
+Forward fetch and custom events with trusted WorkerdBootstrap metadata.
+Required by Coworkerd v1-v29. Ported to v1.20261012.1.
+Upstream status: fills ExternalServer RPC TODO; not submitted.
+
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 1381a55ee382e55cfe0d3d9dcdb18c44f18e579c..5de0fdd946c62c214eaa6e6236e06b3c201a5b7e 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -2222,13 +2222,16 @@ class Server::ExternalTcpService final: public Service, private WorkerInterface
+ // Service used when the service is configured as external HTTP service.
+ class Server::ExternalHttpService final: public Service {
+  public:
++  enum class Transport { HTTP, CAPNP };
++
+   ExternalHttpService(kj::Own<kj::NetworkAddress> addrParam,
+       kj::Own<HttpRewriter> rewriter,
+       kj::HttpHeaderTable& headerTable,
+       kj::Timer& timer,
+       kj::EntropySource& entropySource,
+       capnp::ByteStreamFactory& byteStreamFactory,
+-      capnp::HttpOverCapnpFactory& httpOverCapnpFactory)
++      capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
++      Transport transport = Transport::HTTP)
+       : addr(kj::mv(addrParam)),
+         webSocketErrorHandler(kj::heap<JsgifyWebSocketErrors>()),
+         inner(kj::newHttpClient(timer,
+@@ -2241,9 +2244,21 @@ class Server::ExternalHttpService final: public Service {
+         rewriter(kj::mv(rewriter)),
+         headerTable(headerTable),
+         byteStreamFactory(byteStreamFactory),
+-        httpOverCapnpFactory(httpOverCapnpFactory) {}
++        httpOverCapnpFactory(httpOverCapnpFactory),
++        transport(transport) {}
+ 
+   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
++    if (transport == Transport::CAPNP) {
++      auto request = getOutgoingCapnp(*inner).startEventRequest();
++      KJ_IF_SOME(cf, metadata.cfBlobJson) {
++        request.setCfBlobJson(cf);
++      }
++      request.setFromPersistentStub(metadata.fromPersistentStub.toBool());
++      auto dispatcher = request.send().getDispatcher();
++      return kj::heap<RpcWorkerInterface>(httpOverCapnpFactory, byteStreamFactory,
++          getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher))
++          .attach(kj::addRef(*this));
++    }
+     return kj::heap<WorkerInterfaceImpl>(*this, kj::mv(metadata));
+   }
+ 
+@@ -2268,6 +2283,7 @@ class Server::ExternalHttpService final: public Service {
+   kj::HttpHeaderTable& headerTable;
+   capnp::ByteStreamFactory& byteStreamFactory;
+   capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
++  Transport transport;
+ 
+   struct CapnpClient {
+     kj::Own<kj::AsyncIoStream> connection;
+@@ -2423,14 +2439,22 @@ kj::Rc<Server::Service> Server::makeExternalService(kj::StringPtr name,
+   }
+ 
+   switch (conf.which()) {
+-    case config::ExternalServer::HTTP: {
++    case config::ExternalServer::HTTP:
++    case config::ExternalServer::CAPNP: {
+       // We have to construct the rewriter upfront before waiting on any promises, since the
+       // HeaderTable::Builder is only available synchronously.
+-      auto rewriter = kj::heap<HttpRewriter>(conf.getHttp(), headerTableBuilder);
++      auto options = conf.isCapnp() ? conf.getCapnp() : conf.getHttp();
++      if (conf.isCapnp() && !options.hasCapnpConnectHost()) {
++        reportConfigError(kj::str("Cap'n Proto external service requires capnpConnectHost"));
++        return makeInvalidConfigService();
++      }
++      auto rewriter = kj::heap<HttpRewriter>(options, headerTableBuilder);
+       auto addr = kj::heap<PromisedNetworkAddress>(network.parseAddress(addrStr, 80));
+       return kj::rc<ExternalHttpService>(kj::mv(addr), kj::mv(rewriter),
+           headerTableBuilder.getFutureTable(), timer, entropySource,
+-          globalContext->byteStreamFactory, globalContext->httpOverCapnpFactory);
++          globalContext->byteStreamFactory, globalContext->httpOverCapnpFactory,
++          conf.isCapnp() ? ExternalHttpService::Transport::CAPNP
++                         : ExternalHttpService::Transport::HTTP);
+     }
+     case config::ExternalServer::HTTPS: {
+       auto httpsConf = conf.getHttps();
+diff --git a/src/workerd/server/workerd.capnp b/src/workerd/server/workerd.capnp
+index 3a1f0b100073e1280b6b0aa018b17cb07322aa52..4b0b473368e0c3c6efd7dd50c11a20a4254f363d 100644
+--- a/src/workerd/server/workerd.capnp
++++ b/src/workerd/server/workerd.capnp
+@@ -932,7 +932,9 @@ struct ExternalServer {
+       certificateHost @6 :Text;
+     }
+ 
+-    # TODO(someday): Cap'n Proto RPC
++    capnp @7 :HttpOptions;
++    # Use WorkerdBootstrap and RpcWorkerInterface for every event, including fetch().
++    # Establish the connection with HTTP CONNECT; capnpConnectHost must be specified.
+   }
+ }
+ 

@@ -1,0 +1,29 @@
+# The nodes' workerd processes in their least-privilege environment, with Docker Compose. An addition to
+# docker-compose.yml, for a host prepared for it (INSTALL.md, section 4: unprivileged user namespaces; on Ubuntu
+# 23.10 and later the AppArmor setting for them):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --wait
+#   (or COMPOSE_FILE=docker-compose.yml:docker-compose.sandbox.yml in .env)
+#
+# Without it each node starts workerd directly: sandbox.mode is auto, and Docker's default seccomp profile does not
+# let a process without CAP_SYS_ADMIN create the namespaces (the Server logs a [sandbox] warning; its state endpoint
+# shows processes.sandbox.active false). Here the Servers' containers lift exactly what the launcher needs: the
+# default seccomp profile (unshare, mount, pivot_root and sethostname need CAP_SYS_ADMIN under it) and the default
+# AppArmor profile (it forbids mount); no capability is added, the Server still runs as uid 10001, and
+# no-new-privileges keeps any program in the image from gaining privileges. sandbox.mode launcher makes a Server
+# refuse to start rather than run workerd without the environment.
+x-sandbox: &sandbox
+  security_opt:
+    - seccomp=unconfined
+    - apparmor=unconfined
+    - no-new-privileges=true
+  environment:
+    COWORKERD_SANDBOX_MODE: launcher
+
+services:
+  node-1:
+    <<: *sandbox
+  node-2:
+    <<: *sandbox
+  node-3:
+    <<: *sandbox

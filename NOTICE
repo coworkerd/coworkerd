@@ -1,0 +1,18 @@
+Coworkerd
+Copyright 2026 The Coworkerd Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes modifications of workerd, Cloudflare's JavaScript/Wasm runtime
+(https://github.com/cloudflare/workerd), licensed under the Apache License, Version 2.0.
+Coworkerd builds upstream tag v1.20261012.1 (commit 5358e3d337336eaf696a48bc1563d808b10feba5);
+the files in patches/workerd/ are modifications of that work, applied in the order of
+patches/workerd/series. The workerd binary in the release packages and images is built from
+that tag with those patches.
+
+The build fetches Cap'n Proto (https://github.com/capnproto/capnproto, MIT License) and applies
+patches/kj-http-abort.diff to it.
+
+examples/email-routing-template/ and examples/x402-proxy-template/ are official Cloudflare
+templates (https://github.com/cloudflare/templates), included as they are under the MIT License;
+each directory has its LICENSE file.

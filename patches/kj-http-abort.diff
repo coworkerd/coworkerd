@@ -1,0 +1,21 @@
+--- a/c++/src/kj/compat/http.c++
++++ b/c++/src/kj/compat/http.c++
+@@ -2620,6 +2620,18 @@
+     }
+   }
+ 
++  void abortWrite(kj::Exception&&) override {
++    if (!finished) {
++      KJ_IF_SOME(inner, weakInner) {
++        // An upstream read can fail while no socket write is pending. Explicitly
++        // mark the body incomplete so the chunked destructor cannot emit EOF.
++        inner.unsetCurrentWrapper(weakInner);
++        finished = true;
++        inner.abortBody();
++      }
++    }
++  }
++
+ protected:
+   HttpOutputStream& getInner() {
+     KJ_IF_SOME(i, weakInner) {

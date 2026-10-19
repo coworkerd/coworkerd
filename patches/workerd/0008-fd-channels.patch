@@ -1,0 +1,507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 23:14:46 +0800
+Subject: [PATCH] Deliver the Server's channels as descriptors inherited at
+ startup
+
+Coworkerd v39, depends on v27 CPU limit events, v30 idle eviction, v32 memory band, v33 memory limits, v35 limit events and v36 watchdog. Fixed upstream v1.20261012.1. A workerd process no longer opens a file of the Server's after startup. Limit event rows, the CPU culprit row and both OOM rows go to the write end of a pipe inherited under COWORKERD_EVENT_FD, each in one unbuffered write() of at most PIPE_BUF bytes: a row is in the pipe when the call returns, and the OOM handler writes rows prepared before entering JS. The culprit row replaces the culprit file; a later terminated row of the same invocation withdraws it, where the file was unlinked. The lifecycle snapshot is published into shared memory inherited under COWORKERD_LIFECYCLE_FD (two buffers under sequence counters, so a reader never sees a torn snapshot and a writer killed mid-write leaves the previous one intact); lifecycle event rows stay on stderr. The memory band is read from shared memory inherited under COWORKERD_MEMORY_BAND_FD. Both are mapped once and their descriptors closed. A dynamic Worker's request context writes its completed row whether or not it ran JavaScript and whether or not a limit is on (without limits only the pipe gets it). The pid is read once per process. Row and snapshot formats are unchanged; COWORKERD_CPU_STATE is gone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index 1d152a774a1404021fa714e8152d433b3105fbd9..3171ec4aa37f18a6e3a6ad2c0b2b70b97a8b7c57 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -106,24 +106,6 @@ uint32_t cpuLimitFromEnvironment() {
+   }
+   return static_cast<uint32_t>(value);
+ }
+-kj::String cpuStateFromEnvironment() {
+-  const char* value = std::getenv("COWORKERD_CPU_STATE");
+-  if (value == nullptr) return kj::str("");
+-  KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
+-  return kj::str(value);
+-}
+-int cpuEventsDescriptor() {
+-  // Opened once per process, when the first enabled limit enforcer is created.
+-  static const int descriptor = []() {
+-    auto state = cpuStateFromEnvironment();
+-    if (state.size() == 0) return -1;
+-    auto path = kj::str(state, ".events");
+-    int fd;
+-    do { fd = open(path.cStr(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600); } while (fd < 0 && errno == EINTR);
+-    return fd;
+-  }();
+-  return descriptor;
+-}
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
+   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
+       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
+@@ -215,9 +197,8 @@ class RequestLimits final: public LimitEnforcer {
+         kj::String identity, kj::Function<void()> abortIsolate)
+         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
+           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
+-    ~RequestLimits() noexcept(false) {
+-      if (cpuUsed) limits->record("completed", identity, cpuUsed);
+-    }
++    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript.
++    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
+     struct IdentityScope {
+       jsg::AsyncContextFrame::StorageScope frame;
+       MemoryStartupIdentityScope startup;
+@@ -268,7 +249,7 @@ class RequestLimits final: public LimitEnforcer {
+ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
+     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
+     kj::Function<void()> abortIsolate) {
+-  if (!limits.isEnabled() && !memoryLimitFromEnvironment()) return fallback;
++  if (!limits.isEnabled() && !memoryLimitFromEnvironment() && !limits.reportsCompletion()) return fallback;
+   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
+ }
+ kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index 39181fd854456ecfb1f39c10dc90e21342e07689..45429a4b417fecb6a42cbfdecc8310ae862541e7 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -23,9 +23,6 @@
+ 
+ namespace workerd::server {
+ uint32_t cpuLimitFromEnvironment();
+-kj::String cpuStateFromEnvironment();
+-// The process-wide append-only descriptor of <state>.events, opened on first use; -1 without state.
+-int cpuEventsDescriptor();
+ kj::String escapeCpuJsonString(kj::StringPtr text);
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
+ kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
+@@ -90,20 +87,19 @@ class LimitWatchdog {
+   void run();
+ };
+ 
+-// CPU accounting stays on the isolate thread; only termination and file writes cross threads.
++// CPU accounting stays on the isolate thread; only termination and event writes cross threads.
+ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
+       IdleWorkerRef idleWorker = nullptr, kj::StringPtr startupIdentity = "")
+       : fallback(kj::mv(fallback)), name(kj::str(name)),
+         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
+-        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)),
++        dynamic(dynamic), idleWorker(kj::mv(idleWorker)),
+         startupIdentity(kj::str(startupIdentity)) {
+     if (dynamic) {
+       auto limit = memoryLimitFromEnvironment();
+-      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
++      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
+     }
+-    if (state.size() && isEnabled()) events = cpuEventsDescriptor();
+     if (isEnabled()) watchdog = &LimitWatchdog::start();
+     recordPlatformFacts(name, dynamic);
+     auto paf = kj::newPromiseAndFulfiller<void>();
+@@ -152,6 +148,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     if (memory) memory->customize(value);
+   }
+   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
++  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
++  bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
+   const IdleWorkerRef& activity() const { return idleWorker; }
+   kj::Maybe<EventOutcome> outcome() {
+     if (exceeded->load() == IsolateLimitCause::NONE) return kj::none;
+@@ -195,34 +193,26 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
+     return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
+         ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
+-        ",\"pid\":", getpid(), memory ? memory->metrics() : kj::str(""), "}\n");
++        ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""), "}\n");
+   }
+   void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
+     auto row = report(event, identity, used);
+-    // All workerd processes append to one log: emit the prefix and JSON in one syscall.
+-    auto log = kj::str("[cpu-limit] ", row);
+-    ssize_t written;
+-    do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+-    // One unbuffered write() per row on the descriptor opened once: the row reaches the
+-    // file before record() returns, so a later SIGKILL cannot lose it.
+-    for (size_t done = 0; events >= 0 && done < row.size();) {
+-      written = write(events, row.cStr() + done, row.size() - done);
+-      if (written < 0 && errno == EINTR) continue;
+-      if (written <= 0) break;
+-      done += written;
++    if (isEnabled()) {
++      // All workerd processes append to one log: emit the prefix and JSON in one syscall.
++      auto log = kj::str("[cpu-limit] ", row);
++      ssize_t written;
++      do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+     }
++    writeLimitEvent(row);
+   }
+-  void culprit(kj::StringPtr identity, uint64_t used) {
+-    if (state.size() == 0) return;
+-    auto row = report("culprit", identity, used);
+-    auto path = kj::str(state, ".tmp");
+-    if (auto* file = fopen(path.cStr(), "w")) {
+-      auto written = fwrite(row.cStr(), 1, row.size(), file);
+-      auto closed = fclose(file);
+-      if (written == row.size() && closed == 0) rename(path.cStr(), state.cStr());
+-      else unlink(path.cStr());
+-    }
++  // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
++  // ever ran JavaScript; without limits only the event pipe gets the row.
++  void completed(kj::StringPtr identity, uint64_t used) {
++    if (dynamic) record("completed", identity, used);
+   }
++  // Written while a termination has not taken effect; a later terminated row for the same
++  // invocation withdraws it.
++  void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
+ 
+   struct CpuClock {
+ #if __APPLE__
+@@ -324,7 +314,6 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+         }
+       }
+       if (owner.memory) owner.memory->leave(previousMemory);
+-      if (reported && owner.state.size()) unlink(owner.state.cStr());
+       if (owner.exceeded->load() != IsolateLimitCause::NONE) {
+         owner.record(owner.exceeded->load() == IsolateLimitCause::MEMORY ? "memory-terminated" : "terminated", identity, used);
+       }
+@@ -377,8 +366,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::Own<IsolateLimitEnforcer> fallback;
+   kj::String name;
+   uint64_t cpuNs;
+-  kj::String state;
+-  int events = -1;
++  bool dynamic;
+   IdleWorkerRef idleWorker;
+   kj::String startupIdentity;
+   v8::Isolate* isolate = nullptr;
+diff --git a/src/workerd/server/coworkerd-idle-eviction.c++ b/src/workerd/server/coworkerd-idle-eviction.c++
+index 838ada98683d657fdc9ba53244996e38690ff5a6..9634e50d49a93551ba3bfeff6f41c8456fa09d94 100644
+--- a/src/workerd/server/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/coworkerd-idle-eviction.c++
+@@ -3,12 +3,14 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
++#include <cstring>
+ #include <list>
+ #include <limits>
+ #include <string>
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ namespace workerd::server {
+ namespace {
+@@ -37,13 +39,89 @@ void emit(kj::StringPtr row) {
+   auto line = kj::str("[coworkerd-lifecycle] ", row, '\n');
+   ssize_t n;
+   do { n = write(STDERR_FILENO, line.cStr(), line.size()); } while (n < 0 && errno == EINTR);
+-  const char* state = std::getenv("COWORKERD_CPU_STATE");
+-  if (state && *state) {
+-    auto path = kj::str(state, ".lifecycle.events");
+-    if (auto* f = fopen(path.cStr(), "a")) {
+-      fwrite(row.cStr(), 1, row.size(), f); fputc('\n', f); fclose(f);
+-    }
++}
++// A shared memory object the Server created before this process started, inherited under the
++// descriptor number in `variable`; mapped here, and the descriptor closed. Null without one.
++void* mapInherited(const char* variable, size_t& size, int protection) {
++  const char* text = std::getenv(variable);
++  if (!text) return nullptr;
++  KJ_REQUIRE(*text, "descriptor setting must be a number", variable);
++  int fd = 0;
++  for (auto* p = text; *p; ++p) {
++    KJ_REQUIRE(*p >= '0' && *p <= '9' && fd < 1000000, "descriptor setting must be a number", variable);
++    fd = fd * 10 + (*p - '0');
++  }
++  KJ_REQUIRE(fd > STDERR_FILENO, "invalid inherited descriptor", variable);
++  auto closeFd = kj::defer([&] { close(fd); });
++  struct stat info;
++  KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size > 0, "invalid inherited shared memory", variable);
++  size = size_t(info.st_size);
++  auto mapping = mmap(nullptr, size, protection, MAP_SHARED, fd, 0);
++  KJ_REQUIRE(mapping != MAP_FAILED, "cannot map inherited shared memory", variable);
++  return mapping;
++}
++// The lifecycle snapshot channel: shared memory from the Server (COWORKERD_LIFECYCLE_FD) holding
++// the latest snapshot this process published. Layout, shared with the Server:
++//   [0, 8)    publications completed; the latest snapshot is in buffer (publications % 2)
++//   [8, 12)   magic 0x434c5743 ("CWLC")
++//   [12, 16)  capacity of each buffer's data in bytes
++//   buffer i at 64 + i * (16 + capacity): sequence (8; odd while being written), length (4),
++//             4 unused, data
++// One writer, this process; a reader copies the published buffer and keeps the copy only if its
++// sequence did not change meanwhile. A writer killed mid-write leaves the published buffer intact.
++class LifecycleChannel {
++ public:
++  static constexpr uint32_t MAGIC = 0x434c5743;
++  LifecycleChannel() {
++    size_t size = 0;
++    base = static_cast<char*>(mapInherited("COWORKERD_LIFECYCLE_FD", size, PROT_READ | PROT_WRITE));
++    if (!base) return;
++    KJ_REQUIRE(size >= 64 && *reinterpret_cast<uint32_t*>(base + 8) == MAGIC, "invalid lifecycle channel");
++    capacity = *reinterpret_cast<uint32_t*>(base + 12);
++    KJ_REQUIRE(64 + 2 * (16 + uint64_t(capacity)) <= size, "invalid lifecycle channel size");
++    mappedSize = size;
+   }
++  ~LifecycleChannel() { if (base) munmap(base, mappedSize); }
++  explicit operator bool() const { return base != nullptr; }
++  // False when the snapshot does not fit; the previous one stays published.
++  bool publish(kj::StringPtr row) {
++    auto lock = mutex.lockExclusive();
++    if (row.size() > capacity) return false;
++    auto* published = reinterpret_cast<uint64_t*>(base);
++    auto next = __atomic_load_n(published, __ATOMIC_RELAXED) + 1;
++    auto* buffer = base + 64 + (next % 2) * (16 + uint64_t(capacity));
++    auto* sequence = reinterpret_cast<uint64_t*>(buffer);
++    auto start = __atomic_load_n(sequence, __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, start + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    memcpy(buffer + 16, row.begin(), row.size());
++    __atomic_store_n(reinterpret_cast<uint32_t*>(buffer + 8), uint32_t(row.size()), __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, start + 2, __ATOMIC_RELEASE);
++    __atomic_store_n(published, next, __ATOMIC_RELEASE);
++    return true;
++  }
++ private:
++  kj::MutexGuarded<bool> mutex;
++  char* base = nullptr;
++  size_t mappedSize = 0;
++  uint32_t capacity = 0;
++};
++// The inherited descriptors are mapped once per process and closed.
++LifecycleChannel& lifecycleChannel() {
++  static LifecycleChannel channel;
++  return channel;
++}
++// The band the Server publishes, in shared memory passed at startup (COWORKERD_MEMORY_BAND_FD).
++const uint32_t* inheritedBand() {
++  static const uint32_t* band = []() -> const uint32_t* {
++    size_t size = 0;
++    auto* mapping = mapInherited("COWORKERD_MEMORY_BAND_FD", size, PROT_READ);
++    if (mapping) {
++      KJ_REQUIRE(size == 4096, "invalid memory band channel");
++    }
++    return static_cast<const uint32_t*>(mapping);
++  }();
++  return band;
+ }
+ }  // namespace
+ 
+@@ -68,21 +146,10 @@ class IdleReaper {
+       : timer(timer), threshold(setting("COWORKERD_IDLE_EVICT_MS", 0)),
+         interval(setting("COWORKERD_IDLE_DESTROY_INTERVAL_MS", 10)) {
+     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
+-    const char* channel = std::getenv("COWORKERD_MEMORY_BAND_FILE");
+-    if (channel && *channel) {
+-      int fd = open(channel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+-      KJ_REQUIRE(fd >= 0, "cannot open published memory band");
+-      auto closeFd = kj::defer([&] { close(fd); });
+-      struct stat info;
+-      KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size == 4096, "invalid memory band channel");
+-      auto mapping = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, 0);
+-      KJ_REQUIRE(mapping != MAP_FAILED, "cannot map published memory band");
+-      publishedBand = static_cast<const uint32_t*>(mapping);
+-    }
++    publishedBand = inheritedBand();
+     publish();
+     if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
+   }
+-  ~IdleReaper() { if (publishedBand) munmap(const_cast<uint32_t*>(publishedBand), 4096); }
+   kj::Timer& timer;
+   uint32_t threshold, interval;
+   uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
+@@ -98,7 +165,7 @@ class IdleReaper {
+   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
+     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
+         escapeCpuJsonString(worker.name), ",\"instance\":", worker.id,
+-        ",\"pid\":", getpid(), ",\"monotonicMs\":", monotonicMs(),
++        ",\"pid\":", coworkerdPid(), ",\"monotonicMs\":", monotonicMs(),
+         ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
+         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
+         ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
+@@ -106,8 +173,8 @@ class IdleReaper {
+         ",\"idleDestroyIntervalMs\":", interval, "}"));
+   }
+   void publish() {
+-    const char* state = std::getenv("COWORKERD_CPU_STATE");
+-    if (!state || !*state) return;
++    auto& channel = lifecycleChannel();
++    if (!channel) return;
+     kj::Vector<kj::String> entries;
+     for (auto it = workers.begin(); it != workers.end();) {
+       if (auto worker = it->lock()) {
+@@ -118,19 +185,18 @@ class IdleReaper {
+         it = workers.erase(it);
+       }
+     }
+-    auto row = kj::str("{\"pid\":", getpid(), ",\"residentIsolates\":", created - destroyed,
++    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"residentIsolates\":", created - destroyed,
+         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
+         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
+         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+         ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
+-    auto path = kj::str(state, ".lifecycle"), temporary = kj::str(path, ".tmp");
+-    if (auto* f = fopen(temporary.cStr(), "w")) {
+-      auto written = fwrite(row.cStr(), 1, row.size(), f);
+-      if (fclose(f) == 0 && written == row.size()) rename(temporary.cStr(), path.cStr());
+-      else unlink(temporary.cStr());
++    if (!channel.publish(row) && !overflowReported) {
++      overflowReported = true;
++      emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
+     }
+   }
++  bool overflowReported = false;
+  private:
+   kj::Promise<void> loop() {
+     while (true) {
+diff --git a/src/workerd/server/coworkerd-memory-limit.c++ b/src/workerd/server/coworkerd-memory-limit.c++
+index bf73843f7a00294d498ce1790fe6ec1445304dba..026d06c968db2a785a3318c2cff482596688a803 100644
+--- a/src/workerd/server/coworkerd-memory-limit.c++
++++ b/src/workerd/server/coworkerd-memory-limit.c++
+@@ -13,8 +13,7 @@
+ namespace workerd::server {
+ namespace {
+ thread_local MemoryExecution executingMemory;
+-char oomPath[4096] = {}, oomTemporaryPath[4112] = {}, unknownOomReport[256] = {};
+-int oomSignalFd = -1;
++char unknownOomReport[256] = {};
+ std::atomic<bool> oomReportReady{false};
+ std::atomic<void (*)()> limitStateObserver{nullptr};
+ 
+@@ -30,25 +29,40 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
+   while (old < value && !peak.compare_exchange_weak(old, value)) {}
+ }
+ 
+-// The fatal path performs only file syscalls on data prepared before entering JS.
+-void writeOomReport(kj::StringPtr report) {
+-  if (!oomReportReady.load(std::memory_order_acquire)) return;
+-  auto fd = open(oomTemporaryPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+-  if (fd < 0) return;
+-  size_t offset = 0;
+-  while (offset < report.size()) {
+-    auto n = write(fd, report.cStr() + offset, report.size() - offset);
++}  // namespace
++
++int coworkerdPid() {
++  static const int pid = getpid();
++  return pid;
++}
++int cpuEventsDescriptor() {
++  static const int descriptor = []() {
++    const char* text = std::getenv("COWORKERD_EVENT_FD");
++    if (text == nullptr) return -1;
++    KJ_REQUIRE(*text != '\0', "COWORKERD_EVENT_FD must be a descriptor number");
++    int value = 0;
++    for (const char* p = text; *p; ++p) {
++      KJ_REQUIRE(*p >= '0' && *p <= '9' && value < 1000000, "COWORKERD_EVENT_FD must be a descriptor number");
++      value = value * 10 + (*p - '0');
++    }
++    KJ_REQUIRE(value > STDERR_FILENO && fcntl(value, F_GETFD) >= 0, "COWORKERD_EVENT_FD is not an open descriptor");
++    // Kept from any process this one might start.
++    fcntl(value, F_SETFD, FD_CLOEXEC);
++    return value;
++  }();
++  return descriptor;
++}
++void writeLimitEvent(kj::StringPtr row) {
++  auto fd = cpuEventsDescriptor();
++  // A row of at most PIPE_BUF bytes is written whole by this one call or not at all.
++  for (size_t done = 0; fd >= 0 && done < row.size();) {
++    auto n = write(fd, row.cStr() + done, row.size() - done);
+     if (n < 0 && errno == EINTR) continue;
+     if (n <= 0) break;
+-    offset += n;
++    done += n;
+   }
+-  auto closed = close(fd);
+-  if (offset == report.size() && closed == 0) rename(oomTemporaryPath, oomPath);
+-  else unlink(oomTemporaryPath);
+ }
+ 
+-}  // namespace
+-
+ uint32_t memoryLimitFromEnvironment() {
+   auto* text = std::getenv("COWORKERD_MEMORY_LIMIT_MIB");
+   if (text == nullptr) return 0;
+@@ -63,17 +77,12 @@ uint32_t memoryLimitFromEnvironment() {
+ }
+ void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
+ 
+-IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath)
++IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state)
+     : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
+-  if (!reportPath.size()) return;
+-  KJ_REQUIRE(reportPath.size() + 8 <= sizeof(oomPath), "OOM report path too long");
++  // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
++  if (cpuEventsDescriptor() < 0) return;
+   if (!oomReportReady.load(std::memory_order_acquire)) {
+-    snprintf(oomPath, sizeof(oomPath), "%s.memory", reportPath.cStr());
+-    snprintf(oomTemporaryPath, sizeof(oomTemporaryPath), "%s.tmp", oomPath);
+-    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", getpid());
+-    char signalPath[4112];
+-    snprintf(signalPath, sizeof(signalPath), "%s.memory-oom", reportPath.cStr());
+-    oomSignalFd = open(signalPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", coworkerdPid());
+     oomReportReady.store(true, std::memory_order_release);
+   }
+ }
+@@ -155,7 +164,7 @@ void IsolateMemoryLimit::logSample(const char* event) const {
+   auto length = snprintf(row, sizeof(row),
+       "[memory-limit-sample] {\"event\":\"%s\",\"pid\":%d,\"memoryLimitMiB\":%zu,\"heapUsedBytes\":%zu,"
+       "\"externalOwnedBytes\":%zu,\"arrayBufferBytes\":%zu,\"peakUsedBytes\":%zu,"
+-      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, getpid(), limitBytes >> 20,
++      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, coworkerdPid(), limitBytes >> 20,
+       heapBytes.load(), ownedBytes.load(), bufferBytes.load(), peakUsedBytes.load(),
+       grantedHeadroomBytes.load(), nearCalls.load());
+   if (length > 0 && static_cast<size_t>(length) < sizeof(row)) {
+@@ -164,14 +173,12 @@ void IsolateMemoryLimit::logSample(const char* event) const {
+   }
+ }
+ void IsolateMemoryLimit::oom(const char*, const v8::OOMDetails&) {
+-  // A preopened descriptor distinguishes OOM even if the detailed atomic report fails.
+-  if (oomSignalFd >= 0) {
+-    auto report = kj::StringPtr(unknownOomReport);
+-    ssize_t written;
+-    do { written = write(oomSignalFd, report.cStr(), report.size()); } while (written < 0 && errno == EINTR);
+-  }
+-  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeOomReport(executingMemory.report);
+-  else writeOomReport(unknownOomReport);
++  // Only writes of rows prepared before entering JS, on the descriptor inherited at startup: first
++  // the bare OOM row, which tells an OOM apart even if nothing else is known, then the identity of
++  // the execution that hit it.
++  if (!oomReportReady.load(std::memory_order_acquire)) return;
++  writeLimitEvent(unknownOomReport);
++  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeLimitEvent(executingMemory.report);
+   // V8 invokes the original process-wide jsg OOM callback after this returns.
+ }
+ kj::String IsolateMemoryLimit::metrics() const {
+diff --git a/src/workerd/server/coworkerd-memory-limit.h b/src/workerd/server/coworkerd-memory-limit.h
+index 1d337e4b7cd1496d49159fd649ec7d047cc7156c..e254ac62d5280f6826c4aee3a0fee704c84ddd5c 100644
+--- a/src/workerd/server/coworkerd-memory-limit.h
++++ b/src/workerd/server/coworkerd-memory-limit.h
+@@ -12,6 +12,15 @@ namespace workerd::server {
+ enum class IsolateLimitCause { NONE, CPU, MEMORY };
+ using IsolateLimitState = std::shared_ptr<std::atomic<IsolateLimitCause>>;
+ uint32_t memoryLimitFromEnvironment();
++// This process's pid, read once: event rows carry it on every request.
++int coworkerdPid();
++// The write end of the Server's limit event pipe, inherited at startup and named by
++// COWORKERD_EVENT_FD; -1 without one. Read once per process.
++int cpuEventsDescriptor();
++// Writes one event row (ending in a newline) to the event pipe in one unbuffered write(): the row
++// is in the pipe when this returns, so a later SIGKILL cannot lose it, and a row of at most
++// PIPE_BUF bytes never interleaves with another thread's row.
++void writeLimitEvent(kj::StringPtr row);
+ // Called after a memory limit moves a limit state from NONE, so that the limit watchdog
+ // terminates the isolate without waiting for a CPU deadline. Set by the watchdog; may be null.
+ void setLimitStateObserver(void (*observer)());
+@@ -25,7 +34,7 @@ struct MemoryExecution {
+ class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::enable_shared_from_this<IsolateMemoryLimit> {
+  public:
+   static constexpr size_t HEADROOM = 8ull << 20;
+-  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath);
++  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state);
+   ~IsolateMemoryLimit() noexcept override;
+   void* Allocate(size_t length) override;
+   void* AllocateUninitialized(size_t length) override;

@@ -1,0 +1,25 @@
+# macOS and editor files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and generated output
+node_modules/
+build/
+dist/
+coverage/
+.cache/
+.wrangler/
+__pycache__/
+*.log
+*.pid
+
+# The workerd checkout scripts/workerd-patches.py works on (it has its own Git history)
+/workerd

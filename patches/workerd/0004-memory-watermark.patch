@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 13 Oct 2026 19:00:35 +0800
+Subject: [PATCH] Reap least recently used idle Workers from the Server memory
+ band
+
+Coworkerd v32; reads a shared atomic band published by the Server. Keeps v30 activity semantics and destruction pacing. Only our server source changes.
+
+diff --git a/src/workerd/server/coworkerd-idle-eviction.c++ b/src/workerd/server/coworkerd-idle-eviction.c++
+index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38690ff5a6 100644
+--- a/src/workerd/server/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/coworkerd-idle-eviction.c++
+@@ -6,6 +6,9 @@
+ #include <list>
+ #include <limits>
+ #include <string>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
+ 
+ namespace workerd::server {
+ namespace {
+@@ -65,12 +68,29 @@ class IdleReaper {
+       : timer(timer), threshold(setting("COWORKERD_IDLE_EVICT_MS", 0)),
+         interval(setting("COWORKERD_IDLE_DESTROY_INTERVAL_MS", 10)) {
+     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
++    const char* channel = std::getenv("COWORKERD_MEMORY_BAND_FILE");
++    if (channel && *channel) {
++      int fd = open(channel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++      KJ_REQUIRE(fd >= 0, "cannot open published memory band");
++      auto closeFd = kj::defer([&] { close(fd); });
++      struct stat info;
++      KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size == 4096, "invalid memory band channel");
++      auto mapping = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, 0);
++      KJ_REQUIRE(mapping != MAP_FAILED, "cannot map published memory band");
++      publishedBand = static_cast<const uint32_t*>(mapping);
++    }
+     publish();
+-    if (threshold) task = loop().eagerlyEvaluate(nullptr);
++    if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
+   }
++  ~IdleReaper() { if (publishedBand) munmap(const_cast<uint32_t*>(publishedBand), 4096); }
+   kj::Timer& timer;
+   uint32_t threshold, interval;
+   uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
++  uint64_t watermarkEvicted = 0, bandReads = 0, bandReadNs = 0;
++  const uint32_t* publishedBand = nullptr;
++  uint32_t band = 0;
++  double lastPublish = 0;
++  uint32_t effectiveThreshold() const { return band == 2 ? 1000 : band == 1 ? 5000 : threshold; }
+   double lastDestroy = 0;
+   std::list<std::weak_ptr<IdleWorker>> workers;
+   kj::Promise<void> task = nullptr;
+@@ -82,6 +102,7 @@ class IdleReaper {
+         ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
+         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
+         ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
++        ",\"memoryBand\":" , band, ",\"effectiveIdleEvictMs\":" , effectiveThreshold(),
+         ",\"idleDestroyIntervalMs\":", interval, "}"));
+   }
+   void publish() {
+@@ -99,7 +120,8 @@ class IdleReaper {
+     }
+     auto row = kj::str("{\"pid\":", getpid(), ",\"residentIsolates\":", created - destroyed,
+         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
+-        ",\"idleEvictions\":", evicted, ",\"loadFailureRemovals\":", failed,
++        ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
++        ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+         ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
+     auto path = kj::str(state, ".lifecycle"), temporary = kj::str(path, ".tmp");
+@@ -113,23 +135,35 @@ class IdleReaper {
+   kj::Promise<void> loop() {
+     while (true) {
+       co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
+-      if (pending || monotonicMs() - lastDestroy < interval) continue;
++      if (publishedBand) {
++        auto start = std::chrono::steady_clock::now();
++        band = std::min(__atomic_load_n(publishedBand, __ATOMIC_ACQUIRE), 2u);
++        bandReadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - start).count();
++        ++bandReads;
++        if (monotonicMs() - lastPublish >= 1000) { publish(); lastPublish = monotonicMs(); }
++      }
++      auto minimum = effectiveThreshold();
++      if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
++      IdleWorkerRef oldest;
++      auto now = monotonicMs();
+       for (auto it = workers.begin(); it != workers.end();) {
+         auto worker = it->lock();
+         if (!worker) { it = workers.erase(it); continue; }
+         ++it;
+         if (!worker->eligible || !worker->ready || !worker->created || worker->removed || worker->active ||
+-            monotonicMs() - worker->lastEnd <= threshold) continue;
+-        // The event-loop decision and map removal are synchronous. A new request either
+-        // acquired activity first, or sees a fresh named stub after this removal.
+-        pending = worker->id;
+-        KJ_IF_SOME(cb, worker->remove) {
++            now - worker->lastEnd <= minimum) continue;
++        if (!oldest || worker->lastEnd < oldest->lastEnd) oldest = kj::mv(worker);
++      }
++      if (oldest) {
++        // Activity and removal are decided synchronously on the same event loop.
++        pending = oldest->id;
++        KJ_IF_SOME(cb, oldest->remove) {
+           auto remove = kj::mv(cb);
+-          worker->remove = kj::none;
+-          idleWorkerRemoved(worker, "idle");
++          oldest->remove = kj::none;
++          idleWorkerRemoved(oldest, threshold && now - oldest->lastEnd > threshold ? "idle" : "watermark");
+           remove();
+         }
+-        break;
+       }
+     }
+   }
+@@ -154,6 +188,7 @@ void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason) {
+   worker->removed = true; worker->reason = kj::str(reason);
+   if (auto owner = worker->owner.lock()) {
+     if (reason == "idle") ++owner->evicted;
++    if (reason == "watermark") ++owner->watermarkEvicted;
+     if (reason == "load-failed") ++owner->failed;
+     owner->event(*worker, "removed"); owner->publish();
+   }
