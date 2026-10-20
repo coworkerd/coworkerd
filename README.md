@@ -41,7 +41,7 @@ Boundaries to know about:
   procedure are planned for 0.4. Secret values are not encrypted at rest in etcd in this version.
 - **The upstream runtime** is workerd `v1.20261012.1` with the patch series in [patches/workerd/](patches/workerd/);
   the patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd), and
-  [docs/upstream-sync.md](docs/upstream-sync.md) describes how it follows upstream.
+  [patches/README.md](patches/README.md) describes how it follows upstream.
 
 ## Trying it
 
@@ -93,7 +93,7 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 [docs/components.md](docs/components.md), [docs/control-plane-api.md](docs/control-plane-api.md),
 [docs/cluster-state.md](docs/cluster-state.md) (membership, deployment state, code distribution, placement),
 [docs/process-isolation.md](docs/process-isolation.md) (processes, limits, quarantine, rotation, sandbox),
-[docs/egress-and-auth.md](docs/egress-and-auth.md) and [docs/ecosystem-compat.md](docs/ecosystem-compat.md) (how wrangler projects are converted).
+[docs/egress-and-auth.md](docs/egress-and-auth.md) and [docs/compatibility.md](docs/compatibility.md) (how wrangler projects are converted and run).
 
 ## Contributing and security
 

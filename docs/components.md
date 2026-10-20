@@ -1,60 +1,126 @@
 # Components and boundaries
 
-> Positioning: **Coworkerd is a Workers infrastructure layer for platforms.** One cluster runs all the untrusted Workers of one platform and provides strong isolation, per-tenant quotas and metering, a declarative API and a thin command line; accounts, billing, user interfaces and stateful services are provided by the platform above.
-> Shaped like k8s: declarative state, multi-tenant primitives, a thin client. The core is not like k8s: placement per call, density counted in isolates, cold loads measured in milliseconds, no system of controllers.
+This document is for operators and contributors who need to know what runs where: the components and what each is responsible for, the processes of a node, the two deployment forms, the channels between components and how each is authenticated, where configuration comes from, and how the repository and the release package are laid out. Installation steps are in the [installation guide](guide/install.md).
 
-## 1. Components
+## 1. The components
 
-| Component | Form | Responsibilities | Not responsible for |
+| Component | Form | Responsible for | Not responsible for |
 | --- | --- | --- | --- |
-| `coworkerd` | The node daemon, one process per machine; its only subcommand is `check`: `check --config FILE` is the node-side self-check (etcd, object storage, the launcher's `--check`), `check storage ENDPOINT BUCKET` is the object storage check | The process pool and the lifecycle of workerd, CPU and memory limits, culprits and quarantine processes, per-Worker logs and quotas, process rotation, ingress and peer forwarding, placement per call, the management endpoints, per-tenant usage counting; reads the desired state, writes its own runtime state (membership, suspects, usage) | Does not write the desired state; is not accessed directly by the command line |
-| `coworkerd-apiserver` | The control plane, a separate binary and process, stateless, may run as several instances | The /v1 API; credentials and tenants; admission, meaning validation and trial loads; the only writer of the desired state; uploads of code bundles and static assets; aggregation of logs, state and usage | Runs no tenant code; is not on the request path |
-| `coworkerd-launcher` | A separate small C program | Sets up a least-privilege environment for each workerd and installs the system call allowlist, then hands over | Any business logic |
-| Runtime | `workerd` (upstream + the patch series) + the bridge module `runtime/runtime.js` | Executes tenant code; the workerd side of limits and event reporting | -- |
-| `cowctl` | A Node command line, including the wrangler adapter | The API's client: the developer loop (init, deploy, logs, rollback, secret) and administration (tenants, credentials, quotas) | Does not talk to etcd, storage or the nodes directly |
-| etcd | External | Desired state, membership, suspects, runtime state | -- |
-| S3-compatible object storage | External | Code bundles and static assets | -- |
+| `coworkerd` | The node daemon, one per stack directory | The ingress and the management endpoints; placement per call and forwarding to peers; the pool of workerd processes with its watchdog, limits, suspects, quarantine, eviction and rotation; per-tenant logs and usage; membership; following the deployment state | Writing tenants, credentials or deployments; talking to `cowctl` |
+| `coworkerd-apiserver` | The control plane, an executable of its own | The `/v1` API; tenants and credentials; validation and trial loads of new versions; publishing code packages to object storage; writing the deployment state; collecting state and logs from the nodes and usage from etcd; the operations tool `coworkerd-apiserver tool` | Running tenant code; serving tenant requests |
+| `coworkerd-launcher` | A small C program, built only for Linux | Setting up the least-privilege environment of one workerd process and installing its system call filter, then executing workerd | Anything else |
+| `workerd` | Upstream workerd `v1.20261012.1` with the patch series in `patches/workerd/` | Executing tenant code; the workerd side of the limits, idle eviction, the memory watermark and the steady-state system call filter | Placement, state, policy |
+| The runtime bridge | `runtime/runtime.js`, copied into every workerd generation | Loading each version into an isolate of its own, building its `env` and dispatching each call to its entry point | -- |
+| `cowctl` | A Node.js command line, with the wrangler adapter `cli/adapter.mjs` | Converting wrangler projects and deploying them; the developer's and the administrator's commands, all through `/v1` | Talking to etcd, object storage or the nodes |
+| etcd | External, reached through its HTTP gateway | Membership, the deployment state, tenants and credentials, suspects and usage | -- |
+| Object storage | External, an S3-compatible service reached over plain HTTP with path-style requests | Code packages, modules and static assets, and copies of version definitions, each stored under its hash | -- |
 
-**Why one binary per role**: the node and the API service are a consumer and a producer of etcd, with different placement and permissions; splitting them into two executable targets lets the linker guard the boundary (both depend only on `common` and cannot see each other, so crossing the boundary does not compile), the artifact's name is the role, and the node binary has no control-plane code it does not use. The cost is just one static library target in CMake. The launcher is separate because it has to be as small and static as possible and do only one thing before entering the sandbox.
+**One executable per role.** The node and the control plane are etcd's consumer and producer, run in different places and need different permissions. They are separate executables: `coworkerd` is built from `node/`, `coworkerd-apiserver` from `apiserver/`, and what they share is the static library `common`; neither has the other's directory on its include path, so code that crosses the boundary does not compile, the executable's name is its role, and the node carries no control-plane code. The launcher is a program of its own because it has to be small and do one thing before workerd starts.
 
-**Naming**: the daemons keep full names (`coworkerd`, `coworkerd-apiserver`, `coworkerd-launcher`), like etcd and containerd, where the project name is the daemon's name; only the command line typed dozens of times a day is shortened to `cowctl`, the ctl suffix saying that it is a control tool rather than the product. Files and environment variables follow the program that reads them: the daemons read `COWORKERD_*` and `/etc/coworkerd/`; the command line's project configuration is `cowctl.json` and its token lives in `~/.cowctl/`; the image is `coworkerd:<version>`. A cow mascot is fine: friendly and harmless.
+**Names.** The daemons carry the project's name (`coworkerd`, `coworkerd-apiserver`, `coworkerd-launcher`), as etcd and containerd do; only the command line typed many times a day is short, `cowctl`. Files and environment variables follow the program that reads them: the daemons read `COWORKERD_*` and the file given with `--config`, which has no default path; `cowctl` reads `cowctl.json` in the project and its credential from `COWCTL_TOKEN` or `~/.cowctl/token`.
 
-## 2. Boundary rules
+## 2. The processes of a node
 
-1. **A single writer**: the desired state is written only by `apiserver`, enforced with etcd's role permissions: `apiserver`'s credentials may write the desired-state prefixes; `node`'s credentials may only read the desired state and write only its own runtime-state prefixes (membership, suspects, usage). The deployment tool's subcommands are part of `apiserver`.
-2. **The data plane only consumes state**: `node` watches etcd and does not call `apiserver`; `apiserver` contacts `node` only to pull logs, state and usage (through the management endpoints and the token).
-3. **The client knows only the API**: `cowctl` talks only to `apiserver`. The platform's back end likewise goes only through /v1, which only changes by adding fields until 1.0.
-4. **Ingress stays in the node**: every node is an ingress, and the platform puts its own gateway or load balancer in front; complex traffic splitting does not go into the core. A separate ingress component can be split out later if needed.
-5. **Trust between nodes needs credentials**: peer calls, the management endpoints, etcd and object storage are all authenticated; 0.3.0 signs with a cluster-wide shared key, while mTLS and a node join procedure go into 0.4.
+| Process | Started by | What it does |
+| --- | --- | --- |
+| `coworkerd` | systemd, or the image's entry point | The event loop with every listener -- the ingress (8930), the peer listener (8934), the Unix sockets for its workerd processes -- the process pool, membership, the egress service and the management endpoints |
+| `coworkerd-log` | `coworkerd`, forked before the event loop starts | Writes the node's own log: the node's lines go into a shared-memory ring (4 MiB by default), and this process copies them to the original output -- the terminal, journald or the container log -- so a slow reader never holds up the event loop; a line that does not fit is dropped and counted. Only what the node writes before this process starts -- the ring's own warning, a refusal to start -- and the launcher's startup check reach that output directly |
+| `coworkerd-wlog` | `coworkerd`, forked right after the log writer | Receives the output pipes of every workerd process, writes them to `logs/workerd.log` (rotated at 256 MiB, four files by default) and keeps each tenant's recent lines for its logs |
+| workerd processes | `coworkerd`, through `coworkerd-launcher` when the sandbox is active | `processPool.count` ordinary processes `p<n>` (default 1) and `quarantineProcesses` quarantine processes `q<n>` (default 2); each listens on an inherited Unix socket and has no TCP port |
 
-## 3. Resource model and terminology
+On Linux, when the sandbox is not `off` and its preparation succeeds -- the launcher is an executable file, the sandbox root can be created and workerd opened --, the node also runs short helpers at startup: the dynamic loader's `--list` on a dynamically linked workerd, to learn which shared objects to bind into the sandbox, and then the launcher's own `--check`, which decides whether the sandbox can be used. Beside the event loop it runs threads that hash executables, resolve egress names and, while the system call filter is in `observe`, receive its reports.
 
-- Two levels: **tenant -> Worker**; versions, routes and secrets hang under the Worker. A Worker's full name is `tenant/Worker`.
-- A tenant carries: optional tenant-level credentials; quotas (the number of Workers and versions, bundle size, isolate concurrency and total memory, log volume; a Worker's CPU and memory limits are the Worker's properties, with defaults from the tenant); ownership of routes and hostnames; the scope of suspect marking; usage counters (requests, CPU milliseconds, egress bytes, log lines); cascading deletion.
-- Credentials have two scopes: administrator, and limited to one tenant. There is no "owner" level; the multi-platform case is simply one credential managing several tenants.
-- Terminology: a machine is called a **node** and runs the node daemon; some documents call it a "Server". Its configuration key is `nodeId`; `request.cf.serverId` carries the same value as `nodeId` and remains through 0.3.x.
+The node's working state is its stack directory (`stackDirectory`, default `/var/lib/coworkerd`):
 
-## 4. Source directories
+- `logs/` holds `workerd.log` and its rotations; the node's own log is not there, it goes to standard output and error.
+- `run/` (mode 0700) holds the Unix sockets the workerd processes call back on and each process's own socket; it is the one directory a sandboxed workerd can write.
+- `cache/` is the verified cache of code from object storage.
+- `processes/` holds each slot's workerd configuration and its copy of the runtime bridge, written again for every new generation.
+- `sandbox/` (mode 0700) is the launcher's root, created on Linux when the sandbox is not `off`.
 
-```text
-apiserver/   the API service: /v1 handling, credentials and tenants, admission, desired-state writes, uploads, aggregation
-node/        the node daemon: process-pool, async-log, membership, placement, ingress and peer, management endpoints
-common/      shared by both: etcd client, object storage client, deployment state model, capnp schema, log cleaning
-launcher/    coworkerd-launcher
-cli/         cowctl and its wrangler adapter
-runtime/     the bridge module; patches/ the patch series; workerd/ the upstream checkout (a working directory, not in the repository)
-docker/ docs/ examples/   the image and compose files, design documents and the user guide, example projects
-scripts/     build, release, patches, allowlist
-```
+A second node started on the same stack directory finds the first one's sockets live and refuses to start, changing nothing.
 
-CMake targets: the static library `common`, the executables `coworkerd` and `coworkerd-apiserver`, and the C program `coworkerd-launcher`.
+## 3. Deployment forms
 
-## 5. Release artifacts and the image
+**Compose.** One image, `coworkerd:<version>`, serves every role of Coworkerd; its entry point chooses the role by its first argument (`node`, `apiserver`, `secrets`, `init`, `tool`, `healthcheck`, `version`). etcd and object storage run from their own images.
 
-- The release package's `bin/`: `coworkerd`, `coworkerd-apiserver`, `coworkerd-launcher`, `workerd`, `cowctl` (the image has only the first four: `cowctl` needs Node.js, which the image does not have); `lib/` the command line's dependencies; the allowlist's three files (the startup table, the steady-state table, the generation record) are also in `bin/`, beside workerd (the table in section 1 of the install guide is authoritative); `runtime/`; `docker/`; `docs/`; `examples/`.
-- One image; compose services correspond one to one to the components: `node-1..3`, `apiserver`, `etcd`, `storage`; the entry point script's mode names match them.
-- Bare metal: two systemd units, `coworkerd --config` and `coworkerd-apiserver --config`.
+| Service | Role |
+| --- | --- |
+| `secrets` | Runs once, without a network: generates every credential of the cluster into the `secrets` volume and gives each service a directory of its own |
+| `etcd`, `storage` | etcd (one member) and an S3-compatible store (SeaweedFS) |
+| `init` | Runs once: checks the bucket with both object storage identities, creates etcd's users and roles and turns authentication on, and writes an empty deployment state when there is none |
+| `node-1`, and `node-2`, `node-3` in the profile `cluster` | Nodes |
+| `apiserver` | The control plane |
+| `tool` | The operations tool, in the profile `tools`, run on demand |
 
-## 6. Open, and later
+- **Two networks.** `backend` is isolated: compose gives it no gateway, so it has no route out and none in from the host; it carries etcd, object storage, the nodes, the control plane, `init` and `tool`; `secrets` has no network at all. `frontend` is an ordinary bridge carrying the nodes and the control plane: their published ports and the nodes' route out for tenant egress.
+- **What each network reaches.** A node's peer listener binds a name that exists only on `backend` (`node-N-peer:8934`); its ingress listens on every address, so it is reachable on both networks.
+- **Users.** The Coworkerd containers run as the user `coworkerd`, uid 10001, and etcd and object storage as 10001:10001.
+- **Health checks and stopping.** A node is healthy while `/__coworkerd/ready` answers 200, so a draining node is not; the control plane's check expects a 401 from `/v1/status`, which shows that it answers, not that etcd is reachable. Nodes get 45 seconds to stop, for their 30-second drain; the control plane has Docker's default and exits on SIGTERM without a drain.
+- **The sandbox.** Under Docker's default seccomp profile a process without `CAP_SYS_ADMIN` cannot create namespaces, so under the default compose file the nodes run without the sandbox, each saying so in a `[sandbox]` warning; `docker-compose.sandbox.yml` lifts the default seccomp and AppArmor profiles for the nodes, adds no capability and sets the sandbox mode to `launcher`, so that a node which cannot set it up refuses to start.
 
-- A separate ingress component; mTLS and a node join procedure; an extension point for the platform to implement KV-like bindings with its own services; a binding for "calling by name dynamically within a tenant" (we only make sure the API's wording does not rule it out).
+**Bare metal.** The node runs as a systemd service, `coworkerd --config /etc/coworkerd/config.json`, and the control plane as `coworkerd-apiserver --config /etc/coworkerd/control.json`, with your own etcd and object storage; the programs live in `/opt/coworkerd`. Nothing else separates the channels there, so each credential in section 4 has to be configured by hand.
+
+## 4. Channels and trust
+
+| Channel | Between | Authentication |
+| --- | --- | --- |
+| Ingress, port 8930 | Clients and the platform's load balancer -> nodes | None for tenant traffic: the platform's own gateway is in front |
+| Management endpoints, `/__coworkerd/` on the ingress and peer ports | The control plane, the operations tool and operators -> nodes | The management token, except for `ready` and `probe` |
+| Peer sessions, port 8934 | Node -> node: one Cap'n Proto session per peer, opened by an HTTP CONNECT | The CONNECT is signed with the cluster key |
+| Peer HTTP, port 8934 | The control plane -> nodes, at their advertised addresses: state, logs, trial loads | The management token |
+| `/v1`, port 8940 | The platform's own systems and `cowctl` -> the control plane | The admin credential or a tenant credential |
+| etcd's HTTP gateway | Nodes, the control plane and its tool -> etcd | One etcd user per node and one for the control plane, each with its own role |
+| Object storage | Nodes (read) and the control plane (read and write) -> the store | Signed requests; nodes need only a read-only identity |
+| Unix sockets in `run/` and inherited descriptors | A node and its own workerd processes | Not reachable from outside the node |
+
+- **Each credential is in force only when configured.** The cluster key needs `peerAuth.keyFile`, the management token has to be set, and etcd's users exist once `coworkerd-apiserver tool etcd-auth` has run and each daemon has its etcd credentials file; without them the channel is open, and the node warns at startup about a missing key file or token, not about etcd. Object storage always needs credentials. Compose sets up all of them.
+- **Nothing is encrypted on these links.** etcd and object storage are reached over plain `http://`, and the control plane calls the nodes over plain HTTP.
+- **Tenant code reaches none of these channels itself.** Its outgoing requests leave through the node's egress service, which refuses the cluster's own addresses whatever a rule says -- those the node knows: its own interfaces and endpoints, the etcd and object storage endpoints, every member's advertised address and `egress.clusterAddresses`, where compose lists the control plane -- and its Binding calls go back to its node, which places them. Any other address of a cluster machine, such as another node's `frontend` address under compose, is judged like any destination: a private one is refused unless `allowInternal` opens it.
+
+[Egress and authentication](egress-and-auth.md) describes each credential.
+
+## 5. Where configuration comes from
+
+- **One configuration file format** serves both daemons, given with `--config FILE`: a JSON object decoded into `ServerConfig` of `common/schema/coworkerd.capnp`, whose field defaults are the defaults; unknown fields are refused. A node needs `nodeId`, the etcd endpoint and an object store; the control plane needs the `etcdEndpoint` shorthand, an S3 store and an admin credential, and reads its own section `control`. Every daemon validates the whole file, so a malformed `control` section stops a node too.
+- **Environment variables** override single fields, so secrets need not be written into the file: a non-empty `COWORKERD_MANAGEMENT_TOKEN`, `COWORKERD_ADMIN_CREDENTIAL`, `COWORKERD_ETCD_CREDENTIALS_FILE` or `COWORKERD_PEER_KEY_FILE` takes precedence over the file, and others set the sandbox, the process pool and the drain. The node prints its configuration after applying them, so the printed configuration is the one in effect.
+- **Credential files** are named by the configuration: the object storage identity, the etcd user and the cluster key. The etcd credentials file and the cluster key file must have no group or other permission bits; the object storage file is not checked.
+- **The image's entry point** writes the configuration file from `COWORKERD_*` variables on every start, checking each value against a pattern first, and starts the role; with `COWORKERD_CONFIG` it uses that file as it is.
+- **etcd** holds what changes at run time: tenants with their quotas and log limits, credentials, deployments and secrets. A node reads its configuration file once at startup and follows the deployment state by watching etcd.
+- **`cowctl`** reads `cowctl.json`, found in the current directory or a parent (tenant, control plane URL, ingress URL, credential file, Worker), and takes its credential only from `COWCTL_TOKEN` or the credential file, never from the command line.
+
+## 6. Boundary rules
+
+1. **One writer of the desired state.** Only the control plane's etcd identity writes tenants, credentials and deployments; a node reads the deployment state and the tenants, not the credentials, and writes only its own member key and the keys below it: its membership, its suspects and its usage. etcd's roles enforce this once authentication is on. The operations tool of the same executable writes with that identity directly, so it is not held to `/v1`'s authentication, tenant quotas or hostname ownership, which only the `/v1` handlers check.
+2. **The data plane only consumes state.** Nodes watch etcd, and no node code calls the control plane. The control plane calls nodes only to read their state and logs and for trial loads, and reads usage from etcd.
+3. **The control plane keeps no state of its own.** Every answer is read from etcd or from the nodes when asked, and its writes to etcd are transactions conditioned on what it read, most of them retried on conflict -- a tenant's deletion is the exception ([control plane API](control-plane-api.md), section 4). Nothing in it elects a leader or coordinates instances; compose runs one.
+4. **The client knows only the API.** `cowctl` and the platform's back ends use `/v1` and nothing else -- only the platform's gateway or load balancer talks to the nodes, at their ingress; `/v1` changes only by adding fields and endpoints until 1.0.
+5. **Every node is an ingress.** Any node takes any request and places it; the platform puts its own gateway or load balancer in front, and traffic splitting and edge features stay out of the core.
+
+## 7. The repository
+
+| Directory | Contents |
+| --- | --- |
+| `node/` | The node daemon: the ingress, placement and peers (`main.c++`), the process pool, the asynchronous logs, membership, the deployment-state watch, the code cache, tenants, usage, suspects, the memory watermark, egress, peer authentication and the storage check |
+| `apiserver/` | The control plane: `/v1`, tenants and credentials, the deployment tool, etcd's users and roles, the rotation tool |
+| `common/` | Shared by both: the etcd and object storage clients, the deployment state, code packages, tenancy, configuration, log cleaning and the log writer, shared helpers and the Cap'n Proto schema |
+| `launcher/` | `coworkerd-launcher` and the description of its protocol with the node |
+| `cli/` | `cowctl` and the wrangler adapter |
+| `runtime/` | The runtime bridge, and a static example workerd configuration the node does not use |
+| `patches/` | The workerd patch series with its upstream tag, and the Cap'n Proto change the build applies |
+| `docker/`, `examples/` | The image, the compose files and the example projects of the release package |
+| `scripts/` | Build, release, patch, allowlist and compatibility-flag tools, and the Linux toolchain image |
+| `docs/` | The user guide and these design documents |
+
+- **Building.** CMake (3.24 or newer) builds the static library `common` and the executables `coworkerd` and `coworkerd-apiserver`, plus two libraries from Cap'n Proto's own sources: `capnp-http-over`, which `common` links, and `kj-tls-local`, KJ's TLS layer against the system OpenSSL, which only `coworkerd` links, for egress. On Linux it also builds `coworkerd-launcher`, which `coworkerd` depends on. `scripts/build.sh` builds the two daemons, and through that dependency the launcher.
+- **Cap'n Proto** is not in the repository: CMake fetches it from GitHub at a pinned commit, which needs network access and Git, and applies `patches/kj-http-abort.diff` to it. `CMakeLists.txt` names the pin as aligned with workerd `v1.20260827.1`, not the `v1.20261012.1` the product ships.
+- **workerd** is not built here: it comes from the fork's branch, upstream's tag plus the series, and the release takes a prebuilt binary and refuses one whose SHA-256 is not the one pinned for its architecture. [patches/README.md](../patches/README.md) describes the series and how it follows upstream.
+
+## 8. The release package
+
+Each architecture (`linux/amd64`, `linux/arm64`) has a package and an image.
+
+- The package's `bin/` holds `coworkerd`, `coworkerd-apiserver`, `coworkerd-launcher`, `workerd`, the startup and steady-state system call tables of this workerd with `coworkerd-syscalls.json`, the record of how they were made, and the `cowctl` wrapper, which runs it with the `node` on `PATH`; the wrangler `cowctl` pins declares Node.js 22 or newer.
+- `lib/cowctl/` holds `cowctl` and the adapter with their dependencies; `runtime/` holds `runtime.js`; `docker/`, `examples/`, the four guide pages in `docs/`, `INSTALL.md`, `VERSION` (the `--version` output) and `SHA256SUMS` of every file complete it. The tarball is reproducible: sorted entries, the source commit's time, no owners, normalised modes.
+- The image is built from the unpacked package, compiles nothing, and holds the four executables and the two tables, without `cowctl`, which needs Node.js.
+- A release record per architecture lists the version, the source, the workerd build with its patch series, the allowlist and the hashes of the package and the image.
