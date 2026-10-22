@@ -42,7 +42,7 @@ docker compose up -d --wait
 ```
 
 On the first start, the `secrets` container (no network, exits once it has generated everything) generates all of the cluster's credentials in the data volume named `secrets`: the two object storage identities
-(the read-write identity for deployments, the read-only identity for nodes), the **management token** (used from the control plane to the nodes and between nodes), the **admin credential** (the administrator of `/v1`, used by `cowctl tenant`
+(the read-write identity for deployments, the read-only identity for nodes), the **management token** (used by the control plane, the operations tool and operators calling a node; nodes sign their own sessions with the cluster key), the **admin credential** (the administrator of `/v1`, used by `cowctl tenant`
 and `cowctl credential`), the **cluster key** nodes sign with, and the etcd users (root, one for the control plane, one per node), and puts them into each service's own
 directory on a "whoever reads it gets it" basis -- each service mounts only its own directory: nodes have only the read-only storage identity, their own etcd user, the cluster key and the management token; the control plane (and `tool`) has only the deployment identity, its etcd
 user, the management token and the admin credential; etcd's root exists only in the initialization container. The initialization container `init` then creates the bucket and checks it (the deployment identity writes, the node identity reads back, unsigned
@@ -80,7 +80,7 @@ To change ports, tokens or the project directory, copy `.env.example` to `.env` 
 ```bash
 docker compose --profile cluster up -d --wait
 for port in 18080 18081 18082; do curl -s http://127.0.0.1:$port/acme/hello-world; done
-# All three ingresses take requests; a Worker runs only on its home (the node computed from the full name tenant/Worker), the other two forward the request there
+# All three ingresses take requests; a Worker runs on its home node (computed from the full name tenant/Worker) unless the receiving node ran that version within the last 30 s; otherwise the request is forwarded
 docker compose --profile cluster down -v      # stopping needs --profile cluster too
 ```
 
@@ -323,7 +323,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `storage.bucket` / `storage.region` | `coworkerd` / `us-east-1` | The bucket and the region |
 | `storage.credentialsFile` | none: the environment variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | The node's read-only credential file `{"accessKey","secretKey"}` (the control plane uses the deployment read-write identity) |
 | `storage.cacheDirectory` / `storage.cacheMaxBytes` | `<stack directory>/cache` / 64 MiB | The local code bundle cache |
-| `stackDirectory` | `/var/lib/coworkerd` | The stack directory: `logs/`, `run/` (the Unix sockets shared with workerd), `cache/`, `processes/` |
+| `stackDirectory` | `/var/lib/coworkerd` | The stack directory: `logs/`, `run/` (the Unix sockets shared with workerd, mode 0700), `cache/`, `processes/`, and on Linux with the sandbox not `off` `sandbox/` (0700) |
 | `workerdPath` | `workerd` in the directory of `coworkerd` | The workerd executable |
 | `runtimePath` | `../runtime/runtime.js` (relative to the directory of `coworkerd`) | The runtime script |
 | `listenAddress` | `0.0.0.0:8930` | The ingress (also the management endpoints) |
@@ -352,13 +352,13 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `peerAuth.keyFile` / `peerAuth.windowMs` | none / `30000` | The cluster key file (section 12): when set, peer connections are signed and only signed ones accepted; the time window. The environment variable `COWORKERD_PEER_KEY_FILE` overrides it |
 | `etcdCredentialsFile` | none | etcd's user and password file `{"user","password"}` (mode 0600, "etcd roles, users and authentication" in section 4); the environment variable `COWORKERD_ETCD_CREDENTIALS_FILE` overrides it. The control plane reads the same field |
 | `placement.*`, `membership.*`, `desiredState.*` | see the schema | Detailed parameters of placement, membership and the deployment state; `etcdEndpoint` and `storage` are their shorthands, and when both are written they must agree. Entries in `placements` and `peers` use `nodeId`, and Workers their full name `tenant/Worker` |
-| `control.*` | see "The control plane" in section 4 | Read only by `coworkerd-apiserver`: `listenAddress`, `adminCredential`, `pathRouting`, `maxUploadBytes`, `serverTimeoutMs` |
+| `control.*` | see "The control plane" in section 4 | Used only by `coworkerd-apiserver` (`listenAddress`, `adminCredential`, `pathRouting`, `maxUploadBytes`, `serverTimeoutMs`), but every daemon validates the section: a malformed `control` section stops a node too |
 
 All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. Fields with `ForTest` are for tests only; do not set them in production.
 
 **Per-Worker limits**: the CPU and memory limits are also properties of the Worker (`limits` of `PATCH /v1/tenants/{t}/workers/{w}`, at most the tenant's
 `maxWorkerCpuMs` and `maxWorkerMemoryMiB`; when absent, the tenant's default limits, and when those are absent, the node's `cpuLimitMs` and `memoryLimitMiB`), recorded in etcd with the active version.
-**Nodes apply them per Worker**: each isolate in the same workerd process uses its own Worker's limits (each Worker's `applied` in the state endpoint is the value in effect); a Worker that declares no limits uses the node's configuration. The process-wide WebAssembly memory limit is the largest one the Workers on this node declare, and a newly started generation starts with it.
+**Nodes apply them per Worker**: each isolate in the same workerd process uses its own Worker's limits (each Worker's `applied` in the state endpoint is the value in effect); a Worker that declares no limits uses the node's configuration. The process-wide WebAssembly memory limit of a generation is the largest memory limit any Worker of the deployment declares, or the node's `memoryLimitMiB` if that is larger; a newly started generation starts with it.
 
 **Environment variable overrides** (take precedence over the configuration file): `COWORKERD_MANAGEMENT_TOKEN`, `COWORKERD_ADMIN_CREDENTIAL` (control plane), `COWORKERD_TENANT_LOG_BUFFER_BYTES`, `COWORKERD_DRAIN_TIMEOUT_MS`, `COWORKERD_LOAD_CHECK` (`0`/`1`),
 `COWORKERD_CPU_LIMIT_MS`, `COWORKERD_MEMORY_LIMIT_MIB`, `COWORKERD_QUARANTINE_PROCESSES`, `COWORKERD_IDLE_EVICT_MS`,
@@ -411,7 +411,7 @@ It writes the same deployment state as the control plane (the same write protoco
 | 8333 | Object storage, S3 | Only on the internal network |
 
 compose has two networks: `backend` (internal, without a gateway: etcd, object storage, the nodes' peer listeners, the control plane, the initialization and tool containers; the host cannot reach it) and
-`frontend` (only the nodes, to publish the ingress ports). All containers run as a non-root user (uid 10001).
+`frontend` (the nodes and the control plane: their published ports, and the nodes' egress). All containers run as a non-root user (uid 10001).
 
 On bare metal: the ingress is for users and the front load balancer; the control plane only for the platform's own systems and `cowctl`; the peer port only between nodes; etcd and object storage not exposed.
 Each of these channels has credentials: peer connections are signed with the cluster key (section 12), etcd has authentication on with one user per node ("etcd roles, users and authentication" in section 4),
@@ -458,9 +458,9 @@ Changing the token: edit `.env` (or the environment file), then restart the node
 | Symptom | Cause and remedy |
 | --- | --- |
 | `up --wait` reports `init` failed | `docker compose logs init`: object storage did not pass the self-check within two minutes (full disk, port conflict); `down -v` and start again |
-| The control plane refuses to start with `set control.adminCredential or COWORKERD_ADMIN_CREDENTIAL` | No admin credential: compose's `init` generates it; on bare metal see "The control plane" in section 4 |
+| The control plane refuses to start with `set control.adminCredential or COWORKERD_ADMIN_CREDENTIAL` | No admin credential: compose's `secrets` step generates it; on bare metal see "The control plane" in section 4 |
 | `init` reports `etcd did not take its users and roles` | `docker compose logs init` has the output of `tool etcd-auth` and etcd's answers; when etcd already has authentication on and root's password file is not the one used when it was turned on (the `secrets` volume was replaced), it cannot log in |
-| `cowctl` reports `UNAUTHORIZED` / `FORBIDDEN` | The credential is wrong, revoked or expired / its scope is not enough (a tenant credential acts only on its own tenant; `tenant`, `credential create` and `node` need the admin credential), see [error codes](errors.md) |
+| `cowctl` reports `UNAUTHORIZED` / `FORBIDDEN` | The credential is wrong, revoked or expired / its scope is not enough (a tenant credential acts only on its own tenant; `tenant` (except reading its own record), `credential create` and `node` need the admin credential), see [error codes](errors.md) |
 | The node restarts over and over, logging `deployment state is empty` | No deployment state in etcd: compose's init writes it; on bare metal see the end of section 4 |
 | The internal tool reports `HTTP 401: the Server requires the management token` | The internal tool has no token: set `COWORKERD_MANAGEMENT_TOKEN` (compose's `tool` reads the one `secrets` generated by itself) |
 | Deployment reports `trial load ... failed` | The new version cannot be loaded; the reason is in the error (cleaned: no secret values or paths); the pointer was not switched |
@@ -480,7 +480,7 @@ Changing the token: edit `.env` (or the environment file), then restart the node
 
 ## 11. Egress: tenant code reaching the network
 
-Tenant code's `fetch()` does not connect to the network from workerd itself -- the workerd processes still have no network interfaces ("Sandbox" in section 4) -- but goes to **the egress service of the node it runs on**
+Tenant code's `fetch()` does not connect to the network from workerd itself -- with the sandbox active the workerd processes have no network interfaces ("Sandbox" in section 4), and without it they reach the network only through this egress configuration -- but goes to **the egress service of the node it runs on**
 (`<stack directory>/run/egress.sock`): the node checks the destination against the policy, resolves names itself, opens the connection itself (it also does the TLS of HTTPS, verified against the system's root certificates),
 counts the bytes, and hands the answer back. When refused or unable to connect, `fetch` throws `EGRESS_DENIED: <rule>` or `EGRESS_FAILED: <category>` (section 4 of the [error codes](errors.md)).
 Request and response headers are forwarded as they are (the node adds no identifying headers for the tenant); redirects are followed by `fetch` and each hop is checked again; HTTP, HTTPS and WebSocket are supported.
