@@ -45,7 +45,7 @@ Boundaries to know about:
 
 ## Trying it
 
-With Docker Engine 28 or newer, Docker Compose v2 and Node.js 20 or newer, a cluster, a tenant and a first deployed
+With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22 or newer, a cluster, a tenant and a first deployed
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
