@@ -57,10 +57,10 @@ Common operations:
 | Show the admin credential | `docker compose run --rm tool admin-credential` (for `cowctl`'s administrator subcommands: `COWCTL_TOKEN=$(...) cowctl tenant list`) |
 | Show the management token | `docker compose run --rm tool token` |
 | Show the nodes' state | `COWCTL_TOKEN=<admin credential> cowctl node list`; or read a node directly: `curl -H "Authorization: Bearer $(docker compose run --rm tool token)" http://127.0.0.1:18080/__coworkerd/state` |
-| Show logs | One Worker's: `cowctl logs` (see section 4 of the quickstart); the node's own: `docker compose logs -f node-1`; all of workerd's output is in `logs/workerd.log` of the node's data volume (tenant lines are JSON lines `[tenant-log] <nonce> {"workerId","versionId","level","message"}`, `workerId` is the full name `tenant/Worker`; tools that read the file directly take its `message`), rotated at 256 MiB x 4 |
+| Show logs | One Worker's: `cowctl logs` (see section 4 of the quickstart); the node's own: `docker compose logs -f node-1`; all of workerd's output is in `logs/workerd.log` of the node's data volume (tenant `console.*` output appears there as plain lines without attribution; the lines `cowctl logs` shows reach the node separately over workerd's per-Worker tail channel, attributed to the Worker that wrote them), rotated at 256 MiB x 4 |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.3.0 version` |
+| Show the version | `docker run --rm coworkerd:0.3.1 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
