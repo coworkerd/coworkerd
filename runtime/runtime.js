@@ -3,30 +3,20 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BRIDGE_MODULE = "__coworkerd_entrypoint__.js";
 const TENANT_MODULE = "__coworkerd_tenant__.js";
-// Tenant logs: this process's nonce, written once on standard output before any tenant code runs
-// ("[runtime-log-nonce] {...}", at the start of the first call this runtime receives); the prelude module, evaluated
-// before a version's own modules, turns each console.debug/info/log/warn/error call of the tenant into
-// one line "[tenant-log] <nonce> {"workerId","versionId","level","message"}". The Server attributes a
-// line to a Worker only when it carries its process's nonce, which no tenant can read (it lives in
-// module scope, never in a value or a function's text), and the message is JSON: no tenant output can
-// pass for another Worker's line or break out of its own.
+// Tenant logs: workerd keeps each console.debug/info/log/warn/error call of a tenant isolate, made while one of
+// its invocations runs (its waitUntil work included), in that invocation's trace -- native code, out of the tenant's
+// reach -- and hands the trace, once the invocation is over, to the isolate's tail: the TenantLog entrypoint below,
+// bound to the Worker's identity when the loader loads it (the props come from this runtime, never from the tenant).
+// TenantLog sends the lines to the node over SOURCE (<stack>/run/source.sock, in this isolate's env only), and the node
+// keeps them as that Worker's. What a tenant writes in its lines, or anywhere on standard output, counts only as its own:
+// no value a tenant could read or forge decides whose line it is. The prelude module, evaluated before a version's own
+// modules, formats each call's arguments into one line first; output of a module's top level (outside any invocation)
+// stays in the process's own log.
 const PRELUDE_MODULE = "__coworkerd_console__.js";
-// Chosen in the first call (workerd generates no random values in global scope), before anything else.
-let LOG_NONCE = null;
-function announceNonce(env) {
-  if (LOG_NONCE !== null) return;
-  LOG_NONCE = hex(crypto.getRandomValues(new Uint8Array(16)));
-  console.log("[runtime-log-nonce] " + JSON.stringify({ processId: env.PROCESS_ID,
-    processGeneration: Number(env.PROCESS_GENERATION), nonce: LOG_NONCE }));
-}
-// The prelude of one version: its identity is fixed per isolate (a loader key is one version).
-// Arguments are formatted as console.log formats them in Node (format specifiers, then the rest,
-// objects shown to depth 2); the original console.log stays available to the bridge only.
-function preludeSource(descriptor) {
-  const head = "[tenant-log] " + LOG_NONCE + " {\"workerId\":" + JSON.stringify(descriptor.workerId) +
-    ",\"versionId\":" + JSON.stringify(descriptor.versionId) + ",\"level\":";
-  return `const HEAD = ${JSON.stringify(head)};
-const original = { debug: console.debug, info: console.info, log: console.log, warn: console.warn, error: console.error };
+// The prelude of one version. Arguments are formatted as console.log formats them in Node (format specifiers, then
+// the rest, objects shown to depth 2); the original console.log stays available to the bridge only.
+function preludeSource() {
+  return `const original = { debug: console.debug, info: console.info, log: console.log, warn: console.warn, error: console.error };
 function show(value, depth) {
   switch (typeof value) {
     case "string": return depth ? JSON.stringify(value) : value;
@@ -79,23 +69,54 @@ for (const level of ["debug", "info", "log", "warn", "error"]) {
   console[level] = function (...args) {
     let message;
     try { message = format(args); } catch { message = "[unformattable]"; }
-    write.call(console, HEAD + JSON.stringify(level) + ',"message":' + JSON.stringify(message) + "}");
+    write.call(console, message);
   };
 }
 export const __coworkerdLog = original.log.bind(console);
 `;
 }
+// The bridge's own line of every call it hands to the tenant ([tenant-entry], below): the process's evidence, not
+// one of the tenant's lines.
+const ENTRY_LINE = "[tenant-entry] ";
+const LOG_LEVELS = new Set(["debug", "info", "log", "warn", "error"]);
+export class TenantLog extends WorkerEntrypoint {
+  async tail(events) {
+    const lines = [];
+    for (const event of Array.isArray(events) ? events : []) {
+      for (const log of Array.isArray(event?.logs) ? event.logs : []) {
+        const parts = Array.isArray(log?.message) ? log.message : [log?.message];
+        if (parts.length === 1 && typeof parts[0] === "string" && parts[0].startsWith(ENTRY_LINE)) continue;
+        const message = parts.length === 1 && typeof parts[0] === "string" ? parts[0]
+          : parts.map(part => typeof part === "string" ? part : JSON.stringify(part) ?? String(part)).join(" ");
+        lines.push({ level: LOG_LEVELS.has(log?.level) ? log.level : "log", message });
+      }
+    }
+    if (!lines.length) return;
+    const url = new URL("http://coworkerd-source/v1/log");
+    url.searchParams.set("processId", this.env.PROCESS_ID);
+    url.searchParams.set("processGeneration", this.env.PROCESS_GENERATION);
+    const response = await this.env.SOURCE.fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workerId: this.ctx.props.workerId, versionId: this.ctx.props.versionId, lines }) });
+    await response.body?.cancel();
+  }
+}
+// The tail of a version's isolate: TenantLog with the version's identity.
+function tenantLogTail(descriptor, ctx) {
+  return ctx?.exports?.TenantLog ? [ctx.exports.TenantLog({ props: { workerId: descriptor.workerId, versionId: descriptor.versionId } })] : [];
+}
 // Outbound requests: a tenant Worker's global outbound is the Egress entrypoint below, bound to that Worker's
 // identity when the loader loads it (the props come from this runtime, never from the tenant). It hands the request
 // to the node's egress service (EGRESS, <stack>/run/egress.sock, the proxy form) with that identity and this process's
-// egress token -- in this isolate's env only, which no tenant isolate can reach, as the log nonce is in this module
-// only -- and the node checks, resolves, connects, meters and answers. A refusal comes back as a header and is thrown
-// to the tenant as an Error: "EGRESS_DENIED: <rule>" or "EGRESS_FAILED: <class>". Redirects are the tenant's fetch's
-// to follow: each hop comes back here and is checked again. Without EGRESS (egress.mode off) a tenant has no network.
+// egress token -- in this isolate's env only, which no tenant isolate can reach -- and the node checks, resolves,
+// connects, meters and answers. A refusal comes back as a header and is thrown to the tenant as an Error:
+// "EGRESS_DENIED: <rule>" or "EGRESS_FAILED: <class>". Redirects are the tenant's fetch's to follow: each hop comes back
+// here and is checked again. Without EGRESS (egress.mode off) the same entrypoint refuses every request
+// ("EGRESS_DENIED: egress-off"): a tenant isolate always has an outbound that answers, never workerd's null one.
 const EGRESS_SOURCE_HEADER = "x-coworkerd-egress-source";
 const EGRESS_ERROR_HEADER = "x-coworkerd-egress-error";
 export class Egress extends WorkerEntrypoint {
   async fetch(request) {
+    if (!this.env.EGRESS) throw new Error("EGRESS_DENIED: egress-off");
     const headers = new Headers(request.headers);
     headers.set(EGRESS_SOURCE_HEADER, this.env.EGRESS_TOKEN + " " + JSON.stringify(this.ctx.props));
     const response = await this.env.EGRESS.fetch(request.url, {
@@ -107,9 +128,9 @@ export class Egress extends WorkerEntrypoint {
   }
 }
 // The global outbound of a version's isolate: its identity as the Egress entrypoint's props (the Worker's full name,
-// <tenant>/<worker>: the node takes the tenant from it), or no network.
-function egressOutbound(descriptor, env, ctx) {
-  if (!env.EGRESS || !ctx?.exports?.Egress) return null;
+// <tenant>/<worker>: the node takes the tenant from it), whether or not this process has EGRESS.
+function egressOutbound(descriptor, ctx) {
+  if (!ctx?.exports?.Egress) return null;
   return ctx.exports.Egress({ props: { workerId: descriptor.workerId, versionId: descriptor.versionId } });
 }
 
@@ -379,8 +400,8 @@ export default { fetch(request, variables, ctx) {
 }};`;
     return { compatibilityDate: descriptor.compatibilityDate,
       compatibilityFlags: [...new Set([...descriptor.compatibilityFlags, "enable_request_signal"])],
-      mainModule: BRIDGE_MODULE, modules: { ...source, [BRIDGE_MODULE]: bridge, [PRELUDE_MODULE]: preludeSource(descriptor) },
-      env: variables, globalOutbound: egressOutbound(descriptor, env, ctx) };
+      mainModule: BRIDGE_MODULE, modules: { ...source, [BRIDGE_MODULE]: bridge, [PRELUDE_MODULE]: preludeSource() },
+      env: variables, globalOutbound: egressOutbound(descriptor, ctx), tails: tenantLogTail(descriptor, ctx) };
   }
   return {
     compatibilityDate: descriptor.compatibilityDate,
@@ -389,10 +410,11 @@ export default { fetch(request, variables, ctx) {
     modules: {
       [BRIDGE_MODULE]: BRIDGE_SOURCE,
       [TENANT_MODULE]: source,
-      [PRELUDE_MODULE]: preludeSource(descriptor),
+      [PRELUDE_MODULE]: preludeSource(),
     },
     env: {},
-    globalOutbound: egressOutbound(descriptor, env, ctx),
+    globalOutbound: egressOutbound(descriptor, ctx),
+    tails: tenantLogTail(descriptor, ctx),
   };
 }
 
@@ -516,7 +538,6 @@ async function trialLoad(descriptor, env, ctx) {
 
 export default {
   async fetch(request, env, ctx) {
-    announceNonce(env);
     if (new URL(request.url).pathname === "/__coworkerd/probe" && request.cf?.invocationId === undefined) {
       return new Response(`${env.PROCESS_ID}:${env.PROCESS_GENERATION}`);
     }

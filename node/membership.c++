@@ -499,14 +499,29 @@ private:
     return {id, address, epoch, static_cast<uint64_t>(timestamp.getNumber()), memberState};
   }
 
+  // A value that cannot be read is skipped -- its key is no member while it stays so -- and logged once; it never
+  // stops the other members from being applied, nor this node from starting.
   kj::Promise<void> applyMembers(const EtcdBatch& batch) {
     auto next = batch.full ? std::map<std::string, Member>() : state.members;
+    auto invalid = batch.full ? std::set<std::string>() : state.invalidMembers;
     for (const auto& change : batch.changes) {
       if (!memberKey(change.key)) continue;
-      if (!change.kv) { next.erase(change.key.substr(std::string_view(PREFIX).size())); continue; }
-      auto member = decodeMember(*change.kv);
-      next[member.id] = std::move(member);
+      const auto id = change.key.substr(std::string_view(PREFIX).size());
+      if (!change.kv) { next.erase(id); invalid.erase(change.key); continue; }
+      try {
+        auto member = decodeMember(*change.kv);
+        invalid.erase(change.key);
+        next[member.id] = std::move(member);
+      } catch (const kj::Exception& error) {
+        next.erase(id);
+        ++state.skippedMemberValues;
+        if (invalid.insert(change.key).second)
+          std::cout << "[membership] {\"event\":\"invalid-member\",\"nodeId\":" << quote(serverId) << ",\"key\":" << quote(change.key)
+                    << ",\"modRevision\":\"" << change.kv->modRevision << "\",\"reason\":" << quote(error.getDescription().cStr())
+                    << ",\"revision\":\"" << batch.revision << "\"}" << std::endl;
+      }
     }
+    state.invalidMembers = std::move(invalid);
     logMemberChanges(serverId, state.members, next, batch.revision, state);
     state.members.swap(next);
     return kj::READY_NOW;
@@ -537,7 +552,8 @@ std::string MembershipView::json() const {
          << ",\"draining\":" << (draining ? "true" : "false") << ",\"drainAnnounce\":" << quote(drainAnnounce)
          << ",\"drainAnnouncedAtUnixMs\":" << drainAnnouncedAtUnixMs << ",\"drainAnnounceAttempts\":" << drainAnnounceAttempts
          << ",\"revokeStatus\":" << quote(revokeStatus) << ",\"revokedAtUnixMs\":" << revokedAtUnixMs
-         << ",\"memberChanges\":" << memberChanges
+         << ",\"memberChanges\":" << memberChanges << ",\"invalidMembers\":" << invalidMembers.size()
+         << ",\"skippedMemberValues\":" << skippedMemberValues
          << ",\"heldEpochs\":[";
   size_t heldCount = 0;
   for (const auto& held : heldEpochs) {

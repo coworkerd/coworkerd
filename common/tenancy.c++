@@ -90,7 +90,9 @@ WorkerLimits readWorkerLimits(Json::Reader object) {
     KJ_REQUIRE(name == "cpuMs" || name == "memoryMiB", "unknown limit", name.c_str());
     if (entry.getValue().isNull()) continue;
     const auto value = number(object, name.c_str());
-    KJ_REQUIRE(value > 0 && value <= 4294967295ull, "a limit is a positive integer", name.c_str());
+    if (value == 0 || value > 4294967295ull)
+      KJ_FAIL_REQUIRE((name + " must be a positive whole number (" + (name == "cpuMs" ? "milliseconds" : "MiB") +
+          "); 0 is refused -- leave the field out to name no limit").c_str());
     (name == "cpuMs" ? limits.cpuMs : limits.memoryMiB) = static_cast<uint32_t>(value);
   }
   return limits;

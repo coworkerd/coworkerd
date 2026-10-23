@@ -55,6 +55,10 @@ struct MembershipView {
   uint64_t revokedAtUnixMs = 0;
   uint64_t memberChanges = 0;
   std::map<std::string, Member> members;
+  // Member keys whose value cannot be read (skipped: the other members are applied as usual), and how many
+  // such values were skipped since this process started.
+  std::set<std::string> invalidMembers;
+  uint64_t skippedMemberValues = 0;
 
   std::string json() const;
 };

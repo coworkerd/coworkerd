@@ -267,6 +267,26 @@ secrets() {
     mv "$SECRETS/storage/s3.json.next" "$SECRETS/storage/s3.json"
     printf '[secrets] {"event":"storage-credentials","written":true}\n'
   fi
+  # SeaweedFS's S3 gateway also serves a gRPC configuration interface of its own beside S3, on the same addresses and
+  # without credentials. security.toml (read by the storage container) makes it require a client certificate of a
+  # certificate authority whose key is not kept, so that nobody can use it; the master, volume and filer servers listen
+  # on the storage container's loopback only (docker-compose.yml).
+  if [[ ! -s $SECRETS/storage/security.toml ]]; then
+    local tls
+    tls=$(mktemp -d)
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 36500 -subj /CN=coworkerd-storage-grpc \
+      -keyout "$tls/ca.key" -out "$SECRETS/storage/grpc-ca.crt" 2>/dev/null
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=localhost \
+      -keyout "$SECRETS/storage/grpc-s3.key" -out "$tls/s3.csr" 2>/dev/null
+    openssl x509 -req -in "$tls/s3.csr" -CA "$SECRETS/storage/grpc-ca.crt" -CAkey "$tls/ca.key" -set_serial 1 -days 36500 \
+      -out "$SECRETS/storage/grpc-s3.crt" 2>/dev/null
+    rm -rf "$tls"
+    chmod 0600 "$SECRETS/storage/grpc-s3.key"
+    printf '[grpc]\nca = "/config/grpc-ca.crt"\n\n[grpc.s3]\ncert = "/config/grpc-s3.crt"\nkey = "/config/grpc-s3.key"\n' \
+      >"$SECRETS/storage/security.toml.next"
+    mv "$SECRETS/storage/security.toml.next" "$SECRETS/storage/security.toml"
+    printf '[secrets] {"event":"storage-grpc","written":true}\n'
+  fi
   if [[ -z ${COWORKERD_MANAGEMENT_TOKEN:-} && ! -s $SECRETS/init/management-token ]]; then
     random 32 >"$SECRETS/init/management-token.next"
     mv "$SECRETS/init/management-token.next" "$SECRETS/init/management-token"

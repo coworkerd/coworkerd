@@ -107,6 +107,11 @@ std::string definitionJson(const VersionDefinition& version);
 // when not empty.
 std::string versionStatusJson(const VersionDefinition& version, const std::string& extra = {});
 std::string routesJson(const std::vector<RouteDefinition>& routes);
+// A request's host as routes and tenants' hostnames are compared with it: lower case, without a final dot.
+std::string requestHost(const std::string& host);
+// A tenant's route under the default host * as the control plane writes it: /<tenant> becomes /<tenant>/, so that
+// the prefix stays within the tenant's path space; any other prefix is kept as it is.
+std::string defaultHostPrefix(const std::string& tenant, const std::string& pathPrefix);
 void validateDefinition(const VersionDefinition& version);
 VersionPin versionPin(const VersionDefinition& version);
 // A manifest names Workers by their names in one tenant: each Worker, Binding target and route is read as
@@ -236,7 +241,12 @@ public:
 
   uint64_t revision() const { return revisionValue; }
   uint64_t generation() const { return generationValue; }
-  Selection route(const std::string& host, const std::string& path) const;
+  // The route of a request: the longest prefix that covers the path at a segment boundary (/acme covers /acme and
+  // /acme/..., never /acme-corp/...), at each length the request's host before the default host *. `owner` is the
+  // tenant the host is registered to, when it is one's: then only that tenant's routes count -- its routes on the
+  // host, then its routes under * -- and another tenant's route never serves the host. A route without a readable
+  // owner counts for every host (it answers ROUTE_INVALID). The host is compared as requestHost() gives it.
+  Selection route(const std::string& host, const std::string& path, const std::string* owner = nullptr) const;
   const Worker* worker(const std::string& id) const;
   bool valid(const std::string& id) const;
   const std::map<std::string, Worker>& workers() const { return workerMap; }

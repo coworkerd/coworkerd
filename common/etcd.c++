@@ -197,52 +197,65 @@ kj::Promise<std::string> EtcdClient::token(bool renew) {
   const auto* credentials = etcdCredentials();
   if (credentials == nullptr) co_return std::string();
   auto& state = authState();
-  // A renewal reads the file again when it changed (a password rotation: the file first, then etcd), keeping the
-  // identity it had when the new file cannot be read.
-  if (renew && signatureOf(credentials->file) != state.fileSignature) {
-    try {
-      auto next = readEtcdCredentials(credentials->file);
-      next.origin = credentials->origin;
-      state.fileSignature = signatureOf(credentials->file);
-      state.credentials = std::move(next);
-      credentials = &*state.credentials;
-      ++state.rereads;
-    } catch (const kj::Exception& error) {
-      state.lastError = std::string("cannot read the credentials file again: ") + error.getDescription().cStr();
-    }
-  }
   if (!renew) {
     auto found = state.tokens.find(endpoint);
     if (found != state.tokens.end()) co_return found->second;
   }
-  // The password goes only into this request's body; no error or log line carries it.
-  const auto payload = "{\"name\":" + quote(credentials->user) + ",\"password\":" + quote(credentials->password) + "}";
-  auto client = newClient();
-  kj::HttpHeaders requestHeaders(headers);
-  requestHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-  requestHeaders.setPtr(kj::HttpHeaderId::CONNECTION, "close");
-  auto call = client->request(kj::HttpMethod::POST, (endpoint + "/v3/auth/authenticate").c_str(), requestHeaders, payload.size());
-  co_await call.body->write(kj::arrayPtr(payload.data(), payload.size()).asBytes());
-  call.body = nullptr;
-  auto response = co_await call.response;
-  std::string body = (co_await response.body->readAllText(64 * 1024)).cStr();
-  std::string token;
-  if (response.statusCode == 200) {
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), json);
-    auto value = field(json, "token");
-    if (value.isString()) token = value.getString().cStr();
-  }
-  if (token.empty()) {
+  // The file again, when it changed (or, with `always`, whatever its signature says) -- a password rotation writes
+  // the file first, then etcd -- keeping the identity it had when the new file cannot be read. True when the user or
+  // the password changed.
+  auto reload = [&](bool always) {
+    const auto signature = signatureOf(credentials->file);
+    if (!always && signature == state.fileSignature) return false;
+    try {
+      auto next = readEtcdCredentials(credentials->file);
+      next.origin = credentials->origin;
+      state.fileSignature = signature;
+      const bool changed = next.user != credentials->user || next.password != credentials->password;
+      state.credentials = std::move(next);
+      credentials = &*state.credentials;
+      ++state.rereads;
+      return changed;
+    } catch (const kj::Exception& error) {
+      state.lastError = std::string("cannot read the credentials file again: ") + error.getDescription().cStr();
+      return false;
+    }
+  };
+  // Every authentication -- a renewal after a refused token, or the first one after a watch dropped its token --
+  // starts from the file as it is now, and one that fails reads the file again: the password in memory may be one
+  // etcd no longer takes.
+  reload(false);
+  for (bool reread = false;; reread = true) {
+    // The password goes only into this request's body; no error or log line carries it.
+    const auto payload = "{\"name\":" + quote(credentials->user) + ",\"password\":" + quote(credentials->password) + "}";
+    auto client = newClient();
+    kj::HttpHeaders requestHeaders(headers);
+    requestHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+    requestHeaders.setPtr(kj::HttpHeaderId::CONNECTION, "close");
+    auto call = client->request(kj::HttpMethod::POST, (endpoint + "/v3/auth/authenticate").c_str(), requestHeaders, payload.size());
+    co_await call.body->write(kj::arrayPtr(payload.data(), payload.size()).asBytes());
+    call.body = nullptr;
+    auto response = co_await call.response;
+    std::string body = (co_await response.body->readAllText(64 * 1024)).cStr();
+    std::string token;
+    if (response.statusCode == 200) {
+      capnp::MallocMessageBuilder message;
+      auto json = message.initRoot<Json>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), json);
+      auto value = field(json, "token");
+      if (value.isString()) token = value.getString().cStr();
+    }
+    if (!token.empty()) {
+      ++(renew || reread ? state.renewals : state.authentications);
+      state.tokens[endpoint] = token;
+      co_return token;
+    }
     ++state.failures;
     state.lastError = "authentication as " + credentials->user + " failed: HTTP " + std::to_string(response.statusCode) +
         " " + body.substr(0, 300);
-    KJ_FAIL_REQUIRE("etcd authentication failed", endpoint.c_str(), credentials->user.c_str(), response.statusCode, body.substr(0, 300).c_str());
+    if (reread || !reload(true))
+      KJ_FAIL_REQUIRE("etcd authentication failed", endpoint.c_str(), credentials->user.c_str(), response.statusCode, body.substr(0, 300).c_str());
   }
-  ++(renew ? state.renewals : state.authentications);
-  state.tokens[endpoint] = token;
-  co_return token;
 }
 
 EtcdClient::EtcdClient(std::string endpoint, uint32_t timeoutMs, kj::Network& network,
@@ -347,6 +360,10 @@ kj::Promise<kj::HttpClient::Response> EtcdClient::openWatch(const std::string& p
       call.body->write(kj::arrayPtr(payload.data(), payload.size()).asBytes()));
   call.body = nullptr;
   auto response = co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, kj::mv(call.response));
+  if (response.statusCode == 401 && !authorization.empty()) {
+    ++authState().refusedTokens;
+    authState().tokens.erase(endpoint);
+  }
   KJ_REQUIRE(response.statusCode == 200, "etcd HTTP watch failed", response.statusCode);
   co_return response;
 }
@@ -387,14 +404,15 @@ kj::Promise<EtcdWatcher::WatchEnd> EtcdWatcher::consume(kj::AsyncInputStream& bo
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<Json>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(frame.data(), frame.size()), json);
+    // A watch created with a token etcd no longer accepts (canceled, or the gateway's error): the next attempt
+    // authenticates again, reading the credentials file again (EtcdClient::token).
+    if (tokenRefused(0, frame) && etcdCredentials() != nullptr) {
+      ++authState().refusedTokens;
+      authState().tokens.erase(client.endpoint);
+    }
     KJ_REQUIRE(field(json, "error").isNull(), "etcd watch gateway error", frame.c_str());
     auto result = field(json, "result");
     if (boolean(result, "canceled")) {
-      // A watch created with a token etcd no longer accepts: the next attempt authenticates again.
-      if (tokenRefused(0, frame) && etcdCredentials() != nullptr) {
-        ++authState().refusedTokens;
-        authState().tokens.erase(client.endpoint);
-      }
       auto compacted = integer(result, "compact_revision");
       KJ_REQUIRE(compacted > 0, "etcd canceled watch", frame.c_str());
       ++status.compactions;

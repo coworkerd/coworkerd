@@ -76,6 +76,25 @@ struct Transaction {
     compares.push_back("{\"target\":\"MOD\",\"result\":\"LESS\",\"key\":" + quote(base64(absolute(prefix))) +
         ",\"range_end\":" + quote(base64(end)) + ",\"mod_revision\":\"" + std::to_string(revision + 1) + "\"}");
   }
+  // The key holds exactly these bytes (a version's definition: there, and the one the pointer names).
+  void holds(const std::string& key, const std::string& bytes) {
+    compares.push_back("{\"target\":\"VALUE\",\"result\":\"EQUAL\",\"key\":" + quote(base64(absolute(key))) +
+        ",\"value\":" + quote(base64(bytes)) + "}");
+  }
+  // The tenant's record (tenants/<tenant>, beside the deployment prefix) is as the write read it.
+  void tenantAsRead(const std::string& tenant, const std::optional<EtcdKv>& record) {
+    const auto key = quote(base64(std::string(TENANTS_PREFIX) + tenant));
+    if (record) compares.push_back("{\"target\":\"MOD\",\"result\":\"EQUAL\",\"key\":" + key + ",\"mod_revision\":\"" +
+        std::to_string(record->modRevision) + "\"}");
+    else compares.push_back("{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + key + ",\"version\":\"0\"}");
+  }
+  // Every key below the prefix, whatever it holds when the transaction commits.
+  void removeBelow(const std::string& prefix) {
+    auto end = absolute(prefix);
+    ++end.back();
+    operations.push_back("{\"request_delete_range\":{\"key\":" + quote(base64(absolute(prefix))) + ",\"range_end\":" +
+        quote(base64(end)) + "}}");
+  }
   size_t size() const { return std::max(compares.size(), operations.size()); }
   std::string json() const {
     std::string out = "{\"compare\":[";
@@ -129,6 +148,35 @@ kj::Promise<EtcdSnapshot> tenantSnapshot(EtcdClient& client, const std::string& 
   co_return raw;
 }
 
+// The tenant's record as one write read it, at the revision of its snapshot. Every write compares it
+// (Transaction::tenantAsRead), so that a write that found the tenant active cannot commit once a deletion has marked it,
+// or after its record is gone (control-plane-api.md section 4).
+struct TenantGuard {
+  std::optional<EtcdKv> record;
+  std::string status;  // "" without a record; "unreadable" when it does not decode
+};
+kj::Promise<TenantGuard> tenantGuard(EtcdClient& client, const std::string& tenant, uint64_t revision) {
+  const auto key = std::string(TENANTS_PREFIX) + tenant;
+  auto raw = co_await client.range(key, revision);
+  TenantGuard guard;
+  // A prefix read: the key itself only (a tenant "acme" must not see "acme-corp").
+  if (auto found = raw.values.find(key); found != raw.values.end()) {
+    guard.record = found->second;
+    try { guard.status = decodeTenantRecord(found->second.value).status; } catch (const kj::Exception&) { guard.status = "unreadable"; }
+  }
+  co_return guard;
+}
+// The control plane writes below a tenant only while its record says active; the operations tool also below a tenant
+// without a record (its default tenant has none), never below one being deleted.
+void requireWritable(const std::string& tenant, const TenantGuard& guard, bool controlPlane) {
+  if (!guard.record) {
+    if (controlPlane) refuse("there is no tenant " + tenant);
+    return;
+  }
+  if (guard.status == "unreadable") refuse("the record of tenant " + tenant + " cannot be read; nothing written");
+  if (guard.status != "active") refuse("tenant " + tenant + " is being deleted; nothing written");
+}
+
 enum class Operation { APPLY, UPSERT, REMOVE };
 
 struct ToolOptions {
@@ -149,8 +197,11 @@ struct ToolOptions {
   // The Servers' management token, sent with every trial load: --token, else
   // COWORKERD_MANAGEMENT_TOKEN.
   std::string token;
-  // The control plane. An upload publishes the manifest's version (objects and definition)
-  // and moves no pointer; an activation moves a Worker's pointer to a version published before.
+  // The control plane (controlOptions): its writes need the tenant's record (active), a route under the default host
+  // * is written as defaultHostPrefix gives it, and the flip of a Worker's pointer also compares the definition it
+  // names. An upload publishes the manifest's version (objects and definition) and moves no pointer; an activation
+  // moves a Worker's pointer to a version published before.
+  bool controlPlane = false;
   bool publishOnly = false;
   // An activating upload whose manifest lists no routes keeps the Worker's current ones.
   bool keepRoutes = false;
@@ -419,8 +470,9 @@ std::vector<DeploymentInput> stages(const DeploymentInput& desired, uint32_t lim
   for (const auto& [id, pin] : desired.active) if (!index.contains(id)) connect(id);
   std::vector<DeploymentInput> result;
   DeploymentInput current;
-  size_t writes = 1, compares = 0;  // the generation write of the last step
-  auto flush = [&] { if (!current.active.empty()) result.push_back(std::move(current)); current = {}; writes = 1; compares = 0; };
+  // The generation write of the last step; the comparison of the tenant's record in every step.
+  size_t writes = 1, compares = 1;
+  auto flush = [&] { if (!current.active.empty()) result.push_back(std::move(current)); current = {}; writes = 1; compares = 1; };
   for (const auto& unit : units) {
     size_t unitWrites = 0, unitCompares = 0;
     for (const auto& id : unit) {
@@ -429,7 +481,7 @@ std::vector<DeploymentInput> stages(const DeploymentInput& desired, uint32_t lim
       unitWrites += 1 + routes[id] + bindings;
       unitCompares += 1 + routes[id] + bindings + version.secrets.size();
     }
-    if (std::max(unitWrites + 1, unitCompares) > limit)
+    if (std::max(unitWrites + 1, unitCompares + 1) > limit)
       refuse("a Binding cycle of " + std::to_string(unit.size()) + " Workers does not fit one etcd transaction");
     if (std::max(writes + unitWrites, compares + unitCompares) > limit) flush();
     for (const auto& id : unit) {
@@ -474,23 +526,43 @@ kj::Promise<void> publishObjects(ObjectStore& storage, const DeploymentInput& de
   if (!code.assetObjects.empty()) report << ",\"uploadedAssets\":" << uploadedAssets << ",\"skippedAssets\":" << skippedAssets;
 }
 
-// The definition keys of a change: each created only where none is (an existing one must hold the same bytes).
-kj::Promise<void> publishDefinitions(EtcdClient& client, const Plan& planned, std::ostream& report, uint64_t& revision) {
+// The definition keys of a change: each created only where none is (an existing one must hold the same bytes), and only
+// while the tenant's record is as read, so that no definition lands below a tenant whose deletion has begun. A record
+// that changed otherwise (new quotas, say) is read again and the definition published under it.
+kj::Promise<void> publishDefinitions(EtcdClient& client, const Plan& planned, std::ostream& report, uint64_t& revision,
+    const std::string& tenant, TenantGuard& guard, bool controlPlane) {
+  const auto tenantKey = std::string(TENANTS_PREFIX) + tenant;
   for (const auto& definition : planned.definitions) {
     const auto key = absolute(definition.key);
     const auto& bytes = *definition.value;
-    auto response = co_await client.request("/v3/kv/txn",
-        "{\"compare\":[{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(base64(key)) +
-        ",\"version\":\"0\"}],\"success\":[{\"request_put\":{\"key\":" + quote(base64(key)) + ",\"value\":" +
-        quote(base64(bytes)) + "}}],\"failure\":[{\"request_range\":{\"key\":" + quote(base64(key)) + "}}]}");
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    revision = std::max(revision, integer(field(json, "header"), "revision"));
-    if (!boolean(json, "succeeded")) {
-      auto kvs = field(field(field(json, "responses").getArray()[0], "response_range"), "kvs");
+    for (uint32_t attempt = 0;; ++attempt) {
+      Transaction record;
+      record.tenantAsRead(tenant, guard.record);
+      auto response = co_await client.request("/v3/kv/txn",
+          "{\"compare\":[{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(base64(key)) +
+          ",\"version\":\"0\"}," + record.compares[0] + "],\"success\":[{\"request_put\":{\"key\":" + quote(base64(key)) + ",\"value\":" +
+          quote(base64(bytes)) + "}}],\"failure\":[{\"request_range\":{\"key\":" + quote(base64(key)) + "}},{\"request_range\":{\"key\":" +
+          quote(base64(tenantKey)) + "}}]}");
+      capnp::MallocMessageBuilder message;
+      auto json = message.initRoot<Json>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
+      revision = std::max(revision, integer(field(json, "header"), "revision"));
+      if (boolean(json, "succeeded")) break;
+      auto responses = field(json, "responses").getArray();
+      auto kvs = field(field(responses[0], "response_range"), "kvs");
+      auto records = field(field(responses[1], "response_range"), "kvs");
+      const bool present = records.isArray() && records.getArray().size() == 1;
+      const bool recordChanged = present != guard.record.has_value() ||
+          (present && integer(records.getArray()[0], "mod_revision") != guard.record->modRevision);
+      if (recordChanged) {
+        guard = co_await tenantGuard(client, tenant, 0);
+        requireWritable(tenant, guard, controlPlane);
+        if (attempt >= 8) refuse("the record of tenant " + tenant + " kept changing while a definition was published; nothing flipped");
+        continue;
+      }
       KJ_REQUIRE(kvs.isArray() && kvs.getArray().size() == 1 && unbase64(text(kvs.getArray()[0], "value")) == bytes,
           "deployment label conflict during definition publication", definition.key.c_str());
+      break;
     }
   }
   report << ",\"publishedDefinitions\":" << planned.definitions.size();
@@ -742,6 +814,8 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
     // An upload: the immutable parts, the trial loads of its versions, then their definitions, after the same
     // conflict check as a deployment; no pointer moves.
     auto raw = co_await tenantSnapshot(client, options.tenant);
+    auto guard = co_await tenantGuard(client, options.tenant, raw.revision);
+    requireWritable(options.tenant, guard, options.controlPlane);
     auto before = stateOf(raw);
     Plan uploaded;
     preflightDefinitions(raw, desired, uploaded);
@@ -749,7 +823,7 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
     uint64_t publishedRevision = raw.revision;
     co_await publishObjects(*storage, desired, code, report);
     co_await runTrials(client, timer, trials, "upload", desired, before, uploaded, raw.revision, options, report, out);
-    co_await publishDefinitions(client, uploaded, report, publishedRevision);
+    co_await publishDefinitions(client, uploaded, report, publishedRevision, options.tenant, guard, options.controlPlane);
     out << "{\"operation\":\"upload\",\"flipped\":false,\"revision\":\"" << publishedRevision << "\",\"readRevision\":\""
         << raw.revision << "\",\"versions\":[";
     size_t index = 0;
@@ -761,7 +835,9 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
   for (uint32_t attempt = 0;; ++attempt) {
     const auto readStarted = std::chrono::steady_clock::now();
     auto raw = co_await tenantSnapshot(client, options.tenant);
+    auto guard = co_await tenantGuard(client, options.tenant, raw.revision);
     const auto readFinished = std::chrono::steady_clock::now();
+    requireWritable(options.tenant, guard, options.controlPlane);
     auto before = stateOf(raw);
     if (options.activation) desired = activationInput(raw, before, *options.activation);
     if (options.keepRoutes && !manifestRoutes && !options.activation) {
@@ -775,7 +851,24 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
         }
       }
     }
+    // The control plane writes /<tenant> under * as /<tenant>/ (a route of the tenant's own path space only).
+    if (options.controlPlane)
+      for (auto& route : desired.routes)
+        if (route.host == "*") route.pathPrefix = defaultHostPrefix(tenantOf(route.workerId), route.pathPrefix);
     auto planned = plan(operation, raw, before, desired, options, false);
+    // Nothing commits once the tenant's record changed (its deletion marks it first).
+    planned.txn.tenantAsRead(options.tenant, guard.record);
+    // A pointer this write moves names a definition that is still there, with the bytes the write read: a version
+    // deleted meanwhile (`activate-delete-race`) makes the flip fail rather than leave the Worker naming a definition
+    // that is gone. A definition this write publishes itself is not compared: it was just created, and the comparison
+    // would take an operation from every Worker of a whole-state write (section 8's 63).
+    for (const auto& id : planned.workers) {
+      const auto& version = *desired.versions.at(id + "@" + desired.active.at(id).versionId);
+      const auto key = deploymentDefinitionKey(id, version.versionId);
+      if (std::any_of(planned.definitions.begin(), planned.definitions.end(),
+          [&](const DeploymentState::Change& change) { return change.key == key; })) continue;
+      if (const auto* stored = kvOf(raw, key)) planned.txn.holds(key, stored->value);
+    }
     const auto planned_at = std::chrono::steady_clock::now();
     if (planned.txn.size() > options.maxTxnOps) {
       bool tenantEmpty = true;
@@ -786,14 +879,18 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
       uint64_t publishedRevision = raw.revision;
       co_await publishObjects(*storage, desired, code, report);
       co_await runTrials(client, timer, trials, "apply", desired, before, planned, raw.revision, options, report, out);
-      co_await publishDefinitions(client, planned, report, publishedRevision);
+      co_await publishDefinitions(client, planned, report, publishedRevision, options.tenant, guard, options.controlPlane);
       auto steps = stages(desired, options.maxTxnOps);
       uint64_t revision = 0, generation = 0;
       size_t compares = 0, operations = 0;
       for (size_t step = 0; step < steps.size(); ++step) {
         auto current = co_await tenantSnapshot(client, options.tenant);
+        auto currentGuard = co_await tenantGuard(client, options.tenant, current.revision);
+        requireWritable(options.tenant, currentGuard, options.controlPlane);
         auto state = stateOf(current);
-        auto part = plan(Operation::UPSERT, current, state, steps[step], options, true, step + 1 == steps.size());
+        auto part = plan(Operation::UPSERT, current, state, steps[step], options, false, step + 1 == steps.size());
+        part.txn.tenantAsRead(options.tenant, currentGuard.record);
+        requireSize(part.txn, options.maxTxnOps);
         if (!part.definitions.empty()) KJ_FAIL_REQUIRE("definitions disappeared after publication; refusing to continue");
         auto response = co_await client.request("/v3/kv/txn", part.txn.json());
         capnp::MallocMessageBuilder message;
@@ -827,7 +924,7 @@ kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& time
         // Every new version loads on a node before anything flips (before its definition is published).
         co_await runTrials(client, timer, trials, name, desired, before, planned, raw.revision, options, report, out);
         if (options.activation) report << ",\"publishedDefinitions\":" << planned.definitions.size();
-        else co_await publishDefinitions(client, planned, report, publishedRevision);
+        else co_await publishDefinitions(client, planned, report, publishedRevision, options.tenant, guard, options.controlPlane);
       }
       published = true;
     } else if (!planned.definitions.empty()) {
@@ -922,17 +1019,20 @@ kj::Promise<uint64_t> commitSecret(EtcdClient& client, const Transaction& txn) {
 }
 
 kj::Promise<void> secretPut(EtcdClient& client, kj::Timer& timer, std::string worker, std::string name,
-    std::string value, uint32_t maxRetries, std::ostream& out) {
+    std::string value, uint32_t maxRetries, std::ostream& out, bool controlPlane = false) {
   if (auto problem = secretValueProblem(value); !problem.empty()) { value.clear(); refuse(problem + " (" + worker + "/" + name + ")"); }
   const auto key = deploymentSecretKey(worker, name);
   std::mt19937 random(std::random_device{}());
   for (uint32_t attempt = 0;; ++attempt) {
     auto raw = co_await tenantSnapshot(client, tenantOf(worker));
+    auto guard = co_await tenantGuard(client, tenantOf(worker), raw.revision);
+    requireWritable(tenantOf(worker), guard, controlPlane);
     auto state = stateOf(raw);
     const auto* existing = kvOf(raw, key);
     const auto setAtUnixMs = nowUnixMs();
     Transaction txn;
     txn.unchanged(key, existing);
+    txn.tenantAsRead(tenantOf(worker), guard.record);
     txn.put(key, secretRecordJson(value, setAtUnixMs));
     if (auto revision = co_await commitSecret(client, txn)) {
       // The active version, as read: whether it declares the name (a typo shows here).
@@ -953,11 +1053,13 @@ kj::Promise<void> secretPut(EtcdClient& client, kj::Timer& timer, std::string wo
 }
 
 kj::Promise<void> secretDelete(EtcdClient& client, kj::Timer& timer, std::string worker, std::string name,
-    uint32_t maxRetries, std::ostream& out) {
+    uint32_t maxRetries, std::ostream& out, bool controlPlane = false) {
   const auto key = deploymentSecretKey(worker, name);
   std::mt19937 random(std::random_device{}());
   for (uint32_t attempt = 0;; ++attempt) {
     auto raw = co_await tenantSnapshot(client, tenantOf(worker));
+    auto guard = co_await tenantGuard(client, tenantOf(worker), raw.revision);
+    requireWritable(tenantOf(worker), guard, controlPlane);
     auto before = stateOf(raw);
     const auto* existing = kvOf(raw, key);
     if (!existing) refuse("secret " + name + " of Worker " + worker + " is not set");
@@ -974,6 +1076,7 @@ kj::Promise<void> secretDelete(EtcdClient& client, kj::Timer& timer, std::string
     txn.unchanged(key, existing);
     // A concurrent flip of this Worker to a version declaring the name.
     txn.unchanged(deploymentActiveKey(worker), kvOf(raw, deploymentActiveKey(worker)));
+    txn.tenantAsRead(tenantOf(worker), guard.record);
     txn.remove(key);
     if (auto revision = co_await commitSecret(client, txn)) {
       out << "{\"operation\":\"secret delete\",\"workerId\":" << quote(worker) << ",\"name\":" << quote(name)
@@ -1086,6 +1189,7 @@ std::string controlFailure(const kj::Exception& error, const std::string& printe
 }
 ToolOptions controlOptions(const std::string& token) {
   ToolOptions options;
+  options.controlPlane = true;
   options.maxRetries = 8;
   options.token = token;
   return options;
@@ -1256,6 +1360,8 @@ kj::Promise<std::string> controlLimits(ControlContext& context, std::string work
     std::mt19937 random(std::random_device{}());
     for (uint32_t attempt = 0;; ++attempt) {
       auto raw = co_await tenantSnapshot(context.etcd, tenantOf(workerId));
+      auto guard = co_await tenantGuard(context.etcd, tenantOf(workerId), raw.revision);
+      requireWritable(tenantOf(workerId), guard, true);
       auto state = stateOf(raw);
       const auto pointerKey = deploymentActiveKey(workerId);
       const auto* kv = kvOf(raw, pointerKey);
@@ -1264,6 +1370,7 @@ kj::Promise<std::string> controlLimits(ControlContext& context, std::string work
       if (!worker->pointerError.empty()) refuse("Worker " + workerId + " has an unusable pointer: " + worker->pointerError);
       Transaction txn;
       txn.unchanged(pointerKey, kv);
+      txn.tenantAsRead(tenantOf(workerId), guard.record);
       txn.put(pointerKey, activePointerJson(worker->versionId, worker->definitionHash, limits));
       if (auto revision = co_await commitSecret(context.etcd, txn)) {
         out << "{\"operation\":\"limits\",\"workerId\":" << quote(workerId) << ",\"versionId\":" << quote(worker->versionId)
@@ -1370,6 +1477,8 @@ kj::Promise<std::string> controlDeleteVersion(ControlContext& context, std::stri
     uint64_t revision = 0;
     for (uint32_t attempt = 0;; ++attempt) {
       auto raw = co_await tenantSnapshot(context.etcd, tenantOf(workerId));
+      auto guard = co_await tenantGuard(context.etcd, tenantOf(workerId), raw.revision);
+      requireWritable(tenantOf(workerId), guard, true);
       auto state = stateOf(raw);
       const auto key = deploymentDefinitionKey(workerId, versionId);
       const auto* kv = kvOf(raw, key);
@@ -1381,8 +1490,9 @@ kj::Promise<std::string> controlDeleteVersion(ControlContext& context, std::stri
       deleted = state.definition(workerId + "@" + versionId);
       Transaction txn;
       txn.unchanged(key, kv);
-      // A concurrent flip of the pointer to this version.
+      // A concurrent flip of the pointer to this version (the flip compares this definition too).
       txn.unchanged(pointerKey, kvOf(raw, pointerKey));
+      txn.tenantAsRead(tenantOf(workerId), guard.record);
       txn.remove(key);
       if ((revision = co_await commitSecret(context.etcd, txn))) break;
       if (attempt >= 8) refuse("another write changed Worker " + workerId + " (" + std::to_string(attempt + 1) + " attempts); nothing deleted");
@@ -1408,7 +1518,7 @@ kj::Promise<std::string> controlSecretPut(ControlContext& context, std::string w
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId (<tenant>/<worker>)");
     if (!environmentName(name)) refuse("invalid secret name (a JavaScript identifier of ASCII letters, digits, '_' and '$')");
-    co_await secretPut(context.etcd, context.timer, workerId, name, value, 8, out);
+    co_await secretPut(context.etcd, context.timer, workerId, name, value, 8, out, true);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str(), value);
   }
@@ -1419,7 +1529,7 @@ kj::Promise<std::string> controlSecretDelete(ControlContext& context, std::strin
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId (<tenant>/<worker>)");
     if (!environmentName(name)) refuse("invalid secret name (a JavaScript identifier of ASCII letters, digits, '_' and '$')");
-    co_await secretDelete(context.etcd, context.timer, workerId, name, 8, out);
+    co_await secretDelete(context.etcd, context.timer, workerId, name, 8, out, true);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1457,14 +1567,17 @@ kj::Promise<TenantCounts> tenantCounts(EtcdClient& client, std::string tenant) {
 }
 
 // The deletion cascade of a tenant's deployment state (control-plane-api.md section 5), each step idempotent: its
-// routes, its pointers (nothing of it is served from here on), the objects only its definitions use, then every key
-// below deploy/<tenant>/ (definitions, secrets, the Binding index).
+// routes, its pointers (nothing of it is served from here on), the objects only its definitions use, then -- in one
+// transaction -- every route that still names the tenant and every key below deploy/<tenant>/ (pointers, definitions,
+// secrets, the Binding index), on the condition that no route changed since the read that found those routes and that
+// the tenant's record is as read (marked deleting): no key of the tenant is left, and none can be written after.
 kj::Promise<std::string> controlDeleteTenantState(ControlContext& context, std::string tenant) {
   std::ostringstream out;
   try {
     if (!tenantName(tenant)) refuse("invalid tenant");
     auto raw = co_await tenantSnapshot(context.etcd, tenant);
     auto state = stateOf(raw);
+    std::mt19937 random(std::random_device{}());
     auto commit = [&](const std::vector<std::string>& keys) -> kj::Promise<uint64_t> {
       uint64_t done = 0;
       for (size_t start = 0; start < keys.size(); start += 100) {
@@ -1486,18 +1599,45 @@ kj::Promise<std::string> controlDeleteTenantState(ControlContext& context, std::
     auto cleanup = co_await cleanupObjects(context.storage,
         definitionsOf(all, [&](const std::string& id) { return tenantOf(id) == tenant; }),
         definitionsOf(all, [&](const std::string& id) { return tenantOf(id) != tenant; }));
-    // Everything left below the tenant's prefix, in one range deletion.
-    const auto prefix = absolute(deploymentTenantPrefix(tenant));
-    auto end = prefix;
-    ++end.back();
-    auto response = co_await context.etcd.request("/v3/kv/deleterange", "{\"key\":" + quote(base64(prefix)) +
-        ",\"range_end\":" + quote(base64(end)) + "}");
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
+    // The rest in one transaction: the routes that still name the tenant (any written since the first read) and
+    // everything below its prefix. A route written meanwhile, of any tenant, makes it read again.
+    uint64_t keys = 0, lateRoutes = 0;
+    uint32_t attempts = 0;
+    for (;; ++attempts) {
+      if (attempts > 8) refuse("other writes kept changing the routes while tenant " + tenant + " was deleted; DELETE it again to resume");
+      auto current = co_await tenantSnapshot(context.etcd, tenant);
+      auto guard = co_await tenantGuard(context.etcd, tenant, current.revision);
+      if (guard.status != "deleting") refuse("tenant " + tenant + " is not marked deleting (its record changed); DELETE it again");
+      auto now = stateOf(current);
+      std::vector<std::string> left;
+      for (const auto& [key, route] : now.routes())
+        if (!route.value.workerId.empty() && tenantOf(route.value.workerId) == tenant) left.push_back("routes/" + key);
+      if (left.size() > 100) {
+        // Too many for one transaction with the rest: removed first, then read again.
+        lateRoutes += co_await commit(left);
+        continue;
+      }
+      Transaction txn;
+      txn.tenantAsRead(tenant, guard.record);
+      txn.untouchedSince("routes/", current.revision);
+      for (const auto& key : left) txn.remove(key);
+      txn.removeBelow(deploymentTenantPrefix(tenant));
+      auto response = co_await context.etcd.request("/v3/kv/txn", txn.json());
+      capnp::MallocMessageBuilder message;
+      auto json = message.initRoot<Json>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
+      if (boolean(json, "succeeded")) {
+        auto responses = field(json, "responses");
+        if (responses.isArray() && responses.getArray().size())
+          keys = integer(field(responses.getArray()[responses.getArray().size() - 1], "response_delete_range"), "deleted");
+        lateRoutes += left.size();
+        break;
+      }
+      co_await context.timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
+    }
     out << "{\"operation\":\"delete tenant state\",\"tenant\":" << quote(tenant) << ",\"routes\":" << deletedRoutes
-        << ",\"pointers\":" << deletedPointers << ",\"keys\":" << integer(json, "deleted") << ",\"objects\":"
-        << cleanupJson(cleanup) << '}';
+        << ",\"pointers\":" << deletedPointers << ",\"keys\":" << keys << ",\"lateRoutes\":" << lateRoutes
+        << ",\"finalAttempts\":" << attempts + 1 << ",\"objects\":" << cleanupJson(cleanup) << '}';
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }

@@ -45,6 +45,9 @@
 #include <cstring>
 #include <strings.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <set>
@@ -550,15 +553,15 @@ private:
     co_return std::string(text.cStr(), text.size());
   }
 
-  // Where a tenant may route: a hostname it owns, or the default host * under /<tenant> (unless path routing
-  // is off). Empty when it may.
+  // Where a tenant may route: a hostname it owns, or the default host * under /<tenant>/ (unless path routing
+  // is off; /<tenant> itself is written as /<tenant>/, defaultHostPrefix). Empty when it may.
   std::string routeRefusal(const coworkerd::TenantRecord& tenant, const coworkerd::RouteDefinition& route) const {
     if (route.host == "*") {
       if (!settings.pathRouting)
         return "path routes under the default host are off on this cluster (control.pathRouting); route a hostname of tenant " + tenant.name;
-      const auto prefix = "/" + tenant.name;
-      if (route.pathPrefix == prefix || route.pathPrefix.starts_with(prefix + "/")) return {};
-      return "a route of tenant " + tenant.name + " under the default host * starts with " + prefix + "/ (not " + route.pathPrefix + ")";
+      const auto prefix = "/" + tenant.name + "/";
+      if (coworkerd::defaultHostPrefix(tenant.name, route.pathPrefix).starts_with(prefix)) return {};
+      return "a route of tenant " + tenant.name + " under the default host * starts with " + prefix + " (not " + route.pathPrefix + ")";
     }
     if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), route.host) != tenant.hostnames.end()) return {};
     return "hostname " + route.host + " is not one of tenant " + tenant.name + "'s hostnames";
@@ -614,7 +617,11 @@ private:
     if ((known == counts.versions.end() || !known->second.contains(version)) && versions >= tenant.quotas.versionsPerWorker)
       co_return co_await fail(response, 422, "QUOTA_EXCEEDED", "versionsPerWorker: Worker " + worker + " has " + std::to_string(versions) +
           " versions, the quota is " + std::to_string(tenant.quotas.versionsPerWorker) + "; delete an old version first");
-    const auto package = directory / worker / version / "package.json";
+    // The asset quotas of the package the deployment reads: the version's packagePath (inside the package,
+    // readDeploymentManifest), else its default place.
+    auto package = directory / worker / version / "package.json";
+    if (auto uploaded = input.versions.find(id + "@" + version); uploaded != input.versions.end() && !uploaded->second->packagePath.empty())
+      package = uploaded->second->packagePath;
     if (fs::exists(package)) {
       std::optional<std::string> problem;
       try {
@@ -792,6 +799,37 @@ private:
       result.error = cleanReason(error.getDescription().cStr());
     }
     co_return result;
+  }
+
+public:
+  // This control plane's own addresses for every member's cluster set (POST /__coworkerd/control-plane: node/main.c++,
+  // ControlPlaneAddresses), so that tenant code on no node can reach this API whatever its egress rules allow. A
+  // member that does not answer gets the next announcement.
+  kj::Promise<void> announce(std::string body) {
+    std::vector<Member> list;
+    try { list = co_await members(); } catch (const kj::Exception&) { co_return; }
+    kj::Vector<kj::Promise<void>> pending;
+    for (const auto& member : list) pending.add(post("http://" + member.address + "/__coworkerd/control-plane", body));
+    co_await kj::joinPromises(pending.releaseAsArray());
+  }
+
+private:
+  kj::Promise<void> post(std::string url, std::string body) {
+    try {
+      auto client = kj::newHttpClient(timer, headerTable, network, kj::none);
+      kj::HttpHeaders headers(headerTable);
+      headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
+      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+      if (!settings.token.empty()) headers.addPtr("Authorization", kj::str("Bearer ", settings.token.c_str()));
+      auto call = client->request(kj::HttpMethod::POST, url.c_str(), headers, body.size());
+      auto work = [&]() -> kj::Promise<void> {
+        co_await call.body->write(kj::arrayPtr(body.data(), body.size()).asBytes());
+        call.body = nullptr;
+        auto answer = co_await call.response;
+        co_await answer.body->readAllText(64 * 1024);
+      };
+      co_await timer.timeoutAfter(settings.serverTimeoutMs * kj::MILLISECONDS, work());
+    } catch (const kj::Exception&) {}
   }
 
   static std::string pick(capnp::JsonValue::Reader object, std::initializer_list<const char*> names) {
@@ -1056,7 +1094,12 @@ private:
     auto has = [&](std::string_view part) { return reason.find(part) != std::string::npos; };
     uint status = 422;
     std::string code = std::string(area) == "secret" ? "SECRET_REFUSED" : "DEPLOYMENT_REFUSED", extra;
-    if (has("trial load of ") && has(" failed on node ")) {
+    // The tenant's record as the write found it in its own transaction's read (deployment-tool.c++, requireWritable).
+    if (reason.starts_with("there is no tenant ")) {
+      status = 404; code = "TENANT_NOT_FOUND";
+    } else if (reason.starts_with("tenant ") && has(" is being deleted; nothing written")) {
+      status = 409; code = "CONFLICT";
+    } else if (has("trial load of ") && has(" failed on node ")) {
       status = 422;
       code = "LOAD_FAILED";
       // The trial's verdict: its category and cleaned message (the node cleaned them).
@@ -1074,7 +1117,7 @@ private:
       status = 503; code = "TRIAL_UNAVAILABLE";
     } else if (has("deployment label conflict")) {
       status = 409; code = "VERSION_EXISTS";
-    } else if (has("期间有其他部署") || has("another write changed")) {
+    } else if (has("期间有其他部署") || has("another write changed") || has("kept changing while a definition was published")) {
       status = 409; code = "CONFLICT";
     } else if (has("was never uploaded")) {
       status = 404; code = "VERSION_NOT_FOUND";
@@ -1124,6 +1167,40 @@ private:
   const kj::HttpHeaderTable& headerTable;
   coworkerd::ControlContext context;
 };
+
+// What this control plane announces as its own addresses (ControlService::announce): its listen address's host, or
+// every address of this host when it listens on all of them.
+std::vector<std::string> controlAddresses(const std::string& listenAddress) {
+  auto host = listenAddress.substr(0, listenAddress.rfind(':'));
+  if (host.starts_with('[') && host.ends_with(']')) host = host.substr(1, host.size() - 2);
+  if (!host.empty() && host != "0.0.0.0" && host != "::" && host != "*") return {host};
+  std::vector<std::string> addresses;
+  ifaddrs* interfaces = nullptr;
+  if (getifaddrs(&interfaces) != 0) return addresses;
+  for (auto* entry = interfaces; entry != nullptr; entry = entry->ifa_next) {
+    if (entry->ifa_addr == nullptr) continue;
+    char text[INET6_ADDRSTRLEN] = {};
+    if (entry->ifa_addr->sa_family == AF_INET)
+      inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(entry->ifa_addr)->sin_addr, text, sizeof(text));
+    else if (entry->ifa_addr->sa_family == AF_INET6)
+      inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6*>(entry->ifa_addr)->sin6_addr, text, sizeof(text));
+    else continue;
+    std::string address = text;
+    if (address.find('%') != std::string::npos) continue;  // a scoped link-local address: never a cluster's own
+    if (std::find(addresses.begin(), addresses.end(), address) == addresses.end() && addresses.size() < 64) addresses.push_back(address);
+  }
+  freeifaddrs(interfaces);
+  return addresses;
+}
+
+// Every member hears this control plane's addresses at startup and every ANNOUNCE_MS after.
+constexpr uint32_t ANNOUNCE_MS = 10000;
+kj::Promise<void> announceForever(ControlService& service, kj::Timer& timer, std::string body) {
+  for (;;) {
+    co_await service.announce(body);
+    co_await timer.afterDelay(ANNOUNCE_MS * kj::MILLISECONDS);
+  }
+}
 
 int runControlPlane(const std::vector<std::string>& args) {
   ControlSettings settings;
@@ -1200,7 +1277,13 @@ int runControlPlane(const std::vector<std::string>& args) {
             << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs << "}" << std::endl;
   std::cout << "[control] ready http=" << settings.listenAddress << std::endl;
   auto stop = io.unixEventPort.onSignal(SIGTERM).exclusiveJoin(io.unixEventPort.onSignal(SIGINT));
-  server.listenHttp(*listener).exclusiveJoin(stop.ignoreResult()).exclusiveJoin(runLogClock(timer)).wait(io.waitScope);
+  const auto announced = controlAddresses(settings.listenAddress);
+  std::string body = "{\"instance\":\"" + jsonEscape(settings.instance) + "\",\"addresses\":[";
+  for (size_t i = 0; i < announced.size(); ++i) body += (i ? ",\"" : "\"") + jsonEscape(announced[i]) + "\"";
+  body += "]}";
+  std::cout << "[control] {\"event\":\"announce\",\"addresses\":" << body.substr(body.find('[')) << std::endl;
+  server.listenHttp(*listener).exclusiveJoin(stop.ignoreResult()).exclusiveJoin(runLogClock(timer))
+      .exclusiveJoin(announceForever(service, timer, std::move(body))).wait(io.waitScope);
   std::cout << "[control] {\"event\":\"stopped\"}" << std::endl;
   return 0;
 }

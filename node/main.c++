@@ -115,17 +115,24 @@ bool validSha256(const std::string& value) {
   });
 }
 
-std::string queryParameter(kj::StringPtr rawUrl, std::string_view name, bool required = true) {
-  std::string url = rawUrl.cStr();
-  auto queryStart = url.find('?');
-  KJ_REQUIRE(queryStart != std::string::npos, "source request query is required");
-  auto path = url.substr(0, queryStart);
+// The path of a request to the source socket, without the scheme and authority and without its query (requestPath()
+// below is the same for the request targets a Binding call carries; this one is needed before it).
+std::string sourceRequestPath(kj::StringPtr rawUrl) {
+  std::string path = std::string(rawUrl.cStr()).substr(0, std::string(rawUrl.cStr()).find('?'));
   auto scheme = path.find("://");
   if (scheme != std::string::npos) {
     auto pathStart = path.find('/', scheme + 3);
     path = pathStart == std::string::npos ? "/" : path.substr(pathStart);
   }
-  KJ_REQUIRE(path == "/v1/source", "unknown source path", path.c_str());
+  return path;
+}
+std::string queryParameter(kj::StringPtr rawUrl, std::string_view name, bool required = true,
+    std::string_view expectedPath = "/v1/source") {
+  std::string url = rawUrl.cStr();
+  auto queryStart = url.find('?');
+  KJ_REQUIRE(queryStart != std::string::npos, "source request query is required");
+  const auto path = sourceRequestPath(rawUrl);
+  KJ_REQUIRE(path == expectedPath, "unknown source path", path.c_str());
 
   auto query = std::string_view(url).substr(queryStart + 1);
   while (!query.empty()) {
@@ -450,9 +457,11 @@ public:
     redactions.values = nullptr;
   }
 
-  // ---- Tenants: their records (being deleted: not served) and their usage here ----
+  // ---- Tenants: their records (being deleted, or gone: not served) and their usage here ----
   void setTenancy(coworkerd::TenantView* view, coworkerd::TenantUsage* counters) { tenants = view; usage = counters; }
   bool tenantDeleting(const std::string& tenant) const { return tenants && tenants->deleting(tenant); }
+  // Why a tenant's Workers start nothing here ("" when they may): its record says deleting, or there is none.
+  std::string tenantUnavailable(const std::string& tenant) const { return tenants ? tenants->unavailable(tenant) : std::string(); }
   // Each tenant this node knows of: its record's status and log quota, its Workers here (valid of all), whether it
   // is a suspect and which quarantine process is its shard, and the limits its Workers name (their own, else the
   // tenant's default, else this node's).
@@ -548,9 +557,11 @@ public:
     return "{\"tokenSet\":" + std::string(managementTokenSet() ? "true" : "false") + ",\"unauthorized\":" + countsJson(managementUnauthorized) + "}";
   }
 
-  // The route and the root's closure come from one revision of the state.
+  // The route and the root's closure come from one revision of the state; a hostname registered to a tenant is
+  // routed among that tenant's routes only.
   coworkerd::DeploymentState::Selection route(const std::string& host, const std::string& path) const {
-    auto selection = desiredState.state().route(host, path);
+    const auto* owner = tenants ? tenants->owner(coworkerd::requestHost(host)) : nullptr;
+    auto selection = desiredState.state().route(host, path, owner);
     if (selection.kind != coworkerd::DeploymentState::Selection::Kind::SELECTED) ++routeRejections[selection.kind];
     return selection;
   }
@@ -3117,6 +3128,80 @@ private:
   const kj::HttpHeaderTable& headerTable;
 };
 
+// The control plane's own addresses, as every control plane announces them to every member (POST
+// /__coworkerd/control-plane on the peer listener, with the management token, every few seconds): they join the
+// cluster's addresses, which tenant code cannot reach whatever its egress rules allow -- with nothing to configure
+// (egress.clusterAddresses remains for what no one announces). At most 16 instances of 64 addresses each; an instance
+// that stopped announcing is forgotten after ten minutes.
+class ControlPlaneAddresses final {
+public:
+  // {"instance":"<host:pid>","addresses":["<IP address or host name>",...]}; the answer for the control plane.
+  std::string announce(const std::string& body) {
+    std::string instance;
+    std::vector<std::string> addresses;
+    try {
+      capnp::MallocMessageBuilder message;
+      auto json = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), json);
+      instance = coworkerd::etcd::text(json, "instance");
+      auto list = coworkerd::etcd::field(json, "addresses");
+      KJ_REQUIRE(list.isArray() && list.getArray().size() <= 64, "addresses");
+      for (auto entry : list.getArray()) {
+        KJ_REQUIRE(entry.isString(), "address");
+        auto value = std::string(entry.getString().cStr());
+        KJ_REQUIRE(!value.empty() && value.size() <= 255 && std::all_of(value.begin(), value.end(), [](char c) {
+          return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':' ||
+              c == '[' || c == ']';
+        }), "address");
+        // An IPv6 address in brackets, as the egress policy reads HOST[:PORT] entries.
+        if (value.find(':') != std::string::npos && !value.starts_with('[')) value = "[" + value + "]";
+        addresses.push_back(std::move(value));
+      }
+      KJ_REQUIRE(!instance.empty() && instance.size() <= 128, "instance");
+    } catch (const kj::Exception&) {
+      ++refused;
+      return "{\"ok\":false,\"reason\":\"the body is {\\\"instance\\\",\\\"addresses\\\":[...]} of at most 64 addresses\"}";
+    }
+    expire();
+    if (!instances.contains(instance) && instances.size() >= 16) instances.erase(oldest());
+    instances[instance] = {std::move(addresses), monotonicTimeMs()};
+    ++announcements;
+    return "{\"ok\":true,\"addresses\":" + std::to_string(instances[instance].addresses.size()) + "}";
+  }
+  std::vector<std::string> endpoints() {
+    expire();
+    std::vector<std::string> out;
+    for (const auto& [instance, entry] : instances) out.insert(out.end(), entry.addresses.begin(), entry.addresses.end());
+    return out;
+  }
+  std::string json() {
+    expire();
+    std::string out = "{\"announcements\":" + std::to_string(announcements) + ",\"refused\":" + std::to_string(refused) + ",\"instances\":[";
+    size_t index = 0;
+    for (const auto& [instance, entry] : instances) {
+      out += std::string(index++ ? "," : "") + "{\"instance\":\"" + jsonEscape(instance) + "\",\"addresses\":[";
+      for (size_t i = 0; i < entry.addresses.size(); ++i) out += (i ? ",\"" : "\"") + jsonEscape(entry.addresses[i]) + "\"";
+      out += "],\"seenMsAgo\":" + std::to_string(static_cast<uint64_t>(monotonicTimeMs() - entry.seenAtMs)) + "}";
+    }
+    return out + "]}";
+  }
+
+private:
+  struct Entry { std::vector<std::string> addresses; double seenAtMs = 0; };
+  static constexpr double FORGET_MS = 10 * 60 * 1000;
+  void expire() {
+    const auto now = monotonicTimeMs();
+    std::erase_if(instances, [&](const auto& entry) { return now - entry.second.seenAtMs > FORGET_MS; });
+  }
+  std::string oldest() const {
+    auto found = std::min_element(instances.begin(), instances.end(),
+        [](const auto& a, const auto& b) { return a.second.seenAtMs < b.second.seenAtMs; });
+    return found->first;
+  }
+  std::map<std::string, Entry> instances;
+  uint64_t announcements = 0, refused = 0;
+};
+
 // GET /__coworkerd/logs?worker=<id>[&after=<seq>][&since=<unixMs>][&limit=<n>], on the ingress and the
 // peer listener (the control plane reads every member at its advertised address): one Worker's lines as
 // this Server's workerd output reader keeps them (WorkerdOutput::workerLogs), with this Server's id.
@@ -3197,16 +3282,17 @@ public:
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable,
       kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial,
-      WorkerLogsEndpoint& logs, kj::Function<std::string()> state, coworkerd::PeerAuth& peerAuth)
+      WorkerLogsEndpoint& logs, kj::Function<std::string()> state, coworkerd::PeerAuth& peerAuth,
+      ControlPlaneAddresses& controlPlane)
       : server(server), headerTable(headerTable),
         rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
             server, peerForwarder, factory, headerTable))), trial(kj::mv(trial)), logs(logs), state(kj::mv(state)),
-        peerAuth(peerAuth) {}
+        peerAuth(peerAuth), controlPlane(controlPlane) {}
 
   // Besides the Cap'n Proto CONNECT, the peer listener (the address a member
   // advertises) answers the deployment tool's trial loads, and the control
-  // plane's reads of the state and the Workers' logs, with the management
-  // token when one is set.
+  // plane's reads of the state and the Workers' logs and its announcements of its
+  // own addresses, with the management token when one is set.
   kj::Promise<void> request(
       kj::HttpMethod method,
       kj::StringPtr url,
@@ -3219,6 +3305,16 @@ public:
     }
     if (url == "/__coworkerd/trial-load") return trial(method, body, response);
     if (WorkerLogsEndpoint::matches(url)) return logs.serve(method, url, response);
+    if (url == "/__coworkerd/control-plane" && method == kj::HttpMethod::POST) {
+      return body.readAllText(16 * 1024).then([this, &response](kj::String text) {
+        auto answer = kj::heap<std::string>(controlPlane.announce(std::string(text.cStr(), text.size())));
+        kj::HttpHeaders headers(headerTable);
+        headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+        auto stream = response.send(answer->starts_with("{\"ok\":true") ? 200 : 400, "OK", headers, answer->size());
+        auto write = stream->write(kj::arrayPtr(answer->data(), answer->size()).asBytes());
+        return write.attach(kj::mv(stream), kj::mv(answer));
+      });
+    }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
       auto text = kj::heap<std::string>(state());
       kj::HttpHeaders headers(headerTable);
@@ -3259,6 +3355,7 @@ private:
   WorkerLogsEndpoint& logs;
   kj::Function<std::string()> state;
   coworkerd::PeerAuth& peerAuth;
+  ControlPlaneAddresses& controlPlane;
 };
 
 // The path of a request target, origin-form ("/a?b") or absolute
@@ -3736,8 +3833,8 @@ private:
 
 class SourceService final: public kj::HttpService, public kj::HttpServerCallbacks {
 public:
-  SourceService(ServerCore& server, const kj::HttpHeaderTable& headerTable)
-      : server(server), headerTable(headerTable) {}
+  SourceService(ServerCore& server, kj::LowLevelAsyncIoProvider& provider, kj::Timer& timer, const kj::HttpHeaderTable& headerTable)
+      : server(server), provider(provider), timer(timer), headerTable(headerTable) {}
 
   // Cold reloads can coincide with HTTP idle expiry. KJ owns the Connection header;
   // use its callback to close source connections after each complete response.
@@ -3747,20 +3844,69 @@ public:
       kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders&,
-      kj::AsyncInputStream&,
+      kj::AsyncInputStream& body,
       Response& response) override {
-    return serve(method, url, response).catch_([this, &response](kj::Exception&& error) {
+    return serve(method, url, body, response).catch_([this, &response](kj::Exception&& error) {
       std::cerr << "[server] source request failed: "
                 << cleanReason(error.getDescription().cStr()) << std::endl;
       return response.sendError(404, "Coworkerd source not found", headerTable);
     });
   }
 
+  std::string logJson() const {
+    return "{\"posts\":" + std::to_string(logPosts) + ",\"lines\":" + std::to_string(logLines) + ",\"cutLines\":" +
+        std::to_string(logCutLines) + ",\"refusedPosts\":" + std::to_string(logRefusedPosts) + "}";
+  }
+
 private:
+  // A Worker's console lines, from the runtime of one of this node's processes (runtime/runtime.js, TenantLog: the
+  // tail channel workerd gives each Worker it loads, bound to that Worker's identity by the runtime; only the
+  // runtimes reach this socket). They are kept as that Worker's lines (WorkerdOutput::appendTenantLines); what a line
+  // says never decides whose it is. Lines beyond what one append carries are cut and counted.
+  static constexpr size_t MAX_LOG_POST_BYTES = 16 * 1024 * 1024, MAX_LOG_APPEND_BYTES = 2 * 1024 * 1024;
+  kj::Promise<void> log(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
+    const auto processId = queryParameter(url, "processId", true, "/v1/log");
+    auto text = co_await body.readAllText(MAX_LOG_POST_BYTES);
+    capnp::MallocMessageBuilder message;
+    auto json = message.initRoot<capnp::JsonValue>();
+    capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
+    const auto workerId = coworkerd::etcd::text(json, "workerId"), versionId = coworkerd::etcd::text(json, "versionId");
+    if (!coworkerd::workerFullName(workerId) || !safeName(versionId) || versionId.size() > 255) {
+      ++logRefusedPosts;
+      KJ_FAIL_REQUIRE("a log post names an invalid Worker or version");
+    }
+    auto entries = coworkerd::etcd::field(json, "lines");
+    KJ_REQUIRE(entries.isArray(), "a log post holds {workerId, versionId, lines}");
+    std::string lines;
+    uint64_t kept = 0, cut = 0;
+    for (auto entry : entries.getArray()) {
+      auto level = coworkerd::etcd::field(entry, "level"), text = coworkerd::etcd::field(entry, "message");
+      if (!level.isString() || !text.isString()) { ++cut; continue; }
+      const std::string name(level.getString().cStr());
+      if (name != "debug" && name != "info" && name != "log" && name != "warn" && name != "error") { ++cut; continue; }
+      auto line = "{\"workerId\":\"" + workerId + "\",\"versionId\":\"" + versionId + "\",\"level\":\"" + name + "\",\"message\":\"" +
+          jsonEscape(std::string(text.getString().begin(), text.getString().size())) + "\"}\n";
+      if (lines.size() + line.size() > MAX_LOG_APPEND_BYTES) { ++cut; continue; }
+      lines += line;
+      ++kept;
+    }
+    ++logPosts;
+    logLines += kept;
+    logCutLines += cut;
+    std::string answer = "{\"ok\":true,\"accepted\":0}";
+    if (kept) answer = co_await timer.timeoutAfter(2 * kj::SECONDS, coworkerd::WorkerdOutput::appendTenantLines(provider, processId, lines));
+    kj::HttpHeaders headers(headerTable);
+    headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+    auto stream = response.send(200, "OK", headers, answer.size());
+    co_await stream->write(kj::arrayPtr(answer.data(), answer.size()).asBytes());
+  }
+
   kj::Promise<void> serve(
       kj::HttpMethod method,
       kj::StringPtr url,
+      kj::AsyncInputStream& body,
       Response& response) {
+    if (method == kj::HttpMethod::POST && requestPath(url) == "/v1/log") co_return co_await log(url, body, response);
     KJ_REQUIRE(method == kj::HttpMethod::GET, "source endpoint requires GET");
     auto workerId = queryParameter(url, "workerId");
     auto versionId = queryParameter(url, "versionId");
@@ -3770,13 +3916,16 @@ private:
         queryParameter(url, "processGeneration", false), queryParameter(url, "definitionHash", false));
     kj::HttpHeaders headers(headerTable);
     headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-    auto body = response.send(200, "OK", headers, text.size());
-    co_await body->write(kj::arrayPtr(
+    auto stream = response.send(200, "OK", headers, text.size());
+    co_await stream->write(kj::arrayPtr(
         reinterpret_cast<const kj::byte*>(text.data()), text.size()));
   }
 
   ServerCore& server;
+  kj::LowLevelAsyncIoProvider& provider;
+  kj::Timer& timer;
   const kj::HttpHeaderTable& headerTable;
+  uint64_t logPosts = 0, logLines = 0, logCutLines = 0, logRefusedPosts = 0;
 };
 
 // Forwards an ingress request to the Worker that serves it, and its response to the client. The ingress
@@ -4502,9 +4651,9 @@ private:
       co_return co_await sendText(response, failure.status, statusText(failure.status),
           rejectionJson(code, reason, deadline), "application/json");
     }
-    // A tenant being deleted: nothing of it starts here any more.
-    if (const auto tenant = coworkerd::tenantOf(selected.version->workerId); server.tenantDeleting(tenant)) {
-      auto failure = server.refusal("TENANT_UNAVAILABLE", "tenant " + tenant + " is being deleted", 503, true);
+    // A tenant being deleted, or one whose record is gone: nothing of it starts here any more.
+    if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(selected.version->workerId)); !unavailable.empty()) {
+      auto failure = server.refusal("TENANT_UNAVAILABLE", unavailable, 503, true);
       server.observeLocalRefusal(failure, "localIngress");
       co_return co_await sendText(response, 503, "Service Unavailable",
           rejectionJson(failure.code, failure.reason, deadline), "application/json");
@@ -4953,6 +5102,13 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool) {
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_SYSCALLS_STEADY")) pool.steadySyscallsMode = mode;
   if (const char* path = std::getenv("COWORKERD_SANDBOX_STEADY_ALLOWLIST")) pool.steadyAllowlistPath = path;
   // The launcher beside this executable, as workerd is in a release.
+  // A limit the configuration cannot name (common/config.c++ refuses 0 there): the environment may still turn one
+  // off, and then the node has no culprit to name and no suspect to quarantine. Said once, at startup.
+  if (pool.cpuLimitMs == 0 || pool.memoryLimitMiB == 0) {
+    std::cout << "[server] {\"event\":\"limits\",\"cpuLimitMs\":" << pool.cpuLimitMs << ",\"memoryLimitMiB\":" << pool.memoryLimitMiB
+              << ",\"warning\":\"a limit of 0 comes from the environment (COWORKERD_CPU_LIMIT_MS, COWORKERD_MEMORY_LIMIT_MIB): "
+                 "no culprit is named for it and no tenant goes to the quarantine processes\"}" << std::endl;
+  }
   if (pool.launcherPath.empty()) pool.launcherPath = (executableDirectory() / "coworkerd-launcher").string();
   // The system call allowlist of this build, beside the Server as the release package has it.
   if (pool.allowlistPath.empty()) pool.allowlistPath = (executableDirectory() / "coworkerd-syscalls-startup.txt").string();
@@ -5194,10 +5350,13 @@ int run(Launch launch) {
       "\",\"experimentalNaiveLease\":" + (launch.experimentalNaiveLease ? "true" : "false") + "}");
   PeerForwarder peerForwarder(
       server, io.provider->getNetwork(), timer, *headerTable, httpOverCapnpFactory, peerAuth);
+  // The control plane's addresses as it announces them (ControlPlaneAddresses), beside the members' and this node's own.
+  ControlPlaneAddresses controlPlane;
   coworkerd::EgressService egress(egressConfig, server.placementConfig().serverId, io.provider->getNetwork(), timer, *headerTable,
-      [&membership, &ownEndpoints]() {
+      [&membership, &ownEndpoints, &controlPlane]() {
         auto endpoints = ownEndpoints;
         for (const auto& [id, member] : membership->view().members) endpoints.push_back(member.address);
+        for (auto& address : controlPlane.endpoints()) endpoints.push_back(std::move(address));
         return endpoints;
       },
       [&runtime](const std::string& token) -> std::optional<coworkerd::EgressSource> {
@@ -5208,6 +5367,7 @@ int run(Launch launch) {
       // The tenant's hourly usage rows: egressBytes.
       [&tenantUsage](const std::string& tenant, uint64_t bytes) { tenantUsage.egress(tenant, bytes); });
   server.addStateSection("egress", [&egress]() { return egress.json(); });
+  server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
   server.addStateSection("etcdAuth", []() { return coworkerd::etcdAuthJson(); });
   HttpForwarder forwarder(server, httpOverCapnpFactory);
@@ -5222,8 +5382,9 @@ int run(Launch launch) {
         return trials.serve(method, body, response);
       },
       workerLogs, [&server, &peerForwarder]() { return server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()); },
-      peerAuth);
-  SourceService source(server, *headerTable);
+      peerAuth, controlPlane);
+  SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
+  server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
   kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, peerRpc);

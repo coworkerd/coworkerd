@@ -45,15 +45,6 @@ uint64_t wallClock() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
 }
-bool writeAll(int fd, const char* data, size_t size) {
-  while (size) {
-    auto n = ::write(fd, data, size);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) return false;
-    data += n; size -= n;
-  }
-  return true;
-}
 constexpr uint32_t OUTPUT_SLOTS = 512;
 constexpr size_t OUTPUT_DEFAULT_BUDGET = 4 * 1024 * 1024;
 constexpr size_t OUTPUT_READ_BYTES = 64 * 1024;
@@ -63,6 +54,9 @@ constexpr uint32_t OUTPUT_MAGIC = 0x434f5754;
 // A log query: the record carries one end of a socket pair; the request and the answer travel on it.
 constexpr uint32_t OUTPUT_QUERY_MAGIC = 0x434f5751;
 constexpr size_t OUTPUT_QUERY_REQUEST_BYTES = 512;
+// An append request's lines (one invocation's trace is at most 256 KiB, escaped as JSON at most about four times that).
+constexpr size_t OUTPUT_APPEND_MAX_BYTES = 2 * 1024 * 1024;
+constexpr size_t OUTPUT_QUERY_READ_BYTES = 64 * 1024;
 constexpr uint32_t OUTPUT_QUERY_MAX_LINES = 10000;
 constexpr int OUTPUT_QUERY_IO_MS = 2000;
 #ifdef __linux__
@@ -85,9 +79,9 @@ struct alignas(64) OutputSlot {
   std::array<std::atomic<uint64_t>, DROP_REASONS> droppedBy{};
   std::atomic<uint64_t> firstDropUnixMs{0}, lastDropUnixMs{0}, lastDropGeneration{0}, lastDropPid{0};
   std::atomic<uint64_t> reportedLines{0}, markerLines{0};
-  // Tenant lines: whether this generation's runtime announced its nonce; lines attributed;
-  // lines tagged as a tenant's that did not carry this process's nonce.
-  std::atomic<uint64_t> tenantNonce{0}, tenantLines{0}, tenantUnverified{0};
+  // Tenant lines: those the node appended for this slot's process (from its runtime's tail channel); lines of its own
+  // output that looked like a tenant's line (never attributed).
+  std::atomic<uint64_t> tenantLines{0}, tenantUnverified{0};
 };
 struct OutputShared {
   std::atomic<uint32_t> ready{0}, serverGone{0}, sinkOpen{0}, finished{0};
@@ -159,19 +153,12 @@ void closeOtherDescriptors(int keep) {
 }
 
 // ---- The Workers' logs (by tenant) ----
-// Tenant lines as the runtime writes them: "[tenant-log] <nonce> {"workerId":"..","versionId":"..",
-// "level":"..","message":"<JSON string>"}" (fields in this order). The workerId is a Worker's full name,
-// <tenant>/<worker>, the versionId a deployment's safe name; the message stays as its JSON text.
+// Tenant lines as the node appends them: {"workerId":"..","versionId":"..","level":"..","message":"<JSON string>"}
+// (fields in this order). The workerId is a Worker's full name, <tenant>/<worker>, the versionId a deployment's safe
+// name; the message stays as its JSON text. Output of a process that starts with TENANT_PREFIX is only counted.
 constexpr std::string_view TENANT_PREFIX = "[tenant-log] ";
-constexpr std::string_view NONCE_PREFIX = "[runtime-log-nonce] ";
-constexpr size_t NONCE_HEX = 32;
 bool nameCharacter(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-}
-bool hexNonce(std::string_view value) {
-  return value.size() == NONCE_HEX && std::all_of(value.begin(), value.end(), [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-  });
 }
 struct TenantLine { std::string_view workerId, versionId, level, message; };
 std::optional<TenantLine> parseTenantLine(std::string_view json) {
@@ -490,9 +477,7 @@ public:
 
 private:
   struct Stream { int fd = -1; std::string partial; uint64_t discarded = 0; bool discarding = false; };
-  // `nonce`: what this generation's runtime announced first on its standard output; empty
-  // until then, and then no line of it is attributed to a Worker.
-  struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId, nonce; };
+  struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId; };
   struct Batch { uint32_t slot; uint64_t lines; std::string bytes; };
 
   // Reader thread: keeps every pipe empty whatever the sink does.
@@ -592,11 +577,10 @@ private:
     slot.openStreams.fetch_add(2, std::memory_order_relaxed);
     if (record.slot > shared.highestSlot.load(std::memory_order_relaxed))
       shared.highestSlot.store(record.slot, std::memory_order_release);
-    Source source{record.slot, record.generation, record.pid, {}, {}, {}};
+    Source source{record.slot, record.generation, record.pid, {}, {}};
     source.streams[0].fd = received[0];
     source.streams[1].fd = received[1];
     source.processId = std::string(record.processId, strnlen(record.processId, sizeof record.processId));
-    slot.tenantNonce.store(0, std::memory_order_relaxed);
     sources.push_back(std::move(source));
     {
       std::lock_guard lock(mutex);
@@ -727,40 +711,57 @@ private:
     wake.notify_one();
   }
 
-  // Reader thread: one whole line of a process that starts with '['. The runtime's nonce, first
-  // on its standard output, and the tenant lines that carry it.
-  void observe(Source& source, bool standardOutput, std::string_view line) {
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.remove_suffix(1);
-    auto& slot = shared.slots[source.slot];
-    if (line.starts_with(NONCE_PREFIX)) {
-      // {"processId":"<id>","processGeneration":<n>,"nonce":"<32 hex>"}; only the first counts.
-      if (!standardOutput || !source.nonce.empty()) return;
-      const std::string expected = "{\"processId\":\"" + source.processId + "\",\"processGeneration\":" +
-          std::to_string(source.generation) + ",\"nonce\":\"";
-      auto rest = line.substr(NONCE_PREFIX.size());
-      if (!rest.starts_with(expected) || rest.size() != expected.size() + NONCE_HEX + 2 || !rest.ends_with("\"}")) return;
-      const auto nonce = rest.substr(expected.size(), NONCE_HEX);
-      if (!hexNonce(nonce)) return;
-      source.nonce = std::string(nonce);
-      slot.tenantNonce.store(1, std::memory_order_relaxed);
-      return;
-    }
-    if (!line.starts_with(TENANT_PREFIX)) return;
-    auto rest = line.substr(TENANT_PREFIX.size());
-    unsigned char difference = source.nonce.empty() || rest.size() <= NONCE_HEX || rest[NONCE_HEX] != ' ' ? 1 : 0;
-    for (size_t i = 0; difference == 0 && i < NONCE_HEX; ++i) difference |= static_cast<unsigned char>(rest[i] ^ source.nonce[i]);
-    std::optional<TenantLine> parsed;
-    if (difference == 0) parsed = parseTenantLine(rest.substr(NONCE_HEX + 1));
-    if (!parsed) {
-      slot.tenantUnverified.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    slot.tenantLines.fetch_add(1, std::memory_order_relaxed);
-    tenants.add(source.processId, *parsed);
+  // Reader thread: one whole line of a process that starts with '['. Nothing a process writes on its standard output
+  // or error is a Worker's line -- those come from the node (an append request) -- so a line that looks like one is
+  // only counted.
+  void observe(Source& source, bool, std::string_view line) {
+    if (line.starts_with(TENANT_PREFIX)) shared.slots[source.slot].tenantUnverified.fetch_add(1, std::memory_order_relaxed);
   }
 
-  // Query thread: one request per descriptor, "<workerId> <after|-> <sinceUnixMs> <limit>\n";
-  // the answer is one JSON line, then the descriptor closes. Neither pipe draining nor the sink waits.
+  // Query thread: an append request's size, its first line and the lines after it ("!append <processId> <bytes>");
+  // 0 for every other request (one line).
+  static size_t appendBytes(std::string_view header) {
+    if (!header.starts_with("!append ")) return 0;
+    const auto space = header.rfind(' ');
+    uint64_t bytes = 0;
+    const auto digits = header.substr(space + 1);
+    if (digits.empty() || digits.size() > 9 || !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; }))
+      return 0;
+    for (char c : digits) bytes = bytes * 10 + static_cast<uint64_t>(c - '0');
+    return bytes <= OUTPUT_APPEND_MAX_BYTES ? static_cast<size_t>(bytes) : 0;
+  }
+  // "!append <processId> <bytes>\n" and that many bytes of tenant lines, one per line as parseTenantLine reads them:
+  // what the node received from that process's runtime over its source socket (node/main.c++). Counted for the
+  // process's slot.
+  std::string append(std::string_view header, std::string_view body) {
+    std::istringstream in{std::string(header.substr(1))};
+    std::string verb, processId, size;
+    in >> verb >> processId >> size;
+    if (processId.empty() || processId.size() > 15 || !std::all_of(processId.begin(), processId.end(), nameCharacter) ||
+        size != std::to_string(body.size()))
+      return "{\"error\":\"invalid append\"}";
+    uint64_t accepted = 0, refused = 0;
+    for (size_t at = 0; at < body.size();) {
+      auto end = body.find('\n', at);
+      if (end == std::string_view::npos) end = body.size();
+      const auto line = body.substr(at, end - at);
+      at = end + 1;
+      if (line.empty()) continue;
+      if (auto parsed = parseTenantLine(line)) { tenants.add(processId, *parsed); ++accepted; }
+      else ++refused;
+    }
+    {
+      std::lock_guard lock(mutex);
+      const auto highest = std::min<uint64_t>(shared.highestSlot.load(std::memory_order_acquire), OUTPUT_SLOTS - 1);
+      for (uint64_t i = 0; i <= highest; ++i)
+        if (names[i] == processId) { shared.slots[i].tenantLines.fetch_add(accepted, std::memory_order_relaxed); break; }
+    }
+    return "{\"ok\":true,\"accepted\":" + std::to_string(accepted) + ",\"refused\":" + std::to_string(refused) + "}";
+  }
+
+  // Query thread: one request per descriptor, "<workerId> <after|-> <sinceUnixMs> <limit>\n" (or a request of the
+  // node itself: "!quota", "!usage", "!append" with its lines); the answer is one JSON line, then the descriptor
+  // closes. Neither pipe draining nor the sink waits.
   void queryLoop() {
     for (;;) {
       int fd = -1;
@@ -789,12 +790,19 @@ private:
       }
     };
     std::string request;
-    char buffer[OUTPUT_QUERY_REQUEST_BYTES];
-    while (request.find('\n') == std::string::npos) {
-      const auto n = ::read(fd, buffer, sizeof buffer);
+    std::vector<char> buffer(OUTPUT_QUERY_READ_BYTES);
+    // The whole request's size, once its first line is known (an append's lines follow that line).
+    size_t whole = 0;
+    for (;;) {
+      if (!whole) {
+        if (const auto end = request.find('\n'); end != std::string::npos)
+          whole = end + 1 + appendBytes(std::string_view(request).substr(0, end));
+        else if (request.size() > OUTPUT_QUERY_REQUEST_BYTES) break;
+      }
+      if (whole && request.size() >= whole) break;
+      const auto n = ::read(fd, buffer.data(), buffer.size());
       if (n > 0) {
-        request.append(buffer, n);
-        if (request.size() > OUTPUT_QUERY_REQUEST_BYTES) break;
+        request.append(buffer.data(), n);
         continue;
       }
       if (n < 0 && errno == EINTR) continue;
@@ -802,11 +810,13 @@ private:
       break;
     }
     const auto end = request.find('\n');
-    if (end == std::string::npos) {
+    if (end == std::string::npos || (whole && request.size() < whole)) {
       shared.queryFailures.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    const auto text = tenants.query(std::string_view(request).substr(0, end)) + "\n";
+    const auto header = std::string_view(request).substr(0, end);
+    const auto text = (header.starts_with("!append ") ? append(header, std::string_view(request).substr(end + 1, whole - end - 1))
+        : tenants.query(header)) + "\n";
     size_t done = 0;
     while (done < text.size()) {
       const auto n = ::write(fd, text.data() + done, text.size() - done);
@@ -1126,7 +1136,7 @@ public:
     for (size_t r = 0; r < DROP_REASONS; ++r) out << (r ? "," : "") << '"' << DROP_NAMES[r] << "\":" << slot.droppedBy[r].load();
     out << "},\"firstDroppedAtUnixMs\":" << slot.firstDropUnixMs.load() << ",\"lastDroppedAtUnixMs\":" << slot.lastDropUnixMs.load()
         << ",\"reportedDroppedLines\":" << slot.reportedLines.load() << ",\"markerLines\":" << slot.markerLines.load()
-        << ",\"tenantLogNonce\":" << (slot.tenantNonce.load() ? "true" : "false") << ",\"tenantLines\":" << slot.tenantLines.load()
+        << ",\"tenantLines\":" << slot.tenantLines.load()
         << ",\"tenantUnverifiedLines\":" << slot.tenantUnverified.load() << "}";
     return out.str();
   }
@@ -1160,8 +1170,9 @@ public:
     return out.str();
   }
 
-  // A log query: a socket pair; the request on this end, the other end to the drainer with a
-  // query record (as an attach sends its pipes), the answer read to its end without blocking.
+  // A log query: a socket pair; the other end to the drainer with a query record (as an attach sends its pipes),
+  // then the request on this end and the answer read to its end, both without blocking (an append's lines may not
+  // fit an empty socket buffer, and the drainer reads them only once it holds its end).
   kj::Promise<std::string> workerLogs(kj::LowLevelAsyncIoProvider& provider, std::string request) {
     int pair[2];
     if (control < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
@@ -1169,8 +1180,6 @@ public:
       co_return co_await kj::Promise<std::string>(KJ_EXCEPTION(DISCONNECTED, "the workerd output reader is not available"));
     }
     for (int fd: pair) fcntl(fd, F_SETFD, FD_CLOEXEC);
-    // A few hundred bytes into an empty socket buffer: written at once.
-    const bool written = writeAll(pair[0], request.data(), request.size());
     AttachMessage record{};
     record.magic = OUTPUT_QUERY_MAGIC;
     iovec io{&record, sizeof record};
@@ -1187,7 +1196,7 @@ public:
     header->cmsg_len = CMSG_LEN(sizeof(int));
     std::memcpy(CMSG_DATA(header), &pair[1], sizeof(int));
     ssize_t sent = -1;
-    if (written) do sent = sendmsg(control, &message, OUTPUT_SEND_FLAGS); while (sent < 0 && errno == EINTR);
+    do sent = sendmsg(control, &message, OUTPUT_SEND_FLAGS); while (sent < 0 && errno == EINTR);
     ::close(pair[1]);
     if (sent != ssize_t(sizeof record)) {
       ::close(pair[0]);
@@ -1198,6 +1207,7 @@ public:
     }
     fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) | O_NONBLOCK);
     auto stream = provider.wrapSocketFd(pair[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+    co_await stream->write(kj::arrayPtr(request.data(), request.size()).asBytes());
     auto text = co_await stream->readAllText(64 << 20);
     co_return std::string(text.cStr(), text.size());
   }
@@ -1251,5 +1261,13 @@ kj::Promise<std::string> WorkerdOutput::tenantQuota(kj::LowLevelAsyncIoProvider&
 kj::Promise<std::string> WorkerdOutput::tenantLines(kj::LowLevelAsyncIoProvider& provider) {
   if (!active) return std::string("{\"tenants\":{}}");
   return active->workerLogs(provider, "!usage\n");
+}
+kj::Promise<std::string> WorkerdOutput::appendTenantLines(kj::LowLevelAsyncIoProvider& provider, const std::string& processId,
+    const std::string& lines) {
+  if (!active) return KJ_EXCEPTION(DISCONNECTED, "no workerd output reader in this mode");
+  KJ_REQUIRE(!processId.empty() && processId.size() <= 15 && std::all_of(processId.begin(), processId.end(), nameCharacter),
+      "invalid processId");
+  KJ_REQUIRE(lines.size() <= OUTPUT_APPEND_MAX_BYTES, "too many tenant log bytes in one append");
+  return active->workerLogs(provider, "!append " + processId + ' ' + std::to_string(lines.size()) + '\n' + lines);
 }
 }  // namespace coworkerd

@@ -25,8 +25,10 @@ std::string unbase64(const std::string& value);
 // etcd's authentication. One identity per process: the JSON file {"user":"...","password":"..."} that
 // COWORKERD_ETCD_CREDENTIALS_FILE names, else the one given to useEtcdCredentialsFile() (the configuration's
 // etcdCredentialsFile, ServerConfig::load). With one, every EtcdClient of the process authenticates
-// (/v3/auth/authenticate), sends its token with each request and watch, and authenticates again once when etcd
-// refuses the token (expired, or the auth store changed); without one, requests carry no credentials.
+// (/v3/auth/authenticate), sends its token with each request and watch, and authenticates again when etcd refuses
+// the token (expired, or the auth store changed) -- for a request at once, for a watch at its next attempt. Each
+// authentication reads the file again when it changed, and one that fails reads it again whatever its signature, so
+// a new password reaches a running process without a restart; without one, requests carry no credentials.
 // The file must be readable by its owner only. Errors name the file, never its content.
 struct EtcdCredentials {
   std::string user, password, file, origin;  // origin: "environment" or "configuration"

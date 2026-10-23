@@ -129,8 +129,43 @@ struct Cluster {
   }
 };
 
-// The class of an address: "" for a public one; "private-network" for an internal one, which only a tenant's
-// allowInternal opens; any other name is a denial nothing opens (docs/egress-and-auth.md, section 3).
+// The IPv4 addresses an IPv6 form carries, judged in its place: an IPv4-mapped address, NAT64's well-known prefix and
+// 6to4 carry one. The local-use NAT64 prefix 64:ff9b:1::/48 may carry one at any of the places RFC 6052 allows inside
+// it (a /48, /56, /64 or /96 translator prefix), and which one a translator uses is not known here, so every reading
+// whose other bits are as RFC 6052 requires -- bits 64 to 71 zero and the bits after the address zero -- counts, and
+// an address that reads as several is judged by all of them. None for any other address.
+std::vector<Address> carried(const Address& address) {
+  if (!address.v6) return {};
+  static const Range MAPPED = range("::ffff:0:0/96"), NAT64 = range("64:ff9b::/96"), LOCAL_NAT64 = range("64:ff9b:1::/48"),
+      SIX_TO_FOUR = range("2002::/16");
+  if (MAPPED.contains(address) || NAT64.contains(address)) return {v4At(address, 12)};
+  if (SIX_TO_FOUR.contains(address)) return {v4At(address, 2)};
+  if (!LOCAL_NAT64.contains(address)) return {};
+  if (address.bytes[8] != 0) return {};  // RFC 6052: the byte at bits 64 to 71 is zero in every embedding
+  std::vector<Address> inner;
+  // {the bytes of the address} with {the bytes that must be zero after it}, by translator prefix length.
+  static const std::vector<std::pair<std::array<int, 4>, std::array<int, 5>>> READINGS = {
+    {{6, 7, 9, 10}, {11, 12, 13, 14, 15}},   // /48
+    {{7, 9, 10, 11}, {12, 13, 14, 15, 8}},   // /56
+    {{9, 10, 11, 12}, {13, 14, 15, 8, 8}},   // /64
+    {{12, 13, 14, 15}, {8, 8, 8, 8, 8}},     // /96 (nothing follows it)
+  };
+  for (const auto& [bytes, zeroes] : READINGS) {
+    if (!std::all_of(zeroes.begin(), zeroes.end(), [&](int at) { return address.bytes[at] == 0; })) continue;
+    Address one;
+    for (size_t i = 0; i < bytes.size(); ++i) one.bytes[i] = address.bytes[bytes[i]];
+    if (std::find(inner.begin(), inner.end(), one) == inner.end()) inner.push_back(one);
+  }
+  return inner;
+}
+// What a destination address is judged as: the IPv4 addresses it carries, else itself.
+std::vector<Address> judged(const Address& address) {
+  auto inner = carried(address);
+  return inner.empty() ? std::vector<Address>{address} : inner;
+}
+
+// The class of an address (as judged()): "" for a public one; "private-network" for an internal one, which only a
+// tenant's allowInternal opens; any other name is a denial nothing opens (docs/egress-and-auth.md, section 3).
 std::string classify(const Address& address, const Cluster& cluster) {
   if (cluster.contains(address)) return "cluster";
   static const std::vector<std::pair<Range, const char*>> V4 = {
@@ -145,21 +180,30 @@ std::string classify(const Address& address, const Cluster& cluster) {
     {range("203.0.113.0/24"), "reserved"}, {range("192.88.99.0/24"), "reserved"}, {range("224.0.0.0/4"), "reserved"},
     {range("240.0.0.0/4"), "reserved"},
   };
+  // The clouds' IPv6 metadata services sit in the unique-local range, which allowInternal could otherwise open: Amazon
+  // EC2's instance metadata, DNS and time services, Compute Engine's, Akamai's (Linode) and Oracle Cloud's metadata.
   static const std::vector<std::pair<Range, const char*>> V6 = {
-    {range("fd00:ec2::254/128"), "metadata"}, {range("fd00:ec2::23/128"), "metadata"},
+    {range("fd00:ec2::254/128"), "metadata"}, {range("fd00:ec2::253/128"), "metadata"}, {range("fd00:ec2::123/128"), "metadata"},
+    {range("fd00:ec2::23/128"), "metadata"}, {range("fd20:ce::254/128"), "metadata"}, {range("fd00:a9fe:a9fe::1/128"), "metadata"},
+    {range("fd00:c1::a9fe:a9fe/128"), "metadata"},
     {range("::/128"), "unspecified"}, {range("::1/128"), "loopback"}, {range("fe80::/10"), "link-local"},
-    {range("fc00::/7"), "private-network"}, {range("fec0::/10"), "private-network"}, {range("64:ff9b:1::/48"), "private-network"},
-    {range("2001::/32"), "reserved"}, {range("2001:db8::/32"), "reserved"}, {range("100::/64"), "reserved"},
-    {range("ff00::/8"), "reserved"},
+    {range("fc00::/7"), "private-network"}, {range("fec0::/10"), "private-network"},
+    {range("2001::/32"), "reserved"}, {range("2001:db8::/32"), "reserved"}, {range("3fff::/20"), "reserved"},
+    {range("100::/64"), "reserved"}, {range("ff00::/8"), "reserved"},
   };
   if (!address.v6) {
     for (const auto& [r, name] : V4) if (r.contains(address)) return name;
     return "";
   }
-  // The IPv6 forms that carry an IPv4 address are judged as that address: mapped, NAT64's well-known prefix, 6to4.
-  static const Range MAPPED = range("::ffff:0:0/96"), NAT64 = range("64:ff9b::/96"), SIX_TO_FOUR = range("2002::/16");
-  if (MAPPED.contains(address) || NAT64.contains(address)) return classify(v4At(address, 12), cluster);
-  if (SIX_TO_FOUR.contains(address)) return classify(v4At(address, 2), cluster);
+  // An IPv6 form that carries an IPv4 address is classified by it (callers judge such addresses first).
+  if (auto inner = carried(address); !inner.empty()) {
+    std::string worst = "";
+    for (const auto& one : inner) {
+      auto name = classify(one, cluster);
+      if (!name.empty() && (worst.empty() || worst == "private-network")) worst = name;
+    }
+    return worst;
+  }
   for (const auto& [r, name] : V6) if (r.contains(address)) return name;
   // Outside 2000::/3, the global unicast space, nothing is public.
   if ((address.bytes[0] & 0xe0) != 0x20) return "reserved";
@@ -308,6 +352,26 @@ std::variant<Destination, std::string> parseDestination(const std::string& url) 
   else if (auto value = parsePort(port)) d.port = *value;
   else return std::string("url");
   return d;
+}
+
+// The host of a URL the destination parser refused, for the [egress] line: what follows the scheme up to the path,
+// without user information and port, lower case; "" when it is not a host name or address.
+std::string hostOf(const std::string& url) {
+  const auto scheme = url.find("://");
+  std::string rest = scheme == std::string::npos ? url : url.substr(scheme + 3);
+  rest = rest.substr(0, rest.find_first_of("/?#"));
+  if (const auto at = rest.rfind('@'); at != std::string::npos) rest = rest.substr(at + 1);
+  if (rest.starts_with('[')) {
+    const auto close = rest.find(']');
+    rest = close == std::string::npos ? std::string() : rest.substr(1, close - 1);
+  } else if (const auto colon = rest.rfind(':'); colon != std::string::npos) {
+    rest.resize(colon);
+  }
+  rest = lower(rest);
+  const bool plain = rest.size() <= MAX_HOST_BYTES && std::all_of(rest.begin(), rest.end(), [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' || c == ':';
+  });
+  return plain ? rest : std::string();
 }
 
 // Headers that belong to one connection (RFC 9110, section 7.6.1), or that KJ writes itself.
@@ -530,32 +594,72 @@ struct EgressService::Impl {
   }
 
   // ---- The policy ----
-  // "" when every address may be reached on this port; else the first rule that refuses.
-  std::string decide(const TenantRules* rules, const Destination& d, const std::vector<Address>& addresses) const {
+  // "" when every address may be reached on this port; else the first rule that refuses. Each address is judged as
+  // the IPv4 addresses it carries (judged()), each of which must pass: the tenant's deny first, then the built-in
+  // classes, then allowInternal for a private network, and allow or the default policy for a public address --
+  // allowInternal is the administrator's permission for internal destinations only. A rule written as an address or
+  // CIDR matches the address as given or as judged; a name or wildcard rule matches a request naming a host by that
+  // name, and an IP-literal URL by the addresses the rule stands for (`named`, ruleAddresses()).
+  std::string decide(const TenantRules* rules, const Destination& d, const std::vector<Address>& addresses,
+      const std::map<const Rule*, std::vector<Address>>& named = {}) const {
     static const TenantRules NONE;
     const auto& r = rules ? *rules : NONE;
-    for (const auto& address : addresses) {
-      for (const auto& rule : r.deny)
-        if ((!d.literal && rule.matchesName(d.host, d.port)) || rule.matchesAddress(address, d.port)) return "tenant-deny";
-      const auto builtIn = classify(address, cluster);
-      auto opens = [&](const std::vector<Rule>& list) {
-        return std::any_of(list.begin(), list.end(), [&](const Rule& rule) {
-          return (!d.literal && rule.matchesName(d.host, d.port)) || rule.matchesAddress(address, d.port);
-        });
-      };
-      if (builtIn == "private-network") {
-        if (opens(r.allowInternal)) continue;
-        return builtIn;
+    auto matches = [&](const Rule& rule, const Address& given, const Address& address) {
+      if (rule.port != 0 && rule.port != d.port) return false;
+      if (rule.kind == Rule::Kind::RANGE) return rule.addresses.contains(given) || rule.addresses.contains(address);
+      if (!d.literal) return rule.matchesName(d.host, d.port);
+      auto found = named.find(&rule);
+      return found != named.end() &&
+          std::any_of(found->second.begin(), found->second.end(), [&](const Address& a) { return a == given || a == address; });
+    };
+    auto any = [&](const std::vector<Rule>& list, const Address& given, const Address& address) {
+      return std::any_of(list.begin(), list.end(), [&](const Rule& rule) { return matches(rule, given, address); });
+    };
+    for (const auto& given : addresses) {
+      if (cluster.contains(given)) return "cluster";
+      for (const auto& address : judged(given)) {
+        if (any(r.deny, given, address)) return "tenant-deny";
+        const auto builtIn = classify(address, cluster);
+        if (builtIn == "private-network") {
+          if (any(r.allowInternal, given, address)) continue;
+          return builtIn;
+        }
+        if (!builtIn.empty()) return builtIn;
+        if (any(r.allow, given, address)) continue;
+        if (config.defaultPolicy == "public") {
+          if (std::find(config.publicPorts.begin(), config.publicPorts.end(), d.port) != config.publicPorts.end()) continue;
+          return "port";
+        }
+        return "default-deny";
       }
-      if (!builtIn.empty()) return builtIn;
-      if (opens(r.allow) || opens(r.allowInternal)) continue;
-      if (config.defaultPolicy == "public") {
-        if (std::find(config.publicPorts.begin(), config.publicPorts.end(), d.port) != config.publicPorts.end()) continue;
-        return "port";
-      }
-      return "default-deny";
     }
     return "";
+  }
+
+  // For an IP-literal URL, the addresses each name and wildcard rule of the tenant stands for: a name's own resolution
+  // (one that does not resolve stands for none), and for a wildcard the addresses of the names below it that this node
+  // resolved within egress.dnsCacheMs -- a domain's names cannot be listed, only the ones seen.
+  kj::Promise<std::map<const Rule*, std::vector<Address>>> ruleAddresses(const TenantRules& rules, kj::TimePoint deadline) {
+    std::map<const Rule*, std::vector<Address>> out;
+    std::vector<const Rule*> names;
+    const double now = monotonicTimeMs();
+    for (const auto* list : {&rules.deny, &rules.allow, &rules.allowInternal}) {
+      for (const auto& rule : *list) {
+        if (rule.kind == Rule::Kind::NAME) names.push_back(&rule);
+        if (rule.kind != Rule::Kind::SUFFIX) continue;
+        auto& addresses = out[&rule];
+        for (const auto& [host, entry] : dnsCache)
+          if (entry.second > now && host.size() > rule.name.size() && host.ends_with(rule.name))
+            addresses.insert(addresses.end(), entry.first.begin(), entry.first.end());
+      }
+    }
+    kj::Vector<kj::Promise<void>> lookups;
+    for (const auto* rule : names) {
+      lookups.add(timer.timeoutAt(deadline, resolve(rule->name)).then(
+          [&out, rule](std::vector<Address> addresses) { out[rule] = std::move(addresses); }, [](kj::Exception&&) {}));
+    }
+    co_await kj::joinPromises(lookups.releaseAsArray());
+    co_return out;
   }
 
   // ---- One exchange ----
@@ -702,7 +806,8 @@ struct EgressService::Impl {
     co_await fresh();
     auto parsed = parseDestination(url.cStr());
     if (auto* rule = std::get_if<std::string>(&parsed)) {
-      ex.host = std::string(url.cStr()).substr(0, 200);
+      // The host the URL names, never its user information, path or query.
+      ex.host = hostOf(url.cStr());
       co_return co_await refuse(response, ex, &counts, "EGRESS_DENIED", *rule, 403);
     }
     auto d = std::get<Destination>(kj::mv(parsed));
@@ -732,8 +837,11 @@ struct EgressService::Impl {
       }
       if (!failed.empty()) co_return co_await refuse(response, ex, &counts, "EGRESS_FAILED", failed, 502);
     }
+    // An IP-literal URL meets the tenant's name and wildcard rules through the addresses they stand for.
+    std::map<const Rule*, std::vector<Address>> named;
+    if (rules && d.literal) named = co_await ruleAddresses(*rules, deadline);
     // Every address the name has now is checked; the connection goes only to these.
-    if (auto refused = decide(rules, d, addresses); !refused.empty()) {
+    if (auto refused = decide(rules, d, addresses, named); !refused.empty()) {
       ex.address = addresses.front().text();
       co_return co_await refuse(response, ex, &counts, "EGRESS_DENIED", refused, 403);
     }

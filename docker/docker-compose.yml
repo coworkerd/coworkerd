@@ -24,7 +24,7 @@
 # addresses on ports 80 and 443, never the cluster's own). Settings: .env (see .env.example) or the environment.
 name: ${COWORKERD_PROJECT:-coworkerd}
 
-x-image: &image coworkerd:${COWORKERD_VERSION:-0.3.0}
+x-image: &image coworkerd:${COWORKERD_VERSION:-0.3.1}
 
 x-node: &node
   image: *image
@@ -90,13 +90,16 @@ services:
     depends_on:
       secrets:
         condition: service_completed_successfully
-    # Starts once the secrets step has written the S3 identities (the store reads them at its start).
+    # Starts once the secrets step has written the S3 identities and security.toml (the store reads them at its
+    # start). Only the S3 gateway listens on the container's network -- S3 itself, guarded by the identities'
+    # signatures, and its gRPC interface, which security.toml closes to everyone; the master, volume and filer servers
+    # listen on its loopback only, where the gateway reaches them.
     entrypoint:
       - /bin/sh
       - -c
       - >-
-        until [ -s /config/s3.json ]; do sleep 0.2; done;
-        exec /usr/bin/weed server -ip=127.0.0.1 -ip.bind=0.0.0.0 -dir=/data -volume.max=20
+        until [ -s /config/s3.json ] && [ -s /config/security.toml ]; do sleep 0.2; done;
+        cd /config && exec /usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=20
         -master.volumeSizeLimitMB=64 -s3 -s3.config=/config/s3.json
     volumes:
       - storage-data:/data

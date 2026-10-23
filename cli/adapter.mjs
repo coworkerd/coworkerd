@@ -59,6 +59,9 @@ const environmentName = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 // Local value files: kept out of the staged copy of a project (the build does not need them).
 const localValues = name => (name === ".dev.vars" || name.startsWith(".dev.vars.") || name === ".env" || name.startsWith(".env.")) &&
   !name.endsWith(".example");
+// What the staged copy leaves out (.git and the local value files, at any depth) is never a static asset either, and
+// never read, whichever Wrangler builds the project: a project's own Wrangler builds in the project itself.
+const leftOut = path => path.split("/").some(segment => segment === ".git" || localValues(segment));
 const blank = value => value === null || value === undefined ||
   (Array.isArray(value) ? value.length === 0 : typeof value === "object" && Object.values(value).every(blank));
 // Compared as JSON, as Wrangler compares a field with its default: fields left undefined are absent.
@@ -127,7 +130,7 @@ async function stage(projectDir, configPath, temporary) {
   if (relative(projectDir, configPath).split(sep)[0] === "..") throw new Error(`Configuration outside the project directory: ${configPath}`);
   const project = join(temporary, "stage", "project"), packages = join(temporary, "stage", "adapter", "node_modules");
   const copy = { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE };
-  await cp(projectDir, project, { ...copy, filter: source => basename(source) !== ".git" && !localValues(basename(source)) });
+  await cp(projectDir, project, { ...copy, filter: source => !leftOut(basename(source)) });
   await cp(dependencies, packages, copy);
   const bin = typeof pinned.bin === "string" ? pinned.bin : pinned.bin.wrangler;
   return { project, builder: { source: "adapter", version: pinned.version, packageDirectory: join(packages, "wrangler"), cli: resolve(packages, "wrangler", bin) } };
@@ -191,6 +194,7 @@ async function collectAssets(directory, limits) {
   let total = 0;
   for (const { filePath, contentType } of Object.values(assetsReverseMap)) {
     const path = "/" + filePath.split(sep).join("/");
+    if (leftOut(path)) continue;
     if (unsafeAssetPath(path)) throw new Error(`Unsafe static asset path: ${JSON.stringify(path)}`);
     const bytes = await readFile(join(directory, filePath));
     if (bytes.length > limits.maxFileBytes) throw new Error(`Static asset is larger than allowed: ${path} (${bytes.length} > ${limits.maxFileBytes} bytes)`);

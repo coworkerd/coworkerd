@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.3.1
+
+Isolation and consistency fixes found while the design documents were checked against the code, in the tenant
+boundaries and in the writes below a tenant. Upgrading is replacing the binaries and the image; nothing in etcd or
+object storage changes. Two changes to be aware of before you upgrade: a path route under the default host `*` now
+serves only the tenant that owns the request's hostname, and a path prefix matches whole path segments; and a node
+refuses to start when its configuration names a CPU or memory limit of `0`.
+
+- **A tenant's routes stay its own**: a request whose hostname belongs to a tenant is matched against that tenant's
+  routes only -- its hostname routes first, then its paths under the default host -- so no other tenant's route can
+  take a request to it. A path prefix matches at path-segment boundaries (`/acme` no longer takes `/acme-corp/...`),
+  the control plane writes a tenant's `/<tenant>` under `*` as `/<tenant>/`, and a hostname is compared in lower case
+  without a trailing dot.
+- **A Worker's log lines are its own**: they reach the node over the tail channel workerd gives each loaded Worker
+  under that Worker's own identity, so nothing tenant code can read or write decides whose lines they are. (Before, a
+  per-process marker was part of every tenant isolate.)
+- **With `egress.mode` `off`**, a tenant's `fetch()` is refused by the policy point (`EGRESS_DENIED: egress-off`)
+  instead of leaving the isolate without an outbound, so a throw after `passThroughOnException` fails that request
+  only, rather than ending the workerd process the tenants of that node share.
+- **Writes below a tenant and its deletion**: every write compares the tenant's record as it read it, a pointer flip
+  compares the version definition it names, and a tenant's deletion removes its routes and every key below its prefix
+  in one conditional transaction -- a write that began before the deletion can no longer leave a route, a pointer or a
+  Worker behind, and a node serves no tenant whose record is gone.
+- **An etcd password change** reaches a running component: every authentication reads the credentials file again when
+  it changed, and one that fails reads it again whatever its timestamp, so a watch that is the first to meet the new
+  password recovers without a restart.
+- **Egress policy**: `allowInternal` opens internal destinations only; a tenant's rules also apply to a URL that names
+  an IP address (by the addresses a name resolves to), and an IPv6 form carrying an IPv4 address is judged by that
+  address -- the local-use NAT64 prefix at every position RFC 6052 allows; the metadata class covers the other clouds'
+  IPv6 addresses and the IPv6 documentation range is no longer public; the `[egress]` log line's `host` field holds a
+  host name only; and every control plane announces its own addresses to every node, which refuse them like the rest
+  of the cluster's own (`egress.clusterAddresses` remains for what nobody announces).
+- **Packages**: a manifest's `packagePath` must be a relative path inside the package, and the asset quotas are read
+  from the package file it names.
+- **`cowctl`**: a project's local value files (`.env`, `.dev.vars` and their variants, at any depth) are never
+  published as static assets.
+- **workerd's environment**: a workerd process is given the variables it needs and nothing else of the node's own
+  environment -- the management token and object storage keys stay with the node.
+- **A limit of `0`** is refused in a node's configuration, in a tenant's default limits and in a Worker's own (it
+  turned culprit attribution, and with it the quarantine processes, off). `COWORKERD_CPU_LIMIT_MS` and
+  `COWORKERD_MEMORY_LIMIT_MIB` still turn a limit off deliberately, and the node says so at startup.
+- **compose**: the object store answers on its S3 interface only; its master, volume and filer servers listen on the
+  container's loopback, and the S3 gateway's own gRPC interface requires a client certificate nobody holds.
+- **Membership**: a member value a node cannot read is skipped and logged, and the other members -- and a node's
+  startup -- are unaffected.
+
 ## 0.3.0
 
 The first release, for Linux `amd64` and `arm64`, each as a package and a container image. One cluster serves one

@@ -88,6 +88,14 @@ std::string escape(const std::string& value) {
   }
   return result;
 }
+// The variables of the node's environment a workerd process inherits as they are: the locale, the time zone, the
+// search path and temporary directory, output colouring, and the switches workerd itself reads for tests. Every
+// other one stays with the node; the COWORKERD_* settings workerd reads are set for it by spawn().
+bool workerdInherits(std::string_view name) {
+  static constexpr std::string_view NAMES[] = {"PATH", "TZ", "LANG", "LANGUAGE", "TMPDIR", "NO_COLOR", "FORCE_COLOR",
+      "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST"};
+  return name.starts_with("LC_") || std::find(std::begin(NAMES), std::end(NAMES), name) != std::end(NAMES);
+}
 // Descriptor numbers each workerd inherits (see process-pool.h); the launcher's own two, which it
 // closes before workerd runs.
 constexpr int EVENT_FD = 3, LISTEN_FD = 4, LIFECYCLE_FD = 5, BAND_FD = 6;
@@ -1875,18 +1883,14 @@ public:
     sigaddset(&defaults, SIGTERM); sigaddset(&defaults, SIGINT);
     posix_spawnattr_setsigmask(&attr, &mask); posix_spawnattr_setsigdefault(&attr, &defaults);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    // Per-child configuration must not mutate the Server's environment.
+    // Per-child configuration must not mutate the Server's environment. workerd gets the variables below and the
+    // ones this node sets for it, nothing else of the node's environment: no management token, storage key or other
+    // credential the node was given reaches a workerd process (directly or through the launcher, which passes its
+    // environment on with PWD=/ added).
     std::vector<std::string> childEnvironment;
     for (char** entry = environ; *entry; ++entry) {
       std::string value(*entry);
-      if (value.starts_with("COWORKERD_CPU_LIMIT_MS=") || value.starts_with("COWORKERD_CPU_STATE=") ||
-          value.starts_with("COWORKERD_MEMORY_LIMIT_MIB=") ||
-          value.starts_with("COWORKERD_MEMORY_BAND_FILE=") || value.starts_with("COWORKERD_MEMORY_BAND_FD=") ||
-          value.starts_with("COWORKERD_EVENT_FD=") || value.starts_with("COWORKERD_LIFECYCLE_FD=") ||
-          value.starts_with("COWORKERD_IDLE_EVICT_MS=") || value.starts_with("COWORKERD_IDLE_DESTROY_INTERVAL_MS=") ||
-          value.starts_with("COWORKERD_SECCOMP_STEADY_MODE=") || value.starts_with("COWORKERD_SECCOMP_STEADY_FILE=") ||
-          value.starts_with("COWORKERD_NON_DUMPABLE=")) continue;
-      childEnvironment.push_back(std::move(value));
+      if (workerdInherits(value.substr(0, value.find('=')))) childEnvironment.push_back(std::move(value));
     }
     childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(config.cpuLimitMs));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));

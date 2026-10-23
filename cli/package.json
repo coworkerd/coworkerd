@@ -1,6 +1,6 @@
 {
   "name": "cowctl",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "cowctl: deploy a Wrangler project to a Coworkerd cluster through its control plane",
   "private": true,
   "type": "module",

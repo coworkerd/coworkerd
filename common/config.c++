@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <optional>
 #include <tuple>
 
@@ -116,6 +117,17 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
   result.processPool.cpuLimitMs = root.getCpuLimitMs();
   result.processPool.memoryLimitMiB = root.getMemoryLimitMiB();
+  // A limit of 0 leaves the isolates of this node without one, and with it the culprit a stuck or exhausted process
+  // names, the suspect it makes and the quarantine processes it would run in: a configuration file alone cannot turn a
+  // limit off, as a tenant's default limits and a Worker's own cannot be 0 either (common/tenancy.c++). The
+  // environment keeps its meaning -- a measurement, or an older case replayed with a limit off, asks for it there
+  // (COWORKERD_CPU_LIMIT_MS, COWORKERD_MEMORY_LIMIT_MIB) -- and the node says so at startup.
+  KJ_REQUIRE(result.processPool.cpuLimitMs > 0 || std::getenv("COWORKERD_CPU_LIMIT_MS") != nullptr,
+      "cpuLimitMs must be a positive number of milliseconds; 0 is refused (it would turn culprit attribution off; "
+      "COWORKERD_CPU_LIMIT_MS=0 asks for it deliberately)");
+  KJ_REQUIRE(result.processPool.memoryLimitMiB > 0 || std::getenv("COWORKERD_MEMORY_LIMIT_MIB") != nullptr,
+      "memoryLimitMiB must be a positive number of MiB; 0 is refused (it would turn culprit attribution off; "
+      "COWORKERD_MEMORY_LIMIT_MIB=0 asks for it deliberately)");
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
   result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();

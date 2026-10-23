@@ -481,8 +481,14 @@ DeploymentInput readDeploymentManifest(const std::filesystem::path& manifestPath
         for (auto rule : version.getAssets().getRunWorkerFirstRules()) value->assetsRunWorkerFirstRules.emplace_back(rule.cStr());
       }
       for (auto name : version.getSecrets()) value->secrets.emplace_back(name.cStr());
-      value->packagePath = version.getPackagePath().cStr();
-      if (!value->packagePath.empty() && value->packagePath.is_relative()) value->packagePath = manifestPath.parent_path() / value->packagePath;
+      // A version's own package file inside the package: a relative path below the manifest's directory, never an
+      // absolute one or one that leaves it through "..".
+      if (const std::filesystem::path given = version.getPackagePath().cStr(); !given.empty()) {
+        const auto normal = given.lexically_normal();
+        KJ_REQUIRE(given.is_relative() && !normal.empty() && *normal.begin() != ".." && normal != ".",
+            "packagePath must be a relative path inside the package (no absolute path, no ..)", given.string().c_str());
+        value->packagePath = manifestPath.parent_path() / normal;
+      }
       value->definitionHash = deploymentSha256(definitionEncoding(*value));
       validateDefinition(*value);
       KJ_REQUIRE(input.versions.emplace(value->key(), value).second, "duplicate Worker Version");
@@ -1152,16 +1158,32 @@ DeploymentState DeploymentState::fromInput(const DeploymentInput& input, uint64_
   return state;
 }
 
-DeploymentState::Selection DeploymentState::route(const std::string& host, const std::string& path) const {
+std::string requestHost(const std::string& host) {
+  std::string out = host;
+  for (auto& c : out) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  if (out.size() > 1 && out.back() == '.') out.pop_back();
+  return out;
+}
+
+std::string defaultHostPrefix(const std::string& tenant, const std::string& pathPrefix) {
+  return pathPrefix == "/" + tenant ? pathPrefix + "/" : pathPrefix;
+}
+
+DeploymentState::Selection DeploymentState::route(const std::string& rawHost, const std::string& path, const std::string* owner) const {
   Selection selection;
+  const auto host = requestHost(rawHost);
   if (host.find('/') != std::string::npos) return selection;
   for (auto length = slotLengths.rbegin(); length != slotLengths.rend(); ++length) {
     if (length->first > path.size()) continue;
     const auto prefix = path.substr(0, length->first);
+    // By path segments: the prefix is the whole path, ends with '/', or the path goes on with a new segment.
+    if (path.size() != prefix.size() && !prefix.ends_with('/') && path[prefix.size()] != '/') continue;
     for (const auto& candidate : {host, std::string("*")}) {
       auto found = routeMap.find(candidate + prefix);
       if (found == routeMap.end() || found->second.slotPrefix != prefix || found->second.slotHost != candidate) continue;
       const auto& route = found->second;
+      // A tenant's hostname is served by that tenant's routes only.
+      if (owner && !route.value.workerId.empty() && tenantOf(route.value.workerId) != *owner) continue;
       selection.routeKey = found->first;
       selection.workerId = route.value.workerId;
       if (!route.error.empty()) {
