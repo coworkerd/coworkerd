@@ -2,7 +2,7 @@
 #
 #   docker compose up -d --wait                     one node (node-1), etcd, the object store and the
 #                                                   control plane (apiserver, the API of cowctl)
-#   docker compose --profile cluster up -d --wait   three nodes (node-1..3), members through etcd
+#   docker compose --profile cluster up -d --wait   three nodes (node-1..3), members on the object store
 #   cowctl deploy                                    deploy a Wrangler project through the control plane
 #   docker compose run --rm tool upsert --manifest /work/manifest.json
 #                                                   deploy with the tool directly (the project directory:
@@ -17,11 +17,14 @@
 # (the object store's two identities, the management token unless COWORKERD_MANAGEMENT_TOKEN is set, the API's
 # administrator credential unless COWORKERD_ADMIN_CREDENTIAL is set, the cluster key the nodes sign their peer
 # connections with, etcd's users), one directory per service that reads them, and each service mounts only its own: a
-# node holds the store's read-only identity, its own etcd user and the cluster key; the control plane (and the tool)
+# node holds the store's node identity (it reads, and writes its membership under members/), its own etcd user and the
+# cluster key; the control plane (and the tool)
 # the deploy identity, its etcd user and the administrator's credential; etcd's root stays with init. Rotation:
 # docs/guide/install.md.
 # Tenant Workers reach the network through their node only (egress.* in the node's configuration; by default public
-# addresses on ports 80 and 443, never the cluster's own). Settings: .env (see .env.example) or the environment.
+# addresses on ports 80 and 443, never the cluster's own). The members live in the object store (heartbeats under
+# members/ in the bucket); COWORKERD_MEMBERSHIP_BACKEND=etcd keeps them in etcd instead. Settings: .env (see
+# .env.example) or the environment.
 name: ${COWORKERD_PROJECT:-coworkerd}
 
 x-image: &image coworkerd:${COWORKERD_VERSION:-0.3.1}
@@ -48,6 +51,7 @@ x-node: &node
 x-node-environment: &node-environment
   COWORKERD_ETCD_ENDPOINT: http://etcd:2379
   COWORKERD_STORAGE_ENDPOINT: http://storage:8333
+  COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
   COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
   COWORKERD_PROCESS_COUNT: ${COWORKERD_PROCESS_COUNT:-1}
 
@@ -84,7 +88,8 @@ services:
       start_interval: 1s
 
   storage:
-    image: chrislusf/seaweedfs:3.97@sha256:bb05d66d2963b1cc48073190781c3dd29e2c4c88a2ae2986bf58e38c86d89c6e
+    # 4.29 and later make create-if-absent hold under concurrency (the membership measures it at every start).
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     user: "10001:10001"
     restart: unless-stopped
     depends_on:
@@ -208,6 +213,7 @@ services:
     environment:
       COWORKERD_ETCD_ENDPOINT: http://etcd:2379
       COWORKERD_STORAGE_ENDPOINT: http://storage:8333
+      COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
       COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
       COWORKERD_ADMIN_CREDENTIAL: ${COWORKERD_ADMIN_CREDENTIAL:-}
     healthcheck:
@@ -231,6 +237,7 @@ services:
     environment:
       COWORKERD_ETCD_ENDPOINT: http://etcd:2379
       COWORKERD_STORAGE_ENDPOINT: http://storage:8333
+      COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
       COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
       COWORKERD_ADMIN_CREDENTIAL: ${COWORKERD_ADMIN_CREDENTIAL:-}
     volumes:

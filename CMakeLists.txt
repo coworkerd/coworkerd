@@ -82,6 +82,7 @@ target_link_libraries(kj-tls-local PUBLIC kj-async OpenSSL::SSL OpenSSL::Crypto)
 add_library(common STATIC
   common/etcd.c++
   common/object-store.c++
+  common/object-state.c++
   common/code-package.c++
   common/deployment.c++
   common/tenancy.c++

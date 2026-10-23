@@ -4,6 +4,7 @@
 #include "log-sink.h"
 #include "support.h"
 #include "membership.h"
+#include "object-state.h"
 #include "deployment.h"
 #include "desired-state.h"
 #include "object-store.h"
@@ -671,6 +672,8 @@ public:
   bool holdsEpoch(const std::string& candidate) const {
     return membership.view().heldEpochs.contains(candidate);
   }
+  // (objectStore) Past its TTL without a heartbeat written, by its own monotonic clock: the others drop this node.
+  bool selfExpired() const { return membership.view().selfExpired; }
 
   std::string invocationId(uint64_t sequence) const {
     return serverConfig.serverId + "." + membership.view().epoch +
@@ -696,8 +699,11 @@ public:
     // A member that announced its exit takes no new work. This Server, once draining,
     // ranks after every other candidate: only the trees it still runs place work here, and
     // only when no other Server takes it.
+    // (objectStore) So does this Server once its epoch expired by its own clock: the others drop it, and it takes
+    // no calls from them; what arrives at its ingress still executes here when no other member takes it.
+    const bool lastResort = drain.draining || membership.view().selfExpired;
     for (const auto& [id, member] : membership.view().members) {
-      if (id == serverConfig.serverId && drain.draining) self = true;
+      if (id == serverConfig.serverId && lastResort) self = true;
       else if (id == serverConfig.serverId || member.state != "draining") ids.push_back(id);
     }
     auto order = coworkerd::rendezvousOrder(workerId, ids);
@@ -3049,6 +3055,12 @@ public:
       reject(server.drainingRefusal(invocation.ingressRoot));
       co_return;
     }
+    if (server.selfExpired()) {
+      // The others drop this node: an invocation from one of them is refused before anything executes, and the
+      // sender places it elsewhere.
+      reject(server.refusal("PEER_UNAVAILABLE", "this node's membership expired (no heartbeat written for its TTL)"));
+      co_return;
+    }
     auto destinationEpoch = std::string(remote.getDestinationEpoch().cStr());
     if (!destinationEpoch.empty() && !server.holdsEpoch(destinationEpoch)) {
       reject(server.refusal("PEER_UNAVAILABLE", "target epoch changed before execution"));
@@ -4785,6 +4797,14 @@ public:
     co_await kj::Promise<void>(kj::NEVER_DONE);
   }
 
+  // (objectStore) Another process holds this node's id: the same drain, ending with exit code 3 (the supervisor
+  // restarts it, as a new epoch).
+  void identityTaken(std::string reason) {
+    exitCode = 3;
+    server.drainStep("identity-taken", "\"reason\":\"" + jsonEscape(cleanReason(reason)) + "\"");
+    begin("identity-taken");
+  }
+
   void begin(std::string trigger) {
     if (begun) return;
     begun = true;
@@ -4793,7 +4813,7 @@ public:
       auto& r = server.drainRecord();
       r.trigger = trigger; r.phase = "immediate";
       server.drainStep("immediate", "\"trigger\":\"" + jsonEscape(trigger) + "\"");
-      complete(0);
+      complete(exitCode);
       return;
     }
     startedAt = monotonicTimeMs();
@@ -4905,7 +4925,7 @@ private:
     // 5. Leave: the lease is revoked and the member key disappears at once.
     co_await membership.stop();
     r.phase = "closing-ingress";
-    r.exitCode = 0;
+    r.exitCode = exitCode;
     server.drainStep("revoked", "\"revokeStatus\":\"" + jsonEscape(membership.view().revokeStatus) + "\"");
     server.releaseDrainWaiters();
     // 6. The ingress closes while the event loop still runs, so that nothing a client sends is left
@@ -4922,7 +4942,7 @@ private:
     r.exitAtUnixMs = wallTimeMsForTest();
     server.drainStep("connections-closed");
     server.drainStep("exit", "\"record\":" + server.drainJson());
-    complete(0);
+    complete(exitCode);
   }
 
   kj::Promise<void> emergencyExit() {
@@ -4946,6 +4966,8 @@ private:
   static constexpr uint32_t CONNECTION_GRACE_MS = 100;
   double startedAt = 0;
   bool begun = false, emergencyBegun = false, completed = false;
+  // 0, or 3 once another process holds this node's id.
+  int exitCode = 0;
   kj::Own<kj::PromiseFulfiller<int>> finish;
   kj::ForkedPromise<int> finished = forkedFulfiller(finish);
   kj::Own<kj::PromiseFulfiller<void>> startFulfiller;
@@ -5043,8 +5065,9 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
       .lexically_normal().string();
   launch.listenAddress = c.listenAddress.empty() ? "0.0.0.0:8930" : c.listenAddress;
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
-  KJ_REQUIRE(c.membership.backend == "etcd" && c.desiredState.backend == "etcd",
-      "serve keeps membership and the deployment state in etcd: set etcdEndpoint");
+  KJ_REQUIRE((c.membership.backend == "etcd" || c.membership.backend == "objectStore") && c.desiredState.backend == "etcd",
+      "serve keeps the deployment state in etcd, and membership there or on the object store: set etcdEndpoint "
+      "(and membership.backend objectStore for the object store's)");
   KJ_REQUIRE(c.desiredState.objectStore.backend == "directory" || !c.desiredState.objectStore.endpoint.empty(),
       "serve needs the object store: set storage.endpoint");
   if (c.membership.advertisedAddress.empty()) {
@@ -5144,6 +5167,9 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"advertisedAddress\":" << q(m.advertisedAddress)
       << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"endpoint\":" << q(m.endpoint) << ",\"ttlSeconds\":" << m.ttlSeconds
       << ",\"requestTimeoutMs\":" << m.requestTimeoutMs << ",\"startupTimeoutMs\":" << m.startupTimeoutMs << ",\"retryMs\":" << m.retryMs
+      << (m.backend == "objectStore" ? ",\"heartbeatIntervalMs\":" + std::to_string(m.heartbeatIntervalMs) + ",\"listIntervalMs\":" +
+          std::to_string(m.listIntervalMs) + ",\"livenessGraceMs\":" + std::to_string(m.livenessGraceMs) + ",\"clockSkewToleranceMs\":" +
+          std::to_string(m.clockSkewToleranceMs) + ",\"createSettleMs\":" + std::to_string(m.createSettleMs) : std::string())
       << "},\"desiredState\":{\"backend\":" << q(d.backend) << ",\"endpoint\":" << q(d.endpoint)
       << ",\"codeDirectory\":" << q(d.codeDirectory.string()) << ",\"requestTimeoutMs\":" << d.requestTimeoutMs
       << ",\"startupTimeoutMs\":" << d.startupTimeoutMs << ",\"retryMs\":" << d.retryMs
@@ -5264,14 +5290,21 @@ int run(Launch launch) {
   std::cout << "[server] {\"event\":\"etcd-auth\",\"etcd\":" << coworkerd::etcdAuthJson() << "}" << std::endl;
   auto membership = coworkerd::newMembership(serverConfig.membership, serverConfig.serverId,
       serverConfig.peerListenAddress, serverConfig.peers,
-      io.provider->getNetwork(), timer, *headerTable);
+      io.provider->getNetwork(), timer, *headerTable, serverConfig.desiredState.objectStore);
+  // Suspects, tenants and usage stay in etcd (the deployment state's): with the members on the object store they get
+  // etcd's address from there.
+  auto etcdAuthority = serverConfig.membership;
+  if (etcdAuthority.backend == "objectStore") {
+    etcdAuthority.backend = "etcd";
+    etcdAuthority.endpoint = serverConfig.desiredState.endpoint;
+  }
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
       io.provider->getNetwork(), timer, *headerTable);
   const auto stackDirectory = launch.stackDirectory;
-  coworkerd::Suspects suspects(serverConfig.membership, serverConfig.serverId, serverConfig.suspectBaseMs,
+  coworkerd::Suspects suspects(etcdAuthority, serverConfig.serverId, serverConfig.suspectBaseMs,
       serverConfig.suspectMaxMs, io.provider->getNetwork(), timer, *headerTable);
   // The tenants' records: deletion, log quotas (handed to the log drainer), default limits.
-  coworkerd::TenantView tenantView(serverConfig.membership, io.provider->getNetwork(), timer, *headerTable);
+  coworkerd::TenantView tenantView(etcdAuthority, io.provider->getNetwork(), timer, *headerTable);
   struct QuotaTasks final: kj::TaskSet::ErrorHandler {
     void taskFailed(kj::Exception&& error) override {
       std::cerr << "[tenant] log quota not handed to the drainer: " << error.getDescription().cStr() << std::endl;
@@ -5320,7 +5353,7 @@ int run(Launch launch) {
       serverConfig.desiredState.objectStore.endpoint};
   for (const auto& [peerId, address] : serverConfig.peers) ownEndpoints.push_back(address);
   // Each tenant's usage here: rolled up per hour below this node's own prefix.
-  coworkerd::TenantUsage tenantUsage(serverConfig.usage, serverConfig.serverId, serverConfig.membership, io.provider->getNetwork(),
+  coworkerd::TenantUsage tenantUsage(serverConfig.usage, serverConfig.serverId, etcdAuthority, io.provider->getNetwork(),
       timer, *headerTable, {[&runtime]() { return runtime.takeCpuUsage(); }, [&runtime]() { return runtime.residentIsolatesByTenant(); },
       [&io]() { return coworkerd::WorkerdOutput::tenantLines(*io.lowLevelProvider); }});
   bool shuttingDown = false;
@@ -5370,6 +5403,8 @@ int run(Launch launch) {
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
   server.addStateSection("etcdAuth", []() { return coworkerd::etcdAuthJson(); });
+  if (membership->view().backend == "objectStore")
+    server.addStateSection("storage", [&membership]() { return membership->view().storageJson(); });
   HttpForwarder forwarder(server, httpOverCapnpFactory);
   TrialService trials(server, timer, httpOverCapnpFactory, *headerTable);
   WorkerLogsEndpoint workerLogs(server.placementConfig().serverId, *io.lowLevelProvider, timer, *headerTable);
@@ -5415,6 +5450,7 @@ int run(Launch launch) {
   }
   DrainController drain(server, runtime, *membership, timer, server.placementConfig().drainAnnounceDelayMsForTest,
       [&httpServer]() { return httpServer.drain(); });
+  membership->onIdentityTaken([&drain](std::string reason) { drain.identityTaken(std::move(reason)); });
 
   std::cout << "[server] ready http=" << launch.listenAddress
             << " binding-rpc=" << bindingSocketAddress
@@ -5526,6 +5562,41 @@ int runSelfCheck(const std::vector<std::string>& args) {
   } catch (const kj::Exception& error) {
     report("storage", false, ",\"backend\":\"" + jsonEscape(store.backend) + "\",\"endpoint\":\"" + jsonEscape(store.endpoint) +
         "\",\"bucket\":\"" + jsonEscape(store.bucket) + "\",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
+  }
+  // The membership's backend; on the object store also what the node's start needs: a listing of members/ (List)
+  // whose Date header is near this machine's clock, and a write and removal below the node's own prefix.
+  {
+    const auto& m = c.membership;
+    std::string fields = ",\"backend\":\"" + jsonEscape(m.backend) + "\",\"ttlSeconds\":" + std::to_string(m.ttlSeconds);
+    if (m.backend != "objectStore") {
+      report("membership", true, fields);
+    } else try {
+      fields += ",\"heartbeatIntervalMs\":" + std::to_string(m.heartbeatIntervalMs) + ",\"listIntervalMs\":" +
+          std::to_string(m.listIntervalMs) + ",\"livenessGraceMs\":" + std::to_string(m.livenessGraceMs) +
+          ",\"clockSkewToleranceMs\":" + std::to_string(m.clockSkewToleranceMs) + ",\"createSettleMs\":" + std::to_string(m.createSettleMs);
+      coworkerd::ObjectStore storage(store, io.provider->getNetwork(), timer);
+      coworkerd::ClockSample sample;
+      sample.sentUnixMs = coworkerd::realClockUnixMs();
+      auto listing = storage.list(coworkerd::MEMBERS_PREFIX).wait(io.waitScope);
+      sample.receivedUnixMs = coworkerd::realClockUnixMs();
+      sample.dateUnixMs = listing.dateUnixMs;
+      const auto clock = coworkerd::checkClock(sample, m.clockSkewToleranceMs);
+      const auto live = coworkerd::liveMembers(coworkerd::readMemberListing(listing), m.ttlSeconds, m.livenessGraceMs);
+      const auto key = coworkerd::memberProbePrefix(c.serverId) + "check-" + std::to_string(sample.sentUnixMs) + "-" +
+          std::to_string(getpid());
+      const auto created = storage.create(key, "coworkerd check --config\n").wait(io.waitScope);
+      storage.remove(key).wait(io.waitScope);
+      const bool clockOk = clock.readable && !clock.exceeds;
+      fields += ",\"liveMembers\":" + std::to_string(live.size()) + ",\"dateHeader\":" + (clock.readable ? "true" : "false") +
+          ",\"clockSkewMs\":" + std::to_string(clock.skewMs) + ",\"ownPrefixWritable\":" + (created.created ? "true" : "false");
+      if (!clockOk) fields += ",\"reason\":\"" + std::string(clock.readable
+          ? "this machine's clock differs from the object store's by more than membership.clockSkewToleranceMs: the node would refuse to start"
+          : "the object store's answers carry no Date header: the node would refuse to start") + "\"";
+      else if (!created.created) fields += ",\"reason\":\"a new key below members/" + jsonEscape(c.serverId) + "/ was reported as existing\"";
+      report("membership", clockOk && created.created, fields);
+    } catch (const kj::Exception& error) {
+      report("membership", false, fields + ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
+    }
   }
   const char* temporary = std::getenv("TMPDIR");
   std::string pattern = (fs::path(temporary && *temporary ? temporary : "/tmp") / "coworkerd-check-XXXXXX").string();

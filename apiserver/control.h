@@ -28,6 +28,10 @@ struct ControlContext {
   kj::Network& network;
   const kj::HttpHeaderTable& headers;
   std::string token;  // the nodes' management token (trial loads)
+  // The members trial loads go to: etcd's member keys, or (membership.backend objectStore) the heartbeats under
+  // members/ in `storage`, live within ttlSeconds + livenessGraceMs of the listing's Date.
+  bool membersOnObjectStore = false;
+  uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
 };
 
 // ---- deployment-tool.c++ ----

@@ -72,13 +72,19 @@ struct ProcessPoolConfig {
 };
 
 struct MembershipConfig {
-  std::string backend = "file";
+  std::string backend = "file";  // file, etcd or objectStore
   std::string endpoint;
   std::string advertisedAddress;
   uint32_t ttlSeconds = 15;
   uint32_t requestTimeoutMs = 750;
   uint32_t startupTimeoutMs = 15000;
   uint32_t retryMs = 250;
+  // objectStore (the schema's comments; validated by ServerConfig::load).
+  uint32_t heartbeatIntervalMs = 5000;
+  uint32_t listIntervalMs = 10000;
+  uint32_t livenessGraceMs = 10000;
+  uint32_t clockSkewToleranceMs = 2000;
+  uint32_t createSettleMs = 1000;
 };
 
 // The Workers' logs (ServerConfig.logs). The drainer keeps every tenant line it can attribute in

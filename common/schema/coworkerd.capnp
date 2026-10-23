@@ -119,12 +119,14 @@ struct ServerConfig {
   runtimePath @27 :Text;
   # The ingress. Default 0.0.0.0:8930. Serve only.
   listenAddress @28 :Text;
-  # Membership and the deployment state in etcd (sets both backends to etcd).
+  # The deployment state in etcd, and the membership too unless membership.backend says objectStore (sets the
+  # backends to etcd; membership.backend may name objectStore beside it).
   etcdEndpoint @29 :Text;
   # What other Servers dial for this one (membership.advertisedAddress); default
   # <hostname>:<port of peerListenAddress>, whose default is 0.0.0.0:8934 in serve.
   advertisedAddress @30 :Text;
-  # The object store of the code packages (sets desiredState.objectStore and its cache).
+  # The object store of the code packages (sets desiredState.objectStore and its cache), and of the members when
+  # membership.backend is objectStore.
   storage @31 :StorageConfig;
   # The management endpoints (/__coworkerd/ except ready and probe); COWORKERD_MANAGEMENT_TOKEN
   # overrides the token.
@@ -293,8 +295,8 @@ struct ServerConfig {
     endpoint @0 :Text;
     bucket @1 :Text = "coworkerd";
     region @2 :Text = "us-east-1";
-    # A JSON file {"accessKey":"...","secretKey":"..."} with the Servers' read-only identity;
-    # without one, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+    # A JSON file {"accessKey":"...","secretKey":"..."} with the Servers' identity: it reads, and with the objectStore
+    # membership also lists and writes members/<nodeId>/; without one, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
     credentialsFile @3 :Text;
     timeoutMs @4 :UInt32 = 30000;
     # The local package cache; default <stackDirectory>/cache.
@@ -381,13 +383,29 @@ struct PlacementConfig {
 }
 
 struct MembershipConfig {
+  # "file" (static peers), "etcd" (a key per node on an etcd lease, what etcdEndpoint sets) or "objectStore" (heartbeat
+  # objects and epoch registrations under members/ in the bucket of the storage block, which it needs; written with
+  # the node's storage identity).
   backend @0 :Text = "file";
   endpoint @1 :Text;
   advertisedAddress @2 :Text;
+  # etcd: the lease's TTL. objectStore: how old a heartbeat may be before its identity is free again (and, with
+  # livenessGraceMs, before the other members drop it); a node that wrote none for that long by its own monotonic
+  # clock takes no calls from other nodes and registers again with a new epoch.
   ttlSeconds @3 :UInt32 = 15;
   requestTimeoutMs @4 :UInt32 = 750;
   startupTimeoutMs @5 :UInt32 = 15000;
   retryMs @6 :UInt32 = 250;
+  # objectStore only. The heartbeat's interval (less than half of ttlSeconds), how often the members are listed, the
+  # grace beyond the TTL before a member whose heartbeat stopped is dropped (at least the heartbeat interval), the
+  # largest difference between this machine's clock and the store's Date header (more refuses the start; at runtime it
+  # is checked every minute and only warned of), and how long a new epoch's registration settles before it is read back
+  # (a registration that reads back another process's is lost).
+  heartbeatIntervalMs @7 :UInt32 = 5000;
+  listIntervalMs @8 :UInt32 = 10000;
+  livenessGraceMs @9 :UInt32 = 10000;
+  clockSkewToleranceMs @10 :UInt32 = 2000;
+  createSettleMs @11 :UInt32 = 1000;
 }
 
 struct DesiredStateConfig {

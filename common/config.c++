@@ -157,6 +157,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     membership.getBackend().cStr(), membership.getEndpoint().cStr(),
     membership.getAdvertisedAddress().cStr(), membership.getTtlSeconds(),
     membership.getRequestTimeoutMs(), membership.getStartupTimeoutMs(), membership.getRetryMs(),
+    membership.getHeartbeatIntervalMs(), membership.getListIntervalMs(), membership.getLivenessGraceMs(),
+    membership.getClockSkewToleranceMs(), membership.getCreateSettleMs(),
   };
   auto desired = root.getDesiredState();
   result.desiredState = {
@@ -221,13 +223,18 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   if (given({"etcdEndpoint"})) {
     const std::string endpoint = root.getEtcdEndpoint().cStr();
     KJ_REQUIRE(!endpoint.empty(), "etcdEndpoint is empty");
+    // The membership alone may live on the object store instead (membership.backend objectStore, written out):
+    // a configuration that does not say so keeps it in etcd, as before.
+    const bool objectStoreMembership = given({"membership", "backend"}) == std::optional<std::string>("objectStore");
     for (const char* name : {"membership", "desiredState"}) {
       auto backend = given({name, "backend"}), nested = given({name, "endpoint"});
-      KJ_REQUIRE(!backend || *backend == "etcd", "etcdEndpoint sets the backend to etcd", name);
+      KJ_REQUIRE(!backend || *backend == "etcd" || (objectStoreMembership && std::string_view(name) == "membership"),
+          "etcdEndpoint sets the backend to etcd", name);
       KJ_REQUIRE(!nested || *nested == endpoint, "etcdEndpoint and the endpoint differ", name);
     }
     result.etcdEndpoint = endpoint;
-    result.membership.backend = result.desiredState.backend = "etcd";
+    result.desiredState.backend = "etcd";
+    if (!objectStoreMembership) result.membership.backend = "etcd";
     result.membership.endpoint = result.desiredState.endpoint = endpoint;
   }
   if (given({"advertisedAddress"})) {
@@ -256,6 +263,24 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       result.desiredState.cache.maxBytes = storage.getCacheMaxBytes();
       if (given({"storage", "cacheDirectory"})) result.desiredState.cache.directory = storage.getCacheDirectory().cStr();
       else result.cacheFollowsStack = true;
+    }
+  }
+  // The membership's backend, and the object store's settings it needs (the schema's MembershipConfig).
+  {
+    const auto& m = result.membership;
+    KJ_REQUIRE(m.backend == "file" || m.backend == "etcd" || m.backend == "objectStore",
+        "membership.backend must be file, etcd or objectStore", m.backend.c_str());
+    if (m.backend == "objectStore") {
+      KJ_REQUIRE(given({"storage"}).has_value() && result.desiredState.objectStore.backend == "s3",
+          "membership.backend objectStore keeps the members in the object store: it needs the storage block");
+      KJ_REQUIRE(m.ttlSeconds >= 2 && m.ttlSeconds <= 86400, "membership.ttlSeconds must be 2 to 86400");
+      KJ_REQUIRE(m.heartbeatIntervalMs > 0 && uint64_t(m.heartbeatIntervalMs) * 2 < uint64_t(m.ttlSeconds) * 1000,
+          "membership.heartbeatIntervalMs must be positive and less than half of ttlSeconds");
+      KJ_REQUIRE(m.livenessGraceMs >= m.heartbeatIntervalMs, "membership.livenessGraceMs must be at least heartbeatIntervalMs");
+      KJ_REQUIRE(m.listIntervalMs > 0, "membership.listIntervalMs must be positive");
+      KJ_REQUIRE(m.clockSkewToleranceMs > 0, "membership.clockSkewToleranceMs must be positive");
+      KJ_REQUIRE(m.createSettleMs <= 60000, "membership.createSettleMs must be at most 60000");
+      KJ_REQUIRE(m.startupTimeoutMs > 0 && m.retryMs > 0, "membership timeouts must be positive");
     }
   }
   if (given({"management", "token"})) {

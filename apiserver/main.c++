@@ -7,6 +7,7 @@
 #include "log-cleaning.h"
 #include "log-sink.h"
 #include "object-store.h"
+#include "object-state.h"
 #include "support.h"
 
 #include <capnp/compat/byte-stream.h>
@@ -218,6 +219,9 @@ struct ControlSettings {
   uint32_t serverTimeoutMs = 2000;
   uint64_t startedAtUnixMs = 0;
   std::string instance;
+  // The members: etcd's member keys, or (membership.backend objectStore) the heartbeats under members/ in the bucket.
+  bool membersOnObjectStore = false;
+  uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
 };
 
 // A path segment of the API: a deployment name (letters, digits, '-', '_' and '.').
@@ -362,7 +366,8 @@ public:
   ControlService(const ControlSettings& settings, coworkerd::EtcdClient& etcd, coworkerd::ObjectStore& storage,
       kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
       : settings(settings), etcd(etcd), storage(storage), timer(timer), network(network), headerTable(headerTable),
-        context{etcd, storage, timer, network, headerTable, settings.token} {}
+        context{etcd, storage, timer, network, headerTable, settings.token, settings.membersOnObjectStore,
+            settings.memberTtlSeconds, settings.memberGraceMs} {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body, Response& response) override {
@@ -754,9 +759,20 @@ private:
     co_return co_await methodNotAllowed(response, "PUT, GET, DELETE");
   }
 
-  // The members (etcd: /coworkerd/v2/nodes/<nodeId>) and what each one's state endpoint says, in parallel.
-  struct Member { std::string id, address, state, epoch; uint64_t startedAtUnixMs = 0; };
+  // The members (etcd: /coworkerd/v2/nodes/<nodeId>; objectStore: the live heartbeats under members/, each one's address
+  // read once per epoch) and what each one's state endpoint says, in parallel.
+  struct Member { std::string id, address, state, epoch; uint64_t startedAtUnixMs = 0; int64_t heartbeatAgeMs = -1; };
+  coworkerd::StoreMemberCache memberRecords;
   kj::Promise<std::vector<Member>> members() {
+    if (settings.membersOnObjectStore) {
+      std::vector<Member> result;
+      for (auto& member : co_await coworkerd::readStoreMembers(storage, settings.memberTtlSeconds, settings.memberGraceMs, &memberRecords)) {
+        if (!controlName(member.id)) continue;
+        result.push_back({member.id, member.address, member.state, std::to_string(member.epoch), member.startedAtUnixMs,
+            member.heartbeatAgeMs});
+      }
+      co_return result;
+    }
     const std::string prefix = coworkerd::NODES_PREFIX;
     auto raw = co_await etcd.range(prefix);
     std::vector<Member> result;
@@ -848,7 +864,9 @@ private:
     std::string out = "{\"nodeId\":\"" + jsonEscape(member.id) + "\",\"state\":\"" + jsonEscape(member.state) + "\",\"reachable\":" +
         (state.ok ? "true" : "false");
     if (!tenantView) out += ",\"address\":\"" + jsonEscape(member.address) + "\",\"epoch\":\"" + jsonEscape(member.epoch) +
-        "\",\"startedAtUnixMs\":" + std::to_string(member.startedAtUnixMs);
+        "\",\"startedAtUnixMs\":" + std::to_string(member.startedAtUnixMs) + ",\"backend\":\"" +
+        (settings.membersOnObjectStore ? "objectStore" : "etcd") + "\",\"lastHeartbeatAgeMs\":" +
+        (member.heartbeatAgeMs >= 0 ? std::to_string(member.heartbeatAgeMs) : std::string("null"));
     if (!state.ok) return out + (tenantView ? "}" : ",\"problem\":\"" + jsonEscape(state.error) + "\"}");
     try {
       capnp::MallocMessageBuilder message;
@@ -1218,6 +1236,9 @@ int runControlPlane(const std::vector<std::string>& args) {
       "the control plane publishes code packages: set storage.endpoint (and storage.credentialsFile, the deploy identity)");
   settings.etcdEndpoint = config.etcdEndpoint;
   settings.storage = config.desiredState.objectStore;
+  settings.membersOnObjectStore = config.membership.backend == "objectStore";
+  settings.memberTtlSeconds = config.membership.ttlSeconds;
+  settings.memberGraceMs = config.membership.livenessGraceMs;
   settings.storageCredentials = !config.storageCredentialsFile.empty() ? "file" : !settings.storage.accessKey.empty() ? "inline"
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   settings.listenAddress = config.controlListenAddress.empty() ? "0.0.0.0:8940" : config.controlListenAddress;
@@ -1274,7 +1295,9 @@ int runControlPlane(const std::vector<std::string>& args) {
             << settings.adminSource << "\",\"managementToken\":\"" << (settings.token.empty() ? "unset" : "set") << "\",\"tokenSource\":\""
             << settings.tokenSource << "\",\"pathRouting\":" << (settings.pathRouting ? "true" : "false")
             << ",\"temporaryDirectory\":\"" << jsonEscape(settings.temporaryDirectory.string())
-            << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs << "}" << std::endl;
+            << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs
+            << ",\"membership\":{\"backend\":\"" << (settings.membersOnObjectStore ? "objectStore" : "etcd") << "\",\"ttlSeconds\":"
+            << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "}}" << std::endl;
   std::cout << "[control] ready http=" << settings.listenAddress << std::endl;
   auto stop = io.unixEventPort.onSignal(SIGTERM).exclusiveJoin(io.unixEventPort.onSignal(SIGINT));
   const auto announced = controlAddresses(settings.listenAddress);

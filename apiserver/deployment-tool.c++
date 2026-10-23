@@ -2,6 +2,7 @@
 #include "deployment.h"
 #include "coworkerd.capnp.h"
 #include "object-store.h"
+#include "object-state.h"
 #include "code-package.h"
 #include "support.h"
 
@@ -194,6 +195,11 @@ struct ToolOptions {
   std::string trialServer;
   uint32_t trialTimeoutMs = 5000;
   std::map<std::string, std::string> trialAddressMap;
+  // Where the members are: etcd's member keys, or (--membership objectStore; the control plane's membership.backend)
+  // the heartbeats under members/ in `memberStore`, live within the TTL and grace of the listing's Date.
+  bool membersOnObjectStore = false;
+  uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
+  ObjectStore* memberStore = nullptr;
   // The Servers' management token, sent with every trial load: --token, else
   // COWORKERD_MANAGEMENT_TOKEN.
   std::string token;
@@ -624,8 +630,16 @@ kj::Promise<TrialAttempt> postTrial(TrialContext& context, kj::Timer& timer, std
 
 struct TrialMember { std::string id, address; };
 
-// The cluster's nodes (their member keys /coworkerd/v2/nodes/<nodeId>; the keys below one are its records).
-kj::Promise<std::vector<TrialMember>> trialMembers(EtcdClient& client) {
+// The cluster's nodes: their member keys /coworkerd/v2/nodes/<nodeId> (the keys below one are its records), or the live
+// heartbeats on the object store.
+kj::Promise<std::vector<TrialMember>> trialMembers(EtcdClient& client, const ToolOptions& options) {
+  if (options.membersOnObjectStore) {
+    KJ_REQUIRE(options.memberStore != nullptr, "the object store's members need the object store (--storage-endpoint)");
+    std::vector<TrialMember> live;
+    for (auto& member : co_await readStoreMembers(*options.memberStore, options.memberTtlSeconds, options.memberGraceMs))
+      live.push_back({member.id, member.address});
+    co_return live;
+  }
   const std::string prefix = NODES_PREFIX;
   auto raw = co_await client.range(prefix);
   std::vector<TrialMember> members;
@@ -686,7 +700,7 @@ kj::Promise<void> runTrials(EtcdClient& client, kj::Timer& timer, TrialContext& 
   }
   std::vector<TrialMember> members;
   if (!options.trialServer.empty()) members.push_back({"", options.trialServer});
-  else if (!versions.empty()) members = co_await trialMembers(client);
+  else if (!versions.empty()) members = co_await trialMembers(client, options);
   auto fail = [&](const std::string& reason, const std::string& record) {
     out << "{\"operation\":\"" << operation << "\",\"flipped\":false,\"trial\":{\"enabled\":true,\"server\":"
         << (options.trialServer.empty() ? std::string("\"members\"") : quote(options.trialServer))
@@ -1187,11 +1201,15 @@ std::string controlFailure(const kj::Exception& error, const std::string& printe
   return "{\"ok\":false,\"kind\":\"" + std::string(kind) + "\",\"reason\":" + quote(reason) +
       ",\"record\":" + (record.starts_with("{") ? record : std::string("null")) + '}';
 }
-ToolOptions controlOptions(const std::string& token) {
+ToolOptions controlOptions(ControlContext& context) {
   ToolOptions options;
   options.controlPlane = true;
   options.maxRetries = 8;
-  options.token = token;
+  options.token = context.token;
+  options.membersOnObjectStore = context.membersOnObjectStore;
+  options.memberTtlSeconds = context.memberTtlSeconds;
+  options.memberGraceMs = context.memberGraceMs;
+  options.memberStore = &context.storage;
   return options;
 }
 }  // namespace
@@ -1292,7 +1310,7 @@ kj::Promise<std::string> controlDeploy(ControlContext& context, std::filesystem:
       refuse("the package's manifest must name " + versionId + " as the active version of Worker " + workerId);
     for (const auto& route : input.routes)
       if (route.workerId != workerId) refuse("the package's routes may only name Worker " + workerId);
-    auto options = controlOptions(context.token);
+    auto options = controlOptions(context);
     options.tenant = tenant;
     options.manifest = manifest;
     options.publishOnly = !activate;
@@ -1325,7 +1343,7 @@ kj::Promise<std::string> controlActivate(ControlContext& context, std::string wo
             ",\"versionId\":" + quote(versionId) + ",\"readRevision\":\"" + std::to_string(raw.revision) + "\"}");
       }
     }
-    auto options = controlOptions(context.token);
+    auto options = controlOptions(context);
     options.tenant = tenantOf(workerId);
     options.activation = ToolOptions::Activation{workerId, versionId, routes};
     TrialContext trials{context.network, context.headers, context.token};
@@ -1341,7 +1359,7 @@ kj::Promise<std::string> controlRemove(ControlContext& context, std::string work
   std::ostringstream out;
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId");
-    auto options = controlOptions(context.token);
+    auto options = controlOptions(context);
     options.tenant = tenantOf(workerId);
     options.workers = {workerId};
     TrialContext trials{context.network, context.headers, context.token};
@@ -1647,7 +1665,8 @@ kj::Promise<std::string> controlDeleteTenantState(ControlContext& context, std::
 int runDeploymentTool(int argc, char** argv) {
   KJ_REQUIRE(argc > 0, "usage: coworkerd-apiserver tool <apply|upsert|remove|show|compile> --endpoint URL "
       "[--tenant T] [--manifest PATH] [--worker ID]... [--no-trial | --trial-server URL] [--trial-timeout-ms N] "
-      "[--trial-address-map ADVERTISED=DIALED]... [--token TOKEN], or coworkerd-apiserver tool secret <put|delete|list> ..., "
+      "[--trial-address-map ADVERTISED=DIALED]... [--membership etcd|objectStore [--membership-ttl-seconds N] "
+      "[--membership-grace-ms N]] [--token TOKEN], or coworkerd-apiserver tool secret <put|delete|list> ..., "
       "or coworkerd-apiserver tool etcd-auth ...");
   const std::string operation = argv[0];
   // Its own parser: no argument of a secret command is ever echoed.
@@ -1675,6 +1694,15 @@ int runDeploymentTool(int argc, char** argv) {
     if (flag == "--no-trial") { options.trial = false; --index; continue; }
     KJ_REQUIRE(index + 1 < argc, "missing deployment option value", argv[index]);
     if (flag == "--endpoint") endpoint = argv[index + 1];
+    else if (flag == "--membership") {
+      const std::string backend = argv[index + 1];
+      KJ_REQUIRE(backend == "etcd" || backend == "objectStore", "--membership takes etcd or objectStore", argv[index + 1]);
+      options.membersOnObjectStore = backend == "objectStore";
+    }
+    else if (flag == "--membership-ttl-seconds")
+      options.memberTtlSeconds = static_cast<uint32_t>(number(argv[index + 1], 86400, "membership-ttl-seconds"));
+    else if (flag == "--membership-grace-ms")
+      options.memberGraceMs = static_cast<uint32_t>(number(argv[index + 1], 3600000, "membership-grace-ms"));
     else if (flag == "--tenant") {
       // The tenant whose Workers the manifest names; without it, the default tenant.
       options.tenant = argv[index + 1];
@@ -1744,6 +1772,7 @@ int runDeploymentTool(int argc, char** argv) {
     // apply keeps the original whole-state contract: a conflict fails without retry.
     options.maxRetries = maxRetries.value_or(operation == "apply" ? 0 : 8);
     ObjectStore storage(objectConfig, io.provider->getNetwork(), io.provider->getTimer());
+    options.memberStore = &storage;
     TrialContext trials{io.provider->getNetwork(), *headers, options.token};
     write(operation == "apply" ? Operation::APPLY : Operation::UPSERT, client, io.provider->getTimer(), &storage, options, trials,
         std::cout).wait(io.waitScope);
