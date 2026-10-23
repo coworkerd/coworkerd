@@ -51,4 +51,5 @@ The export is deterministic (no commit hashes, signatures or statistics): export
 same files. A new series also needs the compatibility flags the node accepts regenerated
 (`python3 scripts/compatibility-flags.py`, into `common/generated/`), new workerd builds for both architectures,
 their system call allowlists (`scripts/syscall-profile.mjs`, then `scripts/syscall-allowlist.py`) and the pinned
-hashes in `scripts/release.sh`. [docs/upstream-sync.md](../docs/upstream-sync.md) describes how a sync is checked.
+hashes in `scripts/release.sh`. `check` is the source side of checking a sync: the checkout differs from the tag in
+`UPSTREAM` by exactly the series, and only under `src/workerd/server/`.

@@ -1,94 +1,114 @@
-# Control plane API, first version: tenants, /v1, credentials, a single write path
+# Control plane API
 
-> Premises: the positioning in [components and boundaries](components.md). One cluster serves one platform, and the platform is the only administrator; the resource model has two levels, **tenant -> Worker**.
-> Unchanged foundations: the per-Worker incremental deployment of [cluster state](cluster-state.md) section 10 (immutable definitions, identified by hash, publish before flipping, validity per Worker) and the rule "one call tree sees only one deployment state". Tenants add a layer of ownership and accounting on top of them and do not change them.
+This document is for platform engineers who integrate with Coworkerd and for contributors to the control plane: the resource model, the `/v1` endpoints, credentials and scopes, quotas and limits and where each is enforced, what uploading, activating, rolling back and deleting mean, routes and hostnames, how secrets are stored, how usage and logs are gathered, and what the version promise is. The error codes are listed in [error codes](guide/errors.md), section 2; the command line that uses this API is in the [quickstart](guide/quickstart.md).
 
-## 1. Resource model
+## 1. Resources
 
-| Resource | Identifier | Contents | Who may change it |
+One cluster serves one platform, and the platform is its only administrator. Resources have two levels, **tenant -> Worker**; versions, routes and secrets belong to a Worker, and a Worker's full name is `tenant/Worker`.
+
+| Resource | Identifier | Holds | Changed by |
 | --- | --- | --- | --- |
-| Tenant `tenant` | `[a-z0-9][a-z0-9-]{0,62}`, unique in the cluster | Quotas; owned hostnames; creation time; state (`active`, `deleting`) | The administrator |
-| Credential `credential` | `keyId`; the value is returned once, at creation, and etcd stores only its hash | Scope: `admin` or `tenant:<t>`; an optional expiry; revocation | Created by the administrator; revoked by the administrator, and by a tenant for its own |
-| Worker | `<tenant>/<worker>`, `worker` being `[a-z0-9][a-z0-9-]{0,62}` | Versions (immutable), the active version pointer, routes, secrets, Worker-level limits (CPU milliseconds, memory MiB, defaulting to the tenant's defaults) | That tenant's credentials and the administrator |
-| Version | `<tenant>/<worker>/<version>` | The code bundle and static assets (object storage), the definition (compatibility date and flags, variables, bindings, declared secret names), the definition hash | As above; only created and deleted (when inactive), never overwritten |
-| Route | A key derived from `(host, pathPrefix)` | Points to one Worker; the hostname must be owned by the tenant, or be a path starting with `/<tenant>/` under the cluster's default host | As above |
-| Secret | `<tenant>/<worker>/<name>` | The value. **Worker secrets are stored in etcd unencrypted in 0.3.0** (the record is `{"value":…,"setAtUnixMs":…}`); reading them requires etcd authentication and the role of the apiserver or of a node; encryption at rest is a known limitation planned for 0.4. | As above |
-| Node `node` | `nodeId`, a configuration entry | Membership lease, runtime state, per-tenant usage roll-ups | Written by the node itself; read by the administrator |
+| Tenant | 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit, neither `routes` nor `generation`, unique in the cluster | State (`active`, `deleting`), quotas, hostnames, default Worker limits | The administrator |
+| Tenant credential | `keyId`, 16 hexadecimal characters | Its scope, one tenant; an optional expiry; whether it is revoked | Created by the administrator; revoked by the administrator, or by the tenant itself |
+| Worker | `<tenant>/<worker>`, a name of the same characters and length as a tenant's | Versions, the active version, routes, secrets, the Worker's CPU and memory limits | The tenant and the administrator |
+| Version | `<tenant>/<worker>/<version>` | The package in object storage and the definition (compatibility date and flags, variables, Bindings, declared secret names), identified by the definition's hash | Uploaded and deleted, never changed |
+| Route | Its host and path prefix | The Worker it points to | The tenant and the administrator |
+| Secret | `<tenant>/<worker>/<name>` | A value | The tenant and the administrator |
 
-There is no "owner" level: the multi-platform case is simply one credential with several `tenant:` scopes, and a list of scopes can be added then.
+There is no level above the tenant: a platform that serves other platforms gives each of them tenants of its own. A Worker's Service Bindings may point only to Workers of the same tenant.
 
-**Bindings only within a tenant**: the target of a Worker's Service Binding must be a Worker of the same tenant (authorization across tenants comes later). The properties of the closure, version locking and trial loads stay the same; resolving the target just takes the tenant along.
+## 2. The `/v1` API
 
-**Suspects per tenant**: the quarantine processes' suspect marking is per tenant -- once any Worker of a tenant is identified as a culprit, the culprit is the tenant: all of that tenant's Workers go into the quarantine processes together, sharded by the tenant's hash, until the observation period has passed. The tenant model gives suspect marking the right scope. The neighbour protection holds only for other tenants: the tenant's other Workers follow the culprit, by design.
-
-## 2. The /v1 API
-
-**Authentication**: every `/v1/` request carries `Authorization: Bearer <credential>`; the admin credential is generated by compose's `secrets` step (shown by `docker compose run --rm tool admin-credential`), and on bare metal it is written into `apiserver`'s configuration or `COWORKERD_ADMIN_CREDENTIAL`; tenant credentials are created by the administrator. Errors: `401 UNAUTHORIZED` (none or wrong), `403 FORBIDDEN` (scope not enough).
+Every request carries `Authorization: Bearer <credential>`. Answers are JSON, apart from the log stream (section 10); an error is `{"code","reason"}` with a cleaned reason.
 
 | Method and path | Scope | Purpose |
 | --- | --- | --- |
-| `GET /v1/status` | Any | The cluster: nodes, versions, apiserver instances |
-| `GET /v1/nodes`, `GET /v1/nodes/{node}` | Administrator | A summary of each node's state endpoint (processes, sandbox, rotation, usage) |
-| `POST /v1/tenants`, `GET /v1/tenants`, `GET/PATCH/DELETE /v1/tenants/{t}` | Administrator | Create, list, show, change quotas and hostnames, delete (cascading, see section 5) |
-| `POST /v1/tenants/{t}/credentials`, `GET ...`, `DELETE .../{keyId}` | The administrator creates and lists; a tenant may only revoke its own | Tenant-scoped credentials |
-| `GET /v1/tenants/{t}` | Tenant | Its own quotas, hostnames, usage summary |
-| `GET /v1/tenants/{t}/workers`, `GET/DELETE /v1/tenants/{t}/workers/{w}` | Tenant | List, show (active version, routes, secret names, limits), remove (versions are kept; deploying again restores it) |
-| `PUT /v1/tenants/{t}/workers/{w}/versions/{v}` | Tenant | Upload a bundle and trial-load it (it exists only if it loads); `?activate=true` switches to it as well |
-| `POST /v1/tenants/{t}/workers/{w}/versions/{v}:activate` | Tenant | Switch the active version (rollback is this too) |
-| `DELETE /v1/tenants/{t}/workers/{w}/versions/{v}` | Tenant | Delete an inactive version (including the bundle in object storage, section 5) |
-| `PUT /v1/tenants/{t}/workers/{w}/routes` | Tenant | Replace this Worker's routes as a whole; hostname ownership is checked here |
-| `PUT/GET/DELETE /v1/tenants/{t}/workers/{w}/secrets/{name}`, `GET .../secrets` | Tenant | Secrets; `GET` returns only names and lengths |
-| `PATCH /v1/tenants/{t}/workers/{w}` | Tenant (the limits may not exceed the tenant's quota) | Worker-level CPU and memory limits |
-| `GET /v1/tenants/{t}/workers/{w}/logs[?follow]` | Tenant | The log API, scoped to the tenant |
-| `GET /v1/tenants/{t}/usage?from&to&by=hour` | Tenant and administrator | Hourly usage rows: requests, CPU milliseconds, egress bytes, log lines, isolate time |
+| `GET /v1/status` | Any credential | The answering control plane, the caller, and every node, reduced for tenants |
+| `GET /v1/nodes`, `GET /v1/nodes/{node}` | Administrator | Each node's state: processes, sandbox, rotation, suspects, usage |
+| `GET /v1/usage` | Administrator | Hourly usage of every tenant |
+| `POST /v1/tenants`, `GET /v1/tenants` | Administrator | Create, list tenants |
+| `GET /v1/tenants/{t}` | The tenant or the administrator | The tenant's record, its counts and its usage of the last 24 hours |
+| `PATCH /v1/tenants/{t}`, `DELETE /v1/tenants/{t}` | Administrator | Change hostnames, quotas and default limits; delete the tenant with everything it owns |
+| `POST /v1/tenants/{t}/credentials`, `GET /v1/tenants/{t}/credentials` | Administrator | Issue, list the tenant's credentials |
+| `DELETE /v1/tenants/{t}/credentials/{keyId}` | The tenant or the administrator | Revoke a credential |
+| `GET /v1/tenants/{t}/usage` | The tenant or the administrator | The tenant's hourly usage |
+| `GET /v1/tenants/{t}/workers`, `GET .../workers/{w}` | The tenant or the administrator | The Workers: versions, active version, validity, limits, routes, secret names |
+| `PATCH /v1/tenants/{t}/workers/{w}` | The tenant or the administrator | The Worker's CPU and memory limits, within the tenant's maxima |
+| `DELETE /v1/tenants/{t}/workers/{w}` | The tenant or the administrator | Remove the Worker: its active version and routes go, its versions stay |
+| `PUT .../workers/{w}/versions/{v}` | The tenant or the administrator | Upload a package and trial-load it; `?activate=true` also makes it active |
+| `POST .../workers/{w}/versions/{v}:activate` | The tenant or the administrator | Make an uploaded version active; a rollback is the same |
+| `DELETE .../workers/{w}/versions/{v}` | The tenant or the administrator | Delete an inactive version |
+| `PUT .../workers/{w}/routes` | The tenant or the administrator | Replace the Worker's routes |
+| `GET .../workers/{w}/secrets`, `GET`, `PUT`, `DELETE .../secrets/{name}` | The tenant or the administrator | List names and lengths; show one; set, delete a value |
+| `GET .../workers/{w}/logs` | The tenant or the administrator | The Worker's recent log lines from every node, or a stream with `follow` |
 
-**Versioning promise**: from 0.3.0, `/v1` only changes by adding fields and endpoints, until 1.0; removals or changed semantics go into `/v2`. The `code` in answers follows the [error codes](guide/errors.md), including `TENANT_NOT_FOUND`, `FORBIDDEN`, `QUOTA_EXCEEDED` (`reason` says which entry) and `HOSTNAME_NOT_OWNED`.
+Below `/v1/tenants/{t}/`, a tenant that is being deleted accepts only reads.
 
-**Command line**: each subcommand of `cowctl` takes `--tenant` (default from `cowctl.json`); the administrator's subcommands are `cowctl tenant create|list|get|update|delete`, `cowctl credential create|list|revoke`, `cowctl node list`, `cowctl usage`. The developer loop is `init`, `deploy`, `versions`, `rollback`, `remove`, `secret`, `status`, `logs`.
+**The control plane keeps no state of its own**: everything it answers is read from etcd, object storage and the nodes when it is asked, so it can be stopped at any time -- an interrupted deployment leaves at most published immutable parts, never a half-flipped one. It is not on the request path: a cluster serves calls while the control plane is down, and only changes wait.
 
-## 3. Quotas and limits
+## 3. Credentials and scopes
 
-| Level | Entries | Where enforced |
+- **The admin credential** is the platform's own: configured for the control plane (`control.adminCredential`, or `COWORKERD_ADMIN_CREDENTIAL`), 16 to 4096 visible ASCII characters without spaces; compose's `secrets` step generates one. It is not stored in etcd and has no expiry or revocation: changing it means configuring a new one and restarting the control plane. It can do everything and is never given to tenants.
+- **Tenant credentials** are issued through `/v1` for one tenant. The text is `cwk_<keyId>_<secret>`, shown only in the answer that creates it; etcd keeps only the SHA-256 of the secret part. A credential can carry an expiry, can be revoked (the record stays, marked revoked), and acts only on its own tenant.
+- Every request reads the credential's record, so a revocation takes effect at once, and secrets are compared in constant time.
+- `401 UNAUTHORIZED` answers a missing, malformed, unknown, revoked or expired credential, always with the same reason; only the control plane's log line says which. `403 FORBIDDEN` answers a credential whose scope is not enough: another tenant, or an administrator's endpoint.
+- `cowctl` reads a credential only from `COWCTL_TOKEN` or the credential file its `cowctl.json` names (default `~/.cowctl/token`), never from its command line, where other users could see it.
+
+## 4. One writer
+
+The control plane is the only writer of the desired state -- `tenants/`, `credentials/` and `deploy/` under `/coworkerd/v2/` in etcd -- and etcd's roles enforce it: the nodes can read the deployment state and the tenants but not the credentials, and they write only their own keys. Every write but a tenant's deletion goes through etcd transactions that commit only if the keys they compare are as the write read them -- among them every key it writes except the deployment generation and the Binding index, and for an activated version the creation of its secrets and Binding targets --, so concurrent requests on Workers that share no route or Binding do not conflict; a request whose keys keep changing is tried up to 9 times, with jittered pauses, before it gives up with `409 CONFLICT` (a secret's write whose failure reason would contain the value answers `422 SECRET_REFUSED`, the reason withheld). A tenant's deletion is the exception: once the tenant is marked `deleting`, its routes, pointers, deployment keys and credentials are removed without such conditions, and only its record on the condition that it did not change (section 6). What a write reads but does not compare can change before it commits. A version deleted while it is being activated can leave the Worker naming a definition that is gone, and invalid until that changes -- for example when the same version is uploaded again with the same content, or another version is activated -- or the Worker is removed. A deployment that passed the tenant's status check before a deletion marked the tenant, and commits after the deletion read the tenant's keys, can leave its route behind -- routes are not below the tenant's prefix --, owned by a Worker of the deleted tenant, so that no other tenant's deployment can take it over; if it commits after the deletion's range deletion, its pointer stays as well, and a tenant created again under the same name starts with that Worker. Other writes below the tenant that passed the check can land after the range deletion the same way -- a version's definition, a secret's value --, so the Worker left behind can even be valid; nodes refuse only a tenant whose record says `deleting`, so once the record is gone such a Worker keeps serving its route, and `/v1` reaches it again only through a tenant created again under that name, which starts with these keys. The object cleanup of a version's or a tenant's deletion reads the remaining definitions after its own transaction, so an upload -- of any tenant -- that found shared objects present and skipped them, but publishes its definition only after that read, can be left with a definition whose objects are gone. [Cluster state](cluster-state.md) describes the layout, the roles and the write protocol.
+
+## 5. Quotas and limits
+
+| Quota of a tenant | Default | Enforced |
 | --- | --- | --- |
-| Tenant (set by the administrator, with defaults) | The number of Workers, versions per Worker, bundle size, the number and total size of static assets, the number of secrets, the number of hostnames, log lines per second and the amount kept per node | `apiserver` refuses at admission (`QUOTA_EXCEEDED`); the log volume is enforced by the nodes (their log quota, scoped to the tenant) |
-| Worker (set by the tenant, within the tenant's limits) | CPU milliseconds per request, memory MiB per isolate | The node applies them at load time from the definition (a Worker property, defaulting to the tenant's defaults, then to the node's configuration) |
-| Later | Per-tenant isolate concurrency and total memory, requests per second | Needs coordination across nodes; not in the first version |
+| `workers`, `versionsPerWorker` | 100, 50 | By the control plane when a version of a new Worker, or a new version id, is uploaded |
+| `packageBytes` | 160 MiB | By the control plane, on the size of the uploaded package, which `control.maxUploadBytes` (also 160 MiB) caps for every tenant |
+| `assetFiles`, `assetBytes` | 20,000, 100 MiB | By the control plane on upload |
+| `secrets`, `hostnames` | 1,000, 100 | By the control plane when a new secret is set or the hostnames change |
+| `logLinesPerSecond`, `logBufferBytes` | 100, 1 MiB | By every node, for the tenant's log lines |
+| `maxWorkerCpuMs`, `maxWorkerMemoryMiB` | 30,000, 512 | By the control plane when a Worker's limits or the tenant's default limits are set |
 
-**Worker-level CPU and memory limits** are in the API, the tenant ceilings, etcd and the state endpoint, and apply per Worker: the workerd-side patch takes the values with the Worker configuration, and the isolates in one process each have their own CPU and memory limits (the state endpoint's `applied` reports the declared values; a Worker that declares none uses the node's configuration); the process-wide WebAssembly memory limit is the largest one the Workers on the machine declare, effective per generation.
+A change over a quota is refused with `422 QUOTA_EXCEEDED` and the quota's name at the start of the reason (`defaultLimits:` for default limits above the maxima), and nothing is written; a package over the limit is `413 PACKAGE_TOO_LARGE` instead unless the tenant's `packageBytes` is below `control.maxUploadBytes` -- so at the defaults, both 160 MiB, it is 413. The control plane checks these quotas when it admits a change; the log quotas refuse nothing: every node enforces them on the tenant's lines, dropping lines over the rate and the oldest lines over the buffer -- except that a node keeps the tenant's previous values when the buffer quota is larger than its own `logs.totalBufferBytes`. An upload's and a secret's quotas are checked against one read before the write, outside its transaction, so concurrent requests can together take a tenant over `workers`, `versionsPerWorker` or `secrets`. `workers` counts every Worker the tenant's state names, a removed one whose versions remain included; lowering a maximum leaves Workers' own limits above it as they are, and is refused below the tenant's default limits.
 
-## 4. The etcd layout (v2) and the single write path
+**Worker limits.** A Worker's CPU milliseconds per request and memory MiB per isolate are properties of the Worker (`PATCH .../workers/{w}` with `{"limits":{"cpuMs","memoryMiB"}}`, which replaces both), at most the tenant's maxima. They are stored with the Worker's active version, survive activations and new versions, and go when the Worker is removed. A Worker without its own uses the tenant's default limits, then the node's configuration; nodes apply them per isolate.
 
-```text
-/coworkerd/v2/tenants/<t>                               tenant: quotas, hostnames, state
-/coworkerd/v2/credentials/<keyId>                       hash, scope, expiry, revocation
-/coworkerd/v2/deploy/<t>/definitions/<w>/<v>            version definitions (created only, never overwritten)
-/coworkerd/v2/deploy/<t>/active/<w>                     {versionId, definitionHash, limits}
-/coworkerd/v2/deploy/routes/<route key>                 {host, pathPrefix, tenant, worker} (globally unique; ownership is in the value)
-/coworkerd/v2/deploy/<t>/secrets/<w>/<name>             secrets
-/coworkerd/v2/nodes/<nodeId>                            membership lease (written by the node)
-/coworkerd/v2/nodes/<nodeId>/suspects/<t>               suspect marks (written by the node)
-/coworkerd/v2/nodes/<nodeId>/usage/<hour>/<t>           hourly usage roll-ups (written by the node; apiserver sums them)
-```
+**Not limited per tenant**: isolate concurrency and total memory across the cluster, and requests per second at the ingress. Both would need coordination across nodes.
 
-- **A single writer**: `apiserver` is the only writer of `tenants/`, `credentials/` and `deploy/`; nodes write only the keys under `nodes/<themselves>/`. Enforced with etcd's own roles: the role `coworkerd-apiserver` reads and writes `/coworkerd/v2/` and only reads `nodes/`; the role `coworkerd-node` only reads `/coworkerd/v2/` (except `credentials/`, which it cannot read: nodes have no use for credential hashes) and reads and writes `nodes/<its own nodeId>/` (one user per node, spelled out both in `init` and in the bare-metal documentation). The roles and users are set up by one tool (`coworkerd-apiserver tool etcd-auth`, compose's `secrets` -> `init`). The deployment tool's subcommands are part of `apiserver` and run with its credentials.
-- **The concurrency properties of writes are unchanged**: each write is conditioned only on the keys it touches, concurrent deployments of the same Worker retry a bounded number of times, and a route's ownership cannot be taken away.
-- **The trial load comes before writing the definition key**: a version exists only if it loads, and a failure leaves no definition key; the properties of incremental deployment are unchanged.
-- **Nodes only consume state**: they watch `deploy/` and `tenants/` (the log volume in the quotas, the tenants' default limits); usage is rolled up hourly into their own prefix, written once a minute, and apiserver's `usage` endpoint reads and sums the nodes' roll-ups over a time range (historical usage does not depend on a resident apiserver). When a node drains and exits, it writes the last minute after closing its processes and before revoking its lease (drain steps `closed` -> `usage-flushed` -> `revoked`). The egress service on the nodes feeds each tenant's bytes into the same hourly usage (`egressBytes`), visible in `cowctl usage`; the egress tenant identity is the first part of the Worker's full name.
-- Nodes carry the `tenant` into every place that writes `workerId`: log lines, the state endpoint, `request.cf`, the records of the event pipes, suspects.
+## 6. Versions and deployments
 
-## 5. Lifecycle and cleanup
+- **Upload** (`PUT .../versions/{v}`): the package is a tar file of a manifest and the version's files. The control plane validates it (format, names, sizes, compatibility date and flags, quotas), stores its modules and assets in object storage by hash, and has a node **trial-load** the version in a quarantine process before the definition is written: a version exists only if it loads (one with only static assets has nothing to load and is not tried). A failed trial load answers `422 LOAD_FAILED` with a category; when no node can try, the answer is `503 TRIAL_UNAVAILABLE`.
+- **Versions are immutable.** A version id that already has a different definition is refused (`409 VERSION_EXISTS`); uploading the same content again changes nothing. `cowctl deploy` names versions `v1`, `v2`, ... by itself and takes the next number on a conflict.
+- **Upload and activate** (`?activate=true`) is checked before anything is published: the Worker must be valid afterwards -- every declared secret has a value, every Binding target is valid and has Worker code, the closure has at most 64 Workers -- and no other valid Worker may become invalid; otherwise `422 DEPLOYMENT_REFUSED` -- the answer's code is chosen by the words of the refusal's reason, so a reason that mentions `etcd`, in a Worker's name for example, is answered `503 ETCD_UNAVAILABLE` instead. An upload without it publishes the version after its trial load, if it has code, and checks none of this -- but a version with code whose declared secrets have no values cannot be trial-loaded, so its upload is refused with `503 TRIAL_UNAVAILABLE`.
+- **Activate** (`:activate`) moves the active pointer to a version uploaded before and keeps the Worker's routes; it is validated like an activating upload and trial-loads the version again unless it is already active or has only static assets. A rollback is activating an older version.
+- **Delete a version**: only an inactive one. Its definition goes, then the objects in object storage that no remaining definition of any tenant references -- as far as it goes: a failed object deletion is counted in the answer and not tried again, modules stay when more than 1,000 packages remain, and objects left by an interrupted request are not collected later.
+- **Remove a Worker** (`DELETE .../workers/{w}`): its active pointer and routes go and nobody can call it; its versions and secrets stay. It is refused while another valid Worker binds it.
+- **Delete a tenant**: the tenant is first marked `deleting`, so every node refuses new requests to its Workers (`TENANT_UNAVAILABLE`); calls of trees already running are not refused for the deletion, but can fail once their secrets or code are gone; then its routes and active pointers, the objects only it uses -- as far as their deletion succeeds, as for a version --, its definitions, secrets and credentials are deleted, and finally its record. A failure on the way leaves it `deleting`; deleting again continues where it stopped, and the progress is in `GET /v1/tenants/{t}`.
+- **Retention** is the platform's: there is no automatic cleanup of old versions.
 
-- **Deleting a version**: only inactive versions; after the definition key is deleted, `apiserver` deletes the bundle and assets in object storage (reference counted: a bundle with the same hash referenced by several versions is kept).
-- **Deleting a Worker**: removes the active pointer and the routes; versions are kept; deploying again restores it.
-- **Deleting a tenant**: first mark it `deleting` (the nodes stop serving it), then delete routes, active pointers, secrets, definitions, objects and credentials, and finally the tenant key; a failure on the way can be resumed; the progress is visible in the state endpoint.
-- **Retention**: the first version does no automatic cleanup; the "versions per Worker" quota makes the platform delete old versions itself.
+## 7. Routes and hostnames
 
-## 6. The node side
+A route maps a host and a path prefix to a Worker. `PUT .../routes` replaces a Worker's routes as a whole (at most 64); an activating upload whose manifest lists routes replaces them too, one that lists none keeps them, and `cowctl deploy` always lists one. A tenant may route:
 
-`nodeId` identifies the node (configuration, membership keys, the state endpoint, `request.cf`, logs); limits are applied per Worker at load time; suspects per tenant; per-tenant usage counting and hourly roll-ups; watching the layout of section 4; route matching takes the tenant along; logs and state are organized by tenant. Tenants do not change the protocol, the descriptors or the launcher.
+- **hostnames registered to it** by the administrator; a hostname belongs to one tenant only, and the tenant's list is replaced as a whole when it is changed;
+- **paths under the cluster's default host `*`** that are `/<tenant>` or start with `/<tenant>/` -- `cowctl deploy`'s default route is `*` with `/<tenant>/<worker>` -- unless the administrator turns path routing off (`control.pathRouting`).
 
-**`request.cf`**: `nodeId` is the id of the node running the call; `serverId` carries the same value as `nodeId` and remains through 0.3.x; `workerId` is the full name `tenant/Worker`.
+Because the longest prefix is chosen before the host ([cluster state](cluster-state.md), section 4), a tenant's path route under `*` also receives the requests for that path on every other tenant's hostname. Anything else is `403 HOSTNAME_NOT_OWNED`. A route that belongs to another Worker is refused rather than taken over, and a hostname still routed by one of the tenant's Workers cannot be removed from it. How a request finds its route is in [cluster state](cluster-state.md), section 4.
 
-## 7. Not in the first version
+## 8. Secrets
 
-Encrypted storage of secrets, tenant-level runtime quotas (concurrency, total memory), authorization of cross-tenant bindings, a binding for "calling by name dynamically within a tenant", an automatic version retention policy, a /metrics endpoint.
+- **Storage.** A secret's value is stored in etcd under its Worker as `{"value","setAtUnixMs"}`, **unencrypted**. Access is limited by etcd's authentication and roles: besides etcd's `root`, only the control plane's and the nodes' users can read the deployment state, and tenants never reach etcd. Values also stay in etcd's history until it is compacted, which nothing does by itself: compose starts etcd without automatic compaction. Encryption at rest is not done.
+- **API.** `PUT .../secrets/{name}` sets the request body as the value; a name is a JavaScript identifier, and a value is at most 5 KiB of UTF-8 without NUL. `DELETE` is refused while it would make a valid Worker invalid. `GET .../secrets` lists names, lengths and when they were set; none of the platform's own answers, log lines or state endpoints shows a value.
+- **Use.** A version declares the names it reads, at most 64; a Worker whose active version declares a secret without a value is invalid and not served. Values reach a Worker's `env` when its isolate loads on the executing node, which takes them from its own view of etcd and hands them to its own workerd process with each dispatch; they never travel with a call to another node. An isolate keeps the values it loaded with until it is replaced.
+
+## 9. Usage
+
+Every node counts, per tenant and UTC hour: requests (each execution of one of the tenant's Workers, Binding calls included), CPU milliseconds, egress bytes, log lines kept and isolate time (resident isolates sampled every second). It writes the counts that changed under its own prefix (`nodes/<nodeId>/usage/<hour>/<tenant>`) every `usage.flushIntervalMs` (one minute), so a node that stops loses at most that much; a draining node writes its last counts before it leaves. Each node keeps its own rows for `usage.retentionHours` (31 days). The usage endpoints sum the rows of every node, departed ones included, over whole UTC hours of a range of at most a year (the last 24 hours by default), so the history does not depend on the control plane.
+
+## 10. Logs
+
+Each node keeps the latest log lines of every tenant in memory, within the tenant's log quota ([process isolation](process-isolation.md), section 10). `GET .../logs` asks every node for the Worker's lines at once, each within `control.serverTimeoutMs` (2 s), and merges them by time; a node that does not answer is listed as unreachable. With `follow`, the answer is a stream of server-sent events (`text/event-stream`) that the control plane fills by asking every node for new lines every 500 ms.
+
+## 11. The version promise
+
+From 0.3.0, `/v1` changes only by adding fields and endpoints until 1.0, and error codes keep their meanings; removing something or changing its meaning goes into a new prefix.

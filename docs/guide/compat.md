@@ -8,13 +8,13 @@
 | wrangler configuration / feature | Notes |
 | --- | --- |
 | `name`, `main` | The Worker name (the name within the tenant, full name `tenant/name`; lowercase letters, digits and `-`, at most 63 characters) and the main module; `main` may be TypeScript, built by wrangler |
-| `compatibility_date` | Carried by each version; may not be later than this workerd's limit (`v1.20261012.1`: 2026-10-12) |
+| `compatibility_date` | Carried by each version; may not be later than the maximum of the bundled workerd (`v1.20261012.1`) |
 | `compatibility_flags` | The non-experimental flags this workerd knows, including `nodejs_compat`; the platform always turns on `enable_request_signal`, and `disable_request_signal` is refused |
 | `vars` | Plain-text and JSON environment variables, part of the version definition; at most 64, each at most 5 KiB |
 | Secrets | Names come from the project's `.dev.vars.example` (only the names are read) or `deploy --secret NAME`; values are set with `cowctl secret put`, stored in the cluster, and read in the Worker as `env.NAME`; at most 64, each at most 5 KiB. `.dev.vars` and `.env` are never read |
 | `services` (Service Binding, optionally with `entrypoint`) | Points to another Worker of **the same tenant** (`service` is the name within the tenant), and can run on another node; HTTP `fetch` only; Bindings across tenants are not supported |
 | `assets` | Static assets: `directory`, `not_found_handling` (`none`, `404-page`, `single-page-application`), `binding` (`env.ASSETS.fetch()`), `run_worker_first` (`true` or path rules); `html_handling` accepts only the default value |
-| Build-related: `build` (`command`, `cwd`, `watch_dir`), `base_dir`, `rules`, `no_bundle`, `find_additional_modules`, `preserve_file_names`, `minify`, `tsconfig`, `jsx_factory`, `jsx_fragment`, `alias`, `define`, `keep_names`, `upload_source_maps`, `send_metrics`, `$schema` | Take part in the build as wrangler means them |
+| Build-related: `build` (`command`, `cwd`, `watch_dir`), `base_dir`, `rules`, `no_bundle`, `find_additional_modules`, `preserve_file_names`, `minify`, `tsconfig`, `jsx_factory`, `jsx_fragment`, `alias`, `define`, `keep_names`, `upload_source_maps`, `send_metrics`, `$schema` | Take part in the build as wrangler means them; source maps are never uploaded (`upload_source_maps` has no effect: the adapter drops wrangler's `.map` output) |
 | Module types | ES modules, CommonJS, text, binary data, JSON, WebAssembly (wrangler's module rules) |
 | Entry points | A default export of an object with `fetch`, or a class extending `WorkerEntrypoint`; named entry points (the `entrypoint` of a Service Binding) only up to `fetch` |
 | `ctx.waitUntil` | Background work after the response completes as usual; Binding calls inside it are refused after this call's deadline (`LEASE_EXPIRED`) |
@@ -45,8 +45,8 @@ and entries with empty values (`[]`, `{}` and the like, which build tools often 
 | Bundle size | Code modules at most 10 MiB in total (**uncompressed**); assets at most 20,000 files, 25 MiB each, 100 MiB in total; the tenant's quotas (`packageBytes`, `assetFiles`, `assetBytes`) can be smaller | Counted compressed |
 | CPU per request | 200 ms (the node's configuration; beyond it: 503 `CPU_LIMIT_EXCEEDED`). Worker-level limits are set through `/v1` and applied by the nodes per Worker, within the tenant's quota ([installing and running](install.md), end of section 5) | By plan |
 | Memory per isolate | 128 MiB (the node's configuration; beyond it: 503 `MEMORY_LIMIT_EXCEEDED`); Worker-level limits as above | 128 MB |
-| Logs | `cowctl logs`: quotas are per **tenant**, each tenant keeps the latest 1 MiB on each node, at most 100 lines per second (the administrator can adjust both per tenant), 4 KB per line, and what exceeds them is counted as `[dropped]` | Workers Logs, Tail |
-| Throwing after `passThroughOnException`, a missing entry point | 503 `RESULT_UNCERTAIN` | Falls back to the origin / an error |
+| Logs | `cowctl logs`: quotas are per **tenant**, each tenant keeps the latest 1 MiB on each node, at most 100 lines per second (the administrator can adjust both per tenant), 4 KB per line (longer lines are cut); lines over the per-second rate are counted as `[dropped]` and the buffer keeps the newest lines | Workers Logs, Tail |
+| Throwing after `passThroughOnException` | 503 `RESULT_UNCERTAIN` | Falls back to the origin / an error |
 
 ## 4. Projects that were verified
 

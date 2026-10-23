@@ -11,7 +11,7 @@ a Worker's full name is `tenant/Worker`, so two tenants can each have a Worker c
 ## 0. Preparation
 
 - **Docker Engine 28 or newer** and Docker Compose v2 (Docker Desktop on the Mac has both; on Linux it is enough that `docker compose version` prints a version);
-- **Node.js 20 or newer**: the command line `cowctl` and the wrangler build it runs both use it (`node --version`);
+- **Node.js 22 or newer**: the wrangler that `cowctl deploy` runs requires it (`cowctl` itself runs on 20 or newer; `node --version`);
 - `curl`;
 - your architecture's two files from the release and the checksums: `coworkerd-0.3.0-linux-<arch>.tar.gz`, `coworkerd-0.3.0-linux-<arch>-image.tar.gz`,
   `SHA256SUMS`. A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64`.
@@ -72,7 +72,7 @@ $ curl http://127.0.0.1:18080/acme/hello-world
 Hello from Coworkerd!
 ```
 
-All three ingresses work: a request can enter at any node and runs on this Worker's home (the node computed from `tenant/Worker`). By default the route is
+All three ingresses work: a request can enter at any node and normally runs on this Worker's home node (computed from `tenant/Worker`); a node that ran the version within the last 30 s may serve it itself. By default the route is
 `/<tenant>/<Worker name>` under the cluster's default host; a tenant's own hostnames are registered to it by the administrator, then used with `cowctl deploy --route <hostname>/` (see section 9).
 
 ## 4. Logs
@@ -88,7 +88,7 @@ cowctl logs --follow          # keeps printing; Ctrl-C ends it
 
 Each line is one `console.log`/`info`/`debug`/`warn`/`error` in the Worker: the time, the node that ran it, the level, the version, the content. The control plane fetches this Worker's logs from each node and
 merges them by time. `--since 10m` (or `2h`, or an ISO time) shows only the recent ones; `--json` prints one JSON object per line. Log quotas are per **tenant**: each node keeps the latest 1 MiB in memory for each tenant,
-and each tenant may record at most 100 lines per second (the administrator can adjust both per tenant); what exceeds them is not recorded, and a `[dropped]` line counts it; a line over 4 KB is truncated
+and each tenant may record at most 100 lines per second (the administrator can adjust both per tenant); lines over the per-second rate are not recorded and a `[dropped]` line counts them, the buffer keeps the newest 1 MiB, and a line over 4 KB is cut
 (none of this affects the requests themselves or other tenants).
 
 ## 5. A new version, and a rollback
@@ -205,7 +205,7 @@ To stop without deleting: `down` without `-v`; at the next `up`, the tenants, cr
 | --- | --- |
 | `cannot reach the control plane at http://127.0.0.1:18090` | The cluster is not up, or the control plane's port differs: `docker compose ps`; after changing `COWORKERD_CONTROL_PORT` in `.env`, `cowctl init --url ... --force` |
 | `no credential` / `refused the credential` | Step 2: put the tenant credential into `~/.cowctl/token`, or `export COWCTL_TOKEN=...`; a revoked credential no longer works |
-| `FORBIDDEN` | A tenant credential acts only on its own tenant; `tenant`, `credential create`, `node` and `usage --all` need the admin credential |
+| `FORBIDDEN` | A tenant credential acts only on its own tenant; `tenant` (except reading its own record), `credential create`, `node` and `usage --all` need the admin credential |
 | `TENANT_NOT_FOUND` | The tenant has not been created yet (`cowctl tenant create`), or the name is misspelled |
 | `the project does not convert: Unsupported Wrangler configuration: ...` | The listed settings are not supported by this platform, see the [compatibility scope](compat.md) |
 | `deploy refused: version vN does not load (SYNTAX_ERROR ...)` | The new version cannot be loaded and the active version did not change; reasons and categories are in [error codes](errors.md) |

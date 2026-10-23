@@ -55,7 +55,7 @@ allowlist.
 
 **Components** (`bin/`): `coworkerd` (the node daemon; `coworkerd check` is its self-check), `coworkerd-apiserver` (the
 control plane, the only writer of desired state), `coworkerd-launcher` (starts each workerd in a least-privilege
-environment), `cowctl` (the command line; needs Node.js 20 or newer), `workerd` (upstream `v1.20261012.1` with this
+environment), `cowctl` (the command line; needs Node.js 22 or newer for the bundled wrangler), `workerd` (upstream `v1.20261012.1` with this
 project's patch series, see [coworkerd/workerd](https://github.com/coworkerd/workerd)), and the system call allowlists
 of this workerd build (startup and steady-state tables).
 
@@ -89,7 +89,7 @@ of this workerd build (startup and steady-state tables).
   rotated hourly by default.
 
 **Getting started**: unpack and read `docs/quickstart.md` (about ten minutes); installation, configuration and
-operations are in `docs/install.md`. Requires Docker Engine 28 or newer and Node.js 20 or newer; the sandbox requires
+operations are in `docs/install.md`. Requires Docker Engine 28 or newer and Node.js 22 or newer; the sandbox requires
 Linux with unprivileged user namespaces (Ubuntu 23.10 and later: see the install guide, section 4).
 
 **Known limitations** (planned for 0.4): nodes trust each other through a shared signing key -- no mTLS and no
