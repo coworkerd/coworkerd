@@ -1,6 +1,6 @@
 # Coworkerd quickstart
 
-> For release 0.3.0.
+> For release 0.3.1.
 > From a wrangler project to the first request in about 10 minutes: start the cluster -> the administrator creates a tenant and a credential -> `cowctl init --tenant` -> `cowctl deploy` -> `curl` ->
 > `cowctl logs` -> a new version -> `cowctl rollback` -> `cowctl secret put` -> `cowctl usage`.
 > Installation details, bare-metal deployment and configuration are in [installing and running](install.md); which wrangler features work is in the [compatibility scope](compat.md); errors are in [error codes](errors.md).
@@ -13,16 +13,16 @@ a Worker's full name is `tenant/Worker`, so two tenants can each have a Worker c
 - **Docker Engine 28 or newer** and Docker Compose v2 (Docker Desktop on the Mac has both; on Linux it is enough that `docker compose version` prints a version);
 - **Node.js 22 or newer**: the wrangler that `cowctl deploy` runs requires it (`cowctl` itself runs on 20 or newer; `node --version`);
 - `curl`;
-- your architecture's two files from the release and the checksums: `coworkerd-0.3.0-linux-<arch>.tar.gz`, `coworkerd-0.3.0-linux-<arch>-image.tar.gz`,
+- your architecture's two files from the release and the checksums: `coworkerd-0.3.1-linux-<arch>.tar.gz`, `coworkerd-0.3.1-linux-<arch>-image.tar.gz`,
   `SHA256SUMS`. A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64`.
 
 ## 1. Start the cluster (about 30 seconds)
 
 ```bash
 shasum -a 256 -c --ignore-missing SHA256SUMS        # on Linux: sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.3.0-linux-arm64.tar.gz
-docker load -i coworkerd-0.3.0-linux-arm64-image.tar.gz
-cd coworkerd-0.3.0-linux-arm64
+tar -xzf coworkerd-0.3.1-linux-arm64.tar.gz
+docker load -i coworkerd-0.3.1-linux-arm64-image.tar.gz
+cd coworkerd-0.3.1-linux-arm64
 export COWORKERD_PACKAGE="$PWD" PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```

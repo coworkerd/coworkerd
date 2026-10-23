@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.3.0.
+> For release 0.3.1.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -16,9 +16,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), two file
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.3.0-linux-<arch>.tar.gz` | `bin/` (`coworkerd`: the node daemon (`coworkerd check` is its self-check, including the object storage check `check storage`); `coworkerd-apiserver`: the control plane (also the internal tool `tool`); `coworkerd-launcher`: the launcher that starts workerd in a least-privilege environment (see "Sandbox" in section 4); `cowctl`: the command line; `workerd`; `coworkerd-syscalls-startup.txt`, `coworkerd-syscalls-steady.txt`, `coworkerd-syscalls.json`: the system call allowlist of this workerd and the record of how it was generated, see "System call allowlist" in section 4), `lib/` (`cowctl` and the wrangler adapter with their dependencies), `runtime/runtime.js`, `docker/` (the compose file, the entry point script, the Dockerfile, `.env.example`, `examples/hello/`: the example project the compose `tool` service mounts by default), `examples/` (hello-world and two official templates), `docs/` (this document, the quickstart, the compatibility scope, the error codes), `INSTALL.md` (a copy of this document; read it first after unpacking), `VERSION`, `SHA256SUMS` of the files in the package |
-| `coworkerd-0.3.0-linux-<arch>-image.tar.gz` | The image `coworkerd:0.3.0`, for `docker load` |
-| `coworkerd-0.3.0-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.3.1-linux-<arch>.tar.gz` | `bin/` (`coworkerd`: the node daemon (`coworkerd check` is its self-check, including the object storage check `check storage`); `coworkerd-apiserver`: the control plane (also the internal tool `tool`); `coworkerd-launcher`: the launcher that starts workerd in a least-privilege environment (see "Sandbox" in section 4); `cowctl`: the command line; `workerd`; `coworkerd-syscalls-startup.txt`, `coworkerd-syscalls-steady.txt`, `coworkerd-syscalls.json`: the system call allowlist of this workerd and the record of how it was generated, see "System call allowlist" in section 4), `lib/` (`cowctl` and the wrangler adapter with their dependencies), `runtime/runtime.js`, `docker/` (the compose file, the entry point script, the Dockerfile, `.env.example`, `examples/hello/`: the example project the compose `tool` service mounts by default), `examples/` (hello-world and two official templates), `docs/` (this document, the quickstart, the compatibility scope, the error codes), `INSTALL.md` (a copy of this document; read it first after unpacking), `VERSION`, `SHA256SUMS` of the files in the package |
+| `coworkerd-0.3.1-linux-<arch>-image.tar.gz` | The image `coworkerd:0.3.1`, for `docker load` |
+| `coworkerd-0.3.1-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64` (`uname -m` is `x86_64`).
@@ -31,9 +31,9 @@ prints a version, otherwise install `docker-compose-plugin`). The image download
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.3.0-linux-amd64.tar.gz
-docker load -i coworkerd-0.3.0-linux-amd64-image.tar.gz
-cd coworkerd-0.3.0-linux-amd64/docker
+tar -xzf coworkerd-0.3.1-linux-amd64.tar.gz
+docker load -i coworkerd-0.3.1-linux-amd64-image.tar.gz
+cd coworkerd-0.3.1-linux-amd64/docker
 
 # 2. Start the cluster: etcd, object storage, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 20-30 seconds)
 docker compose up -d --wait

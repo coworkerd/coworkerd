@@ -1,6 +1,6 @@
 # Coworkerd error codes
 
-> For release 0.3.0. The control plane's API is `/v1`, and resources have two levels: tenant -> Worker.
+> For release 0.3.1. The control plane's API is `/v1`, and resources have two levels: tenant -> Worker.
 > Every error answer is JSON: a call's answer `{"error","reason","code",...}`, the control plane's and the management endpoints' answers `{"code","reason"}`.
 > Every `reason` is cleaned: no secret values (replaced by `[redacted]`), no absolute paths (replaced by `<path>`), no stack traces, at most 400 bytes.
 > The full story is in the node's log (`docker compose logs node-1`); `cowctl logs` shows what the Worker itself printed.

@@ -1,6 +1,6 @@
 # Coworkerd compatibility scope: which features of a wrangler project work
 
-> For release 0.3.0. Compiled from [ecosystem compatibility](https://github.com/coworkerd/coworkerd/blob/main/docs/ecosystem-compat.md).
+> For release 0.3.1. Compiled from [ecosystem compatibility](https://github.com/coworkerd/coworkerd/blob/main/docs/ecosystem-compat.md).
 > `cowctl deploy` uses wrangler to read the configuration and build the project, then converts it into a Coworkerd code bundle; unsupported configuration is listed in full at conversion and refused, never silently ignored.
 
 ## 1. What works

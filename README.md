@@ -21,7 +21,7 @@ platform on top. The components and their boundaries are described in [docs/comp
 
 ## Status: 0.3.1
 
-0.3.0 is the first release, for Linux `amd64` and `arm64`; each architecture comes as a package (the node daemon
+0.3.1 (2026-10-23) is the current release, for Linux `amd64` and `arm64`; it fixes the tenant-isolation and consistency gaps found while the design documents were checked against the code (0.3.0, 2026-10-18, was the first release); each architecture comes as a package (the node daemon
 `coworkerd`, the control plane `coworkerd-apiserver`, the launcher `coworkerd-launcher`, the patched `workerd`,
 `cowctl`) and a container image, with compose files for one or three nodes. [CHANGELOG.md](CHANGELOG.md) lists what
 it contains. The `/v1` API changes only by adding fields and endpoints until 1.0.
@@ -49,9 +49,9 @@ With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22 or newer, a clu
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.3.0-linux-arm64.tar.gz
-docker load -i coworkerd-0.3.0-linux-arm64-image.tar.gz
-cd coworkerd-0.3.0-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.3.1-linux-arm64.tar.gz
+docker load -i coworkerd-0.3.1-linux-arm64-image.tar.gz
+cd coworkerd-0.3.1-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 
