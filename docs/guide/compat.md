@@ -46,7 +46,7 @@ and entries with empty values (`[]`, `{}` and the like, which build tools often 
 | CPU per request | 200 ms (the node's configuration; beyond it: 503 `CPU_LIMIT_EXCEEDED`). Worker-level limits are set through `/v1` and applied by the nodes per Worker, within the tenant's quota ([installing and running](install.md), end of section 5) | By plan |
 | Memory per isolate | 128 MiB (the node's configuration; beyond it: 503 `MEMORY_LIMIT_EXCEEDED`); Worker-level limits as above | 128 MB |
 | Logs | `cowctl logs`: quotas are per **tenant**, each tenant keeps the latest 1 MiB on each node, at most 100 lines per second (the administrator can adjust both per tenant), 4 KB per line (longer lines are cut); lines over the per-second rate are counted as `[dropped]` and the buffer keeps the newest lines | Workers Logs, Tail |
-| Throwing after `passThroughOnException` | 503 `RESULT_UNCERTAIN` | Falls back to the origin / an error |
+| Throwing after `passThroughOnException` | The request is sent on to its own URL through the node's egress (a refusal there answers `500`; with egress off, `EGRESS_DENIED: egress-off`) | Falls back to the origin |
 
 ## 4. Projects that were verified
 

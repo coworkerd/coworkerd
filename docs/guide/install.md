@@ -248,7 +248,7 @@ etcdctl auth enable
 ```
 
 The nodes and the control plane log in to etcd as their own users: the configuration file says `"etcdCredentialsFile": "/etc/coworkerd/etcd.json"` (each its own file, owned by coworkerd, 0600), and the deployment tool reads the
-environment variable `COWORKERD_ETCD_CREDENTIALS_FILE`; when etcd refuses the token they authenticate again, reading the file again if it changed meanwhile, so changing a password needs no restart (section 12). compose's `init`
+environment variable `COWORKERD_ETCD_CREDENTIALS_FILE`; when etcd refuses the token they authenticate again and read the file again (also when a watch is the first to be refused), so changing a password needs no restart (section 12). compose's `init`
 runs the same `tool etcd-auth` at every start with the files `secrets` generated.
 
 **The configuration file** `/etc/coworkerd/config.json` (at minimum the nodeId, etcd and the storage endpoint; the rest in section 5):
@@ -343,7 +343,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `loadCheck` | `true` | Check that a Worker loads before its first dispatch, and refuse explicitly when it does not (`LOAD_FAILED`) |
 | `logs.tenantBufferBytes` / `logs.linesPerSecond` | `1048576` / `100` | How much log each tenant keeps on this node and how many lines per second are recorded; `logBufferBytes` and `logLinesPerSecond` of the tenant's quota take precedence |
 | `usage.flushIntervalMs` / `usage.retentionHours` / `usage.sampleIntervalMs` | `60000` / `744` / `1000` | Per-tenant usage: how often the current hour's counts are written to etcd (a stopped node loses at most that much), how long its own hourly rows are kept (`0`: never deleted), the sampling interval of isolate time |
-| `egress.mode` | `on` | Outgoing requests of tenant code (section 11): `on` goes through this node's egress service; `off` gives tenants no network. The environment variable `COWORKERD_EGRESS_MODE` overrides it |
+| `egress.mode` | `on` | Outgoing requests of tenant code (section 11): `on` goes through this node's egress service; `off` refuses every outgoing request at the policy point (`EGRESS_DENIED: egress-off`). The environment variable `COWORKERD_EGRESS_MODE` overrides it |
 | `egress.defaultPolicy` / `egress.publicPorts` | `public` / `[80, 443]` | Where tenants without their own rules may go: `public`, these ports of public addresses; `deny`, nowhere. The environment variable `COWORKERD_EGRESS_DEFAULT_POLICY` overrides it |
 | `egress.tenants[]` | none | Each tenant's rules: `tenant` (the tenant name), `allow`, `deny`, `allowInternal` (internal destinations the administrator allows), `concurrency`, `requestsPerSecond` (section 11) |
 | `egress.clusterAddresses` | none | Cluster addresses the node cannot see itself (the control plane, load balancers, the nodes' other networks): `HOST[:PORT]`, an address or a CIDR; like etcd, object storage and the members, tenants may not reach them |
@@ -387,7 +387,7 @@ the API is `/v1/tenants/...` (the control plane, compose's `apiserver` service, 
 | `maxWorkerCpuMs`, `maxWorkerMemoryMiB` | 30000, 512 | In the control plane when Worker-level limits are set (the limits themselves: see the end of section 5) |
 
 Over a quota gives `422 QUOTA_EXCEEDED`, with a `reason` that starts with the quota's name ([error codes](errors.md)). **Hostnames**: a hostname belongs to one tenant only (`cowctl tenant update T --hostname H`);
-a tenant's routes may use only the hostnames registered to it, or paths starting with `/<tenant>/` under the cluster's default host `*` (not the latter when `control.pathRouting` is `false`), otherwise `403 HOSTNAME_NOT_OWNED`.
+a tenant's routes may use only the hostnames registered to it, or paths starting with `/<tenant>/` under the cluster's default host `*` (not the latter when `control.pathRouting` is `false`), otherwise `403 HOSTNAME_NOT_OWNED`. A request whose hostname is registered to a tenant is matched against that tenant's routes only, and a path prefix matches whole path segments (`/acme` does not take `/acme-corp/...`).
 **Deleting a tenant** (`cowctl tenant delete T`): it is first marked `deleting` (every node stops serving it immediately and requests get `503 TENANT_UNAVAILABLE`), then its routes, active pointers, secrets,
 definitions, bundles and assets in object storage and credentials are deleted, and finally the tenant itself; a failure on the way answers `503 DELETION_INCOMPLETE`, and deleting again continues from where it stopped.
 

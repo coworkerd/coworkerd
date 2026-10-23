@@ -93,7 +93,7 @@ A route maps a host and a path prefix to a Worker. `PUT .../routes` replaces a W
 - **hostnames registered to it** by the administrator; a hostname belongs to one tenant only, and the tenant's list is replaced as a whole when it is changed;
 - **paths under the cluster's default host `*`** that are `/<tenant>` or start with `/<tenant>/` -- `cowctl deploy`'s default route is `*` with `/<tenant>/<worker>` -- unless the administrator turns path routing off (`control.pathRouting`).
 
-Because the longest prefix is chosen before the host ([cluster state](cluster-state.md), section 4), a tenant's path route under `*` also receives the requests for that path on every other tenant's hostname. Anything else is `403 HOSTNAME_NOT_OWNED`. A route that belongs to another Worker is refused rather than taken over, and a hostname still routed by one of the tenant's Workers cannot be removed from it. How a request finds its route is in [cluster state](cluster-state.md), section 4.
+A request whose hostname is registered to a tenant is matched against that tenant's routes only -- its routes on that hostname first, then its paths under `*` -- and a path route under `*` serves only requests whose hostname belongs to no tenant ([cluster state](cluster-state.md), section 4). Prefixes match whole path segments, and the control plane writes a tenant's `/<tenant>` under `*` as `/<tenant>/`. Anything else is `403 HOSTNAME_NOT_OWNED`. A route that belongs to another Worker is refused rather than taken over, and a hostname still routed by one of the tenant's Workers cannot be removed from it. How a request finds its route is in [cluster state](cluster-state.md), section 4.
 
 ## 8. Secrets
 

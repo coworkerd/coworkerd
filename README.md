@@ -19,7 +19,7 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 Accounts, billing, user interfaces and stateful services (Durable Objects, KV, R2, D1 and the like) are left to the
 platform on top. The components and their boundaries are described in [docs/components.md](docs/components.md).
 
-## Status: 0.3.0
+## Status: 0.3.1
 
 0.3.0 is the first release, for Linux `amd64` and `arm64`; each architecture comes as a package (the node daemon
 `coworkerd`, the control plane `coworkerd-apiserver`, the launcher `coworkerd-launcher`, the patched `workerd`,

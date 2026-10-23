@@ -17,7 +17,7 @@ A tenant isolate's global outbound -- where its `fetch()` goes -- is an entry po
 - **Attribution.** Every workerd generation has its own random egress token. The node accepts a request only with a live process's token and a valid Worker name, and the tenant is the first part of that name; anything else is refused as `unknown-source`.
 - **No identity leaves the node.** The node adds no header of its own and drops its egress headers and the hop-by-hop ones in both directions; a platform service that needs to recognise a tenant uses the tenant's own credentials.
 - **No other way out.** With the sandbox active a workerd process has no usable network: its own network namespace has no route and only a loopback device, which is down (a kernel with tunnel drivers loaded adds their inert devices); without it, the only route out for tenant code is still this entry point, because that is how workerd is configured, not because the process could not reach the network.
-- `egress.mode` `off` removes the service: tenant isolates then have no outbound at all.
+- `egress.mode` `off` keeps the policy point but refuses every request (`EGRESS_DENIED: egress-off`): an isolate always has an outbound, so a throw after `passThroughOnException` fails that request alone instead of ending the shared workerd process.
 
 ## 3. Policy, limits and metering
 
@@ -25,7 +25,7 @@ A tenant isolate's global outbound -- where its `fetch()` goes -- is an entry po
 
 **Refused whatever a rule says**: the cluster's own addresses on any port; the cloud metadata addresses on the node's list (`169.254.169.254`, `169.254.170.2`, `169.254.169.253`, `100.100.100.200`, `168.63.129.16`, `fd00:ec2::254`, `fd00:ec2::23`); unspecified, loopback and link-local addresses; the reserved ranges on its list -- documentation ranges, multicast and the rest of IPv6 outside the global unicast space among them. Another cloud's IPv6 metadata address in the unique-local range counts as a private network. IPv4 addresses inside IPv6 forms (IPv4-mapped, NAT64's well-known prefix `64:ff9b::/96`, 6to4) are judged as the IPv4 address.
 
-**The cluster's own addresses** are every interface address of the node, its listen, peer and advertised addresses, every member's advertised address, the etcd and object storage endpoints, and `egress.clusterAddresses` -- addresses, CIDRs or names, for the control plane, load balancers and networks a node cannot see by itself. The set is rebuilt every 5 seconds and whenever the membership changes.
+**The cluster's own addresses** are every interface address of the node, its listen, peer and advertised addresses, every member's advertised address, the etcd and object storage endpoints, the addresses every control plane announces to the nodes (`POST /__coworkerd/control-plane`, every 10 s, forgotten after 10 minutes without an announcement), and `egress.clusterAddresses` -- addresses, CIDRs or names, for the control plane, load balancers and networks a node cannot see by itself. The set is rebuilt every 5 seconds and whenever the membership changes.
 
 **Private networks** (RFC 1918, 100.64.0.0/10, 198.18.0.0/15, IPv6 ULA and site-local, and the local-use NAT64 prefix `64:ff9b:1::/48`) are refused unless the administrator lists the destination in the tenant's `allowInternal`: the platform's own database or services, a decision tenants cannot make. The local-use NAT64 prefix is judged as a whole, so an `allowInternal` entry that covers it opens it whatever IPv4 address it carries.
 
