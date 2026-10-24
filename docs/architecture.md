@@ -16,10 +16,11 @@ Coworkerd adds what a shared, multi-tenant cluster needs: isolation and limits b
         v                                               v
   coworkerd-apiserver  -- state, logs, trial loads -->  node: coworkerd  <-- peer sessions, port 8934 -->  other nodes
         |                 (peer port, management token)    |  (CONNECT signed with the cluster key, when configured)
-        |  writes tenants, credentials, deployments         |  reads the deployment state, tenants, members;
-        v                                                   v  writes its membership, suspects, usage
-       etcd, through its HTTP gateway  <--------------------+
-       object storage (S3 API): packages, modules, assets, definitions -- written by the control plane, read by the nodes
+        |                 and its own addresses            |
+        |  writes tenants, credentials,                    |  reads the deployment state, tenants, members, code;
+        |  deployments and code                            |  writes its own membership, suspects, usage
+        v                                                  v
+       object storage (S3 API), one bucket: the cluster's whole state
 
   inside a node: coworkerd <-- Unix sockets in run/ and inherited descriptors --> its workerd processes
 ```
@@ -31,17 +32,17 @@ Coworkerd adds what a shared, multi-tenant cluster needs: isolation and limits b
 | `coworkerd-launcher` | Starts each workerd process, where the host allows it, in namespaces of its own, without capabilities and under a system call filter |
 | `workerd` | Upstream workerd with the patch series, plus the runtime bridge `runtime/runtime.js` that loads tenant code into isolates |
 | `cowctl` | The command line: converts wrangler projects and talks only to the control plane |
-| etcd, object storage | External: membership and the desired and observed state; the code |
+| Object storage | External, S3-compatible: the cluster's whole state -- membership, the desired and the observed state, the code |
 
 [Components and boundaries](components.md) describes each of them, how they are deployed and configured, the trust between them and the repository's layout.
 
 ## 3. The path of one call
 
-1. **Ingress.** A request reaches any node's ingress. The node selects the route -- the longest path prefix the path starts with, the exact host before the default host `*` at each length -- and so the Worker; static assets of the Worker's version are answered there, without workerd.
+1. **Ingress.** A request reaches any node's ingress. The node selects the route -- on a hostname registered to a tenant only that tenant's routes count -- its routes on that host and its paths under the default host `*` --, and on any other hostname the routes on that host (only the operations tool writes such routes) and those under `*`; among them the longest path prefix that covers the path at a segment boundary (`/acme` covers `/acme` and `/acme/...`, never `/acme-corp/...`), at the same prefix a route on the hostname before one under `*` -- and so the Worker; static assets of the Worker's version are answered there, without workerd.
 2. **One deployment state per call tree.** From the same revision of its deployment state as the route, the node takes the **version lock table** of the Worker's closure: every Worker the call tree can reach, each with its version. Every call of the tree, on every node, executes by that table.
 3. **The call lease.** The root gets a deadline, the lease time of 30 s from its arrival, and a budget of 8 subrequests, which only Service Binding calls draw on; outgoing `fetch()` has the egress service's limits instead. A child call is granted at most 1 of them for its own calls, and its parent is charged for the call and the grant at once, so a tree can never spend more than its root was given: with these defaults a root makes up to four Service Binding calls and each of them one more, while calls to the `ASSETS` Binding draw nothing.
 4. **Placement across nodes.** The node chooses where the call executes: itself, when the version ran there within the last 30 s and it would admit the call -- except that, when it is not the Worker's home, the home goes first with probability 0.05 --; otherwise the Worker's **home** node, the first by rendezvous hashing of the Worker's name over the membership table, then itself, then the others by rank; candidates that failed recently go last, and at most eight attempts are made. A forwarded call carries its lock table, its share of the budget and its remaining time; the receiving node executes or refuses it and never forwards it again.
-5. **Admission and the process.** The executing node admits the call -- at its concurrency limits it refuses new trees before nested calls, while its memory band refuses forwarded and nested calls first, and it never queues -- and chooses a workerd process by rendezvous hashing: of the Worker over the ordinary processes, or of the tenant over the quarantine processes when the tenant is a suspect.
+5. **Admission and the process.** The executing node admits the call -- at its concurrency limits it refuses new trees before nested calls, while its memory band refuses forwarded roots and nested calls, in yellow only those for versions not warm there, and never a request at the node whose ingress received it; it never queues -- and chooses a workerd process by rendezvous hashing: of the Worker over the ordinary processes, or of the tenant over the quarantine processes when the tenant is a suspect.
 6. **The load check.** Before a version's first call in a process generation, and again once its last check there is more than 30 s old, the node loads it in that process without running a request; a version that does not load is refused before it executes (`LOAD_FAILED`).
 7. **Execution.** The call reaches workerd over the process's Unix socket. The runtime bridge runs the version in an isolate of its own, with `env` holding the version's variables and secrets and the call's Bindings.
 8. **Nested calls.** A Service Binding call leaves the isolate through a stub the platform created for its one target and comes back to the node over a Unix socket; the node places it like any call, in the same tree, with the same lock table, the same deadline and a share of the budget.
@@ -57,11 +58,11 @@ Tenants share workerd processes: the V8 isolate is the boundary between them, an
 
 ## 6. Control plane and state
 
-The control plane `coworkerd-apiserver` serves `/v1`: the administrator creates tenants and sets their quotas, hostnames and credentials; tenants upload versions, which exist only once a node has trial-loaded them (unless they hold only static assets), activate them, set routes and secrets, and read their logs and usage. It writes the desired state in etcd; the nodes read it and write only their own keys, which etcd's roles enforce once authentication is on. It keeps no state of its own, and no node calls it: the cluster serves calls while it is down; changes and the API's answers wait. [Control plane API](control-plane-api.md) describes the API and [cluster state](cluster-state.md) the etcd layout.
+The control plane `coworkerd-apiserver` serves `/v1`: the administrator creates tenants and sets their quotas, hostnames and credentials; tenants upload versions, which exist only once a node has trial-loaded them (unless they hold only static assets), activate them, set routes and secrets, and read their logs and usage. It writes the desired state to the object store; the nodes read it every few seconds and write only their own objects, which the store's identities enforce: each node has one of its own, which compose's `secrets` step generates and an operator on bare metal configures in the store. It keeps no state of its own -- it holds a mirror of the desired state, read from the store -- and no node calls it: the cluster serves calls while it is down; changes wait. [Control plane API](control-plane-api.md) describes the API and [cluster state](cluster-state.md) the object layout.
 
 ## 7. Egress and authentication
 
-Tenant code has no network of its own: its outgoing `fetch()` goes to the node's egress service, which refuses the cluster's own addresses and metadata addresses whatever a rule says and private networks unless the administrator allows them, resolves every destination itself and connects only to the addresses it checked, applies the tenant's rules and limits, and meters the bytes. Peer sessions are signed with a cluster key, every component has an etcd user of its own, nodes need only a read-only object storage identity, and the management endpoints take a token -- each of these when it is configured. [Egress and authentication](egress-and-auth.md) has the details and what is not done yet.
+Tenant code has no network of its own: its outgoing `fetch()` goes to the node's egress service, which refuses the cluster's own addresses and metadata addresses whatever a rule says and private networks unless the administrator allows them, resolves every destination itself and connects only to the addresses it checked, applies the tenant's rules and limits, and meters the bytes. Every node has an object storage identity of its own, which writes only that node's objects; secrets' values are sealed with the cluster's secrets key before they are stored; peer sessions are signed with a cluster key and the management endpoints take a token -- these two when they are configured. [Egress and authentication](egress-and-auth.md) has the details and what is not done yet.
 
 ## 8. Compatibility
 
@@ -72,7 +73,7 @@ Tenant code has no network of its own: its outgoing `fetch()` goes to the node's
 - **One region.** A cluster lives in one region or an equivalent low-latency network; there is no routing or failover across regions.
 - **Stateless Workers only.** Coworkerd schedules stateless calls; stateful bindings are refused at conversion, and stateful services are the platform's, reached as external services. State with ownership, such as Durable Objects, would need guarantees this design does not have.
 - **Isolates share processes.** Several tenants run in one workerd process, as on Cloudflare's platform, and an isolate is not as strong a boundary as a process; the per-isolate limits, the quarantine processes, process rotation and the sandbox are what this design adds to it.
-- **Trust between nodes.** Nodes trust each other through a shared signing key, when one is configured; there is no mTLS and no procedure for a node to join, and secret values are stored unencrypted in etcd.
+- **Trust between nodes.** Nodes trust each other through a shared signing key, when one is configured; there is no mTLS, and a node joins with an object storage identity issued for it (compose's `secrets add-node`), not through a join procedure of its own.
 - **Not done.** Accounts, billing and user interfaces; stateful bindings; scheduled triggers, JS RPC, Tail Workers and email handlers; routing across regions.
 
 ## 10. Public references

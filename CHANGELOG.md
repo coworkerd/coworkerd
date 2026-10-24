@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.4.0
+
+The object store becomes the cluster's only state, and etcd leaves Coworkerd: membership, the desired state (tenants,
+credentials, deployments, secrets), the suspects and the usage are all in one bucket of an S3-compatible store, beside
+the code that was there already. The control plane keeps nothing of its own, and a node only its Workers' recent log
+lines and the usage counts it has not written yet (a minute's worth while the store takes them), so a stateless node and
+a bucket make a cluster. **This release does
+not upgrade a 0.3.x cluster in place**: nothing is migrated -- build the cluster anew and deploy again (the install
+guide, section 9, "Upgrading from 0.3.x"); a configuration that names `etcdEndpoint`, `etcdCredentialsFile` or an
+`etcd` backend is refused, saying why.
+
+- **Membership on the object store**: every node registers an epoch it creates only if absent (and reads back), writes
+  a heartbeat every 5 s and lists the members every 10 s; liveness is judged by the store's own clock (`LastModified`
+  against the answer's `Date`), and a node that cannot write its heartbeat for the TTL considers its epoch expired. A
+  node joined the others' tables within 6.6 s, and one that was killed dropped out of them 28 to 33 s later. A node
+  refuses to start when its clock is more than 2 s from the store's, and a node whose identity another process takes
+  drains and exits with 3.
+- **Store outages fail no stateless call whose code and static assets its node holds**: a node whose epoch expired
+  keeps serving the stateless calls addressed to any epoch it held, and a node that could not list the store for
+  longer than the TTL keeps its members, whose heartbeats are still there, until the TTL and the grace have passed
+  after it recovers. Through a 40 s outage of one node's store connection, 3,330 requests at the ingress succeeded.
+- **The desired state on the object store**: one immutable manifest per tenant, the tenant index and the credentials
+  index, each change the next revision created only if absent; the control plane holds a mirror of all of it and
+  writes it -- as does the operations tool, with the same protocol -- and several control planes can share a bucket.
+  Nodes read the index's hint every 5 s and apply what changed: a deployment reached three nodes in 3.8 to 4.7 s (in
+  0.3, etcd pushed it within milliseconds), and ten concurrent deployments to one tenant through two control planes
+  all committed in 305 ms, none lost. A tenant's whole state is one write: there is no limit of 128 operations any
+  more.
+- **Secrets sealed at rest**: values are sealed with AES-256-GCM under the cluster's secrets key (`secrets.keyFile`),
+  which compose's `secrets` step generates for the control plane and every node; the store never holds a value in the
+  clear.
+- **An object storage identity for every node**: each node's identity writes only its own `members/<nodeId>/` and
+  `nodes/<nodeId>/` and cannot read the credentials index; the control plane and its tool keep the deploy identity.
+  `docker compose run --rm secrets add-node <nodeId>` issues a node's identity and its secrets directory to a running
+  cluster, and the node is then started with that directory (compose defines `node-1` to `node-3`; the install guide
+  gives a file for a fourth): the store took the new identity 1.3 s later without a restart, and the fourth node was a
+  member 5.6 s after `add-node`.
+- **Suspects and usage on the object store**: a node's suspects are one object beside its heartbeat, read by the other
+  nodes in their membership listing when it changed -- adopted within one listing cycle (10 s by default; 6.0 s
+  measured), one GET per change and none in between -- and its usage one object per hour
+  (`nodes/<nodeId>/usage/<hour>`), summed by the control plane.
+- **SeaweedFS 4.48** in the compose files (pinned by digest): before 4.29 its create-if-absent does not hold under
+  concurrency. Reads are presigned the standard way (only the host signed), which 4.48 requires -- the 0.3.1 binaries
+  cannot read from it, so the pin and this release's binaries go together.
+- **Checks**: `coworkerd check storage` reports the contract the cluster relies on (create-if-absent, listings with
+  `Date` and `LastModified`, the clock), `conditionalPutAtomic` (create-if-absent under concurrency), whether the bucket
+  holds the cluster's marker, and with `COWORKERD_READ_NODE_ID` a node identity's prefix policy;
+  `coworkerd check --config` checks the desired state (the secrets key, the marker) and the membership (a listing, the
+  clock, a write below the node's own prefix).
+- **The cluster's marker**: `coworkerd-apiserver tool init` writes `cluster/format/1` and empty indexes into a new
+  bucket (compose's `init` runs it); nodes and the control plane refuse to start on a bucket without it.
+- **`/v1`**: `STORAGE_UNAVAILABLE` (503) answers a change while the store cannot be reached, and the usage endpoints;
+  `ETCD_UNAVAILABLE` is not answered any more. The status answer gains `storage` (the revisions of the tenant index and
+  the credentials index, and the store client's counters), `/v1/nodes` gains `backend` and `lastHeartbeatAgeMs` per
+  node, and `etcdRevision` and the administrator view's `apiserver.etcdEndpoint` stay, always `null`. `cowctl status`
+  shows the two revisions.
+- **compose**: the services are `secrets`, `storage`, `init`, `node-1` to `node-3`, `apiserver` and `tool`; there is no
+  etcd service, volume or credential.
+- **The object store client**: separate connect (2 s), read (5 s) and create-if-absent (30 s) timeouts, a second try on
+  a new connection for idempotent requests that failed, and a create whose answer was lost decided by reading the key
+  back.
+
+**Still open**: there is no mTLS between nodes; the system call allowlist still defaults to `observe`; the stream of
+`cowctl logs --follow` is filled by asking the nodes every 500 ms; some reasons the nodes and the control plane give
+are still in Chinese; and `cowctl deploy`, `cowctl rollback` and `cowctl secret put` return before the nodes have read
+the change, which they do within about 5 s (an isolate already loaded keeps a secret's old value until it is replaced:
+an idle one after 5 minutes, one in use at the latest when its process is rotated, every hour by default).
+
 ## 0.3.1
 
 Isolation and consistency fixes found while the design documents were checked against the code, in the tenant
