@@ -7,12 +7,16 @@ a cookie signed with the secret `JWT_SECRET`. It uses:
 - **secrets**: `JWT_SECRET` is written in `.dev.vars.example` (`cowctl deploy` reads only the names in this file, never `.dev.vars`);
 - static assets (`public/`), `vars`, npm dependencies (`hono`, `x402-hono`), built by the template's own wrangler.
 
+It serves at `/` of a hostname of its own, which the administrator registers to the tenant first. With a tenant and its credential as the quickstart's section 2 makes them
+(the tenant `acme`, the admin credential in `~/.cowctl/admin`, the tenant's in `~/.cowctl/token`):
+
 ```bash
 npm ci                                                        # dependencies (about 600 packages)
-cowctl init --route x402.localhost/
+COWCTL_TOKEN=$(cat ~/.cowctl/admin) cowctl tenant update acme --hostname x402.localhost   # the list replaces acme's: name every hostname it keeps
+cowctl init --tenant acme --route x402.localhost/
 export JWT_SECRET=$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')
 printf '%s' "$JWT_SECRET" | cowctl secret put JWT_SECRET    # the value is read only from standard input
-cowctl deploy                                              # declares JWT_SECRET; without a value set, this step is refused
+cowctl deploy                                              # declares JWT_SECRET (refused without a value set); waits for the nodes
 curl http://x402.localhost:18080/__x402/health                # {"status":"ok",...}
 curl -i http://x402.localhost:18080/__x402/protected          # 402: not paid and no cookie
 ```

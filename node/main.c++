@@ -701,7 +701,7 @@ public:
     // (objectStore) So does this Server once its epoch expired by its own clock: the others drop it; it still serves
     // the calls at its ingress when no other member takes them, and the calls from the others addressed to an epoch
     // it held.
-    const bool lastResort = drain.draining || membership.view().selfExpired;
+    const bool lastResort = this->lastResort();
     for (const auto& [id, member] : membership.view().members) {
       if (id == serverConfig.serverId && lastResort) self = true;
       else if (id == serverConfig.serverId || member.state != "draining") ids.push_back(id);
@@ -711,7 +711,12 @@ public:
     return order;
   }
 
+  // This Server places work on itself only when no other member takes it: draining, or its epoch expired by its own
+  // clock (candidates() ranks it last for the same reason).
+  bool lastResort() const { return drain.draining || membership.view().selfExpired; }
   std::string processPlacement(const std::vector<std::string>& workers) { return runtime.placementJson(workers); }
+  // Ready to take work: the ordinary processes (a quarantine shard restarting after its tenant's crash takes nothing from
+  // the others; its state is in the state endpoint's processes and readiness).
   bool processesReady() const { return runtime.ready(); }
   // Process rotation: queue slots (all when empty) and report progress.
   std::string requestRotation(const std::vector<std::string>& processes) { return runtime.requestRotation(processes, "manual"); }
@@ -2202,13 +2207,31 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
 
 const char* statusText(uint status) {
   switch (status) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
     case 409: return "Conflict";
     case 410: return "Gone";
+    case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
     case 508: return "Loop Detected";
     default: return "Service Unavailable";
   }
+}
+
+// A Host header's host (RFC 3986 section 3.2.2): an IP literal keeps its brackets ([::1]:8080 is [::1]), a name or an
+// IPv4 address ends at the port's ':'.
+std::string hostWithoutPort(const std::string& host) {
+  if (host.starts_with('[')) {
+    const auto close = host.find(']');
+    return close == std::string::npos ? host : host.substr(0, close + 1);
+  }
+  const auto colon = host.find(':');
+  return colon == std::string::npos ? host : host.substr(0, colon);
 }
 
 std::string refusalBody(const InvocationRejection& refusal, double deadline) {
@@ -2654,18 +2677,19 @@ public:
     const auto placementId = server.nextPlacementId();
     auto ranked = server.candidates(version->workerId);
     const auto home = ranked.empty() ? "" : ranked.front();
-    // A draining Server is the last of its own candidates: Home, the others, then itself.
-    const bool draining = server.draining();
+    // A draining Server, or one whose epoch expired by its own clock, is the last of its own candidates: Home, the
+    // others, then itself.
+    const bool lastResort = server.lastResort();
     const bool selfRanked = std::find(ranked.begin(), ranked.end(), config.serverId) != ranked.end();
     std::vector<std::string> ordered;
     if (!home.empty()) ordered.push_back(home);
-    if (!draining && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
+    if (!lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
     for (const auto& id : ranked) if (id != home && id != config.serverId) ordered.push_back(id);
-    if (draining && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
+    if (lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
     if (forwarded) *forwarded = false;
     auto avoidedHome = avoidance.find(home);
     bool homeFailed = avoidedHome != avoidance.end() && avoidedHome->second.until > monotonicTimeMs();
-    bool localFirst = !draining && selfRanked &&
+    bool localFirst = !lastResort && selfRanked &&
         server.hot(version->definitionHash) &&
         !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot, allocation.expiresAtMonotonicMs, false);
     if (localFirst && home != config.serverId && server.drawHome()) {
@@ -2784,6 +2808,12 @@ public:
         co_return std::move(result.dispatcher);
       }
       if (!result.retryable) co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
+      // The call's lease ran out: no other candidate can take it, and none is to be avoided for it (a refusal of this
+      // Server's own was counted above).
+      if (result.failure->code == "LEASE_EXPIRED") {
+        if (id != config.serverId) server.observeLocalRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
+        co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
+      }
       if (id == home) homeFailed = true;
       if (attempted > 1) failures += ',';
       failures += "{\"nodeId\":\"" + id + "\",\"failure\":" + result.failure->json() + "}";
@@ -3303,13 +3333,39 @@ public:
   // Besides the Cap'n Proto CONNECT, the peer listener (the address a member
   // advertises) answers the deployment tool's trial loads, and the control
   // plane's reads of the state and the Workers' logs and its announcements of its
-  // own addresses, with the management token when one is set.
+  // own addresses, with the management token when one is set. A handler's failure is answered as JSON, its reason
+  // cleaned: 400, or 413 for a body over its limit.
   kj::Promise<void> request(
       kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body,
       Response& response) override {
+    auto tracked = kj::heap<TrackingHttpResponse>(response);
+    auto answered = kj::evalNow([&]() { return route(method, url, headers, body, *tracked); });
+    return answered.catch_([this, ptr = tracked.get()](kj::Exception&& error) -> kj::Promise<void> {
+      if (ptr->hasStarted()) return kj::mv(error);
+      const auto reason = cleanReason(error.getDescription().cStr());
+      std::cerr << "[server] peer request failed: " << reason << std::endl;
+      return sendJson(*ptr, 400, "Bad Request", "{\"code\":\"INVALID_REQUEST\",\"reason\":\"" + jsonEscape(reason) + "\"}");
+    }).attach(kj::mv(tracked));
+  }
+
+  kj::Promise<void> sendJson(Response& response, uint status, kj::StringPtr statusText, std::string text) {
+    auto body = kj::heap<std::string>(std::move(text));
+    kj::HttpHeaders headers(headerTable);
+    headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+    auto stream = response.send(status, statusText, headers, body->size());
+    auto write = stream->write(kj::arrayPtr(body->data(), body->size()).asBytes());
+    return write.attach(kj::mv(stream), kj::mv(body));
+  }
+
+  kj::Promise<void> route(
+      kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& body,
+      Response& response) {
     if (auto refused = server.managementRefusal(url, headers); !refused.empty()) {
       server.managementRefused("peer", method, url, refused);
       return sendUnauthorized(response, headerTable);
@@ -3317,13 +3373,16 @@ public:
     if (url == "/__coworkerd/trial-load") return trial(method, body, response);
     if (WorkerLogsEndpoint::matches(url)) return logs.serve(method, url, response);
     if (url == "/__coworkerd/control-plane" && method == kj::HttpMethod::POST) {
-      return body.readAllText(16 * 1024).then([this, &response](kj::String text) {
-        auto answer = kj::heap<std::string>(controlPlane.announce(std::string(text.cStr(), text.size())));
-        kj::HttpHeaders headers(headerTable);
-        headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-        auto stream = response.send(answer->starts_with("{\"ok\":true") ? 200 : 400, "OK", headers, answer->size());
-        auto write = stream->write(kj::arrayPtr(answer->data(), answer->size()).asBytes());
-        return write.attach(kj::mv(stream), kj::mv(answer));
+      // At most 16 KiB (read with one byte more: KJ's limit fails once it is reached).
+      constexpr uint64_t LIMIT = 16 * 1024;
+      return body.readAllText(LIMIT + 1).then([this, &response](kj::String text) -> kj::Promise<void> {
+        if (text.size() > LIMIT)
+          return sendJson(response, 413, "Payload Too Large", "{\"ok\":false,\"reason\":\"an announcement is at most 16 KiB\"}");
+        auto answer = controlPlane.announce(std::string(text.cStr(), text.size()));
+        const bool ok = answer.starts_with("{\"ok\":true");
+        return sendJson(response, ok ? 200 : 400, ok ? "OK" : "Bad Request", std::move(answer));
+      }, [this, &response](kj::Exception&&) -> kj::Promise<void> {
+        return sendJson(response, 413, "Payload Too Large", "{\"ok\":false,\"reason\":\"an announcement is at most 16 KiB\"}");
       });
     }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
@@ -4199,11 +4258,19 @@ public:
   TrialService(ServerCore& server, kj::Timer& timer, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headers)
       : server(server), timer(timer), factory(factory), headers(headers) {}
 
+  static constexpr uint64_t BODY_LIMIT = 8192;
   kj::Promise<void> serve(kj::HttpMethod method, kj::AsyncInputStream& body, kj::HttpService::Response& response) {
     if (method != kj::HttpMethod::POST) {
       co_return co_await send(response, 405, "Method Not Allowed", "{\"error\":\"trial-load requires POST\"}");
     }
-    auto text = co_await body.readAllText(8192);
+    // At most BODY_LIMIT bytes (read with one more: KJ's limit fails once it is reached).
+    kj::Maybe<kj::String> read;
+    try { read = co_await body.readAllText(BODY_LIMIT + 1); } catch (const kj::Exception&) {}
+    if (read == kj::none || KJ_ASSERT_NONNULL(read).size() > BODY_LIMIT) {
+      co_return co_await send(response, 413, "Payload Too Large",
+          "{\"error\":\"invalid trial request\",\"reason\":\"a trial request is at most 8192 bytes\"}");
+    }
+    auto text = kj::mv(KJ_ASSERT_NONNULL(read));
     TrialRequest request;
     std::string invalid;
     try { request = parse(text); }
@@ -4278,7 +4345,11 @@ private:
     // read (the values it validated reach the runtime with the definition);
     // a version without needs nothing else from the view. A revision this
     // Server has not applied yet makes it read the desired state at once
-    // rather than at its next poll. Normally all of this takes
+    // rather than at its next poll -- also when the definition is not found:
+    // a view behind the tool's may still name the label with another
+    // definition (a tenant deleted and created again since this Server's last
+    // poll), which refuses the fetch until the view forgets it, so the fetch
+    // is tried again after that read. Normally all of this takes
     // milliseconds; a Server cut off from the object store gives up after
     // VIEW_WAIT_MS, so that the tool soon tries another.
     const double viewDeadline = std::min(deadline, started + VIEW_WAIT_MS);
@@ -4298,8 +4369,9 @@ private:
               ? "deployment revision " + std::to_string(request.revision) + " (the version's secrets)" :
           !server.missingSecrets(*version).empty() ? "the values of the version's secrets" : "";
       if (waiting.empty() || monotonicTimeMs() >= viewDeadline) break;
-      if (version && !refreshed) {
+      if (!refreshed && (version || server.deploymentRevision() < request.revision)) {
         refreshed = true;
+        if (!version) fetched = false;
         co_await server.refreshDesiredState().exclusiveJoin(timer.afterDelay(
             static_cast<int64_t>(std::max(0.0, viewDeadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS));
         continue;
@@ -4556,7 +4628,10 @@ private:
       co_return co_await sendText(response, 200, "OK", server.debugPlacement(workers), "application/json");
     }
     if (url == "/__coworkerd/load-band") {
-      KJ_REQUIRE(method == kj::HttpMethod::POST, "load-band requires POST");
+      if (method != kj::HttpMethod::POST) {
+        co_return co_await sendText(response, 405, "Method Not Allowed",
+            "{\"code\":\"METHOD_NOT_ALLOWED\",\"reason\":\"load-band requires POST\"}", "application/json");
+      }
       auto text = co_await requestBody.readAllText(64);
       server.setLoadBand(text.cStr());
       co_return co_await sendText(response, 200, "OK", server.placementJson(), "application/json");
@@ -4616,7 +4691,10 @@ private:
       }
     }
     if (url == "/__coworkerd/reload") {
-      KJ_REQUIRE(method == kj::HttpMethod::POST, "reload requires POST");
+      if (method != kj::HttpMethod::POST) {
+        co_return co_await sendText(response, 405, "Method Not Allowed",
+            "{\"code\":\"METHOD_NOT_ALLOWED\",\"reason\":\"reload requires POST\"}", "application/json");
+      }
       if (server.draining()) {
         co_return co_await sendText(response, 409, "Conflict",
             "{\"code\":\"SERVER_DRAINING\",\"reason\":\"a draining Server applies no deployment change\"}", "application/json");
@@ -4649,8 +4727,7 @@ private:
     KJ_IF_SOME(value, hostHeader) {
       host = value.cStr();
     }
-    auto colon = host.find(':');
-    if (colon != std::string::npos) host.resize(colon);
+    host = hostWithoutPort(host);
     std::string path = url.cStr();
     auto query = path.find('?');
     if (query != std::string::npos) path.resize(query);
@@ -4694,7 +4771,8 @@ private:
     }
     auto refusal = server.admission(selected.version->workerId, selected.version->definitionHash, true, deadline);
     pathMark(timing, "admission-end");
-    if (refusal) co_return co_await sendText(response, refusal->status, statusText(refusal->status), refusal->json(), "application/json");
+    if (refusal) co_return co_await sendText(response, refusal->status, statusText(refusal->status), refusalBody(*refusal, deadline),
+        "application/json");
     auto slot = server.reserve(true);
     slot->timing = timing;
     pathMark(timing, "code-start");
@@ -4710,7 +4788,7 @@ private:
     if (remainingLeaseMs(deadline) == 0) {
       auto failure = server.refusal("LEASE_EXPIRED", "lease expired before root execution", 410, true);
       server.observeLocalRefusal(failure, "localIngress");
-      co_return co_await sendText(response, 410, "Gone", failure.json(), "application/json");
+      co_return co_await sendText(response, 410, "Gone", refusalBody(failure, deadline), "application/json");
     }
     if (auto missing = server.secretRefusal(*selected.version, true)) {
       server.observeLocalRefusal(*missing, "localIngress");
@@ -4742,7 +4820,7 @@ private:
       processFailure = server.processRefusal(error, true);
     }
     server.observeLocalRefusal(*processFailure, "localIngress");
-    co_return co_await sendText(response, 503, "Service Unavailable", processFailure->json(), "application/json");
+    co_return co_await sendText(response, 503, "Service Unavailable", refusalBody(*processFailure, deadline), "application/json");
   }
 
   kj::Promise<void> sendText(
@@ -5280,9 +5358,15 @@ int run(Launch launch) {
             << launch.form << "\",\"configFile\":\"" << jsonEscape(launch.configFile.string()) << "\",\"tokenSource\":\""
             << tokenSource << "\",\"configuration\":" << configuration << "}" << std::endl;
   if (serverConfig.managementToken.empty()) {
-    std::cout << "[server] {\"event\":\"management\",\"tokenSet\":false,\"warning\":\"the management endpoints have no token: "
-                 "whoever reaches this Server's ingress or peer address can read its state, drain, rotate and trial-load; "
-                 "set management.token or COWORKERD_MANAGEMENT_TOKEN\"}" << std::endl;
+    // The management endpoints (state, drain, rotation, trial loads, every tenant's log lines) take the token; a node
+    // without one starts only where its configuration says so, for development.
+    KJ_REQUIRE(serverConfig.managementAllowWithoutToken, "no management token: set management.token or "
+        "COWORKERD_MANAGEMENT_TOKEN (16 to 4096 printable characters); a development node may start without one with "
+        "management.allowWithoutToken: true -- its management endpoints are then open to whoever reaches it");
+    std::cout << "[server] {\"event\":\"management\",\"tokenSet\":false,\"allowWithoutToken\":true,\"warning\":\"the "
+                 "management endpoints have no token: whoever reaches this Server's ingress or peer address can read its state "
+                 "and every tenant's log lines, drain, rotate and trial-load; set management.token or COWORKERD_MANAGEMENT_TOKEN\"}"
+              << std::endl;
   }
   coworkerd::PeerAuth peerAuth(serverConfig.peerAuth, serverConfig.serverId, timer);
   if (!peerAuth.enabled()) {
@@ -5400,8 +5484,20 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
-  if (membership->view().backend == "objectStore")
-    server.addStateSection("storage", [&membership]() { return membership->view().storageJson(); });
+  // The object store as this node uses it: the membership's measurements, and the tenant index's revision it has applied
+  // (what a deployment waits for: cowctl, /v1/nodes).
+  if (membership->view().backend == "objectStore" || server.placementConfig().desiredState.backend == "objectStore") {
+    server.addStateSection("storage", [&membership, &desiredState, objectState = server.placementConfig().desiredState.backend == "objectStore"]() {
+      std::string out = membership->view().backend == "objectStore" ? membership->view().storageJson() : std::string("{}");
+      if (!objectState) return out;
+      out.pop_back();
+      return out + (out.size() > 1 ? "," : "") + "\"appliedTenantsRevision\":\"" + std::to_string(desiredState->state().revision()) + "\"}";
+    });
+  }
+  server.addStateSection("readiness", [&server, &runtime]() {
+    return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +
+        runtime.quarantineReadinessJson() + "}";
+  });
   HttpForwarder forwarder(server, httpOverCapnpFactory);
   TrialService trials(server, timer, httpOverCapnpFactory, *headerTable);
   WorkerLogsEndpoint workerLogs(server.placementConfig().serverId, *io.lowLevelProvider, timer, *headerTable);
@@ -5447,7 +5543,12 @@ int run(Launch launch) {
   }
   DrainController drain(server, runtime, *membership, timer, server.placementConfig().drainAnnounceDelayMsForTest,
       [&httpServer]() { return httpServer.drain(); });
-  membership->onIdentityTaken([&drain](std::string reason) { drain.identityTaken(std::move(reason)); });
+  // Another process holds this node's id: it writes the node's usage objects from now on, this one none (not even the
+  // drain's last flush), then this one drains and exits.
+  membership->onIdentityTaken([&drain, &tenantUsage](std::string reason) {
+    tenantUsage.stop("another process holds this node's id");
+    drain.identityTaken(std::move(reason));
+  });
 
   std::cout << "[server] ready http=" << launch.listenAddress
             << " binding-rpc=" << bindingSocketAddress
@@ -5470,7 +5571,7 @@ int run(Launch launch) {
       .exclusiveJoin(runLeaseReaper(server, timer))
       .exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(membership->run())
-      // A draining Server applies no further deployment change: the watch ends at the announcement.
+      // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())
           .then([]() -> kj::Promise<void> { return kj::NEVER_DONE; }))
       .exclusiveJoin(drain.signals(shutdown.addBranch(), io.unixEventPort))
@@ -5517,6 +5618,24 @@ int runSelfCheck(const std::vector<std::string>& args) {
   auto io = kj::setupAsyncIo();
   auto& timer = io.provider->getTimer();
   auto headerTable = kj::HttpHeaderTable::Builder().build();
+  // The management token (management.token, else COWORKERD_MANAGEMENT_TOKEN): without one the node does not start,
+  // unless management.allowWithoutToken says it may (development).
+  {
+    std::string token = c.managementToken, source = token.empty() ? "unset" : "config";
+    std::string problem;
+    if (const char* value = std::getenv("COWORKERD_MANAGEMENT_TOKEN"); value != nullptr && *value) {
+      token = value;
+      source = "environment";
+      try { ServerConfig::checkToken(token, "COWORKERD_MANAGEMENT_TOKEN"); }
+      catch (const kj::Exception& error) { problem = cleanReason(error.getDescription().cStr()); }
+    }
+    if (problem.empty() && token.empty() && !c.managementAllowWithoutToken)
+      problem = "no management token (management.token or COWORKERD_MANAGEMENT_TOKEN): the node would not start "
+          "(management.allowWithoutToken: true starts a development node without one)";
+    report("management", problem.empty(), std::string(",\"tokenSet\":") + (token.empty() ? "false" : "true") + ",\"tokenSource\":\"" +
+        source + "\",\"allowWithoutToken\":" + (c.managementAllowWithoutToken ? "true" : "false") +
+        (problem.empty() ? std::string() : ",\"reason\":\"" + jsonEscape(problem) + "\""));
+  }
   // The outbound rules and the peer key file, with the node's environment overrides.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) c.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) c.egress.defaultPolicy = policy;

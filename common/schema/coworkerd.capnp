@@ -286,6 +286,9 @@ struct ServerConfig {
     # How often the control plane reads the desired state's hints again (the writes of another control plane on the same
     # bucket); its own writes are in its mirror as it makes them.
     pollIntervalMs @6 :UInt32 = 5000;
+    # The object cleanup of a version's or a tenant's deletion removes only objects last modified longer ago than this
+    # (an upload may be about to use an object it found there); younger ones are removed by a later sweep.
+    cleanupGraceMs @7 :UInt64 = 3600000;
   }
 
   struct LogsConfig {
@@ -309,7 +312,8 @@ struct ServerConfig {
     bucket @1 :Text = "coworkerd";
     region @2 :Text = "us-east-1";
     # A JSON file {"accessKey":"...","secretKey":"..."} with the Servers' identity: it reads, and with the objectStore
-    # membership also lists and writes members/<nodeId>/; without one, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+    # membership also lists and writes members/<nodeId>/ and nodes/<nodeId>/ (its usage); without one,
+    # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
     credentialsFile @3 :Text;
     # The longest a prefetch waits for one object; a single request is bounded by the three timeouts below.
     timeoutMs @4 :UInt32 = 30000;
@@ -326,8 +330,11 @@ struct ServerConfig {
   }
 
   struct ManagementConfig {
-    # Required as `Authorization: Bearer <token>`; unset keeps the endpoints open.
+    # Required as `Authorization: Bearer <token>` on every /__coworkerd/ endpoint but ready and probe;
+    # COWORKERD_MANAGEMENT_TOKEN overrides it. A node without one refuses to start.
     token @0 :Text;
+    # Development only: start without a token, the endpoints open to whoever reaches the node (warned at startup).
+    allowWithoutToken @1 :Bool = false;
   }
 
   struct Peer {
@@ -413,7 +420,8 @@ struct MembershipConfig {
   advertisedAddress @2 :Text;
   # objectStore: how old a heartbeat may be before its identity is free again (and, with
   # livenessGraceMs, before the other members drop it); a node that wrote none for that long by its own monotonic
-  # clock takes no calls from other nodes and registers again with a new epoch.
+  # clock places calls on itself only when no other member takes them, keeps serving the stateless calls addressed to
+  # any epoch it held, and registers again with a new epoch.
   ttlSeconds @3 :UInt32 = 15;
   requestTimeoutMs @4 :UInt32 = 750;
   startupTimeoutMs @5 :UInt32 = 15000;

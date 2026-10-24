@@ -69,7 +69,8 @@ public:
   }
   kj::Promise<void> run() override {
     while (true) {
-      co_await timer.afterDelay(settings.pollIntervalMs * kj::MILLISECONDS);
+      // A revision waiting for a definition read is tried again sooner (backoff), else every pollIntervalMs.
+      co_await timer.afterDelay((pendingDefinitions.empty() ? settings.pollIntervalMs : pendingBackoffMs) * kj::MILLISECONDS);
       co_await pollShared();
     }
   }
@@ -206,7 +207,10 @@ public:
         << ",\"manifestReads\":" << polls.manifests << ",\"definitionReads\":" << polls.definitions
         << ",\"refreshes\":" << polls.refreshes
         << ",\"tenants\":" << tenants.size() << ",\"definitions\":" << definitionBytes.size()
-        << ",\"missingDefinitions\":" << missingDefinitionsJson() << ",\"undecryptableSecrets\":" << undecryptableJson()
+        << ",\"missingDefinitions\":" << missingDefinitionsJson() << ",\"pendingDefinitions\":" << pendingDefinitionsJson()
+        << ",\"pendingRevision\":\"" << pendingRevision << "\",\"pendingDeferrals\":" << pendingDeferrals
+        << ",\"labels\":" << index.labelCount() << ",\"labelsForgotten\":" << labelsForgotten
+        << ",\"undecryptableSecrets\":" << undecryptableJson()
         << ",\"routeConflicts\":" << routeConflicts << ",\"secretsKey\":" << quote(key.fingerprint())
         << ",\"bucket\":" << quote(storage.config().bucket) << ",\"client\":" << storage.stats().json() << '}'
         << ",\"versionResolutionForTest\":" << quote(settings.versionResolutionForTest)
@@ -395,6 +399,14 @@ private:
   DefinitionBytes definitionBytes;
   std::map<std::string, std::string> missingDefinitions;
   uint64_t lastDefinitionRetryAtUnixMs = 0;
+  // Definitions a new revision names that could not be read (the store failed: not missing, not damaged): the revision
+  // waits, the node serving what it applied, and is read again after pendingBackoffMs (doubling from 200 ms up to the
+  // poll interval) until they are read.
+  std::map<std::string, std::string> pendingDefinitions;
+  uint64_t pendingRevision = 0, pendingDeferrals = 0;
+  uint32_t pendingBackoffMs = 0;
+  // Labels (tenant/Worker@version) the index forgot because no applied revision named them any more.
+  uint64_t labelsForgotten = 0;
   std::set<std::string> undecryptable;  // <tenant>/<worker>/<name>
   std::function<void(const std::map<std::string, std::optional<TenantRecord>>&, uint64_t, bool)> tenantSink;
   bool lastPollOk = false;
@@ -432,6 +444,15 @@ private:
     }
     return out + "}";
   }
+  std::string pendingDefinitionsJson() const {
+    std::string out = "{";
+    size_t index = 0;
+    for (const auto& [hash, reason] : pendingDefinitions) {
+      if (index == STATUS_PROBLEM_LIMIT) break;
+      out += (index++ ? "," : "") + quote(hash) + ":" + quote(reason);
+    }
+    return out + "}";
+  }
   std::string undecryptableJson() const {
     std::string out = "[";
     size_t index = 0;
@@ -455,7 +476,7 @@ private:
           std::cerr << "[deployment] " << refusal << std::endl;
           KJ_FAIL_REQUIRE(refusal.c_str());
         }
-        KJ_REQUIRE(marker.status == 200, "object store read failed", marker.status);
+        requireStorage(marker.status == 200, "object store read failed: HTTP " + std::to_string(marker.status));
         break;
       } catch (const kj::Exception& error) {
         if (!refusal.empty()) throw;
@@ -519,7 +540,8 @@ private:
       ++polls.indexes;
       object = co_await storage.get(revisionKey(TENANT_INDEX_PREFIX, candidate));
     }
-    KJ_REQUIRE(object.status == 200, "object store read failed", object.status, revisionKey(TENANT_INDEX_PREFIX, candidate).c_str());
+    requireStorage(object.status == 200, "object store read failed: HTTP " + std::to_string(object.status) + " (" +
+        revisionKey(TENANT_INDEX_PREFIX, candidate) + ")");
     co_return std::pair<uint64_t, std::string>{candidate, std::move(object.bytes)};
   }
 
@@ -601,7 +623,7 @@ private:
             ++self.polls.manifests;
             const auto objectKey = revisionKey(tenantManifestPrefix(tenant), manifestRev);
             auto response = co_await self.storage.get(objectKey);
-            KJ_REQUIRE(response.status == 200, "object store read failed", response.status, objectKey.c_str());
+            requireStorage(response.status == 200, "object store read failed: HTTP " + std::to_string(response.status) + " (" + objectKey + ")");
             auto manifest = decodeTenantManifest(response.bytes);
             KJ_REQUIRE(manifest.tenant == tenant && manifest.revision == manifestRev,
                 "a manifest names another tenant or revision than its key", objectKey.c_str());
@@ -614,7 +636,37 @@ private:
         }
       }
       lastDefinitionRetryAtUnixMs = nowUnixMs();
-      if (co_await fetchNamedDefinitions(next)) for (const auto& [tenant, manifest] : next) recompute.insert(tenant);
+      const bool added = co_await fetchNamedDefinitions(next);
+      // A definition the changed manifests name anew that could not be read because the store failed: the revision waits
+      // (the Workers keep the versions they have) and is read again soon. One that is missing or does not verify is
+      // applied as before: its Worker is not valid ("definition unknown").
+      if (started) {
+        std::set<std::string> applied;
+        for (const auto& [tenant, manifest] : tenants) applied.merge(namedDefinitions(manifest));
+        std::map<std::string, std::string> unread;
+        for (const auto& tenant : recompute) {
+          auto manifest = next.find(tenant);
+          if (manifest == next.end()) continue;
+          for (const auto& hash : namedDefinitions(manifest->second)) {
+            auto failed = missingDefinitions.find(hash);
+            if (!applied.contains(hash) && failed != missingDefinitions.end() && failed->second.starts_with("read failed"))
+              unread[hash] = failed->second;
+          }
+        }
+        if (!unread.empty()) {
+          if (pendingRevision != revision) ++pendingDeferrals;
+          pendingDefinitions = std::move(unread);
+          pendingRevision = revision;
+          pendingBackoffMs = pendingBackoffMs ? std::min(pendingBackoffMs * 2, settings.pollIntervalMs) : std::min(200u, settings.pollIntervalMs);
+          if (pendingDeferrals == 1 || pendingBackoffMs < settings.pollIntervalMs)
+            std::cerr << "[deployment] revision=" << revision << " waits for " << pendingDefinitions.size()
+                      << " definitions that could not be read; serving revision=" << current.revision() << std::endl;
+          co_return;
+        }
+      }
+      pendingDefinitions.clear();
+      pendingBackoffMs = 0;
+      if (added) for (const auto& [tenant, manifest] : next) recompute.insert(tenant);
     }
     co_await applyView(std::move(next), std::move(recompute), revision);
   }
@@ -696,6 +748,17 @@ private:
       throw;
     }
     tenants = std::move(next);
+    // The labels this revision names, each with its definition: a label no manifest names any more -- a version
+    // deleted, a tenant deleted or created again -- is forgotten, so that another definition may take it.
+    std::map<std::string, std::string> named;
+    for (const auto& [tenant, manifest] : tenants) {
+      for (const auto& [name, worker] : manifest.workers) {
+        const auto id = workerFullId(tenant, name);
+        for (const auto& [versionId, version] : worker.versions) named[id + "@" + versionId] = version.definitionHash;
+        if (worker.active) named[id + "@" + worker.active->versionId] = worker.active->definitionHash;
+      }
+    }
+    labelsForgotten += index.retain(named);
     tenantKeys = std::move(nextKeys);
     routeKeys = std::move(routes);
     appliedGeneration = generation;

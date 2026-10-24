@@ -198,13 +198,16 @@ struct ServerConfig {
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;
   std::string storageCredentialsFile;
   bool serverIdGiven = false, cacheFollowsStack = false;
-  // COWORKERD_MANAGEMENT_TOKEN overrides the file's management.token (run()).
+  // COWORKERD_MANAGEMENT_TOKEN overrides the file's management.token (run()). Without one the node refuses to start
+  // unless management.allowWithoutToken says it may.
   std::string managementToken;
+  bool managementAllowWithoutToken = false;
   // The control plane (`control`) and the Workers' logs (each Server's workerd output reader).
   std::string controlListenAddress, controlTemporaryDirectory;
   uint64_t controlMaxUploadBytes = 167772160;
   uint32_t controlServerTimeoutMs = 2000;
   uint32_t controlPollIntervalMs = 5000;
+  uint64_t controlCleanupGraceMs = 3600000;
   // The administrator's credential of /v1 (COWORKERD_ADMIN_CREDENTIAL overrides it) and path routing
   // under the default host.
   std::string controlAdminCredential;

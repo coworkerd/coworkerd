@@ -63,8 +63,9 @@ kj::Promise<AppendResult> appendRevision(ObjectStore& store, kj::Timer& timer, s
     const auto next = latestRevision(listing, prefix) + 1;
     auto result = co_await store.create(revisionKey(prefix, next), bytes);
     if (result.created) co_return AppendResult{next, attempt, result.dateUnixMs};
-    KJ_REQUIRE(attempt < maxAttempts, "revision sequence: every attempt met a revision another writer created first",
-        prefix.c_str(), attempt);
+    if (attempt >= maxAttempts)
+      failConflict("revision sequence " + prefix + ": every attempt met a revision another writer created first (" +
+          std::to_string(attempt) + " attempts)");
     uint32_t random = 0;
     KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&random), sizeof(random)) == 1, "cannot draw a retry pause");
     const uint32_t ceiling = std::min<uint32_t>(160, 5u << std::min<uint32_t>(attempt, 5));
@@ -75,7 +76,7 @@ kj::Promise<AppendResult> appendRevision(ObjectStore& store, kj::Timer& timer, s
 kj::Promise<std::optional<uint64_t>> readHintRevision(ObjectStore& store, std::string hintKey) {
   auto response = co_await store.get(hintKey);
   if (response.status == 404) co_return std::nullopt;
-  KJ_REQUIRE(response.status == 200, "object store read failed", response.status);
+  requireStorage(response.status == 200, "object store read failed: HTTP " + std::to_string(response.status) + " (" + hintKey + ")");
   co_return parseHint(response.bytes);
 }
 
@@ -96,7 +97,8 @@ kj::Promise<LatestRevision> readLatestRevision(ObjectStore& store, std::string p
       if (candidate) object = co_await store.get(revisionKey(prefix, candidate));
     }
     if (candidate) {
-      KJ_REQUIRE(object.status == 200, "object store read failed", object.status, revisionKey(prefix, candidate).c_str());
+      requireStorage(object.status == 200, "object store read failed: HTTP " + std::to_string(object.status) + " (" +
+          revisionKey(prefix, candidate) + ")");
       result.bytes = std::move(object.bytes);
     }
   }
@@ -104,7 +106,8 @@ kj::Promise<LatestRevision> readLatestRevision(ObjectStore& store, std::string p
     while (true) {
       auto next = co_await store.get(revisionKey(prefix, candidate + 1));
       if (next.status == 404) break;
-      KJ_REQUIRE(next.status == 200, "object store read failed", next.status);
+      requireStorage(next.status == 200, "object store read failed: HTTP " + std::to_string(next.status) + " (" +
+          revisionKey(prefix, candidate + 1) + ")");
       ++candidate;
       result.bytes = std::move(next.bytes);
     }

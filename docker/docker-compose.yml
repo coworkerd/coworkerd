@@ -11,6 +11,7 @@
 #   docker compose run --rm tool admin-credential   the administrator's credential of the API (cowctl tenant ...)
 #   docker compose run --rm secrets add-node ID     a node joining the running cluster: its own identity and directory
 #                                                   (the object store takes the identity within seconds, no restart)
+#   docker compose run --rm secrets remove-node ID  a node leaving for good: its identity withdrawn, its directory removed
 #   docker compose --profile cluster down -v        stop and delete everything, data included
 #
 # Only the nodes' ingress ports and the control plane reach the host (COWORKERD_BIND, COWORKERD_HTTP_PORT
@@ -28,7 +29,7 @@
 # addresses on ports 80 and 443, never the cluster's own). Settings: .env (see .env.example) or the environment.
 name: ${COWORKERD_PROJECT:-coworkerd}
 
-x-image: &image coworkerd:${COWORKERD_VERSION:-0.3.1}
+x-image: &image coworkerd:${COWORKERD_VERSION:-0.4.0}
 
 x-node: &node
   image: *image
@@ -61,13 +62,14 @@ services:
     depends_on:
       secrets:
         condition: service_completed_successfully
-    # Starts once the secrets step has written the S3 identities and security.toml (the store reads them at its
-    # start). Only the S3 gateway listens on the container's network -- S3 itself, guarded by the identities'
+    # Starts once the secrets step has written s3.json (the deploy identity, which the store reads at its start) and
+    # security.toml. Only the S3 gateway listens on the container's network -- S3 itself, guarded by the identities'
     # signatures, and its gRPC interface, which security.toml closes to everyone; the master, volume and filer servers
-    # (the filer's identity service among them) listen on its loopback only, where the gateway reaches them. An identity
-    # the secrets step adds while the store runs (add-node) comes as hotload/<id>.weed: every 2 s a loop beside the store
-    # applies each such file it has not applied yet with weed shell (s3.configure, kept in the filer and in force at
-    # once), its output discarded (it prints the identities).
+    # (the filer's identity service among them) listen on its loopback only, where the gateway reaches them. Every
+    # node's identity comes as hotload/<id>.weed, one the secrets step withdraws (remove-node) as hotload/<id>.remove.weed:
+    # every 2 s a loop beside the store applies each such file it has not applied yet since the container started with
+    # weed shell (s3.configure, kept in the filer and in force at once) until the identity is there, or gone, so that
+    # each one can be withdrawn without a restart; its output discarded (it prints the identities).
     entrypoint:
       - /bin/sh
       - -c
@@ -75,8 +77,10 @@ services:
         until [ -s /config/s3.json ] && [ -s /config/security.toml ]; do sleep 0.2; done;
         (applied=""; while sleep 2; do for f in /config/hotload/*.weed; do [ -f "$$f" ] || continue;
         sum=$$(cksum < "$$f"); case "$$applied" in *"|$$sum|"*) continue;; esac; id=$${f##*/}; id=$${id%.weed};
+        case "$$id" in *.remove) id=$${id%.remove}; want=no;; *) want=yes;; esac;
         cd /tmp && timeout 60 /usr/bin/weed shell < "$$f" > /dev/null 2>&1 &&
-        printf 's3.configure\n' | timeout 60 /usr/bin/weed shell 2>/dev/null | grep -q "\"name\": \"node-$$id\"" &&
+        if printf 's3.configure\n' | timeout 60 /usr/bin/weed shell 2>/dev/null | grep -q "\"name\": \"node-$$id\"";
+        then have=yes; else have=no; fi && [ "$$have" = "$$want" ] &&
         applied="$$applied|$$sum|"; done; done) &
         cd /config && exec /usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=20
         -master.volumeSizeLimitMB=64 -s3 -s3.config=/config/s3.json

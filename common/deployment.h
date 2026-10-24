@@ -299,17 +299,25 @@ private:
   void setRoute(const std::string& key, const std::optional<std::string>& value);
 };
 
-// Local append-only index of definitions by hash. Identity is the hash; a
-// label only distinguishes "known label, other hash" from "unknown label".
+// Local index of definitions by hash, append-only. Identity is the hash; a
+// label only distinguishes "known label, other hash" from "unknown label", and
+// it lasts while the desired state names it: a label no manifest names any
+// more -- a version deleted, a tenant deleted or created again -- is forgotten
+// (retain), so that another definition may take it.
 class DefinitionIndex {
 public:
   // Validates and adds; a known hash is ignored.
   void remember(std::shared_ptr<const VersionDefinition> version);
+  // The labels the applied desired state names, each with its definition's hash: a label it names with that hash only,
+  // every other label forgotten (its definitions stay, by hash). Returns how many labels were forgotten.
+  size_t retain(const std::map<std::string, std::string>& named);
   std::shared_ptr<const VersionDefinition> find(const VersionPin& pin, std::string& reason) const;
   std::shared_ptr<const VersionDefinition> byHash(const std::string& hash) const;
-  // The definition with this label (and hash, when given).
+  // The definition with this label: by its hash when given (whose definition must carry the label), else the one hash
+  // the label names.
   std::shared_ptr<const VersionDefinition> exact(const std::string& label, const std::string& hash = {}) const;
   size_t size() const { return hashes.size(); }
+  size_t labelCount() const { return labels.size(); }
 
 private:
   std::map<std::string, std::shared_ptr<const VersionDefinition>> hashes;

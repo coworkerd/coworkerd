@@ -227,6 +227,8 @@ struct ControlSettings {
   uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
   // The usage objects' retention (usage.retentionHours): the daily cleanup removes what is older, for the nodes that left.
   uint32_t usageRetentionHours = 744;
+  // A deletion's object cleanup removes only objects older than this (control.cleanupGraceMs).
+  uint64_t cleanupGraceMs = 3600000;
 };
 
 // A path segment of the API: a deployment name (letters, digits, '-', '_' and '.').
@@ -371,7 +373,8 @@ public:
   ControlService(const ControlSettings& settings, coworkerd::ObjectStore& storage,
       coworkerd::ManifestStore& state, kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
       : settings(settings), storage(storage), state(state), timer(timer), network(network), headerTable(headerTable),
-        context{storage, state, timer, network, headerTable, settings.token, settings.memberTtlSeconds, settings.memberGraceMs} {}
+        context{storage, state, timer, network, headerTable, settings.token, settings.memberTtlSeconds, settings.memberGraceMs,
+            settings.cleanupGraceMs} {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body, Response& response) override {
@@ -388,9 +391,8 @@ public:
           std::cout << "[control] {\"event\":\"failure\",\"reason\":\"" << jsonEscape(cleanReason(error.getDescription().cStr()))
                     << "\"}" << std::endl;
           if (tracked.status) return kj::mv(error);
-          // The object store out of reach where an answer needed it (and no mirror could stand in).
-          if (std::string(error.getDescription().cStr()).find("object store") != std::string::npos)
-            return fail(tracked, 503, "STORAGE_UNAVAILABLE", error.getDescription().cStr());
+          // The object store failed where an answer needed it (and no mirror could stand in).
+          if (coworkerd::isStorageFailure(error)) return fail(tracked, 503, "STORAGE_UNAVAILABLE", error.getDescription().cStr());
           return fail(tracked, 500, "INTERNAL", error.getDescription().cStr());
         })
         .then([&tracked, started, path = std::move(path), methodName = std::move(methodName)]() {
@@ -557,6 +559,14 @@ private:
     auto text = co_await body.readAllText(limit);
     co_return std::string(text.cStr(), text.size());
   }
+  // A body of at most `limit` bytes: read with one byte more, so that one of exactly `limit` bytes is taken (KJ's
+  // read with a limit fails once the bytes read reach it). None when the body is longer.
+  static kj::Promise<std::optional<kj::Array<kj::byte>>> readAtMost(kj::AsyncInputStream& body, uint64_t limit) {
+    std::optional<kj::Array<kj::byte>> bytes;
+    try { bytes = co_await body.readAllBytes(limit + 1); } catch (const kj::Exception&) {}
+    if (bytes && bytes->size() > limit) bytes.reset();
+    co_return bytes;
+  }
 
   // Where a tenant may route: a hostname it owns, or the default host * under /<tenant>/ (unless path routing
   // is off; /<tenant> itself is written as /<tenant>/, defaultHostPrefix). Empty when it may.
@@ -566,7 +576,10 @@ private:
         return "path routes under the default host are off on this cluster (control.pathRouting); route a hostname of tenant " + tenant.name;
       const auto prefix = "/" + tenant.name + "/";
       if (coworkerd::defaultHostPrefix(tenant.name, route.pathPrefix).starts_with(prefix)) return {};
-      return "a route of tenant " + tenant.name + " under the default host * starts with " + prefix + " (not " + route.pathPrefix + ")";
+      // Routes as host and prefix together (*/acme/...): a route's prefix is not a file path, and the reason's cleaning
+      // takes only a token that starts with '/' for one.
+      return "the routes of tenant " + tenant.name + " under the default host are *" + prefix + "...: route *" + route.pathPrefix +
+          " is outside them";
     }
     if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), route.host) != tenant.hostnames.end()) return {};
     return "hostname " + route.host + " is not one of tenant " + tenant.name + "'s hostnames";
@@ -587,14 +600,9 @@ private:
     KJ_IF_SOME(length, body.tryGetLength()) {
       if (length > limit) co_return co_await tooLarge();
     }
-    kj::Array<kj::byte> archive;
-    bool large = false;
-    try {
-      archive = co_await body.readAllBytes(limit);
-    } catch (const kj::Exception&) {
-      large = true;
-    }
-    if (large) co_return co_await tooLarge();
+    auto read = co_await readAtMost(body, limit);
+    if (!read) co_return co_await tooLarge();
+    kj::Array<kj::byte> archive = kj::mv(*read);
     auto pattern = (settings.temporaryDirectory / "coworkerd-control-XXXXXX").string();
     std::vector<char> name(pattern.begin(), pattern.end());
     name.push_back('\0');
@@ -640,6 +648,11 @@ private:
       } catch (const kj::Exception&) {}  // the deployment's own checks say what is wrong with it
       if (problem) co_return co_await fail(response, 422, "QUOTA_EXCEEDED", *problem);
     }
+    // An upload without activation moves no pointer and writes no route: routes come with an activation.
+    if (!activate && !input.routes.empty())
+      co_return co_await fail(response, 400, "INVALID_REQUEST", "an upload without activation takes no routes (the package's "
+          "manifest lists " + std::to_string(input.routes.size()) + "): a version's routes are written when it is activated -- "
+          "upload with ?activate=true, or after :activate set them with PUT .../workers/" + worker + "/routes");
     if (activate) for (const auto& route : input.routes) {
       if (auto refused = routeRefusal(tenant, route); !refused.empty())
         co_return co_await fail(response, 403, "HOSTNAME_NOT_OWNED", refused);
@@ -721,21 +734,24 @@ private:
     if (!coworkerd::environmentName(name))
       co_return co_await fail(response, 400, "INVALID_REQUEST", "a secret name is a JavaScript identifier of ASCII letters, digits, '_' and '$'");
     if (method == kj::HttpMethod::PUT) {
-      std::string value;
-      bool tooLarge = false;
-      try {
-        auto bytes = co_await body.readAllBytes(64 * 1024);
-        value.assign(reinterpret_cast<const char*>(bytes.begin()), bytes.size());
-      } catch (const kj::Exception&) {
-        tooLarge = true;
-      }
-      if (tooLarge) co_return co_await fail(response, 413, "SECRET_TOO_LARGE", "a secret value is at most 5 KiB");
+      // One answer for a value too large, whatever its size: 422 SECRET_REFUSED naming the limit.
+      auto bytes = co_await readAtMost(body, coworkerd::MAX_SECRET_BYTES);
+      if (!bytes)
+        co_return co_await fail(response, 422, "SECRET_REFUSED", "secret value exceeds 5 KiB: a secret value is at most " +
+            std::to_string(coworkerd::MAX_SECRET_BYTES) + " bytes");
+      std::string value(reinterpret_cast<const char*>(bytes->begin()), bytes->size());
       auto counts = coworkerd::tenantCounts(state, tenant.name);
       const auto known = counts.secrets.find(id);
       const bool exists = known != counts.secrets.end() && known->second.contains(name);
       if (!exists && counts.secretTotal >= tenant.quotas.secrets)
         co_return co_await fail(response, 422, "QUOTA_EXCEEDED", "secrets: tenant " + tenant.name + " has " +
             std::to_string(counts.secretTotal) + " secrets, its quota is " + std::to_string(tenant.quotas.secrets));
+      // A secret of a Worker the tenant does not have yet makes the Worker: it counts against the workers quota as an
+      // upload of a new Worker does.
+      if (!counts.hasWorker(id) && counts.versions.size() >= tenant.quotas.workers)
+        co_return co_await fail(response, 422, "QUOTA_EXCEEDED", "workers: tenant " + tenant.name + " has " +
+            std::to_string(counts.versions.size()) + " Workers, its quota is " + std::to_string(tenant.quotas.workers) +
+            " (a secret of a Worker it does not have makes one)");
       co_return co_await answer(response, co_await coworkerd::controlSecretPut(context, id, name, std::move(value)), "secret");
     }
     if (method == kj::HttpMethod::DELETE)
@@ -782,7 +798,7 @@ private:
     }
     if (failure) {
       if (listedMembers) co_return *listedMembers;
-      KJ_FAIL_REQUIRE("object store request failed: the members cannot be listed", failure->c_str());
+      coworkerd::failStorage("object store request failed: the members cannot be listed (" + *failure + ")");
     }
     listedMembers = result;
     co_return result;
@@ -814,6 +830,9 @@ private:
   }
 
 public:
+  // The deletions' deferred cleanups that are due (deployment-tool.c++ controlSweepCleanup): "" when none was.
+  kj::Promise<std::string> sweep() { return coworkerd::controlSweepCleanup(context); }
+
   // This control plane's own addresses for every member's cluster set (POST /__coworkerd/control-plane: node/main.c++,
   // ControlPlaneAddresses), so that tenant code on no node can reach this API whatever its egress rules allow. A
   // member that does not answer gets the next announcement.
@@ -871,6 +890,8 @@ private:
       using coworkerd::json::field;
       out += ",\"version\":" + pick(field(reader, "version"), tenantView ? std::initializer_list<const char*>{"server"}
           : std::initializer_list<const char*>{"server", "source", "workerdUpstream", "patchSeriesSha256"});
+      // The tenant index's revision the node has applied (what cowctl waits for after a deployment), for every caller.
+      out += ",\"storage\":" + pick(field(reader, "storage"), {"appliedTenantsRevision"});
       if (tenantView) return out + "}";
       out += ",\"server\":" + pick(field(reader, "server"), {"binarySha256", "pid", "startedAtUnixMs"});
       out += ",\"drain\":" + pick(field(reader, "drain"), {"draining", "phase"});
@@ -1125,8 +1146,15 @@ private:
     auto has = [&](std::string_view part) { return reason.find(part) != std::string::npos; };
     uint status = 422;
     std::string code = std::string(area) == "secret" ? "SECRET_REFUSED" : "DEPLOYMENT_REFUSED", extra;
+    // The failure's kind first (deployment-tool.c++ controlFailure): the store's is 503 STORAGE_UNAVAILABLE -- the desired
+    // state and the packages are the object store's, and a write that met its failure did not complete --, other
+    // writers that kept winning 409 CONFLICT.
+    if (kind == "storage") {
+      status = 503; code = "STORAGE_UNAVAILABLE";
+    } else if (kind == "conflict") {
+      status = 409; code = "CONFLICT";
     // The tenant's record as the write found it in its own transaction's read (deployment-tool.c++, requireWritable).
-    if (reason.starts_with("there is no tenant ")) {
+    } else if (reason.starts_with("there is no tenant ")) {
       status = 404; code = "TENANT_NOT_FOUND";
     } else if (reason.starts_with("tenant ") && has(" is being deleted; nothing written")) {
       status = 409; code = "CONFLICT";
@@ -1148,19 +1176,14 @@ private:
       status = 503; code = "TRIAL_UNAVAILABLE";
     } else if (has("deployment label conflict")) {
       status = 409; code = "VERSION_EXISTS";
-    } else if (has("期间有其他部署") || has("another write changed") || has("kept changing while a definition was published")) {
-      status = 409; code = "CONFLICT";
     } else if (has("was never uploaded")) {
       status = 404; code = "VERSION_NOT_FOUND";
     } else if (has(" is not deployed")) {
       status = 404; code = "WORKER_NOT_FOUND";
     } else if (has(" is not set")) {
       status = 404; code = "SECRET_NOT_FOUND";
-    } else if (has("object store") || has("object HEAD failed") || has("object PUT failed") || has("object create failed") ||
-        has("object listing failed") || kind == "disconnected" || kind == "overloaded") {
-      // The desired state and the packages are the object store's: a write that cannot reach it changed nothing it
-      // did not report.
-      status = 503; code = "STORAGE_UNAVAILABLE";
+    } else if (kind == "disconnected" || kind == "overloaded") {
+      status = 500; code = "INTERNAL";
     }
     response.code = code;
     const std::string body = "{\"code\":\"" + code + "\",\"reason\":\"" + jsonEscape(cleanReason(reason)) + "\"" + extra +
@@ -1241,6 +1264,25 @@ kj::Promise<void> pollForever(coworkerd::ManifestStore& state, kj::Timer& timer,
   }
 }
 
+// The deletions' deferred cleanups (younger than control.cleanupGraceMs when they were deleted, or whose references could
+// not be read then), taken up once due: every minute, or every grace when that is shorter (at least a second). A failure is
+// logged; the next sweep tries again.
+kj::Promise<void> sweepForever(ControlService& service, kj::Timer& timer, uint64_t graceMs) {
+  const auto everyMs = std::clamp<uint64_t>(graceMs, 1000, 60000);
+  for (;;) {
+    co_await timer.afterDelay(everyMs * kj::MILLISECONDS);
+    std::string outcome;
+    try {
+      outcome = co_await service.sweep();
+      if (outcome.empty()) continue;
+      outcome = ",\"ok\":true,\"sweep\":" + outcome;
+    } catch (const kj::Exception& error) {
+      outcome = ",\"ok\":false,\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"";
+    }
+    std::cout << "[control] {\"event\":\"cleanup-sweep\"" << outcome << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+  }
+}
+
 // The usage objects of the hours past usage.retentionHours (of every node: a node removes its own, so what is left is the
 // nodes' that left), removed at the start and then once a day. A failure is logged; the next day tries again.
 constexpr uint64_t USAGE_CLEANUP_MS = 86400000;
@@ -1299,6 +1341,7 @@ int runControlPlane(const std::vector<std::string>& args) {
   settings.memberTtlSeconds = config.membership.ttlSeconds;
   settings.memberGraceMs = config.membership.livenessGraceMs;
   settings.usageRetentionHours = config.usage.retentionHours;
+  settings.cleanupGraceMs = config.controlCleanupGraceMs;
   settings.storageCredentials = !config.storageCredentialsFile.empty() ? "file" : !settings.storage.accessKey.empty() ? "inline"
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   settings.listenAddress = config.controlListenAddress.empty() ? "0.0.0.0:8940" : config.controlListenAddress;
@@ -1353,7 +1396,8 @@ int runControlPlane(const std::vector<std::string>& args) {
     for (uint32_t attempt = 1;; ++attempt) {
       std::string reason;
       try {
-        state.load(false, true).wait(io.waitScope);
+        // With the repair: what a writer left half done (a hint, an index write) is completed before the API answers.
+        state.load(false, true, true).wait(io.waitScope);
         break;
       } catch (const kj::Exception& error) {
         reason = error.getDescription().cStr();
@@ -1377,6 +1421,7 @@ int runControlPlane(const std::vector<std::string>& args) {
             << settings.tokenSource << "\",\"pathRouting\":" << (settings.pathRouting ? "true" : "false")
             << ",\"temporaryDirectory\":\"" << jsonEscape(settings.temporaryDirectory.string())
             << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs
+            << ",\"cleanupGraceMs\":" << settings.cleanupGraceMs
             << ",\"membership\":{\"backend\":\"objectStore\",\"ttlSeconds\":"
             << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "},\"usage\":{\"retentionHours\":"
             << settings.usageRetentionHours << ",\"cleanupIntervalMs\":" << USAGE_CLEANUP_MS << "},\"clockOffsetMsForTest\":"
@@ -1394,7 +1439,8 @@ int runControlPlane(const std::vector<std::string>& args) {
   server.listenHttp(*listener).exclusiveJoin(stop.ignoreResult()).exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(announceForever(service, timer, std::move(body)))
       .exclusiveJoin(pollForever(state, timer, settings.pollIntervalMs))
-      .exclusiveJoin(usageCleanupForever(storage, timer, settings.usageRetentionHours)).wait(io.waitScope);
+      .exclusiveJoin(usageCleanupForever(storage, timer, settings.usageRetentionHours))
+      .exclusiveJoin(sweepForever(service, timer, settings.cleanupGraceMs)).wait(io.waitScope);
   std::cout << "[control] {\"event\":\"stopped\"}" << std::endl;
   return 0;
 }

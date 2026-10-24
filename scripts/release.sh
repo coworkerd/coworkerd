@@ -18,8 +18,9 @@
 #   coworkerd-<version>-linux-<arch>-image.tar.gz  the image coworkerd:<version> (`docker load -i`)
 #   coworkerd-<version>-linux-<arch>.json          what was built from what, with every SHA-256
 # then (re)writes OUT/SHA256SUMS over every asset present and prints the upload command. The other
-# architecture is built the same way on a machine of that architecture (an amd64 Linux machine) and its two
-# assets copied into OUT before the upload.
+# architecture is built the same way on a machine of that architecture (an amd64 Linux machine); its three assets (the
+# package, the image and the record) are copied into OUT, and SHA256SUMS written again over every asset there, before
+# the upload (SHA256SUMS lists only the assets present when it was written).
 #
 # Environment:
 #   COWORKERD_BUILD_CONTAINER  the toolchain container (default coworkerd-capacity-linux), running, with this
@@ -35,7 +36,7 @@
 #   COWORKERD_CLI_DEPENDENCIES a directory of cowctl's dependencies (node_modules) prepared before, else
 #                              npm installs them (the registry must be reachable)
 #   COWORKERD_BUILD_JOBS       parallel compile jobs (default 6)
-# Run it under scripts/cluster-lock.py: it builds.
+# It builds: run one at a time on a machine (the toolchain container's tree is shared by every run).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -162,7 +163,7 @@ find "$STAGE/examples" \( -name node_modules -o -name .wrangler -o -name dist \)
 # ---- cowctl ------------------------------------------------------------------------------------------------
 # A directory with its node_modules (not one file: the Wrangler adapter reads its pinned Wrangler from beside
 # it): lib/cowctl (the package cli/ -- the command, the adapter, the lock and the dependencies the lock pins), run
-# by bin/cowctl with the machine's Node.js (20 or newer). The dependencies are installed for Linux and for macOS of
+# by bin/cowctl with the machine's Node.js (22.5 or newer). The dependencies are installed for Linux and for macOS of
 # this architecture (esbuild runs the build when the project has no Wrangler of its own). The command never starts
 # workerd: the workerd package's platform binaries are placeholders that say so, and sharp's natives (Wrangler's
 # image service) are left out.
@@ -196,14 +197,14 @@ for binary in "$STAGE/lib/cowctl/node_modules/@cloudflare/workerd-"*/bin/workerd
 done
 cat >"$STAGE/bin/cowctl" <<'SH'
 #!/bin/sh
-# cowctl: lib/cowctl/bin/cowctl.mjs of this package, run with Node.js 20 or newer.
+# cowctl: lib/cowctl/bin/cowctl.mjs of this package, run with Node.js 22.5 or newer.
 self=$0
 while [ -L "$self" ]; do
   target=$(readlink "$self")
   case $target in /*) self=$target ;; *) self=$(dirname "$self")/$target ;; esac
 done
 here=$(cd "$(dirname "$self")" && pwd -P)
-command -v node >/dev/null 2>&1 || { echo "cowctl: Node.js 20 or newer is needed (node is not on PATH)" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "cowctl: Node.js 22.5 or newer is needed (node is not on PATH)" >&2; exit 1; }
 exec node "$here/../lib/cowctl/bin/cowctl.mjs" "$@"
 SH
 chmod 0755 "$STAGE/bin/cowctl" "$STAGE/lib/cowctl/bin/cowctl.mjs"

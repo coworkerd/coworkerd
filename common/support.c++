@@ -33,6 +33,8 @@ bool safeName(const std::string& value) {
   });
 }
 
+bool nodeIdName(const std::string& value) { return safeName(value) && value != "." && value != ".." && value.size() <= 255; }
+
 std::string sha256Hex(std::string_view value) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   KJ_REQUIRE(

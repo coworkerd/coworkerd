@@ -21,9 +21,8 @@ constexpr uint32_t INDEX_ATTEMPTS = 16;
 uint64_t nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
-[[noreturn]] void refuseWrite(const std::string& reason) {
-  kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(reason.c_str())));
-}
+// Another writer kept winning: a conflict (WRITE_CONFLICT_DETAIL), never a reason's words.
+[[noreturn]] void refuseWrite(const std::string& reason) { failConflict(reason); }
 bool formatOne(const std::string& bytes) {
   try {
     capnp::MallocMessageBuilder message;
@@ -81,7 +80,7 @@ kj::Promise<void> ManifestStore::readManifest(std::string tenant, uint64_t revis
     co_await reloadTenant(tenant);
     co_return;
   }
-  KJ_REQUIRE(response.status == 200, "object store read failed", response.status);
+  requireStorage(response.status == 200, "object store read failed: HTTP " + std::to_string(response.status));
   auto manifest = decodeTenantManifest(response.bytes);
   KJ_REQUIRE(manifest.tenant == tenant && manifest.revision == revision, "a manifest names another tenant or revision than its key",
       tenant.c_str(), revision);
@@ -119,16 +118,18 @@ kj::Promise<void> ManifestStore::adoptIndex(TenantIndex index) {
   tenantIndex = std::move(index);
 }
 
-kj::Promise<void> ManifestStore::load(bool create, bool credentials) {
+kj::Promise<void> ManifestStore::load(bool create, bool credentials, bool repairing) {
   auto marker = co_await store.get(CLUSTER_FORMAT_KEY);
   if (marker.status == 404) {
-    KJ_REQUIRE(create, "the bucket holds no cluster/format/1: it is not a Coworkerd cluster's bucket (init writes the marker)",
-        store.config().bucket.c_str(), store.config().endpoint.c_str());
+    if (!create)
+      KJ_FAIL_REQUIRE(kj::str("the bucket ", store.config().bucket.c_str(), " at ", store.config().endpoint.c_str(),
+          " holds no cluster/format/1: it is not a Coworkerd cluster's bucket (coworkerd-apiserver tool init writes the "
+          "marker of a new cluster's bucket); nothing written"));
     const auto bytes = markerBytes();
     auto created = co_await store.create(CLUSTER_FORMAT_KEY, bytes);
     marker = created.created ? ObjectResponse{200, bytes} : co_await store.get(CLUSTER_FORMAT_KEY);
   }
-  KJ_REQUIRE(marker.status == 200, "object store read failed", marker.status);
+  requireStorage(marker.status == 200, "object store read failed: HTTP " + std::to_string(marker.status) + " (" + CLUSTER_FORMAT_KEY + ")");
   KJ_REQUIRE(formatOne(marker.bytes), "cluster/format/1 does not name format 1: another format's cluster", store.config().bucket.c_str());
   auto latest = co_await readLatestRevision(store, TENANT_INDEX_PREFIX, indexHintKey(TENANT_INDEX_PREFIX), 0, true);
   if (latest.revision) {
@@ -144,6 +145,17 @@ kj::Promise<void> ManifestStore::load(bool create, bool credentials) {
       if (index.revision > credentialIndex.revision) credentialIndex = std::move(index);
     }
   }
+  if (!repairing) co_return;
+  // What a writer left half done (a hint, an index): completed now; what fails here the first poll tries again.
+  try {
+    co_await repairIndex();
+    if (credentials) co_await repairCredentials();
+    co_await repair();
+    if (!unindexed.empty()) co_await syncIndex();
+  } catch (const kj::Exception& error) {
+    log << "[state] {\"event\":\"repair-failed\",\"phase\":\"load\",\"reason\":\"" << jsonEscape(error.getDescription().cStr())
+        << "\"}" << std::endl;
+  }
 }
 
 void ManifestStore::notePollFailure(const std::string& reason) {
@@ -154,19 +166,159 @@ void ManifestStore::notePollFailure(const std::string& reason) {
 kj::Promise<void> ManifestStore::refresh() {
   ++stats.polls;
   stats.lastPollAtUnixMs = nowMs();
-  auto hint = co_await readHintRevision(store, indexHintKey(TENANT_INDEX_PREFIX));
-  if (hint && *hint > tenantIndex.revision) {
-    auto latest = co_await readLatestRevision(store, TENANT_INDEX_PREFIX, indexHintKey(TENANT_INDEX_PREFIX), 0, true);
-    if (latest.revision > tenantIndex.revision) co_await adoptIndex(decodeTenantIndex(latest.bytes));
+  co_await repairIndex();
+  co_await repairCredentials();
+  // Hints this process failed to write, then what any writer left half done.
+  for (auto pending = hintPending; const auto& name : pending) {
+    if (const auto* manifest = tenant(name); manifest && !removing.contains(name)) co_await writeTenantHint(name, manifest->revision);
+    else hintPending.erase(name);
   }
-  auto credentialHint = co_await readHintRevision(store, indexHintKey(CREDENTIAL_INDEX_PREFIX));
-  if (credentialHint && *credentialHint > credentialIndex.revision) {
-    auto latest = co_await readLatestRevision(store, CREDENTIAL_INDEX_PREFIX, indexHintKey(CREDENTIAL_INDEX_PREFIX), 0, true);
-    if (latest.revision > credentialIndex.revision) credentialIndex = decodeCredentialIndex(latest.bytes);
-  }
+  co_await repair();
   // An index write that failed after its manifest was committed is retried here.
-  if (!unindexed.empty() || !removing.empty()) co_await syncIndex();
+  if (!unindexed.empty() || !removing.empty() || tenantIndexHintPending) co_await syncIndex();
   stats.lastPollError.clear();
+}
+
+kj::Promise<void> ManifestStore::writeTenantHint(const std::string& name, uint64_t revision) {
+  const auto prefix = tenantManifestPrefix(name);
+  hintPending.insert(name);
+  try {
+    co_await publishHint(store, prefix, tenantHintKey(name), revision);
+  } catch (const kj::Exception& error) {
+    log << "[state] {\"event\":\"hint-failed\",\"tenant\":\"" << name << "\",\"revision\":" << revision << ",\"reason\":\""
+        << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
+    throw;
+  }
+  hintPending.erase(name);
+  knownHints.erase(name);
+  // The old revisions: a failure there only leaves one more object behind.
+  try {
+    co_await pruneRevision(store, prefix, revision, KEEP_REVISIONS);
+  } catch (const kj::Exception& error) {
+    log << "[state] {\"event\":\"prune-failed\",\"tenant\":\"" << name << "\",\"reason\":\""
+        << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
+  }
+}
+
+kj::Promise<void> ManifestStore::writeIndexHint(const char* prefix, uint64_t revision, bool& pending) {
+  pending = true;
+  try {
+    co_await publishHint(store, prefix, indexHintKey(prefix), revision);
+  } catch (const kj::Exception& error) {
+    log << "[state] {\"event\":\"hint-failed\",\"index\":\"" << (std::string(prefix) == TENANT_INDEX_PREFIX ? "tenants" : "credentials")
+        << "\",\"revision\":" << revision << ",\"reason\":\"" << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
+    throw;
+  }
+  pending = false;
+  try {
+    co_await pruneRevision(store, prefix, revision, KEEP_REVISIONS);
+  } catch (const kj::Exception& error) {
+    log << "[state] {\"event\":\"prune-failed\",\"index\":\"" << prefix << "\",\"reason\":\""
+        << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
+  }
+}
+
+// The tenant index's hint, and whether the revision after the newest known exists (a writer that stopped after its
+// create and before its hint, or this process's hint write that failed): the latest adopted, the hint rewritten.
+kj::Promise<void> ManifestStore::repairIndex() {
+  const auto hint = co_await readHintRevision(store, indexHintKey(TENANT_INDEX_PREFIX));
+  const uint64_t hinted = hint.value_or(0);
+  uint64_t latest = std::max(hinted, tenantIndex.revision);
+  if (hinted > tenantIndex.revision || co_await store.exists(revisionKey(TENANT_INDEX_PREFIX, latest + 1))) {
+    auto read = co_await readLatestRevision(store, TENANT_INDEX_PREFIX, indexHintKey(TENANT_INDEX_PREFIX), 0, true);
+    if (read.revision > tenantIndex.revision) co_await adoptIndex(decodeTenantIndex(read.bytes));
+    latest = std::max(latest, read.revision);
+  }
+  if (latest > hinted) {
+    auto turnHeld = co_await turn("index");
+    co_await writeIndexHint(TENANT_INDEX_PREFIX, std::max(latest, tenantIndex.revision), tenantIndexHintPending);
+    ++stats.repairedIndexHints;
+    log << "[state] {\"event\":\"hint-repaired\",\"index\":\"tenants\",\"from\":" << hinted << ",\"to\":" << latest << "}" << std::endl;
+  }
+}
+
+kj::Promise<void> ManifestStore::repairCredentials() {
+  const auto hint = co_await readHintRevision(store, indexHintKey(CREDENTIAL_INDEX_PREFIX));
+  const uint64_t hinted = hint.value_or(0);
+  uint64_t latest = std::max(hinted, credentialIndex.revision);
+  if (hinted > credentialIndex.revision || co_await store.exists(revisionKey(CREDENTIAL_INDEX_PREFIX, latest + 1))) {
+    auto read = co_await readLatestRevision(store, CREDENTIAL_INDEX_PREFIX, indexHintKey(CREDENTIAL_INDEX_PREFIX), 0, true);
+    if (read.revision > credentialIndex.revision) credentialIndex = decodeCredentialIndex(read.bytes);
+    latest = std::max(latest, read.revision);
+  }
+  if (latest > hinted) {
+    auto turnHeld = co_await turn("credentials");
+    co_await writeIndexHint(CREDENTIAL_INDEX_PREFIX, std::max(latest, credentialIndex.revision), credentialsHintPending);
+    ++stats.repairedIndexHints;
+    log << "[state] {\"event\":\"hint-repaired\",\"index\":\"credentials\",\"from\":" << hinted << ",\"to\":" << latest << "}" << std::endl;
+  }
+}
+
+kj::Promise<void> ManifestStore::repair() {
+  ++stats.repairs;
+  struct Listed { uint64_t latest = 0; bool hint = false; std::string hintEtag; };
+  std::map<std::string, Listed> listed;
+  for (const auto& object : (co_await store.list(TENANT_OBJECTS_PREFIX)).objects) {
+    const std::string_view rest = std::string_view(object.key).substr(std::string_view(TENANT_OBJECTS_PREFIX).size());
+    const auto slash = rest.find('/');
+    if (slash == std::string_view::npos) continue;
+    const std::string name(rest.substr(0, slash));
+    if (!tenantName(name)) continue;
+    if (object.key == tenantHintKey(name)) {
+      listed[name].hint = true;
+      listed[name].hintEtag = object.etag;
+    } else if (auto revision = parseRevision(object.key, tenantManifestPrefix(name))) {
+      listed[name].latest = std::max(listed[name].latest, *revision);
+    }
+  }
+  for (const auto& [name, found] : listed) {
+    if (!found.latest || removing.contains(name)) continue;
+    const auto entry = tenantIndex.tenants.find(name);
+    const bool named = entry != tenantIndex.tenants.end();
+    const auto* current = tenant(name);
+    if (!current || current->revision < found.latest) {
+      if (named) {
+        // A revision of an indexed tenant newer than the mirror holds: written by a writer that did not index it.
+        co_await readManifest(name, found.latest);
+      } else if (auto seen = examined.find(name); seen == examined.end() || seen->second != found.latest) {
+        // A tenant the index does not name: only an active manifest is one to index (a deletion's leftovers stay out).
+        examined[name] = found.latest;
+        auto object = co_await store.get(revisionKey(tenantManifestPrefix(name), found.latest));
+        if (object.status == 404) continue;
+        requireStorage(object.status == 200, "object store read failed: HTTP " + std::to_string(object.status));
+        auto manifest = decodeTenantManifest(object.bytes);
+        if (manifest.tenant != name || manifest.revision != found.latest || manifest.status() != "active") continue;
+        adoptManifest(std::move(manifest));
+      }
+      current = tenant(name);
+    }
+    if (!current) continue;
+    const bool lags = named ? entry->second.manifestRev < current->revision : current->status() == "active";
+    auto refused = indexRefusals.find(name);
+    if (lags && (refused == indexRefusals.end() || refused->second.first != current->revision) && !unindexed.contains(name)) {
+      unindexed.insert(name);
+      ++stats.repairedManifests;
+      log << "[state] {\"event\":\"index-repair\",\"tenant\":\"" << name << "\",\"revision\":" << current->revision
+          << ",\"indexed\":" << (named ? entry->second.manifestRev : 0) << "}" << std::endl;
+    }
+    // The tenant's hint (only for a tenant the index names or is to name: nothing is written back below a deleted
+    // tenant's prefix), read once per change of its ETag.
+    if (!named && !unindexed.contains(name)) continue;
+    if (found.hint) {
+      auto known = knownHints.find(name);
+      if (known != knownHints.end() && known->second.first == found.hintEtag && known->second.second >= found.latest) continue;
+    }
+    const auto hinted = found.hint ? (co_await readHintRevision(store, tenantHintKey(name))).value_or(0) : 0;
+    if (hinted >= found.latest) {
+      knownHints[name] = {found.hintEtag, hinted};
+      continue;
+    }
+    auto held = co_await turn("tenant:" + name);
+    co_await writeTenantHint(name, found.latest);
+    ++stats.repairedHints;
+    log << "[state] {\"event\":\"hint-repaired\",\"tenant\":\"" << name << "\",\"from\":" << hinted << ",\"to\":" << found.latest
+        << "}" << std::endl;
+  }
 }
 
 kj::Promise<ManifestStore::Written> ManifestStore::writeTenant(std::string name,
@@ -188,7 +340,10 @@ kj::Promise<ManifestStore::Written> ManifestStore::writeTenant(std::string name,
     next.tenant = name;
     result.attempts = attempt;
     if (base.revision && sameContent(next, base)) {
-      result.manifest = std::move(base);
+      // Already in the latest manifest (a request tried again -- perhaps after an attempt that created its revision
+      // and was answered with a failure): it completes as a write does, its hint and the index brought up to it.
+      result.manifest = base;
+      co_await complete(name, base, result);
       co_return result;
     }
     next.revision = base.revision + 1;
@@ -208,23 +363,7 @@ kj::Promise<ManifestStore::Written> ManifestStore::writeTenant(std::string name,
       adoptManifest(std::move(next));
       log << "[state] {\"event\":\"manifest\",\"tenant\":\"" << name << "\",\"revision\":" << result.manifest.revision
                 << ",\"generation\":" << result.manifest.generation << ",\"attempts\":" << attempt << "}" << std::endl;
-      // Committed: the hint and the old revisions follow, and a failure there only makes a later reader list.
-      try {
-        co_await publishHint(store, prefix, tenantHintKey(name), result.manifest.revision);
-        co_await pruneRevision(store, prefix, result.manifest.revision, KEEP_REVISIONS);
-      } catch (const kj::Exception& error) {
-        log << "[state] {\"event\":\"hint-failed\",\"tenant\":\"" << name << "\",\"reason\":\""
-                  << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
-      }
-      // The tenant stays this writer's until the index names the revision: the next writer of the tenant in this
-      // process reads an index that has it (a creation is then never taken for an interrupted one).
-      try {
-        result.indexRevision = co_await syncIndex();
-      } catch (const kj::Exception& error) {
-        result.indexed = false;
-        log << "[state] {\"event\":\"index-pending\",\"tenant\":\"" << name << "\",\"reason\":\""
-                  << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
-      }
+      co_await complete(name, base, result);
       co_return result;
     }
     ++stats.conflicts;
@@ -238,8 +377,80 @@ kj::Promise<ManifestStore::Written> ManifestStore::writeTenant(std::string name,
   }
 }
 
+// A tenant's revision made visible: its hint, then the index -- a failure of either thrown (the store's: the write is not
+// done; the revision stays and is completed later) -- then the index's verdict on it.
+kj::Promise<void> ManifestStore::complete(const std::string& name, const TenantManifest& base, Written& result) {
+  const auto revision = result.manifest.revision;
+  if (result.changed || hintPending.contains(name)) co_await writeTenantHint(name, revision);
+  auto entry = tenantIndex.tenants.find(name);
+  const bool lags = entry != tenantIndex.tenants.end() ? entry->second.manifestRev < revision : result.manifest.status() == "active";
+  if (lags) unindexed.insert(name);
+  if (result.changed || lags || tenantIndexHintPending) {
+    try {
+      result.indexRevision = co_await syncIndex();
+    } catch (const kj::Exception& error) {
+      result.indexed = false;
+      log << "[state] {\"event\":\"index-failed\",\"tenant\":\"" << name << "\",\"revision\":" << revision << ",\"reason\":\""
+          << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
+      throw;
+    }
+  } else {
+    result.indexRevision = tenantIndex.revision;
+  }
+  if (auto refused = indexRefusals.find(name); refused != indexRefusals.end() && refused->second.first == revision) {
+    const auto reason = refused->second.second;
+    co_await revert(name, base);
+    failConflict(reason + "; nothing written");
+  }
+  auto now = tenantIndex.tenants.find(name);
+  result.indexed = now != tenantIndex.tenants.end() ? now->second.manifestRev >= revision : result.manifest.status() != "active";
+}
+
+// A write the index refused (a hostname another tenant holds): an update's record goes back to what it was before the
+// write (as a next revision, indexed); a creation -- a tenant the index does not name -- has its objects removed.
+kj::Promise<void> ManifestStore::revert(const std::string& name, const TenantManifest& base) {
+  const auto* current = tenant(name);
+  if (!current) co_return;
+  if (!tenantIndex.tenants.contains(name) || !base.record) {
+    for (const auto& object : (co_await store.list(tenantObjectsPrefix(name))).objects) co_await store.remove(object.key);
+    manifests.erase(name);
+    unindexed.erase(name);
+    hintPending.erase(name);
+    knownHints.erase(name);
+    indexRefusals.erase(name);
+    ++stats.reverted;
+    log << "[state] {\"event\":\"reverted\",\"tenant\":\"" << name << "\",\"removed\":true}" << std::endl;
+    co_return;
+  }
+  TenantManifest next = *current;
+  next.record = base.record;
+  next.revision = current->revision + 1;
+  next.writer = newWriter(instance);
+  next.writtenAtUnixMs = next.writer.writtenAtUnixMs;
+  auto created = co_await store.create(revisionKey(tenantManifestPrefix(name), next.revision), tenantManifestJson(next));
+  if (!created.created) refuseWrite("期间有其他部署 (another writer created revision " + std::to_string(next.revision) + " of tenant " +
+      name + "'s manifest while its refused write went back)");
+  ++stats.writes;
+  ++stats.reverted;
+  indexRefusals.erase(name);
+  unindexed.insert(name);
+  adoptManifest(next);
+  log << "[state] {\"event\":\"reverted\",\"tenant\":\"" << name << "\",\"revision\":" << next.revision << "}" << std::endl;
+  co_await writeTenantHint(name, next.revision);
+  co_await syncIndex();
+}
+
 kj::Promise<uint64_t> ManifestStore::syncIndex() {
   auto held = co_await turn("index");
+  auto settle = [this]() {
+    for (auto it = unindexed.begin(); it != unindexed.end();) {
+      auto entry = tenantIndex.tenants.find(*it);
+      auto manifest = manifests.find(*it);
+      if (manifest == manifests.end() || (entry != tenantIndex.tenants.end() && entry->second.manifestRev >= manifest->second.revision))
+        it = unindexed.erase(it);
+      else ++it;
+    }
+  };
   for (uint32_t attempt = 1;; ++attempt) {
     TenantIndex next = tenantIndex;
     std::set<std::string> settled;
@@ -247,27 +458,46 @@ kj::Promise<uint64_t> ManifestStore::syncIndex() {
       auto manifest = manifests.find(name);
       if (manifest == manifests.end()) { settled.insert(name); continue; }
       auto entry = next.tenants.find(name);
-      if (entry != next.tenants.end()) {
-        if (entry->second.manifestRev >= manifest->second.revision) { settled.insert(name); continue; }
-        entry->second = indexEntryOf(manifest->second);
+      if (entry != next.tenants.end() && entry->second.manifestRev >= manifest->second.revision) { settled.insert(name); continue; }
+      if (entry == next.tenants.end()) {
+        // Not in the index: a tenant this process created (or the tool's first write of one), or one a deletion took out
+        // meanwhile. Only an active manifest that is still the tenant's latest enters it.
+        auto latest = co_await readLatestRevision(store, tenantManifestPrefix(name), tenantHintKey(name), 0, true);
+        if (latest.revision != manifest->second.revision || manifest->second.status() != "active") { settled.insert(name); continue; }
+      }
+      // A hostname is one tenant's, and the index -- one aggregate -- decides: an entry that would name a hostname another
+      // entry names keeps its previous revision (the writer goes back to it, revert()).
+      std::string taken;
+      for (const auto& host : manifest->second.hostnames()) {
+        for (const auto& [other, otherEntry] : next.tenants) {
+          if (other == name || std::find(otherEntry.hostnames.begin(), otherEntry.hostnames.end(), host) == otherEntry.hostnames.end())
+            continue;
+          taken = "hostname " + host + " belongs to tenant " + other;
+          break;
+        }
+        if (!taken.empty()) break;
+      }
+      if (!taken.empty()) {
+        settled.insert(name);
+        if (auto refused = indexRefusals.find(name); refused == indexRefusals.end() || refused->second.first != manifest->second.revision) {
+          ++stats.hostnameRefusals;
+          log << "[state] {\"event\":\"index-refused\",\"tenant\":\"" << name << "\",\"revision\":" << manifest->second.revision
+              << ",\"reason\":\"" << jsonEscape(taken) << "\"}" << std::endl;
+        }
+        indexRefusals[name] = {manifest->second.revision, taken};
         continue;
       }
-      // Not in the index: a tenant this process created (or the tool's first write of one), or one a deletion took out
-      // meanwhile. Only an active manifest that is still the tenant's latest enters it.
-      auto latest = co_await readLatestRevision(store, tenantManifestPrefix(name), tenantHintKey(name), 0, true);
-      if (latest.revision != manifest->second.revision || manifest->second.status() != "active") { settled.insert(name); continue; }
-      next.tenants.emplace(name, indexEntryOf(manifest->second));
+      next.tenants[name] = indexEntryOf(manifest->second);
     }
-    for (const auto& name : removing) next.tenants.erase(name);
+    // A tenant being forgotten leaves the index -- unless the name was created again meanwhile (its manifest active).
+    for (const auto& name : removing) {
+      auto manifest = manifests.find(name);
+      if (manifest == manifests.end() || manifest->second.status() != "active") next.tenants.erase(name);
+    }
     for (const auto& name : settled) unindexed.erase(name);
     if (next.tenants == tenantIndex.tenants) {
-      for (auto it = unindexed.begin(); it != unindexed.end();) {
-        auto entry = tenantIndex.tenants.find(*it);
-        auto manifest = manifests.find(*it);
-        if (manifest == manifests.end() || (entry != tenantIndex.tenants.end() && entry->second.manifestRev >= manifest->second.revision))
-          it = unindexed.erase(it);
-        else ++it;
-      }
+      settle();
+      if (tenantIndexHintPending) co_await writeIndexHint(TENANT_INDEX_PREFIX, tenantIndex.revision, tenantIndexHintPending);
       co_return tenantIndex.revision;
     }
     next.revision = tenantIndex.revision + 1;
@@ -277,24 +507,14 @@ kj::Promise<uint64_t> ManifestStore::syncIndex() {
     if (created.created) {
       ++stats.indexWrites;
       tenantIndex = next;
-      for (auto it = unindexed.begin(); it != unindexed.end();) {
-        auto entry = tenantIndex.tenants.find(*it);
-        auto manifest = manifests.find(*it);
-        if (manifest == manifests.end() || (entry != tenantIndex.tenants.end() && entry->second.manifestRev >= manifest->second.revision))
-          it = unindexed.erase(it);
-        else ++it;
-      }
-      try {
-        co_await publishHint(store, TENANT_INDEX_PREFIX, indexHintKey(TENANT_INDEX_PREFIX), next.revision);
-        co_await pruneRevision(store, TENANT_INDEX_PREFIX, next.revision, KEEP_REVISIONS);
-      } catch (const kj::Exception& error) {
-        log << "[state] {\"event\":\"hint-failed\",\"index\":\"tenants\",\"reason\":\""
-                  << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
-      }
+      settle();
+      // Visible to the nodes only with the hint: a failure here fails the write (the poll writes it later).
+      co_await writeIndexHint(TENANT_INDEX_PREFIX, next.revision, tenantIndexHintPending);
       co_return next.revision;
     }
     ++stats.indexConflicts;
-    KJ_REQUIRE(attempt < INDEX_ATTEMPTS, "other writers kept creating the tenant index's next revision first", attempt);
+    if (attempt >= INDEX_ATTEMPTS)
+      refuseWrite("other writers kept creating the tenant index's next revision first (" + std::to_string(attempt) + " attempts)");
     co_await pause(attempt);
     auto latest = co_await readLatestRevision(store, TENANT_INDEX_PREFIX, indexHintKey(TENANT_INDEX_PREFIX), 0, true);
     if (latest.revision) co_await adoptIndex(decodeTenantIndex(latest.bytes));
@@ -302,11 +522,20 @@ kj::Promise<uint64_t> ManifestStore::syncIndex() {
 }
 
 kj::Promise<ManifestStore::Forgotten> ManifestStore::forgetTenant(std::string name) {
+  auto held = co_await turn("tenant:" + name);
   Forgotten result;
+  // Out of the index first; the name is not kept from the index afterwards, whatever the removals below meet.
   removing.insert(name);
-  result.indexRevision = co_await syncIndex();
+  try {
+    result.indexRevision = co_await syncIndex();
+  } catch (const kj::Exception&) {
+    removing.erase(name);
+    throw;
+  }
+  removing.erase(name);
   auto listing = co_await store.list(tenantObjectsPrefix(name));
-  // The hint and the newest revisions last: an interrupted removal leaves a readable latest revision behind.
+  // The hint first (a reader without it lists the prefix), then the revisions oldest first: a removal that stops half
+  // way leaves the newest revision readable, where the deletion run again finds the tenant.
   std::vector<std::string> keys;
   for (const auto& object : listing.objects) keys.push_back(object.key);
   std::sort(keys.begin(), keys.end());
@@ -316,18 +545,21 @@ kj::Promise<ManifestStore::Forgotten> ManifestStore::forgetTenant(std::string na
   if (!result.failed) {
     manifests.erase(name);
     unindexed.erase(name);
-    removing.erase(name);
+    hintPending.erase(name);
+    knownHints.erase(name);
+    examined.erase(name);
+    indexRefusals.erase(name);
   }
   co_return result;
 }
 
-kj::Promise<ManifestStore::WrittenCredentials> ManifestStore::writeCredentials(std::function<void(CredentialIndex&)> change,
-    uint32_t maxAttempts) {
+kj::Promise<ManifestStore::WrittenCredentials> ManifestStore::writeCredentials(
+    std::function<kj::Promise<void>(CredentialIndex&)> change, uint32_t maxAttempts, bool always) {
   auto held = co_await turn("credentials");
   WrittenCredentials result;
   for (uint32_t attempt = 1;; ++attempt) {
     CredentialIndex next = credentialIndex;
-    change(next);
+    co_await change(next);
     result.attempts = attempt;
     // The same credentials (revision, time and writer aside): nothing to write.
     const auto content = [](const CredentialIndex& index) {
@@ -335,8 +567,9 @@ kj::Promise<ManifestStore::WrittenCredentials> ManifestStore::writeCredentials(s
       bare.credentials = index.credentials;
       return credentialIndexJson(bare);
     };
-    if (next.credentials.size() == credentialIndex.credentials.size() && content(next) == content(credentialIndex)) {
+    if (!always && next.credentials.size() == credentialIndex.credentials.size() && content(next) == content(credentialIndex)) {
       result.index = credentialIndex;
+      if (credentialsHintPending) co_await writeIndexHint(CREDENTIAL_INDEX_PREFIX, credentialIndex.revision, credentialsHintPending);
       co_return result;
     }
     next.revision = credentialIndex.revision + 1;
@@ -348,13 +581,9 @@ kj::Promise<ManifestStore::WrittenCredentials> ManifestStore::writeCredentials(s
       credentialIndex = next;
       result.index = next;
       result.changed = true;
-      try {
-        co_await publishHint(store, CREDENTIAL_INDEX_PREFIX, indexHintKey(CREDENTIAL_INDEX_PREFIX), next.revision);
-        co_await pruneRevision(store, CREDENTIAL_INDEX_PREFIX, next.revision, KEEP_REVISIONS);
-      } catch (const kj::Exception& error) {
-        log << "[state] {\"event\":\"hint-failed\",\"index\":\"credentials\",\"reason\":\""
-                  << jsonEscape(error.getDescription().cStr()) << "\"}" << std::endl;
-      }
+      // The other instances (and this one after a restart) read the credentials through the hint: a failure here fails
+      // the write (the poll writes the hint later).
+      co_await writeIndexHint(CREDENTIAL_INDEX_PREFIX, next.revision, credentialsHintPending);
       co_return result;
     }
     ++stats.credentialConflicts;
@@ -376,7 +605,7 @@ kj::Promise<void> ManifestStore::fetchDefinitions(std::set<std::string> hashes) 
         ++self.stats.definitionFetches;
         auto response = co_await self.store.get("definitions/" + hash);
         if (response.status != 200) {
-          KJ_REQUIRE(response.status == 404, "object store read failed", response.status);
+          requireStorage(response.status == 404, "object store read failed: HTTP " + std::to_string(response.status));
           self.failedDefinitions[hash] = "missing";
           co_return;
         }
@@ -451,7 +680,13 @@ std::string ManifestStore::json() const {
       << ",\"writes\":" << stats.writes << ",\"conflicts\":" << stats.conflicts << ",\"retries\":" << stats.retries
       << ",\"indexWrites\":" << stats.indexWrites << ",\"indexConflicts\":" << stats.indexConflicts
       << ",\"credentialWrites\":" << stats.credentialWrites << ",\"credentialConflicts\":" << stats.credentialConflicts
-      << ",\"unindexed\":" << unindexed.size() << ",\"polls\":" << stats.polls << ",\"pollFailures\":" << stats.pollFailures
+      << ",\"unindexed\":" << unindexed.size() << ",\"hintsPending\":" << hintPending.size()
+      << ",\"indexHintPending\":" << (tenantIndexHintPending ? "true" : "false")
+      << ",\"credentialsHintPending\":" << (credentialsHintPending ? "true" : "false")
+      << ",\"repairs\":" << stats.repairs << ",\"repairedHints\":" << stats.repairedHints
+      << ",\"repairedIndexHints\":" << stats.repairedIndexHints << ",\"repairedManifests\":" << stats.repairedManifests
+      << ",\"hostnameRefusals\":" << stats.hostnameRefusals << ",\"reverted\":" << stats.reverted
+      << ",\"polls\":" << stats.polls << ",\"pollFailures\":" << stats.pollFailures
       << ",\"lastPollAtUnixMs\":" << stats.lastPollAtUnixMs << ",\"lastPollError\":\"" << jsonEscape(stats.lastPollError)
       << "\",\"definitions\":" << definitionBytes.size() << ",\"definitionFetches\":" << stats.definitionFetches
       << ",\"definitionFailures\":" << failedDefinitions.size() << ",\"instance\":\"" << instance

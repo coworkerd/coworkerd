@@ -71,12 +71,30 @@ double mono() { return std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now().time_since_epoch()).count(); }
 uint64_t wall() { return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count(); }
-uint64_t kernelOomKills() {
-  std::ifstream input("/sys/fs/cgroup/memory.events");
+// The memory.events of this process's own cgroup (cgroup v2: the "0::<path>" line of /proc/self/cgroup -- a systemd
+// service's, or "/" in a container with a cgroup namespace of its own), where the kernel counts the OOM kills of every
+// process in it.
+std::string memoryEventsPath() {
+  std::ifstream input("/proc/self/cgroup");
+  for (std::string line; std::getline(input, line);) {
+    if (!line.starts_with("0::")) continue;
+    const auto path = line.substr(3);
+    if (path.empty() || path == "/") break;
+    const auto candidate = "/sys/fs/cgroup" + path + "/memory.events";
+    if (std::filesystem::exists(candidate)) return candidate;
+  }
+  return "/sys/fs/cgroup/memory.events";
+}
+uint64_t kernelOomKills(const std::string& path) {
+  std::ifstream input(path);
   std::string key; uint64_t value;
   while (input >> key >> value) if (key == "oom_kill") return value;
   return 0;
 }
+// An OOM kill the cgroup counted is this pool's when one of its processes exits by SIGKILL within this long after it was
+// seen (the kernel counts the kill before the process is gone and is reaped); one that no such exit takes was another
+// process's of the cgroup, and never makes a later SIGKILL a kernel OOM.
+constexpr double OOM_ATTRIBUTION_MS = 2000;
 std::string escape(const std::string& value) {
   std::string result;
   for (auto ch : value) {
@@ -472,12 +490,19 @@ public:
     listener = -1;
   }
   // What the thread saw since the last call, and the counters.
-  struct Drained { std::vector<Observation> observations; uint64_t notifications = 0, interrupted = 0, errors = 0; };
+  // `counts` are exact (per call number); `observations` (thread and process of each) at most 4096 per drain, the rest
+  // counted in `dropped`.
+  struct Drained {
+    std::vector<Observation> observations;
+    std::map<int, uint64_t> counts;
+    uint64_t notifications = 0, interrupted = 0, errors = 0, dropped = 0;
+  };
   Drained drain() {
     std::lock_guard lock(mutex);
-    Drained result{std::move(pending), notifications, interrupted, errors};
+    Drained result{std::move(pending), std::move(counts), notifications, interrupted, errors, dropped};
     pending.clear();
-    notifications = interrupted = errors = 0;
+    counts.clear();
+    notifications = interrupted = errors = dropped = 0;
     return result;
   }
 private:
@@ -486,12 +511,15 @@ private:
   std::thread worker;
   std::mutex mutex;
   std::vector<Observation> pending;
-  uint64_t notifications = 0, interrupted = 0, errors = 0;
+  std::map<int, uint64_t> counts;
+  uint64_t notifications = 0, interrupted = 0, errors = 0, dropped = 0;
   void record(const Observation& observation, bool answered) {
     std::lock_guard lock(mutex);
     ++notifications;
+    ++counts[observation.number];
     if (!answered) ++errors;
     if (pending.size() < 4096) pending.push_back(observation);
+    else ++dropped;
   }
   void note(uint64_t SyscallSupervisor::*field) {
     std::lock_guard lock(mutex);
@@ -1042,7 +1070,19 @@ public:
   std::deque<std::string> memoryCrashes;
   // The limit event channel of the last exited generations: what the Server read, to the end.
   std::deque<std::string> channelExits;
-  uint64_t observedKernelOomKills = kernelOomKills();
+  // The cgroup's OOM kills (memoryEventsPath): the counter as last read, and the increments no exit has taken yet, each
+  // with when it was seen (observeOomKills, at the supervisor cadence and at every exit).
+  const std::string memoryEvents = memoryEventsPath();
+  uint64_t lastOomKills = kernelOomKills(memoryEvents), foreignOomKills = 0, poolOomKills = 0;
+  std::deque<double> unattributedOomKills;
+  void observeOomKills() {
+    const auto now = mono();
+    for (const auto count = kernelOomKills(memoryEvents); lastOomKills < count; ++lastOomKills) unattributedOomKills.push_back(now);
+    while (!unattributedOomKills.empty() && now - unattributedOomKills.front() > OOM_ATTRIBUTION_MS) {
+      unattributedOomKills.pop_front();
+      ++foreignOomKills;
+    }
+  }
   struct WorkerCpuStats { uint64_t terminated = 0, culprit = 0; };
   struct WorkerMemoryStats { uint64_t terminated = 0, culprit = 0, peakUsedBytes = 0; };
   std::map<std::string, WorkerCpuStats> workerCpuStats;
@@ -1108,7 +1148,7 @@ public:
         std::set<std::string> processes;
       };
       std::map<int, Observed> observed;
-      uint64_t notifications = 0, interrupted = 0, errors = 0, reported = 0, beyondCap = 0;
+      uint64_t notifications = 0, interrupted = 0, errors = 0, reported = 0, beyondCap = 0, detailsDropped = 0;
       // Processes the enforce mode ended, and the latest records of those exits.
       uint64_t denied = 0;
       std::deque<std::string> recentDenials;
@@ -1326,6 +1366,7 @@ public:
            " first request; each process reports it under processes[].sandbox.observed (seccompFilters, layers.steadySyscalls)\"}"
         << ",\"notifications\":" << s.notifications
         << ",\"interrupted\":" << s.interrupted << ",\"errors\":" << s.errors << ",\"reported\":" << s.reported
+        << ",\"detailsDropped\":" << s.detailsDropped
         << ",\"beyondCap\":" << s.beyondCap << ",\"observedCalls\":" << s.observed.size() << ",\"observed\":[";
     size_t i = 0;
     for (const auto& [number, entry] : s.observed) {
@@ -1969,24 +2010,36 @@ public:
     sandbox.syscalls.interrupted += drained.interrupted;
     sandbox.syscalls.errors += drained.errors;
     p.syscallInterrupted += drained.interrupted;
+    sandbox.syscalls.detailsDropped += drained.dropped;
+    countSyscalls(p, drained.counts, drained.notifications);
     for (const auto& observation : drained.observations) observeSyscall(p, observation.number, observation.tid, observation.thread);
   }
-  // One observation: counted per call number for the generation and for this Server, with the name of the
-  // thread it came from, and reported at most once per number per SYSCALL_REPORT_INTERVAL_MS.
+  // The supervisor's exact counts: per call number for the generation and for this Server, whatever the details kept.
+  void countSyscalls(ProcessGeneration& p, const std::map<int, uint64_t>& counts, uint64_t notifications) {
+    auto& s = sandbox.syscalls;
+    s.notifications += notifications;
+    p.syscallNotifications += notifications;
+    const auto now = wall();
+    for (const auto& [number, count] : counts) {
+      const auto existing = s.observed.find(number);
+      if (existing == s.observed.end() && s.observed.size() >= SYSCALL_OBSERVED_CAP) { s.beyondCap += count; continue; }
+      auto& entry = s.observed[number];
+      entry.count += count;
+      entry.lastAtUnixMs = now;
+      if (entry.firstAtUnixMs == 0) entry.firstAtUnixMs = now;
+      if (entry.processes.size() < 16) entry.processes.insert(p.id);
+      if (p.observedCalls.size() < SYSCALL_OBSERVED_CAP || p.observedCalls.contains(number)) p.observedCalls[number] += count;
+    }
+  }
+  // One observation's details: the name of the thread it came from, and a report at most once per number per
+  // SYSCALL_REPORT_INTERVAL_MS (counted already: countSyscalls).
   void observeSyscall(ProcessGeneration& p, int number, unsigned tid, const std::string& thread) {
-    ++sandbox.syscalls.notifications;
-    ++p.syscallNotifications;
     auto& s = sandbox.syscalls;
     const auto existing = s.observed.find(number);
-    if (existing == s.observed.end() && s.observed.size() >= SYSCALL_OBSERVED_CAP) { ++s.beyondCap; return; }
-    auto& entry = s.observed[number];
-    ++entry.count;
-    entry.lastAtUnixMs = wall();
-    if (entry.firstAtUnixMs == 0) entry.firstAtUnixMs = entry.lastAtUnixMs;
+    if (existing == s.observed.end()) return;
+    auto& entry = existing->second;
     if (entry.threads.size() < 16 && !thread.empty()) entry.threads.insert(thread);
-    if (entry.processes.size() < 16) entry.processes.insert(p.id);
-    if (p.observedCalls.size() < SYSCALL_OBSERVED_CAP) {
-      ++p.observedCalls[number];
+    if (p.observedCalls.contains(number)) {
       auto& threads = p.observedThreads[number];
       if (threads.size() < 16 && !thread.empty()) threads.insert(thread);
     }
@@ -2124,6 +2177,7 @@ public:
   void syncEvents() { for (auto& s : slots) eachGeneration(s, [&](const auto& p) { applyEvents(s, *p); }); }
   // The supervisor cadence: each live generation's events at most once per LIMIT_EVENT_SYNC_MS.
   void syncDueEvents() {
+    observeOomKills();
     const auto now = mono();
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
       if (p->pid == 0 || now < p->nextEventSync) return;
@@ -2164,10 +2218,14 @@ public:
         }
       }
     } catch (const kj::Exception&) {}
-    auto kernelKills = kernelOomKills();
-    bool kernelOom = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && kernelKills > observedKernelOomKills;
-    // The cgroup counter can advance for several child exits before one refresh.
-    if (kernelOom) ++observedKernelOomKills;
+    // A kernel OOM: a SIGKILL exit that takes an OOM kill the cgroup counted just before it (another process's kill,
+    // seen earlier, never makes one).
+    observeOomKills();
+    const bool kernelOom = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && !unattributedOomKills.empty();
+    if (kernelOom) {
+      unattributedOomKills.pop_front();
+      ++poolOomKills;
+    }
     if (!v8Oom && !kernelOom) return;
     slot.lastExitCategory = "memory-oom";
     p.lastReason = kernelOom ? "kernel memory OOM" : "V8 memory OOM";
@@ -2761,8 +2819,19 @@ std::optional<std::pair<std::string, uint64_t>> ProcessPool::egressSource(const 
 
 bool ProcessPool::ready() const {
   return std::all_of(impl->slots.begin(), impl->slots.end(), [](const auto& s) {
-    return s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected;
+    return s.quarantine || (s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected);
   });
+}
+std::string ProcessPool::quarantineReadinessJson() const {
+  std::string out = "[";
+  for (const auto& s : impl->slots) {
+    if (!s.quarantine) continue;
+    const bool ready = s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected;
+    if (ready) continue;
+    out += std::string(out.size() > 1 ? "," : "") + "{\"processId\":\"" + escape(s.id) + "\",\"state\":\"" +
+        escape(s.current ? s.current->state : std::string("none")) + "\"}";
+  }
+  return out + "]";
 }
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
@@ -2940,7 +3009,11 @@ std::string ProcessPool::json(uint32_t idleMs) const {
     out << "{\"workerId\":\"" << escape(worker) << "\",\"terminatedRequests\":" << stats.terminated
         << ",\"culpritCount\":" << stats.culprit << ",\"peakUsedBytes\":" << stats.peakUsedBytes << "}";
   }
-  out << "],\"recentMemoryCrashes\":[";
+  // The cgroup's OOM kills as this pool attributed them: its own processes', and the others' (not this pool's exits).
+  out << "],\"kernelOomKills\":{\"memoryEvents\":\"" << escape(impl->memoryEvents) << "\",\"counted\":" << impl->lastOomKills
+      << ",\"pool\":" << impl->poolOomKills << ",\"other\":" << impl->foreignOomKills
+      << ",\"unattributed\":" << impl->unattributedOomKills.size() << "}";
+  out << ",\"recentMemoryCrashes\":[";
   for (size_t j = 0; j < impl->memoryCrashes.size(); ++j) { if (j) out << ','; out << impl->memoryCrashes[j]; }
   out << "],\"recentChannelExits\":[";
   for (size_t j = 0; j < impl->channelExits.size(); ++j) { if (j) out << ','; out << impl->channelExits[j]; }

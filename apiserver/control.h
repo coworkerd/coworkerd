@@ -34,6 +34,8 @@ struct ControlContext {
   // The members trial loads go to: the heartbeats under members/ in `storage`, live within ttlSeconds + livenessGraceMs
   // of the listing's Date.
   uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
+  // control.cleanupGraceMs: a deletion's cleanup removes only objects older than this (deployment-tool.c++).
+  uint64_t cleanupGraceMs = 3600000;
 };
 
 // ---- deployment-tool.c++ ----
@@ -54,8 +56,11 @@ kj::Promise<std::string> controlSecretPut(ControlContext& context, std::string w
 kj::Promise<std::string> controlSecretDelete(ControlContext& context, std::string workerId, std::string name);
 kj::Promise<std::string> controlSecretList(ControlContext& context, std::string workerId);
 // A tenant's deletion cascade over the store's objects (idempotent): the objects no other tenant's definition
-// references -- definitions, packages, modules, bundles.
+// references -- definitions, packages, modules, bundles; a removal the store refuses fails it ({"ok":false}).
 kj::Promise<std::string> controlDeleteTenantObjects(ControlContext& context, std::string tenant);
+// The cleanups deferred below cluster/cleanup/ that are due, taken up (the control plane runs it every minute); "" when
+// none was due, else what it did.
+kj::Promise<std::string> controlSweepCleanup(ControlContext& context);
 
 // What a tenant's quotas are checked against (one read): its Workers, each Worker's versions, its secrets.
 struct TenantCounts {

@@ -64,7 +64,10 @@ public:
   kj::Promise<void> run();
   bool available(const std::string& worker);
   bool quarantined(const std::string& worker) const;
+  // Ready to take work: every ordinary process (a quarantine shard's state does not decide it).
   bool ready() const;
+  // The quarantine shards that are not ready: [{"processId","state"}], for the state endpoint.
+  std::string quarantineReadinessJson() const;
   uint32_t cpuLimitMs() const;
   uint32_t memoryLimitMiB() const;
   // The limits each Worker names: its own, else its tenant's default, 0 where this node's own values

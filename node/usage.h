@@ -21,7 +21,9 @@ namespace coworkerd {
 // written to the object store, one object per hour holding every tenant, nodes/<nodeId>/usage/<hour> -- this node's own
 // prefix, the only one its identity may write -- and once an hour the objects older than retentionHours are removed
 // (a listing of the prefix). A restart within the hour reads that hour's object back first and continues from it, so at
-// most one flush interval is lost. A node without the object store (the file membership) only counts. The hours are
+// most one flush interval is lost; when that read fails (not a missing object), it is tried again before each flush and
+// the hour is not written until it succeeds -- never from zero over the object. A process whose node id another process
+// took writes no more usage (stop()). A node without the object store (the file membership) only counts. The hours are
 // those of wallTimeMsForTest() (clockOffsetMsForTest moves them, for the tests of the retention).
 class TenantUsage final {
 public:
@@ -43,6 +45,8 @@ public:
   // store it only samples. Returns what it wrote, for the drain record; it throws nothing -- a node that cannot write
   // its last minute still has to leave.
   kj::Promise<std::string> flushNow();
+  // No more writes from this process (another process holds the node's id and writes its objects).
+  void stop(std::string reason);
   std::string json() const;
 
 private:
@@ -63,7 +67,12 @@ private:
   uint64_t lastFlushAtUnixMs = 0;
   uint64_t seededTenants = 0;
   std::string lastError, prunedThrough, lastPruneHour, seededHour;
+  // The hour whose object has not been read back yet (the start's read failed), and how often it was tried again.
+  std::string seedPending;
+  uint64_t seedRetries = 0;
+  std::string stoppedReason;
   Counts& now(const std::string& tenant);
+  kj::Promise<void> seed();
   kj::Promise<void> sample();
   kj::Promise<void> flush();
   kj::Promise<void> prune();

@@ -13,6 +13,12 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Node.js 22.5 or newer: the Wrangler this package pins needs 22, and the adapter path.matchesGlob, new in 22.5.
+const [NODE_MAJOR, NODE_MINOR] = process.versions.node.split(".").map(Number);
+if (NODE_MAJOR < 22 || (NODE_MAJOR === 22 && NODE_MINOR < 5)) {
+  console.error(`cowctl: Node.js 22.5 or newer is needed (this is ${process.version})`);
+  process.exit(1);
+}
 const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 // The Wrangler adapter (adapter.mjs) of this package, in the repository and in a release.
 const ADAPTER = new URL("../adapter.mjs", import.meta.url);
@@ -30,12 +36,15 @@ usage: cowctl <command> [options]              (in the project's directory)
 
   init --tenant T [--url URL] [--ingress URL] [--token-file FILE] [--worker NAME] [--route PREFIX] [--force]
                               write cowctl.json: the tenant, the control plane, the ingress, where the credential is
-  deploy [--no-activate] [--version ID] [--route PREFIX] [--secret NAME]...
-                              build with Wrangler, upload as a new version, trial-load it and make it active
+  deploy [--no-activate] [--version ID] [--route PREFIX] [--secret NAME]... [--no-wait]
+                              build with Wrangler, upload as a new version, trial-load it and make it active; then
+                              wait (at most 15 s) until every node serves it. --no-activate only uploads (no route,
+                              no trial load: both come with the activation, cowctl rollback <version>)
   versions                    the Worker's versions, the active one marked
-  rollback <version>          make an earlier version active again
+  rollback <version> [--no-wait]
+                              make an earlier version active again (and wait until every node serves it)
   remove [--yes]              stop serving the Worker (its versions stay)
-  secret put <NAME> [--from-file FILE]
+  secret put <NAME> [--from-file FILE] [--no-wait]
                               set a secret: the value from standard input (typed without echo) or the file
   secret list                 the secrets' names and lengths
   secret delete <NAME>
@@ -123,6 +132,40 @@ function wranglerConfig(directory = process.cwd()) {
   }
   return null;
 }
+// A JSON or JSONC text (comments and trailing commas, as Wrangler reads wrangler.jsonc), parsed; null when it does not
+// parse. Strings are kept as they are: "//" inside one (a URL) is not a comment.
+function parseJsonc(text) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+      out += text.slice(i, end + 1);
+      i = end;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end < 0 ? text.length : end + 1;
+      out += " ";
+    } else if (c === ",") {
+      // A trailing comma: the next character that is not white space or a comment closes an object or an array.
+      let next = i + 1;
+      for (;;) {
+        while (next < text.length && /\s/.test(text[next])) next++;
+        if (text.startsWith("//", next)) { while (next < text.length && text[next] !== "\n") next++; continue; }
+        if (text.startsWith("/*", next)) { const end = text.indexOf("*/", next + 2); next = end < 0 ? text.length : end + 2; continue; }
+        break;
+      }
+      if (text[next] !== "}" && text[next] !== "]") out += c;
+    } else {
+      out += c;
+    }
+  }
+  try { return JSON.parse(out); } catch { return null; }
+}
 function wranglerName(file) {
   if (!file) return null;
   const text = readFileSync(file, "utf8");
@@ -135,8 +178,9 @@ function wranglerName(file) {
     }
     return null;
   }
-  const match = /"name"\s*:\s*"([^"]+)"/.exec(text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""));
-  return match ? match[1] : null;
+  // The top-level name only (vars and other objects may hold a "name" of their own).
+  const config = parseJsonc(text);
+  return config && typeof config === "object" && typeof config.name === "string" ? config.name : null;
 }
 function workerOf(options, config) {
   const worker = options.worker ?? config.worker ?? wranglerName(wranglerConfig(config.file ? dirname(config.file) : process.cwd()));
@@ -174,6 +218,33 @@ async function call(config, method, path, { body, headers = {}, expect = [200] }
   failure.status = response.status;
   failure.code = code;
   throw failure;
+}
+
+// After a change the control plane answered: until every node that is not draining reports that it has applied the tenant
+// index's revision naming the change (its state's storage.appliedTenantsRevision, which /v1/status shows), at most 15 s.
+// A node that has not by then is named: the change is made, and it serves the change at its next read of the index.
+const WAIT_MS = 15000;
+async function waitForNodes(config, revision) {
+  if (!(revision > 0)) return;
+  const started = performance.now();
+  let pending = [], nodes = [];
+  for (;;) {
+    try {
+      nodes = ((await call(config, "GET", "/v1/status")).json?.nodes ?? []).filter(n => n.state !== "draining");
+      pending = nodes.filter(n => !(Number(n.storage?.appliedTenantsRevision ?? 0) >= revision));
+    } catch (error) {
+      pending = [{ nodeId: `(the control plane: ${error.message})` }];
+    }
+    if (!pending.length) break;
+    if (performance.now() - started >= WAIT_MS) {
+      console.log(`  not served yet by ${pending.map(n => n.nodeId).join(", ")} after ${WAIT_MS / 1000} s (the change is made; ` +
+        "a node serves it once it reads the tenant index again)");
+      return;
+    }
+    await new Promise(done => setTimeout(done, 250));
+  }
+  if (nodes.length) console.log(`  served by ${nodes.length} node${nodes.length === 1 ? "" : "s"} (tenant index revision ${revision}) ` +
+    `in ${((performance.now() - started) / 1000).toFixed(1)} s`);
 }
 
 // The Worker as the control plane has it (versions, active version, routes, secrets), or null when it has none.
@@ -239,8 +310,9 @@ async function filesBelow(root, prefix = "") {
 }
 // The adapter's output as the control plane takes it: manifest.json and <worker>/<version>/..., with the version
 // (and its manifest) renamed when the number the adapter built under is already taken, and the route the
-// command line names (a <host>/<prefix> route: the adapter itself only takes a path prefix).
-async function packageOf(output, worker, built, version, route) {
+// command line names (a <host>/<prefix> route: the adapter itself only takes a path prefix). An upload without activation
+// names no route (routes come with the activation).
+async function packageOf(output, worker, built, version, route, activate = true) {
   const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
   for (const entry of manifest.workers) {
     if (entry.activeVersion === built) entry.activeVersion = version;
@@ -250,6 +322,7 @@ async function packageOf(output, worker, built, version, route) {
     const slash = route.indexOf("/");
     manifest.routes = [{ host: route.slice(0, slash), pathPrefix: route.slice(slash), workerId: worker }];
   }
+  if (!activate) manifest.routes = [];
   const entries = [{ name: "manifest.json", content: Buffer.from(JSON.stringify(manifest, null, 2) + "\n") }];
   const root = join(output, worker, built);
   for (const file of await filesBelow(root)) entries.push({ name: `${worker}/${version}/${file}`, content: await readFile(join(root, file)) });
@@ -288,8 +361,10 @@ async function init(args) {
 
 async function deploy(args) {
   const { options, positional } = parse(args, { "no-activate": "flag", version: "value", route: "value", secret: "list", worker: "value",
-    config: "value", tenant: "value" });
+    config: "value", tenant: "value", "no-wait": "flag" });
   if (positional.length) throw usage(`deploy takes no arguments: ${positional.join(" ")}`);
+  if (options["no-activate"] && options.route !== undefined)
+    throw usage("--route takes effect when a version is activated: an upload without activation (--no-activate) takes no route");
   const config = loadConfig();
   const tenant = tenantOf(options, config);
   const projectDirectory = config.file ? dirname(config.file) : process.cwd();
@@ -326,12 +401,13 @@ async function deploy(args) {
     const built = version;
     const builtMs = performance.now() - started;
     for (let attempt = 0; ; attempt++) {
-      const { archive: body, manifest, files } = await packageOf(output, worker, built, version, route);
+      const { archive: body, manifest, files } = await packageOf(output, worker, built, version, route, !options["no-activate"]);
       try {
         const answer = await call(config, "PUT", `${workerPath(tenant, worker)}/versions/${version}${options["no-activate"] ? "" : "?activate=true"}`,
           { body, headers: { "content-type": "application/x-tar" } });
         report(config, `${tenant}/${worker}`, version, manifest, answer.json, { files, bytes: body.length, builtMs, totalMs: performance.now() - started,
           activated: !options["no-activate"], secrets: converted.record.secrets?.names ?? [] });
+        if (!options["no-activate"] && !options["no-wait"]) await waitForNodes(config, Number(answer.json?.record?.revision ?? 0));
         return;
       } catch (error) {
         // Someone else took this number in the meantime: the next one (a version named with --version is never renumbered).
@@ -366,6 +442,7 @@ function report(config, worker, version, manifest, answer, facts) {
   console.log(`${facts.activated ? "deployed" : "uploaded"} ${worker} ${version}${facts.activated ? " (active)" : " (not active: cowctl rollback " + version + " makes it active)"}`);
   console.log(`  package: ${facts.files} files, ${facts.bytes} bytes; built in ${(facts.builtMs / 1000).toFixed(1)} s, deployed in ${(facts.totalMs / 1000).toFixed(1)} s`);
   if (trial) console.log(`  trial load: ${trial.server} (its quarantine process), ${Math.round(trial.elapsedMs)} ms`);
+  else if (record.trial?.atActivation) console.log("  trial load: when it is activated");
   else if (record.trial?.enabled === false) console.log("  trial load: off");
   if (facts.activated) for (const route of manifest.routes ?? []) console.log(`  route ${route.host}${route.pathPrefix}  ->  ${urlOf(config, route)}`);
   if (facts.secrets.length) console.log(`  secrets declared: ${facts.secrets.join(", ")}`);
@@ -388,7 +465,7 @@ async function versions(args) {
 }
 
 async function rollback(args) {
-  const { options, positional } = parse(args, { worker: "value", tenant: "value" });
+  const { options, positional } = parse(args, { worker: "value", tenant: "value", "no-wait": "flag" });
   if (positional.length !== 1) throw usage("rollback takes the version: cowctl rollback <version>");
   const [version] = positional;
   if (!VERSION_NAME.test(version)) throw usage(`not a version name: ${version}`);
@@ -396,8 +473,11 @@ async function rollback(args) {
   const before = await workerState(config, tenant, worker);
   try {
     const answer = (await call(config, "POST", `${workerPath(tenant, worker)}/versions/${version}:activate`)).json;
-    if (answer.unchanged) console.log(`${worker}: ${version} is already the active version`);
-    else console.log(`${worker}: ${version} is active (was ${before?.activeVersion ?? "none"})`);
+    if (answer.unchanged) { console.log(`${worker}: ${version} is already the active version`); return; }
+    console.log(`${worker}: ${version} is active (was ${before?.activeVersion ?? "none"})`);
+    // An activation keeps the Worker's routes: one that never had any answers only through Service Bindings.
+    if (!(before?.routes ?? []).length) console.log("  it has no route: cowctl deploy --route ... (or PUT .../routes) gives it one");
+    if (!options["no-wait"]) await waitForNodes(config, Number(answer.revision ?? 0));
   } catch (error) {
     if (error.code === "LOAD_FAILED") throw new Failure(`rollback refused: ${version} does not load: ${error.detail?.message ?? error.message}`);
     throw new Failure(`rollback failed: ${error.message}`);
@@ -424,7 +504,7 @@ async function remove(args) {
 async function secret(args) {
   const [operation, ...rest] = args;
   if (!["put", "list", "delete"].includes(operation)) throw usage("secret put <NAME> | secret list | secret delete <NAME>");
-  const { options, positional } = parse(rest, { worker: "value", "from-file": "value", tenant: "value" });
+  const { options, positional } = parse(rest, { worker: "value", "from-file": "value", tenant: "value", "no-wait": "flag" });
   const config = loadConfig(), tenant = tenantOf(options, config), worker = workerOf(options, config);
   if (operation === "list") {
     if (positional.length) throw usage("secret list takes no arguments");
@@ -465,6 +545,7 @@ async function secret(args) {
   if (!answer.declaredByActiveVersion)
     console.log(`  no active version declares ${name} yet: list it in .dev.vars.example (or deploy --secret ${name}), then cowctl deploy`);
   else console.log("  isolates loaded from now on read the new value (loaded ones keep theirs until they are recycled)");
+  if (!options["no-wait"]) await waitForNodes(config, Number(answer.revision ?? 0));
 }
 
 async function status(args) {

@@ -574,8 +574,8 @@ export default {
     const props = descriptor.format === "v2" ? { bindings, entrypoint: descriptor.entrypoint || "default" } : bindings;
     return worker.getEntrypoint(undefined, { props }).fetch(request, {
       cf: {
-        // The node this execution runs on. `serverId` carries the same value and remains through 0.3.x
-        // (docs/guide/compat.md).
+        // The node this execution runs on. `serverId` carries the same value: a deprecated alias of `nodeId`, removed in
+        // 1.0 (docs/guide/compat.md).
         nodeId: descriptor.serverId,
         serverId: descriptor.serverId,
         processId: env.PROCESS_ID,

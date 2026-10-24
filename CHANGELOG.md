@@ -27,7 +27,9 @@ guide, section 9, "Upgrading from 0.3.x"); a configuration that names `etcdEndpo
   Nodes read the index's hint every 5 s and apply what changed: a deployment reached three nodes in 3.8 to 4.7 s (in
   0.3, etcd pushed it within milliseconds), and ten concurrent deployments to one tenant through two control planes
   all committed in 305 ms, none lost. A tenant's whole state is one write: there is no limit of 128 operations any
-  more.
+  more. A change is answered as done only once it is visible -- its revision, the hint and the tenant index naming it;
+  a failure after the revision is `503 STORAGE_UNAVAILABLE` -- and the control plane's poll and start complete what a
+  writer left half done. The hostnames of different tenants are checked once more in the tenant index's own turn.
 - **Secrets sealed at rest**: values are sealed with AES-256-GCM under the cluster's secrets key (`secrets.keyFile`),
   which compose's `secrets` step generates for the control plane and every node; the store never holds a value in the
   clear.
@@ -47,10 +49,11 @@ guide, section 9, "Upgrading from 0.3.x"); a configuration that names `etcdEndpo
 - **Checks**: `coworkerd check storage` reports the contract the cluster relies on (create-if-absent, listings with
   `Date` and `LastModified`, the clock), `conditionalPutAtomic` (create-if-absent under concurrency), whether the bucket
   holds the cluster's marker, and with `COWORKERD_READ_NODE_ID` a node identity's prefix policy;
-  `coworkerd check --config` checks the desired state (the secrets key, the marker) and the membership (a listing, the
-  clock, a write below the node's own prefix).
+  `coworkerd check --config` checks the management token, the desired state (the secrets key, the marker) and the
+  membership (a listing, the clock, a write below the node's own prefix).
 - **The cluster's marker**: `coworkerd-apiserver tool init` writes `cluster/format/1` and empty indexes into a new
-  bucket (compose's `init` runs it); nodes and the control plane refuse to start on a bucket without it.
+  bucket (compose's `init` runs it); nodes and the control plane refuse to start on a bucket without it, and the tool's
+  other commands refuse to write to one.
 - **`/v1`**: `STORAGE_UNAVAILABLE` (503) answers a change while the store cannot be reached, and the usage endpoints;
   `ETCD_UNAVAILABLE` is not answered any more. The status answer gains `storage` (the revisions of the tenant index and
   the credentials index, and the store client's counters), `/v1/nodes` gains `backend` and `lastHeartbeatAgeMs` per
@@ -61,12 +64,30 @@ guide, section 9, "Upgrading from 0.3.x"); a configuration that names `etcdEndpo
 - **The object store client**: separate connect (2 s), read (5 s) and create-if-absent (30 s) timeouts, a second try on
   a new connection for idempotent requests that failed, and a create whose answer was lost decided by reading the key
   back.
+- **Deletions**: a tenant's deletion answers `503 DELETION_INCOMPLETE` until nothing of the tenant remains, and goes on
+  when run again; deleting a version removes its objects first and leaves the version in place (503) when one cannot
+  be removed. A deletion removes an object only once it is older than `control.cleanupGraceMs` (1 hour) by the store's
+  clock and leaves younger ones to a sweep of the control plane, so an upload that meets a cleanup keeps its objects.
+- **A management token is required**: a node refuses to start without `management.token` (or
+  `COWORKERD_MANAGEMENT_TOKEN`) unless its configuration says `management.allowWithoutToken: true` (development); compose
+  always sets one. 0.3 started without one and only warned.
+- **`cowctl` waits for the nodes**: `cowctl deploy`, `rollback` and `secret put` return once every node that is not
+  draining reports the change (`storage.appliedTenantsRevision`, new in `/v1/nodes` and the status answer), at most
+  15 s; `--no-wait` returns at once. `cowctl` needs Node.js 22.5 or newer.
+- **`secrets remove-node`** withdraws a node's object storage identity within about 2 s, without a restart of the store:
+  `s3.json` keeps only the deploy identity, and every node's identity is in the store's filer.
+- **Answers**: `SECRET_TOO_LARGE` is retired -- a secret value over 5 KiB is `422 SECRET_REFUSED` whatever its size --;
+  a package of exactly `control.maxUploadBytes` or `packageBytes` is accepted; an upload without activation is not
+  trial-loaded (its activation is) and lists no routes (`400 INVALID_REQUEST`); a store failure is 503 and a write other
+  writers kept winning 409 by the failure's kind, never by its reason's words; the ingress's own refusals carry `error`
+  like every call refusal; a call whose lease runs out during placement ends with `410 LEASE_EXPIRED`.
+  `request.cf.serverId` stays a deprecated alias of `nodeId`, and is removed in 1.0.
+- **Supported versions**: 0.4.x only; 0.3.x is no longer fixed (SECURITY.md).
 
 **Still open**: there is no mTLS between nodes; the system call allowlist still defaults to `observe`; the stream of
 `cowctl logs --follow` is filled by asking the nodes every 500 ms; some reasons the nodes and the control plane give
-are still in Chinese; and `cowctl deploy`, `cowctl rollback` and `cowctl secret put` return before the nodes have read
-the change, which they do within about 5 s (an isolate already loaded keeps a secret's old value until it is replaced:
-an idle one after 5 minutes, one in use at the latest when its process is rotated, every hour by default).
+are still in Chinese; and an isolate already loaded keeps a secret's old value until it is replaced: an idle one after
+5 minutes, one in use at the latest when its process is rotated, every hour by default.
 
 ## 0.3.1
 

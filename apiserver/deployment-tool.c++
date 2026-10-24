@@ -34,6 +34,9 @@ uint64_t nowUnixMs() {
 // Per-Worker maps in the full status are bounded; tests that need every
 // Worker use the counts and digests.
 constexpr size_t STATUS_PROBLEM_LIMIT = 20;
+// A secret's value of fewer bytes than this occurs in reasons by chance ("1" in a revision number): only a longer one
+// found in a failure's reason withholds the reason.
+constexpr size_t WITHHELD_MIN_BYTES = 8;
 
 // ---------------------------------------------------------------------------
 // Deployment tool: one tenant's manifest at a time (common/tenant-manifest.h), its next revision written only if
@@ -92,6 +95,8 @@ struct ToolOptions {
   bool publishOnly = false;
   // An activating upload whose manifest lists no routes keeps the Worker's current ones.
   bool keepRoutes = false;
+  // The cleanup's grace (control.cleanupGraceMs): an object found there that is older than half of it is written again.
+  uint64_t cleanupGraceMs = 3600000;
   struct Activation {
     // An empty versionId is the version the Worker's pointer names at each attempt (PUT routes).
     std::string workerId, versionId;
@@ -226,12 +231,18 @@ Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state,
 
 // The immutable objects first (then the trial loads, then the manifest that names them -- a version exists in the
 // desired state only once it loads). Content objects are written where missing; a definition is created only if
-// absent, and one that exists must hold the same bytes. A failed PUT leaves only immutable objects, never a partly
+// absent, and one that exists must hold the same bytes. An object found there that is older than half the cleanup's
+// grace is written again (its key is its content's hash): a deletion's cleanup removes only objects older than the grace,
+// so none that this upload relies on goes before its manifest names it -- and `reused` lists the keys found there, which
+// are checked once more after the manifest is written. A failed PUT leaves only immutable objects, never a partly
 // published deployment.
 kj::Promise<void> publishObjects(ObjectStore& storage, const DeploymentInput& desired, const DeploymentCode& code,
-    std::ostream& report) {
+    uint64_t graceMs, std::ostream& report, std::map<std::string, std::string>* reused = nullptr) {
   const auto uploadStartedAtUnixMs = nowUnixMs();
-  uint64_t uploaded = 0, skipped = 0, uploadedModules = 0, skippedModules = 0, uploadedAssets = 0, skippedAssets = 0;
+  uint64_t uploaded = 0, skipped = 0, uploadedModules = 0, skippedModules = 0, uploadedAssets = 0, skippedAssets = 0, refreshed = 0;
+  auto stale = [graceMs](const ObjectResponse& found) {
+    return found.dateUnixMs && found.lastModifiedUnixMs && found.dateUnixMs > found.lastModifiedUnixMs + graceMs / 2;
+  };
   std::map<std::string, std::string> definitions;
   for (const auto& [label, version] : desired.versions)
     definitions.emplace("definitions/" + version->definitionHash, definitionJson(*version));
@@ -242,21 +253,29 @@ kj::Promise<void> publishObjects(ObjectStore& storage, const DeploymentInput& de
       if (created.created) { ++uploaded; continue; }
       existing = co_await storage.get(key);
     }
-    KJ_REQUIRE(existing.status == 200, "object store read failed", existing.status);
+    requireStorage(existing.status == 200, "object store read failed: HTTP " + std::to_string(existing.status) + " (" + key + ")");
     if (existing.bytes != bytes)
       refuse(key + " holds other bytes than this definition (a damaged object); nothing published");
+    if (stale(existing)) { co_await storage.put(key, bytes); ++refreshed; }
+    if (reused) (*reused)[key] = bytes;
     ++skipped;
   }
   // The manifest's code objects: bundles/, packages/ and modules/ (code module
   // and static asset bytes share modules/<SHA-256>).
   for (const auto& [key, bytes] : code.objects) {
     const bool module = key.starts_with("modules/"), asset = code.assetObjects.contains(key);
-    if (co_await storage.exists(key)) { ++skipped; skippedModules += module; skippedAssets += asset; }
+    auto head = co_await storage.request(kj::HttpMethod::HEAD, key);
+    requireStorage(head.status == 200 || head.status == 404, "object HEAD failed: HTTP " + std::to_string(head.status));
+    if (head.status == 200) {
+      if (stale(head)) { co_await storage.put(key, bytes); ++refreshed; }
+      if (reused) (*reused)[key] = bytes;
+      ++skipped; skippedModules += module; skippedAssets += asset;
+    }
     else { co_await storage.put(key, bytes); ++uploaded; uploadedModules += module; uploadedAssets += asset; }
   }
   const auto uploadFinishedAtUnixMs = nowUnixMs();
   report << ",\"uploadStartedAtUnixMs\":" << uploadStartedAtUnixMs << ",\"uploadFinishedAtUnixMs\":" << uploadFinishedAtUnixMs
-         << ",\"uploadedObjects\":" << uploaded << ",\"skippedObjects\":" << skipped
+         << ",\"uploadedObjects\":" << uploaded << ",\"skippedObjects\":" << skipped << ",\"refreshedObjects\":" << refreshed
          << ",\"uploadedModules\":" << uploadedModules << ",\"skippedModules\":" << skippedModules;
   // Asset objects are reported only for deployments with assets, so the output
   // of code-only deployments keeps its fields.
@@ -382,7 +401,8 @@ kj::Promise<void> runTrials(kj::Timer& timer, TrialContext& context, const char*
     refuse(reason);
   };
   if (!versions.empty() && members.empty())
-    fail("no member of the cluster can run the trial load (no node has registered); deploy with --no-trial "
+    fail(options.controlPlane ? "no member of the cluster can run the trial load (no node has registered); start a node first"
+        : "no member of the cluster can run the trial load (no node has registered); deploy with --no-trial "
         "(for example the initial deployment, before any node runs) or name a node with --trial-server URL", "");
   for (const auto& version : versions) {
     bool routed = false;
@@ -437,7 +457,8 @@ kj::Promise<void> runTrials(kj::Timer& timer, TrialContext& context, const char*
     if (!decided.valid) {
       fail(options.trialServer.empty()
           ? "none of the " + std::to_string(members.size()) + " members could run the trial load of " + label +
-              " (" + problems + "); nothing flipped. Name a reachable node with --trial-server URL, or deploy with --no-trial"
+              " (" + problems + "); nothing flipped" + (options.controlPlane ? std::string()
+              : ". Name a reachable node with --trial-server URL, or deploy with --no-trial")
           : "the trial node could not run the trial load of " + label + " (" + problems + "); nothing flipped", record);
     }
     if (!decided.ok) {
@@ -555,15 +576,15 @@ kj::Promise<void> write(Operation operation, kj::Timer& timer, ManifestStore& st
   }
   const auto plannedAt = std::chrono::steady_clock::now();
   std::ostringstream report;
+  std::map<std::string, std::string> reused;
   if (operation == Operation::REMOVE) report << ",\"publishedDefinitions\":0";
   else {
     // An activated version was published when it was uploaded: its objects are in the store.
-    if (!options.activation) co_await publishObjects(*storage, desired, code, report);
-    // Every new version loads on a node before anything flips (before the manifest names it). An upload tries the
-    // versions it publishes.
-    std::vector<std::string> tried = preview.workers;
-    if (options.publishOnly) for (const auto& [id, pin] : previewInput.active) tried.push_back(id);
-    co_await runTrials(timer, trials, name, previewInput, before, tried, readRevision, options, report, out);
+    if (!options.activation) co_await publishObjects(*storage, desired, code, options.cleanupGraceMs, report, &reused);
+    // Every new version loads on a node before anything flips (before the manifest names it). An upload without
+    // activation moves no pointer: its versions are tried when one is activated.
+    if (options.publishOnly) report << ",\"trial\":{\"enabled\":false,\"atActivation\":true}";
+    else co_await runTrials(timer, trials, name, previewInput, before, preview.workers, readRevision, options, report, out);
     report << ",\"publishedDefinitions\":" << preview.published.size();
   }
   if (options.pauseMs) co_await timer.afterDelay(options.pauseMs * kj::MILLISECONDS);
@@ -576,6 +597,15 @@ kj::Promise<void> write(Operation operation, kj::Timer& timer, ManifestStore& st
     auto attemptInput = co_await input(base, state.stateOf(tenant, &base));
     planned = plan(operation, next, state, attemptInput, options);
   }, !options.publishOnly, options.maxRetries + 1);
+  // The objects this write found there, once more now that its manifest names them: one a cleanup removed meanwhile is
+  // written again.
+  uint64_t rewritten = 0;
+  for (const auto& [key, bytes] : reused) {
+    if (co_await storage->exists(key)) continue;
+    co_await storage->put(key, bytes);
+    ++rewritten;
+  }
+  if (rewritten) report << ",\"rewrittenAfterCommit\":" << rewritten;
   if (options.publishOnly) {
     out << "{\"operation\":\"upload\",\"flipped\":false,\"tenant\":" << quote(tenant) << ",\"revision\":\"" << state.index().revision
         << "\",\"readRevision\":\"" << readRevision << "\",\"manifestRevision\":" << written.manifest.revision
@@ -803,14 +833,14 @@ int runSecretTool(int argc, char** argv) {
   ManifestStore state(storage, io.provider->getTimer(), loadKey(arguments.keyFile), std::cerr);
   const auto worker = workerFullId(tenant, names[0]);
   try {
-    state.load(operation != "list", false).wait(io.waitScope);
+    state.load(false, false).wait(io.waitScope);
     if (operation == "put") secretPut(state, worker, names[1], value, maxRetries, std::cout).wait(io.waitScope);
     else if (operation == "delete") secretDelete(state, worker, names[1], maxRetries, std::cout).wait(io.waitScope);
     else secretList(state, worker, std::cout);
   } catch (const kj::Exception& error) {
     // Defence in depth: a failure description never quotes the value.
     std::string description = error.getDescription().cStr();
-    if (operation == "put" && !value.empty() && (description.find(value) != std::string::npos ||
+    if (operation == "put" && value.size() >= WITHHELD_MIN_BYTES && (description.find(value) != std::string::npos ||
         description.find(base64(value)) != std::string::npos))
       refuse("secret put failed (detail withheld: it would quote the value)");
     throw;
@@ -835,13 +865,16 @@ std::string controlSuccess(const std::string& printed) {
 std::string controlFailure(const kj::Exception& error, const std::string& printed, const std::string& withheld = {}) {
   std::string reason = error.getDescription().cStr();
   // A secret's value never leaves in a reason (as the secret tool withholds it).
-  if (!withheld.empty() && (reason.find(withheld) != std::string::npos || reason.find(base64(withheld)) != std::string::npos))
+  if (withheld.size() >= WITHHELD_MIN_BYTES &&
+      (reason.find(withheld) != std::string::npos || reason.find(base64(withheld)) != std::string::npos))
     reason = "secret put failed (detail withheld: it would quote the value)";
   auto record = printed;
   while (!record.empty() && (record.back() == '\n' || record.back() == ' ')) record.pop_back();
   // Only a refused trial prints before it refuses: its record is the last line.
   if (auto line = record.rfind('\n'); line != std::string::npos) record = record.substr(line + 1);
-  const char* kind = error.getType() == kj::Exception::Type::DISCONNECTED ? "disconnected"
+  // The failure's kind decides its answer (main.c++), never its reason's words: the store's, another writer's, or else.
+  const char* kind = isStorageFailure(error) ? "storage" : isWriteConflict(error) ? "conflict"
+      : error.getType() == kj::Exception::Type::DISCONNECTED ? "disconnected"
       : error.getType() == kj::Exception::Type::OVERLOADED ? "overloaded" : "failed";
   return "{\"ok\":false,\"kind\":\"" + std::string(kind) + "\",\"reason\":" + quote(reason) +
       ",\"record\":" + (record.starts_with("{") ? record : std::string("null")) + '}';
@@ -854,6 +887,7 @@ ToolOptions controlOptions(ControlContext& context) {
   options.memberTtlSeconds = context.memberTtlSeconds;
   options.memberGraceMs = context.memberGraceMs;
   options.memberStore = &context.storage;
+  options.cleanupGraceMs = context.cleanupGraceMs;
   return options;
 }
 }  // namespace
@@ -1035,86 +1069,184 @@ kj::Promise<std::string> controlLimits(ControlContext& context, std::string work
 }
 
 namespace {
-struct ObjectCleanup { uint64_t deleted = 0, kept = 0, failed = 0; std::string skippedModules; };
+// What a deletion's cleanup removes, and what it leaves for later: an object younger than the grace (an upload may be
+// about to name an object it found there: control.cleanupGraceMs, which uploads keep the objects they find within by
+// writing them again), or one whose references cannot be read now (a remaining version's definition, or a remaining
+// package's manifest -- or more than 1,000 of them to read). Those are listed in one object per cleanup below
+// cluster/cleanup/, named by when it is due (20 digits, Unix ms) and a random value; the control plane's sweep
+// (controlSweepCleanup) takes each up once due, removes what is still unreferenced and old enough, and lists the rest
+// again. A removal the store refuses is a failure: the deletion answers 503 and, run again, resumes.
+constexpr const char* CLEANUP_PREFIX = "cluster/cleanup/";
+constexpr size_t MODULE_CHECK_LIMIT = 1000;
+struct ObjectCleanup {
+  uint64_t deleted = 0, kept = 0, failed = 0, deferred = 0;
+  std::string modules = "checked";
+  std::vector<std::string> deferredKeys;
+};
 std::string cleanupJson(const ObjectCleanup& c) {
   return "{\"deletedObjects\":" + std::to_string(c.deleted) + ",\"keptObjects\":" + std::to_string(c.kept) +
-      ",\"failedObjects\":" + std::to_string(c.failed) + ",\"modules\":" + (c.skippedModules.empty() ? std::string("\"checked\"")
-      : quote(c.skippedModules)) + '}';
+      ",\"failedObjects\":" + std::to_string(c.failed) + ",\"deferredObjects\":" + std::to_string(c.deferred) +
+      ",\"modules\":" + quote(c.modules) + '}';
 }
-// Deletes the objects of `gone` (definitions about to leave, or gone) that no definition of `remaining` references
-// (control-plane-api.md section 5: reference counted by hash). A v2 package's modules and assets go only when no
-// remaining package lists them; past 1,000 remaining packages the modules are kept (reading every manifest is the
-// cost of the count). Not `complete` (a remaining version's definition could not be read): nothing is deleted.
-kj::Promise<ObjectCleanup> cleanupObjects(ObjectStore& storage, const std::vector<std::shared_ptr<const VersionDefinition>>& gone,
-    const std::vector<std::shared_ptr<const VersionDefinition>>& remaining, bool complete) {
-  ObjectCleanup result;
-  if (!complete) {
-    result.kept = gone.size();
-    result.skippedModules = "kept: a remaining version's definition could not be read, so what it references is unknown";
-    co_return result;
-  }
-  std::set<std::string> keepDefinitions, keepContent, keepModules;
-  std::set<std::string> remainingPackages;
+// What the remaining versions reference: their definitions, their content (packages and bundles), and -- read only when
+// a module is a candidate -- the modules their packages list.
+struct References {
+  std::set<std::string> definitions, content, packages;
+  bool complete = true;  // every remaining version's definition was read
+  std::optional<std::set<std::string>> modules;
+  std::string modulesUnknown;  // why `modules` could not be read
+};
+References referencesOf(const std::vector<std::shared_ptr<const VersionDefinition>>& remaining, bool complete) {
+  References refs;
+  refs.complete = complete;
   for (const auto& version : remaining) {
-    keepDefinitions.insert(version->definitionHash);
-    keepContent.insert(version->contentHash);
-    if (version->format == "v2") remainingPackages.insert(version->contentHash);
+    refs.definitions.insert(version->definitionHash);
+    refs.content.insert(version->contentHash);
+    if (version->format == "v2") refs.packages.insert(version->contentHash);
   }
-  std::set<std::string> objects;
-  std::set<std::string> gonePackages;
-  for (const auto& version : gone) {
-    if (!keepDefinitions.contains(version->definitionHash)) objects.insert("definitions/" + version->definitionHash);
-    if (keepContent.contains(version->contentHash)) { ++result.kept; continue; }
-    if (version->format == "v2") { objects.insert("packages/" + version->contentHash); gonePackages.insert(version->contentHash); }
-    else objects.insert("bundles/" + version->contentHash);
+  return refs;
+}
+// A package's modules and assets (its manifest's hashes); none when it cannot be read (`missing`: it is not there).
+kj::Promise<std::optional<std::set<std::string>>> packageHashes(ObjectStore& storage, std::string packageHash, bool* missing = nullptr) {
+  auto response = co_await storage.get("packages/" + packageHash);
+  if (missing) *missing = response.status == 404;
+  if (response.status != 200) co_return std::nullopt;
+  std::set<std::string> hashes;
+  try {
+    auto contents = readPackage(response.bytes);
+    for (const auto& m : contents.modules) hashes.insert(m.sha256);
+    for (const auto& a : contents.assets) hashes.insert(a.sha256);
+  } catch (const kj::Exception&) { co_return std::nullopt; }
+  co_return hashes;
+}
+kj::Promise<void> readModules(ObjectStore& storage, References& refs) {
+  if (refs.modules || !refs.modulesUnknown.empty()) co_return;
+  if (refs.packages.size() > MODULE_CHECK_LIMIT) {
+    refs.modulesUnknown = "deferred: more than 1000 remaining packages to check";
+    co_return;
   }
-  auto manifestHashes = [&](const std::string& packageHash) -> kj::Promise<std::optional<std::set<std::string>>> {
-    auto response = co_await storage.get("packages/" + packageHash);
-    if (response.status != 200) co_return std::nullopt;
-    std::set<std::string> hashes;
-    try {
-      auto contents = readPackage(response.bytes);
-      for (const auto& m : contents.modules) hashes.insert(m.sha256);
-      for (const auto& a : contents.assets) hashes.insert(a.sha256);
-    } catch (const kj::Exception&) { co_return std::nullopt; }
-    co_return hashes;
+  std::set<std::string> modules;
+  for (const auto& hash : refs.packages) {
+    auto hashes = co_await packageHashes(storage, hash);
+    if (!hashes) { refs.modulesUnknown = "deferred: a remaining package's manifest could not be read"; co_return; }
+    modules.insert(hashes->begin(), hashes->end());
+  }
+  refs.modules = std::move(modules);
+}
+// The candidates removed that no remaining version references and that are older than the grace; the others deferred
+// (or, when referenced now, dropped). A package goes only after its modules: they are found through it. Modules first,
+// then packages and bundles, then definitions -- a cleanup that stops half way finds the rest again through what is left.
+kj::Promise<void> removeUnreferenced(ObjectStore& storage, std::set<std::string> candidates, References& refs, uint64_t graceMs,
+    ObjectCleanup& result) {
+  auto defer = [&](const std::string& key) { result.deferredKeys.push_back(key); ++result.deferred; };
+  if (!refs.complete) {
+    // What the remaining versions reference is unknown: nothing goes now.
+    for (const auto& key : candidates) defer(key);
+    result.modules = "deferred: a remaining version's definition could not be read";
+    co_return;
+  }
+  auto referenced = [&](const std::string& key) {
+    const auto slash = key.find('/');
+    const auto kind = key.substr(0, slash), hash = key.substr(slash + 1);
+    if (kind == "definitions") return refs.definitions.contains(hash);
+    if (kind == "packages" || kind == "bundles") return refs.content.contains(hash);
+    return refs.modules && refs.modules->contains(hash);
   };
-  if (!gonePackages.empty()) {
-    if (remainingPackages.size() > 1000) {
-      result.skippedModules = "kept: more than 1000 remaining packages to check";
-    } else {
-      bool readable = true;
-      for (const auto& hash : remainingPackages) {
-        auto hashes = co_await manifestHashes(hash);
-        if (!hashes) { readable = false; break; }
-        keepModules.insert(hashes->begin(), hashes->end());
-      }
-      if (!readable) result.skippedModules = "kept: a remaining package's manifest could not be read";
-      else for (const auto& hash : gonePackages) {
-        auto hashes = co_await manifestHashes(hash);
-        if (!hashes) continue;  // already gone (a deletion that ran before)
-        for (const auto& module : *hashes) if (!keepModules.contains(module)) objects.insert("modules/" + module);
-      }
-    }
-  }
-  // Packages last: a manifest stays readable until its modules are gone, so a deletion that stopped half way
-  // finds them again when it runs again.
-  std::vector<std::string> ordered;
-  for (const auto& key : objects) if (!key.starts_with("packages/")) ordered.push_back(key);
-  for (const auto& key : objects) if (key.starts_with("packages/")) ordered.push_back(key);
-  for (const auto& key : ordered) {
+  // An object's age by the store's own clock (its Last-Modified against the answer's Date): young, or gone already.
+  enum class Age { GONE, YOUNG, OLD };
+  auto age = [&](const std::string& key) -> kj::Promise<Age> {
+    auto head = co_await storage.request(kj::HttpMethod::HEAD, key);
+    if (head.status == 404) co_return Age::GONE;
+    requireStorage(head.status == 200, "object HEAD failed: HTTP " + std::to_string(head.status));
+    if (!head.dateUnixMs || !head.lastModifiedUnixMs) co_return graceMs ? Age::YOUNG : Age::OLD;
+    co_return head.dateUnixMs >= head.lastModifiedUnixMs + graceMs ? Age::OLD : Age::YOUNG;
+  };
+  auto remove = [&](const std::string& key) -> kj::Promise<void> {
     auto response = co_await storage.request(kj::HttpMethod::DELETE, key);
     if (response.status == 204 || response.status == 200 || response.status == 404) ++result.deleted;
     else ++result.failed;
+  };
+  std::vector<std::string> modules, content, definitions;
+  for (const auto& key : candidates) {
+    if (referenced(key)) continue;
+    if (key.starts_with("modules/")) modules.push_back(key);
+    else if (key.starts_with("definitions/")) definitions.push_back(key);
+    else content.push_back(key);
   }
+  // The packages to go now, and their modules: a package found young, or whose modules cannot be checked, stays (with
+  // its modules) for the sweep.
+  std::vector<std::string> goingContent;
+  for (const auto& key : content) {
+    const auto state = co_await age(key);
+    if (state == Age::GONE) { ++result.deleted; continue; }
+    if (state == Age::YOUNG) { defer(key); continue; }
+    if (key.starts_with("packages/")) {
+      bool missing = false;
+      auto hashes = co_await packageHashes(storage, key.substr(9), &missing);
+      if (hashes && !hashes->empty()) {
+        co_await readModules(storage, refs);
+        if (!refs.modules) { result.modules = refs.modulesUnknown; defer(key); continue; }
+        for (const auto& hash : *hashes) if (!refs.modules->contains(hash)) modules.push_back("modules/" + hash);
+      } else if (!hashes && !missing) {
+        result.modules = "deferred: a package's manifest could not be read";
+        defer(key);
+        continue;
+      }
+    }
+    goingContent.push_back(key);
+  }
+  std::sort(modules.begin(), modules.end());
+  modules.erase(std::unique(modules.begin(), modules.end()), modules.end());
+  for (const auto& key : modules) {
+    const auto state = co_await age(key);
+    if (state == Age::GONE) ++result.deleted;
+    else if (state == Age::YOUNG) defer(key);
+    else co_await remove(key);
+  }
+  for (const auto& key : goingContent) co_await remove(key);
+  for (const auto& key : definitions) {
+    const auto state = co_await age(key);
+    if (state == Age::GONE) ++result.deleted;
+    else if (state == Age::YOUNG) defer(key);
+    else co_await remove(key);
+  }
+}
+// The deferred keys of a cleanup, as an object below cluster/cleanup/ due when the youngest of them is older than the
+// grace (the sweep checks each one's age again).
+kj::Promise<void> deferCleanup(ObjectStore& storage, const std::vector<std::string>& keys, uint64_t graceMs) {
+  if (keys.empty()) co_return;
+  const auto due = realClockUnixMs() + std::max<uint64_t>(graceMs, 60000);
+  std::string digits = std::to_string(due);
+  digits.insert(0, REVISION_DIGITS - std::min(digits.size(), REVISION_DIGITS), '0');
+  std::string body = "{\"dueAtUnixMs\":" + std::to_string(due) + ",\"graceMs\":" + std::to_string(graceMs) + ",\"keys\":[";
+  for (size_t i = 0; i < keys.size(); ++i) body += (i ? "," : "") + quote(keys[i]);
+  co_await storage.put(CLEANUP_PREFIX + digits + "-" + newWriterInstance().substr(0, 12), body + "]}");
+}
+// Deletes the objects of `gone` (definitions about to leave, or gone) that no definition of `remaining` references
+// (control-plane-api.md section 5: reference counted by hash): their definitions, their packages or bundles, and a
+// package's modules and assets that no remaining package lists. What cannot go now is deferred (above).
+kj::Promise<ObjectCleanup> cleanupObjects(ObjectStore& storage, const std::vector<std::shared_ptr<const VersionDefinition>>& gone,
+    const std::vector<std::shared_ptr<const VersionDefinition>>& remaining, bool complete, uint64_t graceMs) {
+  ObjectCleanup result;
+  auto refs = referencesOf(remaining, complete);
+  std::set<std::string> candidates;
+  for (const auto& version : gone) {
+    if (!refs.definitions.contains(version->definitionHash)) candidates.insert("definitions/" + version->definitionHash);
+    if (refs.content.contains(version->contentHash)) { ++result.kept; continue; }
+    candidates.insert((version->format == "v2" ? "packages/" : "bundles/") + version->contentHash);
+  }
+  co_await removeUnreferenced(storage, std::move(candidates), refs, graceMs, result);
+  co_await deferCleanup(storage, result.deferredKeys, graceMs);
   co_return result;
 }
 
 // Every definition the tenants `keep` selects name, and whether each one was read.
 struct Definitions { std::vector<std::shared_ptr<const VersionDefinition>> versions; bool complete = true; };
-kj::Promise<Definitions> definitionsOf(ManifestStore& state, std::function<bool(const std::string&)> keep) {
+kj::Promise<Definitions> definitionsOf(ManifestStore& state, std::function<bool(const std::string&)> keep,
+    const std::string& except = {}) {
   std::set<std::string> hashes;
   for (const auto& [tenant, manifest] : state.tenants()) if (keep(tenant)) hashes.merge(namedDefinitions(manifest));
+  hashes.erase(except);
   co_await state.fetchDefinitions(hashes);
   Definitions result;
   for (const auto& hash : hashes) {
@@ -1125,13 +1257,15 @@ kj::Promise<Definitions> definitionsOf(ManifestStore& state, std::function<bool(
 }
 }  // namespace
 
-// DELETE a version: only one the Worker's pointer does not name; then its objects that nothing else uses.
+// DELETE a version: only one the Worker's pointer does not name. Its objects that nothing else uses go first, within the
+// tenant's turn: a removal the store refuses leaves the version in the manifest (503, nothing committed); then the
+// manifest without it.
 kj::Promise<std::string> controlDeleteVersion(ControlContext& context, std::string workerId, std::string versionId) {
   std::ostringstream out;
   try {
     if (!workerFullName(workerId) || !deploymentSafeName(versionId)) refuse("invalid workerId or versionId");
     const auto tenant = tenantOf(workerId);
-    std::string hash;
+    ObjectCleanup cleanup;
     auto written = co_await context.state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
       requireWritable(tenant, next, true);
       auto entry = next.workers.find(workerNameOf(workerId));
@@ -1139,17 +1273,19 @@ kj::Promise<std::string> controlDeleteVersion(ControlContext& context, std::stri
         refuse("version " + versionId + " of Worker " + workerId + " was never uploaded");
       if (entry->second.active && entry->second.active->versionId == versionId)
         refuse("version " + versionId + " is the active version of Worker " + workerId + ": activate another version first");
-      hash = entry->second.versions.at(versionId).definitionHash;
+      const auto hash = entry->second.versions.at(versionId).definitionHash;
+      co_await context.state.fetchDefinitions({hash});
+      cleanup = {};
+      if (auto deleted = context.state.definition(hash)) {
+        // Every tenant's definitions count (the same bytes may be another tenant's package too), this version's aside.
+        auto remaining = co_await definitionsOf(context.state, [](const std::string&) { return true; }, hash);
+        cleanup = co_await cleanupObjects(context.storage, {deleted}, remaining.versions, remaining.complete, context.cleanupGraceMs);
+        if (cleanup.failed)
+          failStorage("the object store refused to remove " + std::to_string(cleanup.failed) + " of the version's objects; "
+              "the version stays (DELETE it again)");
+      }
       entry->second.versions.erase(versionId);
-      co_return;
     }, true);
-    ObjectCleanup cleanup;
-    co_await context.state.fetchDefinitions({hash});
-    if (auto deleted = context.state.definition(hash)) {
-      // Every tenant's definitions count (the same bytes may be another tenant's package too).
-      auto remaining = co_await definitionsOf(context.state, [](const std::string&) { return true; });
-      cleanup = co_await cleanupObjects(context.storage, {deleted}, remaining.versions, remaining.complete);
-    }
     out << "{\"operation\":\"delete version\",\"workerId\":" << quote(workerId) << ",\"versionId\":" << quote(versionId)
         << ",\"revision\":\"" << context.state.index().revision << "\",\"manifestRevision\":" << written.manifest.revision
         << ",\"objects\":" << cleanupJson(cleanup) << '}';
@@ -1209,20 +1345,70 @@ TenantCounts tenantCounts(const ManifestStore& state, const std::string& tenant)
   return counts;
 }
 
-// The objects of a tenant's deletion cascade (control-plane-api.md section 5): what only its definitions reference.
+// The objects of a tenant's deletion cascade (control-plane-api.md section 5): what only its definitions reference. A
+// removal the store refuses fails it (the deletion answers DELETION_INCOMPLETE and resumes when run again); what cannot
+// go now is deferred to the sweep.
 kj::Promise<std::string> controlDeleteTenantObjects(ControlContext& context, std::string tenant) {
   std::ostringstream out;
   try {
     if (!tenantName(tenant)) refuse("invalid tenant");
     auto gone = co_await definitionsOf(context.state, [&](const std::string& name) { return name == tenant; });
     auto remaining = co_await definitionsOf(context.state, [&](const std::string& name) { return name != tenant; });
-    auto cleanup = co_await cleanupObjects(context.storage, gone.versions, remaining.versions, remaining.complete);
+    auto cleanup = co_await cleanupObjects(context.storage, gone.versions, remaining.versions, remaining.complete,
+        context.cleanupGraceMs);
     out << "{\"operation\":\"delete tenant objects\",\"tenant\":" << quote(tenant) << ",\"definitions\":" << gone.versions.size()
         << ",\"objects\":" << cleanupJson(cleanup) << '}';
+    if (!gone.complete) refuse("a definition of tenant " + tenant + " could not be read, so the objects it names are unknown");
+    if (cleanup.failed)
+      failStorage("the object store refused to remove " + std::to_string(cleanup.failed) + " of tenant " + tenant + "'s objects");
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
   co_return controlSuccess(out.str());
+}
+
+// The cleanups deferred below cluster/cleanup/ that are due: each one's keys removed when no remaining version
+// references them and they are older than the grace; what is left listed again (a new object), the old one removed.
+kj::Promise<std::string> controlSweepCleanup(ControlContext& context) {
+  auto listing = co_await context.storage.list(CLEANUP_PREFIX);
+  const auto now = realClockUnixMs();
+  std::vector<std::string> due;
+  for (const auto& object : listing.objects) {
+    const auto name = object.key.substr(std::string_view(CLEANUP_PREFIX).size());
+    if (name.size() < REVISION_DIGITS || !std::all_of(name.begin(), name.begin() + REVISION_DIGITS, [](unsigned char c) { return std::isdigit(c); }))
+      continue;
+    if (std::stoull(name.substr(0, REVISION_DIGITS)) <= now) due.push_back(object.key);
+  }
+  if (due.empty()) co_return std::string();
+  auto remaining = co_await definitionsOf(context.state, [](const std::string&) { return true; });
+  auto refs = referencesOf(remaining.versions, remaining.complete);
+  ObjectCleanup total;
+  for (const auto& key : due) {
+    auto response = co_await context.storage.get(key);
+    if (response.status == 404) continue;
+    requireStorage(response.status == 200, "object store read failed: HTTP " + std::to_string(response.status));
+    std::set<std::string> candidates;
+    try {
+      capnp::MallocMessageBuilder message;
+      auto json = message.initRoot<Json>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.bytes.data(), response.bytes.size()), json);
+      auto keys = field(json, "keys");
+      if (keys.isArray()) for (auto entry : keys.getArray()) {
+        if (!entry.isString()) continue;
+        std::string candidate = entry.getString().cStr();
+        if (candidate.starts_with("definitions/") || candidate.starts_with("packages/") || candidate.starts_with("bundles/") ||
+            candidate.starts_with("modules/")) candidates.insert(std::move(candidate));
+      }
+    } catch (const kj::Exception&) {}
+    ObjectCleanup cleanup;
+    co_await removeUnreferenced(context.storage, std::move(candidates), refs, context.cleanupGraceMs, cleanup);
+    co_await deferCleanup(context.storage, cleanup.deferredKeys, context.cleanupGraceMs);
+    if (!cleanup.failed) co_await context.storage.remove(key);
+    total.deleted += cleanup.deleted;
+    total.deferred += cleanup.deferred;
+    total.failed += cleanup.failed;
+  }
+  co_return "{\"due\":" + std::to_string(due.size()) + ",\"objects\":" + cleanupJson(total) + "}";
 }
 
 int runDeploymentTool(int argc, char** argv) {
@@ -1362,14 +1548,15 @@ int runDeploymentTool(int argc, char** argv) {
     KJ_REQUIRE(options.workers.empty(), "--worker is only for remove");
     // apply keeps the original whole-state contract: a conflict fails without retry.
     options.maxRetries = maxRetries.value_or(operation == "apply" ? 0 : 8);
-    state.load(true, false).wait(io.waitScope);
+    // Only init makes a bucket a cluster's: a write to one without the marker is refused, naming the bucket.
+    state.load(false, false).wait(io.waitScope);
     TrialContext trials{io.provider->getNetwork(), *headers, options.token};
     write(operation == "apply" ? Operation::APPLY : Operation::UPSERT, timer, state, &storage, options, trials,
         std::cout).wait(io.waitScope);
   } else if (operation == "remove") {
     KJ_REQUIRE(!options.workers.empty(), "remove requires --worker");
     options.maxRetries = maxRetries.value_or(8);
-    state.load(true, false).wait(io.waitScope);
+    state.load(false, false).wait(io.waitScope);
     TrialContext trials{io.provider->getNetwork(), *headers, options.token};
     write(Operation::REMOVE, timer, state, nullptr, options, trials, std::cout).wait(io.waitScope);
   } else if (operation == "show") {

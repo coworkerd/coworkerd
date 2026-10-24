@@ -5,7 +5,7 @@
 | Version | Supported |
 | --- | --- |
 | 0.4.x | Yes |
-| 0.3.x | Yes |
+| 0.3.x and earlier | No (0.4 does not upgrade a 0.3 cluster in place: build it anew) |
 
 ## Reporting a vulnerability
 
@@ -38,6 +38,7 @@ reproduce. We acknowledge reports and keep you informed until a fix is released.
   when `peerAuth.keyFile` names it (compose always does; without it peer connections are neither signed nor checked,
   and the node warns at startup); the calls inside a connection are not signed one by one, and it is plain TCP, so the
   signature does not detect tampering on the way. The control plane uses admin and tenant credentials, and it and the
-  operations tool reach the nodes' management endpoints with the management token, a Bearer header -- without a token
-  those endpoints are open, and the node only warns at startup; there is no mTLS yet, and the object store, the nodes
+  operations tool reach the nodes' management endpoints with the management token, a Bearer header -- a node refuses to
+  start without one unless its configuration says `management.allowWithoutToken: true` (development: those endpoints
+  are then open, and it warns at startup); there is no mTLS yet, and the object store, the nodes
   and `/v1` are reached over plain HTTP.

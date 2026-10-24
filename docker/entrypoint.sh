@@ -19,7 +19,8 @@
 #                  COWORKERD_PEER_ADDRESS         what other nodes dial, default <hostname>:8934
 #                  COWORKERD_LISTEN_ADDRESS       the ingress, default 0.0.0.0:8930
 #                  COWORKERD_PEER_LISTEN_ADDRESS  default 0.0.0.0:8934
-#                  COWORKERD_PROCESS_COUNT        workerd processes besides the quarantine one, default 1
+#                  COWORKERD_PROCESS_COUNT        ordinary workerd processes (a node has two quarantine processes besides
+#                                                 them), default 1
 #                  COWORKERD_STACK_DIR            default /var/lib/coworkerd
 #                The management token is COWORKERD_MANAGEMENT_TOKEN, else the one `secrets` generated
 #                ($COWORKERD_SECRETS_DIR/management-token); the Server reads it from its environment
@@ -30,13 +31,15 @@
 #                  init/        cluster-key.json (the peer key), secrets-key.json (the key that seals secrets' values in
 #                               the desired state), management-token, admin-credential (the API's administrator) -- the
 #                               originals; only init and secrets mount the whole volume
-#                  storage/     s3.json, the object store's identities: deploy (the control plane and the tool) reads,
-#                               writes and lists the whole bucket; each node's identity reads what a node reads (the
+#                  storage/     s3.json, the identity the object store reads at its start: deploy (the control plane
+#                               and the tool) reads, writes and lists the whole bucket; and hotload/<id>.weed, each
+#                               node's identity, which the store's container puts into the store's filer (weed shell
+#                               s3.configure) at each of its starts and whenever the file appears or changes, so that
+#                               any of them can be withdrawn without a restart: it reads what a node reads (the
 #                               cluster's marker, the tenant index and the manifests, definitions and code, the members)
 #                               and writes only its own prefixes members/<id>/ and nodes/<id>/ -- never another node's,
 #                               never cluster/, the code or the credentials index (SeaweedFS's prefix actions, bucket
-#                               COWORKERD_STORAGE_BUCKET, default coworkerd); hotload/<id>.weed for an identity added
-#                               to a running store (below)
+#                               COWORKERD_STORAGE_BUCKET, default coworkerd)
 #                  apiserver/   deploy.json (the deploy identity), secrets-key.json, management-token, admin-credential;
 #                               the tool service mounts it too
 #                  nodes/<id>/  server.json (the node's own identity), cluster-key.json, secrets-key.json, management-token;
@@ -48,10 +51,13 @@
 #                `secrets rotate-cluster-key add|promote|retire`: the three steps of a peer key rotation (a new key
 #                accepted second; then signing; then the old one gone), each distributed at once (the nodes re-read
 #                the key within a second). `secrets add-node ID`: a node joining a running cluster -- its directory
-#                nodes/ID/ with an identity of its own, s3.json with it, and storage/hotload/ID.weed, which the object
-#                store's container applies within seconds (weed shell s3.configure, kept in the store's filer: no
-#                restart of the store); then start the node with that directory. The same happens for an id
-#                COWORKERD_NODE_IDS gains while the store runs.
+#                nodes/ID/ with an identity of its own and storage/hotload/ID.weed, which the object store's container
+#                applies within seconds (no restart of the store); then start the node with that directory. The same
+#                happens for an id COWORKERD_NODE_IDS gains while the store runs. `secrets remove-node ID`: a node
+#                leaving for good -- its identity withdrawn: storage/hotload/ID.remove.weed, which the store's container
+#                applies within seconds (s3.configure -delete: out of the filer, which holds every node's identity),
+#                its hotload file and its directory nodes/ID/ removed. An id that COWORKERD_NODE_IDS still names gets
+#                a new identity at the cluster's next start.
 #   init         At every start of the cluster: the bucket and a self-check -- written by the deploy identity, read
 #                back by a node's identity (the first node's), unsigned requests refused, the contract the membership
 #                needs (create-if-absent, a listing's Date and LastModified, the clock) and that node identity's prefix
@@ -87,6 +93,8 @@ check() {
   [[ $value =~ $pattern ]] || fail "$name is not valid: '$value'"
 }
 NAME='^[A-Za-z0-9._-]+$'
+# A node id names its object keys (members/<id>/, nodes/<id>/): a NAME that is not . or ..
+node_id() { [[ $1 =~ $NAME && $1 != . && $1 != .. ]]; }
 ADDRESS='^[A-Za-z0-9._-]+:[0-9]+$'
 ENDPOINT='^http://[A-Za-z0-9._-]+(:[0-9]+)?$'
 PATHNAME='^/[A-Za-z0-9._/-]+$'
@@ -126,6 +134,7 @@ node() {
     local listen=${COWORKERD_LISTEN_ADDRESS:-0.0.0.0:8930} peerListen=${COWORKERD_PEER_LISTEN_ADDRESS:-0.0.0.0:8934}
     local bucket=${COWORKERD_STORAGE_BUCKET:-coworkerd} region=${COWORKERD_STORAGE_REGION:-us-east-1}
     check COWORKERD_NODE_ID "$id" "$NAME"
+    node_id "$id" || fail "COWORKERD_NODE_ID is not valid: '$id' (. and .. name no object key)"
     check COWORKERD_STORAGE_ENDPOINT "$storage" "$ENDPOINT"
     check COWORKERD_STORAGE_BUCKET "$bucket" "$NAME"
     check COWORKERD_STORAGE_REGION "$region" "$NAME"
@@ -224,6 +233,8 @@ secrets() {
   }
   local nodes=${COWORKERD_NODE_IDS:-node-1,node-2,node-3} bucket=${COWORKERD_STORAGE_BUCKET:-coworkerd}
   [[ $nodes =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || fail "COWORKERD_NODE_IDS is not valid: '$nodes'"
+  local one
+  for one in ${nodes//,/ }; do node_id "$one" || fail "COWORKERD_NODE_IDS is not valid: '$one' (. and .. name no object key)"; done
   check COWORKERD_STORAGE_BUCKET "$bucket" "$NAME"
   mkdir -p "$SECRETS/init" "$SECRETS/storage" "$SECRETS/apiserver" "$SECRETS/nodes"
   case ${1:-} in
@@ -248,10 +259,27 @@ secrets() {
       printf '[secrets] {"event":"cluster-key","step":"%s"}\n' "$2" ;;
     add-node)
       # A node joining the running cluster: its id with the others, then the same steps as at a start.
-      [[ ${2:-} =~ $NAME ]] || fail "secrets add-node takes a node id ([A-Za-z0-9._-]+)"
+      node_id "${2:-}" || fail "secrets add-node takes a node id ([A-Za-z0-9._-]+, not . or ..)"
       [[ -s $SECRETS/storage/s3.json ]] || fail "no cluster in $SECRETS yet: start it first (the secrets step runs at every start)"
+      rm -f "$SECRETS/storage/hotload/$2.remove.weed"
       nodes="$nodes,$2" ;;
-    *) fail "secrets takes no argument, rotate-cluster-key add|promote|retire, or add-node ID" ;;
+    remove-node)
+      # A node leaving for good: its directory and hotload file go, and the store's container takes its identity out of
+      # the filer (hotload/ID.remove.weed: s3.configure -delete).
+      node_id "${2:-}" || fail "secrets remove-node takes a node id ([A-Za-z0-9._-]+, not . or ..)"
+      [[ -d $SECRETS/nodes/$2 ]] || fail "no node $2 in $SECRETS/nodes"
+      rm -rf "${SECRETS:?}/nodes/$2"
+      rm -f "$SECRETS/storage/hotload/$2.weed"
+      mkdir -p "$SECRETS/storage/hotload"
+      printf 's3.configure -user=node-%s -delete -apply\n' "$2" >"$SECRETS/storage/hotload/$2.remove.weed.next"
+      mv "$SECRETS/storage/hotload/$2.remove.weed.next" "$SECRETS/storage/hotload/$2.remove.weed"
+      local listed=false kept=""
+      for one in ${nodes//,/ }; do
+        if [[ $one == "$2" ]]; then listed=true; else kept+="${kept:+,}$one"; fi
+      done
+      nodes=$kept
+      printf '[secrets] {"event":"node-removed","node":"%s","file":"storage/hotload/%s.remove.weed","inNodeIds":%s}\n' "$2" "$2" "$listed" ;;
+    *) fail "secrets takes no argument, rotate-cluster-key add|promote|retire, add-node ID or remove-node ID" ;;
   esac
   # The object store's identities. deploy writes everything; each node's identity has SeaweedFS's prefix actions
   # (Action:bucket/prefix*, the prefix ending in '/' so that node-1's never covers node-10's): it reads what a node reads --
@@ -270,8 +298,7 @@ secrets() {
     done
     printf '%s' "${out%,}"
   }
-  local id fresh=false added=()
-  [[ -s $SECRETS/storage/s3.json ]] || fresh=true
+  local id
   if [[ ! -s $SECRETS/apiserver/deploy.json ]]; then
     printf '{"accessKey":"%s","secretKey":"%s"}\n' "$(random 12)" "$(random 24)" >"$SECRETS/apiserver/deploy.json.next"
     mv "$SECRETS/apiserver/deploy.json.next" "$SECRETS/apiserver/deploy.json"
@@ -283,56 +310,58 @@ secrets() {
       printf '{"accessKey":"%s","secretKey":"%s"}\n' "$(random 12)" "$(random 24)" >"$SECRETS/nodes/$id/server.json.next"
       mv "$SECRETS/nodes/$id/server.json.next" "$SECRETS/nodes/$id/server.json"
       printf '[secrets] {"event":"storage-identity","identity":"node-%s","generated":true}\n' "$id"
-      added+=("$id")
     fi
   done
-  # SeaweedFS's file of the identities: deploy, then every node that has one (sorted), rewritten when it changes.
-  local identities directory
-  identities=$(printf '{"name":"deploy","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List"]}' \
-    "$(credential "$SECRETS/apiserver/deploy.json" accessKey)" "$(credential "$SECRETS/apiserver/deploy.json" secretKey)")
-  for directory in "$SECRETS"/nodes/*/; do
-    id=${directory%/}; id=${id##*/}
-    [[ -s $SECRETS/nodes/$id/server.json ]] || continue
-    identities+=$(printf ',{"name":"node-%s","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":[%s]}' "$id" \
-      "$(credential "$SECRETS/nodes/$id/server.json" accessKey)" "$(credential "$SECRETS/nodes/$id/server.json" secretKey)" \
-      "$(node_actions "$id")")
-  done
-  printf '{"identities":[%s]}\n' "$identities" >"$SECRETS/storage/s3.json.candidate"
+  # The file of identities SeaweedFS reads at its start: deploy alone, rewritten when it changes (one from before, which
+  # also held the nodes', is replaced). An identity read from it stays in force until the store's next start, so the
+  # nodes' are not there: each is hotload/<id>.weed, which the store's container applies with weed shell's s3.configure
+  # at each of its starts and whenever the file appears or changes -- kept in the store's filer, in force at once, and
+  # withdrawn the same way (remove-node).
+  local directory candidate
+  printf '{"identities":[{"name":"deploy","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List"]}]}\n' \
+    "$(credential "$SECRETS/apiserver/deploy.json" accessKey)" "$(credential "$SECRETS/apiserver/deploy.json" secretKey)" \
+    >"$SECRETS/storage/s3.json.candidate"
   if [[ -s $SECRETS/storage/s3.json ]] && cmp -s "$SECRETS/storage/s3.json.candidate" "$SECRETS/storage/s3.json"; then
     rm -f "$SECRETS/storage/s3.json.candidate"
   else
     mv "$SECRETS/storage/s3.json.candidate" "$SECRETS/storage/s3.json"
-    printf '[secrets] {"event":"storage-identities","written":true,"nodes":%d}\n' "$(ls -d "$SECRETS"/nodes/*/ 2>/dev/null | wc -l)"
+    printf '[secrets] {"event":"storage-identities","written":true}\n'
   fi
-  # A running store read s3.json at its start: an identity added since reaches it through hotload/<id>.weed, which its
-  # container applies with weed shell's s3.configure (kept in the store's filer, in force at once; s3.json has it too,
-  # for the store's next start).
-  if ! $fresh && (( ${#added[@]} )); then
-    mkdir -p "$SECRETS/storage/hotload"
-    for id in "${added[@]}"; do
-      printf 's3.configure -user=node-%s -access_key=%s -secret_key=%s -actions=%s -apply\n' "$id" \
-        "$(credential "$SECRETS/nodes/$id/server.json" accessKey)" "$(credential "$SECRETS/nodes/$id/server.json" secretKey)" \
-        "$(node_actions "$id" | tr -d '"')" >"$SECRETS/storage/hotload/$id.weed.next"
-      mv "$SECRETS/storage/hotload/$id.weed.next" "$SECRETS/storage/hotload/$id.weed"
-      printf '[secrets] {"event":"storage-identity-hotload","identity":"node-%s","file":"storage/hotload/%s.weed"}\n' "$id" "$id"
-    done
-  fi
+  mkdir -p "$SECRETS/storage/hotload"
+  for directory in "$SECRETS"/nodes/*/; do
+    id=${directory%/}; id=${id##*/}
+    [[ -s $SECRETS/nodes/$id/server.json ]] || continue
+    rm -f "$SECRETS/storage/hotload/$id.remove.weed"
+    candidate=$(printf 's3.configure -user=node-%s -access_key=%s -secret_key=%s -actions=%s -apply' "$id" \
+      "$(credential "$SECRETS/nodes/$id/server.json" accessKey)" "$(credential "$SECRETS/nodes/$id/server.json" secretKey)" \
+      "$(node_actions "$id" | tr -d '"')")
+    [[ -s $SECRETS/storage/hotload/$id.weed && $(cat "$SECRETS/storage/hotload/$id.weed") == "$candidate" ]] && continue
+    printf '%s\n' "$candidate" >"$SECRETS/storage/hotload/$id.weed.next"
+    mv "$SECRETS/storage/hotload/$id.weed.next" "$SECRETS/storage/hotload/$id.weed"
+    printf '[secrets] {"event":"storage-identity-hotload","identity":"node-%s","file":"storage/hotload/%s.weed"}\n' "$id" "$id"
+  done
   # SeaweedFS's S3 gateway also serves a gRPC configuration interface of its own beside S3, on the same addresses and
   # without credentials. security.toml (read by the storage container) makes it require a client certificate of a
-  # certificate authority whose key is not kept, so that nobody can use it; the master, volume and filer servers listen
-  # on the storage container's loopback only (docker-compose.yml).
-  if [[ ! -s $SECRETS/storage/security.toml ]]; then
+  # certificate authority that signs nothing -- its key is dropped at once, no client certificate exists -- while the
+  # gateway's own certificate comes from another authority whose key is dropped too: the gateway's key pair in this
+  # directory is no client certificate the interface accepts, so that nobody can use it. The master, volume and filer
+  # servers listen on the storage container's loopback only (docker-compose.yml). A security.toml from before (one
+  # authority for both) is replaced.
+  if [[ ! -s $SECRETS/storage/security.toml || ! -s $SECRETS/storage/grpc-client-ca.crt ]]; then
     local tls
     tls=$(mktemp -d)
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 36500 -subj /CN=coworkerd-storage-grpc-clients \
+      -keyout "$tls/client-ca.key" -out "$SECRETS/storage/grpc-client-ca.crt" 2>/dev/null
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 36500 -subj /CN=coworkerd-storage-grpc \
-      -keyout "$tls/ca.key" -out "$SECRETS/storage/grpc-ca.crt" 2>/dev/null
+      -keyout "$tls/ca.key" -out "$tls/ca.crt" 2>/dev/null
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=localhost \
       -keyout "$SECRETS/storage/grpc-s3.key" -out "$tls/s3.csr" 2>/dev/null
-    openssl x509 -req -in "$tls/s3.csr" -CA "$SECRETS/storage/grpc-ca.crt" -CAkey "$tls/ca.key" -set_serial 1 -days 36500 \
+    openssl x509 -req -in "$tls/s3.csr" -CA "$tls/ca.crt" -CAkey "$tls/ca.key" -set_serial 1 -days 36500 \
       -out "$SECRETS/storage/grpc-s3.crt" 2>/dev/null
     rm -rf "$tls"
+    rm -f "$SECRETS/storage/grpc-ca.crt"
     chmod 0600 "$SECRETS/storage/grpc-s3.key"
-    printf '[grpc]\nca = "/config/grpc-ca.crt"\n\n[grpc.s3]\ncert = "/config/grpc-s3.crt"\nkey = "/config/grpc-s3.key"\n' \
+    printf '[grpc]\nca = "/config/grpc-client-ca.crt"\n\n[grpc.s3]\ncert = "/config/grpc-s3.crt"\nkey = "/config/grpc-s3.key"\n' \
       >"$SECRETS/storage/security.toml.next"
     mv "$SECRETS/storage/security.toml.next" "$SECRETS/storage/security.toml"
     printf '[secrets] {"event":"storage-grpc","written":true}\n'

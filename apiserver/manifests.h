@@ -4,8 +4,12 @@
 // writing it: an in-memory mirror of the tenant index, every tenant's manifest the index names and the credentials
 // index, read in full at startup and kept current by reading the two indexes' hints every pollIntervalMs (and every
 // aggregate again after another writer created its next revision first). Every change is one aggregate's next revision
-// computed from the mirror, created only if absent: created is committed; a revision another writer created first
-// sends the change back to read and compute again. The operations tool (deployment-tool.c++) uses the same class once.
+// computed from the mirror, created only if absent; a revision another writer created first sends the change back to
+// read and compute again. A change is complete -- answered as done -- once it is visible: its revision created, the
+// aggregate's hint naming it and, for a tenant, the tenant index naming it. A failure after the create is a failure of
+// the change (the store's: 503); the created revision stays (harmless) and is brought into the hint and the index by the
+// next write, by the poll's repair or by the next start's. The operations tool (deployment-tool.c++) uses the same class
+// once, without the repair.
 #include "deployment.h"
 #include "object-state.h"
 #include "object-store.h"
@@ -30,11 +34,13 @@ public:
   // operation's record).
   ManifestStore(ObjectStore& store, kj::Timer& timer, std::optional<SecretsKey> key = std::nullopt, std::ostream& log = std::cout);
 
-  // The cluster's marker first: a store without it is not a cluster's (`create`: the operations tool creates it
-  // where it is missing -- its writes make the bucket one; the control plane refuses to start without it). Then the
-  // index, every manifest it names and (with `credentials`) the credentials index.
-  kj::Promise<void> load(bool create, bool credentials);
-  // The indexes' hints read again and what changed read: the control plane's poll.
+  // The cluster's marker first: a store without it is not a cluster's (`create`: `tool init` creates it where it is
+  // missing; everything else refuses a bucket without it and names the bucket). Then the index, every manifest it names
+  // and (with `credentials`) the credentials index. With `repair` (the control plane), what a writer left half done is
+  // completed (repair()).
+  kj::Promise<void> load(bool create, bool credentials, bool repair = false);
+  // The indexes' hints read again (and the revision after each, which a writer that stopped before its hint left) and
+  // what changed read, then repair(): the control plane's poll.
   kj::Promise<void> refresh();
   // The current revision of one tenant's manifest read from the store into the mirror (hint, then later revisions).
   kj::Promise<void> reloadTenant(std::string tenant);
@@ -52,30 +58,46 @@ public:
   std::string markerBytes() const { return clusterFormatBytes(newWriter(instance)); }
 
   // One tenant's next manifest. `change` edits a copy of the current one (revision 0, no record and no Workers when the
-  // tenant has none) or throws its refusal; when nothing changed nothing is written. The result is created as the next
-  // revision only if absent; when another writer created that revision first, the tenant is read again and `change`
-  // runs again -- `maxAttempts` times in all, jittered pauses of 5 to 160 ms between -- then the tenant's hint and the
-  // index. `deployment`: what the nodes serve changes (the generation counts it).
+  // tenant has none) or throws its refusal; when nothing changed nothing is written -- the change is then already in the
+  // latest manifest (a request tried again), and it completes the same way: the index is brought up to it. The result is
+  // created as the next revision only if absent; when another writer created that revision first, the tenant is read
+  // again and `change` runs again -- `maxAttempts` times in all, jittered pauses of 5 to 160 ms between -- then the
+  // tenant's hint and the index (a failure of either: the store's, thrown). An index that keeps another tenant's
+  // hostname refuses the revision (409 CONFLICT): the tenant goes back to the revision the index names (a creation's
+  // objects are removed). `deployment`: what the nodes serve changes (the generation counts it).
   struct Written {
     TenantManifest manifest;
     bool changed = false;
     uint32_t attempts = 0;
     std::vector<uint64_t> conflictWaitsMs;  // per attempt that met another writer's revision: how long its create took
     uint64_t indexRevision = 0;
-    bool indexed = true;  // false: the index could not be written (retried by the next poll)
+    bool indexed = true;  // the index names the manifest (or, for a tenant past its deletion's index step, leaves it out)
     uint64_t submittedAtUnixMs = 0, committedAtUnixMs = 0;
   };
   kj::Promise<Written> writeTenant(std::string tenant, std::function<kj::Promise<void>(TenantManifest&)> change, bool deployment,
       uint32_t maxAttempts = 8);
-  // The end of a tenant's deletion: the tenant out of the index, then its objects (tenants/<t>/) removed. Returns how
-  // many objects were removed; a removal that fails is counted in `failed`.
+  // The end of a tenant's deletion: the tenant out of the index (only while its manifest says deleting: a tenant created
+  // again under the name meanwhile stays), then its objects (tenants/<t>/) removed. Returns how many objects were removed;
+  // a removal that fails is counted in `failed` (the deletion answers DELETION_INCOMPLETE and resumes when run again;
+  // the name is not kept from the index meanwhile).
   struct Forgotten { uint64_t indexRevision = 0, removed = 0, failed = 0; };
   kj::Promise<Forgotten> forgetTenant(std::string tenant);
-  // The credentials index's next revision (the same protocol).
+  // The credentials index's next revision (the same protocol; `change` may read, for example a tenant's record from the
+  // store, and runs within the credentials index's turn). `always`: a revision even when nothing changed -- a tenant's
+  // deletion writes one, so that a credential another writer created from an index read before it meets that revision,
+  // and is judged again.
   struct WrittenCredentials { CredentialIndex index; bool changed = false; uint32_t attempts = 0; };
-  kj::Promise<WrittenCredentials> writeCredentials(std::function<void(CredentialIndex&)> change, uint32_t maxAttempts = 8);
-  // The index written for what this process wrote and has not indexed yet (the poll retries a failed one).
+  kj::Promise<WrittenCredentials> writeCredentials(std::function<kj::Promise<void>(CredentialIndex&)> change, uint32_t maxAttempts = 8,
+      bool always = false);
+  // The index written for what this process wrote and has not indexed yet, and its hint (a failure: the store's,
+  // thrown; the poll retries).
   kj::Promise<uint64_t> syncIndex();
+
+  // What a writer left half done, completed: the two indexes' hints that lag their latest revision; and, from one
+  // listing of tenants/, every tenant whose hint lags its latest manifest (rewritten) and every manifest newer than the
+  // index names (indexed: a revision whose index write failed or whose writer stopped before it). Each tenant's hint is
+  // read once per change of its ETag.
+  kj::Promise<void> repair();
 
   // Version definitions by hash (definitions/<hash>, immutable): fetched once, kept only when they verify against their
   // hash; `failures` names the ones that did not.
@@ -97,6 +119,10 @@ public:
         credentialConflicts = 0, polls = 0, pollFailures = 0, definitionFetches = 0;
     uint64_t lastPollAtUnixMs = 0;
     std::string lastPollError;
+    // repair(): passes, listings' tenants, hints rewritten (tenants' and the indexes'), manifests indexed late,
+    // revisions an index refused for a hostname another tenant holds, and writes that went back to the indexed revision.
+    uint64_t repairs = 0, repairedHints = 0, repairedIndexHints = 0, repairedManifests = 0, hostnameRefusals = 0,
+        reverted = 0;
   };
   const Counters& counters() const { return stats; }
   std::string json() const;
@@ -113,14 +139,24 @@ private:
   TenantIndex tenantIndex;
   CredentialIndex credentialIndex;
   std::map<std::string, TenantManifest> manifests;
-  // Tenants whose manifest this process wrote and the index does not name yet, and tenants it is removing.
+  // Tenants whose manifest this process holds and the index does not name yet, and tenants it is removing.
   std::set<std::string> unindexed, removing;
+  // Hints this process failed to write: tenants', and the two indexes'. The next write or poll writes them.
+  std::set<std::string> hintPending;
+  bool tenantIndexHintPending = false, credentialsHintPending = false;
+  // repair(): each tenant's hint as last read (its ETag and the revision it named), and the latest revision a listing
+  // showed for a tenant that the index does not name (read once per revision).
+  std::map<std::string, std::pair<std::string, uint64_t>> knownHints;
+  std::map<std::string, uint64_t> examined;
+  // Revisions the index refused (a hostname another tenant's entry holds): tenant -> revision and the reason.
+  std::map<std::string, std::pair<uint64_t, std::string>> indexRefusals;
   DefinitionBytes definitionBytes;
   std::map<std::string, std::shared_ptr<const VersionDefinition>> parsedDefinitions;
   std::map<std::string, std::string> failedDefinitions;
   Counters stats;
   // One writer at a time per aggregate in this process ("index", "credentials", "tenant:<t>"): writers of one process
-  // never take each other's revision; other processes' writers meet as created-first revisions.
+  // never take each other's revision; other processes' writers meet as created-first revisions. A writer of a tenant
+  // takes the index's turn after the tenant's, never the other way round.
   std::map<std::string, kj::ForkedPromise<void>> turns;
   struct Turn;
   kj::Promise<kj::Own<Turn>> turn(const std::string& aggregate);
@@ -128,6 +164,18 @@ private:
   void adoptManifest(TenantManifest manifest);
   kj::Promise<void> readManifest(std::string tenant, uint64_t revision);
   kj::Promise<void> adoptIndex(TenantIndex index);
+  // A hint written (pending until it is), the old revisions pruned (a failure only logged).
+  kj::Promise<void> writeTenantHint(const std::string& tenant, uint64_t revision);
+  kj::Promise<void> writeIndexHint(const char* prefix, uint64_t revision, bool& pending);
+  // The latest revision of an index sequence when it is ahead of what the mirror holds or of its hint: adopted, and
+  // the hint rewritten.
+  kj::Promise<void> repairIndex();
+  kj::Promise<void> repairCredentials();
+  // A tenant's revision made visible (its hint, the index), and the index's verdict on it.
+  kj::Promise<void> complete(const std::string& tenant, const TenantManifest& base, Written& result);
+  // A tenant's write the index refused: the record back to `base`'s (the manifest before the write), or a creation's
+  // objects removed.
+  kj::Promise<void> revert(const std::string& tenant, const TenantManifest& base);
 };
 
 }  // namespace coworkerd

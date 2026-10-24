@@ -47,32 +47,42 @@ void TenantUsage::egress(const std::string& tenant, uint64_t bytes) {
 kj::Promise<void> TenantUsage::start() {
   lastSample = mono();
   if (!store) co_return;
-  // This hour's object, as the previous process of this node left it: the counts go on from there.
-  const auto hour = usageHour(wallTimeMsForTest());
+  // This hour's object, as the previous process of this node left it: the counts go on from there. Usage is no reason not
+  // to serve: a read that fails is tried again before the hour's first write (flush()).
+  seedPending = usageHour(wallTimeMsForTest());
   try {
-    auto response = co_await store->get(nodeUsageKey(nodeId, hour));
-    if (response.status == 200) {
-      try {
-        auto stored = decodeNodeUsageHour(response.bytes);
-        if (stored.nodeId == nodeId && stored.hour == hour) {
-          for (const auto& [tenant, counts] : stored.tenants) {
-            hours[hour][tenant].counts.add(counts);
-            ++seededTenants;
-          }
-          seededHour = hour;
-        }
-      } catch (const kj::Exception& error) {
-        lastError = std::string("this hour's usage object does not read: ") + error.getDescription().cStr();
-      }
-    } else {
-      KJ_REQUIRE(response.status == 404, "object store read failed", response.status);
-    }
+    co_await seed();
     co_await prune();
   } catch (const kj::Exception& error) {
-    // Usage is no reason not to serve: counted from zero, written when the store answers.
     lastError = error.getDescription().cStr();
   }
 }
+
+// The pending hour's object read back and added to what this process counted since: the stored counts and its own.
+kj::Promise<void> TenantUsage::seed() {
+  if (seedPending.empty()) co_return;
+  const auto hour = seedPending;
+  auto response = co_await store->get(nodeUsageKey(nodeId, hour));
+  requireStorage(response.status == 200 || response.status == 404, "object store read failed: HTTP " + std::to_string(response.status));
+  if (response.status == 200) {
+    try {
+      auto stored = decodeNodeUsageHour(response.bytes);
+      if (stored.nodeId == nodeId && stored.hour == hour) {
+        for (const auto& [tenant, counts] : stored.tenants) {
+          hours[hour][tenant].counts.add(counts);
+          ++seededTenants;
+        }
+        seededHour = hour;
+      }
+    } catch (const kj::Exception& error) {
+      // Not a usage object: nothing to go on from (the next write replaces it).
+      lastError = std::string("this hour's usage object does not read: ") + error.getDescription().cStr();
+    }
+  }
+  seedPending.clear();
+}
+
+void TenantUsage::stop(std::string reason) { stoppedReason = std::move(reason); }
 
 kj::Promise<void> TenantUsage::sample() {
   const auto at = mono();
@@ -117,12 +127,19 @@ kj::Promise<void> TenantUsage::sample() {
 }
 
 kj::Promise<void> TenantUsage::flush() {
-  if (!store) co_return;
+  if (!store || !stoppedReason.empty()) co_return;
   const auto at = wallTimeMsForTest();
   const auto current = usageHour(at), previous = usageHour(at > 3600000 ? at - 3600000 : 0);
+  // The start's read of its hour, tried again: until it succeeds, that hour is not written (its object is never replaced
+  // by counts from zero).
+  if (!seedPending.empty()) {
+    ++seedRetries;
+    try { co_await seed(); } catch (const kj::Exception& error) { lastError = error.getDescription().cStr(); }
+  }
   try {
     // Each hour with a change: its object again, every tenant of the hour in it.
     for (auto& [hour, tenants] : hours) {
+      if (hour == seedPending) continue;
       if (std::none_of(tenants.begin(), tenants.end(), [](const auto& entry) { return entry.second.dirty; })) continue;
       NodeUsageHour object{nodeId, hour, at, {}};
       for (const auto& [tenant, entry] : tenants) object.tenants[tenant] = entry.counts;
@@ -151,7 +168,7 @@ kj::Promise<void> TenantUsage::flush() {
 
 // Once an hour: this node's objects of the hours before retentionHours ago, found by listing its own prefix.
 kj::Promise<void> TenantUsage::prune() {
-  if (!store || !settings.retentionHours) co_return;
+  if (!store || !settings.retentionHours || !stoppedReason.empty()) co_return;
   const auto at = wallTimeMsForTest(), keep = uint64_t(settings.retentionHours) * 3600000;
   lastPruneHour = usageHour(at);
   if (at <= keep) co_return;
@@ -168,6 +185,9 @@ kj::Promise<void> TenantUsage::prune() {
 }
 
 kj::Promise<std::string> TenantUsage::flushNow() {
+  if (!stoppedReason.empty())
+    co_return "{\"backend\":\"" + std::string(store ? "objectStore" : "none") + "\",\"objectsWritten\":0,\"rowsWritten\":0,"
+        "\"stopped\":" + quote(stoppedReason) + "}";
   const auto objectsBefore = objectsWritten, rowsBefore = rowsWritten, failuresBefore = flushFailures;
   std::string failure;
   try {
@@ -205,6 +225,7 @@ std::string TenantUsage::json() const {
       << ",\"flushes\":" << flushes << ",\"flushFailures\":" << flushFailures << ",\"objectsWritten\":" << objectsWritten
       << ",\"rowsWritten\":" << rowsWritten << ",\"seededHour\":" << quote(seededHour) << ",\"seededRows\":" << seededTenants
       << ",\"prunes\":" << prunes << ",\"prunedObjects\":" << prunedObjects << ",\"prunedThrough\":" << quote(prunedThrough)
+      << ",\"seedPending\":" << quote(seedPending) << ",\"seedRetries\":" << seedRetries << ",\"stopped\":" << quote(stoppedReason)
       << ",\"lastFlushAtUnixMs\":" << lastFlushAtUnixMs << ",\"lastError\":" << quote(lastError) << ",\"hours\":{";
   size_t h = 0;
   for (const auto& [hour, tenants] : hours) {

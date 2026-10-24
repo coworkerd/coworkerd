@@ -1329,6 +1329,22 @@ void DefinitionIndex::remember(std::shared_ptr<const VersionDefinition> version)
   hashes.emplace(version->definitionHash, std::move(version));
 }
 
+size_t DefinitionIndex::retain(const std::map<std::string, std::string>& named) {
+  size_t forgotten = 0;
+  for (auto entry = labels.begin(); entry != labels.end();) {
+    auto found = named.find(entry->first);
+    if (found != named.end()) std::erase_if(entry->second, [&](const std::string& hash) { return hash != found->second; });
+    if (found == named.end() || entry->second.empty()) {
+      entry = labels.erase(entry);
+      ++forgotten;
+    } else {
+      ++entry;
+    }
+  }
+  for (const auto& [label, hash] : named) if (hashes.contains(hash)) labels[label] = {hash};
+  return forgotten;
+}
+
 std::shared_ptr<const VersionDefinition> DefinitionIndex::find(const VersionPin& value, std::string& reason) const {
   auto found = hashes.find(value.definitionHash);
   if (found != hashes.end()) {
@@ -1346,15 +1362,16 @@ std::shared_ptr<const VersionDefinition> DefinitionIndex::byHash(const std::stri
 }
 
 std::shared_ptr<const VersionDefinition> DefinitionIndex::exact(const std::string& label, const std::string& hash) const {
+  if (!hash.empty()) {
+    auto found = hashes.find(hash);
+    KJ_REQUIRE(found != hashes.end() && found->second->key() == label, "unknown Worker Version definition", label.c_str());
+    return found->second;
+  }
   auto known = labels.find(label);
   KJ_REQUIRE(known != labels.end(), "unknown Worker Version", label.c_str());
-  if (hash.empty()) {
-    KJ_REQUIRE(known->second.size() == 1, "Worker Version label names several definitions; a definition hash is required",
-        label.c_str());
-    return hashes.at(*known->second.begin());
-  }
-  KJ_REQUIRE(known->second.contains(hash), "unknown Worker Version definition", label.c_str());
-  return hashes.at(hash);
+  KJ_REQUIRE(known->second.size() == 1, "Worker Version label names several definitions; a definition hash is required",
+      label.c_str());
+  return hashes.at(*known->second.begin());
 }
 
 }  // namespace coworkerd

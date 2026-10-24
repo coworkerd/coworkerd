@@ -108,7 +108,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.serverId = root.getNodeId().cStr();
   result.serverIdGiven = !result.serverId.empty();
   if (result.serverId.empty()) result.serverId = "local";
-  KJ_REQUIRE(safeName(result.serverId), "invalid nodeId");
+  KJ_REQUIRE(nodeIdName(result.serverId),
+      "invalid nodeId: letters, digits, '-', '_' and '.', at most 255, not . or .. (it names the node's object keys)");
   result.peerListenAddress = root.getPeerListenAddress().cStr();
   result.initialPlacementHops = root.getInitialPlacementHops();
   result.ingressPlacement = root.getIngressPlacement();
@@ -311,6 +312,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     result.managementToken = root.getManagement().getToken().cStr();
     checkToken(result.managementToken, "management.token");
   }
+  result.managementAllowWithoutToken = root.getManagement().getAllowWithoutToken();
   auto control = root.getControl();
   result.controlListenAddress = control.getListenAddress().cStr();
   result.controlTemporaryDirectory = control.getTemporaryDirectory().cStr();
@@ -319,6 +321,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.controlPathRouting = control.getPathRouting();
   result.controlPollIntervalMs = control.getPollIntervalMs();
   KJ_REQUIRE(result.controlPollIntervalMs >= 100 && result.controlPollIntervalMs <= 3600000, "control.pollIntervalMs must be 100 to 3600000");
+  result.controlCleanupGraceMs = control.getCleanupGraceMs();
+  KJ_REQUIRE(result.controlCleanupGraceMs <= 7 * 86400000ull, "control.cleanupGraceMs must be at most 604800000 (a week)");
   if (given({"control", "adminCredential"})) {
     result.controlAdminCredential = control.getAdminCredential().cStr();
     checkToken(result.controlAdminCredential, "control.adminCredential");

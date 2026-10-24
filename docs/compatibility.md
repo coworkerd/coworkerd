@@ -20,7 +20,7 @@ Anything a project configures outside the line is refused at conversion and list
 2. **Build with wrangler.** It runs `wrangler deploy --dry-run --outdir` -- the project's own wrangler when one is installed in the project or above it, otherwise the version `cowctl` pins -- and reads the configuration through wrangler's own interface, so TOML, JSON and the configuration a build tool such as the Vite plugin redirects to are read as wrangler reads them. With the pinned wrangler the build runs in a temporary copy of the project, so the output does not depend on where `cowctl` is installed.
 3. **Check the asset directory's rule files**, `_redirects` and `_headers`, which the build may produce, after building.
 4. **Make a package**: the modules wrangler produced, each with its type, hash and size, and the static assets, in a canonical manifest whose SHA-256 is the package hash. Configuration -- the main module, compatibility date and flags, variables, Bindings, the secret names the version reads, the assets settings -- goes into the version definition, not into the package, so the same code can be deployed with another configuration without storing it again: every deployment sends its whole package, and the control plane stores only the objects the store does not have yet.
-5. **Upload** the package to the control plane as a new version, which validates it, trial-loads it in a node's quarantine process (an ordinary one when the node has none) when it has code, and only then makes it exist ([control plane API](control-plane-api.md), section 6).
+5. **Upload** the package to the control plane as a new version, which validates it, trial-loads it in a node's quarantine process (an ordinary one when the node has none) when it has code, and only then makes it exist and active ([control plane API](control-plane-api.md), section 6); `cowctl deploy --no-activate` uploads without activating, and the trial load comes with the activation.
 
 ## 3. How tenant code runs
 
@@ -64,7 +64,7 @@ The node serves them itself, without workerd or placement -- and, for a request 
 
 | Item | Coworkerd | Why |
 | --- | --- | --- |
-| `request.cf` | Coworkerd's call metadata: `nodeId`, `workerId` as `tenant/Worker`, `versionId`, `invocationId` and others, 13 fields; `serverId`, the field's earlier name, still carries the same value as `nodeId`; no geography or TLS data | There is no source for that data inside a cluster |
+| `request.cf` | Coworkerd's call metadata: `nodeId`, `workerId` as `tenant/Worker`, `versionId`, `invocationId` and others, 13 fields; `serverId`, the field's earlier name, is a deprecated alias of `nodeId` (the same value), removed in 1.0; no geography or TLS data | There is no source for that data inside a cluster |
 | `request.url` | Always `http://`, with the host and without its port; the client's headers pass unchanged, and the node adds no client address of its own | The node's ingress rebuilds the request |
 | Inbound WebSocket | Not supported: a Worker that answers with a WebSocket fails the request | The ingress relays HTTP only |
 | `ctx.props` | The platform's (`{bindings, entrypoint}`); tenants cannot pass props through a Binding | Bindings carry the call tree's identity and budget |

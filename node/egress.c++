@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -39,6 +40,11 @@ constexpr const char* ERROR_HEADER = "x-coworkerd-egress-error";
 constexpr size_t MAX_HOST_BYTES = 253;
 constexpr size_t PUMP_BUFFER_BYTES = 65536;
 constexpr size_t DNS_CACHE_ENTRIES = 4096;
+// A cluster name's resolution in a refresh (the names are resolved together, each within this), and the getaddrinfo
+// threads at most at once (a lookup beyond them waits for one to end, within its caller's deadline; a thread a deadline
+// abandoned counts until it ends).
+constexpr uint32_t CLUSTER_NAME_RESOLUTION_MS = 2000;
+constexpr uint32_t RESOLVER_THREADS = 16;
 constexpr uint64_t CLUSTER_REFRESH_MS = 5000;
 // Limit refusals are counted each, but logged at most once a second per tenant (with the count of the others).
 constexpr double LIMIT_LINE_INTERVAL_MS = 1000;
@@ -462,12 +468,19 @@ struct EgressService::Impl {
     return {lower(text.substr(0, colon)), text.substr(colon + 1)};
   }
 
-  // ---- Resolution (the node's own; getaddrinfo off the event loop) ----
+  // ---- Resolution (the node's own; getaddrinfo off the event loop, at most RESOLVER_THREADS threads at once) ----
+  std::shared_ptr<std::atomic<uint32_t>> resolvers = std::make_shared<std::atomic<uint32_t>>(0);
+  uint64_t resolverWaits = 0, backgroundRefreshes = 0;
   kj::Promise<std::vector<Address>> lookup(std::string host) {
+    if (resolvers->load() >= RESOLVER_THREADS) ++resolverWaits;
+    while (resolvers->load() >= RESOLVER_THREADS) co_await timer.afterDelay(5 * kj::MILLISECONDS);
+    resolvers->fetch_add(1);
     auto pair = kj::newPromiseAndCrossThreadFulfiller<std::vector<Address>>();
     // Held through a shared_ptr: the thread's state must be destructible without throwing (KJ's Own may throw).
     auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<std::vector<Address>>>>(kj::mv(pair.fulfiller));
-    std::thread([host = std::move(host), fulfiller]() mutable {
+    std::thread([host = std::move(host), fulfiller, counter = resolvers]() mutable {
+      // The thread counts until it ends, whoever still waits for its answer.
+      struct Release { std::shared_ptr<std::atomic<uint32_t>>& counter; ~Release() { counter->fetch_sub(1); } } release{counter};
       addrinfo hints{};
       hints.ai_family = AF_UNSPEC;
       hints.ai_socktype = SOCK_STREAM;
@@ -487,7 +500,7 @@ struct EgressService::Impl {
       if (addresses.empty()) (*fulfiller)->reject(KJ_EXCEPTION(FAILED, "name resolution gave no address"));
       else (*fulfiller)->fulfill(kj::mv(addresses));
     }).detach();
-    return kj::mv(pair.promise);
+    co_return co_await kj::mv(pair.promise);
   }
   kj::Promise<std::vector<Address>> resolve(const std::string& host) {
     const double now = monotonicTimeMs();
@@ -515,7 +528,8 @@ struct EgressService::Impl {
 
   // ---- The cluster's own addresses ----
   // The endpoints as the node knows them now; a request that sees others than the last refresh did (a member joined)
-  // waits for a refresh before anything is checked.
+  // starts a refresh and is judged against the set as it is until that refresh ends: no request waits for one (but the
+  // first, which every request waits for: EgressService::run()).
   std::string endpointsSignature() {
     std::string text;
     for (const auto& endpoint : clusterEndpoints()) text += endpoint + "\n";
@@ -525,14 +539,14 @@ struct EgressService::Impl {
     if (endpointsSignature() == refreshedSignature) return kj::READY_NOW;
     // A settled refresh is released here, never from its own continuation (KJ's fork must outlive that).
     if (refreshSettled) { refreshing = kj::none; refreshSettled = false; }
-    KJ_IF_SOME(running, refreshing) return running.addBranch();
-    auto promise = refreshCluster().then([this]() { refreshSettled = true; }, [this](kj::Exception&& error) {
-      refreshSettled = true;
-      kj::throwFatalException(kj::mv(error));
-    }).fork();
-    auto branch = promise.addBranch();
-    refreshing = kj::mv(promise);
-    return branch;
+    if (refreshing == kj::none) {
+      ++backgroundRefreshes;
+      refreshing = refreshCluster().then([this]() { refreshSettled = true; }, [this](kj::Exception&& error) {
+        refreshSettled = true;
+        clusterLastError = error.getDescription().cStr();
+      }).fork();
+    }
+    return kj::READY_NOW;
   }
   kj::Promise<void> refreshCluster() {
     const auto signature = endpointsSignature();
@@ -560,15 +574,19 @@ struct EgressService::Impl {
       if (auto address = parseIp(host)) next.addresses.insert(*address);
       else if (validHost(host)) names.insert(host);
     }
-    std::string failures;
+    // Every name at once, each within CLUSTER_NAME_RESOLUTION_MS. A name that does not resolve now keeps the addresses it
+    // had: the set never shrinks on a failure.
+    std::map<std::string, std::string> failed;
+    kj::Vector<kj::Promise<void>> lookups;
     for (const auto& name : names) {
-      try {
-        auto addresses = co_await timer.timeoutAfter(config.timeoutMs * kj::MILLISECONDS, lookup(name));
-        clusterNames[name] = addresses;
-      } catch (const kj::Exception& error) {
-        // A name that does not resolve now keeps the addresses it had: the set never shrinks on a failure.
-        failures += (failures.empty() ? "" : "; ") + name + ": " + error.getDescription().cStr();
-      }
+      lookups.add(timer.timeoutAfter(CLUSTER_NAME_RESOLUTION_MS * kj::MILLISECONDS, lookup(name)).then(
+          [this, name](std::vector<Address> addresses) { clusterNames[name] = std::move(addresses); },
+          [&failed, name](kj::Exception&& error) { failed[name] = error.getDescription().cStr(); }));
+    }
+    co_await kj::joinPromises(lookups.releaseAsArray());
+    std::string failures;
+    for (const auto& [name, reason] : failed) failures += (failures.empty() ? "" : "; ") + name + ": " + reason;
+    for (const auto& name : names) {
       auto known = clusterNames.find(name);
       if (known != clusterNames.end()) next.addresses.insert(known->second.begin(), known->second.end());
     }
@@ -1000,7 +1018,8 @@ struct EgressService::Impl {
           << ",\"deny\":" << rules.deny.size() << ",\"allowInternal\":" << rules.allowInternal.size()
           << ",\"concurrency\":" << rules.concurrency << ",\"requestsPerSecond\":" << rules.requestsPerSecond << "}";
     }
-    out << "],\"cluster\":{\"refreshes\":" << clusterRefreshes << ",\"refreshedAtUnixMs\":" << clusterRefreshedAtUnixMs
+    out << "],\"cluster\":{\"refreshes\":" << clusterRefreshes << ",\"backgroundRefreshes\":" << backgroundRefreshes
+        << ",\"refreshedAtUnixMs\":" << clusterRefreshedAtUnixMs
         << ",\"names\":" << clusterNames.size() << ",\"ranges\":" << cluster.ranges.size() << ",\"addresses\":[";
     index = 0;
     for (const auto& address : cluster.addresses) {
@@ -1009,6 +1028,7 @@ struct EgressService::Impl {
     }
     out << "],\"lastError\":\"" << jsonEscape(clusterLastError.substr(0, 500)) << "\"},\"dns\":{\"lookups\":" << dnsLookups
         << ",\"cacheHits\":" << dnsHits << ",\"failures\":" << dnsFailures << ",\"entries\":" << dnsCache.size()
+        << ",\"resolverThreads\":" << resolvers->load() << ",\"resolverWaits\":" << resolverWaits
         << "},\"totals\":{\"requests\":" << totalRequests << ",\"allowed\":" << totalAllowed << ",\"denied\":" << totalDenied
         << ",\"failed\":" << totalFailed << ",\"unknownSources\":" << unknownSources << ",\"requestBytes\":" << totalRequestBytes
         << ",\"responseBytes\":" << totalResponseBytes << ",\"egressBytes\":" << totalRequestBytes + totalResponseBytes

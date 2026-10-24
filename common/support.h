@@ -39,6 +39,8 @@ extern const char* executableArgument;
 
 std::string readFile(const std::filesystem::path& path);
 bool safeName(const std::string& value);
+// A node's id: a safe name that is also one segment of an object key (members/<id>/, nodes/<id>/): not "." or "..".
+bool nodeIdName(const std::string& value);
 std::string sha256Hex(std::string_view value);
 // `Authorization: Bearer <token>` as the management endpoints and the control plane take
 // it: "" when it is the token, else what was wrong -- "missing", "malformed" (repeated, or not Bearer)

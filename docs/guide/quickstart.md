@@ -53,7 +53,6 @@ cp -R "$COWORKERD_PACKAGE/examples/hello-world" ~/hello-world     # or go into y
 cd ~/hello-world
 cowctl init --tenant acme
 cowctl deploy
-sleep 6                                                           # every node picks the deployment up within about 5 seconds
 curl http://127.0.0.1:18080/acme/hello-world
 ```
 
@@ -66,10 +65,12 @@ deployed acme/hello-world v1 (active)
   package: 3 files, 4608 bytes; built in 2.2 s, deployed in 2.2 s
   trial load: node-3 (its quarantine process), 17 ms
   route */acme/hello-world  ->  http://127.0.0.1:18080/acme/hello-world
+  served by 3 nodes (tenant index revision 3) in 1.9 s
 ```
 
-The nodes read the cluster's desired state from the object store every 5 seconds, so a deployment reaches them within about 5 seconds of `cowctl deploy`; until then a node answers with what it had before --
-here `404 ROUTE_NOT_FOUND`, after a new version the previous one -- which is why the commands on this page wait before `curl`.
+The nodes read the cluster's desired state from the object store every 5 seconds, so a deployment reaches them within about 5 seconds; until then a node answers with what it had before --
+here `404 ROUTE_NOT_FOUND`, after a new version the previous one. So `cowctl deploy` waits until every node that is not draining reports that it has read the change (the last line), at most 15 seconds:
+past that it names the nodes that have not yet and succeeds all the same, since the change is made. `cowctl rollback` and `cowctl secret put` wait the same way, and `--no-wait` returns at once.
 
 ```text
 $ curl http://127.0.0.1:18080/acme/hello-world
@@ -100,16 +101,14 @@ all tenants' lines on a node together are kept up to 64 MiB, past which the olde
 ```bash
 sed -i.orig 's/Hello from Coworkerd!/Hello again!/' src/index.js && rm src/index.js.orig
 cowctl deploy
-sleep 6
 curl http://127.0.0.1:18080/acme/hello-world          # Hello again!
 cowctl versions
 cowctl rollback v1
-sleep 6
 curl http://127.0.0.1:18080/acme/hello-world          # Hello from Coworkerd!
 ```
 
 Each `deploy` is a new version (`v1`, `v2`, ...; `--version` names it yourself), and old versions are kept (the number of versions kept per Worker is a tenant quota; when it is full, delete old ones first with the API's `DELETE /v1/tenants/{t}/workers/{w}/versions/{v}`: `cowctl` has no command for it);
-`rollback <version>` makes it the active version again (again trial-loading first). `deploy --no-activate` only uploads and trial-loads, without switching; switch to it later with `rollback`.
+`rollback <version>` makes it the active version again (again trial-loading first). `deploy --no-activate` only uploads, without switching and without a trial load (the version is trial-loaded when it is activated) and without a route (it refuses `--route`); switch to it later with `rollback`.
 
 ```text
 $ cowctl versions
@@ -124,14 +123,13 @@ acme/hello-world: active v2
 ```bash
 printf 'my-first-secret' | cowctl secret put API_KEY
 cowctl deploy --secret API_KEY
-sleep 6
 curl http://127.0.0.1:18080/acme/hello-world/secret   # API_KEY has 15 characters
 ```
 
 A secret's value is read only from standard input (run directly in a terminal, it prompts for it without echoing) or from `--from-file`, with trailing whitespace removed; every output, log and state shows only its name, its length and when it was set.
 In the cluster it is stored sealed with the cluster's secrets key: the control plane seals it, and opens it only to check that it opens, each time it evaluates or lists the tenant's Workers (a deployment, a rollback, `versions`, `secret list`); the nodes open it to hand it to the Worker.
 A version has to **declare** which secrets it reads: wrangler's convention is to list them in the project's `.dev.vars.example` (only the names are taken; `.dev.vars` and `.env` are never read),
-or `deploy --secret NAME`. A version that declares a secret without a value is refused at deployment, with a hint to `secret put` first (with `--no-activate` it cannot be trial-loaded, and the upload answers `503 TRIAL_UNAVAILABLE` without the hint). `cowctl secret list` lists only names, lengths and when each was set;
+or `deploy --secret NAME`. A version that declares a secret without a value is refused at deployment, with a hint to `secret put` first (with `--no-activate` the upload is accepted, and its activation is refused, naming the secret, until the value is set). `cowctl secret list` lists only names, lengths and when each was set;
 `cowctl secret delete <name>` deletes one (the deletion is refused while an active version still uses it). After a value changes, newly loaded isolates read the new value, and already loaded ones keep the old value until they are evicted.
 
 ## 7. Usage
@@ -153,7 +151,6 @@ cp -R "$COWORKERD_PACKAGE/examples/hello-world" ~/hello-world-beta
 cd ~/hello-world-beta
 cowctl init --tenant beta --token-file ~/.cowctl/beta-token
 cowctl deploy
-sleep 6
 curl http://127.0.0.1:18080/beta/hello-world
 curl http://127.0.0.1:18080/acme/hello-world/secret   # acme's Worker is unchanged
 cd ~/hello-world
@@ -172,14 +169,14 @@ In the directory of a wrangler project, `cowctl init --tenant <tenant>`, then `c
 - unsupported configuration (KV, Durable Objects, D1 and others) is listed in full at conversion and refused; platform-type settings (`observability` and others) are ignored with a notice, see the [compatibility scope](compat.md);
 - routes: `/<tenant>/<Worker name>` by default. A **static assets site** has its asset paths starting at `/` and needs a whole host: the administrator first registers the hostname to the tenant
   (`cowctl tenant update acme --hostname site.acme.localhost`, which sets the tenant's whole list: name every hostname it keeps; a hostname belongs to one tenant only), then `cowctl deploy --route site.acme.localhost/`
-  (then `curl -H 'Host: site.acme.localhost' http://127.0.0.1:18080/`). An unregistered hostname is refused at deployment with `deploy refused: hostname ... is not one of tenant acme's hostnames`, and a path under the default host that does not start with `/<tenant>/` with `deploy refused: a route of tenant acme under the default host * starts with ...` (the API's code is `HOSTNAME_NOT_OWNED` for both);
+  (then `curl -H 'Host: site.acme.localhost' http://127.0.0.1:18080/`). An unregistered hostname is refused at deployment with `deploy refused: hostname ... is not one of tenant acme's hostnames`, and a path under the default host that does not start with `/<tenant>/` with `deploy refused: the routes of tenant acme under the default host are */acme/...: route */... is outside them` (the API's code is `HOSTNAME_NOT_OWNED` for both);
 - quotas: the number of Workers, versions per Worker, bundle size, the number and total size of static assets, the number of secrets, the number of hostnames and the log volume are all tenant quotas (set by the administrator, shown by `cowctl tenant get`);
   over one, the deployment, the secret or -- for the number of hostnames -- the administrator's tenant update is refused with a reason that names the quota (`deploy refused: tenant acme's quota: ...`, the API's code `QUOTA_EXCEEDED`), except the two log quotas, over which lines are dropped (section 4).
   The conversion itself refuses more than 20000 static assets, 100 MiB of them, or one over 25 MiB, and a package of 160 MiB or more -- both the default quota and the control plane's upload limit -- gets `PACKAGE_TOO_LARGE`.
 
 `examples/` also has two official templates as they are: `email-routing-template` (static assets and the `ASSETS` Binding) and `x402-proxy-template` (secrets).
-Each serves at `/` of a host of its own: register a hostname to the tenant as above, then in the template's directory `cowctl init --tenant acme --route <hostname>/` and `cowctl deploy`; `x402-proxy-template` also needs `npm ci` first and its secret, `cowctl secret put JWT_SECRET` after `init`
-(the examples' own `README.md` files still show older commands, without `--tenant`: use the ones above).
+Each serves at `/` of a host of its own: register a hostname to the tenant as above, then in the template's directory `cowctl init --tenant acme --route <hostname>/` and `cowctl deploy`; `x402-proxy-template` also needs `npm ci` first and its secret, `cowctl secret put JWT_SECRET` after `init`;
+each example's own `README.md` gives these commands for it.
 
 ## 10. Cleaning up
 
@@ -204,11 +201,11 @@ with the admin credential it also shows each node's processes and the revision o
 | Command | Purpose |
 | --- | --- |
 | `cowctl init --tenant T [--url URL] [--ingress URL] [--token-file FILE] [--route PREFIX] [--force]` | Write `cowctl.json` |
-| `cowctl deploy [--no-activate] [--version ID] [--route PREFIX] [--secret NAME]...` | Build, upload a new version, trial-load, switch |
+| `cowctl deploy [--no-activate] [--version ID] [--route PREFIX] [--secret NAME]... [--no-wait]` | Build, upload a new version, trial-load, switch, wait for the nodes |
 | `cowctl versions` | The versions; `*` marks the active one |
-| `cowctl rollback <version>` | Make a version the active one |
+| `cowctl rollback <version> [--no-wait]` | Make a version the active one |
 | `cowctl remove [--yes]` | Stop serving this Worker (its versions are kept; `deploy` again restores it) |
-| `cowctl secret put <NAME> [--from-file FILE]`, `secret list`, `secret delete <NAME>` | Secrets |
+| `cowctl secret put <NAME> [--from-file FILE] [--no-wait]`, `secret list`, `secret delete <NAME>` | Secrets |
 | `cowctl status` | The control plane, the desired state's revisions, the cluster's nodes and their versions (with the admin credential also their processes and the deployment revision they serve) |
 | `cowctl logs [--follow] [--since 10m] [--limit N] [--json]` | This Worker's logs |
 | `cowctl usage [--since 24h] [--until TIME] [--all]` | Hourly usage |
@@ -231,6 +228,6 @@ with the admin credential it also shows each node's processes and the revision o
 | `deploy refused: version vN does not load (SYNTAX_ERROR ...)` | The new version cannot be loaded and the active version did not change; reasons and categories are in [error codes](errors.md) |
 | `deploy refused: Worker ... would be invalid after upsert: missing secret: NAME` | `cowctl secret put NAME` first |
 | `deploy refused: tenant ...'s quota` / `deploy refused: hostname ... is not one of tenant ...'s hostnames` | Over the tenant's quota, or the route's hostname does not belong to this tenant: see section 9 |
-| `curl` right after `cowctl deploy` gets 404 `ROUTE_NOT_FOUND`, or the previous version | The nodes have not read the deployment yet: they do every 5 seconds. Wait a few seconds and try again |
+| `curl` right after `cowctl deploy --no-wait` (or after a deploy that said `not served yet by ...`) gets 404 `ROUTE_NOT_FOUND`, or the previous version | The nodes have not read the deployment yet: they do every 5 seconds. Wait a few seconds and try again |
 | `curl` gets 404 `ROUTE_NOT_FOUND` | The path is not under any route: see the routes at the end of `cowctl versions` (by default `/<tenant>/<Worker>`) |
 | `curl` gets 503 | The request was refused or did not finish: the JSON answer's `code` says why -- a limit exceeded while running, but also a refusal before anything ran (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `SERVER_DRAINING`, `PROCESS_UNAVAILABLE` and others), see [error codes](errors.md); if it ran, `cowctl logs` shows what it printed |

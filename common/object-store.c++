@@ -146,6 +146,22 @@ std::string errorCode(const std::string& body) {
 
 std::string objectErrorCode(const std::string& body) { return errorCode(body); }
 
+kj::Exception storageFailure(kj::Exception::Type type, kj::String description) {
+  kj::Exception error(type, __FILE__, __LINE__, kj::mv(description));
+  error.setDetail(STORAGE_FAILURE_DETAIL, kj::heapArray<kj::byte>(0));
+  return error;
+}
+void failStorage(const std::string& description) {
+  kj::throwFatalException(storageFailure(kj::Exception::Type::FAILED, kj::str(description.c_str())));
+}
+bool isStorageFailure(const kj::Exception& error) { return error.getDetail(STORAGE_FAILURE_DETAIL) != kj::none; }
+void failConflict(const std::string& description) {
+  kj::Exception error(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(description.c_str()));
+  error.setDetail(WRITE_CONFLICT_DETAIL, kj::heapArray<kj::byte>(0));
+  kj::throwFatalException(kj::mv(error));
+}
+bool isWriteConflict(const kj::Exception& error) { return error.getDetail(WRITE_CONFLICT_DETAIL) != kj::none; }
+
 std::string objectSha256(const std::string& bytes) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), digest);
@@ -208,6 +224,7 @@ ObjectStore::ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Tim
   hashHeader = builder.add("x-amz-content-sha256");
   authorizationHeader = builder.add("authorization");
   ifNoneMatchHeader = builder.add("If-None-Match");
+  lastModifiedHeader = builder.add("Last-Modified");
   table = builder.build();
   KJ_REQUIRE(settings.timeoutMs > 0 && settings.connectTimeoutMs > 0 && settings.readTimeoutMs > 0 && settings.createTimeoutMs > 0,
       "object store timeouts must be positive");
@@ -245,10 +262,10 @@ kj::Exception ObjectStore::sanitized(const kj::Exception& error) {
   // or status endpoints: only this client's own words.
   if (error.getType() == kj::Exception::Type::OVERLOADED) {
     const kj::StringPtr description = error.getDescription();
-    return kj::Exception(kj::Exception::Type::OVERLOADED, __FILE__, __LINE__, description.startsWith("object store request timeout (")
+    return storageFailure(kj::Exception::Type::OVERLOADED, description.startsWith("object store request timeout (")
         ? kj::str(description) : kj::str("object store request timeout"));
   }
-  return kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str("object store request failed"));
+  return storageFailure(kj::Exception::Type::FAILED, kj::str("object store request failed"));
 }
 
 kj::Promise<ObjectResponse> ObjectStore::send(Call call) {
@@ -382,9 +399,12 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
   request.body = nullptr;
   auto response = co_await within(timer, call.ifNoneMatch ? settings.createTimeoutMs : settings.readTimeoutMs,
       kj::mv(request.response), statistics.readTimeouts, "answer");
-  uint64_t date = 0;
+  uint64_t date = 0, lastModified = 0;
   KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::DATE)) {
     date = httpDateUnixMs(std::string_view(value.begin(), value.size()));
+  }
+  KJ_IF_SOME(value, response.headers->get(lastModifiedHeader)) {
+    lastModified = httpDateUnixMs(std::string_view(value.begin(), value.size()));
   }
   std::string body;
   std::string buffer(CHUNK, '\0');
@@ -395,17 +415,18 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
     body.append(buffer.data(), read);
     KJ_REQUIRE(body.size() <= 64 * 1024 * 1024, "object store answer larger than 64 MiB");
   }
-  co_return ObjectResponse{response.statusCode, std::move(body), date};
+  co_return ObjectResponse{response.statusCode, std::move(body), date, lastModified};
 }
 
 kj::Promise<bool> ObjectStore::exists(std::string key) {
   auto response = co_await request(kj::HttpMethod::HEAD, std::move(key));
-  KJ_REQUIRE(response.status == 200 || response.status == 404, "object HEAD failed", response.status);
+  requireStorage(response.status == 200 || response.status == 404, "object HEAD failed: HTTP " + std::to_string(response.status));
   co_return response.status == 200;
 }
 kj::Promise<ObjectResponse> ObjectStore::put(std::string key, std::string bytes) {
   auto response = co_await request(kj::HttpMethod::PUT, std::move(key), std::move(bytes));
-  KJ_REQUIRE(response.status == 200, "object PUT failed", response.status);
+  requireStorage(response.status == 200, "object PUT failed: HTTP " + std::to_string(response.status) +
+      (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
   co_return response;
 }
 kj::Promise<ObjectResponse> ObjectStore::get(std::string key) {
@@ -428,8 +449,8 @@ kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes
     }
     if (failure == kj::none) {
       if (response.status == 200) co_return CreateResult{true, response.status, response.dateUnixMs, attempt > 1};
-      KJ_REQUIRE(response.status == 412 || response.status == 409, "object create failed", response.status,
-          errorCode(response.bytes).c_str());
+      requireStorage(response.status == 412 || response.status == 409, "object create failed: HTTP " +
+          std::to_string(response.status) + (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
       // The first create was answered: the key was another writer's.
       if (attempt == 1) co_return CreateResult{false, response.status, response.dateUnixMs};
     } else {
@@ -443,11 +464,11 @@ kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes
       ++(own ? statistics.createsConfirmed : statistics.createsFoundOther);
       co_return CreateResult{own, own ? 200u : 412u, back.dateUnixMs, true};
     }
-    KJ_REQUIRE(back.status == 404, "object store read failed", back.status);
+    requireStorage(back.status == 404, "object store read failed: HTTP " + std::to_string(back.status));
     if (attempt >= 2) {
       ++statistics.createsUnknown;
       KJ_IF_SOME(error, failure) { kj::throwFatalException(sanitized(error)); }
-      KJ_FAIL_REQUIRE("object create failed: the key is absent after a conflicting answer", response.status);
+      failStorage("object create failed: the key is absent after a conflicting answer (HTTP " + std::to_string(response.status) + ")");
     }
     // Absent: the first create did not take effect. Once more, on a new connection.
     ++statistics.retries;
@@ -465,13 +486,14 @@ kj::Promise<ObjectListing> ObjectStore::list(std::string prefix, uint32_t maxKey
         {{"list-type", "2"}, {"max-keys", std::to_string(maxKeys)}, {"prefix", prefix}}};
     if (!token.empty()) call.query.emplace_back("continuation-token", token);
     auto response = co_await send(std::move(call));
-    KJ_REQUIRE(response.status == 200, "object listing failed", response.status, errorCode(response.bytes).c_str());
+    requireStorage(response.status == 200, "object listing failed: HTTP " + std::to_string(response.status) +
+        (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
     const std::string_view xml(response.bytes);
-    KJ_REQUIRE(xml.find("<ListBucketResult") != std::string_view::npos, "object listing answer is not a listing");
+    requireStorage(xml.find("<ListBucketResult") != std::string_view::npos, "object listing answer is not a listing");
     if (++listing.pages == 1) listing.dateUnixMs = response.dateUnixMs;
     for (size_t at = xml.find("<Contents>"); at != std::string_view::npos; at = xml.find("<Contents>", at)) {
       const auto end = xml.find("</Contents>", at);
-      KJ_REQUIRE(end != std::string_view::npos, "object listing answer is cut short");
+      requireStorage(end != std::string_view::npos, "object listing answer is cut short");
       const auto block = xml.substr(at, end - at);
       ListedObject object;
       object.key = element(block, "Key");
@@ -482,15 +504,15 @@ kj::Promise<ObjectListing> ObjectStore::list(std::string prefix, uint32_t maxKey
       const auto size = element(block, "Size");
       object.size = size.empty() ? 0 : std::strtoull(size.c_str(), nullptr, 10);
       object.pageDateUnixMs = response.dateUnixMs;
-      KJ_REQUIRE(object.key.starts_with(prefix) && object.lastModifiedUnixMs > 0,
+      requireStorage(object.key.starts_with(prefix) && object.lastModifiedUnixMs > 0,
           "object listing entry without a key under the prefix or a LastModified");
       listing.objects.push_back(std::move(object));
       at = end;
     }
     if (element(xml, "IsTruncated") != "true") break;
     token = element(xml, "NextContinuationToken");
-    KJ_REQUIRE(!token.empty(), "object listing is truncated without a continuation token");
-    KJ_REQUIRE(listing.pages < 100000, "object listing does not end");
+    requireStorage(!token.empty(), "object listing is truncated without a continuation token");
+    requireStorage(listing.pages < 100000, "object listing does not end");
   }
   co_return listing;
 }
@@ -499,8 +521,8 @@ kj::Promise<ObjectResponse> ObjectStore::remove(std::string key) {
   KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
   KJ_REQUIRE(!key.empty(), "remove needs a key");
   auto response = co_await request(kj::HttpMethod::DELETE, std::move(key));
-  KJ_REQUIRE(response.status == 204 || response.status == 200 || response.status == 404, "object DELETE failed",
-      response.status, errorCode(response.bytes).c_str());
+  requireStorage(response.status == 204 || response.status == 200 || response.status == 404, "object DELETE failed: HTTP " +
+      std::to_string(response.status) + (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
   co_return response;
 }
 }  // namespace coworkerd

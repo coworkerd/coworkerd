@@ -46,7 +46,24 @@ struct ObjectResponse {
   // 1000. 0 when the response carried none that reads as an HTTP-date, and from the directory backend, which has
   // no clock of its own.
   uint64_t dateUnixMs = 0;
+  // The object's Last-Modified header (a GET's or HEAD's), the same way; 0 when there is none.
+  uint64_t lastModifiedUnixMs = 0;
 };
+
+// A failure of the object store -- it could not be reached, did not answer in time, or answered with an error status
+// or with something that is not an answer -- as opposed to a refusal of the caller's own. Every exception this client
+// and the state layer above it (object-state.h) throw for one carries this detail, and the callers classify by it
+// (isStorageFailure), never by the words of a description: one failure, one answer (503 STORAGE_UNAVAILABLE).
+constexpr kj::Exception::DetailTypeId STORAGE_FAILURE_DETAIL = 0x636f776b2d73746full;
+kj::Exception storageFailure(kj::Exception::Type type, kj::String description);
+[[noreturn]] void failStorage(const std::string& description);
+inline void requireStorage(bool condition, const std::string& description) { if (!condition) failStorage(description); }
+bool isStorageFailure(const kj::Exception& error);
+// A write that other writers kept winning: every attempt to create an aggregate's next revision met one another writer
+// had created first (409 CONFLICT). The same detail mechanism, so that no reason's words decide it either.
+constexpr kj::Exception::DetailTypeId WRITE_CONFLICT_DETAIL = 0x636f776b2d636f6eull;
+[[noreturn]] void failConflict(const std::string& description);
+bool isWriteConflict(const kj::Exception& error);
 
 // One object of a listing, with the Date header of the page that listed it: LastModified and Date both come from
 // the store's clock, so their difference is the object's age without trusting this machine's clock.
@@ -128,6 +145,7 @@ private:
   kj::HttpHeaderId hashHeader;
   kj::HttpHeaderId authorizationHeader;
   kj::HttpHeaderId ifNoneMatchHeader;
+  kj::HttpHeaderId lastModifiedHeader;
   // One request, sent once more on a new connection when it is idempotent (GET, HEAD, a listing, DELETE) and the first
   // attempt failed; an overwrite is sent once. Errors never carry the request's URL (a presigned one holds the access
   // key's identifier).

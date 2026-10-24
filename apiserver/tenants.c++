@@ -76,14 +76,13 @@ std::unique_ptr<Body> parseBody(const std::string& text, bool empty = false) {
   kj::throwFatalException(KJ_EXCEPTION(FAILED, "refused"));
 }
 
-// A failure of the store (or any other) during a write: 503 STORAGE_UNAVAILABLE when it is the store's.
+// A failure during a write, by its kind (object-store.h): the store's is 503 STORAGE_UNAVAILABLE, other writers that
+// kept winning 409 CONFLICT, anything else 500 INTERNAL.
 ApiAnswer writeFailure(const kj::Exception& error, const char* what) {
   std::string reason = error.getDescription().cStr();
-  if (reason.find("object store") != std::string::npos || error.getType() == kj::Exception::Type::DISCONNECTED ||
-      error.getType() == kj::Exception::Type::OVERLOADED)
-    return ApiAnswer::error(503, "STORAGE_UNAVAILABLE", std::string("the object store cannot be reached; ") + what + " was not written: " + reason);
-  if (reason.find("期间有其他部署") != std::string::npos || reason.find("another write") != std::string::npos)
-    return ApiAnswer::error(409, "CONFLICT", reason);
+  if (isStorageFailure(error))
+    return ApiAnswer::error(503, "STORAGE_UNAVAILABLE", std::string("the object store failed; ") + what + " was not written: " + reason);
+  if (isWriteConflict(error)) return ApiAnswer::error(409, "CONFLICT", reason);
   return ApiAnswer::error(500, "INTERNAL", reason);
 }
 
@@ -170,6 +169,9 @@ Authenticated authenticate(const ManifestStore& state, const std::string& adminC
   if (record.keyId != token->keyId || !constantEquals(sha256Hex(token->secret), record.sha256)) return refuse("wrong");
   if (record.revokedAtUnixMs) return refuse("revoked");
   if (record.expiresAtUnixMs && nowMs() >= record.expiresAtUnixMs) return refuse("expired");
+  // A credential acts only on a tenant the index names (a deletion removes its credentials; one that outlived it never
+  // acts on a tenant created again under the name).
+  if (!state.index().tenants.contains(record.scope.substr(7))) return refuse("wrong");
   return Authenticated{Caller{false, record.scope.substr(7), record.keyId}, {}, "tenant"};
 }
 
@@ -300,7 +302,12 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
       co_return;
     }, false);
   };
-  if (!readTenant(state, name).tenant) co_return notFound(name);
+  // A deletion that stopped after the tenant left the index is resumed from what the store holds.
+  if (!readTenant(state, name).tenant) {
+    try { co_await state.reloadTenant(name); } catch (const kj::Exception& error) { co_return writeFailure(error, "the deletion"); }
+    const auto* left = state.tenant(name);
+    if (!left || !left->record || left->record->status != "deleting") co_return notFound(name);
+  }
   auto incomplete = [&](const std::string& where, const std::string& reason) {
     return ApiAnswer::error(503, "DELETION_INCOMPLETE", "the deletion of tenant " + name + " stopped at " + where + ": " + reason +
         "; DELETE it again to resume");
@@ -325,10 +332,13 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
     }
     co_await record("objects", capnp::JsonCodec().encodeRaw(field(json, "record")).cStr());
     // 3. Its credentials.
+    // A revision even when the tenant has no credential: a creation another control plane computed from an index read
+    // before this one meets it and judges the tenant again (createCredential).
     size_t deleted = 0;
-    co_await state.writeCredentials([&](CredentialIndex& next) {
+    co_await state.writeCredentials([&](CredentialIndex& next) -> kj::Promise<void> {
       deleted = std::erase_if(next.credentials, [&](const auto& entry) { return entry.second.scope == "tenant:" + name; });
-    });
+      co_return;
+    }, 8, true);
     co_await record("credentials", "{\"deleted\":" + std::to_string(deleted) + "}");
   } catch (const kj::Exception& error) {
     if (refused) co_return *refused;
@@ -341,6 +351,9 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
   } catch (const kj::Exception& error) {
     co_return incomplete("its removal from the index", error.getDescription().cStr());
   }
+  if (forgotten.failed)
+    co_return incomplete("its manifests", std::to_string(forgotten.failed) + " of " + std::to_string(forgotten.removed + forgotten.failed) +
+        " objects below tenants/" + name + "/ could not be removed");
   std::string out = "{\"tenant\":" + quote(name) + ",\"deleted\":true,\"steps\":[";
   for (size_t i = 0; i < steps.size(); ++i) out += (i ? "," : "") + steps[i];
   co_return ApiAnswer::ok(out + "],\"index\":{\"revision\":\"" + std::to_string(forgotten.indexRevision) + "\"},\"manifests\":{\"removed\":" +
@@ -378,7 +391,18 @@ kj::Promise<ApiAnswer> createCredential(ManifestStore& state, std::string tenant
   record.sha256 = sha256Hex(token.secret);
   record.createdAtUnixMs = nowMs();
   try {
-    co_await state.writeCredentials([&](CredentialIndex& next) {
+    co_await state.writeCredentials([&](CredentialIndex& next) -> kj::Promise<void> {
+      // The tenant as the store has it now (its latest manifest), within the credentials index's turn and again at every
+      // attempt: a deletion marks the tenant before it removes its credentials in this same aggregate, so a creation
+      // either comes before that removal or sees the mark -- or no tenant, or one created again since (another
+      // createdAtUnixMs): either way not the tenant this credential was asked for.
+      auto latest = co_await readLatestRevision(state.objects(), tenantManifestPrefix(tenantName), tenantHintKey(tenantName), 0, true);
+      std::optional<TenantRecord> current;
+      if (latest.revision) current = decodeTenantManifest(latest.bytes).record;
+      if (!current || current->createdAtUnixMs != read.tenant->createdAtUnixMs)
+        refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " was deleted while its credential was created"));
+      if (current->status != "active")
+        refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted"));
       // A key id drawn twice (64 random bits) is drawn again by the next request.
       if (next.credentials.contains(record.keyId)) refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "a key id was drawn twice; try again"));
       next.credentials.emplace(record.keyId, record);
@@ -415,11 +439,11 @@ kj::Promise<ApiAnswer> revokeCredential(ManifestStore& state, std::string tenant
   uint64_t revokedAt = 0;
   bool unchanged = false;
   try {
-    co_await state.writeCredentials([&](CredentialIndex& next) {
+    co_await state.writeCredentials([&](CredentialIndex& next) -> kj::Promise<void> {
       auto found = next.credentials.find(keyId);
       if (found == next.credentials.end() || found->second.scope != "tenant:" + tenantName)
         refuseWith(refused, ApiAnswer::error(404, "CREDENTIAL_NOT_FOUND", "tenant " + tenantName + " has no credential " + keyId));
-      if (found->second.revokedAtUnixMs) { unchanged = true; revokedAt = found->second.revokedAtUnixMs; return; }
+      if (found->second.revokedAtUnixMs) { unchanged = true; revokedAt = found->second.revokedAtUnixMs; co_return; }
       found->second.revokedAtUnixMs = revokedAt = nowMs();
     });
   } catch (const kj::Exception& error) {
@@ -464,7 +488,7 @@ kj::Promise<ApiAnswer> usage(ObjectStore& storage, UsageCache& cache, std::optio
     for (size_t i = 0; i < answers.size(); ++i) {
       const auto& object = *stale[start + i];
       if (answers[i].status == 404) { cache.objects.erase(object.key); continue; }  // removed since the listing
-      KJ_REQUIRE(answers[i].status == 200, "object store read failed", answers[i].status);
+      requireStorage(answers[i].status == 200, "object store read failed: HTTP " + std::to_string(answers[i].status));
       ++cache.reads;
       try {
         cache.objects[object.key] = {object.etag, decodeNodeUsageHour(answers[i].bytes)};
@@ -519,7 +543,8 @@ kj::Promise<UsageCleanup> cleanUsage(ObjectStore& storage, uint32_t retentionHou
     ++result.listed;
     if (parsed->second >= result.cutoff) continue;
     auto removed = co_await storage.remove(object.key);
-    KJ_REQUIRE(removed.status == 200 || removed.status == 204 || removed.status == 404, "object store removal failed", removed.status);
+    requireStorage(removed.status == 200 || removed.status == 204 || removed.status == 404,
+        "object store removal failed: HTTP " + std::to_string(removed.status));
     ++result.removed;
   }
   co_return result;
