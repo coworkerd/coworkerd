@@ -83,6 +83,7 @@ add_library(common STATIC
   common/etcd.c++
   common/object-store.c++
   common/object-state.c++
+  common/tenant-manifest.c++
   common/code-package.c++
   common/deployment.c++
   common/tenancy.c++
@@ -106,7 +107,7 @@ add_executable(coworkerd
   node/membership.c++
   node/bundle-cache.c++
   node/desired-state.c++
-  node/desired-state-etcd.c++
+  node/desired-state-store.c++
   node/tenants.c++
   node/usage.c++
   node/storage-probe.c++
@@ -119,6 +120,7 @@ target_link_libraries(coworkerd PRIVATE common kj-tls-local)
 add_executable(coworkerd-apiserver
   apiserver/main.c++
   apiserver/deployment-tool.c++
+  apiserver/manifests.c++
   apiserver/tenants.c++
   apiserver/etcd-auth.c++
   apiserver/rotation-tool.c++

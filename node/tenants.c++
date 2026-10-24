@@ -1,61 +1,32 @@
 #include "tenants.h"
 
-#include <chrono>
 #include <iostream>
 #include <sstream>
 
 namespace coworkerd {
 
-TenantView::TenantView(const MembershipConfig& authority, kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headers)
-    : config(authority), timer(timer) {
-  if (config.backend == "etcd") {
-    client = std::make_unique<EtcdClient>(config.endpoint, config.requestTimeoutMs, network, timer, headers);
-    watcher = std::make_unique<EtcdWatcher>(*client, TENANTS_PREFIX, timer, config.retryMs,
-        [this](const EtcdSnapshot& snapshot) { return apply(snapshot); });
-  }
-}
-
 void TenantView::onQuota(std::function<void(const std::string&, uint64_t, uint64_t)> callback) { quota = std::move(callback); }
 
-kj::Promise<void> TenantView::start() {
-  if (!watcher) co_return;
-  const auto until = timer.now() + config.startupTimeoutMs * kj::MILLISECONDS;
-  while (true) {
-    std::string error;
-    try { co_await watcher->fullRead(); co_return; }
-    catch (const kj::Exception& failure) { error = failure.getDescription().cStr(); }
-    KJ_REQUIRE(timer.now() < until, "the tenants cannot be read at startup", error.c_str());
-    co_await timer.afterDelay(config.retryMs * kj::MILLISECONDS);
-  }
-}
-
-kj::Promise<void> TenantView::run() {
-  if (!watcher) return kj::NEVER_DONE;
-  return watcher->run();
-}
-
-kj::Promise<void> TenantView::apply(const EtcdSnapshot& snapshot) {
+void TenantView::update(const std::map<std::string, std::optional<TenantRecord>>& named, uint64_t at, bool records) {
+  hasRecords = records;
   std::map<std::string, TenantRecord> next;
-  uint64_t bad = 0;
-  for (const auto& [key, kv] : snapshot.values) {
-    try {
-      auto record = decodeTenantRecord(kv.value);
-      if (key != std::string(TENANTS_PREFIX) + record.name) { ++bad; continue; }
-      next.emplace(record.name, std::move(record));
-    } catch (const kj::Exception&) { ++bad; }  // not a record the control plane wrote: no tenant
+  uint64_t bare = 0;
+  for (const auto& [name, record] : named) {
+    if (record) next.emplace(name, *record);
+    else ++bare;  // a tenant only the operations tool writes: no record
   }
   for (const auto& [name, record] : next) {
     auto before = tenants.find(name);
     if (before == tenants.end() || before->second.status != record.status)
       std::cout << "[tenant] {\"event\":\"" << (before == tenants.end() ? "added" : "status") << "\",\"tenant\":\"" << name
-                << "\",\"status\":\"" << record.status << "\",\"revision\":" << snapshot.revision << "}" << std::endl;
+                << "\",\"status\":\"" << record.status << "\",\"revision\":" << at << "}" << std::endl;
   }
   for (const auto& [name, record] : tenants)
     if (!next.contains(name))
-      std::cout << "[tenant] {\"event\":\"removed\",\"tenant\":\"" << name << "\",\"revision\":" << snapshot.revision << "}" << std::endl;
+      std::cout << "[tenant] {\"event\":\"removed\",\"tenant\":\"" << name << "\",\"revision\":" << at << "}" << std::endl;
   tenants = std::move(next);
-  revision = snapshot.revision;
-  unreadable = bad;
+  revision = at;
+  withoutRecord = bare;
   // Which tenant each hostname belongs to (the control plane keeps them unique; one listed twice belongs to no one).
   std::map<std::string, std::string> hosts;
   uint64_t shared = 0;
@@ -78,7 +49,6 @@ kj::Promise<void> TenantView::apply(const EtcdSnapshot& snapshot) {
     for (const auto& [name, value] : quotas) if (!wanted.contains(name)) quota(name, 0, 0);
   }
   quotas = std::move(wanted);
-  co_return;
 }
 
 const TenantRecord* TenantView::tenant(const std::string& name) const {
@@ -94,8 +64,8 @@ bool TenantView::deleting(const std::string& name) const {
 std::string TenantView::unavailable(const std::string& name) const {
   auto found = tenants.find(name);
   if (found != tenants.end()) return found->second.status == "deleting" ? "tenant " + name + " is being deleted" : "";
-  // Without etcd there are no records; the operations tool's default tenant never has one.
-  if (!watcher || name == DEFAULT_TENANT) return "";
+  // Without records (the file backend) every tenant is served; the operations tool's default tenant never has one.
+  if (!hasRecords || name == DEFAULT_TENANT) return "";
   return "tenant " + name + " does not exist";
 }
 
@@ -106,9 +76,9 @@ const std::string* TenantView::owner(const std::string& hostname) const {
 
 std::string TenantView::json() const {
   std::ostringstream out;
-  out << "{\"backend\":\"" << (watcher ? "etcd" : "none") << "\",\"revision\":\"" << revision << "\",\"watchConnected\":"
-      << (watcher && watcher->view().connected ? "true" : "false") << ",\"unreadableRecords\":" << unreadable
-      << ",\"hostnames\":" << owners.size() << ",\"sharedHostnames\":" << sharedHostnames << ",\"records\":{";
+  out << "{\"backend\":\"" << (hasRecords ? "objectStore" : "none") << "\",\"revision\":\"" << revision
+      << "\",\"tenantsWithoutRecord\":" << withoutRecord << ",\"hostnames\":" << owners.size()
+      << ",\"sharedHostnames\":" << sharedHostnames << ",\"records\":{";
   size_t index = 0;
   for (const auto& [name, record] : tenants) {
     out << (index++ ? "," : "") << "\"" << name << "\":{\"status\":\"" << record.status << "\",\"logLinesPerSecond\":"

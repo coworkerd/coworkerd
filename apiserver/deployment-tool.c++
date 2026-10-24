@@ -1,6 +1,7 @@
 #include "control.h"
 #include "deployment.h"
 #include "coworkerd.capnp.h"
+#include "manifests.h"
 #include "object-store.h"
 #include "object-state.h"
 #include "code-package.h"
@@ -35,147 +36,30 @@ uint64_t nowUnixMs() {
 constexpr size_t STATUS_PROBLEM_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
-// Deployment tool: per-key writes conditioned only on the keys of the change.
-
-std::string absolute(const std::string& relative) { return std::string(DEPLOYMENT_PREFIX) + relative; }
+// Deployment tool: one tenant's manifest at a time (common/tenant-manifest.h), its next revision written only if
+// absent (manifests.h); a change of a tenant is one write, whatever it touches.
 
 // A refusal reads as one sentence: "coworkerd-apiserver failed: <reason>".
 [[noreturn]] void refuse(const std::string& reason) {
   kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(reason.c_str())));
 }
 
-struct Transaction {
-  std::vector<std::string> compares, operations;
-  std::vector<DeploymentState::Change> changes;  // the operations' effect, relative keys
-  std::set<std::string> written;
-  void put(const std::string& key, const std::string& value) {
-    KJ_REQUIRE(written.insert(key).second, "internal: key written twice in one transaction", key.c_str());
-    operations.push_back("{\"request_put\":{\"key\":" + quote(base64(absolute(key))) + ",\"value\":" + quote(base64(value)) + "}}");
-    changes.push_back({key, value});
-  }
-  void remove(const std::string& key) {
-    KJ_REQUIRE(written.insert(key).second, "internal: key written twice in one transaction", key.c_str());
-    operations.push_back("{\"request_delete_range\":{\"key\":" + quote(base64(absolute(key))) + "}}");
-    changes.push_back({key, std::nullopt});
-  }
-  // The key is as read: same modification revision, or still absent.
-  void unchanged(const std::string& key, const EtcdKv* kv) {
-    if (kv) compares.push_back("{\"target\":\"MOD\",\"result\":\"EQUAL\",\"key\":" + quote(base64(absolute(key))) +
-        ",\"mod_revision\":\"" + std::to_string(kv->modRevision) + "\"}");
-    else compares.push_back("{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(base64(absolute(key))) +
-        ",\"version\":\"0\"}");
-  }
-  // The key still exists from the same creation (updates are allowed).
-  void sameCreation(const std::string& key, const EtcdKv& kv) {
-    compares.push_back("{\"target\":\"CREATE\",\"result\":\"EQUAL\",\"key\":" + quote(base64(absolute(key))) +
-        ",\"create_revision\":\"" + std::to_string(kv.createRevision) + "\"}");
-  }
-  // No key below the prefix was created or modified after `revision`.
-  void untouchedSince(const std::string& prefix, uint64_t revision) {
-    auto end = absolute(prefix);
-    ++end.back();
-    compares.push_back("{\"target\":\"MOD\",\"result\":\"LESS\",\"key\":" + quote(base64(absolute(prefix))) +
-        ",\"range_end\":" + quote(base64(end)) + ",\"mod_revision\":\"" + std::to_string(revision + 1) + "\"}");
-  }
-  // The key holds exactly these bytes (a version's definition: there, and the one the pointer names).
-  void holds(const std::string& key, const std::string& bytes) {
-    compares.push_back("{\"target\":\"VALUE\",\"result\":\"EQUAL\",\"key\":" + quote(base64(absolute(key))) +
-        ",\"value\":" + quote(base64(bytes)) + "}");
-  }
-  // The tenant's record (tenants/<tenant>, beside the deployment prefix) is as the write read it.
-  void tenantAsRead(const std::string& tenant, const std::optional<EtcdKv>& record) {
-    const auto key = quote(base64(std::string(TENANTS_PREFIX) + tenant));
-    if (record) compares.push_back("{\"target\":\"MOD\",\"result\":\"EQUAL\",\"key\":" + key + ",\"mod_revision\":\"" +
-        std::to_string(record->modRevision) + "\"}");
-    else compares.push_back("{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + key + ",\"version\":\"0\"}");
-  }
-  // Every key below the prefix, whatever it holds when the transaction commits.
-  void removeBelow(const std::string& prefix) {
-    auto end = absolute(prefix);
-    ++end.back();
-    operations.push_back("{\"request_delete_range\":{\"key\":" + quote(base64(absolute(prefix))) + ",\"range_end\":" +
-        quote(base64(end)) + "}}");
-  }
-  size_t size() const { return std::max(compares.size(), operations.size()); }
-  std::string json() const {
-    std::string out = "{\"compare\":[";
-    for (size_t i = 0; i < compares.size(); ++i) { if (i) out += ','; out += compares[i]; }
-    out += "],\"success\":[";
-    for (size_t i = 0; i < operations.size(); ++i) { if (i) out += ','; out += operations[i]; }
-    return out + "]}";
-  }
-};
-
-const EtcdKv* kvOf(const EtcdSnapshot& raw, const std::string& relative) {
-  auto found = raw.values.find(absolute(relative));
-  return found == raw.values.end() ? nullptr : &found->second;
-}
-
-DeploymentState stateOf(const EtcdSnapshot& raw) {
-  const std::string prefix = DEPLOYMENT_PREFIX;
-  std::vector<DeploymentState::Change> changes;
-  changes.reserve(raw.values.size());
-  for (const auto& [key, kv] : raw.values) changes.push_back({key.substr(prefix.size()), kv.value});
-  DeploymentState state;
-  state.apply(changes, true, raw.revision);
-  return state;
-}
-
-// Binder index keys currently naming `binder`, by target (below the binder's tenant, full names).
-std::map<std::string, std::string> binderKeysOf(const EtcdSnapshot& raw, const std::string& binder) {
-  std::map<std::string, std::string> found;
-  const auto tenant = tenantOf(binder), name = workerNameOf(binder);
-  const std::string prefix = absolute(deploymentTenantPrefix(tenant) + "binders/");
-  for (auto it = raw.values.lower_bound(prefix); it != raw.values.end() && it->first.starts_with(prefix); ++it) {
-    auto rest = it->first.substr(prefix.size());
-    auto slash = rest.find('/');
-    if (slash != std::string::npos && rest.substr(slash + 1) == name)
-      found.emplace(workerFullId(tenant, rest.substr(0, slash)), it->first.substr(std::string(DEPLOYMENT_PREFIX).size()));
-  }
-  return found;
-}
-
-// The keys a change of one tenant reads: the tenant's own, every route (a route's key is global, its owner
-// in its value) and the generation -- three ranges at one revision. Bindings stay within a tenant, so the
-// validity of the tenant's Workers is complete in it; other tenants' routes show as naming absent Workers.
-kj::Promise<EtcdSnapshot> tenantSnapshot(EtcdClient& client, const std::string& tenant) {
-  auto raw = co_await client.range(absolute(deploymentTenantPrefix(tenant)));
-  auto routes = co_await client.range(absolute("routes/"), raw.revision);
-  auto generation = co_await client.range(absolute("generation"), raw.revision);
-  for (auto& [key, kv] : routes.values) raw.values.emplace(key, std::move(kv));
-  // A prefix read: "generation" itself only (a tenant may be called "generations").
-  if (auto found = generation.values.find(absolute("generation")); found != generation.values.end())
-    raw.values.emplace(found->first, std::move(found->second));
-  co_return raw;
-}
-
-// The tenant's record as one write read it, at the revision of its snapshot. Every write compares it
-// (Transaction::tenantAsRead), so that a write that found the tenant active cannot commit once a deletion has marked it,
-// or after its record is gone (control-plane-api.md section 4).
-struct TenantGuard {
-  std::optional<EtcdKv> record;
-  std::string status;  // "" without a record; "unreadable" when it does not decode
-};
-kj::Promise<TenantGuard> tenantGuard(EtcdClient& client, const std::string& tenant, uint64_t revision) {
-  const auto key = std::string(TENANTS_PREFIX) + tenant;
-  auto raw = co_await client.range(key, revision);
-  TenantGuard guard;
-  // A prefix read: the key itself only (a tenant "acme" must not see "acme-corp").
-  if (auto found = raw.values.find(key); found != raw.values.end()) {
-    guard.record = found->second;
-    try { guard.status = decodeTenantRecord(found->second.value).status; } catch (const kj::Exception&) { guard.status = "unreadable"; }
-  }
-  co_return guard;
-}
 // The control plane writes below a tenant only while its record says active; the operations tool also below a tenant
-// without a record (its default tenant has none), never below one being deleted.
-void requireWritable(const std::string& tenant, const TenantGuard& guard, bool controlPlane) {
-  if (!guard.record) {
+// without a record (its default tenant has none), never below one being deleted. The record is in the manifest the
+// write changes: a deletion that marked it first makes the write's revision meet the deletion's, read it and refuse.
+void requireWritable(const std::string& tenant, const TenantManifest& manifest, bool controlPlane) {
+  if (!manifest.record) {
     if (controlPlane) refuse("there is no tenant " + tenant);
     return;
   }
-  if (guard.status == "unreadable") refuse("the record of tenant " + tenant + " cannot be read; nothing written");
-  if (guard.status != "active") refuse("tenant " + tenant + " is being deleted; nothing written");
+  if (manifest.record->status != "active") refuse("tenant " + tenant + " is being deleted; nothing written");
+}
+
+TenantManifest currentOf(const ManifestStore& state, const std::string& tenant) {
+  if (const auto* found = state.tenant(tenant)) return *found;
+  TenantManifest empty;
+  empty.tenant = tenant;
+  return empty;
 }
 
 enum class Operation { APPLY, UPSERT, REMOVE };
@@ -186,7 +70,6 @@ struct ToolOptions {
   std::filesystem::path manifest, codeRoot;
   uint64_t pauseMs = 0;
   uint32_t maxRetries = 0;
-  uint32_t maxTxnOps = 128;
   std::vector<std::string> workers;  // remove
   // Trial loads: on unless --no-trial. A named Server (--trial-server
   // URL) or else the cluster's members, Home first; a member's advertised
@@ -203,10 +86,9 @@ struct ToolOptions {
   // The Servers' management token, sent with every trial load: --token, else
   // COWORKERD_MANAGEMENT_TOKEN.
   std::string token;
-  // The control plane (controlOptions): its writes need the tenant's record (active), a route under the default host
-  // * is written as defaultHostPrefix gives it, and the flip of a Worker's pointer also compares the definition it
-  // names. An upload publishes the manifest's version (objects and definition) and moves no pointer; an activation
-  // moves a Worker's pointer to a version published before.
+  // The control plane (controlOptions): its writes need the tenant's record (active), and a route under the default
+  // host * is written as defaultHostPrefix gives it. An upload publishes the manifest's version (objects and the
+  // version's entry) and moves no pointer; an activation moves a Worker's pointer to a version published before.
   bool controlPlane = false;
   bool publishOnly = false;
   // An activating upload whose manifest lists no routes keeps the Worker's current ones.
@@ -221,105 +103,10 @@ struct ToolOptions {
 };
 
 struct Plan {
-  Transaction txn;
-  std::vector<DeploymentState::Change> definitions;  // to publish before the flip
-  std::vector<std::string> workers;                  // Workers whose pointers this change writes
+  std::vector<std::string> workers;                                 // Workers whose pointers this change writes
+  std::vector<std::shared_ptr<const VersionDefinition>> published;  // versions new to the tenant's version tables
+  std::set<std::string> removed;                                    // Workers whose pointers and routes this change removes
 };
-
-// Pointer, routes and Binding index of one Worker in its new state.
-void writeWorker(Plan& plan, const EtcdSnapshot& raw, const DeploymentState& before,
-    const std::string& id, const VersionDefinition& version, const std::vector<RouteDefinition>& routes,
-    const std::set<std::string>& batch, const std::map<std::string, std::set<std::string>>& claimed,
-    const std::set<std::string>& removed) {
-  auto& txn = plan.txn;
-  const auto pointerKey = deploymentActiveKey(id);
-  txn.unchanged(pointerKey, kvOf(raw, pointerKey));
-  // The Worker's own limits stay with its pointer whatever version it names.
-  const auto* current = before.worker(id);
-  txn.put(pointerKey, activePointerJson(version.versionId, version.definitionHash, current ? current->limits : WorkerLimits{}));
-  plan.workers.push_back(id);
-  std::set<std::string> wanted;
-  for (const auto& route : routes) {
-    const auto key = deploymentRouteKey(route.host, route.pathPrefix);
-    const auto relative = key.substr(7);
-    wanted.insert(relative);
-    auto existing = before.routes().find(relative);
-    const auto* kv = kvOf(raw, key);
-    const auto bytes = routeValueJson(route);
-    if (existing != before.routes().end()) {
-      const auto& owner = existing->second.value.workerId;
-      if (owner == id && kv && kv->value == bytes) continue;
-      // A route keeps its owner unless the owner is part of this change and
-      // no longer lists it, or is removed by it. An unreadable value has no
-      // owner and may be repaired.
-      if (!(owner.empty() || owner == id || removed.contains(owner) || (batch.contains(owner) &&
-          !(claimed.contains(owner) && claimed.at(owner).contains(relative)))))
-        refuse("route " + relative + " belongs to Worker " + owner + "; include that Worker in the same upsert to move it");
-    }
-    txn.unchanged(key, kv);
-    txn.put(key, bytes);
-  }
-  auto owned = before.routesByWorker().find(id);
-  if (owned != before.routesByWorker().end()) for (const auto& relative : owned->second) {
-    if (wanted.contains(relative)) continue;
-    bool movedInBatch = false;
-    for (const auto& [other, keys] : claimed) if (other != id && keys.contains(relative)) movedInBatch = true;
-    if (movedInBatch) continue;
-    const auto key = "routes/" + relative;
-    txn.unchanged(key, kvOf(raw, key));
-    txn.remove(key);
-  }
-  // The secrets the version declares were validated as set at the read; each
-  // must still exist from the same creation (a new value is fine), so a
-  // concurrent `secret delete` and this flip cannot both commit.
-  for (const auto& name : version.secrets) {
-    const auto key = deploymentSecretKey(id, name);
-    if (const auto* kv = kvOf(raw, key)) txn.sameCreation(key, *kv);
-  }
-  std::set<std::string> targets;
-  for (const auto& binding : version.bindings) if (!binding.assets) targets.insert(binding.workerId);
-  for (const auto& target : targets) {
-    // Every write of a binder refreshes its index keys, so a concurrent removal
-    // of the target sees the change; the target must still be the same Worker.
-    txn.put(deploymentBinderKey(target, id), activePointerJson(version.versionId, version.definitionHash));
-    if (batch.contains(target)) continue;
-    const auto* kv = kvOf(raw, deploymentActiveKey(target));
-    if (kv) txn.sameCreation(deploymentActiveKey(target), *kv);
-  }
-  for (const auto& [target, key] : binderKeysOf(raw, id)) if (!targets.contains(target)) txn.remove(key);
-}
-
-void removeWorker(Plan& plan, const EtcdSnapshot& raw, const DeploymentState& before, const std::string& id,
-    const std::set<std::string>& taken, bool guardBinders = true) {
-  auto& txn = plan.txn;
-  const auto pointerKey = deploymentActiveKey(id);
-  const auto* pointer = kvOf(raw, pointerKey);
-  txn.unchanged(pointerKey, pointer);
-  if (pointer) txn.remove(pointerKey);
-  auto owned = before.routesByWorker().find(id);
-  if (owned != before.routesByWorker().end()) for (const auto& relative : owned->second) {
-    if (taken.contains(relative)) continue;  // another Worker of this change writes it
-    const auto key = "routes/" + relative;
-    txn.unchanged(key, kvOf(raw, key));
-    txn.remove(key);
-  }
-  for (const auto& [target, key] : binderKeysOf(raw, id)) txn.remove(key);
-  // A Worker that started binding this one after the read refreshed its index
-  // key; the removal must then be re-validated.
-  if (guardBinders) txn.untouchedSince(deploymentTenantPrefix(tenantOf(id)) + "binders/" + workerNameOf(id) + "/", raw.revision);
-}
-
-std::string preflightDefinitions(const EtcdSnapshot& raw, const DeploymentInput& desired, Plan& plan) {
-  for (const auto& [label, version] : desired.versions) {
-    const auto key = deploymentDefinitionKey(version->workerId, version->versionId);
-    const auto* existing = kvOf(raw, key);
-    const auto bytes = definitionJson(*version);
-    if (existing && existing->value != bytes)
-      refuse("deployment label conflict: existing definition bytes differ for " + label + "; publish changes under a new versionId");
-    if (!existing) plan.definitions.push_back({key, bytes});
-  }
-  return {};
-}
 
 // Every Worker valid before the change stays valid unless the change removes it.
 void requireNoCollateral(const DeploymentState& before, const DeploymentState& after,
@@ -332,27 +119,39 @@ void requireNoCollateral(const DeploymentState& before, const DeploymentState& a
   }
 }
 
-void requireSize(const Transaction& txn, uint32_t limit) {
-  if (txn.size() > limit)
-    refuse("change needs " + std::to_string(txn.size()) + " operations in one etcd transaction (" +
-        std::to_string(txn.compares.size()) + " comparisons, " + std::to_string(txn.operations.size()) +
-        " writes), more than the limit " + std::to_string(limit) +
-        "; split it, or raise --max-txn-ops to match the etcd server's --max-txn-ops");
-}
-
-Plan plan(Operation operation, const EtcdSnapshot& raw, const DeploymentState& before,
-    const DeploymentInput& desired, const ToolOptions& options, bool checkSize = true, bool bumpGeneration = true) {
+// The change, made on `next` (a copy of the tenant's current manifest), and validated with the evaluation the nodes
+// use: the state after the change against the state before it -- the tenant's own keys and every tenant's routes.
+Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state, const DeploymentInput& desired,
+    const ToolOptions& options) {
   Plan result;
-  std::set<std::string> removed;
+  const auto& tenant = options.tenant;
+  const TenantManifest base = next;
+  const auto before = state.stateOf(tenant, &base);
+  auto& removed = result.removed;
+  const char* name = operation == Operation::APPLY ? "apply" : operation == Operation::UPSERT ? "upsert" : "remove";
   if (operation == Operation::REMOVE) {
     for (const auto& id : options.workers) {
-      if (!before.worker(id) && !before.routesByWorker().contains(id)) refuse("Worker " + id + " is not deployed");
+      auto found = next.workers.find(workerNameOf(id));
+      if (found == next.workers.end() || (!found->second.active && found->second.routes.empty()))
+        refuse("Worker " + id + " is not deployed");
+      found->second.active.reset();
+      found->second.routes.clear();
       removed.insert(id);
     }
-    for (const auto& id : removed) removeWorker(result, raw, before, id, {});
   } else {
-    preflightDefinitions(raw, desired, result);
-    std::map<std::string, std::vector<RouteDefinition>> routes;
+    // Versions are immutable: a label names one definition for as long as it exists.
+    for (const auto& [label, version] : desired.versions) {
+      auto& worker = next.workers[workerNameOf(version->workerId)];
+      if (auto existing = worker.versions.find(version->versionId); existing != worker.versions.end()) {
+        if (existing->second.definitionHash != version->definitionHash)
+          refuse("deployment label conflict: existing definition bytes differ for " + label + "; publish changes under a new versionId");
+        continue;
+      }
+      worker.versions.emplace(version->versionId, ManifestVersion{version->definitionHash, base.revision + 1});
+      result.published.push_back(version);
+    }
+    if (options.publishOnly) return result;
+    std::map<std::string, std::vector<ManifestRoute>> routes;
     std::map<std::string, std::set<std::string>> claimed;
     std::set<std::string> keys;
     for (const auto& route : desired.routes) {
@@ -363,64 +162,52 @@ Plan plan(Operation operation, const EtcdSnapshot& raw, const DeploymentState& b
       if (!desired.active.contains(route.workerId))
         refuse(std::string(operation == Operation::UPSERT ? "route names a Worker that this upsert does not activate: "
                                                           : "route Worker has no active version: ") + route.workerId);
-      routes[route.workerId].push_back(route);
+      routes[route.workerId].push_back({route.host, route.pathPrefix});
       claimed[route.workerId].insert(route.host + route.pathPrefix);
     }
     std::set<std::string> batch;
     for (const auto& [id, pin] : desired.active) batch.insert(id);
     if (operation == Operation::APPLY) {
       if (desired.routes.empty()) refuse("at least one route is required");
-      // The tenant's whole state: its Workers and routes outside the manifest are removed; other tenants'
-      // are not touched.
-      const auto& tenant = options.tenant;
-      for (const auto& [id, worker] : before.workers()) if (tenantOf(id) == tenant && !batch.contains(id)) removed.insert(id);
-      for (const auto& [id, owned] : before.routesByWorker())
-        if (tenantOf(id) == tenant && !batch.contains(id)) removed.insert(id);
-      // One guard over the tenant's Binding index keeps a large whole-state
-      // removal within one transaction; apply has no retry anyway.
-      for (const auto& id : removed) removeWorker(result, raw, before, id, keys, false);
-      if (!removed.empty()) result.txn.untouchedSince(deploymentTenantPrefix(tenant) + "binders/", raw.revision);
-      for (const auto& id : batch) {
-        // A Worker whose pointer and routes already match is not rewritten.
-        const auto& pin = desired.active.at(id);
-        const auto* pointer = kvOf(raw, deploymentActiveKey(id));
-        const auto* existing = before.worker(id);
-        bool same = pointer && pointer->value == activePointerJson(pin.versionId, pin.definitionHash,
-            existing ? existing->limits : WorkerLimits{});
-        auto owned = before.routesByWorker().find(id);
-        auto current = owned == before.routesByWorker().end() ? std::set<std::string>() : owned->second;
-        same = same && current == (claimed.contains(id) ? claimed.at(id) : std::set<std::string>());
-        for (const auto& route : routes[id]) {
-          const auto* kv = kvOf(raw, deploymentRouteKey(route.host, route.pathPrefix));
-          same = same && kv && kv->value == routeValueJson(route);
-        }
-        if (!same) writeWorker(result, raw, before, id, *desired.versions.at(id + "@" + pin.versionId),
-            routes[id], batch, claimed, removed);
+      // The tenant's whole state: its Workers outside the manifest lose their pointers and routes (their versions and
+      // secrets stay, as a remove leaves them).
+      for (auto& [workerName, worker] : next.workers) {
+        const auto id = workerFullId(tenant, workerName);
+        if (batch.contains(id) || (!worker.active && worker.routes.empty())) continue;
+        worker.active.reset();
+        worker.routes.clear();
+        removed.insert(id);
       }
-      // Anything else under routes/ of this tenant (or without a readable owner) that the manifest does not list.
-      for (const auto& [key, route] : before.routes()) {
-        const auto relative = "routes/" + key;
-        if (result.txn.written.contains(relative) || keys.contains(key)) continue;
-        if (!route.value.workerId.empty() && tenantOf(route.value.workerId) != tenant) continue;
-        result.txn.unchanged(relative, kvOf(raw, relative));
-        result.txn.remove(relative);
-      }
-    } else {
-      for (const auto& id : batch) {
-        const auto& pin = desired.active.at(id);
-        writeWorker(result, raw, before, id, *desired.versions.at(id + "@" + pin.versionId), routes[id], batch, claimed, removed);
+    }
+    for (const auto& id : batch) {
+      const auto& pin = desired.active.at(id);
+      auto& worker = next.workers[workerNameOf(id)];
+      // The Worker's own limits stay with its pointer whatever version it names.
+      const WorkerLimits limits = worker.active ? worker.active->limits : WorkerLimits{};
+      worker.active = ManifestPointer{pin.versionId, pin.definitionHash, limits};
+      auto list = routes[id];
+      std::sort(list.begin(), list.end());
+      worker.routes = std::move(list);
+      result.workers.push_back(id);
+    }
+    // A route keeps its owner unless the owner is part of this change and no longer lists it, or is removed by it. An
+    // unreadable value has no owner and may be repaired. Routes are every tenant's: another tenant's is never taken.
+    for (const auto& [id, list] : routes) {
+      for (const auto& route : list) {
+        const auto relative = route.host + route.pathPrefix;
+        auto existing = before.routes().find(relative);
+        if (existing == before.routes().end()) continue;
+        const auto& owner = existing->second.value.workerId;
+        if (!(owner.empty() || owner == id || removed.contains(owner) || (batch.contains(owner) &&
+            !(claimed.contains(owner) && claimed.at(owner).contains(relative)))))
+          refuse("route " + relative + " belongs to Worker " + owner + "; include that Worker in the same upsert to move it");
       }
     }
   }
-  if (bumpGeneration) result.txn.put("generation", quote(std::to_string(before.generation() + 1)));
   // Validate exactly what will be written, with the shared evaluation.
-  DeploymentState after = before;
-  std::vector<DeploymentState::Change> simulated = result.definitions;
-  simulated.insert(simulated.end(), result.txn.changes.begin(), result.txn.changes.end());
-  after.apply(simulated, false, raw.revision);
-  const char* name = operation == Operation::APPLY ? "apply" : operation == Operation::UPSERT ? "upsert" : "remove";
+  const auto after = state.stateOf(tenant, &next);
   if (operation == Operation::APPLY) {
-    auto problem = after.firstProblem(options.tenant);
+    auto problem = after.firstProblem(tenant);
     if (!problem.empty()) refuse("apply rejected: " + problem);
   } else {
     for (const auto& [id, pin] : desired.active) {
@@ -435,93 +222,38 @@ Plan plan(Operation operation, const EtcdSnapshot& raw, const DeploymentState& b
     }
     requireNoCollateral(before, after, removed, name);
   }
-  if (checkSize) requireSize(result.txn, options.maxTxnOps);
   return result;
 }
 
-// An initial whole-state deployment too large for one transaction is written
-// as upserts of new Workers, Binding targets first and every Binding cycle in
-// one step. Only used when the deployment state is empty: nothing is served
-// yet, so no request can observe a partly written state it relied on.
-std::vector<DeploymentInput> stages(const DeploymentInput& desired, uint32_t limit) {
-  std::map<std::string, std::vector<std::string>> targets;
-  std::map<std::string, size_t> routes;
-  for (const auto& [id, pin] : desired.active) {
-    for (const auto& binding : desired.versions.at(id + "@" + pin.versionId)->bindings)
-      if (desired.active.contains(binding.workerId)) targets[id].push_back(binding.workerId);
-  }
-  for (const auto& route : desired.routes) ++routes[route.workerId];
-  // Tarjan emits each strongly connected component after every component it reaches.
-  std::map<std::string, size_t> index, low;
-  std::vector<std::string> stack;
-  std::set<std::string> onStack;
-  std::vector<std::vector<std::string>> units;
-  size_t counter = 0;
-  std::function<void(const std::string&)> connect = [&](const std::string& id) {
-    index[id] = low[id] = counter++;
-    stack.push_back(id); onStack.insert(id);
-    for (const auto& target : targets[id]) {
-      if (!index.contains(target)) { connect(target); low[id] = std::min(low[id], low[target]); }
-      else if (onStack.contains(target)) low[id] = std::min(low[id], index[target]);
-    }
-    if (low[id] != index[id]) return;
-    std::vector<std::string> unit;
-    while (true) {
-      auto top = stack.back(); stack.pop_back(); onStack.erase(top);
-      unit.push_back(top);
-      if (top == id) break;
-    }
-    units.push_back(std::move(unit));
-  };
-  for (const auto& [id, pin] : desired.active) if (!index.contains(id)) connect(id);
-  std::vector<DeploymentInput> result;
-  DeploymentInput current;
-  // The generation write of the last step; the comparison of the tenant's record in every step.
-  size_t writes = 1, compares = 1;
-  auto flush = [&] { if (!current.active.empty()) result.push_back(std::move(current)); current = {}; writes = 1; compares = 1; };
-  for (const auto& unit : units) {
-    size_t unitWrites = 0, unitCompares = 0;
-    for (const auto& id : unit) {
-      const auto& version = *desired.versions.at(id + "@" + desired.active.at(id).versionId);
-      const auto bindings = version.bindings.size();
-      unitWrites += 1 + routes[id] + bindings;
-      unitCompares += 1 + routes[id] + bindings + version.secrets.size();
-    }
-    if (std::max(unitWrites + 1, unitCompares + 1) > limit)
-      refuse("a Binding cycle of " + std::to_string(unit.size()) + " Workers does not fit one etcd transaction");
-    if (std::max(writes + unitWrites, compares + unitCompares) > limit) flush();
-    for (const auto& id : unit) {
-      const auto& pin = desired.active.at(id);
-      current.active.emplace(id, pin);
-      for (const auto& [label, version] : desired.versions) if (version->workerId == id) current.versions.emplace(label, version);
-      for (const auto& route : desired.routes) if (route.workerId == id) current.routes.push_back(route);
-    }
-    writes += unitWrites; compares += unitCompares;
-  }
-  flush();
-  return result;
-}
-
-// The immutable objects first (then the trial loads, then the definition keys -- a version exists in the
-// deployment state only once it loads). A failed PUT leaves only immutable objects, never a partly published
-// deployment.
+// The immutable objects first (then the trial loads, then the manifest that names them -- a version exists in the
+// desired state only once it loads). Content objects are written where missing; a definition is created only if
+// absent, and one that exists must hold the same bytes. A failed PUT leaves only immutable objects, never a partly
+// published deployment.
 kj::Promise<void> publishObjects(ObjectStore& storage, const DeploymentInput& desired, const DeploymentCode& code,
     std::ostream& report) {
   const auto uploadStartedAtUnixMs = nowUnixMs();
   uint64_t uploaded = 0, skipped = 0, uploadedModules = 0, skippedModules = 0, uploadedAssets = 0, skippedAssets = 0;
-  std::map<std::string, const std::string*> objects;
   std::map<std::string, std::string> definitions;
-  for (const auto& [label, version] : desired.versions) {
-    auto entry = definitions.emplace("definitions/" + version->definitionHash, definitionJson(*version)).first;
-    objects.emplace(entry->first, &entry->second);
+  for (const auto& [label, version] : desired.versions)
+    definitions.emplace("definitions/" + version->definitionHash, definitionJson(*version));
+  for (const auto& [key, bytes] : definitions) {
+    auto existing = co_await storage.get(key);
+    if (existing.status == 404) {
+      auto created = co_await storage.create(key, bytes);
+      if (created.created) { ++uploaded; continue; }
+      existing = co_await storage.get(key);
+    }
+    KJ_REQUIRE(existing.status == 200, "object store read failed", existing.status);
+    if (existing.bytes != bytes)
+      refuse(key + " holds other bytes than this definition (a damaged object); nothing published");
+    ++skipped;
   }
   // The manifest's code objects: bundles/, packages/ and modules/ (code module
   // and static asset bytes share modules/<SHA-256>).
-  for (const auto& [key, bytes] : code.objects) objects.emplace(key, &bytes);
-  for (const auto& [key, bytes] : objects) {
+  for (const auto& [key, bytes] : code.objects) {
     const bool module = key.starts_with("modules/"), asset = code.assetObjects.contains(key);
     if (co_await storage.exists(key)) { ++skipped; skippedModules += module; skippedAssets += asset; }
-    else { co_await storage.put(key, *bytes); ++uploaded; uploadedModules += module; uploadedAssets += asset; }
+    else { co_await storage.put(key, bytes); ++uploaded; uploadedModules += module; uploadedAssets += asset; }
   }
   const auto uploadFinishedAtUnixMs = nowUnixMs();
   report << ",\"uploadStartedAtUnixMs\":" << uploadStartedAtUnixMs << ",\"uploadFinishedAtUnixMs\":" << uploadFinishedAtUnixMs
@@ -532,53 +264,11 @@ kj::Promise<void> publishObjects(ObjectStore& storage, const DeploymentInput& de
   if (!code.assetObjects.empty()) report << ",\"uploadedAssets\":" << uploadedAssets << ",\"skippedAssets\":" << skippedAssets;
 }
 
-// The definition keys of a change: each created only where none is (an existing one must hold the same bytes), and only
-// while the tenant's record is as read, so that no definition lands below a tenant whose deletion has begun. A record
-// that changed otherwise (new quotas, say) is read again and the definition published under it.
-kj::Promise<void> publishDefinitions(EtcdClient& client, const Plan& planned, std::ostream& report, uint64_t& revision,
-    const std::string& tenant, TenantGuard& guard, bool controlPlane) {
-  const auto tenantKey = std::string(TENANTS_PREFIX) + tenant;
-  for (const auto& definition : planned.definitions) {
-    const auto key = absolute(definition.key);
-    const auto& bytes = *definition.value;
-    for (uint32_t attempt = 0;; ++attempt) {
-      Transaction record;
-      record.tenantAsRead(tenant, guard.record);
-      auto response = co_await client.request("/v3/kv/txn",
-          "{\"compare\":[{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(base64(key)) +
-          ",\"version\":\"0\"}," + record.compares[0] + "],\"success\":[{\"request_put\":{\"key\":" + quote(base64(key)) + ",\"value\":" +
-          quote(base64(bytes)) + "}}],\"failure\":[{\"request_range\":{\"key\":" + quote(base64(key)) + "}},{\"request_range\":{\"key\":" +
-          quote(base64(tenantKey)) + "}}]}");
-      capnp::MallocMessageBuilder message;
-      auto json = message.initRoot<Json>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-      revision = std::max(revision, integer(field(json, "header"), "revision"));
-      if (boolean(json, "succeeded")) break;
-      auto responses = field(json, "responses").getArray();
-      auto kvs = field(field(responses[0], "response_range"), "kvs");
-      auto records = field(field(responses[1], "response_range"), "kvs");
-      const bool present = records.isArray() && records.getArray().size() == 1;
-      const bool recordChanged = present != guard.record.has_value() ||
-          (present && integer(records.getArray()[0], "mod_revision") != guard.record->modRevision);
-      if (recordChanged) {
-        guard = co_await tenantGuard(client, tenant, 0);
-        requireWritable(tenant, guard, controlPlane);
-        if (attempt >= 8) refuse("the record of tenant " + tenant + " kept changing while a definition was published; nothing flipped");
-        continue;
-      }
-      KJ_REQUIRE(kvs.isArray() && kvs.getArray().size() == 1 && unbase64(text(kvs.getArray()[0], "value")) == bytes,
-          "deployment label conflict during definition publication", definition.key.c_str());
-      break;
-    }
-  }
-  report << ",\"publishedDefinitions\":" << planned.definitions.size();
-}
-
 // ---------------------------------------------------------------------------
 // Trial loads: after the immutable parts are published and before the
 // flip, one Server loads each new version (POST /__coworkerd/trial-load). A
 // version that does not load stops the change: nothing is flipped, the
-// published definitions and objects stay (immutable, harmless).
+// published objects stay (immutable, harmless).
 
 struct TrialContext {
   kj::Network& network;
@@ -630,9 +320,9 @@ kj::Promise<TrialAttempt> postTrial(TrialContext& context, kj::Timer& timer, std
 
 struct TrialMember { std::string id, address; };
 
-// The cluster's nodes: their member keys /coworkerd/v2/nodes/<nodeId> (the keys below one are its records), or the live
-// heartbeats on the object store.
-kj::Promise<std::vector<TrialMember>> trialMembers(EtcdClient& client, const ToolOptions& options) {
+// The cluster's nodes: their member keys /coworkerd/v2/nodes/<nodeId> in etcd (the keys below one are its records), or
+// the live heartbeats on the object store.
+kj::Promise<std::vector<TrialMember>> trialMembers(EtcdClient* client, const ToolOptions& options) {
   if (options.membersOnObjectStore) {
     KJ_REQUIRE(options.memberStore != nullptr, "the object store's members need the object store (--storage-endpoint)");
     std::vector<TrialMember> live;
@@ -640,8 +330,9 @@ kj::Promise<std::vector<TrialMember>> trialMembers(EtcdClient& client, const Too
       live.push_back({member.id, member.address});
     co_return live;
   }
+  if (client == nullptr) co_return std::vector<TrialMember>{};
   const std::string prefix = NODES_PREFIX;
-  auto raw = co_await client.range(prefix);
+  auto raw = co_await client->range(prefix);
   std::vector<TrialMember> members;
   for (const auto& [key, kv] : raw.values) {
     if (key.find('/', prefix.size()) != std::string::npos) continue;
@@ -682,15 +373,15 @@ TrialVerdict readTrialVerdict(const std::string& body) {
 
 // Trials of every version whose pointer this change moves; adds the "trial"
 // field to the report, or writes the refusal's record to `out` and refuses.
-kj::Promise<void> runTrials(EtcdClient& client, kj::Timer& timer, TrialContext& context, const char* operation,
-    const DeploymentInput& desired, const DeploymentState& before, const Plan& planned, uint64_t revision,
+kj::Promise<void> runTrials(EtcdClient* client, kj::Timer& timer, TrialContext& context, const char* operation,
+    const DeploymentInput& desired, const DeploymentState& before, const std::vector<std::string>& workers, uint64_t revision,
     const ToolOptions& options, std::ostream& report, std::ostream& out) {
   if (!options.trial) { report << ",\"trial\":{\"enabled\":false}"; co_return; }
   const auto phaseStarted = nowUnixMs();
   std::string records;
   size_t skipped = 0;
   std::vector<std::shared_ptr<const VersionDefinition>> versions;
-  for (const auto& id : planned.workers) {
+  for (const auto& id : workers) {
     const auto& version = desired.versions.at(id + "@" + desired.active.at(id).versionId);
     const auto* current = before.worker(id);
     // Not new: the pointer already names this definition.
@@ -779,22 +470,28 @@ kj::Promise<void> runTrials(EtcdClient& client, kj::Timer& timer, TrialContext& 
          << ",\"startedAtUnixMs\":" << phaseStarted << ",\"finishedAtUnixMs\":" << nowUnixMs() << "}";
 }
 
-// Activation: the input that moves a Worker's pointer to a version published before -- its
-// definition as stored -- with the Worker's current usable routes, or the routes the activation names.
-// Built from each attempt's read, so a retry sees the routes as they are then.
-DeploymentInput activationInput(const EtcdSnapshot& raw, const DeploymentState& before, ToolOptions::Activation activation) {
+// Activation: the input that moves a Worker's pointer to a version published before -- its definition as stored --
+// with the Worker's current usable routes, or the routes the activation names. Built from each attempt's manifest, so
+// a retry sees the routes as they are then.
+kj::Promise<DeploymentInput> activationInput(ManifestStore& state, const TenantManifest& manifest, const DeploymentState& before,
+    ToolOptions::Activation activation) {
   if (activation.versionId.empty()) {
     const auto* worker = before.worker(activation.workerId);
     if (!worker || !worker->pointerError.empty()) refuse("Worker " + activation.workerId + " is not deployed (it has no active version)");
     activation.versionId = worker->versionId;
   }
-  const auto* kv = kvOf(raw, deploymentDefinitionKey(activation.workerId, activation.versionId));
-  if (!kv) refuse("version " + activation.versionId + " of Worker " + activation.workerId + " was never uploaded");
-  auto known = before.definitions().find(activation.workerId + "@" + activation.versionId);
-  if (known == before.definitions().end() || !known->second.version)
+  auto worker = manifest.workers.find(workerNameOf(activation.workerId));
+  if (worker == manifest.workers.end() || !worker->second.versions.contains(activation.versionId))
+    refuse("version " + activation.versionId + " of Worker " + activation.workerId + " was never uploaded");
+  const auto hash = worker->second.versions.at(activation.versionId).definitionHash;
+  co_await state.fetchDefinitions({hash});
+  auto version = state.definition(hash);
+  if (!version || version->key() != activation.workerId + "@" + activation.versionId) {
+    auto failure = state.definitionFailures().find(hash);
     refuse("version " + activation.versionId + " of Worker " + activation.workerId + " has an unusable definition: " +
-        (known == before.definitions().end() ? std::string("unreadable") : known->second.error));
-  const auto& version = known->second.version;
+        (failure != state.definitionFailures().end() ? "definitions/" + hash.substr(0, 12) + " " + failure->second
+            : std::string("its definition names another version")));
+  }
   DeploymentInput input;
   input.versions.emplace(version->key(), version);
   input.active.emplace(activation.workerId, versionPin(*version));
@@ -805,185 +502,128 @@ DeploymentInput activationInput(const EtcdSnapshot& raw, const DeploymentState& 
       if (route != before.routes().end() && route->second.error.empty()) input.routes.push_back(route->second.value);
     }
   }
-  return input;
+  co_return input;
 }
 
-// The tool's writes. The record of a change goes to `out` (the tool's standard output); a refusal is an
-// exception with one sentence, after a refused trial's record. Every read is the tenant's snapshot. The
-// order: the immutable objects, the trial loads, the definition keys, the flip -- a version that does not load is
-// never published in the deployment state (control-plane-api.md: "a version exists only if it loads").
-kj::Promise<void> write(Operation operation, EtcdClient& client, kj::Timer& timer, ObjectStore* storage,
+// The generation the nodes report once they applied the index this write named: the sum over the tenants.
+uint64_t clusterGeneration(const ManifestStore& state) {
+  uint64_t sum = 0;
+  for (const auto& [tenant, manifest] : state.tenants()) sum += manifest.generation;
+  return sum;
+}
+
+std::string conflictWaits(const std::vector<uint64_t>& waits) {
+  std::string out = "[";
+  for (size_t i = 0; i < waits.size(); ++i) out += (i ? "," : "") + std::to_string(waits[i]);
+  return out + ']';
+}
+
+// The tool's writes. The record of a change goes to `out` (the tool's standard output); a refusal is an exception with
+// one sentence, after a refused trial's record. The order: a dry run of the change on the current manifest (its
+// refusals come first), the immutable objects, the trial loads, then the manifest's next revision -- the flip, computed
+// again on the manifest as it is then, retried on a newer one, never published or tried again (a version exists in the
+// desired state only once it loads).
+kj::Promise<void> write(Operation operation, EtcdClient* client, kj::Timer& timer, ManifestStore& state, ObjectStore* storage,
     const ToolOptions& options, TrialContext& trials, std::ostream& out) {
   const auto startedAtUnixMs = nowUnixMs();
+  const auto& tenant = options.tenant;
   DeploymentInput desired;
   DeploymentCode code;
   if (operation != Operation::REMOVE && !options.activation) {
-    desired = readDeploymentManifest(options.manifest, options.tenant);
+    desired = readDeploymentManifest(options.manifest, tenant);
     code = readDeploymentCode(desired, options.codeRoot.empty() ? options.manifest.parent_path() : options.codeRoot);
+    for (const auto& [label, version] : desired.versions) state.rememberDefinition(*version);
   }
+  const bool manifestRoutes = !desired.routes.empty();
+  // The change's input as one manifest reads: an activation's version and routes, the routes an activating upload keeps,
+  // the default host's prefixes as the control plane writes them.
+  auto input = [&](const TenantManifest& manifest, const DeploymentState& before) -> kj::Promise<DeploymentInput> {
+    DeploymentInput result = desired;
+    if (options.activation) result = co_await activationInput(state, manifest, before, *options.activation);
+    else if (options.keepRoutes && !manifestRoutes) {
+      result.routes.clear();
+      for (const auto& [id, pin] : result.active) {
+        auto owned = before.routesByWorker().find(id);
+        if (owned == before.routesByWorker().end()) continue;
+        for (const auto& key : owned->second) {
+          auto route = before.routes().find(key);
+          if (route != before.routes().end() && route->second.error.empty()) result.routes.push_back(route->second.value);
+        }
+      }
+    }
+    if (options.controlPlane)
+      for (auto& route : result.routes)
+        if (route.host == "*") route.pathPrefix = defaultHostPrefix(tenantOf(route.workerId), route.pathPrefix);
+    co_return result;
+  };
+  const char* name = options.activation ? "activate" : options.publishOnly ? "upload"
+      : operation == Operation::APPLY ? "apply" : operation == Operation::UPSERT ? "upsert" : "remove";
+  // The dry run: the tenant as the mirror holds it now.
+  const auto readStarted = std::chrono::steady_clock::now();
+  if (!state.tenant(tenant)) co_await state.reloadTenant(tenant);
+  auto current = currentOf(state, tenant);
+  requireWritable(tenant, current, options.controlPlane);
+  co_await state.fetchDefinitions(namedDefinitions(current));
+  const auto readRevision = state.index().revision;
+  auto before = state.stateOf(tenant, &current);
+  auto previewInput = co_await input(current, before);
+  Plan preview;
+  {
+    TenantManifest dry = current;
+    preview = plan(operation, dry, state, previewInput, options);
+  }
+  const auto plannedAt = std::chrono::steady_clock::now();
   std::ostringstream report;
-  bool published = false;
-  std::mt19937 random(std::random_device{}());
+  if (operation == Operation::REMOVE) report << ",\"publishedDefinitions\":0";
+  else {
+    // An activated version was published when it was uploaded: its objects are in the store.
+    if (!options.activation) co_await publishObjects(*storage, desired, code, report);
+    // Every new version loads on a node before anything flips (before the manifest names it). An upload tries the
+    // versions it publishes.
+    std::vector<std::string> tried = preview.workers;
+    if (options.publishOnly) for (const auto& [id, pin] : previewInput.active) tried.push_back(id);
+    co_await runTrials(client, timer, trials, name, previewInput, before, tried, readRevision, options, report, out);
+    report << ",\"publishedDefinitions\":" << preview.published.size();
+  }
+  if (options.pauseMs) co_await timer.afterDelay(options.pauseMs * kj::MILLISECONDS);
+  Plan planned;
+  const auto submittedAtUnixMs = nowUnixMs();
+  auto written = co_await state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
+    requireWritable(tenant, next, options.controlPlane);
+    co_await state.fetchDefinitions(namedDefinitions(next));
+    const TenantManifest base = next;
+    auto attemptInput = co_await input(base, state.stateOf(tenant, &base));
+    planned = plan(operation, next, state, attemptInput, options);
+  }, !options.publishOnly, options.maxRetries + 1);
   if (options.publishOnly) {
-    // An upload: the immutable parts, the trial loads of its versions, then their definitions, after the same
-    // conflict check as a deployment; no pointer moves.
-    auto raw = co_await tenantSnapshot(client, options.tenant);
-    auto guard = co_await tenantGuard(client, options.tenant, raw.revision);
-    requireWritable(options.tenant, guard, options.controlPlane);
-    auto before = stateOf(raw);
-    Plan uploaded;
-    preflightDefinitions(raw, desired, uploaded);
-    for (const auto& [id, pin] : desired.active) uploaded.workers.push_back(id);
-    uint64_t publishedRevision = raw.revision;
-    co_await publishObjects(*storage, desired, code, report);
-    co_await runTrials(client, timer, trials, "upload", desired, before, uploaded, raw.revision, options, report, out);
-    co_await publishDefinitions(client, uploaded, report, publishedRevision, options.tenant, guard, options.controlPlane);
-    out << "{\"operation\":\"upload\",\"flipped\":false,\"revision\":\"" << publishedRevision << "\",\"readRevision\":\""
-        << raw.revision << "\",\"versions\":[";
+    out << "{\"operation\":\"upload\",\"flipped\":false,\"tenant\":" << quote(tenant) << ",\"revision\":\"" << state.index().revision
+        << "\",\"readRevision\":\"" << readRevision << "\",\"manifestRevision\":" << written.manifest.revision
+        << ",\"changed\":" << (written.changed ? "true" : "false") << ",\"attempts\":" << written.attempts << ",\"versions\":[";
     size_t index = 0;
     for (const auto& [label, version] : desired.versions) out << (index++ ? "," : "") << quote(label);
     out << "],\"startedAtUnixMs\":" << startedAtUnixMs << ",\"finishedAtUnixMs\":" << nowUnixMs() << report.str() << '}' << std::endl;
     co_return;
   }
-  const bool manifestRoutes = !desired.routes.empty();
-  for (uint32_t attempt = 0;; ++attempt) {
-    const auto readStarted = std::chrono::steady_clock::now();
-    auto raw = co_await tenantSnapshot(client, options.tenant);
-    auto guard = co_await tenantGuard(client, options.tenant, raw.revision);
-    const auto readFinished = std::chrono::steady_clock::now();
-    requireWritable(options.tenant, guard, options.controlPlane);
-    auto before = stateOf(raw);
-    if (options.activation) desired = activationInput(raw, before, *options.activation);
-    if (options.keepRoutes && !manifestRoutes && !options.activation) {
-      desired.routes.clear();
-      for (const auto& [id, pin] : desired.active) {
-        auto owned = before.routesByWorker().find(id);
-        if (owned == before.routesByWorker().end()) continue;
-        for (const auto& key : owned->second) {
-          auto route = before.routes().find(key);
-          if (route != before.routes().end() && route->second.error.empty()) desired.routes.push_back(route->second.value);
-        }
-      }
-    }
-    // The control plane writes /<tenant> under * as /<tenant>/ (a route of the tenant's own path space only).
-    if (options.controlPlane)
-      for (auto& route : desired.routes)
-        if (route.host == "*") route.pathPrefix = defaultHostPrefix(tenantOf(route.workerId), route.pathPrefix);
-    auto planned = plan(operation, raw, before, desired, options, false);
-    // Nothing commits once the tenant's record changed (its deletion marks it first).
-    planned.txn.tenantAsRead(options.tenant, guard.record);
-    // A pointer this write moves names a definition that is still there, with the bytes the write read: a version
-    // deleted meanwhile (`activate-delete-race`) makes the flip fail rather than leave the Worker naming a definition
-    // that is gone. A definition this write publishes itself is not compared: it was just created, and the comparison
-    // would take an operation from every Worker of a whole-state write (section 8's 63).
-    for (const auto& id : planned.workers) {
-      const auto& version = *desired.versions.at(id + "@" + desired.active.at(id).versionId);
-      const auto key = deploymentDefinitionKey(id, version.versionId);
-      if (std::any_of(planned.definitions.begin(), planned.definitions.end(),
-          [&](const DeploymentState::Change& change) { return change.key == key; })) continue;
-      if (const auto* stored = kvOf(raw, key)) planned.txn.holds(key, stored->value);
-    }
-    const auto planned_at = std::chrono::steady_clock::now();
-    if (planned.txn.size() > options.maxTxnOps) {
-      bool tenantEmpty = true;
-      for (const auto& [id, worker] : before.workers()) tenantEmpty = tenantEmpty && tenantOf(id) != options.tenant;
-      for (const auto& [id, keys] : before.routesByWorker()) tenantEmpty = tenantEmpty && tenantOf(id) != options.tenant;
-      if (operation != Operation::APPLY || !tenantEmpty) requireSize(planned.txn, options.maxTxnOps);
-      // A tenant's initial deployment staged as upserts; the whole state was validated above.
-      uint64_t publishedRevision = raw.revision;
-      co_await publishObjects(*storage, desired, code, report);
-      co_await runTrials(client, timer, trials, "apply", desired, before, planned, raw.revision, options, report, out);
-      co_await publishDefinitions(client, planned, report, publishedRevision, options.tenant, guard, options.controlPlane);
-      auto steps = stages(desired, options.maxTxnOps);
-      uint64_t revision = 0, generation = 0;
-      size_t compares = 0, operations = 0;
-      for (size_t step = 0; step < steps.size(); ++step) {
-        auto current = co_await tenantSnapshot(client, options.tenant);
-        auto currentGuard = co_await tenantGuard(client, options.tenant, current.revision);
-        requireWritable(options.tenant, currentGuard, options.controlPlane);
-        auto state = stateOf(current);
-        auto part = plan(Operation::UPSERT, current, state, steps[step], options, false, step + 1 == steps.size());
-        part.txn.tenantAsRead(options.tenant, currentGuard.record);
-        requireSize(part.txn, options.maxTxnOps);
-        if (!part.definitions.empty()) KJ_FAIL_REQUIRE("definitions disappeared after publication; refusing to continue");
-        auto response = co_await client.request("/v3/kv/txn", part.txn.json());
-        capnp::MallocMessageBuilder message;
-        auto json = message.initRoot<Json>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-        if (!boolean(json, "succeeded"))
-          refuse("期间有其他部署 (another deployment wrote during a staged initial deployment, step " + std::to_string(step + 1) +
-              " of " + std::to_string(steps.size()) + "); earlier steps remain");
-        revision = integer(field(json, "header"), "revision");
-        generation = state.generation() + 1;
-        compares = std::max(compares, part.txn.compares.size());
-        operations = std::max(operations, part.txn.operations.size());
-      }
-      out << "{\"operation\":\"apply\",\"tenant\":" << quote(options.tenant) << ",\"generation\":" << generation << ",\"revision\":\""
-          << revision << "\",\"readRevision\":\"" << raw.revision << "\",\"attempts\":1,\"retries\":0,\"staged\":" << steps.size()
-          << ",\"compares\":" << compares << ",\"operations\":" << operations << ",\"workers\":[";
-      size_t index = 0;
-      for (const auto& [id, pin] : desired.active) out << (index++ ? "," : "") << quote(id);
-      out << "],\"removed\":[],\"startedAtUnixMs\":" << startedAtUnixMs << ",\"committedAtUnixMs\":" << nowUnixMs()
-          << report.str() << '}' << std::endl;
-      co_return;
-    }
-    const char* name = options.activation ? "activate"
-        : operation == Operation::APPLY ? "apply" : operation == Operation::UPSERT ? "upsert" : "remove";
-    if (!published) {
-      if (operation == Operation::REMOVE) report << ",\"publishedDefinitions\":0";
-      else {
-        uint64_t publishedRevision = raw.revision;
-        // An activated version was published when it was uploaded: its objects are in the store.
-        if (!options.activation) co_await publishObjects(*storage, desired, code, report);
-        // Every new version loads on a node before anything flips (before its definition is published).
-        co_await runTrials(client, timer, trials, name, desired, before, planned, raw.revision, options, report, out);
-        if (options.activation) report << ",\"publishedDefinitions\":" << planned.definitions.size();
-        else co_await publishDefinitions(client, planned, report, publishedRevision, options.tenant, guard, options.controlPlane);
-      }
-      published = true;
-    } else if (!planned.definitions.empty()) {
-      KJ_FAIL_REQUIRE("definitions disappeared after publication; refusing to continue");
-    }
-    if (options.activation && !planned.definitions.empty())
-      KJ_FAIL_REQUIRE("the activated version's definition is not published; refusing to continue");
-    if (options.pauseMs) co_await timer.afterDelay(options.pauseMs * kj::MILLISECONDS);
-    const auto submittedAtUnixMs = nowUnixMs();
-    auto response = co_await client.request("/v3/kv/txn", planned.txn.json());
-    const auto committedAtUnixMs = nowUnixMs();
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    if (boolean(json, "succeeded")) {
-      out << "{\"operation\":\"" << name << "\",\"tenant\":" << quote(options.tenant) << ",\"generation\":" << before.generation() + 1
-          << ",\"revision\":\"" << integer(field(json, "header"), "revision")
-          << "\",\"readRevision\":\"" << raw.revision << "\",\"attempts\":" << attempt + 1
-          << ",\"retries\":" << attempt << ",\"compares\":" << planned.txn.compares.size()
-          << ",\"operations\":" << planned.txn.operations.size() << ",\"workers\":[";
-      for (size_t i = 0; i < planned.workers.size(); ++i) out << (i ? "," : "") << quote(planned.workers[i]);
-      out << "],\"removed\":[";
-      for (size_t i = 0; i < options.workers.size(); ++i) out << (i ? "," : "") << quote(options.workers[i]);
-      out << "],\"startedAtUnixMs\":" << startedAtUnixMs << ",\"submittedAtUnixMs\":" << submittedAtUnixMs
-          << ",\"committedAtUnixMs\":" << committedAtUnixMs
-          << ",\"readMicros\":" << std::chrono::duration_cast<std::chrono::microseconds>(readFinished - readStarted).count()
-          << ",\"planMicros\":" << std::chrono::duration_cast<std::chrono::microseconds>(planned_at - readFinished).count()
-          << ",\"readKeys\":" << raw.values.size() << report.str() << '}' << std::endl;
-      co_return;
-    }
-    if (attempt >= options.maxRetries)
-      refuse("期间有其他部署 (another deployment changed a key of this change; " + std::to_string(attempt + 1) +
-          " attempts); flip aborted, nothing written");
-    // Re-read, re-validate and retry after a short jittered pause.
-    const auto ceiling = std::min<uint32_t>(10u << std::min<uint32_t>(attempt, 4u), 160u);
-    co_await timer.afterDelay(std::uniform_int_distribution<uint32_t>(ceiling / 2, ceiling)(random) * kj::MILLISECONDS);
-  }
+  out << "{\"operation\":\"" << name << "\",\"tenant\":" << quote(tenant) << ",\"generation\":" << clusterGeneration(state)
+      << ",\"tenantGeneration\":" << written.manifest.generation << ",\"revision\":\"" << state.index().revision
+      << "\",\"readRevision\":\"" << readRevision << "\",\"manifestRevision\":" << written.manifest.revision
+      << ",\"changed\":" << (written.changed ? "true" : "false") << ",\"indexed\":" << (written.indexed ? "true" : "false")
+      << ",\"attempts\":" << written.attempts << ",\"retries\":" << written.attempts - 1
+      << ",\"conflictWaitsMs\":" << conflictWaits(written.conflictWaitsMs) << ",\"workers\":[";
+  for (size_t i = 0; i < planned.workers.size(); ++i) out << (i ? "," : "") << quote(planned.workers[i]);
+  out << "],\"removed\":[";
+  size_t index = 0;
+  for (const auto& id : planned.removed) out << (index++ ? "," : "") << quote(id);
+  out << "],\"startedAtUnixMs\":" << startedAtUnixMs << ",\"submittedAtUnixMs\":" << submittedAtUnixMs
+      << ",\"committedAtUnixMs\":" << (written.committedAtUnixMs ? written.committedAtUnixMs : nowUnixMs())
+      << ",\"readMicros\":" << std::chrono::duration_cast<std::chrono::microseconds>(plannedAt - readStarted).count()
+      << report.str() << '}' << std::endl;
 }
 
 // ---------------------------------------------------------------------------
 // Secrets: secret put <worker> <name> (value on standard input), secret delete
-// <worker> <name>, secret list <worker>. A write is conditioned on the secret's
-// own key (and, for a delete, on the Worker's pointer), never on another
-// Worker's keys. Nothing here prints, logs or reports a value: output carries
-// names, lengths and times.
+// <worker> <name>, secret list <worker>. A value is sealed with the cluster's secrets key before it is written into
+// the tenant's manifest. Nothing here prints, logs or reports a value: output carries names, lengths and times.
 
 // The value as `wrangler secret put` reads it: a line typed without echo on a
 // terminal, otherwise all of standard input; trailing whitespace removed.
@@ -1018,107 +658,124 @@ std::string readSecretValue() {
   // Never echo the arguments: a value passed by mistake must not reach the output.
   if (operation == "put")
     refuse("secret put reads the value from standard input and takes no value argument or option; usage: "
-        "coworkerd-apiserver tool secret put <worker> <name> --endpoint URL < value-file (or type it when prompted)");
-  refuse("usage: coworkerd-apiserver tool secret put|delete <worker> <name> --endpoint URL [--tenant T], "
-      "or coworkerd-apiserver tool secret list <worker> --endpoint URL [--tenant T]");
+        "coworkerd-apiserver tool secret put <worker> <name> [--tenant T] [--storage-endpoint URL] [--secrets-key-file FILE] "
+        "< value-file (or type it when prompted)");
+  refuse("usage: coworkerd-apiserver tool secret put|delete <worker> <name> [--tenant T] [--storage-endpoint URL] "
+      "[--storage-bucket B] [--secrets-key-file FILE] [--max-retries N], or coworkerd-apiserver tool secret list <worker> "
+      "[--tenant T] [--storage-endpoint URL] (--endpoint URL is accepted and unused)");
 }
 
-// The revision of a committed transaction, 0 when a comparison failed.
-kj::Promise<uint64_t> commitSecret(EtcdClient& client, const Transaction& txn) {
-  auto response = co_await client.request("/v3/kv/txn", txn.json());
-  capnp::MallocMessageBuilder message;
-  auto json = message.initRoot<Json>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-  co_return boolean(json, "succeeded") ? integer(field(json, "header"), "revision") : 0;
-}
-
-kj::Promise<void> secretPut(EtcdClient& client, kj::Timer& timer, std::string worker, std::string name,
-    std::string value, uint32_t maxRetries, std::ostream& out, bool controlPlane = false) {
+kj::Promise<void> secretPut(ManifestStore& state, std::string worker, std::string name, std::string value, uint32_t maxRetries,
+    std::ostream& out, bool controlPlane = false) {
   if (auto problem = secretValueProblem(value); !problem.empty()) { value.clear(); refuse(problem + " (" + worker + "/" + name + ")"); }
-  const auto key = deploymentSecretKey(worker, name);
-  std::mt19937 random(std::random_device{}());
-  for (uint32_t attempt = 0;; ++attempt) {
-    auto raw = co_await tenantSnapshot(client, tenantOf(worker));
-    auto guard = co_await tenantGuard(client, tenantOf(worker), raw.revision);
-    requireWritable(tenantOf(worker), guard, controlPlane);
-    auto state = stateOf(raw);
-    const auto* existing = kvOf(raw, key);
-    const auto setAtUnixMs = nowUnixMs();
-    Transaction txn;
-    txn.unchanged(key, existing);
-    txn.tenantAsRead(tenantOf(worker), guard.record);
-    txn.put(key, secretRecordJson(value, setAtUnixMs));
-    if (auto revision = co_await commitSecret(client, txn)) {
-      // The active version, as read: whether it declares the name (a typo shows here).
-      const auto* current = state.worker(worker);
-      auto pointed = current ? state.definition(worker + "@" + current->versionId) : nullptr;
-      const bool declared = pointed && std::find(pointed->secrets.begin(), pointed->secrets.end(), name) != pointed->secrets.end();
-      out << "{\"operation\":\"secret put\",\"workerId\":" << quote(worker) << ",\"name\":" << quote(name)
-          << ",\"bytes\":" << value.size() << ",\"created\":" << (existing ? "false" : "true")
-          << ",\"declaredByActiveVersion\":" << (declared ? "true" : "false")
-          << ",\"setAtUnixMs\":" << setAtUnixMs << ",\"revision\":\"" << revision
-          << "\",\"readRevision\":\"" << raw.revision << "\",\"attempts\":" << attempt + 1 << '}' << std::endl;
-      co_return;
+  if (!state.secretsKey())
+    refuse("a secret's value is sealed with the cluster's secrets key: set secrets.keyFile (or COWORKERD_SECRETS_KEY_FILE, "
+        "--secrets-key-file)");
+  const auto tenant = tenantOf(worker), workerName = workerNameOf(worker);
+  bool existed = false, declared = false;
+  uint64_t setAtUnixMs = 0;
+  const auto readRevision = state.index().revision;
+  auto written = co_await state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
+    requireWritable(tenant, next, controlPlane);
+    auto& entry = next.workers[workerName];
+    existed = entry.secrets.contains(name);
+    setAtUnixMs = nowUnixMs();
+    entry.secrets[name] = state.secretsKey()->seal(secretAad(tenant, workerName, name), value, setAtUnixMs);
+    // The active version, as read: whether it declares the name (a typo shows here).
+    declared = false;
+    if (entry.active) {
+      const auto hash = entry.active->definitionHash;
+      co_await state.fetchDefinitions({hash});
+      if (auto version = state.definition(hash))
+        declared = std::find(version->secrets.begin(), version->secrets.end(), name) != version->secrets.end();
     }
-    if (attempt >= maxRetries)
-      refuse("another write changed secret " + worker + "/" + name + " (" + std::to_string(attempt + 1) + " attempts); nothing written");
-    co_await timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
-  }
+  }, true, maxRetries + 1);
+  out << "{\"operation\":\"secret put\",\"workerId\":" << quote(worker) << ",\"name\":" << quote(name)
+      << ",\"bytes\":" << value.size() << ",\"created\":" << (existed ? "false" : "true")
+      << ",\"declaredByActiveVersion\":" << (declared ? "true" : "false")
+      << ",\"setAtUnixMs\":" << setAtUnixMs << ",\"revision\":\"" << state.index().revision
+      << "\",\"readRevision\":\"" << readRevision << "\",\"manifestRevision\":" << written.manifest.revision
+      << ",\"attempts\":" << written.attempts << '}' << std::endl;
 }
 
-kj::Promise<void> secretDelete(EtcdClient& client, kj::Timer& timer, std::string worker, std::string name,
-    uint32_t maxRetries, std::ostream& out, bool controlPlane = false) {
-  const auto key = deploymentSecretKey(worker, name);
-  std::mt19937 random(std::random_device{}());
-  for (uint32_t attempt = 0;; ++attempt) {
-    auto raw = co_await tenantSnapshot(client, tenantOf(worker));
-    auto guard = co_await tenantGuard(client, tenantOf(worker), raw.revision);
-    requireWritable(tenantOf(worker), guard, controlPlane);
-    auto before = stateOf(raw);
-    const auto* existing = kvOf(raw, key);
-    if (!existing) refuse("secret " + name + " of Worker " + worker + " is not set");
+kj::Promise<void> secretDelete(ManifestStore& state, std::string worker, std::string name, uint32_t maxRetries, std::ostream& out,
+    bool controlPlane = false) {
+  const auto tenant = tenantOf(worker), workerName = workerNameOf(worker);
+  const auto readRevision = state.index().revision;
+  auto written = co_await state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
+    requireWritable(tenant, next, controlPlane);
+    auto entry = next.workers.find(workerName);
+    if (entry == next.workers.end() || !entry->second.secrets.contains(name))
+      refuse("secret " + name + " of Worker " + worker + " is not set");
+    co_await state.fetchDefinitions(namedDefinitions(next));
+    const TenantManifest base = next;
+    next.workers[workerName].secrets.erase(name);
     // The shared evaluation decides: a delete must leave every valid Worker
     // valid (the active version must not declare the name). The Worker's own
     // reason first, then any Worker that binds it.
-    DeploymentState after = before;
-    after.apply({{key, std::nullopt}}, false, raw.revision);
+    const auto before = state.stateOf(tenant, &base), after = state.stateOf(tenant, &next);
     if (before.valid(worker) && !after.valid(worker))
       refuse("secret delete would make valid Worker " + worker + " invalid: " + after.worker(worker)->reason +
           "; deploy a version that does not declare " + name + " first");
     requireNoCollateral(before, after, {}, "secret delete");
-    Transaction txn;
-    txn.unchanged(key, existing);
-    // A concurrent flip of this Worker to a version declaring the name.
-    txn.unchanged(deploymentActiveKey(worker), kvOf(raw, deploymentActiveKey(worker)));
-    txn.tenantAsRead(tenantOf(worker), guard.record);
-    txn.remove(key);
-    if (auto revision = co_await commitSecret(client, txn)) {
-      out << "{\"operation\":\"secret delete\",\"workerId\":" << quote(worker) << ",\"name\":" << quote(name)
-          << ",\"revision\":\"" << revision << "\",\"readRevision\":\"" << raw.revision
-          << "\",\"attempts\":" << attempt + 1 << '}' << std::endl;
-      co_return;
-    }
-    if (attempt >= maxRetries)
-      refuse("another write changed secret " + worker + "/" + name + " or the Worker's pointer (" +
-          std::to_string(attempt + 1) + " attempts); nothing deleted");
-    co_await timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
-  }
+  }, true, maxRetries + 1);
+  out << "{\"operation\":\"secret delete\",\"workerId\":" << quote(worker) << ",\"name\":" << quote(name)
+      << ",\"revision\":\"" << state.index().revision << "\",\"readRevision\":\"" << readRevision
+      << "\",\"manifestRevision\":" << written.manifest.revision << ",\"attempts\":" << written.attempts << '}' << std::endl;
 }
 
-kj::Promise<void> secretList(EtcdClient& client, std::string worker, std::ostream& out) {
-  auto raw = co_await client.range(absolute(deploymentTenantPrefix(tenantOf(worker)) + "secrets/" + workerNameOf(worker) + "/"));
-  auto state = stateOf(raw);
-  out << "{\"workerId\":" << quote(worker) << ",\"revision\":\"" << raw.revision << "\",\"secrets\":[";
+// Names, lengths and times: never a value. With this process's secrets key, a value that does not open with it is
+// listed with its problem (bytes null), as the nodes would find it.
+std::string secretEntries(const ManifestStore& state, const std::string& tenant, const std::string& workerName,
+    const ManifestWorker& worker, bool times) {
+  std::string out;
   size_t index = 0;
-  auto names = state.secrets().find(worker);
-  // Names, lengths and times: never a value.
-  if (names != state.secrets().end()) for (const auto& [name, record] : names->second) {
-    out << (index++ ? "," : "") << "{\"name\":" << quote(name) << ",\"bytes\":";
-    if (record.error.empty()) out << record.value.size() << ",\"setAtUnixMs\":" << record.setAtUnixMs;
-    else out << "null,\"setAtUnixMs\":null,\"problem\":" << quote(record.error);
-    out << '}';
+  for (const auto& [name, sealed] : worker.secrets) {
+    auto length = sealedLength(sealed);
+    std::string problem;
+    if (!length) problem = "the sealed record cannot be read";
+    else if (state.secretsKey()) {
+      auto value = state.secretsKey()->open(secretAad(tenant, workerName, name), sealed);
+      if (!value) problem = "the value does not open with this process's secrets key";
+      else std::fill(value->begin(), value->end(), '\0');
+    }
+    out += std::string(index++ ? "," : "") + "{\"name\":" + quote(name) + ",\"bytes\":";
+    if (problem.empty()) out += std::to_string(*length) + (times ? ",\"setAtUnixMs\":" + std::to_string(sealed.setAtUnixMs) : "");
+    else out += std::string("null") + (times ? ",\"setAtUnixMs\":null" : "") + ",\"problem\":" + quote(problem);
+    out += '}';
+  }
+  return out;
+}
+
+void secretList(const ManifestStore& state, std::string worker, std::ostream& out) {
+  const auto tenant = tenantOf(worker), workerName = workerNameOf(worker);
+  out << "{\"workerId\":" << quote(worker) << ",\"revision\":\"" << state.index().revision << "\",\"secrets\":[";
+  if (const auto* manifest = state.tenant(tenant)) {
+    if (auto found = manifest->workers.find(workerName); found != manifest->workers.end())
+      out << secretEntries(state, tenant, workerName, found->second, true);
   }
   out << "]}" << std::endl;
+}
+
+// The object store and the secrets key of a tool invocation: the options' values, else the environment's.
+struct StoreArguments {
+  ObjectStoreConfig config;
+  std::string keyFile;
+};
+StoreArguments storeArguments() {
+  StoreArguments arguments;
+  if (auto value = std::getenv("COWORKERD_STORAGE_ENDPOINT")) arguments.config.endpoint = value;
+  if (auto value = std::getenv("COWORKERD_STORAGE_BUCKET")) arguments.config.bucket = value;
+  if (auto value = std::getenv("COWORKERD_OBJECT_DIRECTORY")) {
+    arguments.config.backend = "directory";
+    arguments.config.directory = value;
+  }
+  if (auto value = std::getenv("COWORKERD_SECRETS_KEY_FILE"); value != nullptr && *value) arguments.keyFile = value;
+  return arguments;
+}
+std::optional<SecretsKey> loadKey(const std::string& file) {
+  if (file.empty()) return std::nullopt;
+  return SecretsKey::load(file);
 }
 
 int runSecretTool(int argc, char** argv) {
@@ -1127,11 +784,17 @@ int runSecretTool(int argc, char** argv) {
   if (operation != "put" && operation != "delete" && operation != "list") refuseSecretUsage("");
   const size_t positionals = operation == "list" ? 1 : 2;
   std::vector<std::string> names;
-  std::string endpoint, tenant = DEFAULT_TENANT;
+  std::string tenant = DEFAULT_TENANT;
+  auto arguments = storeArguments();
   uint32_t maxRetries = 8;
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
-    if (argument == "--endpoint" && index + 1 < argc) { endpoint = argv[++index]; continue; }
+    // etcd's endpoint (the deployment state's place before 0.4): accepted, unused.
+    if (argument == "--endpoint" && index + 1 < argc) { ++index; continue; }
+    if (argument == "--storage-endpoint" && index + 1 < argc) { arguments.config.endpoint = argv[++index]; continue; }
+    if (argument == "--storage-bucket" && index + 1 < argc) { arguments.config.bucket = argv[++index]; continue; }
+    if (argument == "--storage-region" && index + 1 < argc) { arguments.config.region = argv[++index]; continue; }
+    if (argument == "--secrets-key-file" && index + 1 < argc) { arguments.keyFile = argv[++index]; continue; }
     if (argument == "--tenant" && index + 1 < argc) {
       tenant = argv[++index];
       if (!tenantName(tenant)) refuse("invalid tenant ([a-z0-9][a-z0-9-]{0,62})");
@@ -1147,7 +810,7 @@ int runSecretTool(int argc, char** argv) {
     if (argument.starts_with("-") || names.size() == positionals) refuseSecretUsage(operation);
     names.push_back(argument);
   }
-  if (names.size() != positionals || endpoint.empty()) refuseSecretUsage(operation);
+  if (names.size() != positionals || arguments.config.endpoint.empty()) refuseSecretUsage(operation);
   // Not echoed either: a value typed in place of a name must not reach the output.
   if (!deploymentSafeName(names[0])) refuse("invalid workerId (letters, digits, '-', '_' and '.')");
   if (positionals == 2 && !environmentName(names[1]))
@@ -1155,13 +818,14 @@ int runSecretTool(int argc, char** argv) {
   std::string value;
   if (operation == "put") value = readSecretValue();
   auto io = kj::setupAsyncIo();
-  auto headers = kj::HttpHeaderTable::Builder().build();
-  EtcdClient client(endpoint, 750, io.provider->getNetwork(), io.provider->getTimer(), *headers);
+  ObjectStore storage(arguments.config, io.provider->getNetwork(), io.provider->getTimer());
+  ManifestStore state(storage, io.provider->getTimer(), loadKey(arguments.keyFile), std::cerr);
   const auto worker = workerFullId(tenant, names[0]);
   try {
-    if (operation == "put") secretPut(client, io.provider->getTimer(), worker, names[1], value, maxRetries, std::cout).wait(io.waitScope);
-    else if (operation == "delete") secretDelete(client, io.provider->getTimer(), worker, names[1], maxRetries, std::cout).wait(io.waitScope);
-    else secretList(client, worker, std::cout).wait(io.waitScope);
+    state.load(operation != "list", false).wait(io.waitScope);
+    if (operation == "put") secretPut(state, worker, names[1], value, maxRetries, std::cout).wait(io.waitScope);
+    else if (operation == "delete") secretDelete(state, worker, names[1], maxRetries, std::cout).wait(io.waitScope);
+    else secretList(state, worker, std::cout);
   } catch (const kj::Exception& error) {
     // Defence in depth: a failure description never quotes the value.
     std::string description = error.getDescription().cStr();
@@ -1214,42 +878,22 @@ ToolOptions controlOptions(ControlContext& context) {
 }
 }  // namespace
 
-// The Workers of a tenant the deployment state names (a pointer, a definition or a route), with their versions in
-// upload order, active version, validity, limits, routes and secrets (names and lengths) -- or one of them.
-kj::Promise<std::string> controlWorkers(EtcdClient& client, std::string tenant, std::optional<std::string> only) {
+// The Workers of a tenant its manifest names (a pointer, a version, a route or a secret), with their versions in upload
+// order, active version, validity, limits, routes and secrets (names and lengths) -- or one of them.
+kj::Promise<std::string> controlWorkers(ManifestStore& state, std::string tenant, std::optional<std::string> only) {
   std::ostringstream printed;
   try {
-    auto raw = co_await tenantSnapshot(client, tenant);
-    auto state = stateOf(raw);
-    std::map<std::string, std::vector<std::pair<uint64_t, std::string>>> versions;
-    for (const auto& [label, definition] : state.definitions()) {
-      const auto at = label.find('@');
-      if (at == std::string::npos) continue;
-      const auto id = label.substr(0, at), versionId = label.substr(at + 1);
-      if (tenantOf(id) != tenant) continue;
-      const auto* kv = kvOf(raw, deploymentDefinitionKey(id, versionId));
-      std::string entry = "{\"versionId\":" + quote(versionId) + ",\"uploadedRevision\":\"" +
-          std::to_string(kv ? kv->createRevision : 0) + '"';
-      if (const auto& version = definition.version) {
-        entry += ",\"definitionHash\":" + quote(version->definitionHash) + ",\"contentHash\":" + quote(version->contentHash) +
-            ",\"format\":" + quote(version->format) + ",\"compatibilityDate\":" + quote(version->compatibilityDate) +
-            ",\"mainModule\":" + quote(version->mainModule) + ",\"assets\":" + (version->assets ? "true" : "false") + ",\"secrets\":[";
-        for (size_t i = 0; i < version->secrets.size(); ++i) entry += (i ? "," : "") + quote(version->secrets[i]);
-        entry += ']';
-      } else {
-        entry += ",\"problem\":" + quote(definition.error);
-      }
-      versions[id].emplace_back(kv ? kv->createRevision : 0, entry + '}');
-    }
+    const auto manifest = currentOf(state, tenant);
+    co_await state.fetchDefinitions(namedDefinitions(manifest));
+    auto current = state.stateOf(tenant, &manifest);
     std::set<std::string> ids;
-    for (const auto& [id, list] : versions) ids.insert(id);
-    for (const auto& [id, worker] : state.workers()) if (tenantOf(id) == tenant) ids.insert(id);
-    for (const auto& [id, keys] : state.routesByWorker()) if (tenantOf(id) == tenant) ids.insert(id);
+    for (const auto& [name, worker] : manifest.workers) if (!worker.empty()) ids.insert(workerFullId(tenant, name));
     if (only && !ids.contains(*only)) refuse("Worker " + *only + " is not deployed");
     auto describe = [&](const std::string& id) {
+      const auto& entry = manifest.workers.at(workerNameOf(id));
       std::string out = "{\"tenant\":" + quote(tenant) + ",\"worker\":" + quote(workerNameOf(id)) + ",\"workerId\":" + quote(id) +
           ",\"activeVersion\":";
-      if (const auto* worker = state.worker(id)) {
+      if (const auto* worker = current.worker(id)) {
         out += (worker->pointerError.empty() ? quote(worker->versionId) : std::string("null")) + ",\"valid\":" +
             (worker->valid ? "true" : "false") + ",\"reason\":" + (worker->valid ? std::string("null") : quote(worker->reason)) +
             ",\"limits\":" + workerLimitsJson(worker->limits);
@@ -1261,33 +905,44 @@ kj::Promise<std::string> controlWorkers(EtcdClient& client, std::string tenant, 
       } else {
         out += "null,\"valid\":false,\"reason\":\"no active version\",\"limits\":{}";
       }
-      auto& list = versions[id];
-      std::sort(list.begin(), list.end());
+      std::vector<std::pair<std::pair<uint64_t, std::string>, std::string>> versions;
+      for (const auto& [versionId, version] : entry.versions) {
+        std::string item = "{\"versionId\":" + quote(versionId) + ",\"uploadedRevision\":\"" + std::to_string(version.uploadedRevision) + '"';
+        auto definition = state.definition(version.definitionHash);
+        if (definition && definition->key() == id + "@" + versionId) {
+          item += ",\"definitionHash\":" + quote(definition->definitionHash) + ",\"contentHash\":" + quote(definition->contentHash) +
+              ",\"format\":" + quote(definition->format) + ",\"compatibilityDate\":" + quote(definition->compatibilityDate) +
+              ",\"mainModule\":" + quote(definition->mainModule) + ",\"assets\":" + (definition->assets ? "true" : "false") + ",\"secrets\":[";
+          for (size_t i = 0; i < definition->secrets.size(); ++i) item += (i ? "," : "") + quote(definition->secrets[i]);
+          item += ']';
+        } else {
+          auto failure = state.definitionFailures().find(version.definitionHash);
+          item += ",\"definitionHash\":" + quote(version.definitionHash) + ",\"problem\":" +
+              quote(definition ? "the definition names another version" : "definitions/" + version.definitionHash.substr(0, 12) + " " +
+                  (failure != state.definitionFailures().end() ? failure->second : std::string("not read")));
+        }
+        versions.push_back({{version.uploadedRevision, versionId}, item + '}'});
+      }
+      std::sort(versions.begin(), versions.end());
       out += ",\"versions\":[";
-      for (size_t i = 0; i < list.size(); ++i) out += (i ? "," : "") + list[i].second;
+      for (size_t i = 0; i < versions.size(); ++i) out += (i ? "," : "") + versions[i].second;
       out += "],\"routes\":[";
       size_t routes = 0;
-      if (auto owned = state.routesByWorker().find(id); owned != state.routesByWorker().end()) {
+      if (auto owned = current.routesByWorker().find(id); owned != current.routesByWorker().end()) {
         for (const auto& key : owned->second) {
-          auto route = state.routes().find(key);
-          if (route == state.routes().end()) continue;
+          auto route = current.routes().find(key);
+          if (route == current.routes().end()) continue;
           out += std::string(routes++ ? "," : "") + "{\"host\":" + quote(route->second.value.host) + ",\"pathPrefix\":" +
               quote(route->second.value.pathPrefix) + ",\"effective\":" + (route->second.effective ? "true" : "false") + '}';
         }
       }
-      out += "],\"secrets\":[";
-      size_t secrets = 0;
-      if (auto names = state.secrets().find(id); names != state.secrets().end()) for (const auto& [name, record] : names->second) {
-        out += std::string(secrets++ ? "," : "") + "{\"name\":" + quote(name) + ",\"bytes\":" +
-            (record.error.empty() ? std::to_string(record.value.size()) : std::string("null")) + '}';
-      }
-      return out + "]}";
+      return out + "],\"secrets\":[" + secretEntries(state, tenant, workerNameOf(id), entry, false) + "]}";
     };
     if (only) {
       printed << describe(*only);
     } else {
-      printed << "{\"tenant\":" << quote(tenant) << ",\"revision\":\"" << raw.revision << "\",\"generation\":"
-              << state.generation() << ",\"workers\":[";
+      printed << "{\"tenant\":" << quote(tenant) << ",\"revision\":\"" << state.index().revision << "\",\"generation\":"
+              << current.generation() << ",\"workers\":[";
       size_t index = 0;
       for (const auto& id : ids) printed << (index++ ? "," : "") << describe(id);
       printed << "]}";
@@ -1316,7 +971,7 @@ kj::Promise<std::string> controlDeploy(ControlContext& context, std::filesystem:
     options.publishOnly = !activate;
     options.keepRoutes = true;
     TrialContext trials{context.network, context.headers, context.token};
-    co_await write(Operation::UPSERT, context.etcd, context.timer, &context.storage, options, trials, out);
+    co_await write(Operation::UPSERT, &context.etcd, context.timer, context.state, &context.storage, options, trials, out);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1335,26 +990,27 @@ kj::Promise<std::string> controlActivate(ControlContext& context, std::string wo
     if (routes) for (const auto& route : *routes)
       if (route.workerId != workerId) refuse("the routes may only name Worker " + workerId);
     if (!routes) {
-      auto raw = co_await tenantSnapshot(context.etcd, tenantOf(workerId));
-      auto state = stateOf(raw);
+      const auto manifest = currentOf(context.state, tenantOf(workerId));
+      co_await context.state.fetchDefinitions(namedDefinitions(manifest));
+      auto state = context.state.stateOf(tenantOf(workerId), &manifest);
       const auto* worker = state.worker(workerId);
       if (worker && worker->valid && worker->versionId == versionId) {
         co_return controlSuccess("{\"operation\":\"activate\",\"unchanged\":true,\"workerId\":" + quote(workerId) +
-            ",\"versionId\":" + quote(versionId) + ",\"readRevision\":\"" + std::to_string(raw.revision) + "\"}");
+            ",\"versionId\":" + quote(versionId) + ",\"readRevision\":\"" + std::to_string(context.state.index().revision) + "\"}");
       }
     }
     auto options = controlOptions(context);
     options.tenant = tenantOf(workerId);
     options.activation = ToolOptions::Activation{workerId, versionId, routes};
     TrialContext trials{context.network, context.headers, context.token};
-    co_await write(Operation::UPSERT, context.etcd, context.timer, nullptr, options, trials, out);
+    co_await write(Operation::UPSERT, &context.etcd, context.timer, context.state, nullptr, options, trials, out);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
   co_return controlSuccess(out.str());
 }
 
-// DELETE a Worker: its pointer and routes (its definitions stay, as with the tool's remove).
+// DELETE a Worker: its pointer and routes (its versions and secrets stay, as with the tool's remove).
 kj::Promise<std::string> controlRemove(ControlContext& context, std::string workerId) {
   std::ostringstream out;
   try {
@@ -1363,42 +1019,35 @@ kj::Promise<std::string> controlRemove(ControlContext& context, std::string work
     options.tenant = tenantOf(workerId);
     options.workers = {workerId};
     TrialContext trials{context.network, context.headers, context.token};
-    co_await write(Operation::REMOVE, context.etcd, context.timer, nullptr, options, trials, out);
+    co_await write(Operation::REMOVE, &context.etcd, context.timer, context.state, nullptr, options, trials, out);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
   co_return controlSuccess(out.str());
 }
 
-// A Worker's own limits: its pointer rewritten with them, conditioned on the pointer as read.
+// A Worker's own limits: its pointer rewritten with them.
 kj::Promise<std::string> controlLimits(ControlContext& context, std::string workerId, WorkerLimits limits) {
   std::ostringstream out;
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId");
-    std::mt19937 random(std::random_device{}());
-    for (uint32_t attempt = 0;; ++attempt) {
-      auto raw = co_await tenantSnapshot(context.etcd, tenantOf(workerId));
-      auto guard = co_await tenantGuard(context.etcd, tenantOf(workerId), raw.revision);
-      requireWritable(tenantOf(workerId), guard, true);
-      auto state = stateOf(raw);
-      const auto pointerKey = deploymentActiveKey(workerId);
-      const auto* kv = kvOf(raw, pointerKey);
-      const auto* worker = state.worker(workerId);
-      if (!kv || !worker) refuse("Worker " + workerId + " is not deployed (its limits travel with its active version)");
-      if (!worker->pointerError.empty()) refuse("Worker " + workerId + " has an unusable pointer: " + worker->pointerError);
-      Transaction txn;
-      txn.unchanged(pointerKey, kv);
-      txn.tenantAsRead(tenantOf(workerId), guard.record);
-      txn.put(pointerKey, activePointerJson(worker->versionId, worker->definitionHash, limits));
-      if (auto revision = co_await commitSecret(context.etcd, txn)) {
-        out << "{\"operation\":\"limits\",\"workerId\":" << quote(workerId) << ",\"versionId\":" << quote(worker->versionId)
-            << ",\"limits\":" << workerLimitsJson(limits) << ",\"previous\":" << workerLimitsJson(worker->limits)
-            << ",\"revision\":\"" << revision << "\",\"attempts\":" << attempt + 1 << '}';
-        break;
-      }
-      if (attempt >= 8) refuse("another write changed Worker " + workerId + "'s pointer (" + std::to_string(attempt + 1) + " attempts)");
-      co_await context.timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
-    }
+    const auto tenant = tenantOf(workerId);
+    std::string versionId;
+    WorkerLimits previous;
+    auto written = co_await context.state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
+      requireWritable(tenant, next, true);
+      auto entry = next.workers.find(workerNameOf(workerId));
+      if (entry == next.workers.end() || !entry->second.active)
+        refuse("Worker " + workerId + " is not deployed (its limits travel with its active version)");
+      versionId = entry->second.active->versionId;
+      previous = entry->second.active->limits;
+      entry->second.active->limits = limits;
+      co_return;
+    }, true);
+    out << "{\"operation\":\"limits\",\"workerId\":" << quote(workerId) << ",\"versionId\":" << quote(versionId)
+        << ",\"limits\":" << workerLimitsJson(limits) << ",\"previous\":" << workerLimitsJson(previous)
+        << ",\"revision\":\"" << context.state.index().revision << "\",\"manifestRevision\":" << written.manifest.revision
+        << ",\"attempts\":" << written.attempts << '}';
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1415,10 +1064,15 @@ std::string cleanupJson(const ObjectCleanup& c) {
 // Deletes the objects of `gone` (definitions about to leave, or gone) that no definition of `remaining` references
 // (control-plane-api.md section 5: reference counted by hash). A v2 package's modules and assets go only when no
 // remaining package lists them; past 1,000 remaining packages the modules are kept (reading every manifest is the
-// cost of the count).
+// cost of the count). Not `complete` (a remaining version's definition could not be read): nothing is deleted.
 kj::Promise<ObjectCleanup> cleanupObjects(ObjectStore& storage, const std::vector<std::shared_ptr<const VersionDefinition>>& gone,
-    const std::vector<std::shared_ptr<const VersionDefinition>>& remaining) {
+    const std::vector<std::shared_ptr<const VersionDefinition>>& remaining, bool complete) {
   ObjectCleanup result;
+  if (!complete) {
+    result.kept = gone.size();
+    result.skippedModules = "kept: a remaining version's definition could not be read, so what it references is unknown";
+    co_return result;
+  }
   std::set<std::string> keepDefinitions, keepContent, keepModules;
   std::set<std::string> remainingPackages;
   for (const auto& version : remaining) {
@@ -1449,13 +1103,13 @@ kj::Promise<ObjectCleanup> cleanupObjects(ObjectStore& storage, const std::vecto
     if (remainingPackages.size() > 1000) {
       result.skippedModules = "kept: more than 1000 remaining packages to check";
     } else {
-      bool complete = true;
+      bool readable = true;
       for (const auto& hash : remainingPackages) {
         auto hashes = co_await manifestHashes(hash);
-        if (!hashes) { complete = false; break; }
+        if (!hashes) { readable = false; break; }
         keepModules.insert(hashes->begin(), hashes->end());
       }
-      if (!complete) result.skippedModules = "kept: a remaining package's manifest could not be read";
+      if (!readable) result.skippedModules = "kept: a remaining package's manifest could not be read";
       else for (const auto& hash : gonePackages) {
         auto hashes = co_await manifestHashes(hash);
         if (!hashes) continue;  // already gone (a deletion that ran before)
@@ -1476,12 +1130,18 @@ kj::Promise<ObjectCleanup> cleanupObjects(ObjectStore& storage, const std::vecto
   co_return result;
 }
 
-std::vector<std::shared_ptr<const VersionDefinition>> definitionsOf(const DeploymentState& state,
-    const std::function<bool(const std::string&)>& keep) {
-  std::vector<std::shared_ptr<const VersionDefinition>> out;
-  for (const auto& [label, definition] : state.definitions())
-    if (definition.version && keep(definition.version->workerId)) out.push_back(definition.version);
-  return out;
+// Every definition the tenants `keep` selects name, and whether each one was read.
+struct Definitions { std::vector<std::shared_ptr<const VersionDefinition>> versions; bool complete = true; };
+kj::Promise<Definitions> definitionsOf(ManifestStore& state, std::function<bool(const std::string&)> keep) {
+  std::set<std::string> hashes;
+  for (const auto& [tenant, manifest] : state.tenants()) if (keep(tenant)) hashes.merge(namedDefinitions(manifest));
+  co_await state.fetchDefinitions(hashes);
+  Definitions result;
+  for (const auto& hash : hashes) {
+    if (auto version = state.definition(hash)) result.versions.push_back(version);
+    else result.complete = false;
+  }
+  co_return result;
 }
 }  // namespace
 
@@ -1490,40 +1150,29 @@ kj::Promise<std::string> controlDeleteVersion(ControlContext& context, std::stri
   std::ostringstream out;
   try {
     if (!workerFullName(workerId) || !deploymentSafeName(versionId)) refuse("invalid workerId or versionId");
-    std::mt19937 random(std::random_device{}());
-    std::shared_ptr<const VersionDefinition> deleted;
-    uint64_t revision = 0;
-    for (uint32_t attempt = 0;; ++attempt) {
-      auto raw = co_await tenantSnapshot(context.etcd, tenantOf(workerId));
-      auto guard = co_await tenantGuard(context.etcd, tenantOf(workerId), raw.revision);
-      requireWritable(tenantOf(workerId), guard, true);
-      auto state = stateOf(raw);
-      const auto key = deploymentDefinitionKey(workerId, versionId);
-      const auto* kv = kvOf(raw, key);
-      if (!kv) refuse("version " + versionId + " of Worker " + workerId + " was never uploaded");
-      const auto pointerKey = deploymentActiveKey(workerId);
-      const auto* worker = state.worker(workerId);
-      if (worker && worker->versionId == versionId)
+    const auto tenant = tenantOf(workerId);
+    std::string hash;
+    auto written = co_await context.state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
+      requireWritable(tenant, next, true);
+      auto entry = next.workers.find(workerNameOf(workerId));
+      if (entry == next.workers.end() || !entry->second.versions.contains(versionId))
+        refuse("version " + versionId + " of Worker " + workerId + " was never uploaded");
+      if (entry->second.active && entry->second.active->versionId == versionId)
         refuse("version " + versionId + " is the active version of Worker " + workerId + ": activate another version first");
-      deleted = state.definition(workerId + "@" + versionId);
-      Transaction txn;
-      txn.unchanged(key, kv);
-      // A concurrent flip of the pointer to this version (the flip compares this definition too).
-      txn.unchanged(pointerKey, kvOf(raw, pointerKey));
-      txn.tenantAsRead(tenantOf(workerId), guard.record);
-      txn.remove(key);
-      if ((revision = co_await commitSecret(context.etcd, txn))) break;
-      if (attempt >= 8) refuse("another write changed Worker " + workerId + " (" + std::to_string(attempt + 1) + " attempts); nothing deleted");
-      co_await context.timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
-    }
+      hash = entry->second.versions.at(versionId).definitionHash;
+      entry->second.versions.erase(versionId);
+      co_return;
+    }, true);
     ObjectCleanup cleanup;
-    if (deleted) {
+    co_await context.state.fetchDefinitions({hash});
+    if (auto deleted = context.state.definition(hash)) {
       // Every tenant's definitions count (the same bytes may be another tenant's package too).
-      auto all = stateOf(co_await context.etcd.range(DEPLOYMENT_PREFIX));
-      cleanup = co_await cleanupObjects(context.storage, {deleted}, definitionsOf(all, [](const std::string&) { return true; }));
+      auto remaining = co_await definitionsOf(context.state, [](const std::string&) { return true; });
+      cleanup = co_await cleanupObjects(context.storage, {deleted}, remaining.versions, remaining.complete);
     }
     out << "{\"operation\":\"delete version\",\"workerId\":" << quote(workerId) << ",\"versionId\":" << quote(versionId)
-        << ",\"revision\":\"" << revision << "\",\"objects\":" << cleanupJson(cleanup) << '}';
+        << ",\"revision\":\"" << context.state.index().revision << "\",\"manifestRevision\":" << written.manifest.revision
+        << ",\"objects\":" << cleanupJson(cleanup) << '}';
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1536,7 +1185,7 @@ kj::Promise<std::string> controlSecretPut(ControlContext& context, std::string w
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId (<tenant>/<worker>)");
     if (!environmentName(name)) refuse("invalid secret name (a JavaScript identifier of ASCII letters, digits, '_' and '$')");
-    co_await secretPut(context.etcd, context.timer, workerId, name, value, 8, out, true);
+    co_await secretPut(context.state, workerId, name, value, 8, out, true);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str(), value);
   }
@@ -1547,7 +1196,7 @@ kj::Promise<std::string> controlSecretDelete(ControlContext& context, std::strin
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId (<tenant>/<worker>)");
     if (!environmentName(name)) refuse("invalid secret name (a JavaScript identifier of ASCII letters, digits, '_' and '$')");
-    co_await secretDelete(context.etcd, context.timer, workerId, name, 8, out, true);
+    co_await secretDelete(context.state, workerId, name, 8, out, true);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1557,105 +1206,39 @@ kj::Promise<std::string> controlSecretList(ControlContext& context, std::string 
   std::ostringstream out;
   try {
     if (!workerFullName(workerId)) refuse("invalid workerId (<tenant>/<worker>)");
-    co_await secretList(context.etcd, workerId, out);
+    secretList(context.state, workerId, out);
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
   co_return controlSuccess(out.str());
 }
 
-kj::Promise<TenantCounts> tenantCounts(EtcdClient& client, std::string tenant) {
-  auto raw = co_await tenantSnapshot(client, tenant);
-  auto state = stateOf(raw);
+TenantCounts tenantCounts(const ManifestStore& state, const std::string& tenant) {
   TenantCounts counts;
-  counts.revision = raw.revision;
-  for (const auto& [label, definition] : state.definitions()) {
-    const auto at = label.find('@');
-    const auto id = label.substr(0, at);
-    if (tenantOf(id) == tenant) counts.versions[id].insert(label.substr(at + 1));
+  counts.revision = state.index().revision;
+  const auto* manifest = state.tenant(tenant);
+  if (!manifest) return counts;
+  for (const auto& [name, worker] : manifest->workers) {
+    if (worker.empty()) continue;
+    const auto id = workerFullId(tenant, name);
+    auto& versions = counts.versions[id];
+    for (const auto& [versionId, version] : worker.versions) versions.insert(versionId);
+    for (const auto& [secret, sealed] : worker.secrets) counts.secrets[id].insert(secret);
+    counts.secretTotal += worker.secrets.size();
   }
-  for (const auto& [id, worker] : state.workers()) if (tenantOf(id) == tenant) counts.versions.try_emplace(id);
-  for (const auto& [id, keys] : state.routesByWorker()) if (tenantOf(id) == tenant) counts.versions.try_emplace(id);
-  for (const auto& [id, names] : state.secrets()) {
-    if (tenantOf(id) != tenant) continue;
-    for (const auto& [name, record] : names) counts.secrets[id].insert(name);
-    counts.secretTotal += names.size();
-  }
-  co_return counts;
+  return counts;
 }
 
-// The deletion cascade of a tenant's deployment state (control-plane-api.md section 5), each step idempotent: its
-// routes, its pointers (nothing of it is served from here on), the objects only its definitions use, then -- in one
-// transaction -- every route that still names the tenant and every key below deploy/<tenant>/ (pointers, definitions,
-// secrets, the Binding index), on the condition that no route changed since the read that found those routes and that
-// the tenant's record is as read (marked deleting): no key of the tenant is left, and none can be written after.
-kj::Promise<std::string> controlDeleteTenantState(ControlContext& context, std::string tenant) {
+// The objects of a tenant's deletion cascade (control-plane-api.md section 5): what only its definitions reference.
+kj::Promise<std::string> controlDeleteTenantObjects(ControlContext& context, std::string tenant) {
   std::ostringstream out;
   try {
     if (!tenantName(tenant)) refuse("invalid tenant");
-    auto raw = co_await tenantSnapshot(context.etcd, tenant);
-    auto state = stateOf(raw);
-    std::mt19937 random(std::random_device{}());
-    auto commit = [&](const std::vector<std::string>& keys) -> kj::Promise<uint64_t> {
-      uint64_t done = 0;
-      for (size_t start = 0; start < keys.size(); start += 100) {
-        Transaction txn;
-        for (size_t i = start; i < std::min(keys.size(), start + 100); ++i) txn.remove(keys[i]);
-        auto revision = co_await commitSecret(context.etcd, txn);
-        KJ_REQUIRE(revision, "a deletion transaction failed");
-        done += std::min(keys.size(), start + 100) - start;
-      }
-      co_return done;
-    };
-    std::vector<std::string> routes, pointers;
-    for (const auto& [key, route] : state.routes())
-      if (!route.value.workerId.empty() && tenantOf(route.value.workerId) == tenant) routes.push_back("routes/" + key);
-    for (const auto& [id, worker] : state.workers()) if (tenantOf(id) == tenant) pointers.push_back(deploymentActiveKey(id));
-    const auto deletedRoutes = co_await commit(routes);
-    const auto deletedPointers = co_await commit(pointers);
-    auto all = stateOf(co_await context.etcd.range(DEPLOYMENT_PREFIX));
-    auto cleanup = co_await cleanupObjects(context.storage,
-        definitionsOf(all, [&](const std::string& id) { return tenantOf(id) == tenant; }),
-        definitionsOf(all, [&](const std::string& id) { return tenantOf(id) != tenant; }));
-    // The rest in one transaction: the routes that still name the tenant (any written since the first read) and
-    // everything below its prefix. A route written meanwhile, of any tenant, makes it read again.
-    uint64_t keys = 0, lateRoutes = 0;
-    uint32_t attempts = 0;
-    for (;; ++attempts) {
-      if (attempts > 8) refuse("other writes kept changing the routes while tenant " + tenant + " was deleted; DELETE it again to resume");
-      auto current = co_await tenantSnapshot(context.etcd, tenant);
-      auto guard = co_await tenantGuard(context.etcd, tenant, current.revision);
-      if (guard.status != "deleting") refuse("tenant " + tenant + " is not marked deleting (its record changed); DELETE it again");
-      auto now = stateOf(current);
-      std::vector<std::string> left;
-      for (const auto& [key, route] : now.routes())
-        if (!route.value.workerId.empty() && tenantOf(route.value.workerId) == tenant) left.push_back("routes/" + key);
-      if (left.size() > 100) {
-        // Too many for one transaction with the rest: removed first, then read again.
-        lateRoutes += co_await commit(left);
-        continue;
-      }
-      Transaction txn;
-      txn.tenantAsRead(tenant, guard.record);
-      txn.untouchedSince("routes/", current.revision);
-      for (const auto& key : left) txn.remove(key);
-      txn.removeBelow(deploymentTenantPrefix(tenant));
-      auto response = co_await context.etcd.request("/v3/kv/txn", txn.json());
-      capnp::MallocMessageBuilder message;
-      auto json = message.initRoot<Json>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-      if (boolean(json, "succeeded")) {
-        auto responses = field(json, "responses");
-        if (responses.isArray() && responses.getArray().size())
-          keys = integer(field(responses.getArray()[responses.getArray().size() - 1], "response_delete_range"), "deleted");
-        lateRoutes += left.size();
-        break;
-      }
-      co_await context.timer.afterDelay(std::uniform_int_distribution<uint32_t>(5, 40)(random) * kj::MILLISECONDS);
-    }
-    out << "{\"operation\":\"delete tenant state\",\"tenant\":" << quote(tenant) << ",\"routes\":" << deletedRoutes
-        << ",\"pointers\":" << deletedPointers << ",\"keys\":" << keys << ",\"lateRoutes\":" << lateRoutes
-        << ",\"finalAttempts\":" << attempts + 1 << ",\"objects\":" << cleanupJson(cleanup) << '}';
+    auto gone = co_await definitionsOf(context.state, [&](const std::string& name) { return name == tenant; });
+    auto remaining = co_await definitionsOf(context.state, [&](const std::string& name) { return name != tenant; });
+    auto cleanup = co_await cleanupObjects(context.storage, gone.versions, remaining.versions, remaining.complete);
+    out << "{\"operation\":\"delete tenant objects\",\"tenant\":" << quote(tenant) << ",\"definitions\":" << gone.versions.size()
+        << ",\"objects\":" << cleanupJson(cleanup) << '}';
   } catch (const kj::Exception& error) {
     co_return controlFailure(error, out.str());
   }
@@ -1663,11 +1246,11 @@ kj::Promise<std::string> controlDeleteTenantState(ControlContext& context, std::
 }
 
 int runDeploymentTool(int argc, char** argv) {
-  KJ_REQUIRE(argc > 0, "usage: coworkerd-apiserver tool <apply|upsert|remove|show|compile> --endpoint URL "
-      "[--tenant T] [--manifest PATH] [--worker ID]... [--no-trial | --trial-server URL] [--trial-timeout-ms N] "
-      "[--trial-address-map ADVERTISED=DIALED]... [--membership etcd|objectStore [--membership-ttl-seconds N] "
-      "[--membership-grace-ms N]] [--token TOKEN], or coworkerd-apiserver tool secret <put|delete|list> ..., "
-      "or coworkerd-apiserver tool etcd-auth ...");
+  KJ_REQUIRE(argc > 0, "usage: coworkerd-apiserver tool <init|apply|upsert|remove|show|compile> [--storage-endpoint URL] "
+      "[--storage-bucket B] [--tenant T] [--manifest PATH] [--worker ID]... [--no-trial | --trial-server URL] "
+      "[--trial-timeout-ms N] [--trial-address-map ADVERTISED=DIALED]... [--endpoint ETCD_URL (the members of an etcd "
+      "membership)] [--membership etcd|objectStore [--membership-ttl-seconds N] [--membership-grace-ms N]] [--token TOKEN], "
+      "or coworkerd-apiserver tool secret <put|delete|list> ..., or coworkerd-apiserver tool etcd-auth ...");
   const std::string operation = argv[0];
   // Its own parser: no argument of a secret command is ever echoed.
   if (operation == "secret") return runSecretTool(argc - 1, argv + 1);
@@ -1676,13 +1259,9 @@ int runDeploymentTool(int argc, char** argv) {
   ToolOptions options;
   bool tenantGiven = false;
   std::optional<uint32_t> maxRetries;
-  ObjectStoreConfig objectConfig;
-  if (auto value = std::getenv("COWORKERD_STORAGE_ENDPOINT")) objectConfig.endpoint = value;
+  auto arguments = storeArguments();
+  auto& objectConfig = arguments.config;
   if (auto value = std::getenv("COWORKERD_MANAGEMENT_TOKEN")) options.token = value;
-  if (auto value = std::getenv("COWORKERD_OBJECT_DIRECTORY")) {
-    objectConfig.backend = "directory";
-    objectConfig.directory = value;
-  }
   auto number = [](const char* text, uint64_t limit, const char* name) {
     size_t end = 0;
     auto value = std::stoull(text, &end);
@@ -1714,13 +1293,15 @@ int runDeploymentTool(int argc, char** argv) {
     else if (flag == "--storage-endpoint") objectConfig.endpoint = argv[index + 1];
     else if (flag == "--storage-bucket") objectConfig.bucket = argv[index + 1];
     else if (flag == "--storage-region") objectConfig.region = argv[index + 1];
+    else if (flag == "--secrets-key-file") arguments.keyFile = argv[index + 1];
     else if (flag == "--object-directory") {
       objectConfig.backend = "directory";
       objectConfig.directory = argv[index + 1];
     }
     else if (flag == "--pause-before-flip-ms") options.pauseMs = number(argv[index + 1], 60000, "pause-before-flip-ms");
     else if (flag == "--max-retries") maxRetries = number(argv[index + 1], 100, "max-retries");
-    else if (flag == "--max-txn-ops") options.maxTxnOps = number(argv[index + 1], 100000, "max-txn-ops");
+    // etcd's transaction size before 0.4: a tenant's change is one object now, whatever its size. Accepted, unused.
+    else if (flag == "--max-txn-ops") number(argv[index + 1], 100000, "max-txn-ops");
     else if (flag == "--token") options.token = argv[index + 1];
     else if (flag == "--trial-server") {
       const std::string url = argv[index + 1];
@@ -1763,42 +1344,93 @@ int runDeploymentTool(int argc, char** argv) {
     std::cout << "]}" << std::endl;
     return 0;
   }
+  KJ_REQUIRE(!objectConfig.endpoint.empty() || objectConfig.backend == "directory",
+      "the desired state is in the object store: --storage-endpoint URL (or COWORKERD_STORAGE_ENDPOINT)");
   auto io = kj::setupAsyncIo();
   auto headers = kj::HttpHeaderTable::Builder().build();
-  EtcdClient client(endpoint, 750, io.provider->getNetwork(), io.provider->getTimer(), *headers);
+  auto& timer = io.provider->getTimer();
+  std::unique_ptr<EtcdClient> client;
+  if (!endpoint.empty()) client = std::make_unique<EtcdClient>(endpoint, 750, io.provider->getNetwork(), timer, *headers);
+  ObjectStore storage(objectConfig, io.provider->getNetwork(), timer);
+  ManifestStore state(storage, timer, loadKey(arguments.keyFile), std::cerr);
+  options.memberStore = &storage;
+  if (operation == "init") {
+    // A new cluster's bucket: its marker, and empty indexes so that the nodes' first reads find their hints.
+    const bool present = storage.get(CLUSTER_FORMAT_KEY).wait(io.waitScope).status == 200;
+    state.load(true, true).wait(io.waitScope);
+    std::string written;
+    auto empty = [&](const char* prefix, const std::string& bytes) {
+      if (readLatestRevision(storage, prefix, indexHintKey(prefix), 0, true).wait(io.waitScope).revision) return;
+      if (storage.create(revisionKey(prefix, 1), bytes).wait(io.waitScope).created) {
+        publishHint(storage, prefix, indexHintKey(prefix), 1).wait(io.waitScope);
+        written += std::string(written.empty() ? "" : ",") + quote(prefix);
+      }
+    };
+    // Each revision names its writer (this run of the tool): a create whose answer is lost is decided by reading it back.
+    TenantIndex index;
+    index.revision = 1;
+    index.writer = newWriter(state.writerInstance());
+    index.writtenAtUnixMs = index.writer.writtenAtUnixMs;
+    empty(TENANT_INDEX_PREFIX, tenantIndexJson(index));
+    CredentialIndex credentials;
+    credentials.revision = 1;
+    credentials.writer = newWriter(state.writerInstance());
+    credentials.writtenAtUnixMs = credentials.writer.writtenAtUnixMs;
+    empty(CREDENTIAL_INDEX_PREFIX, credentialIndexJson(credentials));
+    std::cout << "{\"operation\":\"init\",\"bucket\":" << quote(objectConfig.bucket) << ",\"format\":\"" << (present ? "present" : "created")
+              << "\",\"emptyIndexes\":[" << written << "],\"instance\":" << quote(state.writerInstance()) << ",\"client\":"
+              << storage.stats().json() << "}" << std::endl;
+    return 0;
+  }
   if (operation == "apply" || operation == "upsert") {
     KJ_REQUIRE(!options.manifest.empty(), "apply and upsert require --manifest");
     KJ_REQUIRE(options.workers.empty(), "--worker is only for remove");
     // apply keeps the original whole-state contract: a conflict fails without retry.
     options.maxRetries = maxRetries.value_or(operation == "apply" ? 0 : 8);
-    ObjectStore storage(objectConfig, io.provider->getNetwork(), io.provider->getTimer());
-    options.memberStore = &storage;
+    state.load(true, false).wait(io.waitScope);
     TrialContext trials{io.provider->getNetwork(), *headers, options.token};
-    write(operation == "apply" ? Operation::APPLY : Operation::UPSERT, client, io.provider->getTimer(), &storage, options, trials,
+    write(operation == "apply" ? Operation::APPLY : Operation::UPSERT, client.get(), timer, state, &storage, options, trials,
         std::cout).wait(io.waitScope);
   } else if (operation == "remove") {
     KJ_REQUIRE(!options.workers.empty(), "remove requires --worker");
     options.maxRetries = maxRetries.value_or(8);
+    state.load(true, false).wait(io.waitScope);
     TrialContext trials{io.provider->getNetwork(), *headers, options.token};
-    write(Operation::REMOVE, client, io.provider->getTimer(), nullptr, options, trials, std::cout).wait(io.waitScope);
+    write(Operation::REMOVE, client.get(), timer, state, nullptr, options, trials, std::cout).wait(io.waitScope);
   } else if (operation == "show") {
-    // The whole deployment state, or with --tenant the tenant's (its Workers, and the routes they own).
-    auto raw = (tenantGiven ? tenantSnapshot(client, options.tenant) : client.range(DEPLOYMENT_PREFIX)).wait(io.waitScope);
-    auto state = stateOf(raw);
+    // The whole desired state, or with --tenant the tenant's (its Workers, and the routes they own).
+    state.load(false, false).wait(io.waitScope);
+    std::set<std::string> hashes;
+    for (const auto& [tenant, manifest] : state.tenants())
+      if (!tenantGiven || tenant == options.tenant) hashes.merge(namedDefinitions(manifest));
+    state.fetchDefinitions(hashes).wait(io.waitScope);
+    // Every tenant's keys at once, as a node reads them.
+    ManifestView view;
+    for (const auto& [tenant, manifest] : state.tenants()) view.emplace(tenant, &manifest);
+    std::vector<DeploymentState::Change> changes;
+    SecretOpener open = [](const std::string&, const std::string&, const std::string&, const ManifestSecret& sealed) {
+      return sealedLength(sealed) ? std::optional<std::string>(std::string()) : std::nullopt;
+    };
+    for (const auto& [tenant, manifest] : view)
+      for (auto& [key, value] : tenantStateKeys(*manifest, state.definitions(), open)) changes.push_back({key, value});
+    for (auto& [key, value] : routeStateKeys(view)) changes.push_back({key, value});
+    changes.push_back({"generation", generationValue(view)});
+    DeploymentState current;
+    current.apply(changes, true, state.index().revision);
     std::string active = "{";
     size_t index = 0;
-    for (const auto& [id, worker] : state.workers()) {
-      if (!worker.valid) continue;
+    for (const auto& [id, worker] : current.workers()) {
+      if (!worker.valid || (tenantGiven && tenantOf(id) != options.tenant)) continue;
       if (index++) active += ',';
       active += quote(id) + ':' + activePointerJson(worker.version->versionId, worker.version->definitionHash);
     }
     active += '}';
     std::vector<RouteDefinition> routes;
-    for (const auto& [key, route] : state.routes())
+    for (const auto& [key, route] : current.routes())
       if (route.effective && (!tenantGiven || tenantOf(route.value.workerId) == options.tenant)) routes.push_back(route.value);
-    std::cout << "{\"generation\":" << state.generation() << ",\"revision\":\"" << raw.revision
+    std::cout << "{\"generation\":" << current.generation() << ",\"revision\":\"" << state.index().revision
               << "\",\"activeVersions\":" << active << ",\"routes\":" << routesJson(routes)
-              << ',' << state.statusFields(STATUS_PROBLEM_LIMIT) << "}" << std::endl;
+              << ',' << current.statusFields(STATUS_PROBLEM_LIMIT) << "}" << std::endl;
   } else KJ_FAIL_REQUIRE("unknown deployment operation", operation.c_str());
   return 0;
 }

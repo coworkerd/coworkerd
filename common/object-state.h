@@ -36,6 +36,28 @@ struct AppendResult {
 kj::Promise<AppendResult> appendRevision(ObjectStore& store, kj::Timer& timer, std::string prefix, std::string bytes,
     uint32_t maxAttempts = 16);
 
+// A revision sequence with a hint (the desired state, tenant-manifest.h): the hint <...>/current names the current
+// revision, and only says so -- a reader reads that revision's object, and lists the prefix when the hint is missing or
+// behind what the reader already knows.
+struct LatestRevision {
+  uint64_t revision = 0;  // 0: the sequence has no revision
+  std::string bytes;
+  bool listed = false;    // the hint was missing or behind: a listing found the revision
+};
+// The revision a hint names; none when the hint is missing or does not read as one.
+kj::Promise<std::optional<uint64_t>> readHintRevision(ObjectStore& store, std::string hintKey);
+// The sequence's latest revision and its bytes: the hint's when it names at least `floor`, else the largest a listing
+// names. With `probe`, later revisions are looked for one by one (a writer's hint may lag its revision): GET n + 1 until
+// one is missing.
+kj::Promise<LatestRevision> readLatestRevision(ObjectStore& store, std::string prefix, std::string hintKey,
+    uint64_t floor = 0, bool probe = false);
+// The hint after revision `revision` was created: written, then whether a later revision exists is checked (another
+// writer may have created one and written its hint before this one), and the hint rewritten to the latest if so.
+// Returns the revision the hint names in the end.
+kj::Promise<uint64_t> publishHint(ObjectStore& store, std::string prefix, std::string hintKey, uint64_t revision);
+// Old revisions go: revision - keep is removed (one per write keeps a sequence at `keep` objects).
+kj::Promise<void> pruneRevision(ObjectStore& store, std::string prefix, uint64_t revision, uint64_t keep);
+
 // This machine's real clock, as Unix milliseconds: never the test offset (clockOffsetMsForTest).
 uint64_t realClockUnixMs();
 

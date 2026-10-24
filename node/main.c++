@@ -15,6 +15,7 @@
 #include "etcd.h"
 #include "peer-auth.h"
 #include "tenancy.h"
+#include "tenant-manifest.h"
 #include "tenants.h"
 #include "usage.h"
 
@@ -1778,6 +1779,8 @@ public:
   // slot, lease, execution record or placement decision, and nothing it runs
   // can make a subrequest. Trials are counted on their own.
   uint64_t deploymentRevision() const { return desiredState.state().revision(); }
+  // The desired state read now (a trial load naming a revision this node has not applied yet).
+  kj::Promise<void> refreshDesiredState() { return desiredState.refresh(); }
   std::shared_ptr<const VersionDefinition> definitionByHash(const std::string& hash) const { return desiredState.byHash(hash); }
   std::vector<std::string> missingSecrets(const VersionDefinition& version) const {
     return desiredState.state().missingSecrets(version);
@@ -4277,13 +4280,15 @@ private:
     // key; else wait for this Server's view to apply the key. A version
     // with secrets also waits for the view to reach the revision the tool
     // read (the values it validated reach the runtime with the definition);
-    // a version without needs nothing else from the view. Normally all of
-    // this takes milliseconds; a Server cut off from etcd and the object
-    // store gives up after VIEW_WAIT_MS, so that the tool soon tries another.
+    // a version without needs nothing else from the view. A revision this
+    // Server has not applied yet makes it read the desired state at once
+    // rather than at its next poll. Normally all of this takes
+    // milliseconds; a Server cut off from the object store gives up after
+    // VIEW_WAIT_MS, so that the tool soon tries another.
     const double viewDeadline = std::min(deadline, started + VIEW_WAIT_MS);
     std::shared_ptr<const VersionDefinition> version;
     std::string waiting;
-    bool fetched = false;
+    bool fetched = false, refreshed = false;
     while (true) {
       version = server.definitionByHash(request.definitionHash);
       if (!version && !request.contentHash.empty() && !fetched) {
@@ -4297,6 +4302,12 @@ private:
               ? "deployment revision " + std::to_string(request.revision) + " (the version's secrets)" :
           !server.missingSecrets(*version).empty() ? "the values of the version's secrets" : "";
       if (waiting.empty() || monotonicTimeMs() >= viewDeadline) break;
+      if (version && !refreshed) {
+        refreshed = true;
+        co_await server.refreshDesiredState().exclusiveJoin(timer.afterDelay(
+            static_cast<int64_t>(std::max(0.0, viewDeadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS));
+        continue;
+      }
       co_await timer.afterDelay(5 * kj::MILLISECONDS);
     }
     waitMs = monotonicTimeMs() - started;
@@ -5065,11 +5076,11 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
       .lexically_normal().string();
   launch.listenAddress = c.listenAddress.empty() ? "0.0.0.0:8930" : c.listenAddress;
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
-  KJ_REQUIRE((c.membership.backend == "etcd" || c.membership.backend == "objectStore") && c.desiredState.backend == "etcd",
-      "serve keeps the deployment state in etcd, and membership there or on the object store: set etcdEndpoint "
-      "(and membership.backend objectStore for the object store's)");
-  KJ_REQUIRE(c.desiredState.objectStore.backend == "directory" || !c.desiredState.objectStore.endpoint.empty(),
-      "serve needs the object store: set storage.endpoint");
+  KJ_REQUIRE(c.desiredState.backend == "objectStore" && !c.desiredState.objectStore.endpoint.empty(),
+      "serve reads the desired state from the object store: set storage.endpoint (the storage block)");
+  KJ_REQUIRE((c.membership.backend == "etcd" || c.membership.backend == "objectStore") && !c.etcdEndpoint.empty(),
+      "serve keeps the suspects and the usage rows in etcd until 0.4's last round, and the membership there or on the "
+      "object store: set etcdEndpoint (and membership.backend objectStore for the object store's)");
   if (c.membership.advertisedAddress.empty()) {
     // What the other Servers dial: this host's name and the peer listener's port.
     char name[256] = {};
@@ -5291,20 +5302,23 @@ int run(Launch launch) {
   auto membership = coworkerd::newMembership(serverConfig.membership, serverConfig.serverId,
       serverConfig.peerListenAddress, serverConfig.peers,
       io.provider->getNetwork(), timer, *headerTable, serverConfig.desiredState.objectStore);
-  // Suspects, tenants and usage stay in etcd (the deployment state's): with the members on the object store they get
-  // etcd's address from there.
+  // Suspects and usage stay in etcd until 0.4's last round: with the members on the object store they get etcd's
+  // address from etcdEndpoint.
   auto etcdAuthority = serverConfig.membership;
   if (etcdAuthority.backend == "objectStore") {
     etcdAuthority.backend = "etcd";
-    etcdAuthority.endpoint = serverConfig.desiredState.endpoint;
+    etcdAuthority.endpoint = serverConfig.etcdEndpoint;
   }
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
       io.provider->getNetwork(), timer, *headerTable);
   const auto stackDirectory = launch.stackDirectory;
   coworkerd::Suspects suspects(etcdAuthority, serverConfig.serverId, serverConfig.suspectBaseMs,
       serverConfig.suspectMaxMs, io.provider->getNetwork(), timer, *headerTable);
-  // The tenants' records: deletion, log quotas (handed to the log drainer), default limits.
-  coworkerd::TenantView tenantView(etcdAuthority, io.provider->getNetwork(), timer, *headerTable);
+  // The tenants' records: deletion, log quotas (handed to the log drainer), default limits -- from the desired state's
+  // manifests, at every revision it applies.
+  coworkerd::TenantView tenantView;
+  desiredState->onTenants([&tenantView](const std::map<std::string, std::optional<coworkerd::TenantRecord>>& records,
+      uint64_t revision, bool known) { tenantView.update(records, revision, known); });
   struct QuotaTasks final: kj::TaskSet::ErrorHandler {
     void taskFailed(kj::Exception&& error) override {
       std::cerr << "[tenant] log quota not handed to the drainer: " << error.getDescription().cStr() << std::endl;
@@ -5349,7 +5363,7 @@ int run(Launch launch) {
   // What the egress policy denies as the cluster's own, besides the members it learns from etcd (egress.h).
   const auto egressConfig = serverConfig.egress;
   std::vector<std::string> ownEndpoints = {launch.listenAddress, serverConfig.peerListenAddress,
-      serverConfig.membership.advertisedAddress, serverConfig.membership.endpoint, serverConfig.desiredState.endpoint,
+      serverConfig.membership.advertisedAddress, serverConfig.membership.endpoint, serverConfig.etcdEndpoint,
       serverConfig.desiredState.objectStore.endpoint};
   for (const auto& [peerId, address] : serverConfig.peers) ownEndpoints.push_back(address);
   // Each tenant's usage here: rolled up per hour below this node's own prefix.
@@ -5365,7 +5379,6 @@ int run(Launch launch) {
     desiredState->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     membership->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     suspects.start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
-    tenantView.start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     tenantUsage.start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     if (shuttingDown) {
       membership->stop().wait(waitScope);
@@ -5469,7 +5482,6 @@ int run(Launch launch) {
       .exclusiveJoin(runtime.run())
       .exclusiveJoin(memory.run(timer))
       .exclusiveJoin(suspects.run())
-      .exclusiveJoin(tenantView.run())
       .exclusiveJoin(tenantUsage.run())
       .exclusiveJoin(runLeaseReaper(server, timer))
       .exclusiveJoin(runLogClock(timer))
@@ -5489,8 +5501,8 @@ int run(Launch launch) {
 }
 
 // `coworkerd check --config FILE`: the node's self-check, against the configuration `coworkerd --config FILE`
-// starts with -- the configuration itself, etcd (the cluster's deployment state must be there), the object store
-// (with this node's identity) and the sandbox's prerequisites: the process pool's startup check, which runs the
+// starts with -- the configuration itself, etcd (suspects and usage), the object store (with this node's identity), the
+// desired state there (the cluster's marker, the secrets key) and the sandbox's prerequisites: the process pool's startup check, which runs the
 // launcher's --check when the sandbox is on (it prints its own [sandbox] line). One [check] line per check, then the
 // result; exits 0 when this node would start, 1 otherwise. It changes nothing: the startup check runs in a
 // temporary directory, not in the node's stack. `coworkerd check storage ENDPOINT BUCKET` is the object store's own
@@ -5542,12 +5554,13 @@ int runSelfCheck(const std::vector<std::string>& args) {
   } catch (const kj::Exception& error) {
     report("peer-auth", false, ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
   }
+  // etcd keeps the suspects and the usage rows (until 0.4's last round): it answers, with this node's identity, a read of
+  // the node's own usage rows. The desired state is not there any more.
   try {
     coworkerd::EtcdClient etcd(c.etcdEndpoint, 2000, io.provider->getNetwork(), timer, *headerTable);
-    auto raw = etcd.range(std::string(coworkerd::DEPLOYMENT_PREFIX) + "generation").wait(io.waitScope);
-    report("etcd", !raw.values.empty(), ",\"endpoint\":\"" + jsonEscape(c.etcdEndpoint) + "\",\"revision\":\"" +
-        std::to_string(raw.revision) + "\",\"deploymentState\":" + (raw.values.empty() ? "false" : "true") +
-        (raw.values.empty() ? ",\"reason\":\"no deployment state in etcd (the cluster's init writes it): the node would not start\"" : ""));
+    auto raw = etcd.range(coworkerd::nodeUsagePrefix(c.serverId)).wait(io.waitScope);
+    report("etcd", true, ",\"endpoint\":\"" + jsonEscape(c.etcdEndpoint) + "\",\"revision\":\"" + std::to_string(raw.revision) +
+        "\",\"holds\":\"suspects and usage\"");
   } catch (const kj::Exception& error) {
     report("etcd", false, ",\"endpoint\":\"" + jsonEscape(c.etcdEndpoint) + "\",\"reason\":\"" +
         jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
@@ -5562,6 +5575,28 @@ int runSelfCheck(const std::vector<std::string>& args) {
   } catch (const kj::Exception& error) {
     report("storage", false, ",\"backend\":\"" + jsonEscape(store.backend) + "\",\"endpoint\":\"" + jsonEscape(store.endpoint) +
         "\",\"bucket\":\"" + jsonEscape(store.bucket) + "\",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
+  }
+  // The desired state on the object store: the secrets key opens (its file, its format), the bucket holds the cluster's
+  // marker (without it the node refuses to start), and the tenant index's hint reads.
+  {
+    const auto& d = c.desiredState;
+    std::string fields = ",\"backend\":\"" + jsonEscape(d.backend) + "\",\"pollIntervalMs\":" + std::to_string(d.pollIntervalMs) +
+        ",\"secretsKeyFile\":\"" + jsonEscape(d.secretsKeyFile) + "\"";
+    try {
+      auto key = coworkerd::SecretsKey::load(d.secretsKeyFile);
+      fields += ",\"secretsKey\":\"" + key.fingerprint() + "\"";
+      coworkerd::ObjectStore storage(store, io.provider->getNetwork(), timer);
+      const auto marker = storage.get(coworkerd::CLUSTER_FORMAT_KEY).wait(io.waitScope);
+      KJ_REQUIRE(marker.status == 200 || marker.status == 404, "object store read failed", marker.status);
+      auto hint = coworkerd::readHintRevision(storage, coworkerd::indexHintKey(coworkerd::TENANT_INDEX_PREFIX)).wait(io.waitScope);
+      fields += std::string(",\"clusterFormat\":") + (marker.status == 200 ? "true" : "false") + ",\"tenantsRevision\":" +
+          (hint ? "\"" + std::to_string(*hint) + "\"" : std::string("null"));
+      if (marker.status != 200)
+        fields += ",\"reason\":\"the bucket holds no cluster/format/1 (the cluster's init writes it): the node would not start\"";
+      report("desiredState", marker.status == 200, fields);
+    } catch (const kj::Exception& error) {
+      report("desiredState", false, fields + ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
+    }
   }
   // The membership's backend; on the object store also what the node's start needs: a listing of members/ (List)
   // whose Date header is near this machine's clock, and a write and removal below the node's own prefix.

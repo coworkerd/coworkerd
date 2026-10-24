@@ -170,9 +170,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   auto object = desired.getObjectStore();
   result.desiredState.objectStore = {object.getBackend().cStr(), object.getDirectory().cStr(),
     object.getEndpoint().cStr(), object.getBucket().cStr(), object.getRegion().cStr(),
-    object.getAccessKey().cStr(), object.getSecretKey().cStr(), object.getTimeoutMs()};
+    object.getAccessKey().cStr(), object.getSecretKey().cStr(), object.getTimeoutMs(),
+    object.getConnectTimeoutMs(), object.getReadTimeoutMs(), object.getCreateTimeoutMs()};
   auto cache = desired.getCache();
   result.desiredState.cache = {cache.getDirectory().cStr(), cache.getMaxBytes(), cache.getPrefetchConcurrency()};
+  result.desiredState.pollIntervalMs = desired.getPollIntervalMs();
   KJ_REQUIRE(result.initialPlacementHops > 0, "initialPlacementHops must be positive");
   KJ_REQUIRE(result.peerTimeoutMs > 0, "peerTimeoutMs must be positive");
   KJ_REQUIRE(
@@ -220,22 +222,22 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.workerdPath = root.getWorkerdPath().cStr();
   result.runtimePath = root.getRuntimePath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
+  // etcd's backend of the desired state was removed in 0.4: the desired state is the object store's.
+  KJ_REQUIRE(given({"desiredState", "backend"}) != std::optional<std::string>("etcd"),
+      "desiredState.backend must be file or objectStore: etcd's backend was removed in 0.4 (the desired state is the object "
+      "store's; desiredState.backend objectStore with the storage block)");
   if (given({"etcdEndpoint"})) {
     const std::string endpoint = root.getEtcdEndpoint().cStr();
     KJ_REQUIRE(!endpoint.empty(), "etcdEndpoint is empty");
-    // The membership alone may live on the object store instead (membership.backend objectStore, written out):
-    // a configuration that does not say so keeps it in etcd, as before.
+    // etcd keeps the suspects and the usage rows, and the membership unless it lives on the object store
+    // (membership.backend objectStore, written out): a configuration that does not say so keeps it in etcd, as before.
     const bool objectStoreMembership = given({"membership", "backend"}) == std::optional<std::string>("objectStore");
-    for (const char* name : {"membership", "desiredState"}) {
-      auto backend = given({name, "backend"}), nested = given({name, "endpoint"});
-      KJ_REQUIRE(!backend || *backend == "etcd" || (objectStoreMembership && std::string_view(name) == "membership"),
-          "etcdEndpoint sets the backend to etcd", name);
-      KJ_REQUIRE(!nested || *nested == endpoint, "etcdEndpoint and the endpoint differ", name);
-    }
+    auto backend = given({"membership", "backend"}), nested = given({"membership", "endpoint"});
+    KJ_REQUIRE(!backend || *backend == "etcd" || objectStoreMembership, "etcdEndpoint sets the backend to etcd", "membership");
+    KJ_REQUIRE(!nested || *nested == endpoint, "etcdEndpoint and the endpoint differ", "membership");
     result.etcdEndpoint = endpoint;
-    result.desiredState.backend = "etcd";
     if (!objectStoreMembership) result.membership.backend = "etcd";
-    result.membership.endpoint = result.desiredState.endpoint = endpoint;
+    result.membership.endpoint = endpoint;
   }
   if (given({"advertisedAddress"})) {
     const std::string address = root.getAdvertisedAddress().cStr();
@@ -254,6 +256,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     store.bucket = storage.getBucket().cStr();
     store.region = storage.getRegion().cStr();
     store.timeoutMs = storage.getTimeoutMs();
+    store.connectTimeoutMs = storage.getConnectTimeoutMs();
+    store.readTimeoutMs = storage.getReadTimeoutMs();
+    store.createTimeoutMs = storage.getCreateTimeoutMs();
     KJ_REQUIRE(!store.endpoint.empty(), "storage.endpoint is required");
     if (given({"storage", "credentialsFile"})) {
       result.storageCredentialsFile = storage.getCredentialsFile().cStr();
@@ -264,6 +269,31 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       if (given({"storage", "cacheDirectory"})) result.desiredState.cache.directory = storage.getCacheDirectory().cStr();
       else result.cacheFollowsStack = true;
     }
+    // The object store holds the desired state unless the configuration says file.
+    if (!given({"desiredState", "backend"})) result.desiredState.backend = "objectStore";
+  }
+  // The cluster's secrets key (secrets.keyFile; the environment's COWORKERD_SECRETS_KEY_FILE over it).
+  if (given({"secrets", "keyFile"})) result.secretsKeyFile = root.getSecrets().getKeyFile().cStr();
+  if (const char* file = std::getenv("COWORKERD_SECRETS_KEY_FILE"); file != nullptr && *file) result.secretsKeyFile = file;
+  result.desiredState.secretsKeyFile = result.secretsKeyFile;
+  // The desired state's backend and what objectStore needs: the bucket (storage, or desiredState.objectStore) and the
+  // secrets key that opens the secrets' values.
+  {
+    const auto& d = result.desiredState;
+    KJ_REQUIRE(d.backend == "file" || d.backend == "objectStore", "desiredState.backend must be file or objectStore", d.backend.c_str());
+    if (d.backend == "objectStore") {
+      KJ_REQUIRE(d.objectStore.backend == "s3" && !d.objectStore.endpoint.empty(),
+          "desiredState.backend objectStore reads the desired state from the object store: it needs the storage block "
+          "(or desiredState.objectStore with an endpoint)");
+      KJ_REQUIRE(!result.secretsKeyFile.empty(), "desiredState.backend objectStore needs the cluster's secrets key, which "
+          "opens the secrets' values: set secrets.keyFile (or COWORKERD_SECRETS_KEY_FILE)");
+      KJ_REQUIRE(d.pollIntervalMs >= 50 && d.pollIntervalMs <= 3600000, "desiredState.pollIntervalMs must be 50 to 3600000");
+    }
+    const auto& o = d.objectStore;
+    KJ_REQUIRE(o.connectTimeoutMs >= 100 && o.connectTimeoutMs <= 60000, "storage.connectTimeoutMs must be 100 to 60000");
+    KJ_REQUIRE(o.readTimeoutMs >= 100 && o.readTimeoutMs <= 600000, "storage.readTimeoutMs must be 100 to 600000");
+    KJ_REQUIRE(o.createTimeoutMs >= o.readTimeoutMs && o.createTimeoutMs <= 600000,
+        "storage.createTimeoutMs must be at least storage.readTimeoutMs and at most 600000");
   }
   // The membership's backend, and the object store's settings it needs (the schema's MembershipConfig).
   {
@@ -293,6 +323,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.controlMaxUploadBytes = control.getMaxUploadBytes();
   result.controlServerTimeoutMs = control.getServerTimeoutMs();
   result.controlPathRouting = control.getPathRouting();
+  result.controlPollIntervalMs = control.getPollIntervalMs();
+  KJ_REQUIRE(result.controlPollIntervalMs >= 100 && result.controlPollIntervalMs <= 3600000, "control.pollIntervalMs must be 100 to 3600000");
   if (given({"control", "adminCredential"})) {
     result.controlAdminCredential = control.getAdminCredential().cStr();
     checkToken(result.controlAdminCredential, "control.adminCredential");

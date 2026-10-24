@@ -16,10 +16,11 @@
 # unprivileged user (10001). The first start generates every credential of the cluster into the `secrets` volume
 # (the object store's two identities, the management token unless COWORKERD_MANAGEMENT_TOKEN is set, the API's
 # administrator credential unless COWORKERD_ADMIN_CREDENTIAL is set, the cluster key the nodes sign their peer
-# connections with, etcd's users), one directory per service that reads them, and each service mounts only its own: a
-# node holds the store's node identity (it reads, and writes its membership under members/), its own etcd user and the
-# cluster key; the control plane (and the tool)
-# the deploy identity, its etcd user and the administrator's credential; etcd's root stays with init. Rotation:
+# connections with, the secrets key that seals the secrets' values in the tenants' manifests, etcd's users), one
+# directory per service that reads them, and each service mounts only its own: a node holds the store's node identity
+# (it reads, and writes its membership under members/), its own etcd user, the cluster key and the secrets key; the
+# control plane (and the tool) the deploy identity, its etcd user, the administrator's credential and the secrets key;
+# etcd's root stays with init. Rotation:
 # docs/guide/install.md.
 # Tenant Workers reach the network through their node only (egress.* in the node's configuration; by default public
 # addresses on ports 80 and 443, never the cluster's own). The members live in the object store (heartbeats under
@@ -128,7 +129,7 @@ services:
     network_mode: none
 
   # The bucket and the store's self-check; etcd's users and roles (the v2 layout) and its authentication;
-  # the first deployment state; then it exits.
+  # the cluster's marker and empty indexes in the object store (coworkerd-apiserver tool init); then it exits.
   init:
     image: *image
     command: [init]
@@ -199,7 +200,8 @@ services:
       - {type: volume, source: secrets, target: /var/lib/coworkerd-secrets, read_only: true, volume: {subpath: nodes/node-3}}
 
   # The control plane: coworkerd-apiserver, the API of cowctl, on the backend network (etcd, the object
-  # store, the nodes' peer listeners) and published to the host. It keeps no state of its own.
+  # store, the nodes' peer listeners) and published to the host. It keeps no state of its own: the desired state is the
+  # object store's, which it holds a copy of in memory.
   apiserver:
     image: *image
     init: true

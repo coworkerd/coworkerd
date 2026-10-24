@@ -867,6 +867,7 @@ private:
     // A new epoch replaces any expired one: calls addressed to that one are refused from now on.
     state.heldEpochs = {state.epoch};
     ++state.registrations;
+    state.storeClient = store.stats().json();
     std::cout << "[membership] registered node=" << serverId << " epoch=" << epoch << " address=" << config.advertisedAddress
               << " ttl-seconds=" << config.ttlSeconds << " attempts=" << attempt << std::endl;
   }
@@ -886,6 +887,7 @@ private:
     lastHeartbeatOk = sent;
     ++state.heartbeatsWritten;
     state.lastHeartbeatAtUnixMs = record.writtenAtUnixMs;
+    state.storeClient = store.stats().json();
     state.leaseConnected = true;
   }
 
@@ -945,6 +947,7 @@ private:
     auto [listing, sample] = co_await timedList(MEMBERS_PREFIX);
     ++state.lists;
     state.lastListAtUnixMs = nowUnixMs();
+    state.storeClient = store.stats().json();
     state.watchConnected = true;
     if (realClockUnixMs() - state.clockCheckedAtUnixMs >= CLOCK_RECHECK_MS) noteClock(sample, false);
     uint64_t ignored = 0;
@@ -1097,7 +1100,8 @@ std::string MembershipView::json() const {
            << ",\"drainAnnouncedAtUnixMs\":" << drainAnnouncedAtUnixMs << ",\"drainAnnounceAttempts\":" << drainAnnounceAttempts
            << ",\"revokeStatus\":" << quote(revokeStatus) << ",\"revokedAtUnixMs\":" << revokedAtUnixMs
            << ",\"memberChanges\":" << memberChanges << ",\"invalidMembers\":" << invalidMembers.size()
-           << ",\"skippedMemberValues\":" << skippedMemberValues << ",\"heldEpochs\":[";
+           << ",\"skippedMemberValues\":" << skippedMemberValues
+           << ",\"storeClient\":" << (storeClient.empty() ? std::string("null") : storeClient) << ",\"heldEpochs\":[";
     size_t held = 0;
     for (const auto& value : heldEpochs) output << (held++ ? "," : "") << quote(value);
     output << "],\"members\":[";

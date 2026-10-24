@@ -1,27 +1,27 @@
 #include "desired-state.h"
 #include "coworkerd.capnp.h"
+#include "object-state.h"
 #include "object-store.h"
 #include "code-package.h"
 #include "bundle-cache.h"
+#include "tenant-manifest.h"
 
 #include <capnp/message.h>
 
-#include <termios.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <functional>
-#include <fstream>
 #include <iostream>
-#include <random>
 #include <sstream>
 
+// The desired state on the object store (common/tenant-manifest.h): every pollIntervalMs one GET of the tenant index's
+// hint; when it names another revision, the index, then only the manifests whose revision the index changed, the
+// definitions they name by hash (immutable: each read once and verified), the secrets' values opened with the cluster's
+// secrets key -- all of it turned into the deployment state's keys and applied at the index's revision, so the
+// evaluation (DeploymentState) is the one etcd's keys had.
 namespace coworkerd {
 namespace {
-using namespace etcd;
-namespace rpc = v1::rpc;
+using etcd::quote;
 
 uint64_t nowUnixMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -46,27 +46,39 @@ std::string activeVersionsJson(const DeploymentState& state, bool details, size_
 // Worker use the counts and digests.
 constexpr size_t STATUS_ACTIVE_LIMIT = 256;
 constexpr size_t STATUS_PROBLEM_LIMIT = 20;
+constexpr size_t FETCH_CONCURRENCY = 8;
+// A definition that could not be read is tried again at the next poll, but not more often than this.
+constexpr uint64_t DEFINITION_RETRY_MS = 2000;
 
-class EtcdDesiredState final: public DesiredState, private kj::TaskSet::ErrorHandler {
+class ObjectStoreDesiredState final: public DesiredState, private kj::TaskSet::ErrorHandler {
 public:
-  EtcdDesiredState(DesiredStateConfig config, kj::Network& network, kj::Timer& timer,
-      const kj::HttpHeaderTable& headers)
-      : settings(std::move(config)), timer(timer),
-        storage(settings.objectStore, network, timer), cache(storage, settings.cache, timer),
-        definitionTasks(*this), authority(settings.endpoint, settings.requestTimeoutMs, network, timer, headers),
-        watcher(authority, DEPLOYMENT_PREFIX, timer, settings.retryMs,
-            EtcdWatcher::ApplyChanges([this](const EtcdBatch& batch) { return apply(batch); })) {
-    KJ_REQUIRE(settings.startupTimeoutMs > 0 && settings.retryMs > 0, "deployment timeouts must be positive");
+  ObjectStoreDesiredState(DesiredStateConfig config, kj::Network& network, kj::Timer& timer)
+      : settings(std::move(config)), timer(timer), storage(settings.objectStore, network, timer),
+        cache(storage, settings.cache, timer), definitionTasks(*this), key(SecretsKey::load(settings.secretsKeyFile)) {
+    KJ_REQUIRE(settings.startupTimeoutMs > 0 && settings.retryMs > 0 && settings.pollIntervalMs > 0,
+        "deployment timeouts must be positive");
   }
   kj::Promise<void> start() override {
     try {
       co_await timer.timeoutAfter(settings.startupTimeoutMs * kj::MILLISECONDS, startRetry());
     } catch (const kj::Exception& error) {
-      KJ_FAIL_REQUIRE("etcd deployment startup failed before membership registration and serving",
-          lastRejectedReason.c_str(), error.getDescription());
+      if (refusal.empty()) KJ_FAIL_REQUIRE("the desired state could not be read from the object store before serving",
+          lastPollError.c_str(), error.getDescription());
+      KJ_FAIL_REQUIRE(refusal.c_str());
     }
   }
-  kj::Promise<void> run() override { return watcher.run(); }
+  kj::Promise<void> run() override {
+    while (true) {
+      co_await timer.afterDelay(settings.pollIntervalMs * kj::MILLISECONDS);
+      co_await pollShared();
+    }
+  }
+  kj::Promise<void> refresh() override {
+    // A poll already running may have read the hint before the write the caller knows of: wait for it, then read again.
+    if (pollFlight) co_await pollFlight->addBranch();
+    ++polls.refreshes;
+    co_await pollShared();
+  }
   void reload() override { KJ_FAIL_REQUIRE("reload is only available for the file backend"); }
   const DeploymentState& state() const override { return current; }
   std::shared_ptr<const VersionDefinition> find(const VersionPin& pin, std::string& reason) const override {
@@ -167,8 +179,7 @@ public:
   }
   std::string json(bool full) const override {
     std::ostringstream out;
-    const auto& watch = watcher.view();
-    out << "{\"backend\":\"etcd\",\"revision\":\"" << current.revision()
+    out << "{\"backend\":\"objectStore\",\"revision\":\"" << current.revision()
         << "\",\"generation\":" << current.generation();
     if (full) {
       out << ",\"activeVersions\":" << activeVersionsJson(current, false, STATUS_ACTIVE_LIMIT)
@@ -178,19 +189,34 @@ public:
     out << ',' << current.statusFields(STATUS_PROBLEM_LIMIT)
         << ",\"rejectedRevisions\":" << rejectedRevisions << ",\"lastRejectedRevision\":\"" << lastRejectedRevision
         << "\",\"lastRejectedReason\":" << quote(lastRejectedReason)
-        << ",\"fullRereads\":" << watch.fullRereads << ",\"compactions\":" << watch.compactions
-        << ",\"watchConnected\":" << (watch.connected ? "true" : "false")
-        << ",\"watchRevision\":\"" << watch.revision << "\",\"watchLastError\":" << quote(watch.lastError)
+        // The etcd backend's fields, as the poll has them: a full read at the start, no compaction; connected while
+        // the last poll reached the store.
+        << ",\"fullRereads\":" << (started ? 1 : 0) << ",\"compactions\":0"
+        << ",\"watchConnected\":" << (lastPollOk ? "true" : "false")
+        << ",\"watchRevision\":\"" << current.revision() << "\",\"watchLastError\":" << quote(lastPollError)
         << ",\"apply\":{\"count\":" << applies.count << ",\"lastMicros\":" << applies.lastMicros
         << ",\"maxMicros\":" << applies.maxMicros << ",\"totalMicros\":" << applies.totalMicros
         << ",\"lastKeys\":" << applies.lastKeys << ",\"lastWorkers\":" << applies.lastWorkers
         << ",\"lastEvaluated\":" << applies.lastEvaluated << ",\"lastRoutes\":" << applies.lastRoutes
         << ",\"lastFull\":" << (applies.lastFull ? "true" : "false") << '}'
+        << ",\"pollFailures\":" << polls.failures << ",\"lastPollAtUnixMs\":" << polls.lastAtUnixMs
+        << ",\"poll\":{\"intervalMs\":" << settings.pollIntervalMs << ",\"polls\":" << polls.count
+        << ",\"lastOkAtUnixMs\":" << polls.lastOkAtUnixMs << ",\"lastChangeAtUnixMs\":" << polls.lastChangeAtUnixMs
+        << ",\"hintReads\":" << polls.hints << ",\"indexReads\":" << polls.indexes << ",\"listings\":" << polls.listings
+        << ",\"manifestReads\":" << polls.manifests << ",\"definitionReads\":" << polls.definitions
+        << ",\"refreshes\":" << polls.refreshes
+        << ",\"tenants\":" << tenants.size() << ",\"definitions\":" << definitionBytes.size()
+        << ",\"missingDefinitions\":" << missingDefinitionsJson() << ",\"undecryptableSecrets\":" << undecryptableJson()
+        << ",\"routeConflicts\":" << routeConflicts << ",\"secretsKey\":" << quote(key.fingerprint())
+        << ",\"bucket\":" << quote(storage.config().bucket) << ",\"client\":" << storage.stats().json() << '}'
         << ",\"versionResolutionForTest\":" << quote(settings.versionResolutionForTest)
         << ",\"deploymentApplyDelayMsForTest\":" << settings.deploymentApplyDelayMsForTest << '}';
     return out.str();
   }
   const DesiredStateConfig& config() const override { return settings; }
+  void onTenants(std::function<void(const std::map<std::string, std::optional<TenantRecord>>&, uint64_t, bool)> sink) override {
+    tenantSink = std::move(sink);
+  }
 
 private:
   DesiredStateConfig settings;
@@ -322,14 +348,22 @@ private:
   uint64_t outOfBandDefinitions = 0, definitionFetchFailures = 0;
   kj::TaskSet definitionTasks;
   void taskFailed(kj::Exception&&) override { ++definitionFetchFailures; }
+  // A definition a call tree's lock names that this node's state does not (its view lags, or the version left): by
+  // hash, verified, kept.
   kj::Promise<DefinitionResult> fetchDefinition(std::string hash) {
     DefinitionResult result;
     try {
-      auto response = co_await storage.get("definitions/" + hash);
-      if (response.status != 200) {
-        result.reason = response.status == 404 ? "定义未知（对象不存在）" : "定义未知（拉取失败）";
-      } else {
-        auto version = decodeDeploymentDefinition(response.bytes);
+      std::string bytes;
+      if (auto known = definitionBytes.find(hash); known != definitionBytes.end()) bytes = known->second;
+      else {
+        auto response = co_await storage.get("definitions/" + hash);
+        if (response.status != 200) {
+          result.reason = response.status == 404 ? "定义未知（对象不存在）" : "定义未知（拉取失败）";
+        }
+        bytes = std::move(response.bytes);
+      }
+      if (result.reason.empty()) {
+        auto version = decodeDeploymentDefinition(bytes);
         if (version->definitionHash != hash || deploymentSha256(definitionEncoding(*version)) != hash) {
           result.reason = "定义未知（内容哈希不符）";
         } else {
@@ -342,14 +376,43 @@ private:
     if (!result.version) ++definitionFetchFailures;
     co_return result;
   }
-  EtcdClient authority;
-  EtcdWatcher watcher;
   DeploymentState current;
   DefinitionIndex index;
+  SecretsKey key;
   bool started = false;
   uint64_t rejectedRevisions = 0;
   uint64_t lastRejectedRevision = 0;
   std::string lastRejectedReason;
+  // A start that must not be retried (the bucket is not a cluster's): its reason.
+  std::string refusal;
+  // The applied view: each tenant's manifest and the keys it contributed, every route key, the generation.
+  std::map<std::string, TenantManifest> tenants;
+  std::map<std::string, std::map<std::string, std::string>> tenantKeys;
+  std::map<std::string, std::string> routeKeys;
+  std::string appliedGeneration;
+  size_t routeConflicts = 0;
+  // Definitions by hash: verified bytes, and the ones that could not be read with why.
+  DefinitionBytes definitionBytes;
+  std::map<std::string, std::string> missingDefinitions;
+  uint64_t lastDefinitionRetryAtUnixMs = 0;
+  std::set<std::string> undecryptable;  // <tenant>/<worker>/<name>
+  std::function<void(const std::map<std::string, std::optional<TenantRecord>>&, uint64_t, bool)> tenantSink;
+  bool lastPollOk = false;
+  std::string lastPollError;
+  struct {
+    uint64_t count = 0, failures = 0, lastAtUnixMs = 0, lastOkAtUnixMs = 0, lastChangeAtUnixMs = 0;
+    uint64_t hints = 0, indexes = 0, listings = 0, manifests = 0, definitions = 0, refreshes = 0;
+  } polls;
+  // One poll at a time: the periodic one and the ones asked for share it.
+  std::unique_ptr<kj::ForkedPromise<void>> pollFlight;
+  kj::Promise<void> pollShared() {
+    if (!pollFlight) {
+      pollFlight = std::make_unique<kj::ForkedPromise<void>>(pollGuarded().then([this]() { pollFlight.reset(); }).fork());
+      // A branch held by the task set keeps the fork alive while it resolves and its owner is reset.
+      definitionTasks.add(pollFlight->addBranch());
+    }
+    return pollFlight->addBranch();
+  }
   // Code of the served Workers, kept current from each batch's served changes
   // so that background prefetch never rescans every Worker.
   std::map<std::string, size_t> servedBundles;
@@ -360,21 +423,202 @@ private:
     bool lastFull = false;
   } applies;
 
+  std::string missingDefinitionsJson() const {
+    std::string out = "{";
+    size_t index = 0;
+    for (const auto& [hash, reason] : missingDefinitions) {
+      if (index == STATUS_PROBLEM_LIMIT) break;
+      out += (index++ ? "," : "") + quote(hash) + ":" + quote(reason);
+    }
+    return out + "}";
+  }
+  std::string undecryptableJson() const {
+    std::string out = "[";
+    size_t index = 0;
+    for (const auto& name : undecryptable) {
+      if (index == STATUS_PROBLEM_LIMIT) break;
+      out += (index++ ? "," : "") + quote(name);
+    }
+    return out + "]";
+  }
+
   kj::Promise<void> startRetry() {
+    const auto begin = std::chrono::steady_clock::now();
+    // The cluster's marker: a bucket without it is not a cluster's, and serving it as an empty cluster would be wrong.
+    while (true) {
+      std::string problem;
+      try {
+        auto marker = co_await storage.get(CLUSTER_FORMAT_KEY);
+        if (marker.status == 404) {
+          refusal = "the bucket " + storage.config().bucket + " at " + storage.config().endpoint + " holds no " + CLUSTER_FORMAT_KEY +
+              ": it is not a Coworkerd cluster's bucket (the cluster's init writes the marker); not starting";
+          std::cerr << "[deployment] " << refusal << std::endl;
+          KJ_FAIL_REQUIRE(refusal.c_str());
+        }
+        KJ_REQUIRE(marker.status == 200, "object store read failed", marker.status);
+        break;
+      } catch (const kj::Exception& error) {
+        if (!refusal.empty()) throw;
+        problem = error.getDescription().cStr();
+      }
+      lastPollError = problem;
+      co_await timer.afterDelay(settings.retryMs * kj::MILLISECONDS);
+    }
     while (!started) {
-      const auto begin = std::chrono::steady_clock::now();
-      try { co_await watcher.fullRead(); }
-      catch (const kj::Exception& error) { lastRejectedReason = error.getDescription().cStr(); }
+      co_await pollGuarded();
       if (started) {
-        // The initial read: etcd range (all pages) plus the full evaluation.
+        // The initial read: the index, every manifest it names, their definitions, plus the full evaluation.
         std::cout << "[deployment] startup read micros=" << std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - begin).count() << " workers=" << current.workers().size()
+            std::chrono::steady_clock::now() - begin).count() << " backend=objectStore revision=" << current.revision()
+            << " tenants=" << tenants.size() << " workers=" << current.workers().size()
             << " routes=" << current.routes().size() << " definitions=" << current.definitions().size() << std::endl;
       } else {
         co_await timer.afterDelay(settings.retryMs * kj::MILLISECONDS);
       }
     }
   }
+
+  kj::Promise<void> pollGuarded() {
+    ++polls.count;
+    polls.lastAtUnixMs = nowUnixMs();
+    std::string failure;
+    try {
+      co_await poll();
+      lastPollOk = true;
+      lastPollError.clear();
+      polls.lastOkAtUnixMs = nowUnixMs();
+    } catch (const kj::Exception& error) {
+      failure = error.getDescription().cStr();
+    }
+    if (!failure.empty()) {
+      // The store cannot be read (or what it holds cannot): the node serves the state it has.
+      lastPollOk = false;
+      lastPollError = failure;
+      if (++polls.failures == 1 || polls.failures % 60 == 0)
+        std::cerr << "[deployment] poll failed failures=" << polls.failures << " reason=" << failure << std::endl;
+    }
+  }
+
+  // The index's revision `revision` (when the hint named one), else the largest a listing names.
+  kj::Promise<std::pair<uint64_t, std::string>> readIndex(std::optional<uint64_t> hinted) {
+    uint64_t candidate = 0;
+    bool listed = false;
+    auto list = [&]() -> kj::Promise<uint64_t> {
+      listed = true;
+      ++polls.listings;
+      co_return latestRevision(co_await storage.list(std::string(TENANT_INDEX_PREFIX) + '/'), TENANT_INDEX_PREFIX);
+    };
+    // A hint behind the revision applied (another writer's late hint) is not followed backwards.
+    candidate = hinted && *hinted >= current.revision() ? *hinted : co_await list();
+    if (!candidate) co_return std::pair<uint64_t, std::string>{0, {}};
+    ++polls.indexes;
+    auto object = co_await storage.get(revisionKey(TENANT_INDEX_PREFIX, candidate));
+    if (object.status == 404 && !listed) {
+      candidate = co_await list();
+      if (!candidate) co_return std::pair<uint64_t, std::string>{0, {}};
+      ++polls.indexes;
+      object = co_await storage.get(revisionKey(TENANT_INDEX_PREFIX, candidate));
+    }
+    KJ_REQUIRE(object.status == 200, "object store read failed", object.status, revisionKey(TENANT_INDEX_PREFIX, candidate).c_str());
+    co_return std::pair<uint64_t, std::string>{candidate, std::move(object.bytes)};
+  }
+
+  // The definitions the manifests name that this node has not verified yet, read by hash with a bounded number in
+  // flight. One that is missing or does not verify stays out (the Worker that names it is not valid: "active Worker
+  // Version is missing") and is tried again at a later poll.
+  kj::Promise<bool> fetchNamedDefinitions(const std::map<std::string, TenantManifest>& view) {
+    std::set<std::string> wanted;
+    for (const auto& [tenant, manifest] : view)
+      for (const auto& hash : namedDefinitions(manifest)) if (!definitionBytes.contains(hash)) wanted.insert(hash);
+    bool added = false;
+    std::vector<std::string> list(wanted.begin(), wanted.end());
+    for (size_t start = 0; start < list.size(); start += FETCH_CONCURRENCY) {
+      kj::Vector<kj::Promise<void>> reads;
+      for (size_t i = start; i < std::min(list.size(), start + FETCH_CONCURRENCY); ++i) {
+        reads.add([](ObjectStoreDesiredState& self, std::string hash, bool& added) -> kj::Promise<void> {
+          ++self.polls.definitions;
+          std::string problem;
+          try {
+            auto response = co_await self.storage.get("definitions/" + hash);
+            if (response.status == 404) problem = "missing";
+            else if (response.status != 200) problem = "read failed: HTTP " + std::to_string(response.status);
+            else if (!definitionMatches(hash, response.bytes)) problem = "content hash mismatch";
+            else {
+              self.definitionBytes[hash] = std::move(response.bytes);
+              self.missingDefinitions.erase(hash);
+              added = true;
+              co_return;
+            }
+          } catch (const kj::Exception&) {
+            problem = "read failed";
+          }
+          self.missingDefinitions[hash] = problem;
+        }(*this, list[i], added));
+      }
+      co_await kj::joinPromises(reads.releaseAsArray());
+    }
+    co_return added;
+  }
+
+  kj::Promise<void> poll() {
+    ++polls.hints;
+    auto hinted = co_await readHintRevision(storage, indexHintKey(TENANT_INDEX_PREFIX));
+    const bool sameIndex = started && hinted && *hinted == current.revision();
+    std::map<std::string, TenantManifest> next = tenants;
+    TenantIndex index;
+    uint64_t revision = current.revision();
+    std::set<std::string> recompute;
+    if (sameIndex) {
+      // Nothing new (one GET); only a definition that could not be read before is tried again.
+      const auto now = nowUnixMs();
+      if (missingDefinitions.empty() || now - lastDefinitionRetryAtUnixMs < DEFINITION_RETRY_MS) co_return;
+      lastDefinitionRetryAtUnixMs = now;
+      if (!co_await fetchNamedDefinitions(next)) co_return;
+      for (const auto& [tenant, manifest] : next) recompute.insert(tenant);
+    } else {
+      auto [read, bytes] = co_await readIndex(hinted);
+      if (read) {
+        index = decodeTenantIndex(bytes);
+        KJ_REQUIRE(index.revision == read, "the tenant index names another revision than its key", read);
+      }
+      revision = read;
+      if (started && revision == current.revision() && missingDefinitions.empty()) co_return;
+      // The manifests whose revision the index changed, a bounded number in flight; a tenant the index no longer names
+      // leaves.
+      std::vector<std::pair<std::string, uint64_t>> wanted;
+      for (const auto& [tenant, entry] : index.tenants) {
+        auto known = next.find(tenant);
+        if (known == next.end() || known->second.revision != entry.manifestRev) wanted.emplace_back(tenant, entry.manifestRev);
+      }
+      for (auto it = next.begin(); it != next.end();) {
+        if (!index.tenants.contains(it->first)) { recompute.insert(it->first); it = next.erase(it); }
+        else ++it;
+      }
+      for (size_t start = 0; start < wanted.size(); start += FETCH_CONCURRENCY) {
+        kj::Vector<kj::Promise<TenantManifest>> reads;
+        for (size_t i = start; i < std::min(wanted.size(), start + FETCH_CONCURRENCY); ++i) {
+          reads.add([](ObjectStoreDesiredState& self, std::string tenant, uint64_t manifestRev) -> kj::Promise<TenantManifest> {
+            ++self.polls.manifests;
+            const auto objectKey = revisionKey(tenantManifestPrefix(tenant), manifestRev);
+            auto response = co_await self.storage.get(objectKey);
+            KJ_REQUIRE(response.status == 200, "object store read failed", response.status, objectKey.c_str());
+            auto manifest = decodeTenantManifest(response.bytes);
+            KJ_REQUIRE(manifest.tenant == tenant && manifest.revision == manifestRev,
+                "a manifest names another tenant or revision than its key", objectKey.c_str());
+            co_return manifest;
+          }(*this, wanted[i].first, wanted[i].second));
+        }
+        for (auto& manifest : co_await kj::joinPromises(reads.releaseAsArray())) {
+          recompute.insert(manifest.tenant);
+          next[manifest.tenant] = std::move(manifest);
+        }
+      }
+      lastDefinitionRetryAtUnixMs = nowUnixMs();
+      if (co_await fetchNamedDefinitions(next)) for (const auto& [tenant, manifest] : next) recompute.insert(tenant);
+    }
+    co_await applyView(std::move(next), std::move(recompute), revision);
+  }
+
   void serve(const std::shared_ptr<const VersionDefinition>& version, int delta) {
     if (!version) return;
     if (version->format == "v2") {
@@ -388,40 +632,81 @@ private:
       if (count == 0) servedBundles.erase(version->contentHash);
     }
   }
-  kj::Promise<void> apply(const EtcdBatch& batch) {
-    if (started && batch.revision <= current.revision()) co_return;
+
+  // The keys of the view against the keys applied: what changed is one batch at the index's revision.
+  kj::Promise<void> applyView(std::map<std::string, TenantManifest> next, std::set<std::string> recompute, uint64_t revision) {
     if (settings.deploymentApplyDelayMsForTest > 0) {
       co_await timer.afterDelay(settings.deploymentApplyDelayMsForTest * kj::MILLISECONDS);
     }
     const auto begin = std::chrono::steady_clock::now();
-    DeploymentState::ApplyStats stats;
+    const bool full = !started;
     std::vector<DeploymentState::Change> changes;
-    try {
-      // Nothing has ever been deployed (or the endpoint is wrong): do not
-      // start serving. A running Server applies whatever the prefix holds.
-      KJ_REQUIRE(started || !batch.full || !batch.changes.empty(),
-          "deployment state is empty or incomplete: no keys under /coworkerd/v2/deploy/");
-      const std::string prefix = DEPLOYMENT_PREFIX;
-      changes.reserve(batch.changes.size());
-      for (const auto& change : batch.changes) {
-        KJ_REQUIRE(change.key.starts_with(prefix), "unexpected deployment key");
-        changes.push_back({change.key.substr(prefix.size()),
-            change.kv ? std::optional<std::string>(change.kv->value) : std::nullopt});
+    std::map<std::string, std::map<std::string, std::string>> nextKeys = tenantKeys;
+    std::set<std::string> nextUndecryptable;
+    for (const auto& name : undecryptable) {
+      if (!recompute.contains(name.substr(0, name.find('/')))) nextUndecryptable.insert(name);
+    }
+    SecretOpener open = [&](const std::string& tenant, const std::string& worker, const std::string& secret,
+        const ManifestSecret& sealed) -> std::optional<std::string> {
+      auto value = key.open(secretAad(tenant, worker, secret), sealed);
+      if (!value) nextUndecryptable.insert(secretAad(tenant, worker, secret));
+      return value;
+    };
+    for (const auto& tenant : recompute) {
+      std::map<std::string, std::string> keys;
+      if (auto manifest = next.find(tenant); manifest != next.end()) keys = tenantStateKeys(manifest->second, definitionBytes, open);
+      const auto& previous = tenantKeys[tenant];
+      for (const auto& [stateKey, value] : previous)
+        if (!keys.contains(stateKey)) changes.push_back({stateKey, std::nullopt});
+      for (const auto& [stateKey, value] : keys) {
+        auto old = previous.find(stateKey);
+        if (old == previous.end() || old->second != value) changes.push_back({stateKey, value});
       }
-      stats = current.apply(changes, batch.full, batch.revision);
+      if (keys.empty()) nextKeys.erase(tenant); else nextKeys[tenant] = std::move(keys);
+    }
+    ManifestView view;
+    for (const auto& [tenant, manifest] : next) view.emplace(tenant, &manifest);
+    size_t conflicts = 0;
+    auto routes = routeStateKeys(view, &conflicts);
+    for (const auto& [stateKey, value] : routeKeys)
+      if (!routes.contains(stateKey)) changes.push_back({stateKey, std::nullopt});
+    for (const auto& [stateKey, value] : routes) {
+      auto old = routeKeys.find(stateKey);
+      if (old == routeKeys.end() || old->second != value) changes.push_back({stateKey, value});
+    }
+    const auto generation = generationValue(view);
+    if (generation != appliedGeneration || full) changes.push_back({"generation", generation});
+    // Nothing for the deployment state (a definition tried again in vain): no batch.
+    if (started && changes.empty() && revision == current.revision()) co_return;
+    DeploymentState::ApplyStats stats;
+    try {
+      stats = current.apply(changes, full, revision);
       for (const auto& version : stats.definitions) index.remember(version);
-      if (batch.full) { servedBundles.clear(); servedPackages.clear(); }
+      if (full) { servedBundles.clear(); servedPackages.clear(); }
       for (const auto& change : stats.served) {
-        if (!batch.full) serve(change.before, -1);
+        if (!full) serve(change.before, -1);
         serve(change.after, 1);
       }
-      if (!stats.served.empty() || batch.full) dropUnservedPackages();
+      if (!stats.served.empty() || full) dropUnservedPackages();
     } catch (const kj::Exception& error) {
-      if (lastRejectedRevision != batch.revision) ++rejectedRevisions;
-      lastRejectedRevision = batch.revision;
+      if (lastRejectedRevision != revision) ++rejectedRevisions;
+      lastRejectedRevision = revision;
       lastRejectedReason = error.getDescription().cStr();
-      std::cerr << "[deployment] apply failed revision=" << batch.revision << " reason=" << lastRejectedReason << std::endl;
+      std::cerr << "[deployment] apply failed revision=" << revision << " reason=" << lastRejectedReason << std::endl;
       throw;
+    }
+    tenants = std::move(next);
+    tenantKeys = std::move(nextKeys);
+    routeKeys = std::move(routes);
+    appliedGeneration = generation;
+    routeConflicts = conflicts;
+    undecryptable = std::move(nextUndecryptable);
+    if (!changes.empty()) polls.lastChangeAtUnixMs = nowUnixMs();
+    // The tenants' records: deletion, log quotas, default limits, hostnames (node/tenants.h).
+    if (tenantSink) {
+      std::map<std::string, std::optional<TenantRecord>> records;
+      for (const auto& [tenant, manifest] : tenants) records.emplace(tenant, manifest.record);
+      tenantSink(records, revision, true);
     }
     // Background prefetch of the served code, as after every applied revision.
     std::vector<std::string> bundles;
@@ -436,7 +721,7 @@ private:
         std::chrono::steady_clock::now() - begin).count());
     ++applies.count; applies.lastMicros = micros; applies.maxMicros = std::max(applies.maxMicros, micros);
     applies.totalMicros += micros; applies.lastKeys = stats.keys; applies.lastWorkers = stats.workers;
-    applies.lastEvaluated = stats.evaluated; applies.lastRoutes = stats.routes; applies.lastFull = batch.full;
+    applies.lastEvaluated = stats.evaluated; applies.lastRoutes = stats.routes; applies.lastFull = full;
     started = true;
     // Secret keys of the batch, by name and length: never a value.
     for (const auto& change : changes) {
@@ -452,23 +737,24 @@ private:
       if (auto names = current.secrets().find(worker); names != current.secrets().end()) {
         if (auto found = names->second.find(name); found != names->second.end()) record = &found->second;
       }
-      std::cout << "[deployment] secret revision=" << batch.revision << " worker=" << worker << " name=" << name;
+      std::cout << "[deployment] secret revision=" << revision << " worker=" << worker << " name=" << name;
       if (!record) std::cout << " state=deleted";
       else if (record->error.empty()) std::cout << " state=set bytes=" << record->value.size();
+      else if (undecryptable.contains(worker + "/" + name)) std::cout << " state=undecryptable";
       else std::cout << " state=unusable";
       std::cout << std::endl;
     }
     std::cout << "[deployment] applied revision=" << current.revision() << " generation=" << current.generation()
-              << " full=" << (batch.full ? 1 : 0) << " keys=" << stats.keys << " workers=" << stats.workers
+              << " full=" << (full ? 1 : 0) << " keys=" << stats.keys << " workers=" << stats.workers
               << " evaluated=" << stats.evaluated << " routes=" << stats.routes
               << " valid=" << current.validCount() << '/' << current.workers().size()
+              << " tenants=" << tenants.size() << " missingDefinitions=" << missingDefinitions.size()
               << " applyMicros=" << micros << " atUnixMs=" << nowUnixMs() << std::endl;
   }
 };
 }  // namespace
 
-kj::Own<DesiredState> newEtcdDesiredState(const DesiredStateConfig& config,
-    kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headers) {
-  return kj::heap<EtcdDesiredState>(config, network, timer, headers);
+kj::Own<DesiredState> newObjectStoreDesiredState(const DesiredStateConfig& config, kj::Network& network, kj::Timer& timer) {
+  return kj::heap<ObjectStoreDesiredState>(config, network, timer);
 }
 }  // namespace coworkerd

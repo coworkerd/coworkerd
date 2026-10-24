@@ -12,6 +12,8 @@
 #                  COWORKERD_MEMBERSHIP_BACKEND   objectStore (default: the members' heartbeats under members/ in the
 #                                                 bucket, written with the storage identity) or etcd
 #                  COWORKERD_ETCD_CREDENTIALS_FILE     default $COWORKERD_SECRETS_DIR/etcd.json when it exists
+#                  COWORKERD_SECRETS_KEY_FILE     the secrets key (it opens the secrets' values of the desired state on
+#                                                 the object store), default $COWORKERD_SECRETS_DIR/secrets-key.json
 #                  COWORKERD_PEER_KEY_FILE        the cluster key, default $COWORKERD_SECRETS_DIR/cluster-key.json
 #                                                 when it exists
 #                  COWORKERD_CONTROL_ADDRESS      the control plane, which tenant code may not reach (egress), default
@@ -28,14 +30,15 @@
 #                unless it exists, and a copy of each in the directory of every service that reads it -- in the
 #                compose file each service mounts only its own directory of the secrets volume:
 #                  init/        etcd-root.json (etcd's root), server.json (the object store's node identity),
-#                               cluster-key.json (the peer key), management-token, admin-credential (the API's
-#                               administrator) -- the originals; only init and secrets mount the whole volume
+#                               cluster-key.json (the peer key), secrets-key.json (the key that seals secrets' values in
+#                               the desired state), management-token, admin-credential (the API's administrator) -- the
+#                               originals; only init and secrets mount the whole volume
 #                  storage/     s3.json, the object store's identities (deploy writes; the nodes read, list and write
 #                               their membership under members/ -- the whole bucket for now: per-prefix rights later)
 #                  apiserver/   deploy.json (the deploy identity), etcd.json (etcd user coworkerd-apiserver),
-#                               management-token, admin-credential; the tool service mounts it too
+#                               secrets-key.json, management-token, admin-credential; the tool service mounts it too
 #                  nodes/<id>/  server.json (the node identity), etcd.json (etcd user coworkerd-node-<id>), cluster-key.json,
-#                               management-token; one directory per id of COWORKERD_NODE_IDS (default
+#                               secrets-key.json, management-token; one directory per id of COWORKERD_NODE_IDS (default
 #                               node-1,node-2,node-3)
 #                The management token and the administrator's credential are not generated when COWORKERD_MANAGEMENT_TOKEN
 #                or COWORKERD_ADMIN_CREDENTIAL is set: the services take it from their environment then.
@@ -47,23 +50,24 @@
 #                its file again when etcd refuses its token).
 #   init         At every start of the cluster: the bucket and a self-check -- written by the deploy identity, read
 #                back by the nodes' identity, unsigned requests refused, and the contract the membership needs
-#                (create-if-absent, a listing's Date and LastModified, the clock; coworkerd check storage); etcd's users, roles
-#                and authentication (coworkerd-apiserver tool etcd-auth: the roles of the v2 layout -- the control
-#                plane writes tenants/, credentials/ and deploy/, each node only its own nodes/<id>/ -- every user's
-#                password from its file, then authentication on); an empty deployment state in etcd when there is
-#                none yet. Retries until the store and etcd answer.
+#                (create-if-absent, a listing's Date and LastModified, the clock; coworkerd check storage); the cluster's
+#                marker cluster/format/1 and empty indexes in the bucket when there are none yet (coworkerd-apiserver tool
+#                init: nodes and the control plane refuse to start on a bucket without the marker); etcd's users, roles
+#                and authentication (coworkerd-apiserver tool etcd-auth: each node writes only its own nodes/<id>/ --
+#                suspects and usage -- every user's password from its file, then authentication on). Retries until the
+#                store and etcd answer.
 #   apiserver    Start the control plane (coworkerd-apiserver), the API cowctl uses. With COWORKERD_CONFIG,
 #                that file; otherwise one written to $COWORKERD_STACK_DIR/control.json from
 #                  COWORKERD_ETCD_ENDPOINT, COWORKERD_STORAGE_ENDPOINT (required), COWORKERD_STORAGE_BUCKET,
 #                  COWORKERD_STORAGE_REGION, COWORKERD_MEMBERSHIP_BACKEND (as for node: where the control plane reads the
 #                  members), COWORKERD_DEPLOY_CREDENTIALS_FILE (default the deploy identity
-#                  secrets wrote, $COWORKERD_SECRETS_DIR/deploy.json), COWORKERD_CONTROL_LISTEN_ADDRESS
-#                  (default 0.0.0.0:8940).
+#                  secrets wrote, $COWORKERD_SECRETS_DIR/deploy.json), COWORKERD_SECRETS_KEY_FILE (default
+#                  $COWORKERD_SECRETS_DIR/secrets-key.json), COWORKERD_CONTROL_LISTEN_ADDRESS (default 0.0.0.0:8940).
 #                The administrator's credential (required): COWORKERD_ADMIN_CREDENTIAL, else the one `secrets` generated
 #                ($COWORKERD_SECRETS_DIR/admin-credential). The management token (what it sends to the nodes) as for
 #                node; etcd's credentials as for node (COWORKERD_ETCD_CREDENTIALS_FILE, default
 #                $COWORKERD_SECRETS_DIR/etcd.json when it exists).
-#   tool ARGS    coworkerd-apiserver tool ARGS with the cluster's addresses and the deploy identity, e.g.
+#   tool ARGS    coworkerd-apiserver tool ARGS with the cluster's object store, the deploy identity and the secrets key, e.g.
 #                `tool upsert --manifest /work/manifest.json` (the default tenant; --tenant T for another);
 #                `tool token` prints the management token, `tool admin-credential` the administrator's credential
 #                of the API (what cowctl's administrator commands take), `tool version` coworkerd-apiserver --version.
@@ -148,6 +152,10 @@ node() {
       check COWORKERD_PEER_KEY_FILE "$peerKey" "$PATHNAME"
       extra+=$',\n  "peerAuth": {"keyFile": "'"$peerKey"'"}'
     fi
+    # The secrets key opens the secrets' values in the tenants' manifests.
+    local secretsKey=${COWORKERD_SECRETS_KEY_FILE:-$SECRETS/secrets-key.json}
+    check COWORKERD_SECRETS_KEY_FILE "$secretsKey" "$PATHNAME"
+    [[ -s $secretsKey ]] || fail "no secrets key at $secretsKey (run the secrets step first)"
     local control=${COWORKERD_CONTROL_ADDRESS:-apiserver:8940}
     check COWORKERD_CONTROL_ADDRESS "$control" "$ADDRESS"
     extra+=$',\n  "egress": {"clusterAddresses": ["'"$control"'"]}'
@@ -168,6 +176,8 @@ node() {
   "peerListenAddress": "$peerListen",
   "etcdEndpoint": "$etcd",
   "membership": {"backend": "$membership"},
+  "desiredState": {"backend": "objectStore"},
+  "secrets": {"keyFile": "$secretsKey"},
   "storage": {"endpoint": "$storage", "bucket": "$bucket", "region": "$region", "credentialsFile": "$credentials"}$extra
 }
 JSON
@@ -197,6 +207,9 @@ apiserver() {
     local membership=${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
     check COWORKERD_MEMBERSHIP_BACKEND "$membership" "$MEMBERSHIP"
     [[ -s $credentials ]] || fail "no deploy credentials at $credentials (run init first)"
+    local secretsKey=${COWORKERD_SECRETS_KEY_FILE:-$SECRETS/secrets-key.json}
+    check COWORKERD_SECRETS_KEY_FILE "$secretsKey" "$PATHNAME"
+    [[ -s $secretsKey ]] || fail "no secrets key at $secretsKey (run the secrets step first)"
     mkdir -p "$STACK/control-tmp"
     # etcd's user coworkerd-apiserver, as the secrets step distributed it.
     local etcdCredentials=${COWORKERD_ETCD_CREDENTIALS_FILE:-$SECRETS/etcd.json} etcdLine=""
@@ -209,6 +222,7 @@ apiserver() {
 {$etcdLine
   "etcdEndpoint": "$etcd",
   "membership": {"backend": "$membership"},
+  "secrets": {"keyFile": "$secretsKey"},
   "storage": {"endpoint": "$storage", "bucket": "$bucket", "region": "$region", "credentialsFile": "$credentials"},
   "control": {"listenAddress": "$listen", "temporaryDirectory": "$STACK/control-tmp"}
 }
@@ -311,6 +325,13 @@ secrets() {
     mv "$SECRETS/init/admin-credential.next" "$SECRETS/init/admin-credential"
     printf '[secrets] {"event":"admin-credential","generated":true}\n'
   fi
+  # The secrets key: secrets' values are sealed with it in the tenants' manifests (AES-256-GCM); the control plane seals,
+  # every node opens.
+  if [[ ! -s $SECRETS/init/secrets-key.json ]]; then
+    printf '{"key":"%s"}\n' "$(random 32)" >"$SECRETS/init/secrets-key.json.next"
+    mv "$SECRETS/init/secrets-key.json.next" "$SECRETS/init/secrets-key.json"
+    printf '[secrets] {"event":"secrets-key","generated":true}\n'
+  fi
   # The cluster key: the nodes sign their peer connections with it.
   if [[ ! -s $SECRETS/init/cluster-key.json ]]; then
     printf '{"keys":[{"id":"k%s","secret":"%s"}]}\n' "$(date -u +%Y%m%d%H%M%S)" "$(random 32)" >"$SECRETS/init/cluster-key.json.next"
@@ -329,12 +350,14 @@ secrets() {
   user "$SECRETS/apiserver/etcd.json" coworkerd-apiserver
   [[ -s $SECRETS/init/management-token ]] && place "$SECRETS/init/management-token" "$SECRETS/apiserver/management-token"
   [[ -s $SECRETS/init/admin-credential ]] && place "$SECRETS/init/admin-credential" "$SECRETS/apiserver/admin-credential"
+  place "$SECRETS/init/secrets-key.json" "$SECRETS/apiserver/secrets-key.json"
   local id
   for id in ${nodes//,/ }; do
     mkdir -p "$SECRETS/nodes/$id"
     user "$SECRETS/nodes/$id/etcd.json" "coworkerd-node-$id"
     place "$SECRETS/init/server.json" "$SECRETS/nodes/$id/server.json"
     place "$SECRETS/init/cluster-key.json" "$SECRETS/nodes/$id/cluster-key.json"
+    place "$SECRETS/init/secrets-key.json" "$SECRETS/nodes/$id/secrets-key.json"
     [[ -s $SECRETS/init/management-token ]] && place "$SECRETS/init/management-token" "$SECRETS/nodes/$id/management-token"
   done
   printf '[secrets] {"event":"ready","nodes":"%s"}\n' "$nodes"
@@ -361,10 +384,9 @@ init() {
   done
   printf '[init] {"event":"storage","bucket":"%s","attempts":%d,"seconds":%d}\n' "$bucket" "$((attempt + 1))" "$((SECONDS - started))"
   printf '[init] %s\n' "$(grep -o '{"contract".*' "$SECRETS/init/.probe.log")"
-  # etcd's users, roles and authentication: the roles of the v2 layout -- the control plane writes tenants/,
-  # credentials/ and deploy/, each node only its own nodes/<id>/ -- each user's password from its file, then
-  # authentication on; anonymous requests are refused from here on.
-  local etcd=${COWORKERD_ETCD_ENDPOINT:-http://etcd:2379} state="" args=() id
+  # etcd's users, roles and authentication (suspects and usage, until 0.4's last round): each node writes only its own
+  # nodes/<id>/ -- each user's password from its file, then authentication on; anonymous requests are refused from here on.
+  local etcd=${COWORKERD_ETCD_ENDPOINT:-http://etcd:2379} args=() id
   check COWORKERD_ETCD_ENDPOINT "$etcd" "$ENDPOINT"
   args=(--endpoint "$etcd" --root "$SECRETS/init/etcd-root.json" --apiserver "$SECRETS/apiserver/etcd.json")
   for id in "$SECRETS"/nodes/*/; do
@@ -377,27 +399,18 @@ init() {
     sleep 1
   done
   printf '[init] %s\n' "$(grep -o '{"event":"etcd-auth".*' "$SECRETS/init/.etcd-auth.log")"
-  # A Server starts only once the cluster's deployment state exists (an empty prefix may be a wrong
-  # endpoint). A new cluster gets an empty one: generation 1, nothing deployed -- written by the
-  # deployment tool as the control plane's etcd user, and only while nothing is there at all.
-  export COWORKERD_ETCD_CREDENTIALS_FILE=$SECRETS/apiserver/etcd.json
+  # Nodes and the control plane start only on a bucket that holds the cluster's marker (cluster/format/1; a bucket
+  # without it may be a wrong one): written once, with empty indexes beside it, by the deploy identity.
+  local format=""
   started=$SECONDS
-  until state=$(coworkerd-apiserver tool show --endpoint "$etcd" 2>"$SECRETS/init/.show.log"); do
-    if ((SECONDS - started > 120)); then cat "$SECRETS/init/.show.log" >&2; fail "etcd did not answer"; fi
+  until format=$(COWORKERD_STORAGE_ENDPOINT=$storage COWORKERD_STORAGE_BUCKET=$bucket \
+        AWS_ACCESS_KEY_ID=$(credential "$SECRETS/apiserver/deploy.json" accessKey) \
+        AWS_SECRET_ACCESS_KEY=$(credential "$SECRETS/apiserver/deploy.json" secretKey) \
+        coworkerd-apiserver tool init 2>"$SECRETS/init/.format.log"); do
+    if ((SECONDS - started > 120)); then cat "$SECRETS/init/.format.log" >&2; fail "the cluster's marker could not be written"; fi
     sleep 1
   done
-  if [[ $state == '{"generation":0,'* && $state == *'"activeVersions":{},"routes":[],'* ]]; then
-    local empty
-    empty=$(mktemp)
-    printf '{"compatibilityDate":"2026-10-01","routes":[],"workers":[]}\n' >"$empty"
-    COWORKERD_STORAGE_ENDPOINT=$storage AWS_ACCESS_KEY_ID=$(credential "$SECRETS/apiserver/deploy.json" accessKey) \
-      AWS_SECRET_ACCESS_KEY=$(credential "$SECRETS/apiserver/deploy.json" secretKey) \
-      coworkerd-apiserver tool upsert --endpoint "$etcd" --manifest "$empty" --no-trial >/dev/null
-    rm -f "$empty"
-    printf '[init] {"event":"deployment-state","initialized":true}\n'
-  else
-    printf '[init] {"event":"deployment-state","initialized":false}\n'
-  fi
+  printf '[init] %s\n' "$format"
   printf '[init] {"event":"ready","seconds":%d}\n' "$SECONDS"
 }
 
@@ -428,6 +441,10 @@ tool() {
     AWS_SECRET_ACCESS_KEY=$(credential "$SECRETS/deploy.json" secretKey)
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
   fi
+  # The secrets key: `tool secret put` seals the value with it.
+  if [[ -z ${COWORKERD_SECRETS_KEY_FILE:-} && -s $SECRETS/secrets-key.json ]]; then
+    export COWORKERD_SECRETS_KEY_FILE=$SECRETS/secrets-key.json
+  fi
   local args=("$@") given=false membershipGiven=false argument
   for argument in "${args[@]}"; do
     [[ $argument == --endpoint ]] && given=true
@@ -435,9 +452,13 @@ tool() {
   done
   local membership=${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
   check COWORKERD_MEMBERSHIP_BACKEND "$membership" "$MEMBERSHIP"
-  case ${1:-} in
-    apply|upsert|remove|show|secret) $given || args+=(--endpoint "$etcd") ;;
-  esac
+  # etcd is where the members are with the etcd membership (the trial loads go to them); the desired state is the
+  # object store's (COWORKERD_STORAGE_ENDPOINT).
+  if [[ $membership == etcd ]]; then
+    case ${1:-} in
+      apply|upsert) $given || args+=(--endpoint "$etcd") ;;
+    esac
+  fi
   # The trial loads go to the members where they live.
   case ${1:-} in
     apply|upsert) $membershipGiven || args+=(--membership "$membership") ;;

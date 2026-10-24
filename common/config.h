@@ -116,8 +116,8 @@ struct BundleCacheConfig {
 };
 
 struct DesiredStateConfig {
-  std::string backend = "file";
-  std::string endpoint;
+  std::string backend = "file";  // file or objectStore
+  std::string endpoint;          // unused since 0.4
   std::filesystem::path codeDirectory;
   uint32_t requestTimeoutMs = 750;
   uint32_t startupTimeoutMs = 15000;
@@ -126,6 +126,9 @@ struct DesiredStateConfig {
   uint32_t deploymentApplyDelayMsForTest = 0;
   ObjectStoreConfig objectStore;
   BundleCacheConfig cache;
+  uint32_t pollIntervalMs = 5000;
+  // The secrets key's file (ServerConfig::secretsKeyFile, after COWORKERD_SECRETS_KEY_FILE).
+  std::string secretsKeyFile;
 };
 
 // Tenant Workers' outbound requests (ServerConfig.egress, the schema's comments). The rules are kept as written
@@ -200,6 +203,7 @@ struct ServerConfig {
   std::string controlListenAddress, controlTemporaryDirectory;
   uint64_t controlMaxUploadBytes = 167772160;
   uint32_t controlServerTimeoutMs = 2000;
+  uint32_t controlPollIntervalMs = 5000;
   // The administrator's credential of /v1 (COWORKERD_ADMIN_CREDENTIAL overrides it) and path routing
   // under the default host.
   std::string controlAdminCredential;
@@ -211,6 +215,8 @@ struct ServerConfig {
   coworkerd::EgressConfig egress;
   coworkerd::PeerAuthConfig peerAuth;
   std::string etcdCredentialsFile;
+  // The cluster's secrets key (secrets.keyFile; COWORKERD_SECRETS_KEY_FILE overrides it).
+  std::string secretsKeyFile;
 
   // A management token: 16 to 4096 printable characters without spaces. Never echoed.
   static void checkToken(const std::string& token, const char* origin);

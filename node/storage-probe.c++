@@ -1,5 +1,6 @@
 #include "object-store.h"
 #include "object-state.h"
+#include "tenant-manifest.h"
 
 #include <kj/debug.h>
 
@@ -17,7 +18,8 @@ namespace coworkerd {
 // objects' LastModified, and this machine's clock within COWORKERD_CLOCK_SKEW_TOLERANCE_MS (default 2000) of that Date.
 // Reported but not required: a listing of members/ with the read identity (the 0.4 nodes' identity lists and writes
 // members/; a 0.3 read-only one does not) and whether create-if-absent holds under concurrency (8 writers on one key,
-// 20 rounds at once) -- `conditionalPutAtomic` (SeaweedFS before 4.29 answers false). One JSON line per request, then
+// 20 rounds at once) -- `conditionalPutAtomic` (SeaweedFS before 4.29 answers false) -- and whether the bucket holds the
+// cluster's marker cluster/format/1 (`clusterFormat`: init writes it after this check). One JSON line per request, then
 // the contract's line.
 // SeaweedFS 4.48, compared with 3.97 (v22, b8): an object PUT into a bucket that does not exist still answers 200 (so the
 // bucket comes first, here and in init), but its gateway no longer keeps answering NoSuchBucket once the bucket exists,
@@ -87,6 +89,9 @@ int runStorageCheck(int argc, char** argv) {
       for (auto& c : membersListed) if (c == '\n') c = ' ';
     }
     auto measurement = coworkerd::measureConditionalPut(store, prefix + "concurrent-", 8, 20).wait(io.waitScope);
+    // Reported, not required (init runs this check before it writes the marker): whether the bucket already holds the
+    // cluster's marker, cluster/format/1, without which nodes and the control plane refuse to start.
+    const auto marker = reader.get(coworkerd::CLUSTER_FORMAT_KEY).wait(io.waitScope);
     const bool sequential = first.created && !second.created && kept.bytes == "first\n";
     const bool clockOk = clock.readable && !clock.exceeds;
     const bool ok = sequential && listing.dateUnixMs > 0 && lastModified && clockOk;
@@ -97,6 +102,8 @@ int runStorageCheck(int argc, char** argv) {
         << ",\"lastModified\":" << (lastModified ? "true" : "false") << "},\"clock\":{\"skewMs\":" << clock.skewMs
         << ",\"minSkewMs\":" << clock.minSkewMs << ",\"maxSkewMs\":" << clock.maxSkewMs << ",\"toleranceMs\":" << tolerance
         << ",\"ok\":" << (clockOk ? "true" : "false") << "},\"readIdentityLists\":{\"prefix\":\"members/\"," << membersListed
+        << "},\"clusterFormat\":{\"key\":\"" << coworkerd::CLUSTER_FORMAT_KEY << "\",\"present\":"
+        << (marker.status == 200 ? "true" : "false") << ",\"status\":" << marker.status
         << "},\"conditionalPutAtomic\":" << (measurement.atomic() ? "true" : "false")
         << ",\"concurrency\":" << measurement.json() << ",\"ok\":" << (ok ? "true" : "false") << "}}" << std::endl;
     KJ_REQUIRE(sequential, "the second create-if-absent of a key did not find it existing");

@@ -119,20 +119,22 @@ struct ServerConfig {
   runtimePath @27 :Text;
   # The ingress. Default 0.0.0.0:8930. Serve only.
   listenAddress @28 :Text;
-  # The deployment state in etcd, and the membership too unless membership.backend says objectStore (sets the
-  # backends to etcd; membership.backend may name objectStore beside it).
+  # etcd: the suspects and the usage rows (until 0.4's last round), and the membership unless membership.backend says
+  # objectStore (sets the membership's backend to etcd; membership.backend may name objectStore beside it). The desired
+  # state is not in etcd any more: it is the object store's (desiredState.backend objectStore).
   etcdEndpoint @29 :Text;
   # What other Servers dial for this one (membership.advertisedAddress); default
   # <hostname>:<port of peerListenAddress>, whose default is 0.0.0.0:8934 in serve.
   advertisedAddress @30 :Text;
-  # The object store of the code packages (sets desiredState.objectStore and its cache), and of the members when
-  # membership.backend is objectStore.
+  # The object store: the desired state (sets desiredState.objectStore and its cache, and the desired state's backend to
+  # objectStore unless desiredState.backend says otherwise), the code packages, and the members when membership.backend
+  # is objectStore.
   storage @31 :StorageConfig;
   # The management endpoints (/__coworkerd/ except ready and probe); COWORKERD_MANAGEMENT_TOKEN
   # overrides the token.
   management @32 :ManagementConfig;
-  # The control plane: `coworkerd-apiserver --config FILE` reads the same file -- etcd
-  # (etcdEndpoint), the object store with the deploy identity (storage), the management token
+  # The control plane: `coworkerd-apiserver --config FILE` reads the same file -- the object store with the deploy
+  # identity (storage), the secrets key (secrets), etcd for the usage rows (etcdEndpoint), the management token
   # (management) -- and this.
   control @33 :ControlConfig;
   # The Workers' logs: each Server's in-memory log of every Worker, the tenant log quota, and
@@ -155,6 +157,15 @@ struct ServerConfig {
   # etcd's authentication: a JSON file {"user":"...","password":"..."} readable by its owner only; unset, the
   # requests carry no credentials. COWORKERD_ETCD_CREDENTIALS_FILE overrides it.
   etcdCredentialsFile @39 :Text;
+  # The cluster's secrets key: secrets' values are sealed with it in the tenants' manifests on the object store (AES-256-GCM).
+  # The control plane and every node with the objectStore desired state need it.
+  secrets @40 :SecretsConfig;
+
+  struct SecretsConfig {
+    # A JSON file {"key":"<64 hexadecimal digits>"} (32 bytes) readable by its owner only; compose's secrets step writes
+    # secrets-key.json and gives the control plane and every node a copy. COWORKERD_SECRETS_KEY_FILE overrides it.
+    keyFile @0 :Text;
+  }
 
   struct UsageConfig {
     # How often the current hour's counts are written (a node that stops loses at most this much).
@@ -273,6 +284,9 @@ struct ServerConfig {
     # Path routes under the cluster's default host: a tenant may route `*` with a prefix /<tenant> or
     # /<tenant>/...; false: only hostnames the tenant owns.
     pathRouting @5 :Bool = true;
+    # How often the control plane reads the desired state's hints again (the writes of another control plane on the same
+    # bucket); its own writes are in its mirror as it makes them.
+    pollIntervalMs @6 :UInt32 = 5000;
   }
 
   struct LogsConfig {
@@ -298,10 +312,18 @@ struct ServerConfig {
     # A JSON file {"accessKey":"...","secretKey":"..."} with the Servers' identity: it reads, and with the objectStore
     # membership also lists and writes members/<nodeId>/; without one, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
     credentialsFile @3 :Text;
+    # The longest a prefetch waits for one object; a single request is bounded by the three timeouts below.
     timeoutMs @4 :UInt32 = 30000;
     # The local package cache; default <stackDirectory>/cache.
     cacheDirectory @5 :Text;
     cacheMaxBytes @6 :UInt64 = 67108864;
+    # Every request: its connection (the name resolved and connected) within connectTimeoutMs; its answer, and every
+    # read or write after the one before, within readTimeoutMs; a create-if-absent's answer within createTimeoutMs
+    # (SeaweedFS 4.48 queues the later writers of one key, about 1 s each). GET, HEAD, listings, DELETE and creates
+    # that fail are sent once more on a new connection; a create whose answer was lost is decided by reading it back.
+    connectTimeoutMs @7 :UInt32 = 2000;
+    readTimeoutMs @8 :UInt32 = 5000;
+    createTimeoutMs @9 :UInt32 = 30000;
   }
 
   struct ManagementConfig {
@@ -409,7 +431,11 @@ struct MembershipConfig {
 }
 
 struct DesiredStateConfig {
+  # "file" (a manifest file of the stack, the positional form) or "objectStore" (the tenant index and the tenants'
+  # manifests in the bucket of the storage block, which `storage` sets): the node reads the index's hint every
+  # pollIntervalMs, and the index and the manifests it names when they change. etcd's backend was removed in 0.4.
   backend @0 :Text = "file";
+  # Unused since 0.4 (etcd's backend); accepted.
   endpoint @1 :Text;
   codeDirectory @2 :Text;
   requestTimeoutMs @3 :UInt32 = 750;
@@ -419,6 +445,9 @@ struct DesiredStateConfig {
   deploymentApplyDelayMsForTest @7 :UInt32 = 0;
   objectStore @8 :ObjectStoreConfig;
   cache @9 :BundleCacheConfig;
+  # objectStore: how often the tenant index's hint is read (one GET; a changed one reads the index and the manifests it
+  # names anew).
+  pollIntervalMs @10 :UInt32 = 5000;
 }
 
 struct ObjectStoreConfig {
@@ -429,7 +458,11 @@ struct ObjectStoreConfig {
   region @4 :Text = "us-east-1";
   accessKey @5 :Text;
   secretKey @6 :Text;
+  # As StorageConfig's.
   timeoutMs @7 :UInt32 = 30000;
+  connectTimeoutMs @8 :UInt32 = 2000;
+  readTimeoutMs @9 :UInt32 = 5000;
+  createTimeoutMs @10 :UInt32 = 30000;
 }
 
 struct BundleCacheConfig {

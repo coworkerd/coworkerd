@@ -210,6 +210,9 @@ int runDrainTool(int argc, char** argv) {
 
 struct ControlSettings {
   std::string listenAddress, etcdEndpoint, token, tokenSource, configFile;
+  // The desired state's mirror: its hints read again every pollIntervalMs; the secrets key that seals secrets' values.
+  uint32_t pollIntervalMs = 5000, startupTimeoutMs = 15000;
+  std::string secretsKeyFile, secretsKeySource;
   std::string adminCredential, adminSource;
   bool pathRouting = true;
   fs::path temporaryDirectory;
@@ -364,9 +367,9 @@ private:
 class ControlService final: public kj::HttpService {
 public:
   ControlService(const ControlSettings& settings, coworkerd::EtcdClient& etcd, coworkerd::ObjectStore& storage,
-      kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
-      : settings(settings), etcd(etcd), storage(storage), timer(timer), network(network), headerTable(headerTable),
-        context{etcd, storage, timer, network, headerTable, settings.token, settings.membersOnObjectStore,
+      coworkerd::ManifestStore& state, kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
+      : settings(settings), etcd(etcd), storage(storage), state(state), timer(timer), network(network), headerTable(headerTable),
+        context{etcd, storage, state, timer, network, headerTable, settings.token, settings.membersOnObjectStore,
             settings.memberTtlSeconds, settings.memberGraceMs} {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
@@ -384,6 +387,9 @@ public:
           std::cout << "[control] {\"event\":\"failure\",\"reason\":\"" << jsonEscape(cleanReason(error.getDescription().cStr()))
                     << "\"}" << std::endl;
           if (tracked.status) return kj::mv(error);
+          // The object store out of reach where an answer needed it (and no mirror could stand in).
+          if (std::string(error.getDescription().cStr()).find("object store") != std::string::npos)
+            return fail(tracked, 503, "STORAGE_UNAVAILABLE", error.getDescription().cStr());
           return fail(tracked, 500, "INTERNAL", error.getDescription().cStr());
         })
         .then([&tracked, started, path = std::move(path), methodName = std::move(methodName)]() {
@@ -406,7 +412,7 @@ private:
     const auto segments = controlSegments(url.cStr());
     const auto query = controlQuery(url.cStr());
     if (segments.empty() || segments[0] != "v1") co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
-    // No credential at all: refused before anything else (the health check's probe), etcd or not.
+    // No credential at all: refused before anything else (the health check's probe).
     bool presented = false;
     headers.forEach([&](kj::StringPtr name, kj::StringPtr) { if (name.size() == 13 && strncasecmp(name.cStr(), "authorization", 13) == 0) presented = true; });
     if (!presented) {
@@ -416,16 +422,9 @@ private:
       co_return co_await sendJson(response, 401, "{\"code\":\"UNAUTHORIZED\",\"reason\":\"this endpoint requires Authorization: Bearer <credential> "
           "(the administrator's or a tenant's)\"}", "Bearer realm=\"coworkerd\"");
     }
-    // etcd next: when it cannot be reached every endpoint says so (a tenant's credential is read from it too).
-    std::optional<std::string> unreachable;
-    try {
-      co_await etcd.range(std::string(coworkerd::DEPLOYMENT_PREFIX) + "generation");
-    } catch (const kj::Exception& error) {
-      unreachable = error.getDescription().cStr();
-    }
-    if (unreachable)
-      co_return co_await fail(response, 503, "ETCD_UNAVAILABLE", "etcd cannot be reached (" + settings.etcdEndpoint + "): " + *unreachable);
-    auto authenticated = co_await coworkerd::authenticate(etcd, settings.adminCredential, headers);
+    // The credential from the mirror of the credentials index: every read of /v1 is the mirror's, so reads go on while
+    // the object store cannot be reached; writes then answer STORAGE_UNAVAILABLE.
+    auto authenticated = coworkerd::authenticate(state, settings.adminCredential, headers);
     if (!authenticated.caller) {
       std::string path = url.cStr();
       if (auto mark = path.find('?'); mark != std::string::npos) path.resize(mark);
@@ -463,8 +462,8 @@ private:
     if (segments[1] != "tenants") co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
     if (n == 2) {
       if (!caller.admin) co_return co_await adminOnly();
-      if (is(kj::HttpMethod::POST)) co_return co_await send(response, co_await coworkerd::createTenant(etcd, timer, co_await readBody(body)));
-      if (is(kj::HttpMethod::GET)) co_return co_await send(response, co_await coworkerd::listTenants(etcd));
+      if (is(kj::HttpMethod::POST)) co_return co_await send(response, co_await coworkerd::createTenant(state, co_await readBody(body)));
+      if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::listTenants(state));
       co_return co_await methodNotAllowed(response, "GET, POST");
     }
     const auto tenant = segments[2];
@@ -475,12 +474,12 @@ private:
     if (n == 3) {
       if (is(kj::HttpMethod::GET)) co_return co_await tenantSummary(tenant, response);
       if (!caller.admin) co_return co_await adminOnly();
-      if (is(kj::HttpMethod::PATCH)) co_return co_await send(response, co_await coworkerd::updateTenant(etcd, timer, tenant, co_await readBody(body)));
+      if (is(kj::HttpMethod::PATCH)) co_return co_await send(response, co_await coworkerd::updateTenant(state, tenant, co_await readBody(body)));
       if (is(kj::HttpMethod::DELETE)) co_return co_await send(response, co_await coworkerd::deleteTenant(context, tenant));
       co_return co_await methodNotAllowed(response, "GET, PATCH, DELETE");
     }
     // Below a tenant: it exists, and only an active one is written to.
-    auto read = co_await coworkerd::readTenant(etcd, tenant);
+    auto read = coworkerd::readTenant(state, tenant);
     if (!read.tenant) co_return co_await fail(response, 404, "TENANT_NOT_FOUND", "there is no tenant " + tenant);
     const auto record = *read.tenant;
     if (!is(kj::HttpMethod::GET) && record.status != "active")
@@ -490,14 +489,14 @@ private:
       if (n == 4) {
         if (!caller.admin) co_return co_await adminOnly();
         if (is(kj::HttpMethod::POST))
-          co_return co_await send(response, co_await coworkerd::createCredential(etcd, timer, tenant, co_await readBody(body)));
-        if (is(kj::HttpMethod::GET)) co_return co_await send(response, co_await coworkerd::listCredentials(etcd, tenant));
+          co_return co_await send(response, co_await coworkerd::createCredential(state, tenant, co_await readBody(body)));
+        if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::listCredentials(state, tenant));
         co_return co_await methodNotAllowed(response, "GET, POST");
       }
       if (n == 5) {
         // A tenant revokes its own credentials; the administrator any tenant's.
         if (!is(kj::HttpMethod::DELETE)) co_return co_await methodNotAllowed(response, "DELETE");
-        co_return co_await send(response, co_await coworkerd::revokeCredential(etcd, timer, tenant, segments[4]));
+        co_return co_await send(response, co_await coworkerd::revokeCredential(state, tenant, segments[4]));
       }
     }
     if (area == "usage" && n == 4) {
@@ -507,13 +506,13 @@ private:
     if (area != "workers") co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
     if (n == 4) {
       if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
-      co_return co_await answer(response, co_await coworkerd::controlWorkers(etcd, tenant), "deploy");
+      co_return co_await answer(response, co_await coworkerd::controlWorkers(state, tenant), "deploy");
     }
     const auto& worker = segments[4];
     if (!coworkerd::apiName(worker)) co_return co_await fail(response, 400, "INVALID_REQUEST", "invalid Worker name ([a-z0-9][a-z0-9-]{0,62})");
     const auto id = coworkerd::workerFullId(tenant, worker);
     if (n == 5) {
-      if (is(kj::HttpMethod::GET)) co_return co_await answer(response, co_await coworkerd::controlWorkers(etcd, tenant, id), "deploy");
+      if (is(kj::HttpMethod::GET)) co_return co_await answer(response, co_await coworkerd::controlWorkers(state, tenant, id), "deploy");
       if (is(kj::HttpMethod::PATCH)) co_return co_await limits(record, id, body, response);
       if (is(kj::HttpMethod::DELETE)) co_return co_await answer(response, co_await coworkerd::controlRemove(context, id), "deploy");
       co_return co_await methodNotAllowed(response, "GET, PATCH, DELETE");
@@ -613,7 +612,7 @@ private:
     if (invalid) co_return co_await fail(response, 400, "INVALID_REQUEST", *invalid);
     archive = nullptr;
     // The tenant's quotas (control-plane-api.md section 3), against one read of its state.
-    auto counts = co_await coworkerd::tenantCounts(etcd, tenant.name);
+    auto counts = coworkerd::tenantCounts(state, tenant.name);
     if (!counts.hasWorker(id) && counts.versions.size() >= tenant.quotas.workers)
       co_return co_await fail(response, 422, "QUOTA_EXCEEDED", "workers: tenant " + tenant.name + " has " +
           std::to_string(counts.versions.size()) + " Workers, its quota is " + std::to_string(tenant.quotas.workers));
@@ -730,7 +729,7 @@ private:
         tooLarge = true;
       }
       if (tooLarge) co_return co_await fail(response, 413, "SECRET_TOO_LARGE", "a secret value is at most 5 KiB");
-      auto counts = co_await coworkerd::tenantCounts(etcd, tenant.name);
+      auto counts = coworkerd::tenantCounts(state, tenant.name);
       const auto known = counts.secrets.find(id);
       const bool exists = known != counts.secrets.end() && known->second.contains(name);
       if (!exists && counts.secretTotal >= tenant.quotas.secrets)
@@ -763,14 +762,27 @@ private:
   // read once per epoch) and what each one's state endpoint says, in parallel.
   struct Member { std::string id, address, state, epoch; uint64_t startedAtUnixMs = 0; int64_t heartbeatAgeMs = -1; };
   coworkerd::StoreMemberCache memberRecords;
+  // The members last listed: while the object store cannot be listed they stand in (the nodes' own state endpoints
+  // still answer for themselves).
+  std::optional<std::vector<Member>> listedMembers;
   kj::Promise<std::vector<Member>> members() {
     if (settings.membersOnObjectStore) {
       std::vector<Member> result;
-      for (auto& member : co_await coworkerd::readStoreMembers(storage, settings.memberTtlSeconds, settings.memberGraceMs, &memberRecords)) {
-        if (!controlName(member.id)) continue;
-        result.push_back({member.id, member.address, member.state, std::to_string(member.epoch), member.startedAtUnixMs,
-            member.heartbeatAgeMs});
+      std::optional<std::string> failure;
+      try {
+        for (auto& member : co_await coworkerd::readStoreMembers(storage, settings.memberTtlSeconds, settings.memberGraceMs, &memberRecords)) {
+          if (!controlName(member.id)) continue;
+          result.push_back({member.id, member.address, member.state, std::to_string(member.epoch), member.startedAtUnixMs,
+              member.heartbeatAgeMs});
+        }
+      } catch (const kj::Exception& error) {
+        failure = error.getDescription().cStr();
       }
+      if (failure) {
+        if (listedMembers) co_return *listedMembers;
+        KJ_FAIL_REQUIRE("object store request failed: the members cannot be listed", failure->c_str());
+      }
+      listedMembers = result;
       co_return result;
     }
     const std::string prefix = coworkerd::NODES_PREFIX;
@@ -914,13 +926,16 @@ private:
     kj::Vector<kj::Promise<Fetched>> pending;
     for (const auto& member : list) pending.add(fetch("http://" + member.address + "/__coworkerd/state"));
     auto states = co_await kj::joinPromises(pending.releaseAsArray());
-    auto raw = co_await etcd.range(std::string(coworkerd::DEPLOYMENT_PREFIX) + "generation");
     std::string out = "{\"apiserver\":{\"version\":" + versionJson() + ",\"instance\":\"" + jsonEscape(settings.instance) +
         "\",\"startedAtUnixMs\":" + std::to_string(settings.startedAtUnixMs);
     if (caller.admin) out += ",\"etcdEndpoint\":\"" + jsonEscape(settings.etcdEndpoint) + "\",\"storageEndpoint\":\"" +
         jsonEscape(settings.storage.endpoint) + "\",\"pathRouting\":" + (settings.pathRouting ? "true" : "false");
+    // The desired state's revisions (the store's indexes as this control plane's mirror holds them); etcd no longer holds
+    // it, and the field that named etcd's revision stays, null.
     out += "},\"caller\":" + std::string(caller.admin ? "{\"admin\":true}" : "{\"admin\":false,\"tenant\":\"" + caller.tenant + "\"}") +
-        ",\"etcdRevision\":\"" + std::to_string(raw.revision) + "\",\"nodes\":[";
+        ",\"etcdRevision\":null,\"storage\":{\"tenantsRevision\":\"" + std::to_string(state.index().revision) +
+        "\",\"credentialsRevision\":\"" + std::to_string(state.credentials().revision) + "\",\"client\":" +
+        state.objects().stats().json() + "},\"nodes\":[";
     for (size_t i = 0; i < list.size(); ++i) out += (i ? "," : "") + nodeSummary(list[i], states[i], false, !caller.admin);
     co_return out + "]}";
   }
@@ -955,18 +970,32 @@ private:
     if (!number("from", from)) from = to > 86400000 ? to - 86400000 : 0;
     for (const auto& [key, value] : query) valid = valid && (key == "from" || key == "to" || (key == "by" && value == "hour"));
     if (!valid) co_return co_await fail(response, 400, "INVALID_REQUEST", "usage?from=<unix ms>&to=<unix ms>&by=hour");
-    co_return co_await send(response, co_await coworkerd::usage(etcd, tenant, from, to));
+    // Usage rows are still in etcd (each node's own prefix).
+    std::optional<std::string> unreachable;
+    coworkerd::ApiAnswer result;
+    try {
+      result = co_await coworkerd::usage(etcd, tenant, from, to);
+    } catch (const kj::Exception& error) {
+      unreachable = error.getDescription().cStr();
+    }
+    if (unreachable)
+      co_return co_await fail(response, 503, "ETCD_UNAVAILABLE", "the usage rows are in etcd, which cannot be reached (" +
+          settings.etcdEndpoint + "): " + *unreachable);
+    co_return co_await send(response, result);
   }
 
   // GET /v1/tenants/{t}: the record, what it holds, and its usage of the last 24 hours.
   kj::Promise<void> tenantSummary(std::string tenant, ControlResponse& response) {
-    auto read = co_await coworkerd::readTenant(etcd, tenant);
+    auto read = coworkerd::readTenant(state, tenant);
     if (!read.tenant) co_return co_await fail(response, 404, "TENANT_NOT_FOUND", "there is no tenant " + tenant);
-    auto counts = co_await coworkerd::tenantCounts(etcd, tenant);
+    auto counts = coworkerd::tenantCounts(state, tenant);
     uint64_t versions = 0;
     for (const auto& [id, names] : counts.versions) versions += names.size();
     const auto now = wallTimeMsForTest();
-    auto day = co_await coworkerd::usage(etcd, tenant, now > 86400000 ? now - 86400000 : 0, now + 1);
+    // The last day's usage from etcd's rows; null while etcd cannot be reached.
+    coworkerd::ApiAnswer day;
+    day.status = 503;
+    try { day = co_await coworkerd::usage(etcd, tenant, now > 86400000 ? now - 86400000 : 0, now + 1); } catch (const kj::Exception&) {}
     std::string total = "null";
     if (day.status == 200) {
       capnp::MallocMessageBuilder message;
@@ -1143,10 +1172,11 @@ private:
       status = 404; code = "WORKER_NOT_FOUND";
     } else if (has(" is not set")) {
       status = 404; code = "SECRET_NOT_FOUND";
-    } else if (has("object store") || has("object HEAD failed") || has("object PUT failed")) {
+    } else if (has("object store") || has("object HEAD failed") || has("object PUT failed") || has("object create failed") ||
+        has("object listing failed") || kind == "disconnected" || kind == "overloaded") {
+      // The desired state and the packages are the object store's: a write that cannot reach it changed nothing it
+      // did not report.
       status = 503; code = "STORAGE_UNAVAILABLE";
-    } else if (has("etcd") || kind == "disconnected" || kind == "overloaded") {
-      status = 503; code = "ETCD_UNAVAILABLE";
     }
     response.code = code;
     const std::string body = "{\"code\":\"" + code + "\",\"reason\":\"" + jsonEscape(cleanReason(reason)) + "\"" + extra +
@@ -1180,6 +1210,7 @@ private:
   const ControlSettings& settings;
   coworkerd::EtcdClient& etcd;
   coworkerd::ObjectStore& storage;
+  coworkerd::ManifestStore& state;
   kj::Timer& timer;
   kj::Network& network;
   const kj::HttpHeaderTable& headerTable;
@@ -1211,6 +1242,22 @@ std::vector<std::string> controlAddresses(const std::string& listenAddress) {
   return addresses;
 }
 
+// The mirror's poll: the indexes' hints every pollIntervalMs (writes of another control plane instance; this one's
+// own are in the mirror as it makes them). A failure leaves the mirror as it is and is counted.
+kj::Promise<void> pollForever(coworkerd::ManifestStore& state, kj::Timer& timer, uint32_t intervalMs) {
+  for (;;) {
+    co_await timer.afterDelay(intervalMs * kj::MILLISECONDS);
+    std::string failure;
+    try { co_await state.refresh(); } catch (const kj::Exception& error) { failure = cleanReason(error.getDescription().cStr()); }
+    if (!failure.empty()) {
+      state.notePollFailure(failure);
+      if (state.counters().pollFailures == 1 || state.counters().pollFailures % 60 == 0)
+        std::cout << "[control] {\"event\":\"poll-failed\",\"failures\":" << state.counters().pollFailures << ",\"reason\":\""
+                  << jsonEscape(failure) << "\"}" << std::endl;
+    }
+  }
+}
+
 // Every member hears this control plane's addresses at startup and every ANNOUNCE_MS after.
 constexpr uint32_t ANNOUNCE_MS = 10000;
 kj::Promise<void> announceForever(ControlService& service, kj::Timer& timer, std::string body) {
@@ -1230,10 +1277,22 @@ int runControlPlane(const std::vector<std::string>& args) {
   KJ_REQUIRE(!settings.configFile.empty(), "control requires --config FILE");
   settings.configFile = fs::absolute(settings.configFile).string();
   auto config = ServerConfig::load(settings.configFile);
-  KJ_REQUIRE(config.desiredState.backend == "etcd" && !config.etcdEndpoint.empty(),
-      "the control plane keeps no state of its own: set etcdEndpoint");
   KJ_REQUIRE(config.desiredState.objectStore.backend == "s3" && !config.desiredState.objectStore.endpoint.empty(),
-      "the control plane publishes code packages: set storage.endpoint (and storage.credentialsFile, the deploy identity)");
+      "the control plane keeps no state of its own: the desired state is the object store's -- set storage.endpoint (and "
+      "storage.credentialsFile, the deploy identity)");
+  KJ_REQUIRE(!config.etcdEndpoint.empty(), "the nodes' usage rows are in etcd until 0.4's last round: set etcdEndpoint");
+  // The secrets key seals every secret's value before it is written (COWORKERD_SECRETS_KEY_FILE overrides the file's).
+  settings.secretsKeyFile = config.secretsKeyFile;
+  settings.secretsKeySource = settings.secretsKeyFile.empty() ? "unset" : "config";
+  if (const char* file = std::getenv("COWORKERD_SECRETS_KEY_FILE"); file != nullptr && *file) {
+    settings.secretsKeyFile = file;
+    settings.secretsKeySource = "environment";
+  }
+  KJ_REQUIRE(!settings.secretsKeyFile.empty(), "the control plane seals secrets' values with the cluster's secrets key: set "
+      "secrets.keyFile (or COWORKERD_SECRETS_KEY_FILE)");
+  auto secretsKey = coworkerd::SecretsKey::load(settings.secretsKeyFile);
+  settings.pollIntervalMs = config.controlPollIntervalMs;
+  settings.startupTimeoutMs = config.desiredState.startupTimeoutMs;
   settings.etcdEndpoint = config.etcdEndpoint;
   settings.storage = config.desiredState.objectStore;
   settings.membersOnObjectStore = config.membership.backend == "objectStore";
@@ -1283,7 +1342,29 @@ int runControlPlane(const std::vector<std::string>& args) {
   auto& timer = io.provider->getTimer();
   coworkerd::EtcdClient etcd(settings.etcdEndpoint, 2000, io.provider->getNetwork(), timer, *headerTable);
   coworkerd::ObjectStore storage(settings.storage, io.provider->getNetwork(), timer);
-  ControlService service(settings, etcd, storage, timer, io.provider->getNetwork(), *headerTable);
+  coworkerd::ManifestStore state(storage, timer, std::move(secretsKey));
+  // The revisions this control plane writes name it: its host and process, and a random value of this start.
+  state.setWriterInstance(settings.instance + "/" + coworkerd::newWriterInstance());
+  // The mirror read in full before the API answers: the cluster's marker (none: not a cluster's bucket, refused at once),
+  // the tenant index, every manifest it names, the credentials index. While the store cannot be reached the start
+  // waits, up to desiredState.startupTimeoutMs.
+  {
+    const auto started = monotonicTimeMs();
+    for (uint32_t attempt = 1;; ++attempt) {
+      std::string reason;
+      try {
+        state.load(false, true).wait(io.waitScope);
+        break;
+      } catch (const kj::Exception& error) {
+        reason = error.getDescription().cStr();
+      }
+      KJ_REQUIRE(reason.find("cluster/format/1") == std::string::npos, reason.c_str());
+      KJ_REQUIRE(monotonicTimeMs() - started < settings.startupTimeoutMs, "the desired state cannot be read from the object store",
+          settings.storage.endpoint.c_str(), cleanReason(reason).c_str());
+      timer.afterDelay(250 * kj::MILLISECONDS).wait(io.waitScope);
+    }
+  }
+  ControlService service(settings, etcd, storage, state, timer, io.provider->getNetwork(), *headerTable);
   kj::HttpServer server(timer, *headerTable, service);
   auto address = io.provider->getNetwork().parseAddress(settings.listenAddress.c_str()).wait(io.waitScope);
   auto listener = address->listen();
@@ -1297,7 +1378,10 @@ int runControlPlane(const std::vector<std::string>& args) {
             << ",\"temporaryDirectory\":\"" << jsonEscape(settings.temporaryDirectory.string())
             << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs
             << ",\"membership\":{\"backend\":\"" << (settings.membersOnObjectStore ? "objectStore" : "etcd") << "\",\"ttlSeconds\":"
-            << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "}}" << std::endl;
+            << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "},\"desiredState\":{\"pollIntervalMs\":"
+            << settings.pollIntervalMs << ",\"secretsKeyFile\":\"" << jsonEscape(settings.secretsKeyFile) << "\",\"secretsKeySource\":\""
+            << settings.secretsKeySource << "\",\"secretsKey\":\"" << state.secretsKey()->fingerprint() << "\",\"state\":" << state.json()
+            << "}}" << std::endl;
   std::cout << "[control] ready http=" << settings.listenAddress << std::endl;
   auto stop = io.unixEventPort.onSignal(SIGTERM).exclusiveJoin(io.unixEventPort.onSignal(SIGINT));
   const auto announced = controlAddresses(settings.listenAddress);
@@ -1306,7 +1390,8 @@ int runControlPlane(const std::vector<std::string>& args) {
   body += "]}";
   std::cout << "[control] {\"event\":\"announce\",\"addresses\":" << body.substr(body.find('[')) << std::endl;
   server.listenHttp(*listener).exclusiveJoin(stop.ignoreResult()).exclusiveJoin(runLogClock(timer))
-      .exclusiveJoin(announceForever(service, timer, std::move(body))).wait(io.waitScope);
+      .exclusiveJoin(announceForever(service, timer, std::move(body)))
+      .exclusiveJoin(pollForever(state, timer, settings.pollIntervalMs)).wait(io.waitScope);
   std::cout << "[control] {\"event\":\"stopped\"}" << std::endl;
   return 0;
 }

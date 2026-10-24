@@ -64,6 +64,9 @@ struct MembershipView {
   // such values were skipped since this process started.
   std::set<std::string> invalidMembers;
   uint64_t skippedMemberValues = 0;
+  // objectStore: what this membership's object store client met (ObjectStoreStats), as of its last registration,
+  // heartbeat or listing.
+  std::string storeClient;
 
   // ---- objectStore (the json() of the other backends leaves these out) ----
   std::string storeEndpoint, bucket, instance;

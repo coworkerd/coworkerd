@@ -474,7 +474,7 @@ async function status(args) {
   const answer = (await call(config, "GET", "/v1/status")).json;
   if (options.json) { console.log(JSON.stringify(answer, null, 2)); return; }
   const control = answer.apiserver?.version ?? {};
-  console.log(`control plane ${config.controlPlane}: coworkerd-apiserver ${control.server ?? "?"} (source ${control.source ?? "?"}), etcd revision ${answer.etcdRevision}` +
+  console.log(`control plane ${config.controlPlane}: coworkerd-apiserver ${control.server ?? "?"} (source ${control.source ?? "?"}), tenants revision ${answer.storage?.tenantsRevision ?? "?"}, credentials revision ${answer.storage?.credentialsRevision ?? "?"}` +
     (answer.caller?.admin ? "" : `; tenant ${answer.caller?.tenant}`));
   if (!answer.nodes.length) console.log("no node has registered");
   for (const m of answer.nodes) {

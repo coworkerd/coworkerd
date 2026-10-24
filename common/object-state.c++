@@ -1,5 +1,6 @@
 #include "object-state.h"
 #include "etcd.h"
+#include "tenant-manifest.h"
 #include "support.h"
 
 #include <capnp/compat/json.h>
@@ -69,6 +70,60 @@ kj::Promise<AppendResult> appendRevision(ObjectStore& store, kj::Timer& timer, s
     const uint32_t ceiling = std::min<uint32_t>(160, 5u << std::min<uint32_t>(attempt, 5));
     co_await timer.afterDelay((5 + random % (ceiling - 4)) * kj::MILLISECONDS);
   }
+}
+
+kj::Promise<std::optional<uint64_t>> readHintRevision(ObjectStore& store, std::string hintKey) {
+  auto response = co_await store.get(hintKey);
+  if (response.status == 404) co_return std::nullopt;
+  KJ_REQUIRE(response.status == 200, "object store read failed", response.status);
+  co_return parseHint(response.bytes);
+}
+
+kj::Promise<LatestRevision> readLatestRevision(ObjectStore& store, std::string prefix, std::string hintKey, uint64_t floor,
+    bool probe) {
+  LatestRevision result;
+  auto hint = co_await readHintRevision(store, hintKey);
+  auto listLatest = [&]() -> kj::Promise<uint64_t> {
+    result.listed = true;
+    co_return latestRevision(co_await store.list(prefix + '/'), prefix);
+  };
+  uint64_t candidate = hint && *hint >= floor ? *hint : co_await listLatest();
+  if (candidate) {
+    auto object = co_await store.get(revisionKey(prefix, candidate));
+    // A hint can name a revision that is gone (pruned after a late hint): the listing has the latest.
+    if (object.status == 404 && !result.listed) {
+      candidate = co_await listLatest();
+      if (candidate) object = co_await store.get(revisionKey(prefix, candidate));
+    }
+    if (candidate) {
+      KJ_REQUIRE(object.status == 200, "object store read failed", object.status, revisionKey(prefix, candidate).c_str());
+      result.bytes = std::move(object.bytes);
+    }
+  }
+  if (probe) {
+    while (true) {
+      auto next = co_await store.get(revisionKey(prefix, candidate + 1));
+      if (next.status == 404) break;
+      KJ_REQUIRE(next.status == 200, "object store read failed", next.status);
+      ++candidate;
+      result.bytes = std::move(next.bytes);
+    }
+  }
+  result.revision = candidate;
+  co_return result;
+}
+
+kj::Promise<uint64_t> publishHint(ObjectStore& store, std::string prefix, std::string hintKey, uint64_t revision) {
+  co_await store.put(hintKey, hintJson(revision));
+  uint64_t latest = revision;
+  while (co_await store.exists(revisionKey(prefix, latest + 1))) ++latest;
+  if (latest != revision) co_await store.put(hintKey, hintJson(latest));
+  co_return latest;
+}
+
+kj::Promise<void> pruneRevision(ObjectStore& store, std::string prefix, uint64_t revision, uint64_t keep) {
+  if (keep == 0 || revision <= keep) co_return;
+  co_await store.remove(revisionKey(prefix, revision - keep));
 }
 
 uint64_t realClockUnixMs() {

@@ -8,7 +8,7 @@
 #include <sstream>
 
 namespace coworkerd {
-kj::Own<DesiredState> newEtcdDesiredState(const DesiredStateConfig&, kj::Network&, kj::Timer&, const kj::HttpHeaderTable&);
+kj::Own<DesiredState> newObjectStoreDesiredState(const DesiredStateConfig&, kj::Network&, kj::Timer&);
 namespace {
 
 std::string quote(const std::string& value) {
@@ -142,10 +142,10 @@ std::string FileDesiredState::json(bool full) const {
 
 kj::Own<DesiredState> newDesiredState(const DesiredStateConfig& config, const std::filesystem::path& manifest,
     kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headers) {
-  KJ_REQUIRE(config.backend == "file" || config.backend == "etcd", "unknown desired state backend");
+  KJ_REQUIRE(config.backend == "file" || config.backend == "objectStore", "unknown desired state backend", config.backend.c_str());
   KJ_REQUIRE(config.versionResolutionForTest.empty() || config.versionResolutionForTest == "per-call",
       "versionResolutionForTest must be empty or per-call");
-  if (config.backend == "etcd") return newEtcdDesiredState(config, network, timer, headers);
+  if (config.backend == "objectStore") return newObjectStoreDesiredState(config, network, timer);
   return kj::heap<FileDesiredState>(config, manifest);
 }
 }  // namespace coworkerd

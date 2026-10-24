@@ -1,6 +1,7 @@
-// Tenants, credentials and usage (docs/control-plane-api.md sections 1-5): the records below
-// /coworkerd/v2/tenants/ and credentials/, which the control plane alone writes, and the usage rows each node writes
-// below its own /coworkerd/v2/nodes/<nodeId>/usage/, which the control plane only reads and sums.
+// Tenants, credentials and usage (docs/control-plane-api.md sections 1-5): the tenants' records in their manifests and
+// the credentials index on the object store (manifests.h), which the control plane alone writes and reads from its
+// mirror, and the usage rows each node writes below its own /coworkerd/v2/nodes/<nodeId>/usage/ in etcd, which the
+// control plane only reads and sums.
 #include "control.h"
 #include "support.h"
 
@@ -67,61 +68,29 @@ std::unique_ptr<Body> parseBody(const std::string& text, bool empty = false) {
   return body;
 }
 
-// One transaction; true when it committed.
-struct Txn {
-  std::vector<std::string> compares, operations;
-  void absent(const std::string& key) {
-    compares.push_back("{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(base64(key)) + ",\"version\":\"0\"}");
-  }
-  void unchanged(const std::string& key, uint64_t modRevision) {
-    compares.push_back("{\"target\":\"MOD\",\"result\":\"EQUAL\",\"key\":" + quote(base64(key)) + ",\"mod_revision\":\"" +
-        std::to_string(modRevision) + "\"}");
-  }
-  // No key below the prefix was written after `revision`.
-  void untouchedSince(const std::string& prefix, uint64_t revision) {
-    compares.push_back("{\"target\":\"MOD\",\"result\":\"LESS\",\"key\":" + quote(base64(prefix)) + ",\"range_end\":" +
-        quote(base64(prefixEnd(prefix))) + ",\"mod_revision\":\"" + std::to_string(revision + 1) + "\"}");
-  }
-  void put(const std::string& key, const std::string& value) {
-    operations.push_back("{\"request_put\":{\"key\":" + quote(base64(key)) + ",\"value\":" + quote(base64(value)) + "}}");
-  }
-  void remove(const std::string& key) {
-    operations.push_back("{\"request_delete_range\":{\"key\":" + quote(base64(key)) + "}}");
-  }
-  kj::Promise<bool> commit(EtcdClient& client) const {
-    std::string json = "{\"compare\":[";
-    for (size_t i = 0; i < compares.size(); ++i) json += (i ? "," : "") + compares[i];
-    json += "],\"success\":[";
-    for (size_t i = 0; i < operations.size(); ++i) json += (i ? "," : "") + operations[i];
-    json += "]}";
-    auto response = co_await client.request("/v3/kv/txn", json);
-    capnp::MallocMessageBuilder message;
-    auto value = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), value);
-    co_return boolean(value, "succeeded");
-  }
-};
 
-kj::Promise<void> pause(kj::Timer& timer, uint32_t attempt) {
-  static thread_local std::mt19937 random(std::random_device{}());
-  const auto ceiling = std::min<uint32_t>(10u << std::min<uint32_t>(attempt, 4u), 160u);
-  co_await timer.afterDelay(std::uniform_int_distribution<uint32_t>(ceiling / 2, ceiling)(random) * kj::MILLISECONDS);
+// A refusal of a change: the ManifestStore's change functions keep its answer in `slot` and end with an exception (a
+// KJ coroutine carries only KJ's), which the caller turns back into that answer.
+[[noreturn]] void refuseWith(std::optional<ApiAnswer>& slot, ApiAnswer answer) {
+  slot = std::move(answer);
+  kj::throwFatalException(KJ_EXCEPTION(FAILED, "refused"));
 }
 
-std::string tenantKey(const std::string& tenant) { return std::string(TENANTS_PREFIX) + tenant; }
-std::string credentialKey(const std::string& keyId) { return std::string(CREDENTIALS_PREFIX) + keyId; }
+// A failure of the store (or any other) during a write: 503 STORAGE_UNAVAILABLE when it is the store's.
+ApiAnswer writeFailure(const kj::Exception& error, const char* what) {
+  std::string reason = error.getDescription().cStr();
+  if (reason.find("object store") != std::string::npos || error.getType() == kj::Exception::Type::DISCONNECTED ||
+      error.getType() == kj::Exception::Type::OVERLOADED)
+    return ApiAnswer::error(503, "STORAGE_UNAVAILABLE", std::string("the object store cannot be reached; ") + what + " was not written: " + reason);
+  if (reason.find("期间有其他部署") != std::string::npos || reason.find("another write") != std::string::npos)
+    return ApiAnswer::error(409, "CONFLICT", reason);
+  return ApiAnswer::error(500, "INTERNAL", reason);
+}
 
-// Every tenant record of one read (unreadable records are skipped: no API wrote them).
-std::map<std::string, std::pair<TenantRecord, uint64_t>> tenantsOf(const EtcdSnapshot& raw) {
-  std::map<std::string, std::pair<TenantRecord, uint64_t>> result;
-  for (const auto& [key, kv] : raw.values) {
-    try {
-      auto record = decodeTenantRecord(kv.value);
-      // The name copied first: the pair's construction moves the record.
-      const auto name = record.name;
-      if (key == tenantKey(name)) result.emplace(name, std::pair{std::move(record), kv.modRevision});
-    } catch (const kj::Exception&) {}
-  }
+// Every tenant's record the mirror holds, by name.
+std::map<std::string, TenantRecord> recordsOf(const ManifestStore& state) {
+  std::map<std::string, TenantRecord> result;
+  for (const auto& [name, manifest] : state.tenants()) if (manifest.record) result.emplace(name, *manifest.record);
   return result;
 }
 
@@ -202,7 +171,7 @@ kj::Promise<EtcdSnapshot> rangeBetween(EtcdClient& client, std::string start, st
 }
 }  // namespace
 
-kj::Promise<Authenticated> authenticate(EtcdClient& client, const std::string& adminCredential, const kj::HttpHeaders& headers) {
+Authenticated authenticate(const ManifestStore& state, const std::string& adminCredential, const kj::HttpHeaders& headers) {
   std::optional<std::string> authorization;
   bool repeated = false;
   headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
@@ -213,35 +182,34 @@ kj::Promise<Authenticated> authenticate(EtcdClient& client, const std::string& a
     return Authenticated{std::nullopt, ApiAnswer::error(401, "UNAUTHORIZED",
         "this endpoint requires Authorization: Bearer <credential> (the administrator's or a tenant's)"), std::move(kind)};
   };
-  if (!authorization) co_return refuse("missing");
-  if (repeated || !authorization->starts_with("Bearer ")) co_return refuse("malformed");
+  if (!authorization) return refuse("missing");
+  if (repeated || !authorization->starts_with("Bearer ")) return refuse("malformed");
   const auto presented = authorization->substr(7);
-  if (!adminCredential.empty() && bearerRefusal(adminCredential, headers).empty()) co_return Authenticated{Caller{true, {}, {}}, {}, "admin"};
+  if (!adminCredential.empty() && bearerRefusal(adminCredential, headers).empty()) return Authenticated{Caller{true, {}, {}}, {}, "admin"};
   auto token = parseCredential(presented);
-  if (!token) co_return refuse("wrong");
-  auto raw = co_await client.range(credentialKey(token->keyId));
-  auto found = raw.values.find(credentialKey(token->keyId));
-  if (found == raw.values.end()) co_return refuse("wrong");
-  CredentialRecord record;
-  try { record = decodeCredentialRecord(found->second.value); } catch (const kj::Exception&) { co_return refuse("wrong"); }
-  if (record.keyId != token->keyId || !constantEquals(sha256Hex(token->secret), record.sha256)) co_return refuse("wrong");
-  if (record.revokedAtUnixMs) co_return refuse("revoked");
-  if (record.expiresAtUnixMs && nowMs() >= record.expiresAtUnixMs) co_return refuse("expired");
-  co_return Authenticated{Caller{false, record.scope.substr(7), record.keyId}, {}, "tenant"};
+  if (!token) return refuse("wrong");
+  const auto& credentials = state.credentials().credentials;
+  auto found = credentials.find(token->keyId);
+  if (found == credentials.end()) return refuse("wrong");
+  const auto& record = found->second;
+  if (record.keyId != token->keyId || !constantEquals(sha256Hex(token->secret), record.sha256)) return refuse("wrong");
+  if (record.revokedAtUnixMs) return refuse("revoked");
+  if (record.expiresAtUnixMs && nowMs() >= record.expiresAtUnixMs) return refuse("expired");
+  return Authenticated{Caller{false, record.scope.substr(7), record.keyId}, {}, "tenant"};
 }
 
-kj::Promise<ReadTenant> readTenant(EtcdClient& client, const std::string& tenant) {
+ReadTenant readTenant(const ManifestStore& state, const std::string& tenant) {
   ReadTenant result;
-  auto raw = co_await client.range(tenantKey(tenant));
-  result.revision = raw.revision;
-  auto found = raw.values.find(tenantKey(tenant));
-  if (found == raw.values.end()) co_return result;
-  result.tenant = decodeTenantRecord(found->second.value);
-  result.modRevision = found->second.modRevision;
-  co_return result;
+  result.revision = state.index().revision;
+  const auto* manifest = state.tenant(tenant);
+  if (!manifest || !manifest->record) return result;
+  result.tenant = *manifest->record;
+  result.manifestRevision = manifest->revision;
+  return result;
 }
 
-kj::Promise<ApiAnswer> createTenant(EtcdClient& client, kj::Timer& timer, std::string text) {
+kj::Promise<ApiAnswer> createTenant(ManifestStore& state, std::string text) {
+  std::optional<ApiAnswer> refused;
   auto body = parseBody(text);
   if (!body->problem.empty()) co_return invalid(body->problem);
   auto name = field(body->json, "name");
@@ -251,95 +219,94 @@ kj::Promise<ApiAnswer> createTenant(EtcdClient& client, kj::Timer& timer, std::s
   tenant.name = name.getString().cStr();
   bool hostnamesChanged = false;
   if (auto problem = applyTenantFields(tenant, body->json, true, hostnamesChanged)) co_return *problem;
-  for (uint32_t attempt = 0; attempt < 9; ++attempt) {
-    auto raw = co_await client.range(TENANTS_PREFIX);
-    auto tenants = tenantsOf(raw);
-    if (raw.values.contains(tenantKey(tenant.name)))
-      co_return ApiAnswer::error(409, "CONFLICT", "tenant " + tenant.name + " already exists");
-    for (const auto& [other, entry] : tenants) for (const auto& host : entry.first.hostnames)
-      if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), host) != tenant.hostnames.end())
-        co_return ApiAnswer::error(409, "CONFLICT", "hostname " + host + " belongs to tenant " + other);
-    tenant.createdAtUnixMs = tenant.updatedAtUnixMs = nowMs();
-    Txn txn;
-    txn.absent(tenantKey(tenant.name));
-    // Hostnames are unique across tenants: no tenant changed since the read.
-    txn.untouchedSince(TENANTS_PREFIX, raw.revision);
-    txn.put(tenantKey(tenant.name), tenantRecordJson(tenant));
-    if (co_await txn.commit(client)) co_return ApiAnswer::ok(tenantAnswer(tenant));
-    co_await pause(timer, attempt);
+  try {
+    auto written = co_await state.writeTenant(tenant.name, [&](TenantManifest& next) -> kj::Promise<void> {
+      // A tenant whose record is active exists; a manifest left by a deletion (deleting) or by a creation that was
+      // interrupted before the index named it is replaced: the tenant starts empty.
+      if (next.record && next.record->status == "active" && state.index().tenants.contains(tenant.name))
+        refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenant.name + " already exists"));
+      if (next.record && next.record->status == "deleting" && state.index().tenants.contains(tenant.name))
+        refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenant.name + " is being deleted"));
+      // Hostnames are unique across tenants (the other tenants as the mirror holds them).
+      for (const auto& [other, record] : recordsOf(state)) {
+        if (other == tenant.name) continue;
+        for (const auto& host : record.hostnames)
+          if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), host) != tenant.hostnames.end())
+            refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "hostname " + host + " belongs to tenant " + other));
+      }
+      tenant.createdAtUnixMs = tenant.updatedAtUnixMs = nowMs();
+      next.workers.clear();
+      next.record = tenant;
+      co_return;
+    }, false);
+    co_return ApiAnswer::ok(tenantAnswer(*written.manifest.record));
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the tenant");
   }
-  co_return ApiAnswer::error(409, "CONFLICT", "other tenant writes kept changing the tenants (9 attempts); nothing written");
 }
 
-kj::Promise<ApiAnswer> listTenants(EtcdClient& client) {
-  auto raw = co_await client.range(TENANTS_PREFIX);
-  std::string out = "{\"revision\":\"" + std::to_string(raw.revision) + "\",\"tenants\":[";
+ApiAnswer listTenants(const ManifestStore& state) {
+  std::string out = "{\"revision\":\"" + std::to_string(state.index().revision) + "\",\"tenants\":[";
   size_t index = 0;
-  for (const auto& [name, entry] : tenantsOf(raw)) {
-    auto record = tenantRecordJson(entry.first);
-    out += (index++ ? "," : "") + record;
-  }
-  co_return ApiAnswer::ok(out + "]}");
+  for (const auto& [name, record] : recordsOf(state)) out += (index++ ? "," : "") + tenantRecordJson(record);
+  return ApiAnswer::ok(out + "]}");
 }
 
-kj::Promise<ApiAnswer> updateTenant(EtcdClient& client, kj::Timer& timer, std::string tenantName, std::string text) {
+kj::Promise<ApiAnswer> updateTenant(ManifestStore& state, std::string tenantName, std::string text) {
+  std::optional<ApiAnswer> refused;
   auto body = parseBody(text);
   if (!body->problem.empty()) co_return invalid(body->problem);
-  for (uint32_t attempt = 0; attempt < 9; ++attempt) {
-    auto raw = co_await client.range(TENANTS_PREFIX);
-    auto tenants = tenantsOf(raw);
-    auto found = tenants.find(tenantName);
-    if (found == tenants.end()) co_return notFound(tenantName);
-    auto [tenant, modRevision] = found->second;
-    if (tenant.status != "active") co_return ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted");
-    const auto previous = tenant.hostnames;
-    bool hostnamesChanged = false;
-    if (auto problem = applyTenantFields(tenant, body->json, false, hostnamesChanged)) co_return *problem;
-    if (hostnamesChanged) {
-      for (const auto& [other, entry] : tenants) {
-        if (other == tenantName) continue;
-        for (const auto& host : entry.first.hostnames)
-          if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), host) != tenant.hostnames.end())
-            co_return ApiAnswer::error(409, "CONFLICT", "hostname " + host + " belongs to tenant " + other);
+  TenantRecord result;
+  try {
+    co_await state.writeTenant(tenantName, [&](TenantManifest& next) -> kj::Promise<void> {
+      if (!next.record) refuseWith(refused, notFound(tenantName));
+      auto tenant = *next.record;
+      if (tenant.status != "active") refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted"));
+      const auto previous = tenant.hostnames;
+      bool hostnamesChanged = false;
+      if (auto problem = applyTenantFields(tenant, body->json, false, hostnamesChanged)) refuseWith(refused, *problem);
+      if (hostnamesChanged) {
+        for (const auto& [other, record] : recordsOf(state)) {
+          if (other == tenantName) continue;
+          for (const auto& host : record.hostnames)
+            if (std::find(tenant.hostnames.begin(), tenant.hostnames.end(), host) != tenant.hostnames.end())
+              refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "hostname " + host + " belongs to tenant " + other));
+        }
+        // A hostname still routed by one of the tenant's Workers stays until its route goes.
+        for (const auto& [worker, entry] : next.workers) {
+          for (const auto& route : entry.routes) {
+            if (std::find(previous.begin(), previous.end(), route.host) != previous.end() &&
+                std::find(tenant.hostnames.begin(), tenant.hostnames.end(), route.host) == tenant.hostnames.end())
+              refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "hostname " + route.host + " is still routed by a Worker of tenant " +
+                  tenantName + "; replace that Worker's routes first"));
+          }
+        }
       }
-      // A hostname still routed by one of the tenant's Workers stays until its route goes.
-      auto routes = co_await client.range(std::string(DEPLOYMENT_PREFIX) + "routes/");
-      for (const auto& [key, kv] : routes.values) {
-        std::string host, owner;
-        try {
-          capnp::MallocMessageBuilder message;
-          auto json = message.initRoot<Json>();
-          capnp::JsonCodec().decodeRaw(kj::arrayPtr(kv.value.data(), kv.value.size()), json);
-          host = etcd::text(json, "host"); owner = etcd::text(json, "tenant");
-        } catch (const kj::Exception&) { continue; }
-        if (owner == tenantName && std::find(previous.begin(), previous.end(), host) != previous.end() &&
-            std::find(tenant.hostnames.begin(), tenant.hostnames.end(), host) == tenant.hostnames.end())
-          co_return ApiAnswer::error(409, "CONFLICT", "hostname " + host + " is still routed by a Worker of tenant " + tenantName +
-              "; replace that Worker's routes first");
-      }
-    }
-    tenant.updatedAtUnixMs = nowMs();
-    Txn txn;
-    txn.unchanged(tenantKey(tenantName), modRevision);
-    if (hostnamesChanged) txn.untouchedSince(TENANTS_PREFIX, raw.revision);
-    txn.put(tenantKey(tenantName), tenantRecordJson(tenant));
-    if (co_await txn.commit(client)) co_return ApiAnswer::ok(tenantAnswer(tenant));
-    co_await pause(timer, attempt);
+      tenant.updatedAtUnixMs = nowMs();
+      next.record = tenant;
+      result = tenant;
+      co_return;
+    }, false);
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the tenant");
   }
-  co_return ApiAnswer::error(409, "CONFLICT", "other writes kept changing tenant " + tenantName + " (9 attempts); nothing written");
+  co_return ApiAnswer::ok(tenantAnswer(result));
 }
 
 kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
-  auto& client = context.etcd;
+  std::optional<ApiAnswer> refused;
+  auto& state = context.state;
   // Each step's record joins the tenant's `deletion` (visible in GET /v1/tenants/{t} while it runs).
   std::vector<std::string> steps;
-  auto record = [&](const std::string& step, const std::string& result) -> kj::Promise<bool> {
+  // The tenant's routes and pointers stay while it is deleted: the nodes refuse its Workers (TENANT_UNAVAILABLE, the record
+  // says deleting) and no other tenant takes its routes before it has left the index, where they go with it.
+  auto record = [&](const std::string& step, const std::string& result) -> kj::Promise<void> {
     steps.push_back("{\"step\":" + quote(step) + ",\"atUnixMs\":" + std::to_string(nowMs()) + ",\"result\":" + result + "}");
-    for (uint32_t attempt = 0; attempt < 9; ++attempt) {
-      auto read = co_await readTenant(client, name);
-      if (!read.tenant) co_return false;
-      auto tenant = *read.tenant;
-      std::string deletion = "{\"startedAtUnixMs\":";
+    co_await state.writeTenant(name, [&](TenantManifest& next) -> kj::Promise<void> {
+      if (!next.record) refuseWith(refused, notFound(name));
+      auto tenant = *next.record;
       // Keep the first start of a deletion that runs again.
       uint64_t started = nowMs();
       if (tenant.deletion != "null") {
@@ -349,63 +316,64 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
         auto value = field(json, "startedAtUnixMs");
         if (value.isNumber()) started = static_cast<uint64_t>(value.getNumber());
       }
-      deletion += std::to_string(started) + ",\"steps\":[";
+      std::string deletion = "{\"startedAtUnixMs\":" + std::to_string(started) + ",\"steps\":[";
       for (size_t i = 0; i < steps.size(); ++i) deletion += (i ? "," : "") + steps[i];
       tenant.status = "deleting";
       tenant.deletion = deletion + "]}";
       tenant.updatedAtUnixMs = nowMs();
-      Txn txn;
-      txn.unchanged(tenantKey(name), read.modRevision);
-      txn.put(tenantKey(name), tenantRecordJson(tenant));
-      if (co_await txn.commit(client)) co_return true;
-      co_await pause(context.timer, attempt);
-    }
-    KJ_FAIL_REQUIRE("the tenant record kept changing while it was being deleted");
+      next.record = tenant;
+      co_return;
+    }, false);
   };
-  auto read = co_await readTenant(client, name);
-  if (!read.tenant) co_return notFound(name);
+  if (!readTenant(state, name).tenant) co_return notFound(name);
+  auto incomplete = [&](const std::string& where, const std::string& reason) {
+    return ApiAnswer::error(503, "DELETION_INCOMPLETE", "the deletion of tenant " + name + " stopped at " + where + ": " + reason +
+        "; DELETE it again to resume");
+  };
   // 1. Marked deleting: the nodes stop serving it, the API refuses its writes.
-  co_await record("marked", "{\"status\":\"deleting\"}");
-  // 2. Its routes, pointers, the objects only it uses, and its keys below deploy/<tenant>/.
-  auto state = co_await controlDeleteTenantState(context, name);
-  {
+  try {
+    co_await record("marked", "{\"status\":\"deleting\"}");
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the deletion's mark");
+  }
+  // 2. The objects only it uses.
+  try {
+    auto objects = co_await controlDeleteTenantObjects(context, name);
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(state.data(), state.size()), json);
+    capnp::JsonCodec().decodeRaw(kj::arrayPtr(objects.data(), objects.size()), json);
     if (!boolean(json, "ok")) {
-      co_await record("deployment", state);
-      co_return ApiAnswer::error(503, "DELETION_INCOMPLETE", "the deletion of tenant " + name + " stopped at its deployment state: " +
-          etcd::text(json, "reason") + "; DELETE it again to resume");
+      const auto reason = etcd::text(json, "reason");
+      try { co_await record("objects", objects); } catch (const kj::Exception&) {}
+      co_return incomplete("its objects", reason);
     }
-    co_await record("deployment", capnp::JsonCodec().encodeRaw(field(json, "record")).cStr());
+    co_await record("objects", capnp::JsonCodec().encodeRaw(field(json, "record")).cStr());
+    // 3. Its credentials.
+    size_t deleted = 0;
+    co_await state.writeCredentials([&](CredentialIndex& next) {
+      deleted = std::erase_if(next.credentials, [&](const auto& entry) { return entry.second.scope == "tenant:" + name; });
+    });
+    co_await record("credentials", "{\"deleted\":" + std::to_string(deleted) + "}");
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return incomplete("its objects or credentials", error.getDescription().cStr());
   }
-  // 3. Its credentials.
-  auto credentials = co_await client.range(CREDENTIALS_PREFIX);
-  std::vector<std::string> keys;
-  for (const auto& [key, kv] : credentials.values) {
-    try { if (decodeCredentialRecord(kv.value).scope == "tenant:" + name) keys.push_back(key); } catch (const kj::Exception&) {}
-  }
-  for (size_t start = 0; start < keys.size(); start += 100) {
-    Txn txn;
-    for (size_t i = start; i < std::min(keys.size(), start + 100); ++i) txn.remove(keys[i]);
-    KJ_REQUIRE(co_await txn.commit(client), "a credential deletion failed");
-  }
-  co_await record("credentials", "{\"deleted\":" + std::to_string(keys.size()) + "}");
-  // 4. The record.
-  auto last = co_await readTenant(client, name);
-  if (last.tenant) {
-    Txn txn;
-    txn.unchanged(tenantKey(name), last.modRevision);
-    txn.remove(tenantKey(name));
-    if (!co_await txn.commit(client))
-      co_return ApiAnswer::error(503, "DELETION_INCOMPLETE", "the tenant record changed at the last step; DELETE it again to finish");
+  // 4. Out of the index; then its manifests and their hint.
+  ManifestStore::Forgotten forgotten;
+  try {
+    forgotten = co_await state.forgetTenant(name);
+  } catch (const kj::Exception& error) {
+    co_return incomplete("its removal from the index", error.getDescription().cStr());
   }
   std::string out = "{\"tenant\":" + quote(name) + ",\"deleted\":true,\"steps\":[";
   for (size_t i = 0; i < steps.size(); ++i) out += (i ? "," : "") + steps[i];
-  co_return ApiAnswer::ok(out + "]}");
+  co_return ApiAnswer::ok(out + "],\"index\":{\"revision\":\"" + std::to_string(forgotten.indexRevision) + "\"},\"manifests\":{\"removed\":" +
+      std::to_string(forgotten.removed) + ",\"failed\":" + std::to_string(forgotten.failed) + "}}");
 }
 
-kj::Promise<ApiAnswer> createCredential(EtcdClient& client, kj::Timer& timer, std::string tenantName, std::string text) {
+kj::Promise<ApiAnswer> createCredential(ManifestStore& state, std::string tenantName, std::string text) {
+  std::optional<ApiAnswer> refused;
   auto body = parseBody(text, true);
   if (!body->problem.empty()) co_return invalid(body->problem);
   CredentialRecord record;
@@ -427,38 +395,34 @@ kj::Promise<ApiAnswer> createCredential(EtcdClient& client, kj::Timer& timer, st
   } catch (const kj::Exception& error) {
     co_return invalid(error.getDescription().cStr());
   }
-  for (uint32_t attempt = 0; attempt < 9; ++attempt) {
-    auto read = co_await readTenant(client, tenantName);
-    if (!read.tenant) co_return notFound(tenantName);
-    if (read.tenant->status != "active") co_return ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted");
-    CredentialToken token{randomHex(8), randomHex(32)};
-    record.keyId = token.keyId;
-    record.sha256 = sha256Hex(token.secret);
-    record.createdAtUnixMs = nowMs();
-    Txn txn;
-    txn.absent(credentialKey(token.keyId));
-    txn.unchanged(tenantKey(tenantName), read.modRevision);
-    txn.put(credentialKey(token.keyId), credentialRecordJson(record));
-    if (co_await txn.commit(client)) {
-      // The credential's text is in this answer only; etcd keeps its hash.
-      co_return ApiAnswer::ok("{\"keyId\":" + quote(record.keyId) + ",\"credential\":" + quote(credentialText(token)) +
-          ",\"scope\":" + quote(record.scope) + ",\"description\":" + quote(record.description) + ",\"createdAtUnixMs\":" +
-          std::to_string(record.createdAtUnixMs) + ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + "}");
-    }
-    co_await pause(timer, attempt);
+  auto read = readTenant(state, tenantName);
+  if (!read.tenant) co_return notFound(tenantName);
+  if (read.tenant->status != "active") co_return ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted");
+  CredentialToken token{randomHex(8), randomHex(32)};
+  record.keyId = token.keyId;
+  record.sha256 = sha256Hex(token.secret);
+  record.createdAtUnixMs = nowMs();
+  try {
+    co_await state.writeCredentials([&](CredentialIndex& next) {
+      // A key id drawn twice (64 random bits) is drawn again by the next request.
+      if (next.credentials.contains(record.keyId)) refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "a key id was drawn twice; try again"));
+      next.credentials.emplace(record.keyId, record);
+    });
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the credential");
   }
-  co_return ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " kept changing (9 attempts); no credential created");
+  // The credential's text is in this answer only; the store keeps its hash.
+  co_return ApiAnswer::ok("{\"keyId\":" + quote(record.keyId) + ",\"credential\":" + quote(credentialText(token)) +
+      ",\"scope\":" + quote(record.scope) + ",\"description\":" + quote(record.description) + ",\"createdAtUnixMs\":" +
+      std::to_string(record.createdAtUnixMs) + ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + "}");
 }
 
-kj::Promise<ApiAnswer> listCredentials(EtcdClient& client, std::string tenantName) {
-  auto read = co_await readTenant(client, tenantName);
-  if (!read.tenant) co_return notFound(tenantName);
-  auto raw = co_await client.range(CREDENTIALS_PREFIX);
+ApiAnswer listCredentials(const ManifestStore& state, std::string tenantName) {
+  if (!readTenant(state, tenantName).tenant) return notFound(tenantName);
   std::string out = "{\"tenant\":" + quote(tenantName) + ",\"credentials\":[";
   size_t index = 0;
-  for (const auto& [key, kv] : raw.values) {
-    CredentialRecord record;
-    try { record = decodeCredentialRecord(kv.value); } catch (const kj::Exception&) { continue; }
+  for (const auto& [keyId, record] : state.credentials().credentials) {
     if (record.scope != "tenant:" + tenantName) continue;
     // Never the hash.
     out += std::string(index++ ? "," : "") + "{\"keyId\":" + quote(record.keyId) + ",\"scope\":" + quote(record.scope) +
@@ -466,32 +430,31 @@ kj::Promise<ApiAnswer> listCredentials(EtcdClient& client, std::string tenantNam
         ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + ",\"revokedAtUnixMs\":" +
         std::to_string(record.revokedAtUnixMs) + "}";
   }
-  co_return ApiAnswer::ok(out + "]}");
+  return ApiAnswer::ok(out + "]}");
 }
 
-kj::Promise<ApiAnswer> revokeCredential(EtcdClient& client, kj::Timer& timer, std::string tenantName, std::string keyId) {
+kj::Promise<ApiAnswer> revokeCredential(ManifestStore& state, std::string tenantName, std::string keyId) {
+  std::optional<ApiAnswer> refused;
   if (keyId.size() != 16 || !std::all_of(keyId.begin(), keyId.end(), [](unsigned char c) { return std::isxdigit(c) && !std::isupper(c); }))
     co_return invalid("a key id is 16 lowercase hex characters");
-  for (uint32_t attempt = 0; attempt < 9; ++attempt) {
-    auto raw = co_await client.range(credentialKey(keyId));
-    auto found = raw.values.find(credentialKey(keyId));
-    CredentialRecord record;
-    bool readable = found != raw.values.end();
-    if (readable) { try { record = decodeCredentialRecord(found->second.value); } catch (const kj::Exception&) { readable = false; } }
-    if (!readable || record.scope != "tenant:" + tenantName)
-      co_return ApiAnswer::error(404, "CREDENTIAL_NOT_FOUND", "tenant " + tenantName + " has no credential " + keyId);
-    if (record.revokedAtUnixMs) co_return ApiAnswer::ok("{\"keyId\":" + quote(keyId) + ",\"revoked\":true,\"revokedAtUnixMs\":" +
-        std::to_string(record.revokedAtUnixMs) + ",\"unchanged\":true}");
-    record.revokedAtUnixMs = nowMs();
-    Txn txn;
-    txn.unchanged(credentialKey(keyId), found->second.modRevision);
-    txn.put(credentialKey(keyId), credentialRecordJson(record));
-    if (co_await txn.commit(client))
-      co_return ApiAnswer::ok("{\"keyId\":" + quote(keyId) + ",\"revoked\":true,\"revokedAtUnixMs\":" + std::to_string(record.revokedAtUnixMs) + "}");
-    co_await pause(timer, attempt);
+  uint64_t revokedAt = 0;
+  bool unchanged = false;
+  try {
+    co_await state.writeCredentials([&](CredentialIndex& next) {
+      auto found = next.credentials.find(keyId);
+      if (found == next.credentials.end() || found->second.scope != "tenant:" + tenantName)
+        refuseWith(refused, ApiAnswer::error(404, "CREDENTIAL_NOT_FOUND", "tenant " + tenantName + " has no credential " + keyId));
+      if (found->second.revokedAtUnixMs) { unchanged = true; revokedAt = found->second.revokedAtUnixMs; return; }
+      found->second.revokedAtUnixMs = revokedAt = nowMs();
+    });
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the revocation");
   }
-  co_return ApiAnswer::error(409, "CONFLICT", "credential " + keyId + " kept changing (9 attempts)");
+  co_return ApiAnswer::ok("{\"keyId\":" + quote(keyId) + ",\"revoked\":true,\"revokedAtUnixMs\":" + std::to_string(revokedAt) +
+      (unchanged ? ",\"unchanged\":true}" : "}"));
 }
+
 
 kj::Promise<std::vector<std::string>> nodeIds(EtcdClient& client) {
   // A skip scan: one key per step (keys only), then past that node's keys -- two reads per node however many rows it
