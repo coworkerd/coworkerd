@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace coworkerd {
 
@@ -21,6 +22,9 @@ public:
   // startup and mapped read-only there; -1 while the watermark is off.
   int channelDescriptor() const;
   static uint64_t residentBytes(int pid);
+  // The memory this node may use, and where that came from: its cgroup's memory.max (a container's limit), else the
+  // configured budget, else the machine's physical memory. Rotation's default memory threshold is a share of it.
+  static std::pair<uint64_t, std::string> nodeMemory(uint64_t configuredBudget);
   // Memory-triggered process rotation (no default threshold is set): true when the process's resident
   // memory reached the threshold. 0 disables it.
   static bool rotationDue(int pid, uint64_t thresholdBytes);

@@ -107,11 +107,13 @@ std::string escape(const std::string& value) {
   return result;
 }
 // The variables of the node's environment a workerd process inherits as they are: the locale, the time zone, the
-// search path and temporary directory, output colouring, and the switches workerd itself reads for tests. Every
+// search path and temporary directory, output colouring, the switches workerd itself reads for tests, and the
+// build's system call profile (scripts/syscall-trace-wrapper.sh stands in for workerd and reads its three). Every
 // other one stays with the node; the COWORKERD_* settings workerd reads are set for it by spawn().
 bool workerdInherits(std::string_view name) {
   static constexpr std::string_view NAMES[] = {"PATH", "TZ", "LANG", "LANGUAGE", "TMPDIR", "NO_COLOR", "FORCE_COLOR",
-      "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST"};
+      "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST",
+      "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK"};
   return name.starts_with("LC_") || std::find(std::begin(NAMES), std::end(NAMES), name) != std::end(NAMES);
 }
 // Descriptor numbers each workerd inherits (see process-pool.h); the launcher's own two, which it
@@ -768,7 +770,10 @@ struct ProcessGeneration {
   // never fills and workerd's writes never wait); rows are parsed and applied only when needed --
   // supervisor cadence, exit, failure classification, status -- never per dispatch. At the exit the
   // rest is read up to the end of the pipe.
-  struct LimitEvent { std::string event, isolate, workerId; uint32_t memoryLimitMiB; uint64_t peakUsedBytes; };
+  struct LimitEvent {
+    std::string event, isolate, workerId; uint32_t memoryLimitMiB; uint64_t peakUsedBytes;
+    uint64_t pauseNs = 0; std::string row;  // gc-pause rows: the pause, and the row itself
+  };
   bool eventChannel = false, eventsFinal = false, eventsEnded = false;
   int eventFd = -1;
   kj::Own<kj::UnixEventPort::FdObserver> eventObserver;
@@ -943,10 +948,11 @@ struct ProcessGeneration {
               report.getWorkerId().cStr(), report.getVersionId().cStr()));
         if (event == "completed" && !openContexts.empty() &&
             openContexts.erase(std::string(report.getInvocationId().cStr()))) ++contextsCompleted;
-        // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's.
+        // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
+        // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same.
         if (event == "completed" && cpuUsage && std::string_view(report.getInvocationId().cStr()).find("-invocation-") != std::string_view::npos) {
           const auto tenant = tenantOf(report.getWorkerId().cStr());
-          if (!tenant.empty()) (*cpuUsage)[tenant] += report.getCpuUsedNs();
+          if (!tenant.empty()) (*cpuUsage)[tenant] += report.getCpuUsedNs() + report.getGcExcludedNs();
         }
         if (event == "culprit") {
           culpritRow = row; culpritInvocation = report.getInvocationId().cStr();
@@ -957,7 +963,8 @@ struct ProcessGeneration {
         if (event == "memory-oom-undetermined") oomSignalled = true;
         if (event == "memory-culprit") oomCulpritRow = row;
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
-            report.getMemoryLimitMiB(), report.getPeakUsedBytes()});
+            report.getMemoryLimitMiB(), report.getPeakUsedBytes(), report.getPauseNs(),
+            event == "gc-pause" ? row : std::string()});
       } catch (const kj::Exception& error) {
         ++rejectedRows;
         std::cerr << "[process-pool] CPU report rejected: " << error.getDescription().cStr() << std::endl;
@@ -1017,6 +1024,9 @@ public:
     std::string lastReason;
     uint64_t cpuTerminatedRequests = 0, cpuInvalidatedIsolates = 0, cpuReloadedIsolates = 0;
     uint64_t memoryTerminatedRequests = 0, memoryInvalidatedIsolates = 0, memoryReloadedIsolates = 0;
+    // The long collections of every generation (gc-pause rows, gc.longPauseMs): how many, and the longest one's row.
+    uint64_t gcLongPauses = 0, gcLongestPauseNs = 0;
+    std::string gcLongestPause;
     // Launches that failed before workerd ran (the launcher's `failed` record, or no `exec` one).
     uint64_t launchFailures = 0;
     std::string lastLaunchFailure = "null";
@@ -1068,6 +1078,8 @@ public:
   std::vector<Slot> slots;
   std::deque<std::string> kills;
   std::deque<std::string> memoryCrashes;
+  // The latest gc-pause rows of any generation (gc.longPauseMs).
+  std::deque<std::string> recentGcPauses;
   // The limit event channel of the last exited generations: what the Server read, to the end.
   std::deque<std::string> channelExits;
   // The cgroup's OOM kills (memoryEventsPath): the counter as last read, and the increments no exit has taken yet, each
@@ -1213,6 +1225,19 @@ public:
       if (auto* text = std::getenv(setting.first)) {
         char* end = nullptr; auto value = std::strtoull(text, &end, 10);
         KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid process pool override", setting.first);
+        *setting.second = static_cast<uint32_t>(value);
+      }
+    }
+    for (const auto& setting : {std::pair{"COWORKERD_GC_BUDGET_MS", &this->config.gcBudgetMs},
+                               std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &this->config.gcRefillMsPerSecond},
+                               std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &this->config.gcLongPauseMs},
+                               std::pair{"COWORKERD_IDLE_GC_MS", &this->config.gcIdleCollectAfterMs},
+                               std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &this->config.gcIdleCollectMinGrowthMiB},
+                               std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &this->config.gcInitialOldSpaceMiB},
+                               std::pair{"COWORKERD_STATIC_HEAP_MIB", &this->config.gcRuntimeHeapMiB}}) {
+      if (auto* text = std::getenv(setting.first)) {
+        char* end = nullptr; auto value = std::strtoull(text, &end, 10);
+        KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid gc override", setting.first);
         *setting.second = static_cast<uint32_t>(value);
       }
     }
@@ -1840,8 +1865,17 @@ public:
     std::ofstream configFile(path);
     configFile << "using Workerd = import \"/workerd/workerd.capnp\";\nconst config :Workerd.Config = (\n";
     p->wasmMemoryCapMiB = wasmMemoryCapMiB();
-    if (p->wasmMemoryCapMiB) configFile << "v8Flags = [\"--wasm-max-mem-pages=" << uint64_t(p->wasmMemoryCapMiB) * 16
-        << "\", \"--enforce-global-heap-limit\", \"--maximum-global-heap-limit-factor=1\"],\n";
+    std::vector<std::string> v8Flags;
+    if (p->wasmMemoryCapMiB) v8Flags = {"--wasm-max-mem-pages=" + std::to_string(uint64_t(p->wasmMemoryCapMiB) * 16),
+        "--enforce-global-heap-limit", "--maximum-global-heap-limit-factor=1"};
+    // Every isolate's old generation starts this small, so its first full collection comes early and is small
+    // (gc.initialOldSpaceMiB); V8 grows it from there.
+    if (config.gcInitialOldSpaceMiB) v8Flags.push_back("--initial-old-space-size=" + std::to_string(config.gcInitialOldSpaceMiB));
+    if (!v8Flags.empty()) {
+      configFile << "v8Flags = [";
+      for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
+      configFile << "],\n";
+    }
     configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
         "compatibilityFlags = [\"enable_request_signal\"], modules = [(name = \"runtime.js\", esModule = embed \""
         << p->id << ".runtime.js\")], bindings = [\n"
@@ -1940,6 +1974,14 @@ public:
     childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
     childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));
+    // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
+    // pauses it names, the idle collection, and the runtime's heap.
+    childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));
+    childEnvironment.push_back("COWORKERD_GC_REFILL_MS_PER_S=" + std::to_string(config.gcRefillMsPerSecond));
+    childEnvironment.push_back("COWORKERD_GC_LONG_PAUSE_MS=" + std::to_string(config.gcLongPauseMs));
+    childEnvironment.push_back("COWORKERD_IDLE_GC_MS=" + std::to_string(config.gcIdleCollectAfterMs));
+    childEnvironment.push_back("COWORKERD_IDLE_GC_MIN_MIB=" + std::to_string(config.gcIdleCollectMinGrowthMiB));
+    childEnvironment.push_back("COWORKERD_STATIC_HEAP_MIB=" + std::to_string(config.gcRuntimeHeapMiB));
 #ifdef __linux__
     // What only the process itself can do, once it serves (coworkerd-steady.h): narrow its system calls
     // to the steady table, and make itself non-dumpable again -- the launcher sets that bit before the
@@ -2170,6 +2212,11 @@ public:
         ++s.memoryTerminatedRequests;
         if (s.memoryInvalidated.insert(e.isolate).second) ++s.memoryInvalidatedIsolates;
         if (!e.workerId.empty()) ++workerMemoryStats[e.workerId].terminated;
+      } else if (e.event == "gc-pause") {
+        ++s.gcLongPauses;
+        if (e.pauseNs > s.gcLongestPauseNs) { s.gcLongestPauseNs = e.pauseNs; s.gcLongestPause = e.row; }
+        if (recentGcPauses.size() == 32) recentGcPauses.pop_front();
+        recentGcPauses.push_back(e.row);
       }
     }
     p.unappliedEvents.clear();
@@ -2731,13 +2778,35 @@ public:
         << "\",\"sandbox\":" << generationSandboxJson(*p) << "}";
     return out.str();
   }
+  // A slot's collections: the long ones of every generation (their gc-pause rows) and the current generation's own
+  // counts from its lifecycle snapshot -- full, minor and idle collections, the longest pause of any kind.
+  std::string gcJson(const Slot& s, const std::shared_ptr<ProcessGeneration>& p) const {
+    std::string generation = "null";
+    if (p) {
+      auto row = p->lifecycle.read();
+      if (!row.empty() && row.front() == '{') try {
+        capnp::MallocMessageBuilder message;
+        auto value = message.initRoot<capnp::JsonValue>();
+        capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), value);
+        auto gc = json::field(value, "gc");
+        if (gc.isObject()) generation = capnp::JsonCodec().encodeRaw(gc).cStr();
+      } catch (const kj::Exception&) {}
+    }
+    std::ostringstream out;
+    out << std::setprecision(17) << "{\"longPauseMs\":" << config.gcLongPauseMs << ",\"longPauses\":" << s.gcLongPauses
+        << ",\"longestPauseMs\":" << double(s.gcLongestPauseNs) / 1e6
+        << ",\"longestPause\":" << (s.gcLongestPause.empty() ? std::string("null") : s.gcLongestPause)
+        << ",\"generation\":" << generation << "}";
+    return out.str();
+  }
   // The state endpoint carries the latest records; /__coworkerd/rotation carries the whole history.
   std::string rotationStateJson(size_t recentLimit = ROTATION_HISTORY) const {
     std::ostringstream out;
     out << std::setprecision(17) << "{\"configuration\":{\"drainTimeoutMs\":" << config.rotationDrainTimeoutMs
         << ",\"termGraceMs\":" << config.rotationTermGraceMs << ",\"binaryCheckMs\":" << config.rotationBinaryCheckMs
         << ",\"maxAgeMs\":" << config.rotationMaxAgeMs << ",\"maxRequests\":" << config.rotationMaxRequests
-        << ",\"residentBytes\":" << config.rotationResidentBytes << ",\"retryMs\":" << config.rotationRetryMs
+        << ",\"residentBytes\":" << config.rotationResidentBytes << ",\"residentBytesSource\":\""
+        << escape(config.rotationResidentBytesSource) << "\",\"retryMs\":" << config.rotationRetryMs
         << ",\"concurrency\":1},\"binary\":{\"path\":\"" << escape(executable) << "\",\"sha256\":\"" << hasher.lookup(configuredBinary)
         << "\",\"checks\":" << binaryChecks << ",\"changes\":" << binaryChanges << ",\"changedAtUnixMs\":" << binaryChangedAtUnixMs
         << ",\"hashes\":" << hasher.counts().first << ",\"hashFailures\":" << hasher.counts().second
@@ -2945,7 +3014,12 @@ std::string ProcessPool::json(uint32_t idleMs) const {
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
-      << ",\"restartMaxMs\":" << impl->config.restartMaxMs << "},\"entries\":[";
+      << ",\"restartMaxMs\":" << impl->config.restartMaxMs
+      << ",\"gc\":{\"budgetMs\":" << impl->config.gcBudgetMs << ",\"refillMsPerSecond\":" << impl->config.gcRefillMsPerSecond
+      << ",\"longPauseMs\":" << impl->config.gcLongPauseMs << ",\"idleCollectAfterMs\":" << impl->config.gcIdleCollectAfterMs
+      << ",\"idleCollectMinGrowthMiB\":" << impl->config.gcIdleCollectMinGrowthMiB
+      << ",\"initialOldSpaceMiB\":" << impl->config.gcInitialOldSpaceMiB << ",\"runtimeHeapMiB\":" << impl->config.gcRuntimeHeapMiB
+      << "}},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
     const auto slotIndex = i;
@@ -2956,7 +3030,8 @@ std::string ProcessPool::json(uint32_t idleMs) const {
         << ",\"residentBytes\":" << MemoryWatermark::residentBytes(p ? p->pid : 0)
         << ",\"state\":\"" << (p ? p->state : "starting") << "\",\"restartCount\":" << s.restarts << ",\"exitCount\":" << s.exits
         << ",\"cpuTerminatedRequests\":" << s.cpuTerminatedRequests << ",\"cpuInvalidatedIsolates\":" << s.cpuInvalidatedIsolates
-        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
+        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
+        << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
         << ",\"lastReason\":\"" << escape(p && !p->lastReason.empty() ? p->lastReason : s.lastReason) << "\",\"inFlight\":" << (p ? p->inFlight : 0)
@@ -2995,6 +3070,8 @@ std::string ProcessPool::json(uint32_t idleMs) const {
   }
   out << "],\"recentKills\":[";
   for (size_t j = 0; j < impl->kills.size(); ++j) { if (j) out << ','; out << impl->kills[j]; }
+  out << "],\"recentGcPauses\":[";
+  for (size_t j = 0; j < impl->recentGcPauses.size(); ++j) { if (j) out << ','; out << impl->recentGcPauses[j]; }
   out << "],\"workerCpuStats\":[";
   size_t workerIndex = 0;
   for (const auto& [worker, stats] : impl->workerCpuStats) {

@@ -5189,7 +5189,7 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 
 // The process pool's own environment overrides (process-pool.c++), applied here as well so that the
 // configuration a Server reports is the one it runs; the pool applies the same values again.
-void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool) {
+void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
@@ -5204,6 +5204,26 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool) {
                              std::pair{"COWORKERD_ROTATION_MAX_REQUESTS", &pool.rotationMaxRequests},
                              std::pair{"COWORKERD_ROTATION_RESIDENT_BYTES", &pool.rotationResidentBytes}})
     *field = environmentUnsigned(name, *field, UINT64_MAX);
+  if (std::getenv("COWORKERD_ROTATION_RESIDENT_BYTES")) {
+    pool.rotationResidentBytesDefault = false;
+    pool.rotationResidentBytesSource = "environment";
+  }
+  // The memory threshold nobody gave: 70% of this node's memory, so that a process whose memory keeps growing is
+  // replaced before the node's memory runs out, whatever else rotates it.
+  if (pool.rotationResidentBytesDefault) {
+    const auto [bytes, source] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
+    pool.rotationResidentBytes = bytes / 10 * 7;
+    pool.rotationResidentBytesDefault = false;
+    pool.rotationResidentBytesSource = "default: 70% of " + source + " (" + std::to_string(bytes) + " bytes)";
+  }
+  for (auto [name, field] : {std::pair{"COWORKERD_GC_BUDGET_MS", &pool.gcBudgetMs},
+                             std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &pool.gcRefillMsPerSecond},
+                             std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &pool.gcLongPauseMs},
+                             std::pair{"COWORKERD_IDLE_GC_MS", &pool.gcIdleCollectAfterMs},
+                             std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &pool.gcIdleCollectMinGrowthMiB},
+                             std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &pool.gcInitialOldSpaceMiB},
+                             std::pair{"COWORKERD_STATIC_HEAP_MIB", &pool.gcRuntimeHeapMiB}})
+    *field = static_cast<uint32_t>(environmentUnsigned(name, *field, UINT32_MAX));
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_MODE")) pool.sandboxMode = mode;
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_SYSCALLS")) pool.syscallsMode = mode;
   if (const char* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) pool.allowlistPath = path;
@@ -5270,7 +5290,12 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"limits\":{\"cpuLimitMs\":" << p.cpuLimitMs << ",\"memoryLimitMiB\":" << p.memoryLimitMiB
       << "},\"rotation\":{\"drainTimeoutMs\":" << p.rotationDrainTimeoutMs << ",\"termGraceMs\":" << p.rotationTermGraceMs
       << ",\"binaryCheckMs\":" << p.rotationBinaryCheckMs << ",\"maxAgeMs\":" << p.rotationMaxAgeMs << ",\"maxRequests\":" << p.rotationMaxRequests
-      << ",\"residentBytes\":" << p.rotationResidentBytes << ",\"retryMs\":" << p.rotationRetryMs
+      << ",\"residentBytes\":" << p.rotationResidentBytes << ",\"residentBytesSource\":" << q(p.rotationResidentBytesSource)
+      << ",\"retryMs\":" << p.rotationRetryMs
+      << "},\"gc\":{\"budgetMs\":" << p.gcBudgetMs << ",\"refillMsPerSecond\":" << p.gcRefillMsPerSecond
+      << ",\"longPauseMs\":" << p.gcLongPauseMs << ",\"idleCollectAfterMs\":" << p.gcIdleCollectAfterMs
+      << ",\"idleCollectMinGrowthMiB\":" << p.gcIdleCollectMinGrowthMiB << ",\"initialOldSpaceMiB\":" << p.gcInitialOldSpaceMiB
+      << ",\"runtimeHeapMiB\":" << p.gcRuntimeHeapMiB
       << "},\"sandbox\":{\"mode\":" << q(p.sandboxMode) << ",\"launcherPath\":" << q(p.launcherPath)
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
@@ -5343,7 +5368,7 @@ int run(Launch launch) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig.processPool);
+  applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) serverConfig.egress.defaultPolicy = policy;
@@ -5606,7 +5631,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
     launch = serveLaunch(options, false);
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
-    applyProcessPoolEnvironment(launch->config.processPool);
+    applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\"");
   } catch (const kj::Exception& error) {

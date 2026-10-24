@@ -107,4 +107,14 @@ export const bindingCallee = `export default { async fetch(request) {
     process: request.cf.processId, query: new URL(request.url).search });
 } };\n`;
 
+// The collections between requests (gc.idleCollectAfterMs): each request keeps `keep` MiB of small objects alive
+// until the next one, so the old generation grows by that much and its isolate is collected once it is idle.
+export const gcTenant = `let kept = [];
+export default { async fetch(request) {
+  const mib = Number(new URL(request.url).searchParams.get("keep") || 2), next = [];
+  for (let i = 0; i < mib * 16384; i++) next.push({ i, s: "gc-" + i, t: [i] });
+  kept = next;
+  return Response.json({ process: request.cf.processId, kept: kept.length });
+} };\n`;
+
 export const isolateIds = count => Array.from({ length: count }, (_, i) => `iso-${String(i).padStart(3, "0")}`);

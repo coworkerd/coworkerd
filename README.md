@@ -25,9 +25,10 @@ Accounts, billing and user interfaces are left to the platform on top. Stateful 
 being built for 0.5 (ownership per shard with fencing, writes confirmed by peer nodes and shipped to the object store),
 and this release runs stateless Workers only. The components and their boundaries are described in [docs/components.md](docs/components.md).
 
-## Status: 0.4.0
+## Status: 0.4.1
 
-0.4.0 is the current release, for Linux `amd64` and `arm64`: the cluster's whole state moves from etcd to the object
+0.4.1 is the current release, for Linux `amd64` and `arm64`: a full garbage collection is no longer taken for a CPU
+overrun, and processes are no longer replaced every hour. 0.4.0 moved the cluster's whole state from etcd to the object
 store, and etcd is gone; it does not upgrade a 0.3.x cluster in place (0.3.0 was the first release, 0.3.1 its fixes).
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
 launcher `coworkerd-launcher`, the patched `workerd`, `cowctl`) and a container image, with compose files for one or
@@ -64,9 +65,9 @@ With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a c
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.4.0-linux-arm64.tar.gz
-docker load -i coworkerd-0.4.0-linux-arm64-image.tar.gz
-cd coworkerd-0.4.0-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.4.1-linux-arm64.tar.gz
+docker load -i coworkerd-0.4.1-linux-arm64-image.tar.gz
+cd coworkerd-0.4.1-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 

@@ -1,6 +1,6 @@
 # Coworkerd error codes
 
-> For release 0.4.0. The control plane's API is `/v1`, and resources have two levels: tenant -> Worker.
+> For release 0.4.1. The control plane's API is `/v1`, and resources have two levels: tenant -> Worker.
 > Error answers are JSON as a rule: a call's answer `{"error","reason","code",...}` (an admission refusal adds `loadBand`, `inFlight`, `limit`, `avoidMs` and `status`),
 > the control plane's and the management endpoints' answers `{"code","reason"}`, some with more fields (a `LOAD_FAILED` of the control plane adds `category`, `message`, `nodeId` and the trial's `record`).
 > A few answers are shaped otherwise, for example the plain-text 500 `Coworkerd execution failed` a node answers for an unexpected failure, `/__coworkerd/ready`'s plain-text 503, a static asset's empty 404 or 405, the trial-load endpoint's 400 and 413 `{"error","reason"}`, and the control plane's announcement's 400 and 413 `{"ok":false,"reason"}` on a node's peer port.

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.1
+
+A full garbage collection is no longer taken for a CPU overrun, and processes are no longer replaced every hour. V8
+collects an isolate on the thread that runs its requests, and a long-lived isolate's full collection -- mostly the
+destruction of the wrappers of objects it let go, in one atomic pause -- was charged to whichever request it ran in: on
+a busy node it terminated well-behaved requests with `CPU_LIMIT_EXCEEDED`. With a tree of Workers at 15 requests a
+second per root, four processes and no rotation, 0.4.0 terminated 50 requests in an hour on an amd64 machine, each right
+after a full collection; 0.4.1, beside it on the same machine, none. The object store's layout and `/v1` do not change;
+the node's configuration gains `gc`, and two of rotation's defaults change.
+
+- **Collections are left out of the CPU limit, within a budget**: the thread CPU of a full collection that runs during a
+  request -- also while it is under way -- is subtracted from the request's CPU as far as its Worker's budget goes, a
+  token bucket of `gc.budgetMs` (2,000 ms) refilled at `gc.refillMsPerSecond` (100 ms a second), one per Worker in each
+  process, which the Worker's next isolate takes over; beyond it, collections are charged as before. A tenant that
+  allocates on purpose so gets at most a tenth of a core of uncharged collections (87 ms a second measured over 45 s of
+  back-to-back collections), and a request that only runs JavaScript is terminated at the limit as before. The rows of
+  completed requests carry the CPU left out (`gcExcludedNs`).
+- **Long pauses are named**: a collection that pauses its process for `gc.longPauseMs` (100 ms) or more writes a
+  `gc-pause` row -- the isolate, the pause, the request it ran in or none, the kind of collection, the CPU left out and
+  the budget left -- to `logs/workerd.log` after `[cpu-limit] ` and to its node, whose state endpoint keeps the latest
+  rows (`processes.recentGcPauses`) and counts collections, long pauses and the longest per process
+  (`processes.entries[].gc`).
+- **Idle isolates are collected between requests**: a Worker's isolate idle for `gc.idleCollectAfterMs` (50 ms) whose
+  old generation grew `gc.idleCollectMinGrowthMiB` (4 MiB) since its last full collection is collected outside any
+  request, never while its process has work waiting; and every isolate starts with an 8 MiB old generation
+  (`gc.initialOldSpaceMiB`, V8's `--initial-old-space-size`), so its first full collection comes while it holds little.
+  Measured on an arm64 machine, every first full collection of the tree's isolates was such an idle one and paused its
+  process less than 21 ms.
+- **The runtime's heap is bounded**: the runtime bridge's isolate, which every call passes through, gets a heap of
+  `gc.runtimeHeapMiB` (128 MiB) instead of one V8 sizes from the machine (four times the most it was measured to hold
+  after a full collection, 7.7 MiB under load, and at least 128 MiB). Its own full collections, outside any request, are
+  now the longest pauses left, and are named like the others (isolate `runtime`).
+- **Rotation on demand**: `rotation.maxAgeMs` defaults to `0`, so a process is no longer replaced every hour, and
+  `rotation.residentBytes` left out of the configuration is 70% of the node's memory (its container's `memory.max`, else
+  `memoryBudgetBytes`, else the machine's; the state endpoint names which): a generation is replaced when its workerd
+  file changes, by hand, or at that threshold. With the collections above a process's memory stays level -- in the same
+  hour without rotation the node's processes together rose to 891 MiB in the first 40 minutes and to 894 MiB by the end
+  (0.4.0's, beside them, to 3,205 MiB) -- and an hourly rotation only rebuilt every isolate, its cold loads and its
+  first, largest collection, and cut the requests longer than the drain. Set `rotation.maxAgeMs` to keep replacing
+  processes by age.
+- **An actor's CPU limit is topped up with each event** (`topUpActor()`, workerd's own contract): the requests to one
+  Durable Object shared one CPU limit for the object's whole life. Coworkerd runs no Durable Objects before 0.5; this is
+  one of their prerequisites.
+- **The system call allowlists** are generated anew for the patched workerd: the same calls as 0.4.0's on both
+  architectures (arm64: 59 at startup, 43 in the steady state; amd64: 63 and 42), only the binary they name is new.
+
 ## 0.4.0
 
 The object store becomes the cluster's only state, and etcd leaves Coworkerd: membership, the desired state (tenants,

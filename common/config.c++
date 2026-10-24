@@ -30,6 +30,9 @@ void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(idleDestroyIntervalMs > 0, "idleDestroyIntervalMs must be positive");
   KJ_REQUIRE(idleEvictMs == 0 || idleEvictMs > heatIdleMs, "idleEvictMs must exceed placement.idleMs");
   KJ_REQUIRE(rotationDrainTimeoutMs > 0 && rotationTermGraceMs > 0 && rotationRetryMs > 0, "rotation periods must be positive");
+  KJ_REQUIRE(gcRuntimeHeapMiB == 0 || (gcRuntimeHeapMiB >= 16 && gcRuntimeHeapMiB <= 65536),
+      "gc.runtimeHeapMiB must be 0 (V8's own) or 16 to 65536");
+  KJ_REQUIRE(gcInitialOldSpaceMiB <= 65536 && gcIdleCollectMinGrowthMiB <= 65536, "gc sizes are at most 65536 MiB");
   KJ_REQUIRE(sandboxMode == "off" || sandboxMode == "launcher" || sandboxMode == "auto",
       "sandbox.mode must be off, launcher or auto", sandboxMode.c_str());
   KJ_REQUIRE(syscallsMode == "off" || syscallsMode == "observe" || syscallsMode == "enforce",
@@ -170,7 +173,16 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.rotationMaxAgeMs = rotation.getMaxAgeMs();
   result.processPool.rotationMaxRequests = rotation.getMaxRequests();
   result.processPool.rotationResidentBytes = rotation.getResidentBytes();
+  result.processPool.rotationResidentBytesDefault = !given({"rotation", "residentBytes"}).has_value();
   result.processPool.rotationRetryMs = rotation.getRetryMs();
+  auto gc = root.getGc();
+  result.processPool.gcBudgetMs = gc.getBudgetMs();
+  result.processPool.gcRefillMsPerSecond = gc.getRefillMsPerSecond();
+  result.processPool.gcLongPauseMs = gc.getLongPauseMs();
+  result.processPool.gcIdleCollectAfterMs = gc.getIdleCollectAfterMs();
+  result.processPool.gcIdleCollectMinGrowthMiB = gc.getIdleCollectMinGrowthMiB();
+  result.processPool.gcInitialOldSpaceMiB = gc.getInitialOldSpaceMiB();
+  result.processPool.gcRuntimeHeapMiB = gc.getRuntimeHeapMiB();
   auto sandbox = root.getSandbox();
   result.processPool.sandboxMode = sandbox.getMode().cStr();
   result.processPool.launcherPath = sandbox.getLauncherPath().cStr();

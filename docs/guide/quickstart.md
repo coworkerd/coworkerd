@@ -1,6 +1,6 @@
 # Coworkerd quickstart
 
-> For release 0.4.0.
+> For release 0.4.1.
 > From a wrangler project to the first request: start the cluster -> the administrator creates a tenant and a credential -> `cowctl init --tenant` -> `cowctl deploy` -> `curl` ->
 > `cowctl logs` -> a new version -> `cowctl rollback` -> `cowctl secret put` -> `cowctl usage`.
 > Installation details, bare-metal deployment and configuration are in [installing and running](install.md); which wrangler features work is in the [compatibility scope](compat.md); errors are in [error codes](errors.md).
@@ -13,16 +13,16 @@ a Worker's full name is `tenant/Worker`, so two tenants can each have a Worker c
 - **Docker Engine 28 or newer** and the Docker Compose plugin (Docker Desktop on the Mac has both; on Linux take a Compose that supports volume `subpath` and the healthcheck's `start_interval`, which the compose file uses; this page was run with Docker 29.2 and Compose 5.1);
 - **Node.js 22.5 or newer** (`node --version`): the wrangler that `cowctl deploy` runs requires Node.js 22, and `cowctl`'s adapter uses `path.matchesGlob`, which Node.js has since 22.5;
 - `curl`;
-- your architecture's two files from the release and the checksums: `coworkerd-0.4.0-linux-<arch>.tar.gz`, `coworkerd-0.4.0-linux-<arch>-image.tar.gz`,
+- your architecture's two files from the release and the checksums: `coworkerd-0.4.1-linux-<arch>.tar.gz`, `coworkerd-0.4.1-linux-<arch>-image.tar.gz`,
   `SHA256SUMS`. A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64`.
 
 ## 1. Start the cluster (well under a minute)
 
 ```bash
 shasum -a 256 -c --ignore-missing SHA256SUMS        # on Linux: sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.4.0-linux-arm64.tar.gz
-docker load -i coworkerd-0.4.0-linux-arm64-image.tar.gz
-cd coworkerd-0.4.0-linux-arm64
+tar -xzf coworkerd-0.4.1-linux-arm64.tar.gz
+docker load -i coworkerd-0.4.1-linux-arm64-image.tar.gz
+cd coworkerd-0.4.1-linux-arm64
 export COWORKERD_PACKAGE="$PWD" PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
@@ -118,6 +118,8 @@ acme/hello-world: active v2
   route */acme/hello-world  ->  http://127.0.0.1:18080/acme/hello-world
 ```
 
+The `package` hashes are an example from an arm64 machine: `cowctl` bundles the Worker with the tools installed for the machine it runs on, so on another architecture they differ.
+
 ## 6. Add a secret
 
 ```bash
@@ -187,13 +189,13 @@ cowctl status                                                       # the contro
 
 ```text
 $ cowctl status
-control plane http://127.0.0.1:18090: coworkerd-apiserver 0.4.0 (source 9d8a0003edd8), tenants revision 9, credentials revision 3; tenant acme
-node-1  active  coworkerd 0.4.0
-node-2  active  coworkerd 0.4.0
-node-3  active  coworkerd 0.4.0
+control plane http://127.0.0.1:18090: coworkerd-apiserver 0.4.1 (source 9d8a0003edd8), tenants revision 9, credentials revision 3; tenant acme
+node-1  active  coworkerd 0.4.1
+node-2  active  coworkerd 0.4.1
+node-3  active  coworkerd 0.4.1
 ```
 
-`cowctl status` names the control plane, the revisions of the tenant index and the credentials index it holds (each change of the desired state is a new revision in the object store), and the nodes;
+`cowctl status` names the control plane -- its `source` is the commit its binaries were built from, an example above --, the revisions of the tenant index and the credentials index it holds (each change of the desired state is a new revision in the object store), and the nodes;
 with the admin credential it also shows each node's processes and the revision of the deployment state the node serves. To stop without deleting: `down` without `-v`; at the next `up`, the tenants, credentials, deployments and secrets are all still there.
 
 ## 11. Commands

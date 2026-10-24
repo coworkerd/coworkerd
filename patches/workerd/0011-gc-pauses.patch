@@ -1,0 +1,1117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 12:00:00 +0800
+Subject: [PATCH] Leave garbage collection out of request CPU, collect idle
+ isolates and size the runtime heap
+
+A full collection runs inside the request whose allocation triggered it, and the CPU
+limit charged all of it to that request, terminating it and its isolate. Its thread
+CPU is now excluded from the request, up to a token bucket per Worker
+(COWORKERD_GC_BUDGET_MS, refilled at COWORKERD_GC_REFILL_MS_PER_S) that a new isolate
+of the same Worker continues; beyond it a collection is charged as before. A
+collection that pauses its process at least COWORKERD_GC_LONG_PAUSE_MS writes a
+gc-pause row where the CPU limit writes its rows. The idle reaper collects a dynamic
+isolate between requests once it has been idle COWORKERD_IDLE_GC_MS and its old
+generation grew COWORKERD_IDLE_GC_MIN_MIB -- never while the event loop has been busy
+within that time, which its own late ticks show, and never an isolate hosting actors;
+actor events reach the reaper through topUpActor(), which now tops an actor's CPU up
+for each new event as the interface prescribes. Static isolates take
+COWORKERD_STATIC_HEAP_MIB as their heap. The lifecycle snapshot carries the process's
+collection counts.
+
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index b3b317313830458c627718efbe082ca93f31d7e5..3d372f798b831f16d4285678080e44d02c990b93 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -336,12 +336,14 @@ wd_cc_library(
+     srcs = [
+         "server.c++",
+         "coworkerd-cpu-limit.c++",
++        "coworkerd-gc.c++",
+         "coworkerd-idle-eviction.c++",
+         "coworkerd-steady.c++",
+     ],
+     hdrs = [
+         "server.h",
+         "coworkerd-cpu-limit.h",
++        "coworkerd-gc.h",
+         "coworkerd-idle-eviction.h",
+         "coworkerd-steady.h",
+     ],
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index b34935b0ccb041ab9551ae4aa217250d7d0204d1..2cf65d0f60ed3eb76a4faf3d41f4a19135c780ed 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -213,11 +213,12 @@ class CpuWorkerInterface final: public WorkerInterface {
+ class RequestLimits final: public LimitEnforcer {
+    public:
+     RequestLimits(kj::Own<LimitEnforcer> fallback, CpuIsolateLimitEnforcer& limits,
+-        kj::String identity, kj::Function<void()> abortIsolate)
++        kj::String identity, kj::Function<void()> abortIsolate, bool actor)
+         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
+-          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
+-    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript.
+-    ~RequestLimits() noexcept(false) { limits->completed(identity, cpuUsed); }
++          abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)), actor(actor) {}
++    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
++    // ends with the actor: its row has the CPU of all its events.
++    ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed, gcExcluded); }
+     struct IdentityScope {
+       jsg::AsyncContextFrame::StorageScope frame;
+       MemoryStartupIdentityScope startup;
+@@ -227,15 +228,23 @@ class RequestLimits final: public LimitEnforcer {
+                 lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
+             startup(owner.identity),
+             limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
+-                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); })) {}
++                [&owner]() { if (owner.limits->publish()) owner.abortIsolate(); }, &owner.gcExcluded)) {}
+     };
+     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
+       if (limits->publish()) abortIsolate();
+       limits->requireNotExceeded();
+       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
+-      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
++      return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
++    }
++    // Upstream's contract: each new event delivered to an actor starts with its limits topped up -- an actor's
++    // requests share one IoContext, and this enforcer, for the actor's whole life -- and nothing happens for any
++    // other request. The idle reaper hears of the event too (coworkerd-idle-eviction.h).
++    void topUpActor() override {
++      if (!actor) return;
++      toppedUp += cpuUsed;
++      cpuUsed = 0;
++      idleWorkerActorEvent(limits->activity());
+     }
+-    void topUpActor() override {}
+     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
+     void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
+     void newAnalyticsEngineRequest() override { fallback->newAnalyticsEngineRequest(); }
+@@ -259,7 +268,9 @@ class RequestLimits final: public LimitEnforcer {
+     kj::Own<CpuIsolateLimitEnforcer> limits;
+     kj::Function<void()> abortIsolate;
+     kj::String identity;
+-    uint64_t cpuUsed = 0;
++    bool actor;
++    // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
++    uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
+   };
+ 
+ 
+@@ -267,9 +278,9 @@ class RequestLimits final: public LimitEnforcer {
+ 
+ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
+     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
+-    kj::Function<void()> abortIsolate) {
++    kj::Function<void()> abortIsolate, bool actor) {
+   if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
+-  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
++  return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate), actor);
+ }
+ kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
+     CpuIsolateLimitEnforcer& limits) {
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index 430257403180e532290f84b942728e034a01274f..679764cafe370255aef62762a25d6d45e6f9a073 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "coworkerd-gc.h"
+ #include "coworkerd-idle-eviction.h"
+ #include <workerd/server/coworkerd-memory-limit.h>
+ 
+@@ -110,6 +111,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
+       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
+     }
++    // The isolate's collections (coworkerd-gc.h): what its CPU limit excludes, its long pauses, its idle collection.
++    if (gcSettings().observes()) {
++      gc = std::make_shared<IsolateGc>(name, dynamic, cpuNs);
++      idleWorkerSetGc(this->idleWorker, gc);
++    }
+     if (isEnabled()) watchdog = &LimitWatchdog::start();
+     recordPlatformFacts(name, dynamic);
+     auto paf = kj::newPromiseAndFulfiller<void>();
+@@ -124,6 +130,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     if (memory) {
+       params.constraints.ConfigureDefaultsFromHeapSize(0, memory->limitBytes);
+       params.array_buffer_allocator_shared = memory;
++    } else if (!dynamic && gcSettings().staticHeapBytes) {
++      // The runtime: a heap sized for its working set rather than from the machine, so its collections stay small
++      // (its young generation follows from the maximum).
++      params.constraints.ConfigureDefaultsFromHeapSize(0, gcSettings().staticHeapBytes);
+     }
+     return params;
+   }
+@@ -156,6 +166,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   void customizeIsolate(v8::Isolate* value) override {
+     isolate = value;
+     if (memory) memory->customize(value);
++    if (gc) gc->install(value);
+   }
+   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
+   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
+@@ -209,13 +220,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+         escapeCpuJsonString(version), ",\"invocationId\":", escapeCpuJsonString(invocation), ',');
+   }
+ 
+-  kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
++  // `gcExcluded`: the GC CPU the limit did not charge (coworkerd-gc.h), in the row only when there was some.
++  kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used, uint64_t gcExcluded = 0) {
+     return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
+         ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
+-        ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""), "}\n");
++        ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""),
++        gcExcluded ? kj::str(",\"gcExcludedNs\":", gcExcluded) : kj::str(""), "}\n");
+   }
+-  void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
+-    auto row = report(event, identity, used);
++  void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used, uint64_t gcExcluded = 0) {
++    auto row = report(event, identity, used, gcExcluded);
+     if (isEnabled()) {
+       // All workerd processes append to one log: emit the prefix and JSON in one syscall.
+       auto log = kj::str("[cpu-limit] ", row);
+@@ -225,36 +238,16 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     writeLimitEvent(row);
+   }
+   // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
+-  // ever ran JavaScript; without limits only the event pipe gets the row.
+-  void completed(kj::StringPtr identity, uint64_t used) {
+-    if (dynamic) record("completed", identity, used);
++  // ever ran JavaScript; without limits only the event pipe gets the row. `used` is what the limit charged, and
++  // `gcExcluded` the GC CPU it did not: the request's CPU is their sum.
++  void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
++    if (dynamic) record("completed", identity, used, gcExcluded);
+   }
+   // Written while a termination has not taken effect; a later terminated row for the same
+   // invocation withdraws it.
+   void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
+ 
+-  struct CpuClock {
+-#if __APPLE__
+-    mach_port_t thread = mach_thread_self();
+-    ~CpuClock() { mach_port_deallocate(mach_task_self(), thread); }
+-    uint64_t now() const {
+-      thread_basic_info_data_t info;
+-      mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+-      KJ_REQUIRE(thread_info(thread, THREAD_BASIC_INFO,
+-          reinterpret_cast<thread_info_t>(&info), &count) == KERN_SUCCESS);
+-      return (uint64_t(info.user_time.seconds) + info.system_time.seconds) * 1000000000
+-          + (uint64_t(info.user_time.microseconds) + info.system_time.microseconds) * 1000;
+-    }
+-#else
+-    clockid_t clock;
+-    CpuClock() { KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &clock) == 0); }
+-    uint64_t now() const {
+-      timespec time;
+-      KJ_REQUIRE(clock_gettime(clock, &time) == 0);
+-      return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+-    }
+-#endif
+-  };
++  using CpuClock = ThreadCpuClock;
+ 
+   // One JS entry, registered with the watchdog while it runs. Its watch state is touched only by
+   // the watchdog thread with the registry locked, and read here after unregistering.
+@@ -265,6 +258,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     uint64_t& used;
+     kj::String identity;
+     kj::Function<void()> onExit;
++    // The request's excluded GC CPU (the gcExcludedNs of its rows), or null; and this entry inside the isolate's
++    // collections, which tells it what to exclude.
++    uint64_t* gcExcluded;
++    IsolateGc::Entry gcEntry;
+     CpuClock clock;
+     uint64_t started = clock.now();
+     bool terminated = false;
+@@ -275,8 +272,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     MemoryExecution previousMemory;
+ 
+     Scope(CpuIsolateLimitEnforcer& owner, uint64_t& used, kj::StringPtr identity,
+-        kj::Function<void()> onExit)
+-        : owner(owner), used(used), identity(kj::str(identity)), onExit(kj::mv(onExit)) {
++        kj::Function<void()> onExit, uint64_t* gcExcluded = nullptr)
++        : owner(owner), used(used), identity(kj::str(identity)), onExit(kj::mv(onExit)), gcExcluded(gcExcluded),
++          gcEntry(owner.gc.get(), this->identity) {
+       if (owner.memory) {
+         oomReport = owner.report("memory-culprit", this->identity, 0);
+         previousMemory = owner.memory->enter(oomReport);
+@@ -296,7 +294,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       if (finished) return kj::none;
+       if (terminated) {
+         if (now < graceEnd) return graceEnd;
+-        auto finalConsumed = clock.now() - started + used;
++        auto finalCpu = clock.now();
++        auto finalConsumed = finalCpu - started - gcEntry.excluded(started, finalCpu) + used;
+         if (owner.cpuNs && finalConsumed >= owner.cpuNs) {
+           owner.culprit(identity, finalConsumed);
+           reported = true;
+@@ -308,7 +307,9 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+         terminated = false;
+         return now + 1 * kj::MILLISECONDS;
+       }
+-      auto consumed = clock.now() - started + used;
++      // The CPU of a major GC that ran inside this entry is not charged, as far as its Worker's budget goes.
++      auto cpuNow = clock.now();
++      auto consumed = cpuNow - started - gcEntry.excluded(started, cpuNow) + used;
+       if ((owner.cpuNs && consumed >= owner.cpuNs) ||
+           owner.exceeded->load() != IsolateLimitCause::NONE) {
+         if (owner.cpuNs && consumed >= owner.cpuNs) {
+@@ -325,7 +326,13 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       return now + static_cast<int64_t>(kj::max(owner.cpuNs - consumed, MIN_RECHECK_NS)) * kj::NANOSECONDS;
+     }
+     ~Scope() noexcept(false) {
+-      owner.watchdog->remove(*this, [this]() { used += clock.now() - started; });
++      owner.watchdog->remove(*this, [this]() {
++        auto cpuNow = clock.now();
++        auto excluded = gcEntry.excluded(started, cpuNow);
++        used += cpuNow - started - excluded;
++        if (gcExcluded) *gcExcluded += excluded;
++      });
++      if (owner.gc) owner.gc->measureOld();
+       if (owner.cpuNs && used >= owner.cpuNs) {
+         auto expected = IsolateLimitCause::NONE;
+         if (owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU)) {
+@@ -354,10 +361,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     auto& self = const_cast<CpuIsolateLimitEnforcer&>(*this);
+     return kj::heap<AuxiliaryScope>(self, memoryExecutionIdentity(lock), result);
+   }
+-  kj::Own<void> enterRequestJs(uint64_t& used, kj::StringPtr identity, kj::Function<void()> onExit) {
++  kj::Own<void> enterRequestJs(uint64_t& used, kj::StringPtr identity, kj::Function<void()> onExit,
++      uint64_t* gcExcluded = nullptr) {
+     requireNotExceeded();
+     if (!isEnabled()) return {};
+-    return kj::heap<Scope>(*this, used, identity, kj::mv(onExit));
++    return kj::heap<Scope>(*this, used, identity, kj::mv(onExit), gcExcluded);
+   }
+   struct StartupScope {
+     jsg::AsyncContextFrame::StorageScope frame;
+@@ -394,14 +402,16 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   LimitWatchdog* watchdog = nullptr;
+   IsolateLimitState exceeded = std::make_shared<std::atomic<IsolateLimitCause>>(IsolateLimitCause::NONE);
+   std::shared_ptr<IsolateMemoryLimit> memory;
++  std::shared_ptr<IsolateGc> gc;
+   bool published = false;
+   kj::ForkedPromise<void> failure = nullptr;
+   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+ };
+ 
++// `actor`: the request is an actor's (its IoContext, and this enforcer, serve the actor's later events too).
+ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
+     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
+-    kj::Function<void()> abortIsolate);
++    kj::Function<void()> abortIsolate, bool actor);
+ kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
+     CpuIsolateLimitEnforcer& limits);
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/coworkerd-gc.c++ b/src/workerd/server/coworkerd-gc.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8151a165909521579b2264e319f224ed0838dc9
+--- /dev/null
++++ b/src/workerd/server/coworkerd-gc.c++
+@@ -0,0 +1,388 @@
++#include "coworkerd-gc.h"
++#include "coworkerd-cpu-limit.h"
++
++#include <workerd/io/worker.h>
++#include <kj/debug.h>
++#include <kj/mutex.h>
++#include <cppgc/heap-statistics.h>
++#include <v8-cppgc.h>
++#include <v8-statistics.h>
++#include <algorithm>
++#include <cerrno>
++#include <cstdlib>
++#include <limits>
++#include <map>
++#include <string>
++#include <unistd.h>
++
++namespace workerd::server {
++namespace {
++
++uint64_t setting(const char* name, bool* given = nullptr) {
++  const char* text = std::getenv(name);
++  if (given) *given = text != nullptr;
++  if (text == nullptr) return 0;
++  KJ_REQUIRE(*text != '\0', "GC setting must be an unsigned 32-bit integer", name);
++  uint64_t value = 0;
++  for (const char* p = text; *p; ++p) {
++    KJ_REQUIRE(*p >= '0' && *p <= '9', "GC setting must be an unsigned 32-bit integer", name);
++    value = value * 10 + uint64_t(*p - '0');
++    KJ_REQUIRE(value <= std::numeric_limits<uint32_t>::max(), "GC setting exceeds uint32", name);
++  }
++  return value;
++}
++
++GcSettings readSettings() {
++  GcSettings s;
++  s.budgetNs = setting("COWORKERD_GC_BUDGET_MS") * 1000000;
++  s.refillNsPerSecond = setting("COWORKERD_GC_REFILL_MS_PER_S") * 1000000;
++  s.longPauseNs = setting("COWORKERD_GC_LONG_PAUSE_MS") * 1000000;
++  s.idleCollectMs = static_cast<uint32_t>(setting("COWORKERD_IDLE_GC_MS"));
++  bool minGiven = false;
++  auto minMiB = setting("COWORKERD_IDLE_GC_MIN_MIB", &minGiven);
++  if (minGiven) s.idleCollectMinBytes = minMiB << 20;
++  s.staticHeapBytes = setting("COWORKERD_STATIC_HEAP_MIB") << 20;
++  return s;
++}
++
++uint64_t monotonicNs() {
++  timespec t;
++  KJ_REQUIRE(clock_gettime(CLOCK_MONOTONIC, &t) == 0);
++  return uint64_t(t.tv_sec) * 1000000000 + uint64_t(t.tv_nsec);
++}
++uint64_t unixMs() {
++  timespec t;
++  KJ_REQUIRE(clock_gettime(CLOCK_REALTIME, &t) == 0);
++  return uint64_t(t.tv_sec) * 1000 + uint64_t(t.tv_nsec) / 1000000;
++}
++
++constexpr uint32_t MAJOR = v8::kGCTypeMarkSweepCompact | v8::kGCTypeIncrementalMarking;
++constexpr uint32_t EXCLUDABLE = MAJOR | v8::kGCTypeProcessWeakCallbacks;
++
++const char* typeName(v8::GCType type) {
++  if (type & v8::kGCTypeMarkSweepCompact) return "mark-compact";
++  if (type & v8::kGCTypeIncrementalMarking) return "incremental-marking";
++  if (type & v8::kGCTypeProcessWeakCallbacks) return "weak-callbacks";
++  if (type & v8::kGCTypeMinorMarkSweep) return "minor-mark-sweep";
++  return "scavenge";
++}
++
++// The Worker an isolate belongs to: its name before the version. A dynamic isolate is named
++// "<namespace>:<workerId>@<versionId>#<content>#<definition>[#limits=...]" (the node's runtime bridge); any other
++// name is its own Worker.
++std::string workerKey(kj::StringPtr name) {
++  std::string text(name.cStr());
++  auto hash = text.find('#');
++  if (hash != std::string::npos) text.resize(hash);
++  auto at = text.rfind('@');
++  if (at != std::string::npos) text.resize(at);
++  return text;
++}
++
++// What a static isolate (the runtime) holds once a mark-compact is done: its working set.
++struct StaticHeap {
++  uint64_t majors = 0, liveAfterMajorBytes = 0, peakLiveAfterMajorBytes = 0, heapLimitBytes = 0;
++};
++
++// This process's collections. Counted on the isolates' thread (the GC callbacks) and read by the idle reaper on the
++// event loop; locked anyway, so that nothing depends on there being one such thread.
++struct ProcessGc {
++  uint64_t version = 0;
++  uint64_t majors = 0, minors = 0, weakCallbacks = 0;
++  uint64_t idleCollections = 0, idleSkippedBusy = 0, idleSkippedQueued = 0, idleSkippedGone = 0;
++  uint64_t longPauses = 0;
++  uint64_t longestPauseNs = 0;
++  std::string longestPauseIsolate, longestPauseType;
++  uint64_t firstMajorLongestNs = 0;
++  std::string firstMajorLongestIsolate;
++  uint64_t excludedNs = 0, chargedMajorNs = 0;
++  std::map<std::string, StaticHeap> statics;
++};
++kj::MutexGuarded<ProcessGc>& processGc() {
++  static kj::MutexGuarded<ProcessGc> value;
++  return value;
++}
++
++void writeRow(kj::StringPtr row) {
++  // As the CPU limit's rows: the log line with its prefix in one write, then the event pipe.
++  auto line = kj::str("[cpu-limit] ", row);
++  for (size_t done = 0; done < line.size();) {
++    auto n = write(STDERR_FILENO, line.cStr() + done, line.size() - done);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) break;
++    done += size_t(n);
++  }
++  writeLimitEvent(row);
++}
++
++}  // namespace
++
++const GcSettings& gcSettings() {
++  static const GcSettings settings = readSettings();
++  return settings;
++}
++
++#if __APPLE__
++uint64_t ThreadCpuClock::now() const {
++  thread_basic_info_data_t info;
++  mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++  KJ_REQUIRE(thread_info(thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) == KERN_SUCCESS);
++  return (uint64_t(info.user_time.seconds) + info.system_time.seconds) * 1000000000 +
++      (uint64_t(info.user_time.microseconds) + info.system_time.microseconds) * 1000;
++}
++#else
++ThreadCpuClock::ThreadCpuClock() { KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &clock) == 0); }
++uint64_t ThreadCpuClock::now() const {
++  timespec time;
++  KJ_REQUIRE(clock_gettime(clock, &time) == 0);
++  return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
++}
++#endif
++
++// A Worker's budget of excludable GC CPU in this process: a token bucket of the burst, refilled by wall time. Used on
++// the isolates' thread only.
++class GcBudget {
++ public:
++  explicit GcBudget(uint64_t now): tokens(double(gcSettings().budgetNs)), updated(now) {}
++  // The tokens now: refilled by the wall time since the last touch, at most the burst.
++  uint64_t refill(uint64_t now) {
++    const auto& s = gcSettings();
++    if (now > updated) {
++      tokens = std::min(double(s.budgetNs), tokens + double(now - updated) / 1e9 * double(s.refillNsPerSecond));
++      updated = now;
++    }
++    return uint64_t(tokens);
++  }
++  // Spends what a collection of `cpu` may exclude; returns that much.
++  uint64_t spend(uint64_t cpu) {
++    auto excluded = std::min(cpu, uint64_t(tokens));
++    tokens -= double(excluded);
++    return excluded;
++  }
++  bool full(uint64_t now) { return refill(now) >= gcSettings().budgetNs; }
++
++ private:
++  double tokens;
++  uint64_t updated;
++};
++
++namespace {
++// Every Worker's budget in this process, kept while an isolate of the Worker holds it and until it is full again (from
++// then on it is the same as a new one), so that a new isolate of the Worker goes on with the old one's.
++std::shared_ptr<GcBudget> budgetFor(kj::StringPtr isolateName) {
++  static kj::MutexGuarded<std::map<std::string, std::shared_ptr<GcBudget>>> budgets;
++  auto now = monotonicNs();
++  auto lock = budgets.lockExclusive();
++  std::erase_if(*lock, [now](auto& entry) { return entry.second.use_count() == 1 && entry.second->full(now); });
++  auto key = workerKey(isolateName);
++  auto found = lock->find(key);
++  if (found != lock->end()) return found->second;
++  auto made = std::make_shared<GcBudget>(now);
++  lock->emplace(kj::mv(key), made);
++  return made;
++}
++}  // namespace
++
++IsolateGc::IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs)
++    : name(kj::str(name)), dynamic(dynamic), cpuLimitNs(cpuLimitNs) {
++  if (dynamic && cpuLimitNs && gcSettings().excludes()) budget = budgetFor(name);
++}
++IsolateGc::~IsolateGc() noexcept(false) {}
++
++void IsolateGc::install(v8::Isolate* value) {
++  isolate = value;
++  clock = kj::heap<ThreadCpuClock>();
++  value->AddGCPrologueCallback(&IsolateGc::prologue, this, v8::kGCTypeAll);
++  value->AddGCEpilogueCallback(&IsolateGc::epilogue, this, v8::kGCTypeAll);
++  if (dynamic && gcSettings().idleCollectMs) oldUsed = oldAfterMajor = oldGenerationBytes();
++}
++
++void IsolateGc::prologue(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* data) {
++  static_cast<IsolateGc*>(data)->began(type);
++}
++void IsolateGc::epilogue(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* data) {
++  static_cast<IsolateGc*>(data)->ended(type);
++}
++
++void IsolateGc::began(v8::GCType value) {
++  // A collection inside another one (the weak callbacks of a mark-compact) is part of it.
++  if (depth++ > 0) return;
++  type = value;
++  startCpu = KJ_ASSERT_NONNULL(clock)->now();
++  startMono = monotonicNs();
++  startedInside = inside;
++  startedExcludable = false;
++  if (startedInside && budget && (type & EXCLUDABLE)) {
++    excludableBudgetNs.store(budget->refill(startMono), std::memory_order_release);
++    excludableStartCpu.store(startCpu ? startCpu : 1, std::memory_order_release);
++    startedExcludable = true;
++  }
++}
++
++void IsolateGc::ended(v8::GCType) {
++  if (depth == 0 || --depth > 0) return;
++  auto cpuNow = KJ_ASSERT_NONNULL(clock)->now();
++  const uint64_t cpu = cpuNow > startCpu ? cpuNow - startCpu : 0;
++  const uint64_t pause = monotonicNs() - startMono;
++  uint64_t excluded = 0, left = 0;
++  if (startedExcludable) {
++    excluded = budget->spend(cpu);
++    left = budget->refill(startMono);
++    excludedNs.fetch_add(excluded, std::memory_order_acq_rel);
++    excludableStartCpu.store(0, std::memory_order_release);
++  }
++  const bool major = (type & MAJOR) != 0;
++  if (major) ++majors;
++  const auto& settings = gcSettings();
++  if (dynamic && settings.idleCollectMs) {
++    oldUsed = oldGenerationBytes();
++    if (major) oldAfterMajor = oldUsed;
++  }
++  uint64_t live = 0, limit = 0;
++  if (!dynamic && major) {
++    v8::HeapStatistics stats;
++    isolate->GetHeapStatistics(&stats);
++    live = stats.used_heap_size();
++    limit = stats.heap_size_limit();
++    if (auto* cpp = isolate->GetCppHeap()) {
++      live += cpp->CollectStatistics(cppgc::HeapStatistics::DetailLevel::kBrief).used_size_bytes;
++    }
++  }
++  const bool longPause = settings.longPauseNs && pause >= settings.longPauseNs;
++  {
++    auto lock = processGc().lockExclusive();
++    auto& p = *lock;
++    ++p.version;
++    if (major) ++p.majors;
++    else if (type & v8::kGCTypeProcessWeakCallbacks) ++p.weakCallbacks;
++    else ++p.minors;
++    p.excludedNs += excluded;
++    if (startedInside && (type & EXCLUDABLE)) p.chargedMajorNs += cpu - excluded;
++    if (longPause) ++p.longPauses;
++    if (pause > p.longestPauseNs) {
++      p.longestPauseNs = pause;
++      p.longestPauseIsolate = name.cStr();
++      p.longestPauseType = typeName(type);
++    }
++    if (major && majors == 1 && pause > p.firstMajorLongestNs) {
++      p.firstMajorLongestNs = pause;
++      p.firstMajorLongestIsolate = name.cStr();
++    }
++    if (!dynamic && major) {
++      auto& heap = p.statics[name.cStr()];
++      ++heap.majors;
++      heap.liveAfterMajorBytes = live;
++      heap.peakLiveAfterMajorBytes = std::max(heap.peakLiveAfterMajorBytes, live);
++      heap.heapLimitBytes = limit;
++    }
++  }
++  if (longPause) {
++    writeRow(kj::str("{\"event\":\"gc-pause\",\"isolate\":", escapeCpuJsonString(name), ',',
++        startedInside ? identity : kj::StringPtr(""), "\"cpuUsedNs\":", cpu, ",\"cpuLimitMs\":", cpuLimitNs / 1000000,
++        ",\"pid\":", coworkerdPid(), ",\"gcType\":\"", typeName(type), "\",\"pauseNs\":", pause,
++        ",\"gcExcludedNs\":", excluded, ",\"gcBudgetNs\":", left, ",\"inRequest\":", startedInside ? "true" : "false",
++        ",\"idleCollection\":", idle ? "true" : "false", ",\"majorOrdinal\":", major ? majors : 0,
++        ",\"observedAtUnixMs\":", unixMs(), "}\n"));
++  }
++}
++
++// The old generation of the unified heap: V8's spaces but the young ones, and cppgc's objects (the jsg wrappers' C++
++// side, which a full collection of the V8 heap collects too and whose growth alone can trigger one).
++size_t IsolateGc::oldGenerationBytes() const {
++  size_t total = 0;
++  auto spaces = isolate->NumberOfHeapSpaces();
++  for (size_t i = 0; i < spaces; ++i) {
++    v8::HeapSpaceStatistics space;
++    if (!isolate->GetHeapSpaceStatistics(&space, i)) continue;
++    kj::StringPtr spaceName = space.space_name();
++    if (spaceName == "new_space" || spaceName == "new_large_object_space") continue;
++    total += space.space_used_size();
++  }
++  if (auto* cpp = isolate->GetCppHeap()) {
++    total += cpp->CollectStatistics(cppgc::HeapStatistics::DetailLevel::kBrief).used_size_bytes;
++  }
++  return total;
++}
++
++void IsolateGc::measureOld() {
++  // At most every few milliseconds: a request's entries come in bursts, and the collections measure it anyway.
++  if (!dynamic || !isolate || !gcSettings().idleCollectMs) return;
++  auto now = monotonicNs();
++  if (now - lastMeasured < 5000000) return;
++  lastMeasured = now;
++  oldUsed = oldGenerationBytes();
++}
++
++void IsolateGc::collectIdle(v8::Isolate* value) {
++  idle = true;
++  KJ_DEFER(idle = false);
++  value->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
++}
++
++IsolateGc::Entry::Entry(IsolateGc* gc, kj::StringPtr identity): gc(gc) {
++  if (!gc) return;
++  base = gc->excludedNs.load(std::memory_order_acquire);
++  previousIdentity = gc->identity;
++  previousInside = gc->inside;
++  gc->identity = identity;
++  gc->inside = true;
++}
++IsolateGc::Entry::~Entry() noexcept(false) {
++  if (!gc) return;
++  gc->identity = previousIdentity;
++  gc->inside = previousInside;
++}
++uint64_t IsolateGc::Entry::excluded(uint64_t entryStartCpu, uint64_t cpuNow) const {
++  if (!gc || !gc->budget) return 0;
++  auto inGc = gc->excludableStartCpu.load(std::memory_order_acquire);
++  auto inGcBudget = gc->excludableBudgetNs.load(std::memory_order_acquire);
++  uint64_t total = gc->excludedNs.load(std::memory_order_acquire) - base;
++  if (inGc && cpuNow > inGc) total += std::min(cpuNow - inGc, inGcBudget);
++  return std::min(total, cpuNow > entryStartCpu ? cpuNow - entryStartCpu : uint64_t(0));
++}
++
++kj::Promise<IdleCollection> collectIdleIsolate(
++    kj::Own<const Worker> worker, std::shared_ptr<IsolateGc> gc, kj::Function<bool()> stillIdle) {
++  auto asyncLock = co_await worker->takeAsyncLockWithoutRequest(nullptr);
++  if (!stillIdle()) co_return IdleCollection::BUSY;
++  worker->runInLockScope(asyncLock, [&](Worker::Lock& lock) { gc->collectIdle(lock.getIsolate()); });
++  co_return IdleCollection::COLLECTED;
++}
++
++void countIdleCollection(IdleCollection outcome, bool skippedQueued) {
++  auto lock = processGc().lockExclusive();
++  ++lock->version;
++  if (skippedQueued) ++lock->idleSkippedQueued;
++  else if (outcome == IdleCollection::COLLECTED) ++lock->idleCollections;
++  else if (outcome == IdleCollection::BUSY) ++lock->idleSkippedBusy;
++  else ++lock->idleSkippedGone;
++}
++
++uint64_t processGcVersion() { return processGc().lockShared()->version; }
++
++kj::String processGcJson() {
++  const auto& s = gcSettings();
++  auto lock = processGc().lockShared();
++  const auto& p = *lock;
++  kj::Vector<kj::String> statics;
++  for (const auto& [isolateName, heap]: p.statics) {
++    statics.add(kj::str("{\"isolate\":", escapeCpuJsonString(isolateName.c_str()), ",\"majors\":", heap.majors,
++        ",\"liveAfterMajorBytes\":", heap.liveAfterMajorBytes, ",\"peakLiveAfterMajorBytes\":",
++        heap.peakLiveAfterMajorBytes, ",\"heapLimitBytes\":", heap.heapLimitBytes, "}"));
++  }
++  return kj::str(",\"gc\":{\"majorCollections\":", p.majors, ",\"minorCollections\":", p.minors,
++      ",\"weakCallbacks\":", p.weakCallbacks, ",\"idleCollections\":", p.idleCollections,
++      ",\"idleSkippedBusy\":", p.idleSkippedBusy, ",\"idleSkippedQueued\":", p.idleSkippedQueued,
++      ",\"idleSkippedGone\":", p.idleSkippedGone, ",\"longPauses\":", p.longPauses,
++      ",\"longPauseMs\":", s.longPauseNs / 1000000, ",\"longestPauseNs\":", p.longestPauseNs,
++      ",\"longestPauseIsolate\":", escapeCpuJsonString(p.longestPauseIsolate.c_str()),
++      ",\"longestPauseType\":", escapeCpuJsonString(p.longestPauseType.c_str()),
++      ",\"firstMajorLongestNs\":", p.firstMajorLongestNs,
++      ",\"firstMajorLongestIsolate\":", escapeCpuJsonString(p.firstMajorLongestIsolate.c_str()),
++      ",\"excludedNs\":", p.excludedNs, ",\"chargedMajorNs\":", p.chargedMajorNs,
++      ",\"budgetMs\":", s.budgetNs / 1000000, ",\"refillMsPerSecond\":", s.refillNsPerSecond / 1000000,
++      ",\"idleCollectMs\":", s.idleCollectMs, ",\"idleCollectMinBytes\":", s.idleCollectMinBytes,
++      ",\"staticHeapBytes\":", s.staticHeapBytes, ",\"static\":[", kj::strArray(statics, ","), "]}");
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/coworkerd-gc.h b/src/workerd/server/coworkerd-gc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..615197157d31ef48a4df3be736c50176836bd80a
+--- /dev/null
++++ b/src/workerd/server/coworkerd-gc.h
+@@ -0,0 +1,166 @@
++#pragma once
++// Coworkerd: V8's garbage collection under the CPU limit. A major GC -- one atomic mark-compact of the V8 heap and
++// cppgc together, most of it the destruction of dead jsg wrappers -- runs inside the request whose allocation
++// triggered it, and the CPU limit used to charge all of it to that request: the request was terminated, and its
++// isolate with it, although its own JavaScript had used a few milliseconds. Here, each part enabled by the
++// environment the node gives workerd (read once per process; without it nothing changes):
++//
++//   COWORKERD_GC_BUDGET_MS, COWORKERD_GC_REFILL_MS_PER_S
++//       The thread CPU of a major GC that runs inside a JS entry is not charged to the entry, up to a token bucket
++//       per Worker of that many milliseconds, refilled at that rate of wall time; beyond it the GC is charged as
++//       before. The bucket is the Worker's (the isolate name before its version), not the isolate's, so an isolate
++//       the limit revoked does not come back with a full one. 0: every GC is charged (as before).
++//   COWORKERD_GC_LONG_PAUSE_MS
++//       A collection whose pause reaches this writes one row, event gc-pause, where the CPU limit writes its rows
++//       (the log's [cpu-limit] lines and the limit event pipe): which isolate, how long, in whose request, what kind.
++//   COWORKERD_IDLE_GC_MS, COWORKERD_IDLE_GC_MIN_MIB
++//       The idle reaper collects a dynamic isolate between requests once it has been idle that long and its old
++//       generation grew that much since its last mark-compact (coworkerd-idle-eviction.c++).
++//   COWORKERD_STATIC_HEAP_MIB
++//       The heap constraint of the static isolates (the runtime), which V8 otherwise sizes from the machine.
++#include <kj/async.h>
++#include <kj/function.h>
++#include <kj/string.h>
++#include <v8-callbacks.h>
++#include <v8-isolate.h>
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <pthread.h>
++#include <time.h>
++#if __APPLE__
++#include <mach/mach.h>
++#endif
++
++namespace workerd {
++class Worker;
++}
++
++namespace workerd::server {
++
++struct GcSettings {
++  uint64_t budgetNs = 0, refillNsPerSecond = 0;
++  uint64_t longPauseNs = 0;
++  uint32_t idleCollectMs = 0;
++  uint64_t idleCollectMinBytes = 4ull << 20;
++  uint64_t staticHeapBytes = 0;
++  bool excludes() const { return budgetNs != 0; }
++  // Whether the isolates need the GC callbacks at all.
++  bool observes() const { return excludes() || longPauseNs != 0 || idleCollectMs != 0; }
++};
++const GcSettings& gcSettings();
++
++// A thread's CPU time, created on that thread and readable from any other (the limit watchdog reads the isolate
++// thread's).
++struct ThreadCpuClock {
++#if __APPLE__
++  mach_port_t thread = mach_thread_self();
++  ThreadCpuClock() = default;
++  ThreadCpuClock(const ThreadCpuClock&) = delete;
++  ~ThreadCpuClock() { mach_port_deallocate(mach_task_self(), thread); }
++  uint64_t now() const;
++#else
++  clockid_t clock;
++  ThreadCpuClock();
++  ThreadCpuClock(const ThreadCpuClock&) = delete;
++  uint64_t now() const;
++#endif
++};
++
++// A Worker's GC budget in this process (coworkerd-gc.c++).
++class GcBudget;
++
++// What one idle collection came to (coworkerd-idle-eviction.c++ counts them).
++enum class IdleCollection { COLLECTED, BUSY, GONE };
++
++// One isolate's collections: its GC callbacks, its CPU limit's entries and the idle reaper on the isolate's thread,
++// and the limit watchdog on its own thread (the atomics). Owned by the isolate's limit enforcer, which outlives the
++// V8 isolate (Worker::Isolate destroys its API, and with it the V8 isolate, before its limit enforcer), so the
++// callbacks are never removed: they end with the isolate.
++class IsolateGc {
++ public:
++  IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs);
++  ~IsolateGc() noexcept(false);
++  IsolateGc(const IsolateGc&) = delete;
++
++  // On the isolate's thread, once, before any JavaScript: the callbacks, and the clock the exclusion reads.
++  void install(v8::Isolate* isolate);
++
++  // A JS entry of this isolate (the CPU limit's scope) for as long as it runs: the collections that happen meanwhile
++  // run inside it, in the request `identity` names (the CPU limit's identity fragment; empty outside a request).
++  class Entry {
++   public:
++    Entry(IsolateGc* gc, kj::StringPtr identity);
++    ~Entry() noexcept(false);
++    Entry(const Entry&) = delete;
++    // The excluded GC CPU since this entry began: collections finished meanwhile and the one in progress (at most what
++    // its Worker's budget held when it began), never more than the entry's own CPU. Read on the watchdog thread with
++    // its registry locked, and on the isolate's thread when the entry ends. The in-progress start is read before the
++    // total, so a collection that ends in between may be counted twice (a late termination), never missed (an early one).
++    uint64_t excluded(uint64_t entryStartCpu, uint64_t cpuNow) const;
++
++   private:
++    IsolateGc* gc;
++    uint64_t base = 0;
++    kj::StringPtr previousIdentity;
++    bool previousInside = false;
++  };
++
++  // The idle reaper's view: whether the old generation grew enough since the last mark-compact to be worth a
++  // collection, and by how much.
++  uint64_t oldGrowth() const { return oldUsed > oldAfterMajor ? oldUsed - oldAfterMajor : 0; }
++  uint64_t majorCollections() const { return majors; }
++  // A full collection of this isolate between requests (fix B): with the isolate locked on its own thread, V8 collects
++  // synchronously -- a full GC that reduces the footprint, then another while that keeps freeing much.
++  void collectIdle(v8::Isolate* isolate);
++  // The isolate's old generation, measured again (at the end of a JS entry: what an allocation in old space added).
++  void measureOld();
++
++  kj::StringPtr getName() const { return name; }
++  bool isDynamic() const { return dynamic; }
++
++ private:
++  static void prologue(v8::Isolate* isolate, v8::GCType type, v8::GCCallbackFlags flags, void* data);
++  static void epilogue(v8::Isolate* isolate, v8::GCType type, v8::GCCallbackFlags flags, void* data);
++  void began(v8::GCType type);
++  void ended(v8::GCType type);
++  size_t oldGenerationBytes() const;
++
++  const kj::String name;
++  const bool dynamic;
++  const uint64_t cpuLimitNs;
++  std::shared_ptr<GcBudget> budget;  // dynamic isolates while the exclusion is on
++  v8::Isolate* isolate = nullptr;
++  kj::Maybe<kj::Own<ThreadCpuClock>> clock;
++
++  // The isolate's thread only.
++  uint32_t depth = 0;
++  v8::GCType type = v8::kGCTypeScavenge;
++  uint64_t startCpu = 0, startMono = 0;
++  bool startedInside = false, startedExcludable = false, idle = false;
++  bool inside = false;
++  kj::StringPtr identity;
++  uint64_t majors = 0;
++  // The old generation of the unified heap (V8's old spaces and cppgc's objects): at the last measurement, and right
++  // after the last full collection.
++  uint64_t oldUsed = 0, oldAfterMajor = 0, lastMeasured = 0;
++
++  // Shared with the limit watchdog.
++  std::atomic<uint64_t> excludableStartCpu{0};  // nonzero while an excludable collection runs: its start
++  std::atomic<uint64_t> excludableBudgetNs{0};  // what its Worker's budget held when it began
++  std::atomic<uint64_t> excludedNs{0};          // excluded GC CPU since this isolate began
++};
++
++// Fix B's collection, from the idle reaper: the Worker's async lock, then -- unless `stillIdle` says a request came
++// meanwhile -- one collectIdle() under it.
++kj::Promise<IdleCollection> collectIdleIsolate(
++    kj::Own<const Worker> worker, std::shared_ptr<IsolateGc> gc, kj::Function<bool()> stillIdle);
++
++// This process's collections as one JSON object member, ,"gc":{...}, for the lifecycle snapshot (the node's state
++// endpoint shows it per process); and a number that changes whenever it does.
++kj::String processGcJson();
++uint64_t processGcVersion();
++// The idle reaper's outcomes, counted with the rest.
++void countIdleCollection(IdleCollection outcome, bool skippedQueued);
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/coworkerd-idle-eviction.c++ b/src/workerd/server/coworkerd-idle-eviction.c++
+index 9634e50d49a93551ba3bfeff6f41c8456fa09d94..616caf7d68e40ff959ffbaecaf6232d3ddf7b259 100644
+--- a/src/workerd/server/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/coworkerd-idle-eviction.c++
+@@ -1,5 +1,6 @@
+ #include "coworkerd-idle-eviction.h"
+ #include "coworkerd-cpu-limit.h"
++#include "coworkerd-gc.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
+@@ -135,6 +136,11 @@ struct IdleWorker {
+   double lastEnd = monotonicMs(), loadStart = lastEnd, teardownStart = 0;
+   uint64_t loadCpu = cpuNs();
+   kj::String reason = kj::str("");
++  // Its collections and its collector (fix B); the actor events it received and their last time.
++  std::shared_ptr<IsolateGc> gc;
++  kj::Maybe<IdleCollector> collect;
++  uint64_t actorEvents = 0, idleCollections = 0;
++  double lastActorEvent = 0;
+   IdleWorker(std::shared_ptr<IdleReaper> owner, kj::StringPtr name,
+       kj::Function<void()> remove, uint64_t id)
+       : owner(owner), name(kj::str(name)), remove(kj::mv(remove)), id(id) {}
+@@ -148,7 +154,8 @@ class IdleReaper {
+     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
+     publishedBand = inheritedBand();
+     publish();
+-    if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
++    if (threshold || publishedBand || gcSettings().observes()) task = loop().eagerlyEvaluate(nullptr);
++    if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
+   }
+   kj::Timer& timer;
+   uint32_t threshold, interval;
+@@ -160,7 +167,8 @@ class IdleReaper {
+   uint32_t effectiveThreshold() const { return band == 2 ? 1000 : band == 1 ? 5000 : threshold; }
+   double lastDestroy = 0;
+   std::list<std::weak_ptr<IdleWorker>> workers;
+-  kj::Promise<void> task = nullptr;
++  kj::Promise<void> task = nullptr, collectTask = nullptr;
++  uint64_t publishedGc = 0;
+ 
+   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
+     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
+@@ -170,7 +178,8 @@ class IdleReaper {
+         ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
+         ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
+         ",\"memoryBand\":" , band, ",\"effectiveIdleEvictMs\":" , effectiveThreshold(),
+-        ",\"idleDestroyIntervalMs\":", interval, "}"));
++        ",\"idleDestroyIntervalMs\":", interval, ",\"actorEvents\":", worker.actorEvents,
++        ",\"idleCollections\":", worker.idleCollections, "}"));
+   }
+   void publish() {
+     auto& channel = lifecycleChannel();
+@@ -190,7 +199,9 @@ class IdleReaper {
+         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
+         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
++        gcSettings().observes() ? processGcJson() : kj::str(""),
+         ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
++    if (gcSettings().observes()) publishedGc = processGcVersion();
+     if (!channel.publish(row) && !overflowReported) {
+       overflowReported = true;
+       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
+@@ -198,6 +209,71 @@ class IdleReaper {
+   }
+   bool overflowReported = false;
+  private:
++  // The isolate fix B collects next: idle for the threshold, not hosting actors, its old generation grown the most since
++  // its last full collection and by at least the minimum. `responsiveSince` is when the event loop last came out of a stall:
++  // idle time counts from there too. `deferred` says a candidate was due by its own idle time but the loop has not been
++  // free that long.
++  IdleWorkerRef idleCandidate(double now, double responsiveSince, bool& deferred) {
++    const auto& settings = gcSettings();
++    IdleWorkerRef best;
++    uint64_t bestGrowth = 0;
++    for (auto& entry: workers) {
++      auto worker = entry.lock();
++      if (!worker || !worker->gc || worker->collect == kj::none || !worker->ready || !worker->created ||
++          worker->removed || worker->destroyed || worker->active || worker->actorEvents ||
++          now - worker->lastEnd < settings.idleCollectMs) continue;
++      auto growth = worker->gc->oldGrowth();
++      if (growth && growth >= settings.idleCollectMinBytes && growth > bestGrowth) { best = worker; bestGrowth = growth; }
++    }
++    deferred = best && now - responsiveSince < settings.idleCollectMs;
++    return deferred ? IdleWorkerRef() : best;
++  }
++  // Fix B (coworkerd-gc.h): one isolate at a time, collected between its requests. Idle is not only a matter of the
++  // isolate's clock: while the event loop is busy -- running another isolate's request, or paused by a collection -- the
++  // requests that arrive meanwhile wait unread, and the isolate looks idle because its own next request is among them; a
++  // collection then would lengthen the wait rather than use idle time. The loop's own ticks tell: one that comes more
++  // than STALL_MS late ends a stall, and the isolate must also have been idle that long since then. Before collecting, what
++  // is already queued on the event loop runs first (until it would sleep, waiting no longer than the idle threshold), and
++  // the isolate must still be idle when its lock is taken.
++  static constexpr double STALL_MS = 10;
++  kj::Promise<void> collectLoop() {
++    const auto& settings = gcSettings();
++    const auto tick = std::clamp(interval, 10u, 100u);
++    double responsiveSince = monotonicMs();
++    while (true) {
++      const auto expected = monotonicMs() + tick;
++      co_await timer.afterDelay(tick * kj::MILLISECONDS);
++      const auto now = monotonicMs();
++      if (now - expected > STALL_MS) responsiveSince = now;
++      bool deferred = false;
++      auto candidate = idleCandidate(now, responsiveSince, deferred);
++      if (deferred) countIdleCollection(IdleCollection::BUSY, true);
++      if (!candidate) continue;
++      bool quiet = co_await kj::yieldUntilWouldSleep().then([]() { return true; }).exclusiveJoin(
++          timer.afterDelay(settings.idleCollectMs * kj::MILLISECONDS).then([]() { return false; }));
++      auto lastEnd = candidate->lastEnd;
++      auto stillIdle = [candidate, lastEnd]() {
++        return !candidate->active && candidate->lastEnd == lastEnd && !candidate->removed && !candidate->destroyed;
++      };
++      if (!quiet || !stillIdle()) {
++        countIdleCollection(IdleCollection::BUSY, true);
++        continue;
++      }
++      kj::Maybe<kj::Promise<IdleCollection>> started;
++      KJ_IF_SOME(collect, candidate->collect) { started = collect(candidate->gc, kj::mv(stillIdle)); }
++      auto outcome = IdleCollection::GONE;
++      KJ_IF_SOME(promise, started) {
++        try {
++          outcome = co_await kj::mv(promise);
++        } catch (kj::Exception& error) {
++          emit(kj::str("{\"event\":\"idle-collection-failed\",\"isolate\":", escapeCpuJsonString(candidate->name),
++              ",\"pid\":", coworkerdPid(), ",\"reason\":", escapeCpuJsonString(error.getDescription()), "}"));
++        }
++      }
++      if (outcome == IdleCollection::COLLECTED) ++candidate->idleCollections;
++      countIdleCollection(outcome, false);
++    }
++  }
+   kj::Promise<void> loop() {
+     while (true) {
+       co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
+@@ -207,7 +283,12 @@ class IdleReaper {
+         bandReadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start).count();
+         ++bandReads;
+-        if (monotonicMs() - lastPublish >= 1000) { publish(); lastPublish = monotonicMs(); }
++      }
++      // At most once a second: for the band, and for the collections when they changed.
++      if (monotonicMs() - lastPublish >= 1000 &&
++          (publishedBand || (gcSettings().observes() && processGcVersion() != publishedGc))) {
++        publish();
++        lastPublish = monotonicMs();
+       }
+       auto minimum = effectiveThreshold();
+       if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
+@@ -267,7 +348,20 @@ void idleWorkerFailed(const IdleWorkerRef& worker) {
+     idleWorkerRemoved(worker, "load-failed"); remove();
+   }
+ }
+-void detachIdleWorker(const IdleWorkerRef& worker) { if (worker) worker->remove = kj::none; }
++void detachIdleWorker(const IdleWorkerRef& worker) {
++  if (worker) { worker->remove = kj::none; worker->collect = kj::none; }
++}
++void idleWorkerSetGc(const IdleWorkerRef& worker, std::shared_ptr<IsolateGc> gc) { if (worker) worker->gc = kj::mv(gc); }
++void idleWorkerSetCollector(const IdleWorkerRef& worker, IdleCollector collect) {
++  if (worker) worker->collect = kj::mv(collect);
++}
++void idleWorkerActorEvent(const IdleWorkerRef& worker) {
++  if (!worker) return;
++  ++worker->actorEvents;
++  // An actor's events never pass through the isolate's entry (activity()), so its last one counts as its last use: the
++  // reaper does not evict an isolate whose actors are still receiving events.
++  worker->lastActorEvent = worker->lastEnd = monotonicMs();
++}
+ 
+ namespace {
+ struct Activity {
+diff --git a/src/workerd/server/coworkerd-idle-eviction.h b/src/workerd/server/coworkerd-idle-eviction.h
+index 0c5c3967f777d0c248d1491d21ca33f97793dbff..ba938ebade3a478344f816cee7eadcbd23a0e027 100644
+--- a/src/workerd/server/coworkerd-idle-eviction.h
++++ b/src/workerd/server/coworkerd-idle-eviction.h
+@@ -19,6 +19,20 @@ void idleWorkerReady(const IdleWorkerRef& worker);
+ void idleWorkerFailed(const IdleWorkerRef& worker);
+ void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason);
+ void detachIdleWorker(const IdleWorkerRef& worker);
++// The isolate's collections (coworkerd-gc.h), and how to collect it between requests (fix B): the collector returns
++// none once the isolate's service is gone. The reaper collects with it only while the environment asks for idle
++// collection.
++class IsolateGc;
++enum class IdleCollection;
++using IdleCollector = kj::Function<kj::Maybe<kj::Promise<IdleCollection>>(
++    std::shared_ptr<IsolateGc> gc, kj::Function<bool()> stillIdle)>;
++void idleWorkerSetGc(const IdleWorkerRef& worker, std::shared_ptr<IsolateGc> gc);
++void idleWorkerSetCollector(const IdleWorkerRef& worker, IdleCollector collect);
++// A new event delivered to an actor of this isolate (the CPU limit's topUpActor()): the reaper sees an actor's events
++// here, which never pass through the isolate's entry the way a request does -- each counts as the isolate's last use, so
++// it is not evicted as idle while its actors receive events. An isolate that hosts actors is not collected between
++// requests: that decision belongs with the Durable Objects' process group.
++void idleWorkerActorEvent(const IdleWorkerRef& worker);
+ kj::Own<void> idleActivity(const IdleWorkerRef& worker);
+ kj::Own<IsolateObserver> idleIsolateObserver(kj::StringPtr name,
+     bool dynamic, IdleWorkerRef worker);
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 2b94d22e581c697d95ca0384b1079eb5b4e11fcf..3bc7c68ddadf3fade22cc8d96c152f82e5395f46 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -7,6 +7,7 @@
+ #include "alarm-scheduler.h"
+ #include "container-client.h"
+ #include "coworkerd-cpu-limit.h"
++#include "coworkerd-gc.h"
+ #include "coworkerd-steady.h"
+ #include "pyodide.h"
+ #include "workerd-api.h"
+@@ -3563,6 +3564,9 @@ class Server::WorkerService final: public Service,
+         abortIsolateCallback(kj::mv(abortIsolateCallback)),
+         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
+ 
++  // A strong reference to this service's Worker: an idle collection holds it while it waits for the Worker's lock.
++  kj::Own<const Worker> workerRef() { return kj::atomicAddRef(*worker); }
++
+   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
+   // the constructor itself since it sets up cyclic references, which will throw an exception if
+   // done during the constructor.
+@@ -4140,7 +4144,7 @@ class Server::WorkerService final: public Service,
+         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+         *cpuLimits, metadata.cfBlobJson, [this]() {
+           KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
+-        });
++        }, actor != kj::none);
+     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+         kj::mv(props), kj::mv(actor),
+         kj::mv(requestLimits),
+@@ -5636,6 +5640,18 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
+ 
+       this->service = kj::mv(service);
+       idleWorkerReady(idleWorker);
++      // The idle reaper may collect this isolate between requests (coworkerd-gc.h). The stub detaches the collector
++      // when it is destroyed; a collection in progress holds the Worker itself.
++      if (gcSettings().idleCollectMs) {
++        idleWorkerSetCollector(idleWorker,
++            [this](std::shared_ptr<IsolateGc> gc,
++                kj::Function<bool()> stillIdle) -> kj::Maybe<kj::Promise<IdleCollection>> {
++          KJ_IF_SOME(s, this->service) {
++            return collectIdleIsolate(s->workerRef(), kj::mv(gc), kj::mv(stillIdle));
++          }
++          return kj::none;
++        });
++      }
+     }
+ 
+     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {

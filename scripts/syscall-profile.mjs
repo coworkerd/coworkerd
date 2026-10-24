@@ -16,8 +16,9 @@
 //           apis (the APIs that hand native bytes to JS); binding (a service binding call: the runtime calls
 //           back over binding.sock); cpu-limit (an infinite loop the CPU limit ends); memory-limit (an
 //           over-limit ArrayBuffer refused); oom (a Wasm allocation: V8's fatal OOM, the exit, the next
-//           generation's startup); after-oom; rotation (every slot rotated: a generation change); then
-//           the Server's SIGTERM (the exit)
+//           generation's startup); after-oom; idle-gc (a Worker's old generation grown by a few MiB, then left
+//           idle: the node's idle collection between requests); rotation (every slot rotated: a generation
+//           change); then the Server's SIGTERM (the exit)
 //     idle  idle eviction at 2 s: an isolate removed, destroyed and recreated
 // Environment: V45_BIN (the binaries to profile), V45_STACK, V45_MACHINE (names kept from the tool's first version).
 import { chmod, mkdir, readdir } from "node:fs/promises";
@@ -89,7 +90,8 @@ try {
   if (run === "main") {
     const workers = { ordinary: w.ordinary, "bytes-heavy": w.bytesHeavy, probe: w.sandboxProbe, "cpu-tenant": w.cpuTenant,
       "mem-ab": w.memoryTenant("mem-ab", ["arraybuffer"]), "mem-wasm": w.memoryTenant("mem-wasm", ["wasm"]),
-      caller: { source: w.bindingCaller, bindings: [{ name: "TARGET", workerId: "callee" }] }, callee: w.bindingCallee };
+      caller: { source: w.bindingCaller, bindings: [{ name: "TARGET", workerId: "callee" }] }, callee: w.bindingCallee,
+      "gc-tenant": w.gcTenant };
     for (const id of w.isolateIds(20)) workers[id] = w.ordinary;
     Object.assign(data, await h.setup({ sandbox: "off", workers, env: environment, trace: true,
       workerdPath: `${h.REPO}/scripts/syscall-trace-wrapper.sh` }));
@@ -113,6 +115,17 @@ try {
       return { status: r.status, body: (r.body ?? r.error ?? "").slice(0, 300) };
     });
     await window("after-oom", () => repeat("/ordinary", 5));
+    // The idle collection: requests that each leave 2 MiB more in the old generation, then idle time; the
+    // process reports its idle collections in its lifecycle snapshot (gc.idleCollections).
+    await window("idle-gc", async () => {
+      const idleCollections = async () => (await h.state()).processes.entries
+        .reduce((sum, e) => sum + (e.gc?.generation?.idleCollections ?? 0), 0);
+      const before = await idleCollections();
+      const statuses = [];
+      for (let n = 0; n < 6; n++) { statuses.push((await h.request("/gc-tenant?keep=2")).status); await h.delay(300); }
+      const waited = await h.waitFor(async () => (await idleCollections()) > before, "an idle collection", 15000, 200);
+      return { statuses, idleCollectionsBefore: before, idleCollectionsAfter: await idleCollections(), waitedMs: waited.elapsedMs };
+    });
     // The generation change: every slot rotated, each slot's next generation starting while requests run.
     await window("rotation", async () => {
       const before = await h.state();

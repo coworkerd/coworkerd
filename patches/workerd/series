@@ -7,3 +7,4 @@
 0007-resident-watchdog.patch
 0008-fd-channels.patch
 0010-steady-and-worker-limits.patch
+0011-gc-pauses.patch

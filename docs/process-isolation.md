@@ -20,7 +20,8 @@ So each mechanism handles what the one before it cannot:
 | A single allocation too large to stop | V8 aborts the process; workerd writes the culprit first |
 | A tenant does it again | The tenant becomes a suspect and runs only in quarantine processes for a while |
 | Idle isolates hold memory | Idle eviction, earlier and faster under the memory watermark |
-| A process's memory keeps growing | Process rotation replaces it with a new generation |
+| A long-lived isolate's garbage collection runs inside a request | Its CPU is not charged to the request, within its Worker's budget; idle isolates are collected between requests |
+| A process's memory keeps growing | Process rotation replaces it with a new generation at a memory threshold |
 | Tenant code attacks the host | The launcher's namespaces, no capabilities and the system call allowlist |
 
 ## 2. The process pool
@@ -49,6 +50,16 @@ A probe that fails at once (a reset connection) does not stop the probing, and t
 - The isolate is invalidated -- a terminated isolate may be inconsistent: requests still in flight in it fail with it, and the next request loads a new one.
 - One watchdog thread per workerd process keeps the deadlines: entering JavaScript registers one, leaving removes it. Termination takes effect within about a millisecond of the limit for ordinary code.
 - If termination has not taken effect after a 100 ms grace period, workerd writes a **culprit** row naming the call to its event pipe -- from the watchdog thread, not the event loop, which is what is stuck -- and the node's watchdog later kills the process with the culprit already known.
+
+**Garbage collection.** V8 collects an isolate's garbage on the thread that runs its requests, so a collection's CPU time would count against whichever request is running. A minor collection (scavenge) is short and stays charged. A full collection (mark-compact) of a long-lived isolate can take hundreds of milliseconds -- most of it destroying the wrappers of objects the isolate let go, in one atomic pause -- and is not the request's doing:
+
+- **Left out of the limit, within a budget.** The thread CPU of a full collection -- its incremental marking steps and weak callbacks included -- that runs during a request is subtracted from the request's CPU, also from its deadline while the collection is under way, as far as its Worker's budget goes: a token bucket of `gc.budgetMs` (2,000 ms) refilled at `gc.refillMsPerSecond` (100 ms a second), one per Worker in each process, which the Worker's next isolate takes over. What goes beyond the budget is charged as before. A tenant that allocates on purpose thus gets at most a tenth of a core of collections the limit does not see -- measured, 87 ms a second over 45 s of back-to-back collections -- and a request that only runs JavaScript is terminated at the limit as before. A completed request's row in the event pipe carries the CPU left out (`gcExcludedNs`); a `terminated` row carries the CPU charged.
+- **Long pauses named.** A collection that pauses its process for `gc.longPauseMs` (100 ms) or more writes a `gc-pause` row -- the isolate, the pause, the request it ran in (Worker, version, invocation) or none, the kind of collection, the CPU left out and what the budget held after it -- to `logs/workerd.log` after `[cpu-limit] ` and to the event pipe; the state endpoint keeps the latest rows (`processes.recentGcPauses`) and counts collections, long pauses and the longest pause per process (`processes.entries[].gc`).
+- **Idle collections.** An isolate of a Worker idle for `gc.idleCollectAfterMs` (50 ms) whose old generation has grown `gc.idleCollectMinGrowthMiB` (4 MiB) since its last full collection is collected between its requests, under its own lock, so that its next full collection inside a request has little to do. Not while the process has work waiting: workerd's evictor wakes every 10 ms, a wake-up more than 10 ms late means the event loop was busy, and idle time is counted again from there. Measured with a tree of Workers (3 roots calling 6 children and 3 shared leaves) at 15 requests a second per root on an arm64 machine, every isolate's first full collection was such an idle one and paused its process less than 21 ms.
+- **A small first old generation.** Every isolate starts with an old generation of `gc.initialOldSpaceMiB` (8 MiB; V8's `--initial-old-space-size`), so that its first full collection comes while it holds little.
+- **The runtime's heap.** The runtime bridge's isolate -- not a tenant's, without a CPU limit -- has a heap of `gc.runtimeHeapMiB` (128 MiB) instead of one V8 sizes from the machine: four times the most it was measured to hold after a full collection (7.7 MiB, with 100 more calls in flight), and at least 128 MiB. Its own full collections, outside any request and never idle, are the longest pauses left: measured on an amd64 machine under the tree of Workers, 510 of its 518 full collections in an hour took 100 ms or more, half of those over 151 ms and the longest 357 ms.
+
+**Why.** Charged to the request it ran in, a long-lived isolate's first full collection terminated well-behaved requests: with a tree of Workers at 15 requests a second per root on a node with four processes and no rotation, on an amd64 machine, 0.4.0 terminated 50 requests in an hour, each right after a full collection; 0.4.1 terminated none.
 
 **Why 200 ms.** A process has one event loop, so the CPU limit is also the bound of how long one request can delay its neighbours: measured, neighbours in the same process wait at most the limit plus about 8 ms. The limits' own cost is about 0.03 ms per request.
 
@@ -79,6 +90,8 @@ A Worker can have its own CPU and memory limits, set through `/v1` within its te
 
 ## 8. Eviction and the memory watermark
 
+Idle collections (section 4) run in the same loop of workerd's evictor.
+
 **Idle eviction** is workerd's (a patch): a Worker loaded by the Worker Loader is removed once it has no request in flight -- streaming responses and JS RPC included -- no `waitUntil` work, and has been idle for `idleEvictMs` (5 minutes). Isolates are removed one at a time, at least `idleDestroyIntervalMs` (10 ms) after the previous one was destroyed, so a batch does not stall the neighbours; destroying one takes about 0.3 ms. A Worker whose load failed is removed at once, so a failure is never permanent. The threshold weighs a cold start, a few milliseconds, against about 2 MB per resident Worker; it must be `0` or longer than `placement.idleMs`.
 
 **The memory watermark** is the node's, on Linux: every 100 ms it reads its cgroup's working set (`memory.current` minus `inactive_file`, as Kubernetes counts it) against `memory.max`, or against `memoryBudgetBytes` when the container has no limit, and sets a band; with neither, the watermark is off. Red is from 90 %, yellow from 75 %, back to green below 65 %, and red steps down to yellow below 75 %. workerd's evictor reads the band from shared memory.
@@ -100,9 +113,9 @@ A slot is replaced by a new generation in steps, at most one rotation at a time 
 3. drain the old generation until its calls and request contexts -- `waitUntil` work included -- have ended, for at most `rotation.drainTimeoutMs` (30 s); what is still running then is killed and ends as `RESULT_UNCERTAIN`;
 4. close the node's connections to it, send SIGTERM, and SIGKILL after `rotation.termGraceMs` (5 s).
 
-**Triggers**: the content of the workerd file changes (checked every `rotation.binaryCheckMs`, 1 s); a generation has been ready for `rotation.maxAgeMs` (1 hour); `rotation.maxRequests` or `rotation.residentBytes` (both off by default); by hand (`POST /__coworkerd/rotate`, `coworkerd-apiserver tool rotate`). A failed automatic rotation is retried after `rotation.retryMs` (5 s), doubling. Quarantine processes rotate too; replacing the launcher does not trigger a rotation. A request that lasts longer than the drain period can therefore be cut by a rotation, by default once an hour.
+**Triggers**: the content of the workerd file changes (checked every `rotation.binaryCheckMs`, 1 s); by hand (`POST /__coworkerd/rotate`, `coworkerd-apiserver tool rotate`); a generation's resident memory reaches `rotation.residentBytes` -- by default 70% of the node's memory: its container's `memory.max`, else `memoryBudgetBytes`, else the machine's, which the state endpoint names (`processes.rotation.configuration.residentBytesSource`); and, both off by default, a generation ready for `rotation.maxAgeMs` or one that took `rotation.maxRequests` calls. A failed automatic rotation is retried after `rotation.retryMs` (5 s), doubling. Quarantine processes rotate too; replacing the launcher does not trigger a rotation. A request that lasts longer than the drain period can be cut by a rotation.
 
-**Why every hour.** Under sustained load a process's resident memory keeps growing between rotations, and destroying isolates gives back only part of it; a new generation starts at the idle baseline. Rotation is also how workerd is upgraded on a running node. Its cost is the new generation's cold loads; measured, rotating a node's slots under load failed no request.
+**Why not every hour.** Up to 0.4.0 every process was replaced every hour, because its resident memory kept growing between rotations. The collections of section 4 keep it level -- measured, an hour of the tree of Workers at 15 requests a second per root without rotation on an amd64 machine: the node's processes together rose to 891 MiB in the first 40 minutes and to 894 MiB by the end (0.4.0's, beside them, to 3,205 MiB) -- while a new generation only rebuilt every isolate, with its cold loads and its first, largest collection, and cut the requests longer than the drain. The memory threshold stays as the bound. Rotation is also how workerd is upgraded on a running node; measured, rotating a node's slots under load failed no request.
 
 ## 10. Logs
 
@@ -161,6 +174,8 @@ Installing the filter costs about 2 ms per process start; request latency shows 
 | A stuck process | Its neighbours are unavailable for about half a second with several ordinary processes per node, about three seconds with the default single one |
 | An evicted Worker | One cold start, about 6 ms, the next time it is called |
 | A rotation | The new generation's cold loads, about 7-12 ms per Worker |
+| Idle collections | Each pauses its process, outside any request: measured, the first ones under 21 ms on an arm64 machine; on an amd64 machine 53 of 754 in an hour took 100 ms or more, at most 156 ms |
+| The collection budget | Up to a tenth of a core per Worker of collections the CPU limit does not charge |
 | A quarantine process | About 30-45 MB of resident memory |
 
 ## 15. Where isolation ends

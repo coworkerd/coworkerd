@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.4.0.
+> For release 0.4.1.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.4.0-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.4.0-linux-<arch>/` (the next table) |
-| `coworkerd-0.4.0-linux-<arch>-image.tar.gz` | The image `coworkerd:0.4.0`, for `docker load` |
-| `coworkerd-0.4.0-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.4.1-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.4.1-linux-<arch>/` (the next table) |
+| `coworkerd-0.4.1-linux-<arch>-image.tar.gz` | The image `coworkerd:0.4.1`, for `docker load` |
+| `coworkerd-0.4.1-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -47,9 +47,9 @@ Requirements: **Docker Engine 28 or newer** (compose's internal network uses `ga
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.4.0-linux-amd64.tar.gz
-docker load -i coworkerd-0.4.0-linux-amd64-image.tar.gz
-cd coworkerd-0.4.0-linux-amd64/docker
+tar -xzf coworkerd-0.4.1-linux-amd64.tar.gz
+docker load -i coworkerd-0.4.1-linux-amd64-image.tar.gz
+cd coworkerd-0.4.1-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -94,13 +94,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.4.0 version` |
+| Show the version | `docker run --rm coworkerd:0.4.1 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.4.0` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.4.1` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -123,7 +123,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.4.0}
+    image: coworkerd:${COWORKERD_VERSION:-0.4.1}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -426,7 +426,8 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `cpuLimitMs` / `memoryLimitMiB` | `200` / `128` | The CPU limit per request and the memory limit per isolate (the node's defaults; a limit the Worker declares takes precedence, see the end of this section) |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off |
-| `rotation.*` | see the schema | Process rotation: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `maxAgeMs` (default `3600000`: every process is replaced by a new generation every hour, with in-flight requests completing in the old process; `0` turns it off), `maxRequests`, `drainTimeoutMs` and others |
+| `rotation.*` | see the schema | Process rotation, which replaces a process by a new generation with in-flight requests completing in the old one: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `residentBytes` (rotate a process whose resident memory reaches it; left out, 70% of the node's memory -- its container's `memory.max`, else `memoryBudgetBytes`, else the machine's), `maxAgeMs` (default `0`, off; a value replaces every process after that long, as releases before 0.4.1 did every hour), `maxRequests`, `drainTimeoutMs` and others |
+| `gc.*` | see the schema | Garbage collection in the workerd processes ([process isolation](../process-isolation.md), section 4): `budgetMs` / `refillMsPerSecond` (`2000` / `100`: each Worker's budget of full-collection CPU the CPU limit does not charge to the request it runs in; `0` charges every collection), `longPauseMs` (`100`: a collection that pauses a process that long is named in `logs/workerd.log`; `0`: none), `idleCollectAfterMs` / `idleCollectMinGrowthMiB` (`50` / `4`: an idle Worker's isolate is collected between its requests; `0` turns it off), `initialOldSpaceMiB` (`8`: V8's initial old generation), `runtimeHeapMiB` (`128`: the runtime's heap; `0` leaves V8's own) |
 | `sandbox.mode` | `auto` | The least-privilege environment of workerd ("Sandbox" in section 4): `auto` turns it on when the prerequisites are met, otherwise runs without it and warns; `launcher` refuses to start without them; `off` turns it off |
 | `sandbox.launcherPath` | `coworkerd-launcher` in the directory of `coworkerd` | The launcher. The node checks and fixes it at startup: replacing the file while running triggers no rotation, and the state endpoint's `processes.sandbox.pendingRestart` says the new one is used only after a restart |
 | `sandbox.syscalls.mode` | `observe` | The system call allowlist ("System call allowlist" in section 4): `off` installs nothing; `observe` reports calls outside the allowlist and executes them as usual; `enforce` kills the process on a call outside the allowlist (exit category `syscall-denied`). The environment variable `COWORKERD_SANDBOX_SYSCALLS` overrides it |
@@ -456,6 +457,7 @@ All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. 
 
 **Environment variable overrides** (take precedence over the configuration file): `COWORKERD_MANAGEMENT_TOKEN`, `COWORKERD_ADMIN_CREDENTIAL` (control plane), `COWORKERD_SECRETS_KEY_FILE`, `COWORKERD_PEER_KEY_FILE`, `COWORKERD_DRAIN_TIMEOUT_MS`, `COWORKERD_LOAD_CHECK` (`0`/`1`),
 `COWORKERD_CPU_LIMIT_MS`, `COWORKERD_MEMORY_LIMIT_MIB`, `COWORKERD_QUARANTINE_PROCESSES`, `COWORKERD_IDLE_EVICT_MS`, `COWORKERD_IDLE_DESTROY_INTERVAL_MS`, `COWORKERD_MEMORY_WATERMARK_ENABLED`, `COWORKERD_ROTATION_*`, `COWORKERD_RUNTIME_FILE`,
+`COWORKERD_GC_BUDGET_MS`, `COWORKERD_GC_REFILL_MS_PER_S`, `COWORKERD_GC_LONG_PAUSE_MS`, `COWORKERD_IDLE_GC_MS`, `COWORKERD_IDLE_GC_MIN_MIB`, `COWORKERD_GC_INITIAL_OLD_SPACE_MIB`, `COWORKERD_STATIC_HEAP_MIB` (the `gc` fields, in that order),
 `COWORKERD_SANDBOX_MODE`, `COWORKERD_SANDBOX_SYSCALLS`, `COWORKERD_SANDBOX_ALLOWLIST`, `COWORKERD_SANDBOX_SYSCALLS_STEADY`, `COWORKERD_SANDBOX_STEADY_ALLOWLIST`, `COWORKERD_EGRESS_MODE`, `COWORKERD_EGRESS_DEFAULT_POLICY`,
 and for the Workers' logs `COWORKERD_TENANT_LOG_BUFFER_BYTES`, `COWORKERD_WORKER_LOG_TOTAL_BYTES`, `COWORKERD_WORKER_LOG_LINES_PER_SECOND`, `COWORKERD_WORKER_LOG_MAX_LINE_BYTES`, `COWORKERD_WORKERD_LOG_MAX_BYTES`, `COWORKERD_WORKERD_LOG_FILES`.
 Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`), `COWORKERD_SUBREQUEST_BUDGET` (`8`) and `COWORKERD_SUBREQUEST_GRANT` (`1`);

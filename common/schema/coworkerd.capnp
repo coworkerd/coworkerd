@@ -158,6 +158,10 @@ struct ServerConfig {
   # The cluster's secrets key: secrets' values are sealed with it in the tenants' manifests on the object store (AES-256-GCM).
   # The control plane and every node with the objectStore desired state need it.
   secrets @40 :SecretsConfig;
+  # V8's garbage collection in the workerd processes (docs/process-isolation.md, section 4): the CPU limit leaves a full
+  # collection out of the request it ran in, as far as its Worker's budget goes; long pauses are named; an idle
+  # Worker's isolate is collected between its requests; the runtime's heap is sized for its working set.
+  gc @41 :GcConfig;
 
   struct SecretsConfig {
     # A JSON file {"key":"<64 hexadecimal digits>"} (32 bytes) readable by its owner only; compose's secrets step writes
@@ -369,13 +373,37 @@ struct RotationConfig {
   termGraceMs @1 :UInt32 = 5000;
   # How often the workerd executable is checked for a change; 0 turns that trigger off.
   binaryCheckMs @2 :UInt32 = 1000;
-  # Age, dispatched-request and resident-memory limits of a generation; 0 turns each off. A
-  # generation rotates after an hour by default (resident memory grows between rotations).
-  maxAgeMs @3 :UInt64 = 3600000;
+  # Age, dispatched-request and resident-memory limits of a generation; 0 turns each off. A generation rotates when
+  # its workerd file changes (an upgrade), by hand, and when its resident memory reaches residentBytes -- not with age
+  # by default: a process's memory stays bounded by the collections (gc), and a new generation would only rebuild every
+  # isolate and its first, largest collection. residentBytes left out of the file: 70% of the node's memory (its
+  # container's memory.max, else memoryBudgetBytes, else the machine's).
+  maxAgeMs @3 :UInt64 = 0;
   maxRequests @4 :UInt64 = 0;
   residentBytes @5 :UInt64 = 0;
   # First retry after a failed automatic rotation (then doubling).
   retryMs @6 :UInt32 = 5000;
+}
+
+struct GcConfig {
+  # A Worker's budget, in each process, of collection CPU the CPU limit does not charge to the request it ran in: a
+  # token bucket of budgetMs refilled at refillMsPerSecond (a tenant that allocates on purpose gets at most that much,
+  # one core's tenth by default); a collection beyond it is charged as before. 0 charges every collection.
+  budgetMs @0 :UInt32 = 2000;
+  refillMsPerSecond @1 :UInt32 = 100;
+  # A collection that pauses its process at least this long writes one gc-pause row (workerd.log's [cpu-limit] lines):
+  # which isolate, how long, in whose request, what kind; the state endpoint counts them per process. 0: no rows.
+  longPauseMs @2 :UInt32 = 100;
+  # A Worker's isolate idle at least idleCollectAfterMs, whose old generation grew at least idleCollectMinGrowthMiB since
+  # its last full collection, is collected between its requests -- never while other work is queued. 0 turns it off.
+  idleCollectAfterMs @3 :UInt32 = 50;
+  idleCollectMinGrowthMiB @4 :UInt32 = 4;
+  # V8's initial old generation, for every isolate of a process (--initial-old-space-size): a smaller first full
+  # collection. 0 leaves V8's own.
+  initialOldSpaceMiB @5 :UInt32 = 8;
+  # The runtime's heap (the isolate every call passes through), which V8 otherwise sizes from the machine. 0 leaves
+  # V8's own; otherwise at least 16.
+  runtimeHeapMiB @6 :UInt32 = 128;
 }
 
 # Written by workerd resource enforcement, then matched against live invocations.
@@ -396,6 +424,19 @@ struct CpuReport {
   deniedAllocationBytes @13 :UInt64;
   headroomBytes @14 :UInt64;
   nearHeapCalls @15 :UInt64;
+  # The collection CPU the limit did not charge (gc.budgetMs); a request's CPU is cpuUsedNs plus this.
+  gcExcludedNs @16 :UInt64;
+  # gc-pause rows: the collection's kind (mark-compact, scavenge, ...), its pause, what its Worker's budget held after
+  # it, whether it ran inside a request (whose identity the row carries) or was an idle collection, and which full
+  # collection of its isolate it was (1: the first).
+  gcType @17 :Text;
+  pauseNs @18 :UInt64;
+  gcBudgetNs @19 :UInt64;
+  inRequest @20 :Bool;
+  idleCollection @21 :Bool;
+  majorOrdinal @22 :UInt64;
+  # When the collection ended (gc-pause rows).
+  observedAtUnixMs @23 :UInt64;
 }
 
 struct PlacementConfig {

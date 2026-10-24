@@ -38,10 +38,21 @@ struct ProcessPoolConfig {
   uint32_t rotationDrainTimeoutMs = 30000;
   uint32_t rotationTermGraceMs = 5000;
   uint32_t rotationBinaryCheckMs = 1000;    // 0 disables the executable-change trigger
-  uint64_t rotationMaxAgeMs = 3600000;      // 0 = off; an hour by default
+  uint64_t rotationMaxAgeMs = 0;            // 0 = off (the default)
   uint64_t rotationMaxRequests = 0;         // 0 = off
-  uint64_t rotationResidentBytes = 0;       // memory trigger interface; 0 = off
+  uint64_t rotationResidentBytes = 0;       // 0 = off
+  // Neither the file nor the environment gave residentBytes: the node sets it to 70% of its memory at startup
+  // (node/main.c++), and says where that came from.
+  bool rotationResidentBytesDefault = true;
+  std::string rotationResidentBytesSource = "configuration";
   uint32_t rotationRetryMs = 5000;          // first retry after a failed automatic rotation (then doubling)
+  // V8's garbage collection in each workerd (ServerConfig.gc, the schema's comments; COWORKERD_GC_BUDGET_MS,
+  // COWORKERD_GC_REFILL_MS_PER_S, COWORKERD_GC_LONG_PAUSE_MS, COWORKERD_IDLE_GC_MS, COWORKERD_IDLE_GC_MIN_MIB,
+  // COWORKERD_GC_INITIAL_OLD_SPACE_MIB and COWORKERD_STATIC_HEAP_MIB override them). spawn() hands them to workerd
+  // (its patch coworkerd-gc.h) and the initial old space as a V8 flag.
+  uint32_t gcBudgetMs = 2000, gcRefillMsPerSecond = 100, gcLongPauseMs = 100;
+  uint32_t gcIdleCollectAfterMs = 50, gcIdleCollectMinGrowthMiB = 4;
+  uint32_t gcInitialOldSpaceMiB = 8, gcRuntimeHeapMiB = 128;
   // The sandbox: each workerd started through coworkerd-launcher in its least-privilege environment
   // (launcher/PROTOCOL.md). "off" starts workerd directly; "launcher" through the launcher, and the
   // pool refuses to start when the launcher's check fails here; "auto" through the launcher when its check

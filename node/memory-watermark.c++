@@ -29,6 +29,20 @@ bool readNumber(const std::string& path, uint64_t& value) {
   std::ifstream input(path);
   return bool(input >> value);
 }
+#ifdef __linux__
+// This process's unified cgroup directory. Docker's private cgroup namespace exposes the container cgroup at the mount
+// root; with a host namespace, our own cgroup is found relative to that mount.
+std::string cgroupDirectory() {
+  std::string cgroup = "/sys/fs/cgroup";
+  std::ifstream membership("/proc/self/cgroup");
+  std::string line;
+  while (std::getline(membership, line)) if (line.starts_with("0::") && line.substr(3) != "/") {
+    auto candidate = cgroup + line.substr(3);
+    if (std::filesystem::exists(candidate + "/memory.current")) cgroup = candidate;
+  }
+  return cgroup;
+}
+#endif
 }
 
 class MemoryWatermark::Impl {
@@ -44,14 +58,7 @@ public:
 
   Impl(bool requested, uint64_t configuredBudget): requested(requested) {
 #ifdef __linux__
-    // Docker's private cgroup namespace exposes the container cgroup at the mount root.
-    // With a host namespace, locate our own unified cgroup relative to that mount.
-    std::ifstream membership("/proc/self/cgroup");
-    std::string line;
-    while (std::getline(membership, line)) if (line.starts_with("0::") && line.substr(3) != "/") {
-      auto candidate = cgroup + line.substr(3);
-      if (std::filesystem::exists(candidate + "/memory.current")) cgroup = candidate;
-    }
+    cgroup = cgroupDirectory();
     if (readNumber(cgroup + "/memory.max", budget)) source = "memory.max";
     else if (configuredBudget) { budget = configuredBudget; source = "memoryBudgetBytes"; }
     enabled = requested && budget && readNumber(cgroup + "/memory.current", current);
@@ -148,5 +155,16 @@ uint64_t MemoryWatermark::residentBytes(int pid) {
 }
 bool MemoryWatermark::rotationDue(int pid, uint64_t thresholdBytes) {
   return thresholdBytes > 0 && pid > 0 && residentBytes(pid) >= thresholdBytes;
+}
+std::pair<uint64_t, std::string> MemoryWatermark::nodeMemory(uint64_t configuredBudget) {
+  uint64_t bytes = 0;
+#ifdef __linux__
+  // memory.max reads "max" without a limit, which is not a number.
+  if (readNumber(cgroupDirectory() + "/memory.max", bytes) && bytes > 0) return {bytes, "memory.max"};
+#endif
+  if (configuredBudget) return {configuredBudget, "memoryBudgetBytes"};
+  const auto pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+  bytes = pages > 0 && page > 0 ? uint64_t(pages) * uint64_t(page) : 0;
+  return {bytes, "physical memory"};
 }
 }  // namespace coworkerd
