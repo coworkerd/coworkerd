@@ -107,7 +107,8 @@ public:
   ObjectStoreMembership(MembershipConfig config, std::string serverId, const ObjectStoreConfig& storeConfig,
       kj::Network& network, kj::Timer& timer)
       : config(std::move(config)), serverId(std::move(serverId)), store(storeConfig, network, timer), timer(timer),
-        startedAtUnixMs(nowUnixMs()), lastHeartbeatOk(timer.now()), lastListOk(timer.now()), startupDeadline(timer.now()) {
+        startedAtUnixMs(nowUnixMs()), lastHeartbeatOk(timer.now()), lastHeartbeatOkDue(timer.now()), lastListOk(timer.now()),
+        startupDeadline(timer.now()) {
     std::array<unsigned char, 16> random;
     KJ_REQUIRE(RAND_bytes(random.data(), random.size()) == 1, "cannot name this membership's instance");
     for (auto byte : random) { instance += "0123456789abcdef"[byte >> 4]; instance += "0123456789abcdef"[byte & 15]; }
@@ -161,7 +162,12 @@ public:
       try {
         KJ_REQUIRE(timer.now() < startupDeadline, "membership startup timeout", state.lastError.c_str());
         if (!epoch) co_await registerEpoch(true);
-        co_await writeHeartbeat();
+        if (cadence == kj::none) {
+          co_await writeHeartbeat();
+          // The cadence starts at this first heartbeat, not once the old epochs' objects are removed and the members
+          // listed: on a slow store those take longer than an interval.
+          cadence = heartbeats();
+        }
         co_await removeOldObjects();
         co_await listMembers();
         state.leaseStatus = "active";
@@ -180,6 +186,12 @@ public:
 
   kj::Promise<void> run() override {
     tasks.add(measure());
+    serving = true;
+    KJ_IF_SOME(running, cadence) {
+      auto loop = kj::mv(running);
+      cadence = kj::none;
+      return loop.exclusiveJoin(listings()).exclusiveJoin(watchExpiry());
+    }
     return heartbeats().exclusiveJoin(listings()).exclusiveJoin(watchExpiry());
   }
 
@@ -254,13 +266,23 @@ private:
   MembershipView state;
   uint64_t epoch = 0;
   kj::TimePoint lastHeartbeatOk;
+  // The cadence time of the last heartbeat the store took, and of every heartbeat in flight: one that went out, by the
+  // cadence, within the TTL of the last one taken decides the epoch's expiry (expireIfDue()).
+  kj::TimePoint lastHeartbeatOkDue;
+  std::multiset<kj::TimePoint> dueInFlight;
   // The last listing of members/ that answered, and whether one failed since (the recovery anchor's blindness).
   kj::TimePoint lastListOk;
   bool listFailedSinceOk = false;
   kj::TimePoint startupDeadline;
   bool fatal = false, stopping = false, collisionAllowanceUsed = false;
-  // Writes of this epoch's objects in flight (the heartbeat, the suspects object): stop() waits for them.
+  // Writes of this epoch's objects in flight (the heartbeats, the suspects object): stop() waits for them.
   uint32_t writing = 0;
+  // The heartbeats sent and the newest of them that finished: heartbeatConnected follows that one alone.
+  uint64_t heartbeatsSent = 0, heartbeatsSettled = 0;
+  // The heartbeats' loop from start()'s first heartbeat on, which run() joins; and whether run() began (only then can
+  // the epoch expire).
+  kj::Maybe<kj::Promise<void>> cadence;
+  bool serving = false;
   std::function<void(std::string)> identityCallback;
   SuspectsCallback suspectsCallback;
   // (node, epoch) -> the ETag of its suspects object as this membership last read it.
@@ -371,12 +393,27 @@ private:
     KJ_FAIL_REQUIRE("membership identity taken", reason.c_str());
   }
 
+  // Whether the newest write of this id is a heartbeat of this process's own: under an epoch it held, its instance in the
+  // bytes. A heartbeat it gave up on can reach the store after it, also once its epoch expired.
+  kj::Promise<bool> ownHeartbeat(const ListedNode& node, const IdentityUse& use) {
+    auto listed = node.epochs.find(use.freshestEpoch);
+    if (listed == node.epochs.end() || !listed->second.heartbeat || listed->second.heartbeatUnixMs != use.freshestUnixMs ||
+        !state.heldEpochs.contains(std::to_string(use.freshestEpoch))) co_return false;
+    auto response = co_await bounded(store.get(memberHeartbeatKey(serverId, use.freshestEpoch)));
+    if (response.status == 404) co_return false;
+    KJ_REQUIRE(response.status == 200, "cannot read this id's heartbeat back", response.status);
+    auto record = parseMemberRecord(response.bytes);
+    co_return record && record->instance == instance;
+  }
+
   // Waits while the id is in use: until the heartbeat or registration that makes it so is TTL old. Written again
-  // meanwhile, or still in use past TTL + grace + 2 s, it is another process's: a conflict.
+  // meanwhile, or still in use past TTL + grace + 2 s, it is another process's: a conflict -- unless what was written
+  // is a late heartbeat of this process's own, which only restarts the wait.
   kj::Promise<void> waitForIdentity(IdentityUse first, bool starting) {
     ++state.identityWaits;
     const auto began = timer.now();
-    const auto bound = began + (uint64_t(config.ttlSeconds) * 1000 + config.livenessGraceMs + 2000) * kj::MILLISECONDS;
+    const auto window = (uint64_t(config.ttlSeconds) * 1000 + config.livenessGraceMs + 2000) * kj::MILLISECONDS;
+    auto bound = began + window;
     if (starting && !collisionAllowanceUsed) {
       // The startup timeout stays the global bound; one wait for an identity in use gets its own allowance.
       collisionAllowanceUsed = true;
@@ -393,8 +430,16 @@ private:
       auto use = identityUse(nodes[serverId], listing.dateUnixMs, config.ttlSeconds);
       state.startupCollisionWaitMs = (timer.now() - began) / kj::MILLISECONDS;
       if (use.freshestUnixMs > first.freshestUnixMs) {
-        conflict(starting, "epoch " + std::to_string(use.freshestEpoch) + " of this id was written again while waiting (" +
-            std::to_string(state.startupCollisionWaitMs) + " ms)");
+        if (co_await ownHeartbeat(nodes[serverId], use)) {
+          std::cout << "[membership] {\"event\":\"own-late-heartbeat\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\""
+                    << use.freshestEpoch << "\",\"lastModifiedUnixMs\":" << use.freshestUnixMs << ",\"observedAtUnixMs\":"
+                    << nowUnixMs() << "}" << std::endl;
+          first = use;
+          bound = kj::max(bound, timer.now() + window);
+        } else {
+          conflict(starting, "epoch " + std::to_string(use.freshestEpoch) + " of this id was written again while waiting (" +
+              std::to_string(state.startupCollisionWaitMs) + " ms)");
+        }
       }
       if (!use.inUse) co_return;
       if (timer.now() >= bound) {
@@ -472,23 +517,38 @@ private:
               << " ttl-seconds=" << config.ttlSeconds << " attempts=" << attempt << std::endl;
   }
 
-  kj::Promise<void> writeHeartbeat() {
+  // `due`: the heartbeat's time on the cadence (start()'s and a re-registration's first heartbeat: when it is sent).
+  kj::Promise<void> writeHeartbeat(kj::Maybe<kj::TimePoint> due = kj::none) {
     KJ_REQUIRE(epoch && !state.identityTaken && !stopping, "no epoch to write a heartbeat for");
     auto record = recordOf(state.draining ? "draining" : "active");
     const auto sent = timer.now();
+    const auto slot = due.orDefault(sent);
+    const auto number = ++heartbeatsSent;
     ++writing;
     KJ_DEFER(--writing);
+    auto inFlight = dueInFlight.insert(slot);
+    bool settled = false;
+    KJ_DEFER(if (!settled) dueInFlight.erase(inFlight));
     try {
       co_await bounded(store.put(memberHeartbeatKey(serverId, epoch), memberRecordJson(record)));
     } catch (const kj::Exception&) {
+      settled = true;
+      dueInFlight.erase(inFlight);
       ++state.heartbeatFailures;
+      if (number > heartbeatsSettled) { heartbeatsSettled = number; state.leaseConnected = false; }
+      // It may be the heartbeat the epoch's expiry waited for: judged now, not at the next check.
+      expireIfDue();
       throw;
     }
-    lastHeartbeatOk = sent;
+    settled = true;
+    dueInFlight.erase(inFlight);
+    // Two may be in flight (heartbeats()): one that finishes after a later one moves nothing back.
+    if (sent > lastHeartbeatOk) lastHeartbeatOk = sent;
+    if (slot > lastHeartbeatOkDue) lastHeartbeatOkDue = slot;
     ++state.heartbeatsWritten;
-    state.lastHeartbeatAtUnixMs = record.writtenAtUnixMs;
+    state.lastHeartbeatAtUnixMs = std::max(state.lastHeartbeatAtUnixMs, record.writtenAtUnixMs);
     state.storeClient = store.stats().json();
-    state.leaseConnected = true;
+    if (number > heartbeatsSettled) { heartbeatsSettled = number; state.leaseConnected = true; }
   }
 
   // A member's suspects object, handed to the callback (Suspects adopts what it holds) once it reads; its ETag is
@@ -655,17 +715,25 @@ private:
     state.members.swap(next);
   }
 
+  // The heartbeats of an epoch go out on a fixed cadence: one every interval from its first, whether the one before has
+  // finished or not. Each is bounded by the interval and given up as a failure when that runs out, so at most two are in
+  // flight and one that hangs never holds up the next. One given up on may still reach the store after a later one:
+  // liveness reads only LastModified, and its bytes name this process as the later one's do.
   kj::Promise<void> heartbeats() {
+    const auto interval = config.heartbeatIntervalMs * kj::MILLISECONDS;
+    // The epoch's first heartbeat is start()'s, just written.
+    auto next = lastHeartbeatOk + interval;
     while (true) {
-      co_await timer.afterDelay(config.heartbeatIntervalMs * kj::MILLISECONDS);
+      co_await timer.atTime(next);
       // After stop(), or once the id is another process's, nothing is written; the promise stays pending (it is joined
       // with the Server's other loops).
       if (stopping || state.identityTaken) co_await kj::Promise<void>(kj::NEVER_DONE);
-      try {
-        if (!state.selfExpired) {
-          co_await writeHeartbeat();
-        } else if (!state.draining) {
-          // A new epoch once the store answers (an exiting Server takes none).
+      if (!state.selfExpired) {
+        tasks.add(beat(next));
+      } else if (!state.draining) {
+        // A new epoch once the store answers (an exiting Server takes none); its first heartbeat starts its cadence, and
+        // the old epochs' objects go beside it.
+        try {
           const auto old = epoch;
           co_await registerEpoch(false);
           co_await writeHeartbeat();
@@ -674,12 +742,25 @@ private:
           std::cout << "[membership] {\"event\":\"re-registered\",\"nodeId\":" << quote(serverId) << ",\"oldEpoch\":\"" << old
                     << "\",\"epoch\":\"" << epoch << "\",\"observedAtUnixMs\":" << nowUnixMs() << "}" << std::endl;
           state.members[serverId] = selfMember();
-          co_await removeOldObjects();
+          next = lastHeartbeatOkDue;
+          tasks.add(removeOldObjects());
+        } catch (const kj::Exception& error) {
+          state.leaseConnected = false;
+          failed("re-registration", error);
         }
-      } catch (const kj::Exception& error) {
-        state.leaseConnected = false;
-        failed(state.selfExpired ? "re-registration" : "heartbeat", error);
       }
+      // A time the loop missed -- a re-registration, a stalled event loop -- is not made up: the next heartbeat goes at the
+      // first time of the cadence still ahead.
+      do next += interval; while (next <= timer.now());
+    }
+  }
+
+  // One heartbeat of the cadence, on its own (a failure is the store's answer or the interval running out).
+  kj::Promise<void> beat(kj::TimePoint due) {
+    try {
+      co_await writeHeartbeat(due);
+    } catch (const kj::Exception& error) {
+      failed("heartbeat", error);
     }
   }
 
@@ -699,24 +780,33 @@ private:
     }
   }
 
-  // The epoch's own deadline, by this node's monotonic clock: TTL after the last heartbeat it wrote was sent.
   kj::Promise<void> watchExpiry() {
     while (true) {
       co_await timer.afterDelay(EXPIRY_CHECK_MS * kj::MILLISECONDS);
-      if (stopping || state.identityTaken || state.selfExpired || !epoch) continue;
-      if (timer.now() - lastHeartbeatOk <= config.ttlSeconds * kj::SECONDS) continue;
-      state.selfExpired = true;
-      ++state.selfExpiries;
-      state.selfExpiredAtUnixMs = nowUnixMs();
-      state.leaseStatus = "expired";
-      state.leaseConnected = false;
-      // Never renewed (once the store answers, a new epoch is registered); still held: the stateless calls addressed to
-      // it are served.
-      std::cout << "[membership] lease expired node=" << serverId << " old-epoch=" << epoch << std::endl;
-      std::cout << "[membership] {\"event\":\"self-expired\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
-                << "\",\"lastHeartbeatAtUnixMs\":" << state.lastHeartbeatAtUnixMs << ",\"observedAtUnixMs\":" << nowUnixMs()
-                << "}" << std::endl;
+      expireIfDue();
     }
+  }
+
+  // The epoch's own deadline, by this node's monotonic clock: TTL after the last heartbeat the store took was sent --
+  // unless a heartbeat that went out, by the cadence, within that TTL is still in flight: its outcome decides then, and
+  // its failure expires the epoch at once (writeHeartbeat()). With a TTL of three intervals, the third heartbeat after
+  // two failed ones goes out at the deadline itself.
+  void expireIfDue() {
+    if (!serving || stopping || state.identityTaken || state.selfExpired || !epoch) return;
+    const auto ttl = config.ttlSeconds * kj::SECONDS;
+    if (timer.now() - lastHeartbeatOk <= ttl) return;
+    if (!dueInFlight.empty() && *dueInFlight.begin() <= lastHeartbeatOkDue + ttl) return;
+    state.selfExpired = true;
+    ++state.selfExpiries;
+    state.selfExpiredAtUnixMs = nowUnixMs();
+    state.leaseStatus = "expired";
+    state.leaseConnected = false;
+    // Never renewed (once the store answers, a new epoch is registered); still held: the stateless calls addressed to it
+    // are served.
+    std::cout << "[membership] lease expired node=" << serverId << " old-epoch=" << epoch << std::endl;
+    std::cout << "[membership] {\"event\":\"self-expired\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
+              << "\",\"lastHeartbeatAtUnixMs\":" << state.lastHeartbeatAtUnixMs << ",\"observedAtUnixMs\":" << nowUnixMs()
+              << "}" << std::endl;
   }
 
   // Whether the store's create-if-absent holds under concurrency (4 writers, 5 rounds, under members/<id>/probe/):

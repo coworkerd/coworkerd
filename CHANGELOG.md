@@ -7,8 +7,10 @@ collects an isolate on the thread that runs its requests, and a long-lived isola
 destruction of the wrappers of objects it let go, in one atomic pause -- was charged to whichever request it ran in: on
 a busy node it terminated well-behaved requests with `CPU_LIMIT_EXCEEDED`. With a tree of Workers at 15 requests a
 second per root, four processes and no rotation, 0.4.0 terminated 50 requests in an hour on an amd64 machine, each right
-after a full collection; 0.4.1, beside it on the same machine, none. The object store's layout and `/v1` do not change;
-the node's configuration gains `gc`, and two of rotation's defaults change.
+after a full collection; 0.4.1, beside it on the same machine, none. A node also no longer expires, and takes a new
+epoch, because one store write of its heartbeat was answered late: the heartbeats keep their cadence, and a node survives
+two failed ones in a row. The object store's layout and `/v1` do not change; the node's configuration gains `gc`, and two
+of rotation's defaults change.
 
 - **Collections are left out of the CPU limit, within a budget**: the thread CPU of a full collection that runs during a
   request -- also while it is under way -- is subtracted from the request's CPU as far as its Worker's budget goes, a
@@ -45,6 +47,17 @@ the node's configuration gains `gc`, and two of rotation's defaults change.
   one of their prerequisites.
 - **The system call allowlists** are generated anew for the patched workerd: the same calls as 0.4.0's on both
   architectures (arm64: 59 at startup, 43 in the steady state; amd64: 63 and 42), only the binary they name is new.
+- **One slow heartbeat no longer expires a node**: the membership's heartbeats go out on a fixed cadence, one every
+  `membership.heartbeatIntervalMs` from the epoch's first -- at startup while the node still lists the members --,
+  whether the one before has finished or not, each still bounded by the interval. In 0.4.0 a heartbeat waited an
+  interval after the previous one had finished, so one that hung to its bound sent the next exactly at the TTL after the
+  last one the store took: a single store write answered late (7 s, say) expired the node and gave it a new epoch,
+  although no stateless call failed. Now one failed heartbeat leaves a full interval to spare; after two in a row the
+  third goes out at the deadline, and a node waits for its answer before it expires -- a third failure expires it one
+  interval past the TTL, still before the other nodes drop it (the cluster's state page, section 3). A node registering a
+  new epoch after its own expired no longer takes a heartbeat of its own that lands late, while it waits for its id, for
+  another process's, which drained the node and ended it with exit code 3. The TTL, the interval and the grace keep
+  their defaults.
 
 ## 0.4.0
 
