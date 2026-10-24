@@ -23,3 +23,5 @@ __pycache__/
 
 # The workerd checkout scripts/workerd-patches.py works on (it has its own Git history)
 /workerd
+# cowctl's dependencies installed for local runs (the package carries its own under lib/cowctl)
+cli/node_modules/
