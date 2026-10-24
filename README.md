@@ -21,8 +21,9 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
   and the usage counts it has not written yet (a minute's worth while the store takes them), so a stateless node and a
   bucket make a cluster.
 
-Accounts, billing, user interfaces and stateful services (Durable Objects, KV, R2, D1 and the like) are left to the
-platform on top. The components and their boundaries are described in [docs/components.md](docs/components.md).
+Accounts, billing and user interfaces are left to the platform on top. Stateful services are not: Durable Objects are
+being built for 0.5 (ownership per shard with fencing, writes confirmed by peer nodes and shipped to the object store),
+and this release runs stateless Workers only. The components and their boundaries are described in [docs/components.md](docs/components.md).
 
 ## Status: 0.4.0
 
@@ -36,8 +37,8 @@ The `/v1` API changes only by adding fields and endpoints until 1.0.
 Boundaries to know about:
 
 - **One region.** A cluster lives in one region or an equivalent low-latency network; no routing or failover across regions.
-- **Stateless Workers only.** Stateful bindings and several Cloudflare features (scheduled triggers, Tail Workers and
-  others) are refused when a project is converted, and JS RPC is not supported: a Service Binding reaches only the other
+- **Stateless Workers only, in this release.** Stateful bindings (Durable Objects come in 0.5) and several Cloudflare
+  features (scheduled triggers, Tail Workers and others) are refused when a project is converted, and JS RPC is not supported: a Service Binding reaches only the other
   Worker's `fetch()`; the full list is in [docs/guide/compat.md](docs/guide/compat.md).
 - **The sandbox needs host support.** The launcher needs unprivileged user namespaces; under Docker's default seccomp
   and AppArmor profiles it cannot set up its environment, so the default compose cluster runs without the sandbox and

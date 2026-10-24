@@ -6,7 +6,7 @@ This page is the map of Coworkerd for anyone who wants to know how it works befo
 
 A Coworkerd cluster runs all the Workers of one platform. The platform is the cluster's only administrator; its users are **tenants**, every Worker belongs to one tenant and is named `tenant/Worker`, and a tenant's credential acts only on its own tenant. Worker code follows the Cloudflare Workers programming model and runs in workerd, Cloudflare's open-source runtime, with a series of nine patches, all under `src/workerd/server/`.
 
-Coworkerd adds what a shared, multi-tenant cluster needs: isolation and limits between tenants, per-tenant quotas and metering, placement of every call across the nodes, and a declarative API with a thin command line. Accounts, billing, user interfaces and stateful services are left to the platform on top.
+Coworkerd adds what a shared, multi-tenant cluster needs: isolation and limits between tenants, per-tenant quotas and metering, placement of every call across the nodes, and a declarative API with a thin command line. Accounts, billing and user interfaces are left to the platform on top; stateful services are not: Durable Objects are being built for 0.5, and this release runs stateless Workers.
 
 ## 2. Components and channels
 
@@ -71,10 +71,10 @@ Tenant code has no network of its own: its outgoing `fetch()` goes to the node's
 ## 9. Boundaries
 
 - **One region.** A cluster lives in one region or an equivalent low-latency network; there is no routing or failover across regions.
-- **Stateless Workers only.** Coworkerd schedules stateless calls; stateful bindings are refused at conversion, and stateful services are the platform's, reached as external services. State with ownership, such as Durable Objects, would need guarantees this design does not have.
+- **Stateless Workers only, in this release.** Coworkerd schedules stateless calls and refuses stateful bindings at conversion. State with ownership -- Durable Objects -- is being built for 0.5 on the object store: ownership per shard, taken with create-if-absent epochs and fenced; writes confirmed by peer nodes and shipped to the bucket. Until then a platform reaches stateful services of its own as external services.
 - **Isolates share processes.** Several tenants run in one workerd process, as on Cloudflare's platform, and an isolate is not as strong a boundary as a process; the per-isolate limits, the quarantine processes, process rotation and the sandbox are what this design adds to it.
 - **Trust between nodes.** Nodes trust each other through a shared signing key, when one is configured; there is no mTLS, and a node joins with an object storage identity issued for it (compose's `secrets add-node`), not through a join procedure of its own.
-- **Not done.** Accounts, billing and user interfaces; stateful bindings; scheduled triggers, JS RPC, Tail Workers and email handlers; routing across regions.
+- **Not done.** Accounts, billing and user interfaces; stateful bindings (Durable Objects in 0.5); scheduled triggers, JS RPC, Tail Workers and email handlers; routing across regions.
 
 ## 10. Public references
 

@@ -4,9 +4,9 @@ This document is for platform engineers and contributors who want to know how fa
 
 ## 1. The goal and the line
 
-An important reason to build on workerd is to reuse the Workers ecosystem: wrangler, its build pipeline and existing applications. The goal is that a stateless application built with wrangler runs without changing its code. The line is drawn by what a cluster of this kind provides:
+An important reason to build on workerd is to reuse the Workers ecosystem: wrangler, its build pipeline and existing applications. The goal is that an application built with wrangler runs without changing its code -- a stateless one in this release, one with Durable Objects from 0.5. The line is drawn by what a cluster of this kind provides:
 
-- **Stateless execution only.** Durable Objects, KV, R2, D1, Queues, Workflows, Vectorize and the like need storage and placement with ownership that this release does not have; configuration that uses them is refused at conversion.
+- **Stateless execution only, in this release.** Durable Objects, KV, R2, D1, Queues, Workflows, Vectorize and the like need storage and placement with ownership that this release does not have; configuration that uses them is refused at conversion. Durable Objects are being built for 0.5, with D1's basic shape; KV and an object storage service follow.
 - **No Cloudflare cloud services.** Workers AI, Hyperdrive, Email, dispatch namespaces, Access, Rate Limiting and similar bindings are services of Cloudflare's network, not of the runtime.
 - **Not yet.** Scheduled triggers need scheduling across the cluster -- one trigger runs once in the whole cluster -- and JS RPC needs capabilities and their lifetimes across machines; neither is done, and only `fetch` handlers are ever called.
 

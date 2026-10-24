@@ -27,7 +27,7 @@ and entries with empty values (`[]`, `{}` and the like, which build tools often 
 
 | Category | Configuration entries |
 | --- | --- |
-| Stateful and cloud services (this platform does not provide them) | `kv_namespaces`, `durable_objects`, `migrations`, `r2_buckets`, `d1_databases`, `queues`, `hyperdrive`, `vectorize`, `ai`, `workflows`, `analytics_engine_datasets`, `browser`, `containers`, `dispatch_namespaces`, `send_email`, `mtls_certificates` and others |
+| Stateful and cloud services (this release does not provide them; Durable Objects come in 0.5) | `kv_namespaces`, `durable_objects`, `migrations`, `r2_buckets`, `d1_databases`, `queues`, `hyperdrive`, `vectorize`, `ai`, `workflows`, `analytics_engine_datasets`, `browser`, `containers`, `dispatch_namespaces`, `send_email`, `mtls_certificates` and others |
 | Ecosystem features not done yet | Scheduled triggers (`triggers`), JS RPC (calling class methods over a Service Binding), Tail Workers, email handlers (`email()` is never called) |
 | Cloudflare's routing and environments | `routes`, `route`, `env` (Coworkerd's routes are decided by `cowctl deploy --route`: a hostname the administrator registered to the tenant, or `/<tenant>/...` under the cluster's default host) |
 | Rule files among static assets | `_redirects` and `_headers` with rules |
