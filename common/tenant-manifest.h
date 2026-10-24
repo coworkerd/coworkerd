@@ -16,7 +16,7 @@
 // manifest per tenant -- its record, and each Worker's active pointer, version table, routes and sealed secrets --, the
 // tenant index that names each tenant's current manifest, and the credentials index. Each is a revision sequence
 // (object-state.h) with a hint, written by the control plane alone; the nodes read the index and the manifests it names
-// and turn them into the deployment state's keys (DeploymentState), whose evaluation is the one etcd's keys had.
+// and turn them into the deployment state's keys (DeploymentState), whose evaluation is the one 0.3's keys had.
 namespace coworkerd {
 
 // ---- Keys ----
@@ -157,7 +157,7 @@ using DefinitionBytes = std::map<std::string, std::string>;
 // it is then not valid: "missing secret: <name>").
 using SecretOpener = std::function<std::optional<std::string>(const std::string& tenant, const std::string& worker,
     const std::string& name, const ManifestSecret& sealed)>;
-// The keys one tenant contributes, relative to DEPLOYMENT_PREFIX as DeploymentState reads them: <t>/active/<w>,
+// The keys one tenant contributes, as DeploymentState reads them: <t>/active/<w>,
 // <t>/definitions/<w>/<v> (a version whose definition is not in `definitions` has no key: unknown, as a definition key
 // that is missing), <t>/secrets/<w>/<name>. Routes are every tenant's at once (routeStateKeys).
 std::map<std::string, std::string> tenantStateKeys(const TenantManifest& manifest, const DefinitionBytes& definitions,

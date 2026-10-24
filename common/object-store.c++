@@ -70,7 +70,8 @@ kj::Promise<T> within(kj::Timer& timer, uint32_t ms, kj::Promise<T> promise, uin
 }
 // A key of the cluster's state; a listing's prefix may end with '/' or in the middle of a segment.
 bool stateKey(const std::string& key, bool prefix) {
-  if (!key.starts_with("members/") && !key.starts_with("check/") && !key.starts_with("cluster/") && !key.starts_with("tenants/"))
+  if (!key.starts_with("members/") && !key.starts_with("check/") && !key.starts_with("cluster/") && !key.starts_with("tenants/") &&
+      !key.starts_with("nodes/"))
     return false;
   const std::string_view rest(key);
   size_t start = 0;
@@ -142,6 +143,8 @@ std::string errorCode(const std::string& body) {
   return code;
 }
 }  // namespace
+
+std::string objectErrorCode(const std::string& body) { return errorCode(body); }
 
 std::string objectSha256(const std::string& bytes) {
   unsigned char digest[SHA256_DIGEST_LENGTH];

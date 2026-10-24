@@ -75,12 +75,12 @@ target_compile_definitions(kj-tls-local PRIVATE KJ_HAS_OPENSSL=1)
 target_include_directories(kj-tls-local PUBLIC "${capnproto_SOURCE_DIR}/c++/src")
 target_link_libraries(kj-tls-local PUBLIC kj-async OpenSSL::SSL OpenSSL::Crypto)
 
-# One binary per role (docs/components.md). `common` is what both daemons share -- the etcd and object
-# store clients, the deployment state model, the configuration, the cleaning of reasons and the log sink, the
-# schema. The node daemon `coworkerd` sees common/ and node/, the control plane `coworkerd-apiserver` common/
+# One binary per role (docs/components.md). `common` is what both daemons share -- the object store client and
+# the state on it, the JSON helpers, the deployment state model, the configuration, the cleaning of reasons and the
+# log sink, the schema. The node daemon `coworkerd` sees common/ and node/, the control plane `coworkerd-apiserver` common/
 # and apiserver/: neither has the other's directory on its include path or links its sources.
 add_library(common STATIC
-  common/etcd.c++
+  common/json.c++
   common/object-store.c++
   common/object-state.c++
   common/tenant-manifest.c++
@@ -122,7 +122,6 @@ add_executable(coworkerd-apiserver
   apiserver/deployment-tool.c++
   apiserver/manifests.c++
   apiserver/tenants.c++
-  apiserver/etcd-auth.c++
   apiserver/rotation-tool.c++
 )
 target_include_directories(coworkerd-apiserver PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")

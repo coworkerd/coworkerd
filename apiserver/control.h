@@ -1,13 +1,13 @@
 #pragma once
 
 // The control plane's operations (by tenant), behind /v1 (main.c++): the deployment tool's own
-// (deployment-tool.c++), tenants, credentials and usage (tenants.c++) and etcd's users and roles (etcd-auth.c++). The
+// (deployment-tool.c++) and tenants, credentials and usage (tenants.c++). The
 // desired state -- tenants, credentials, versions, pointers, routes, secrets -- is the object store's (manifests.h): every
 // read is the in-memory mirror's, every write one aggregate's next revision. The deployment operations answer
 // {"ok":true,"record":...} or {"ok":false,"kind","reason","record"}; main.c++ maps a reason to a /v1 code. Worker names
 // are full names, <tenant>/<worker>.
 #include "deployment.h"
-#include "etcd.h"
+#include "json.h"
 #include "manifests.h"
 #include "object-store.h"
 #include "tenancy.h"
@@ -25,17 +25,14 @@
 namespace coworkerd {
 
 struct ControlContext {
-  // The members' (membership.backend etcd) and the usage rows' etcd.
-  EtcdClient& etcd;
   ObjectStore& storage;
   ManifestStore& state;
   kj::Timer& timer;
   kj::Network& network;
   const kj::HttpHeaderTable& headers;
   std::string token;  // the nodes' management token (trial loads)
-  // The members trial loads go to: etcd's member keys, or (membership.backend objectStore) the heartbeats under
-  // members/ in `storage`, live within ttlSeconds + livenessGraceMs of the listing's Date.
-  bool membersOnObjectStore = false;
+  // The members trial loads go to: the heartbeats under members/ in `storage`, live within ttlSeconds + livenessGraceMs
+  // of the listing's Date.
   uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
 };
 
@@ -105,17 +102,26 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string tenant)
 kj::Promise<ApiAnswer> createCredential(ManifestStore& state, std::string tenant, std::string body);
 ApiAnswer listCredentials(const ManifestStore& state, std::string tenant);
 kj::Promise<ApiAnswer> revokeCredential(ManifestStore& state, std::string tenant, std::string keyId);
-// Hourly usage rows summed over every node's rows (history does not depend on a node still being there): of one
-// tenant, or with none of every tenant. `from`/`to` are Unix milliseconds (to exclusive).
-kj::Promise<ApiAnswer> usage(EtcdClient& client, std::optional<std::string> tenant, uint64_t from, uint64_t to);
-// Every node id that has keys below /coworkerd/v2/nodes/ (members and the nodes that left records behind).
-kj::Promise<std::vector<std::string>> nodeIds(EtcdClient& client);
+// Hourly usage summed over every node's objects nodes/<nodeId>/usage/<hour> (history does not depend on a node still
+// being there): of one tenant, or with none of every tenant. `from`/`to` are Unix milliseconds (to exclusive). One listing
+// of nodes/ (and one of members/: the answer's nodes are the ones with objects under either); the hours in range are
+// read only where this process has no copy of the object's current ETag. Throws when the store cannot be read.
+struct UsageCache {
+  std::map<std::string, std::pair<std::string, NodeUsageHour>> objects;  // key -> (ETag, the object)
+  uint64_t reads = 0;
+};
+kj::Promise<ApiAnswer> usage(ObjectStore& storage, UsageCache& cache, std::optional<std::string> tenant, uint64_t from,
+    uint64_t to);
+// The usage objects older than retentionHours at `nowUnixMs` (every node's: a node that left removes none of its own any
+// more), removed; the control plane runs it at its start and then once a day. 0 hours keeps everything.
+struct UsageCleanup {
+  std::string cutoff;  // the first hour kept
+  uint64_t listed = 0, removed = 0;
+  std::string json() const;
+};
+kj::Promise<UsageCleanup> cleanUsage(ObjectStore& storage, uint32_t retentionHours, uint64_t nowUnixMs);
 
 // ---- rotation-tool.c++ ----
 int runRotationTool(int argc, char** argv);
-// ---- etcd-auth.c++ ----
-// etcd's users and roles of the v2 layout, each user's password from its file, then authentication on.
-// The compose file's init runs it at every start of the cluster.
-int runEtcdAuthTool(int argc, char** argv);
 
 }  // namespace coworkerd

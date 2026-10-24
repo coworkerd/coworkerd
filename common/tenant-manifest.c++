@@ -18,9 +18,9 @@
 
 namespace coworkerd {
 namespace {
-using etcd::Json;
-using etcd::field;
-using etcd::quote;
+using json::Json;
+using json::field;
+using json::quote;
 
 constexpr size_t NONCE_BYTES = 12, TAG_BYTES = 16;
 

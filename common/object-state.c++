@@ -1,5 +1,5 @@
 #include "object-state.h"
-#include "etcd.h"
+#include "json.h"
 #include "tenant-manifest.h"
 #include "support.h"
 
@@ -153,6 +153,7 @@ std::string memberRegistrationKey(const std::string& nodeId, uint64_t epoch) {
 }
 std::string memberHeartbeatKey(const std::string& nodeId, uint64_t epoch) { return memberPrefix(nodeId) + padded(epoch); }
 std::string memberDrainKey(const std::string& nodeId, uint64_t epoch) { return memberHeartbeatKey(nodeId, epoch) + ".draining"; }
+std::string memberSuspectsKey(const std::string& nodeId, uint64_t epoch) { return memberHeartbeatKey(nodeId, epoch) + ".suspects"; }
 std::string memberProbePrefix(const std::string& nodeId) { return memberPrefix(nodeId) + "probe/"; }
 
 std::map<std::string, ListedNode> readMemberListing(const ObjectListing& listing, uint64_t* ignored) {
@@ -165,10 +166,11 @@ std::map<std::string, ListedNode> readMemberListing(const ObjectListing& listing
     const std::string id(rooted ? key.substr(root.size(), slash - root.size()) : std::string_view());
     const auto rest = rooted ? key.substr(slash + 1) : std::string_view();
     std::optional<uint64_t> epoch;
-    enum { REGISTRATION, HEARTBEAT, DRAINING, NONE } kind = NONE;
+    enum { REGISTRATION, HEARTBEAT, DRAINING, SUSPECTS, NONE } kind = NONE;
     if (rooted && safeName(id) && id != "." && id != "..") {
       if (rest.starts_with("epochs/")) { epoch = epochSegment(rest.substr(7)); kind = REGISTRATION; }
       else if (rest.ends_with(".draining")) { epoch = epochSegment(rest.substr(0, rest.size() - 9)); kind = DRAINING; }
+      else if (rest.ends_with(".suspects")) { epoch = epochSegment(rest.substr(0, rest.size() - 9)); kind = SUSPECTS; }
       else if (rest.starts_with("probe/")) { if (ignored) ++*ignored; continue; }
       else { epoch = epochSegment(rest); kind = HEARTBEAT; }
     }
@@ -182,7 +184,8 @@ std::map<std::string, ListedNode> readMemberListing(const ObjectListing& listing
       listed.heartbeat = true;
       listed.heartbeatUnixMs = object.lastModifiedUnixMs;
       listed.pageDateUnixMs = object.pageDateUnixMs;
-    } else { listed.draining = true; listed.drainKeyUnixMs = object.lastModifiedUnixMs; }
+    } else if (kind == DRAINING) { listed.draining = true; listed.drainKeyUnixMs = object.lastModifiedUnixMs; }
+    else { listed.suspects = true; listed.suspectsUnixMs = object.lastModifiedUnixMs; listed.suspectsEtag = object.etag; }
   }
   return nodes;
 }
@@ -229,7 +232,7 @@ IdentityUse identityUse(const ListedNode& node, uint64_t dateUnixMs, uint32_t tt
 }
 
 std::string memberRecordJson(const MemberRecord& record) {
-  using etcd::quote;
+  using json::quote;
   return "{\"nodeId\":" + quote(record.nodeId) + ",\"epoch\":" + quote(std::to_string(record.epoch)) +
       ",\"address\":" + quote(record.address) + ",\"startedAtUnixMs\":" + std::to_string(record.startedAtUnixMs) +
       ",\"state\":" + quote(record.state) + ",\"writtenAtUnixMs\":" + std::to_string(record.writtenAtUnixMs) +
@@ -243,21 +246,21 @@ std::optional<MemberRecord> parseMemberRecord(const std::string& bytes, std::str
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), json);
     auto reader = json.asReader();
     MemberRecord record;
-    record.nodeId = etcd::text(reader, "nodeId");
-    const auto epoch = etcd::text(reader, "epoch");
+    record.nodeId = json::text(reader, "nodeId");
+    const auto epoch = json::text(reader, "epoch");
     KJ_REQUIRE(safeName(record.nodeId), "invalid member nodeId");
     KJ_REQUIRE(!epoch.empty() && epoch.size() <= 20 && std::all_of(epoch.begin(), epoch.end(),
         [](unsigned char c) { return std::isdigit(c); }), "invalid member epoch");
     record.epoch = std::stoull(epoch);
     KJ_REQUIRE(record.epoch > 0, "invalid member epoch");
-    record.instance = etcd::text(reader, "instance");
+    record.instance = json::text(reader, "instance");
     KJ_REQUIRE(!record.instance.empty(), "a member record without its instance");
-    if (auto address = etcd::field(reader, "address"); address.isString()) record.address = address.getString().cStr();
-    if (auto state = etcd::field(reader, "state"); state.isString()) record.state = state.getString().cStr();
+    if (auto address = json::field(reader, "address"); address.isString()) record.address = address.getString().cStr();
+    if (auto state = json::field(reader, "state"); state.isString()) record.state = state.getString().cStr();
     KJ_REQUIRE(record.state == "active" || record.state == "draining", "invalid member state");
     for (auto [name, target] : {std::pair{"startedAtUnixMs", &record.startedAtUnixMs},
         std::pair{"writtenAtUnixMs", &record.writtenAtUnixMs}}) {
-      auto value = etcd::field(reader, name);
+      auto value = json::field(reader, name);
       if (value.isNumber() && value.getNumber() > 0) *target = static_cast<uint64_t>(value.getNumber());
     }
     return record;
@@ -300,7 +303,7 @@ std::string ConditionalPutMeasurement::json() const {
   for (size_t i = 0; i < createdPerRound.size(); ++i) out << (i ? "," : "") << createdPerRound[i];
   out << "],\"statuses\":{";
   size_t index = 0;
-  for (const auto& [status, count] : statuses) out << (index++ ? "," : "") << etcd::quote(status) << ":" << count;
+  for (const auto& [status, count] : statuses) out << (index++ ? "," : "") << json::quote(status) << ":" << count;
   out << "},\"elapsedMs\":" << elapsedMs << "}";
   return out.str();
 }

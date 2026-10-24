@@ -29,7 +29,7 @@ bool formatOne(const std::string& bytes) {
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), json);
-    auto format = etcd::field(json.asReader(), "format");
+    auto format = json::field(json.asReader(), "format");
     return format.isNumber() && format.getNumber() == 1;
   } catch (const kj::Exception&) {
     return false;

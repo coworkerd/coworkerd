@@ -16,13 +16,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 # An unprivileged user owns the Server's state (stack directory) and the cluster's generated secrets.
-# The compose file's init container also mounts the etcd and object store volumes at the last two
-# directories first, so that a new volume takes their owner and those services run as this user too.
-# The object store's directory is not empty: its image has content at /data that Docker would copy
-# (as root) into a volume still empty when that container starts.
+# The compose file's secrets container also mounts the object store's volume at the last directory first,
+# so that a new volume takes its owner and the object store runs as this user too. That directory is not
+# empty: the store's image has content at /data that Docker would copy (as root) into a volume still empty
+# when that container starts.
 RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/coworkerd --no-create-home --shell /usr/sbin/nologin coworkerd \
  && install -d -o coworkerd -g coworkerd -m 0750 /var/lib/coworkerd /var/lib/coworkerd-secrets \
- && install -d -o coworkerd -g coworkerd -m 0700 /var/lib/coworkerd-etcd /var/lib/coworkerd-storage \
+ && install -d -o coworkerd -g coworkerd -m 0700 /var/lib/coworkerd-storage \
  && install -o coworkerd -g coworkerd -m 0600 /dev/null /var/lib/coworkerd-storage/.coworkerd
 # coworkerd-launcher starts each workerd process in its least-privilege environment; in a container that
 # needs the options of docker-compose.sandbox.yml (sandbox.mode auto runs workerd without it otherwise).

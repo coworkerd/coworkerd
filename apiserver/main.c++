@@ -3,7 +3,7 @@
 #include "config.h"
 #include "control.h"
 #include "deployment.h"
-#include "etcd.h"
+#include "json.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
 #include "object-store.h"
@@ -168,8 +168,8 @@ int runDrainTool(int argc, char** argv) {
   capnp::MallocMessageBuilder message;
   auto json = message.initRoot<capnp::JsonValue>();
   capnp::JsonCodec().decodeRaw(kj::arrayPtr(record.data(), record.size()), json);
-  auto revoke = coworkerd::etcd::field(json, "revokeStatus");
-  auto outcome = coworkerd::etcd::field(json, "outcome");
+  auto revoke = coworkerd::json::field(json, "revokeStatus");
+  auto outcome = coworkerd::json::field(json, "outcome");
   std::cout << "{\"server\":\"" << jsonEscape(server) << "\",\"exited\":true,\"elapsedMs\":" << std::setprecision(17)
             << monotonicTimeMs() - started << ",\"outcome\":\"" << (outcome.isString() ? outcome.getString().cStr() : "")
             << "\",\"revokeStatus\":\"" << jsonEscape(revoke.isString() ? revoke.getString().cStr() : "") << "\"}" << std::endl;
@@ -178,13 +178,14 @@ int runDrainTool(int argc, char** argv) {
 
 // ---- The control plane (/v1 by tenant): `coworkerd-apiserver --config FILE` ----
 // The API of docs/control-plane-api.md section 2, in front of the deployment tool's own operations
-// (deployment-tool.c++) and the tenants, credentials and usage (tenants.c++). The configuration file names etcd
-// (etcdEndpoint), the object store with the deploy identity (storage), the administrator's credential
+// (deployment-tool.c++) and the tenants, credentials and usage (tenants.c++). The configuration file names the object
+// store with the deploy identity (storage), the administrator's credential
 // (control.adminCredential or COWORKERD_ADMIN_CREDENTIAL, required), the nodes' management token (management.token
 // or COWORKERD_MANAGEMENT_TOKEN: what this sends to the nodes' trial, state and log endpoints) and
 // control.listenAddress (default 0.0.0.0:8940). Every /v1/ request takes `Authorization: Bearer <credential>`: the
-// administrator's, or a tenant's (scope tenant:<t>, created through the API). It keeps no state of its own: each
-// answer is read from etcd and from the nodes, at the addresses their member keys advertise, when it is asked.
+// administrator's, or a tenant's (scope tenant:<t>, created through the API). It keeps no state of its own: the
+// desired state is the object store's (a mirror in memory), the members and the usage are read from the store and the
+// nodes, at the addresses their heartbeats advertise, when it is asked.
 //
 //   GET    /v1/status                                        any: the cluster's nodes, versions, this instance
 //   GET    /v1/nodes, /v1/nodes/{node}                       admin: each node's state endpoint, summarized
@@ -209,7 +210,7 @@ int runDrainTool(int argc, char** argv) {
 // endpoint), QUOTA_EXCEEDED (422, the reason names the quota), HOSTNAME_NOT_OWNED (403).
 
 struct ControlSettings {
-  std::string listenAddress, etcdEndpoint, token, tokenSource, configFile;
+  std::string listenAddress, token, tokenSource, configFile;
   // The desired state's mirror: its hints read again every pollIntervalMs; the secrets key that seals secrets' values.
   uint32_t pollIntervalMs = 5000, startupTimeoutMs = 15000;
   std::string secretsKeyFile, secretsKeySource;
@@ -222,9 +223,10 @@ struct ControlSettings {
   uint32_t serverTimeoutMs = 2000;
   uint64_t startedAtUnixMs = 0;
   std::string instance;
-  // The members: etcd's member keys, or (membership.backend objectStore) the heartbeats under members/ in the bucket.
-  bool membersOnObjectStore = false;
+  // The members: the heartbeats under members/ in the bucket.
   uint32_t memberTtlSeconds = 15, memberGraceMs = 10000;
+  // The usage objects' retention (usage.retentionHours): the daily cleanup removes what is older, for the nodes that left.
+  uint32_t usageRetentionHours = 744;
 };
 
 // A path segment of the API: a deployment name (letters, digits, '-', '_' and '.').
@@ -366,11 +368,10 @@ private:
 
 class ControlService final: public kj::HttpService {
 public:
-  ControlService(const ControlSettings& settings, coworkerd::EtcdClient& etcd, coworkerd::ObjectStore& storage,
+  ControlService(const ControlSettings& settings, coworkerd::ObjectStore& storage,
       coworkerd::ManifestStore& state, kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
-      : settings(settings), etcd(etcd), storage(storage), state(state), timer(timer), network(network), headerTable(headerTable),
-        context{etcd, storage, state, timer, network, headerTable, settings.token, settings.membersOnObjectStore,
-            settings.memberTtlSeconds, settings.memberGraceMs} {}
+      : settings(settings), storage(storage), state(state), timer(timer), network(network), headerTable(headerTable),
+        context{storage, state, timer, network, headerTable, settings.token, settings.memberTtlSeconds, settings.memberGraceMs} {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body, Response& response) override {
@@ -664,7 +665,7 @@ private:
         KJ_REQUIRE(field.getName() == "routes" && field.getValue().isArray(), "the body is {\"routes\":[{\"host\",\"pathPrefix\"}]}");
         for (auto entry : field.getValue().getArray()) {
           KJ_REQUIRE(entry.isObject(), "a route is {\"host\",\"pathPrefix\"}");
-          list.push_back({coworkerd::etcd::text(entry, "host"), coworkerd::etcd::text(entry, "pathPrefix"), id});
+          list.push_back({coworkerd::json::text(entry, "host"), coworkerd::json::text(entry, "pathPrefix"), id});
         }
       }
       KJ_REQUIRE(list.size() <= 64, "at most 64 routes per Worker");
@@ -744,11 +745,11 @@ private:
       capnp::MallocMessageBuilder message;
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(listed.data(), listed.size()), json);
-      if (coworkerd::etcd::boolean(json, "ok")) {
-        auto record = coworkerd::etcd::field(json, "record");
-        auto list = coworkerd::etcd::field(record, "secrets");
+      if (coworkerd::json::boolean(json, "ok")) {
+        auto record = coworkerd::json::field(json, "record");
+        auto list = coworkerd::json::field(record, "secrets");
         if (list.isArray()) for (auto entry : list.getArray()) {
-          if (coworkerd::etcd::text(entry, "name") != name) continue;
+          if (coworkerd::json::text(entry, "name") != name) continue;
           co_return co_await sendJson(response, 200, "{\"workerId\":\"" + jsonEscape(id) + "\"," +
               std::string(capnp::JsonCodec().encodeRaw(entry).cStr()).substr(1));
         }
@@ -758,49 +759,32 @@ private:
     co_return co_await methodNotAllowed(response, "PUT, GET, DELETE");
   }
 
-  // The members (etcd: /coworkerd/v2/nodes/<nodeId>; objectStore: the live heartbeats under members/, each one's address
-  // read once per epoch) and what each one's state endpoint says, in parallel.
+  // The members (the live heartbeats under members/, each one's address read once per epoch) and what each one's state
+  // endpoint says, in parallel.
   struct Member { std::string id, address, state, epoch; uint64_t startedAtUnixMs = 0; int64_t heartbeatAgeMs = -1; };
   coworkerd::StoreMemberCache memberRecords;
+  // The usage objects this process read, by ETag (a past hour's object is read once).
+  coworkerd::UsageCache usageCache;
   // The members last listed: while the object store cannot be listed they stand in (the nodes' own state endpoints
   // still answer for themselves).
   std::optional<std::vector<Member>> listedMembers;
   kj::Promise<std::vector<Member>> members() {
-    if (settings.membersOnObjectStore) {
-      std::vector<Member> result;
-      std::optional<std::string> failure;
-      try {
-        for (auto& member : co_await coworkerd::readStoreMembers(storage, settings.memberTtlSeconds, settings.memberGraceMs, &memberRecords)) {
-          if (!controlName(member.id)) continue;
-          result.push_back({member.id, member.address, member.state, std::to_string(member.epoch), member.startedAtUnixMs,
-              member.heartbeatAgeMs});
-        }
-      } catch (const kj::Exception& error) {
-        failure = error.getDescription().cStr();
-      }
-      if (failure) {
-        if (listedMembers) co_return *listedMembers;
-        KJ_FAIL_REQUIRE("object store request failed: the members cannot be listed", failure->c_str());
-      }
-      listedMembers = result;
-      co_return result;
-    }
-    const std::string prefix = coworkerd::NODES_PREFIX;
-    auto raw = co_await etcd.range(prefix);
     std::vector<Member> result;
-    for (const auto& [key, kv] : raw.values) {
-      if (key.find('/', prefix.size()) != std::string::npos) continue;  // a node's own records
-      try {
-        capnp::MallocMessageBuilder message;
-        auto json = message.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(kv.value.data(), kv.value.size()), json);
-        Member member{coworkerd::etcd::text(json, "nodeId"), coworkerd::etcd::text(json, "address"),
-            coworkerd::etcd::text(json, "state"), coworkerd::etcd::text(json, "epoch")};
-        auto started = coworkerd::etcd::field(json, "startedAtUnixMs");
-        if (started.isNumber()) member.startedAtUnixMs = static_cast<uint64_t>(started.getNumber());
-        if (key == prefix + member.id && controlName(member.id)) result.push_back(std::move(member));
-      } catch (const kj::Exception&) {}  // not a member record
+    std::optional<std::string> failure;
+    try {
+      for (auto& member : co_await coworkerd::readStoreMembers(storage, settings.memberTtlSeconds, settings.memberGraceMs, &memberRecords)) {
+        if (!controlName(member.id)) continue;
+        result.push_back({member.id, member.address, member.state, std::to_string(member.epoch), member.startedAtUnixMs,
+            member.heartbeatAgeMs});
+      }
+    } catch (const kj::Exception& error) {
+      failure = error.getDescription().cStr();
     }
+    if (failure) {
+      if (listedMembers) co_return *listedMembers;
+      KJ_FAIL_REQUIRE("object store request failed: the members cannot be listed", failure->c_str());
+    }
+    listedMembers = result;
     co_return result;
   }
 
@@ -863,7 +847,7 @@ private:
   static std::string pick(capnp::JsonValue::Reader object, std::initializer_list<const char*> names) {
     std::string picked = "{";
     if (object.isObject()) for (auto name : names) {
-      auto value = coworkerd::etcd::field(object, name);
+      auto value = coworkerd::json::field(object, name);
       if (value.isNull()) continue;
       picked += std::string(picked.size() > 1 ? "," : "") + "\"" + name + "\":" + capnp::JsonCodec().encodeRaw(value).cStr();
     }
@@ -876,8 +860,7 @@ private:
     std::string out = "{\"nodeId\":\"" + jsonEscape(member.id) + "\",\"state\":\"" + jsonEscape(member.state) + "\",\"reachable\":" +
         (state.ok ? "true" : "false");
     if (!tenantView) out += ",\"address\":\"" + jsonEscape(member.address) + "\",\"epoch\":\"" + jsonEscape(member.epoch) +
-        "\",\"startedAtUnixMs\":" + std::to_string(member.startedAtUnixMs) + ",\"backend\":\"" +
-        (settings.membersOnObjectStore ? "objectStore" : "etcd") + "\",\"lastHeartbeatAgeMs\":" +
+        "\",\"startedAtUnixMs\":" + std::to_string(member.startedAtUnixMs) + ",\"backend\":\"objectStore\",\"lastHeartbeatAgeMs\":" +
         (member.heartbeatAgeMs >= 0 ? std::to_string(member.heartbeatAgeMs) : std::string("null"));
     if (!state.ok) return out + (tenantView ? "}" : ",\"problem\":\"" + jsonEscape(state.error) + "\"}");
     try {
@@ -885,7 +868,7 @@ private:
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(state.body.data(), state.body.size()), json);
       auto reader = json.asReader();
-      using coworkerd::etcd::field;
+      using coworkerd::json::field;
       out += ",\"version\":" + pick(field(reader, "version"), tenantView ? std::initializer_list<const char*>{"server"}
           : std::initializer_list<const char*>{"server", "source", "workerdUpstream", "patchSeriesSha256"});
       if (tenantView) return out + "}";
@@ -928,10 +911,10 @@ private:
     auto states = co_await kj::joinPromises(pending.releaseAsArray());
     std::string out = "{\"apiserver\":{\"version\":" + versionJson() + ",\"instance\":\"" + jsonEscape(settings.instance) +
         "\",\"startedAtUnixMs\":" + std::to_string(settings.startedAtUnixMs);
-    if (caller.admin) out += ",\"etcdEndpoint\":\"" + jsonEscape(settings.etcdEndpoint) + "\",\"storageEndpoint\":\"" +
+    // Two fields of 0.3 stay, null: /v1 only adds fields (the endpoint and the revision of a store 0.4 does not have).
+    if (caller.admin) out += ",\"etcdEndpoint\":null,\"storageEndpoint\":\"" +
         jsonEscape(settings.storage.endpoint) + "\",\"pathRouting\":" + (settings.pathRouting ? "true" : "false");
-    // The desired state's revisions (the store's indexes as this control plane's mirror holds them); etcd no longer holds
-    // it, and the field that named etcd's revision stays, null.
+    // The desired state's revisions (the store's indexes as this control plane's mirror holds them).
     out += "},\"caller\":" + std::string(caller.admin ? "{\"admin\":true}" : "{\"admin\":false,\"tenant\":\"" + caller.tenant + "\"}") +
         ",\"etcdRevision\":null,\"storage\":{\"tenantsRevision\":\"" + std::to_string(state.index().revision) +
         "\",\"credentialsRevision\":\"" + std::to_string(state.credentials().revision) + "\",\"client\":" +
@@ -970,17 +953,17 @@ private:
     if (!number("from", from)) from = to > 86400000 ? to - 86400000 : 0;
     for (const auto& [key, value] : query) valid = valid && (key == "from" || key == "to" || (key == "by" && value == "hour"));
     if (!valid) co_return co_await fail(response, 400, "INVALID_REQUEST", "usage?from=<unix ms>&to=<unix ms>&by=hour");
-    // Usage rows are still in etcd (each node's own prefix).
+    // The usage objects every node writes (nodes/<nodeId>/usage/<hour>), summed.
     std::optional<std::string> unreachable;
     coworkerd::ApiAnswer result;
     try {
-      result = co_await coworkerd::usage(etcd, tenant, from, to);
+      result = co_await coworkerd::usage(storage, usageCache, tenant, from, to);
     } catch (const kj::Exception& error) {
       unreachable = error.getDescription().cStr();
     }
     if (unreachable)
-      co_return co_await fail(response, 503, "ETCD_UNAVAILABLE", "the usage rows are in etcd, which cannot be reached (" +
-          settings.etcdEndpoint + "): " + *unreachable);
+      co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "the usage objects cannot be read from the object store (" +
+          settings.storage.endpoint + "): " + *unreachable);
     co_return co_await send(response, result);
   }
 
@@ -992,16 +975,17 @@ private:
     uint64_t versions = 0;
     for (const auto& [id, names] : counts.versions) versions += names.size();
     const auto now = wallTimeMsForTest();
-    // The last day's usage from etcd's rows; null while etcd cannot be reached.
+    // The last day's usage from the nodes' objects; null while the store cannot be read.
     coworkerd::ApiAnswer day;
     day.status = 503;
-    try { day = co_await coworkerd::usage(etcd, tenant, now > 86400000 ? now - 86400000 : 0, now + 1); } catch (const kj::Exception&) {}
+    try { day = co_await coworkerd::usage(storage, usageCache, tenant, now > 86400000 ? now - 86400000 : 0, now + 1); }
+    catch (const kj::Exception&) {}
     std::string total = "null";
     if (day.status == 200) {
       capnp::MallocMessageBuilder message;
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(day.body.data(), day.body.size()), json);
-      total = capnp::JsonCodec().encodeRaw(coworkerd::etcd::field(json, "total")).cStr();
+      total = capnp::JsonCodec().encodeRaw(coworkerd::json::field(json, "total")).cStr();
     }
     auto record = coworkerd::tenantRecordJson(*read.tenant);
     if (read.tenant->deletion == "null") { record.pop_back(); record += ",\"deletion\":null}"; }
@@ -1038,16 +1022,16 @@ private:
         capnp::MallocMessageBuilder message;
         auto json = message.initRoot<capnp::JsonValue>();
         capnp::JsonCodec().decodeRaw(kj::arrayPtr(answers[i].body.data(), answers[i].body.size()), json);
-        const auto epoch = coworkerd::etcd::text(json, "epoch");
+        const auto epoch = coworkerd::json::text(json, "epoch");
         // A node that restarted numbers its lines from 1 again: its new lines from now on.
         const bool restarted = cursor.started && epoch != cursor.epoch;
         cursor.epoch = epoch;
-        auto next = coworkerd::etcd::field(json, "next");
+        auto next = coworkerd::json::field(json, "next");
         if (next.isNumber()) cursor.next = static_cast<uint64_t>(next.getNumber());
         cursor.started = true;
         if (!restarted) {
-          for (auto entry : coworkerd::etcd::field(json, "lines").getArray()) {
-            auto at = coworkerd::etcd::field(entry, "atUnixMs"), seq = coworkerd::etcd::field(entry, "seq");
+          for (auto entry : coworkerd::json::field(json, "lines").getArray()) {
+            auto at = coworkerd::json::field(entry, "atUnixMs"), seq = coworkerd::json::field(entry, "seq");
             std::string text = capnp::JsonCodec().encodeRaw(entry).cStr();
             text.pop_back();
             text += ",\"nodeId\":\"" + jsonEscape(member.id) + "\"}";
@@ -1056,7 +1040,7 @@ private:
           }
         }
         for (const char* name : {"keptLines", "droppedLines", "truncatedLines", "evictedLines", "bufferBytes", "next"}) {
-          auto value = coworkerd::etcd::field(json, name);
+          auto value = coworkerd::json::field(json, name);
           if (!value.isNull()) batch.nodes += std::string(",\"") + name + "\":" + capnp::JsonCodec().encodeRaw(value).cStr();
         }
         batch.nodes += "}";
@@ -1132,12 +1116,12 @@ private:
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(result.data(), result.size()), json);
-    auto record = coworkerd::etcd::field(json, "record");
+    auto record = coworkerd::json::field(json, "record");
     std::string recordText = record.isNull() ? "null" : capnp::JsonCodec().encodeRaw(record).cStr();
-    if (coworkerd::etcd::boolean(json, "ok")) {
+    if (coworkerd::json::boolean(json, "ok")) {
       co_return co_await sendJson(response, 200, wrap ? wrap(recordText) : recordText);
     }
-    const std::string reason = coworkerd::etcd::text(json, "reason"), kind = coworkerd::etcd::text(json, "kind");
+    const std::string reason = coworkerd::json::text(json, "reason"), kind = coworkerd::json::text(json, "kind");
     auto has = [&](std::string_view part) { return reason.find(part) != std::string::npos; };
     uint status = 422;
     std::string code = std::string(area) == "secret" ? "SECRET_REFUSED" : "DEPLOYMENT_REFUSED", extra;
@@ -1151,11 +1135,11 @@ private:
       code = "LOAD_FAILED";
       // The trial's verdict: its category and cleaned message (the node cleaned them).
       try {
-        auto versions = coworkerd::etcd::field(coworkerd::etcd::field(record, "trial"), "versions");
+        auto versions = coworkerd::json::field(coworkerd::json::field(record, "trial"), "versions");
         if (versions.isArray() && versions.getArray().size()) {
-          auto verdict = coworkerd::etcd::field(versions.getArray()[versions.getArray().size() - 1], "verdict");
+          auto verdict = coworkerd::json::field(versions.getArray()[versions.getArray().size() - 1], "verdict");
           for (const char* name : {"category", "message", "nodeId"}) {
-            auto value = coworkerd::etcd::field(verdict, name);
+            auto value = coworkerd::json::field(verdict, name);
             if (value.isString()) extra += std::string(",\"") + name + "\":" + capnp::JsonCodec().encodeRaw(value).cStr();
           }
         }
@@ -1208,7 +1192,6 @@ private:
   }
 
   const ControlSettings& settings;
-  coworkerd::EtcdClient& etcd;
   coworkerd::ObjectStore& storage;
   coworkerd::ManifestStore& state;
   kj::Timer& timer;
@@ -1258,6 +1241,24 @@ kj::Promise<void> pollForever(coworkerd::ManifestStore& state, kj::Timer& timer,
   }
 }
 
+// The usage objects of the hours past usage.retentionHours (of every node: a node removes its own, so what is left is the
+// nodes' that left), removed at the start and then once a day. A failure is logged; the next day tries again.
+constexpr uint64_t USAGE_CLEANUP_MS = 86400000;
+kj::Promise<void> usageCleanupForever(coworkerd::ObjectStore& storage, kj::Timer& timer, uint32_t retentionHours) {
+  for (;;) {
+    std::string outcome;
+    try {
+      auto cleaned = co_await coworkerd::cleanUsage(storage, retentionHours, wallTimeMsForTest());
+      outcome = ",\"ok\":true,\"cleanup\":" + cleaned.json();
+    } catch (const kj::Exception& error) {
+      outcome = ",\"ok\":false,\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"";
+    }
+    std::cout << "[control] {\"event\":\"usage-cleanup\",\"retentionHours\":" << retentionHours << outcome
+              << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    co_await timer.afterDelay(USAGE_CLEANUP_MS * kj::MILLISECONDS);
+  }
+}
+
 // Every member hears this control plane's addresses at startup and every ANNOUNCE_MS after.
 constexpr uint32_t ANNOUNCE_MS = 10000;
 kj::Promise<void> announceForever(ControlService& service, kj::Timer& timer, std::string body) {
@@ -1280,7 +1281,8 @@ int runControlPlane(const std::vector<std::string>& args) {
   KJ_REQUIRE(config.desiredState.objectStore.backend == "s3" && !config.desiredState.objectStore.endpoint.empty(),
       "the control plane keeps no state of its own: the desired state is the object store's -- set storage.endpoint (and "
       "storage.credentialsFile, the deploy identity)");
-  KJ_REQUIRE(!config.etcdEndpoint.empty(), "the nodes' usage rows are in etcd until 0.4's last round: set etcdEndpoint");
+  // The test clock offset (clockOffsetMsForTest): the usage's hours as the nodes with the same offset count them.
+  clockOffsetMsForTest = config.clockOffsetMsForTest;
   // The secrets key seals every secret's value before it is written (COWORKERD_SECRETS_KEY_FILE overrides the file's).
   settings.secretsKeyFile = config.secretsKeyFile;
   settings.secretsKeySource = settings.secretsKeyFile.empty() ? "unset" : "config";
@@ -1293,11 +1295,10 @@ int runControlPlane(const std::vector<std::string>& args) {
   auto secretsKey = coworkerd::SecretsKey::load(settings.secretsKeyFile);
   settings.pollIntervalMs = config.controlPollIntervalMs;
   settings.startupTimeoutMs = config.desiredState.startupTimeoutMs;
-  settings.etcdEndpoint = config.etcdEndpoint;
   settings.storage = config.desiredState.objectStore;
-  settings.membersOnObjectStore = config.membership.backend == "objectStore";
   settings.memberTtlSeconds = config.membership.ttlSeconds;
   settings.memberGraceMs = config.membership.livenessGraceMs;
+  settings.usageRetentionHours = config.usage.retentionHours;
   settings.storageCredentials = !config.storageCredentialsFile.empty() ? "file" : !settings.storage.accessKey.empty() ? "inline"
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   settings.listenAddress = config.controlListenAddress.empty() ? "0.0.0.0:8940" : config.controlListenAddress;
@@ -1340,7 +1341,6 @@ int runControlPlane(const std::vector<std::string>& args) {
   auto io = kj::setupAsyncIo();
   auto headerTable = kj::HttpHeaderTable::Builder().build();
   auto& timer = io.provider->getTimer();
-  coworkerd::EtcdClient etcd(settings.etcdEndpoint, 2000, io.provider->getNetwork(), timer, *headerTable);
   coworkerd::ObjectStore storage(settings.storage, io.provider->getNetwork(), timer);
   coworkerd::ManifestStore state(storage, timer, std::move(secretsKey));
   // The revisions this control plane writes name it: its host and process, and a random value of this start.
@@ -1364,21 +1364,23 @@ int runControlPlane(const std::vector<std::string>& args) {
       timer.afterDelay(250 * kj::MILLISECONDS).wait(io.waitScope);
     }
   }
-  ControlService service(settings, etcd, storage, state, timer, io.provider->getNetwork(), *headerTable);
+  ControlService service(settings, storage, state, timer, io.provider->getNetwork(), *headerTable);
   kj::HttpServer server(timer, *headerTable, service);
   auto address = io.provider->getNetwork().parseAddress(settings.listenAddress.c_str()).wait(io.waitScope);
   auto listener = address->listen();
   std::cout << "[control] {\"event\":\"configuration\",\"version\":" << versionJson() << ",\"configFile\":\""
             << jsonEscape(settings.configFile) << "\",\"listenAddress\":\"" << jsonEscape(settings.listenAddress)
-            << "\",\"etcdEndpoint\":\"" << jsonEscape(settings.etcdEndpoint) << "\",\"storage\":{\"endpoint\":\""
+            << "\",\"storage\":{\"endpoint\":\""
             << jsonEscape(settings.storage.endpoint) << "\",\"bucket\":\"" << jsonEscape(settings.storage.bucket)
             << "\",\"credentials\":\"" << settings.storageCredentials << "\"},\"adminCredential\":\"set\",\"adminCredentialSource\":\""
             << settings.adminSource << "\",\"managementToken\":\"" << (settings.token.empty() ? "unset" : "set") << "\",\"tokenSource\":\""
             << settings.tokenSource << "\",\"pathRouting\":" << (settings.pathRouting ? "true" : "false")
             << ",\"temporaryDirectory\":\"" << jsonEscape(settings.temporaryDirectory.string())
             << "\",\"maxUploadBytes\":" << settings.maxUploadBytes << ",\"serverTimeoutMs\":" << settings.serverTimeoutMs
-            << ",\"membership\":{\"backend\":\"" << (settings.membersOnObjectStore ? "objectStore" : "etcd") << "\",\"ttlSeconds\":"
-            << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "},\"desiredState\":{\"pollIntervalMs\":"
+            << ",\"membership\":{\"backend\":\"objectStore\",\"ttlSeconds\":"
+            << settings.memberTtlSeconds << ",\"livenessGraceMs\":" << settings.memberGraceMs << "},\"usage\":{\"retentionHours\":"
+            << settings.usageRetentionHours << ",\"cleanupIntervalMs\":" << USAGE_CLEANUP_MS << "},\"clockOffsetMsForTest\":"
+            << clockOffsetMsForTest << ",\"desiredState\":{\"pollIntervalMs\":"
             << settings.pollIntervalMs << ",\"secretsKeyFile\":\"" << jsonEscape(settings.secretsKeyFile) << "\",\"secretsKeySource\":\""
             << settings.secretsKeySource << "\",\"secretsKey\":\"" << state.secretsKey()->fingerprint() << "\",\"state\":" << state.json()
             << "}}" << std::endl;
@@ -1391,7 +1393,8 @@ int runControlPlane(const std::vector<std::string>& args) {
   std::cout << "[control] {\"event\":\"announce\",\"addresses\":" << body.substr(body.find('[')) << std::endl;
   server.listenHttp(*listener).exclusiveJoin(stop.ignoreResult()).exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(announceForever(service, timer, std::move(body)))
-      .exclusiveJoin(pollForever(state, timer, settings.pollIntervalMs)).wait(io.waitScope);
+      .exclusiveJoin(pollForever(state, timer, settings.pollIntervalMs))
+      .exclusiveJoin(usageCleanupForever(storage, timer, settings.usageRetentionHours)).wait(io.waitScope);
   std::cout << "[control] {\"event\":\"stopped\"}" << std::endl;
   return 0;
 }
@@ -1399,7 +1402,7 @@ int runControlPlane(const std::vector<std::string>& args) {
 constexpr const char* USAGE =
     "usage: coworkerd-apiserver --config FILE  (the control plane's API, default 0.0.0.0:8940)\n"
     "       coworkerd-apiserver --version\n"
-    "       coworkerd-apiserver tool <apply|upsert|remove|show|compile|secret|rotate|drain|etcd-auth> ...\n";
+    "       coworkerd-apiserver tool <init|apply|upsert|remove|show|compile|secret|rotate|drain> ...\n";
 
 }  // namespace
 

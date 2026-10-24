@@ -1,5 +1,6 @@
 #include "tenancy.h"
 #include "deployment.h"
+#include "support.h"
 
 #include <capnp/message.h>
 
@@ -9,7 +10,7 @@
 #include <set>
 
 namespace coworkerd {
-using namespace etcd;
+using namespace json;
 
 namespace {
 bool lowerAlnum(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }
@@ -220,20 +221,40 @@ std::optional<CredentialToken> parseCredential(const std::string& value) {
 }
 std::string credentialText(const CredentialToken& token) { return "cwk_" + token.keyId + "_" + token.secret; }
 
-std::string usageRowJson(const UsageRow& row) {
-  return "{\"tenant\":" + quote(row.tenant) + ",\"hour\":" + quote(row.hour) + ",\"nodeId\":" + quote(row.nodeId) +
-      ",\"requests\":" + std::to_string(row.requests) + ",\"cpuMs\":" + digits(row.cpuMs) + ",\"egressBytes\":" +
-      std::to_string(row.egressBytes) + ",\"logLines\":" + std::to_string(row.logLines) + ",\"isolateMs\":" +
-      digits(row.isolateMs) + ",\"updatedAtUnixMs\":" + std::to_string(row.updatedAtUnixMs) + '}';
+void UsageCounts::add(const UsageCounts& other) {
+  requests += other.requests; logLines += other.logLines; egressBytes += other.egressBytes;
+  cpuMs += other.cpuMs; isolateMs += other.isolateMs;
 }
-UsageRow decodeUsageRow(const std::string& bytes) {
+std::string usageCountsFields(const UsageCounts& counts) {
+  return "\"requests\":" + std::to_string(counts.requests) + ",\"cpuMs\":" + digits(counts.cpuMs) + ",\"egressBytes\":" +
+      std::to_string(counts.egressBytes) + ",\"logLines\":" + std::to_string(counts.logLines) + ",\"isolateMs\":" +
+      digits(counts.isolateMs);
+}
+std::string nodeUsageHourJson(const NodeUsageHour& usage) {
+  std::string out = "{\"nodeId\":" + quote(usage.nodeId) + ",\"hour\":" + quote(usage.hour) + ",\"updatedAtUnixMs\":" +
+      std::to_string(usage.updatedAtUnixMs) + ",\"tenants\":{";
+  bool first = true;
+  for (const auto& [tenant, counts] : usage.tenants) {
+    out += std::string(first ? "" : ",") + quote(tenant) + ":{" + usageCountsFields(counts) + "}";
+    first = false;
+  }
+  return out + "}}";
+}
+NodeUsageHour decodeNodeUsageHour(const std::string& bytes) {
   return decoded(bytes, [](Json::Reader json) {
-    UsageRow row{string(json, "tenant"), string(json, "hour"), string(json, "nodeId"), number(json, "requests"),
-        number(json, "logLines"), number(json, "egressBytes"), decimal(json, "cpuMs"), decimal(json, "isolateMs"),
-        number(json, "updatedAtUnixMs")};
-    KJ_REQUIRE(tenantName(row.tenant) && !row.nodeId.empty(), "invalid usage row");
-    usageHourStartMs(row.hour);
-    return row;
+    NodeUsageHour usage{string(json, "nodeId"), string(json, "hour"), number(json, "updatedAtUnixMs"), {}};
+    KJ_REQUIRE(safeName(usage.nodeId), "invalid usage object: nodeId");
+    usageHourStartMs(usage.hour);
+    auto tenants = field(json, "tenants");
+    KJ_REQUIRE(tenants.isObject(), "invalid usage object: tenants");
+    for (auto entry : tenants.getObject()) {
+      const std::string tenant = entry.getName().cStr();
+      KJ_REQUIRE(tenantName(tenant) && entry.getValue().isObject(), "invalid usage object: tenant", tenant.c_str());
+      auto value = entry.getValue();
+      usage.tenants[tenant] = {number(value, "requests"), number(value, "logLines"), number(value, "egressBytes"),
+          decimal(value, "cpuMs"), decimal(value, "isolateMs")};
+    }
+    return usage;
   });
 }
 std::string usageHour(uint64_t unixMs) {
@@ -259,13 +280,17 @@ uint64_t usageHourStartMs(const std::string& hour) {
   return uint64_t(seconds) * 1000;
 }
 
-std::string nodeMemberKey(const std::string& nodeId) { return std::string(NODES_PREFIX) + nodeId; }
-std::string nodeSuspectKey(const std::string& nodeId, const std::string& tenant) {
-  return std::string(NODES_PREFIX) + nodeId + "/suspects/" + tenant;
-}
-std::string nodeUsagePrefix(const std::string& nodeId) { return std::string(NODES_PREFIX) + nodeId + "/usage/"; }
-std::string nodeUsageKey(const std::string& nodeId, const std::string& hour, const std::string& tenant) {
-  return nodeUsagePrefix(nodeId) + hour + "/" + tenant;
+std::string nodeUsagePrefix(const std::string& nodeId) { return std::string(NODES_OBJECT_PREFIX) + nodeId + "/usage/"; }
+std::string nodeUsageKey(const std::string& nodeId, const std::string& hour) { return nodeUsagePrefix(nodeId) + hour; }
+std::optional<std::pair<std::string, std::string>> parseNodeUsageKey(const std::string& key) {
+  const std::string_view root(NODES_OBJECT_PREFIX);
+  if (!key.starts_with(root)) return std::nullopt;
+  const auto slash = key.find('/', root.size());
+  if (slash == std::string::npos || key.compare(slash, 7, "/usage/") != 0) return std::nullopt;
+  std::string node = key.substr(root.size(), slash - root.size()), hour = key.substr(slash + 7);
+  if (!safeName(node)) return std::nullopt;
+  try { usageHourStartMs(hour); } catch (const kj::Exception&) { return std::nullopt; }
+  return std::pair{std::move(node), std::move(hour)};
 }
 
 }  // namespace coworkerd

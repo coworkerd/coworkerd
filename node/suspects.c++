@@ -9,36 +9,21 @@
 
 namespace coworkerd {
 namespace {
-// Every node's records: nodes/<nodeId>/suspects/<tenant> is one of them.
-constexpr const char* PREFIX = NODES_PREFIX;
-// The node and tenant of a suspicion key, or nothing.
-std::optional<std::pair<std::string, std::string>> suspectKey(const std::string& key) {
-  if (!key.starts_with(PREFIX)) return std::nullopt;
-  const auto rest = key.substr(std::string_view(PREFIX).size());
-  const auto slash = rest.find('/');
-  if (slash == std::string::npos || rest.compare(slash, 10, "/suspects/") != 0) return std::nullopt;
-  auto node = rest.substr(0, slash), tenant = rest.substr(slash + 10);
-  if (node.empty() || !tenantName(tenant)) return std::nullopt;
-  return std::pair{node, tenant};
-}
 uint64_t wall() { return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count(); }
 double mono() { return std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now().time_since_epoch()).count(); }
-Suspect decode(const std::string& bytes) {
-  capnp::MallocMessageBuilder message;
-  auto value = message.initRoot<etcd::Json>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
+// One suspicion of a node's object: the tenant is its field's name.
+Suspect decode(const std::string& tenant, json::Json::Reader value) {
   auto integer = [&](const char* name) -> uint64_t {
-    auto field = etcd::field(value, name);
-    if (field.isString()) return etcd::integer(value, name);
+    auto field = json::field(value, name);
     KJ_REQUIRE(field.isNumber() && std::isfinite(field.getNumber()) && field.getNumber() >= 0 &&
         field.getNumber() <= 9007199254740991.0 && std::floor(field.getNumber()) == field.getNumber(),
         "invalid suspect integer", name);
     return static_cast<uint64_t>(field.getNumber());
   };
-  Suspect record{etcd::text(value, "tenant"), etcd::text(value, "workerId"), etcd::text(value, "sourceNodeId"),
-      etcd::text(value, "processId"), etcd::text(value, "invocationId"),
+  Suspect record{tenant, json::text(value, "workerId"), json::text(value, "sourceNodeId"),
+      json::text(value, "processId"), json::text(value, "invocationId"),
       integer("generation"), integer("count"), integer("recognizedAtUnixMs"), integer("expiresAtUnixMs"),
       integer("durationMs"), true};
   KJ_REQUIRE(tenantName(record.tenant) && tenantOf(record.workerId) == record.tenant && !record.sourceServerId.empty() &&
@@ -47,27 +32,37 @@ Suspect decode(const std::string& bytes) {
       "invalid suspect record");
   return record;
 }
+// A suspicion as a node's object holds it (beside the others, under its tenant's name).
+std::string objectRecord(const Suspect& record) {
+  return "{\"workerId\":" + json::quote(record.workerId) + ",\"sourceNodeId\":" + json::quote(record.sourceServerId) +
+      ",\"processId\":" + json::quote(record.processId) + ",\"generation\":" + std::to_string(record.generation) +
+      ",\"invocationId\":" + json::quote(record.invocationId) + ",\"count\":" + std::to_string(record.count) +
+      ",\"recognizedAtUnixMs\":" + std::to_string(record.recognizedAtUnixMs) +
+      ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + ",\"durationMs\":" + std::to_string(record.durationMs) + "}";
+}
 }
 std::string Suspect::json() const {
-  return "{\"tenant\":" + etcd::quote(tenant) + ",\"workerId\":" + etcd::quote(workerId) + ",\"sourceNodeId\":" + etcd::quote(sourceServerId) +
-      ",\"processId\":" + etcd::quote(processId) + ",\"generation\":" + std::to_string(generation) +
-      ",\"invocationId\":" + etcd::quote(invocationId) + ",\"count\":" + std::to_string(count) +
+  return "{\"tenant\":" + json::quote(tenant) + ",\"workerId\":" + json::quote(workerId) + ",\"sourceNodeId\":" + json::quote(sourceServerId) +
+      ",\"processId\":" + json::quote(processId) + ",\"generation\":" + std::to_string(generation) +
+      ",\"invocationId\":" + json::quote(invocationId) + ",\"count\":" + std::to_string(count) +
       ",\"recognizedAtUnixMs\":" + std::to_string(recognizedAtUnixMs) +
       ",\"expiresAtUnixMs\":" + std::to_string(expiresAtUnixMs) +
       ",\"durationMs\":" + std::to_string(durationMs) + ",\"synced\":" + (synced ? "true" : "false") + "}";
 }
-Suspects::Suspects(const MembershipConfig& authority, std::string serverId,
-    uint32_t baseMs, uint32_t maxMs, kj::Network& network, kj::Timer& timer,
-    const kj::HttpHeaderTable& headers)
-    : config(authority), serverId(std::move(serverId)), baseMs(baseMs), maxMs(maxMs), timer(timer) {
+Suspects::Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer)
+    : membership(membership), serverId(std::move(serverId)), baseMs(baseMs), maxMs(maxMs), timer(timer) {
   KJ_REQUIRE(baseMs > 0 && maxMs >= baseMs, "invalid suspicion durations");
-  if (config.backend == "etcd") {
-    client = std::make_unique<EtcdClient>(config.endpoint, config.requestTimeoutMs, network, timer, headers);
-    // Changes only: the prefix also holds every node's member key and usage rows.
-    watcher = std::make_unique<EtcdWatcher>(*client, PREFIX, timer, config.retryMs,
-        EtcdWatcher::ApplyChanges([this](const EtcdBatch& batch) { return apply(batch); }));
+  // The members' objects, as the membership reads them (installed before it starts: its first listing adopts them).
+  if (keepsObjects()) {
+    membership->onSuspects([this](const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
+      adopt(nodeId, epoch, bytes);
+    });
   }
 }
+Suspects::~Suspects() noexcept(false) {
+  if (keepsObjects()) membership->onSuspects(nullptr);
+}
+bool Suspects::keepsObjects() const { return membership != nullptr && membership->view().backend == "objectStore"; }
 bool Suspects::contains(const std::string& tenant) const {
   auto found = deadlines.find(tenant);
   return found != deadlines.end() && found->second > mono();
@@ -78,7 +73,7 @@ void Suspects::remember(Suspect record, const char* event) {
   counts[record.tenant] = std::max(counts[record.tenant], record.count);
   deadlines[record.tenant] = mono() + (record.expiresAtUnixMs - now);
   entries[record.tenant] = record;
-  std::cout << "[suspect] {\"event\":" << etcd::quote(event) << ",\"nodeId\":" << etcd::quote(serverId)
+  std::cout << "[suspect] {\"event\":" << json::quote(event) << ",\"nodeId\":" << json::quote(serverId)
       << ",\"observedAtUnixMs\":" << now << ",\"record\":" << record.json() << "}" << std::endl;
 }
 void Suspects::confirm(const std::string& worker, const std::string& process,
@@ -91,119 +86,109 @@ void Suspects::confirm(const std::string& worker, const std::string& process,
   const auto now = wall();
   Suspect record{tenant, worker, serverId, process, invocation, generation, ++counts[tenant], now, now + duration, duration, false};
   remember(record, "recognized");
-  if (client) pending[tenant] = std::move(record);
+  // Written at once (the maintenance loop wakes up).
+  if (wake && wake->isWaiting()) wake->fulfill();
 }
 void Suspects::expire() {
   for (auto it = entries.begin(); it != entries.end();) {
     if (contains(it->first)) { ++it; continue; }
-    std::cout << "[suspect] {\"event\":\"expired\",\"nodeId\":" << etcd::quote(serverId)
+    std::cout << "[suspect] {\"event\":\"expired\",\"nodeId\":" << json::quote(serverId)
         << ",\"observedAtUnixMs\":" << wall() << ",\"record\":" << it->second.json() << "}" << std::endl;
-    deadlines.erase(it->first); pending.erase(it->first); it = entries.erase(it);
+    deadlines.erase(it->first); it = entries.erase(it);
   }
 }
-kj::Promise<void> Suspects::apply(const EtcdBatch& batch) {
-  // A missing authority key cannot erase a locally recognized, unsynchronized
-  // offender. Known suspicions expire on their recorded deadline, even offline.
-  for (const auto& change : batch.changes) {
-    auto key = suspectKey(change.key);
-    if (!key || !change.kv) continue;
+std::string Suspects::ownObject() const {
+  std::string out;
+  for (const auto& [tenant, record] : entries) {
+    if (record.sourceServerId != serverId || !contains(tenant)) continue;
+    out += (out.empty() ? "{" : ",") + json::quote(tenant) + ":" + objectRecord(record);
+  }
+  return out.empty() ? out : out + "}";
+}
+void Suspects::adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
+  // A member's object holds that member's suspicions only. A missing object never erases one: known suspicions expire on
+  // their recorded deadline, even offline.
+  capnp::MallocMessageBuilder message;
+  auto value = message.initRoot<json::Json>();
+  try {
+    capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
+    KJ_REQUIRE(value.isObject(), "a suspects object is a JSON object");
+  } catch (const kj::Exception& error) {
+    ++invalidObjects;
+    lastError = "the suspects object of " + nodeId + " epoch " + epoch + " does not read: " + error.getDescription().cStr();
+    return;
+  }
+  ++adoptedObjects;
+  for (auto entry : value.asReader().getObject()) {
     Suspect record;
-    try { record = decode(change.kv->value); } catch (const kj::Exception&) { continue; }  // not a suspicion's record
-    if (record.tenant != key->second || record.sourceServerId != key->first || change.kv->lease.empty()) continue;
-    if (record.expiresAtUnixMs <= wall()) continue;
+    try { record = decode(entry.getName().cStr(), entry.getValue()); } catch (const kj::Exception&) { ++invalidObjects; continue; }
+    if (record.sourceServerId != nodeId || record.expiresAtUnixMs <= wall()) continue;
     auto local = entries.find(record.tenant);
     if (local != entries.end() && local->second.invocationId == record.invocationId) {
-      if (!local->second.synced || record.expiresAtUnixMs > local->second.expiresAtUnixMs)
-        remember(record, "synchronized");
-      auto dirty = pending.find(record.tenant);
-      if (dirty != pending.end() && dirty->second.invocationId == record.invocationId) pending.erase(dirty);
+      if (record.expiresAtUnixMs > local->second.expiresAtUnixMs) { remember(record, "shared"); ++adoptions; }
     } else if (local == entries.end() || record.expiresAtUnixMs >= local->second.expiresAtUnixMs) {
-      remember(record, "shared");
+      // This node's own suspicions of an earlier epoch (left by a process that ended without removing them) come back
+      // as its own and are written again with the new epoch's object.
+      remember(record, record.sourceServerId == serverId ? "restored" : "shared");
+      ++adoptions;
     }
   }
-  expire();
-  co_return;
-}
-kj::Promise<void> Suspects::start() {
-  if (!watcher) co_return;
-  const auto until = mono() + config.startupTimeoutMs;
-  while (true) {
-    try { co_await watcher->fullRead(); co_return; }
-    catch (const kj::Exception& error) {
-      lastError = error.getDescription().cStr();
-      KJ_REQUIRE(mono() < until, "suspect authority unavailable at startup", lastError.c_str());
-    }
-    co_await timer.afterDelay(config.retryMs * kj::MILLISECONDS);
-  }
-}
-kj::Promise<void> Suspects::publish(Suspect record) {
-  // This node's own key: no other node writes it (each node's etcd user writes only below its own prefix).
-  auto key = nodeSuspectKey(serverId, record.tenant);
-  auto snapshot = co_await client->range(key);
-  auto found = snapshot.values.find(key);
-  uint64_t revision = 0;
-  if (found != snapshot.values.end()) {
-    revision = found->second.modRevision;
-    Suspect previous;
-    bool readable = true;
-    try { previous = decode(found->second.value); } catch (const kj::Exception&) { readable = false; }
-    if (readable && previous.invocationId == record.invocationId) {
-      EtcdBatch echo{found->second.modRevision, false, {{key, found->second}}};
-      co_await apply(echo);
-      co_return;
-    }
-    if (readable) {
-      record.count = std::max(record.count, previous.count + 1);
-      if (previous.expiresAtUnixMs > record.recognizedAtUnixMs)
-        record.durationMs = std::min<uint64_t>(maxMs, std::max(record.durationMs, previous.durationMs * 2));
-      record.expiresAtUnixMs = record.recognizedAtUnixMs + record.durationMs;
-    }
-  }
-  if (record.expiresAtUnixMs <= wall()) co_return;
-  auto remaining = record.expiresAtUnixMs - wall();
-  auto grant = co_await client->request("/v3/lease/grant", "{\"TTL\":" + std::to_string((remaining + 999) / 1000) + "}");
-  capnp::MallocMessageBuilder grantMessage;
-  auto lease = grantMessage.initRoot<etcd::Json>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(grant.data(), grant.size()), lease);
-  auto leaseId = etcd::text(lease, "ID");
-  KJ_REQUIRE(!leaseId.empty(), "missing suspect lease");
-  record.synced = true;
-  auto result = co_await client->request("/v3/kv/txn", "{\"compare\":[{\"key\":" + etcd::quote(etcd::base64(key)) +
-      ",\"target\":\"MOD\",\"result\":\"EQUAL\",\"mod_revision\":" + etcd::quote(std::to_string(revision)) +
-      "}],\"success\":[{\"request_put\":{\"key\":" + etcd::quote(etcd::base64(key)) +
-      ",\"value\":" + etcd::quote(etcd::base64(record.json())) + ",\"lease\":" + etcd::quote(leaseId) + "}}]}");
-  capnp::MallocMessageBuilder resultMessage;
-  auto transaction = resultMessage.initRoot<etcd::Json>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(result.data(), result.size()), transaction);
-  if (!etcd::boolean(transaction, "succeeded")) co_return;
-  auto local = entries.find(record.tenant);
-  if (local != entries.end() && local->second.invocationId == record.invocationId) remember(record, "synchronized");
-  auto dirty = pending.find(record.tenant);
-  if (dirty != pending.end() && dirty->second.invocationId == record.invocationId) pending.erase(dirty);
-  lastError.clear();
 }
 kj::Promise<void> Suspects::maintain() {
   while (true) {
     expire();
-    if (client && !pending.empty()) {
-      const auto record = pending.begin()->second;
-      try { co_await publish(record); }
-      catch (const kj::Exception& error) { lastError = error.getDescription().cStr(); }
+    if (keepsObjects()) {
+      const auto& view = membership->view();
+      const bool live = !view.epoch.empty() && view.leaseStatus == "active" && !view.selfExpired && !view.identityTaken;
+      const auto body = ownObject();
+      if (live && view.epoch != writtenEpoch && body.empty()) {
+        // A new epoch has no object of its own yet; nothing to write.
+        writtenEpoch = view.epoch;
+        writtenBody.clear();
+      }
+      const bool due = body != writtenBody || view.epoch != writtenEpoch || (!body.empty() && mono() - writtenAt >= REWRITE_MS);
+      if (live && due) {
+        const auto epoch = view.epoch;
+        try {
+          co_await membership->writeSuspects(body);
+          body.empty() ? ++removals : ++writes;
+          writtenBody = body;
+          writtenEpoch = epoch;
+          writtenAt = mono();
+          lastWriteAtUnixMs = wall();
+          lastError.clear();
+          // This node's suspicions the object now holds are synchronized.
+          for (auto& [tenant, record] : entries) {
+            if (record.sourceServerId != serverId || record.synced || !contains(tenant)) continue;
+            auto synchronized = record;
+            synchronized.synced = true;
+            remember(synchronized, "synchronized");
+          }
+        } catch (const kj::Exception& error) {
+          ++writeFailures;
+          lastError = error.getDescription().cStr();
+        }
+      }
     }
-    co_await timer.afterDelay(config.retryMs * kj::MILLISECONDS);
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    wake = kj::mv(paf.fulfiller);
+    co_await paf.promise.exclusiveJoin(timer.afterDelay(CHECK_MS * kj::MILLISECONDS));
+    wake = nullptr;
   }
 }
-kj::Promise<void> Suspects::run() {
-  if (watcher) return maintain().exclusiveJoin(watcher->run());
-  return maintain();
-}
+kj::Promise<void> Suspects::run() { return maintain(); }
 std::string Suspects::json() const {
   std::ostringstream out;
   out << "{\"configuration\":{\"baseMs\":" << baseMs << ",\"maxMs\":" << maxMs
-      << "},\"watchConnected\":" << (watcher && watcher->view().connected ? "true" : "false")
-      << ",\"revision\":" << (watcher ? watcher->view().revision : 0)
-      << ",\"watchLastError\":" << etcd::quote(watcher ? watcher->view().lastError : "")
-      << ",\"lastError\":" << etcd::quote(lastError) << ",\"entries\":[";
+      << "},\"backend\":" << (keepsObjects() ? "\"objectStore\"" : "\"local\"")
+      << ",\"objectEpoch\":" << json::quote(writtenEpoch) << ",\"objectSuspects\":" << [&] {
+           size_t count = 0;
+           for (const auto& [tenant, record] : entries) if (record.sourceServerId == serverId && record.synced && contains(tenant)) ++count;
+           return count;
+         }()
+      << ",\"writes\":" << writes << ",\"removals\":" << removals << ",\"writeFailures\":" << writeFailures
+      << ",\"adoptedObjects\":" << adoptedObjects << ",\"adoptions\":" << adoptions << ",\"invalidObjects\":" << invalidObjects
+      << ",\"lastWriteAtUnixMs\":" << lastWriteAtUnixMs << ",\"lastError\":" << json::quote(lastError) << ",\"entries\":[";
   size_t i = 0;
   for (const auto& [tenant, record] : entries) if (contains(tenant)) {
     if (i++) out << ',';

@@ -1,8 +1,9 @@
 // Tenants, credentials and usage (docs/control-plane-api.md sections 1-5): the tenants' records in their manifests and
 // the credentials index on the object store (manifests.h), which the control plane alone writes and reads from its
-// mirror, and the usage rows each node writes below its own /coworkerd/v2/nodes/<nodeId>/usage/ in etcd, which the
-// control plane only reads and sums.
+// mirror, and the usage objects each node writes below its own nodes/<nodeId>/usage/, which the control plane reads and
+// sums, and once a day removes past their retention (a node removes its own; these are the ones of the nodes that left).
 #include "control.h"
+#include "object-state.h"
 #include "support.h"
 
 #include <capnp/compat/json.h>
@@ -20,7 +21,7 @@
 
 namespace coworkerd {
 namespace {
-using namespace etcd;
+using namespace json;
 
 uint64_t nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -40,7 +41,6 @@ bool constantEquals(const std::string& a, const std::string& b) {
   for (size_t i = 0; i < a.size(); ++i) difference |= static_cast<unsigned char>(a[i] ^ (i < b.size() ? b[i] : 0));
   return difference == 0;
 }
-std::string prefixEnd(std::string prefix) { ++prefix.back(); return prefix; }
 
 ApiAnswer invalid(std::string reason) { return ApiAnswer::error(400, "INVALID_REQUEST", std::move(reason)); }
 ApiAnswer notFound(const std::string& tenant) {
@@ -144,31 +144,6 @@ std::string tenantAnswer(const TenantRecord& tenant, const std::string& extra = 
   return "{\"tenant\":" + record + extra + "}";
 }
 
-// A raw range [start, end) with its pages, keys only or with values.
-kj::Promise<EtcdSnapshot> rangeBetween(EtcdClient& client, std::string start, std::string end, bool keysOnly = false) {
-  EtcdSnapshot snapshot;
-  std::string from = start;
-  while (true) {
-    auto response = co_await client.request("/v3/kv/range", "{\"key\":" + quote(base64(from)) + ",\"range_end\":" +
-        quote(base64(end)) + ",\"limit\":\"2000\"" + (keysOnly ? ",\"keys_only\":true" : "") +
-        (snapshot.revision ? ",\"revision\":\"" + std::to_string(snapshot.revision) + "\"" : std::string()) + "}");
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    if (!snapshot.revision) snapshot.revision = integer(field(json, "header"), "revision");
-    auto kvs = field(json, "kvs");
-    std::string last;
-    if (kvs.isArray()) for (auto kv : kvs.getArray()) {
-      auto value = EtcdClient::decodeKv(kv);
-      last = value.key;
-      snapshot.values.emplace(value.key, std::move(value));
-    }
-    if (!boolean(json, "more")) break;
-    KJ_REQUIRE(!last.empty(), "etcd range reported more keys without returning any");
-    from = last + '\0';
-  }
-  co_return snapshot;
-}
 }  // namespace
 
 Authenticated authenticate(const ManifestStore& state, const std::string& adminCredential, const kj::HttpHeaders& headers) {
@@ -344,7 +319,7 @@ kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string name) {
     auto json = message.initRoot<Json>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(objects.data(), objects.size()), json);
     if (!boolean(json, "ok")) {
-      const auto reason = etcd::text(json, "reason");
+      const auto reason = json::text(json, "reason");
       try { co_await record("objects", objects); } catch (const kj::Exception&) {}
       co_return incomplete("its objects", reason);
     }
@@ -456,65 +431,73 @@ kj::Promise<ApiAnswer> revokeCredential(ManifestStore& state, std::string tenant
 }
 
 
-kj::Promise<std::vector<std::string>> nodeIds(EtcdClient& client) {
-  // A skip scan: one key per step (keys only), then past that node's keys -- two reads per node however many rows it
-  // wrote. A node's keys are "nodes/<id>" and "nodes/<id>/...": ids that extend <id> with '-', '_' or '.' sort between
-  // the two and are met on the way; '0' is the byte after '/'.
-  const std::string prefix = NODES_PREFIX, end = prefixEnd(prefix);
-  std::vector<std::string> ids;
-  std::string cursor = prefix;
-  for (size_t steps = 0; steps < 100000; ++steps) {
-    auto response = co_await client.request("/v3/kv/range", "{\"key\":" + quote(base64(cursor)) + ",\"range_end\":" +
-        quote(base64(end)) + ",\"limit\":\"1\",\"keys_only\":true}");
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    auto kvs = field(json, "kvs");
-    if (!kvs.isArray() || kvs.getArray().size() == 0) break;
-    const auto key = unbase64(text(kvs.getArray()[0], "key"));
-    if (!key.starts_with(prefix)) break;
-    const auto rest = key.substr(prefix.size());
-    const auto slash = rest.find('/');
-    const auto id = rest.substr(0, slash);
-    if (!id.empty() && (ids.empty() || ids.back() != id)) ids.push_back(id);
-    cursor = slash == std::string::npos ? key + '\0' : prefix + id + "0";
-  }
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-  co_return ids;
-}
-
-kj::Promise<ApiAnswer> usage(EtcdClient& client, std::optional<std::string> tenant, uint64_t from, uint64_t to) {
+kj::Promise<ApiAnswer> usage(ObjectStore& storage, UsageCache& cache, std::optional<std::string> tenant, uint64_t from,
+    uint64_t to) {
   if (to <= from) co_return invalid("to must be after from");
   if (to - from > 366ull * 24 * 3600 * 1000) co_return invalid("at most a year at a time");
   const auto firstHour = usageHour(from), lastHour = usageHour(to - 1);
-  auto ids = co_await nodeIds(client);
-  struct Sum { uint64_t requests = 0, logLines = 0, egressBytes = 0, rows = 0; double cpuMs = 0, isolateMs = 0; std::set<std::string> nodes; };
+  // The usage objects (every node's hours) and the members: the nodes are the ones with objects under either.
+  auto listings = co_await kj::joinPromises(kj::arr(storage.list(NODES_OBJECT_PREFIX), storage.list(MEMBERS_PREFIX)));
+  std::set<std::string> ids;
+  for (const auto& [id, node] : readMemberListing(listings[1])) ids.insert(id);
+  struct Wanted { std::string key, etag, node; };
+  std::vector<Wanted> wanted;
+  std::set<std::string> listed;
+  for (const auto& object : listings[0].objects) {
+    auto parsed = parseNodeUsageKey(object.key);
+    if (!parsed) continue;
+    ids.insert(parsed->first);
+    listed.insert(object.key);
+    if (parsed->second >= firstHour && parsed->second <= lastHour) wanted.push_back({object.key, object.etag, parsed->first});
+  }
+  std::erase_if(cache.objects, [&](const auto& entry) { return !listed.contains(entry.first); });
+  // Read what changed since the copy this process holds (the past hours do not), eight at a time.
+  std::vector<const Wanted*> stale;
+  for (const auto& object : wanted) {
+    auto found = cache.objects.find(object.key);
+    if (found == cache.objects.end() || found->second.first != object.etag || object.etag.empty()) stale.push_back(&object);
+  }
+  for (size_t start = 0; start < stale.size(); start += 8) {
+    kj::Vector<kj::Promise<ObjectResponse>> reads;
+    for (size_t i = start; i < std::min(stale.size(), start + 8); ++i) reads.add(storage.get(stale[i]->key));
+    auto answers = co_await kj::joinPromises(reads.releaseAsArray());
+    for (size_t i = 0; i < answers.size(); ++i) {
+      const auto& object = *stale[start + i];
+      if (answers[i].status == 404) { cache.objects.erase(object.key); continue; }  // removed since the listing
+      KJ_REQUIRE(answers[i].status == 200, "object store read failed", answers[i].status);
+      ++cache.reads;
+      try {
+        cache.objects[object.key] = {object.etag, decodeNodeUsageHour(answers[i].bytes)};
+      } catch (const kj::Exception&) {
+        cache.objects.erase(object.key);  // not a usage object: left out
+      }
+    }
+  }
+  struct Sum { UsageCounts counts; uint64_t rows = 0; std::set<std::string> nodes; };
   std::map<std::pair<std::string, std::string>, Sum> sums;  // (hour, tenant)
   Sum total;
-  for (const auto& id : ids) {
-    const auto prefix = nodeUsagePrefix(id);
-    auto raw = co_await rangeBetween(client, prefix + firstHour, prefix + lastHour + "0");
-    for (const auto& [key, kv] : raw.values) {
-      UsageRow row;
-      try { row = decodeUsageRow(kv.value); } catch (const kj::Exception&) { continue; }
-      if (key != nodeUsageKey(id, row.hour, row.tenant) || row.nodeId != id) continue;
-      if (tenant && row.tenant != *tenant) continue;
-      for (auto* sum : {&sums[{row.hour, row.tenant}], &total}) {
-        sum->requests += row.requests; sum->logLines += row.logLines; sum->egressBytes += row.egressBytes;
-        sum->cpuMs += row.cpuMs; sum->isolateMs += row.isolateMs; ++sum->rows; sum->nodes.insert(id);
+  for (const auto& object : wanted) {
+    auto found = cache.objects.find(object.key);
+    if (found == cache.objects.end()) continue;
+    const auto& stored = found->second.second;
+    // An object names the node and the hour of its key.
+    if (stored.nodeId != object.node || nodeUsageKey(stored.nodeId, stored.hour) != object.key) continue;
+    for (const auto& [name, counts] : stored.tenants) {
+      if (tenant && name != *tenant) continue;
+      for (auto* sum : {&sums[{stored.hour, name}], &total}) {
+        sum->counts.add(counts);
+        ++sum->rows;
+        sum->nodes.insert(stored.nodeId);
       }
     }
   }
   auto fields = [](const Sum& sum) {
-    auto row = usageRowJson({"x", "1970-01-01T00", "x", sum.requests, sum.logLines, sum.egressBytes, sum.cpuMs, sum.isolateMs, 0});
-    // The counting fields of a row: requests .. isolateMs.
-    const auto begin = row.find(",\"requests\":"), end = row.find(",\"updatedAtUnixMs\":");
-    return row.substr(begin + 1, end - begin - 1) + ",\"nodes\":" + std::to_string(sum.nodes.size()) + ",\"nodeRows\":" + std::to_string(sum.rows);
+    return usageCountsFields(sum.counts) + ",\"nodes\":" + std::to_string(sum.nodes.size()) + ",\"nodeRows\":" + std::to_string(sum.rows);
   };
   std::string out = "{" + (tenant ? "\"tenant\":" + quote(*tenant) + "," : std::string()) + "\"from\":" + std::to_string(from) +
       ",\"to\":" + std::to_string(to) + ",\"by\":\"hour\",\"nodes\":[";
-  for (size_t i = 0; i < ids.size(); ++i) out += (i ? "," : "") + quote(ids[i]);
+  size_t n = 0;
+  for (const auto& id : ids) out += (n++ ? "," : "") + quote(id);
   out += "],\"rows\":[";
   size_t index = 0;
   for (const auto& [key, sum] : sums) {
@@ -522,6 +505,28 @@ kj::Promise<ApiAnswer> usage(EtcdClient& client, std::optional<std::string> tena
         std::to_string(usageHourStartMs(key.first)) + (tenant ? std::string() : ",\"tenant\":" + quote(key.second)) + "," + fields(sum) + "}";
   }
   co_return ApiAnswer::ok(out + "],\"total\":{" + fields(total) + "}}");
+}
+
+kj::Promise<UsageCleanup> cleanUsage(ObjectStore& storage, uint32_t retentionHours, uint64_t nowUnixMs) {
+  UsageCleanup result;
+  const uint64_t keep = uint64_t(retentionHours) * 3600000;
+  if (!retentionHours || nowUnixMs <= keep) co_return result;
+  result.cutoff = usageHour(nowUnixMs - keep);
+  auto listing = co_await storage.list(NODES_OBJECT_PREFIX);
+  for (const auto& object : listing.objects) {
+    auto parsed = parseNodeUsageKey(object.key);
+    if (!parsed) continue;
+    ++result.listed;
+    if (parsed->second >= result.cutoff) continue;
+    auto removed = co_await storage.remove(object.key);
+    KJ_REQUIRE(removed.status == 200 || removed.status == 204 || removed.status == 404, "object store removal failed", removed.status);
+    ++result.removed;
+  }
+  co_return result;
+}
+
+std::string UsageCleanup::json() const {
+  return "{\"cutoff\":" + quote(cutoff) + ",\"listed\":" + std::to_string(listed) + ",\"removed\":" + std::to_string(removed) + "}";
 }
 
 }  // namespace coworkerd

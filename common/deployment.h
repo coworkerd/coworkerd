@@ -12,15 +12,13 @@
 #include <string>
 #include <vector>
 
-#include "etcd.h"
+#include "json.h"
 #include "code-package.h"
 #include "tenancy.h"
 
 namespace coworkerd {
 
 inline constexpr size_t MAX_DEPLOYMENT_CLOSURE = 64;
-// The deployment state (the v2 layout, control-plane-api.md section 4).
-inline constexpr const char* DEPLOYMENT_PREFIX = "/coworkerd/v2/deploy/";
 // Secrets, as Cloudflare limits environment values: names per version, bytes per value.
 inline constexpr size_t MAX_SECRETS = 64;
 inline constexpr size_t MAX_SECRET_BYTES = 5 * 1024;
@@ -125,7 +123,7 @@ struct DeploymentCode {
 };
 DeploymentCode readDeploymentCode(const DeploymentInput& input, const std::filesystem::path& codeRoot);
 
-// Keys below DEPLOYMENT_PREFIX (by tenant). Every route has its own key, derived from the route:
+// The deployment state's keys (by tenant), as the tenants' manifests translate into them (tenant-manifest.h). Every route has its own key, derived from the route:
 // "routes/<host><pathPrefix>" -- a host never contains '/', a prefix starts with '/', so the key names exactly one
 // (host, pathPrefix) slot, across tenants; its value names the tenant and the Worker. A tenant's other keys are below
 // "<tenant>/": definitions/<worker>/<version>, active/<worker>, secrets/<worker>/<name> (the value of one secret of
@@ -136,7 +134,7 @@ std::string deploymentActiveKey(const std::string& workerId);
 std::string deploymentDefinitionKey(const std::string& workerId, const std::string& versionId);
 std::string deploymentBinderKey(const std::string& target, const std::string& binder);
 std::string deploymentSecretKey(const std::string& workerId, const std::string& name);
-// "<tenant>/": the prefix of a tenant's keys (relative to DEPLOYMENT_PREFIX).
+// "<tenant>/": the prefix of a tenant's keys.
 std::string deploymentTenantPrefix(const std::string& tenant);
 // The active pointer {versionId, definitionHash[, limits]}: a Worker's own limits travel with it.
 std::string activePointerJson(const std::string& versionId, const std::string& definitionHash, const WorkerLimits& limits = {});
@@ -168,7 +166,7 @@ private:
   std::array<uint64_t, 4> limbs{};
 };
 
-// The deployment keys of one etcd revision and the deterministic per-Worker
+// The deployment keys of one revision of the desired state and the deterministic per-Worker
 // view derived from them. A Worker is valid when its active pointer names an
 // existing, well-formed definition with the same hash, every secret that
 // definition declares has a usable value, every Worker reachable through
@@ -181,7 +179,7 @@ private:
 class DeploymentState {
 public:
   struct Change {
-    std::string key;                   // relative to DEPLOYMENT_PREFIX
+    std::string key;                   // a deployment key (routes/..., <tenant>/..., generation)
     std::optional<std::string> value;  // nullopt: deleted
   };
   // A Worker whose served definition changed: became valid, invalid, or valid

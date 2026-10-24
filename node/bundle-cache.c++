@@ -1,5 +1,5 @@
 #include "bundle-cache.h"
-#include "etcd.h"
+#include "json.h"
 
 #include <kj/debug.h>
 #include <algorithm>
@@ -193,14 +193,14 @@ kj::Promise<void> BundleCache::prefetchLoop() {
 }
 std::string BundleCache::json() const {
   std::ostringstream out;
-  out << "{\"backend\":" << etcd::quote(storage.config().backend) << ",\"entries\":" << index.size()
+  out << "{\"backend\":" << json::quote(storage.config().backend) << ",\"entries\":" << index.size()
       << ",\"bytes\":" << bytes << ",\"maxBytes\":" << settings.maxBytes << ",\"hits\":" << hits
       << ",\"misses\":" << misses << ",\"fetchStarted\":" << started << ",\"fetchSucceeded\":" << succeeded
       << ",\"singleFlightMerged\":" << merged << ",\"evictions\":" << evictions
       << ",\"prefetchQueueLength\":" << prefetchPending << ",\"prefetchFailures\":" << prefetchFailures
-      << ",\"lastError\":" << etcd::quote(lastError) << ",\"failures\":{";
+      << ",\"lastError\":" << json::quote(lastError) << ",\"failures\":{";
   size_t i = 0;
-  for (const auto& [reason, count] : failures) { if (i++) out << ','; out << etcd::quote(reason) << ':' << count; }
+  for (const auto& [reason, count] : failures) { if (i++) out << ','; out << json::quote(reason) << ':' << count; }
   out << "}}";
   return out.str();
 }

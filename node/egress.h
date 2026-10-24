@@ -36,7 +36,7 @@ struct EgressSource {
 
 class EgressService final: public kj::HttpService {
 public:
-  // `clusterEndpoints`: the cluster's own HOST[:PORT]s this node knows (members, etcd, the object store, its own
+  // `clusterEndpoints`: the cluster's own HOST[:PORT]s this node knows (members, the object store, its own
   // listeners), asked at every refresh. `source`: the process holding an egress token, if any. `metered`: each part of
   // either body as it passes, for the tenant's usage (TenantUsage::egress).
   EgressService(const EgressConfig& config, std::string serverId, kj::Network& network, kj::Timer& timer,

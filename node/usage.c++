@@ -1,4 +1,6 @@
 #include "usage.h"
+#include "json.h"
+#include "support.h"
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -11,59 +13,63 @@
 
 namespace coworkerd {
 namespace {
-using namespace etcd;
+using namespace json;
 uint64_t wall() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 double mono() {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-std::string end(std::string prefix) { ++prefix.back(); return prefix; }
 }  // namespace
 
-TenantUsage::TenantUsage(UsageSettings settings, std::string nodeId, const MembershipConfig& authority, kj::Network& network,
-    kj::Timer& timer, const kj::HttpHeaderTable& headers, Sources sources)
+TenantUsage::TenantUsage(UsageSettings settings, std::string nodeId, std::optional<ObjectStoreConfig> storeConfig,
+    kj::Network& network, kj::Timer& timer, Sources sources)
     : settings(settings), nodeId(std::move(nodeId)), timer(timer), sources(std::move(sources)) {
-  if (authority.backend == "etcd")
-    client = std::make_unique<EtcdClient>(authority.endpoint, authority.requestTimeoutMs, network, timer, headers);
+  if (storeConfig) store = std::make_unique<ObjectStore>(std::move(*storeConfig), network, timer);
 }
 
-TenantUsage::Counts& TenantUsage::now(const std::string& tenant) { return hours[usageHour(wall())][tenant]; }
+TenantUsage::Counts& TenantUsage::now(const std::string& tenant) { return hours[usageHour(wallTimeMsForTest())][tenant]; }
 
 void TenantUsage::request(const std::string& tenant) {
   if (tenant.empty()) return;
-  auto& counts = now(tenant);
-  ++counts.requests;
-  counts.dirty = true;
+  auto& entry = now(tenant);
+  ++entry.counts.requests;
+  entry.dirty = true;
 }
 
 void TenantUsage::egress(const std::string& tenant, uint64_t bytes) {
   if (tenant.empty() || !bytes) return;
-  auto& counts = now(tenant);
-  counts.egressBytes += bytes;
-  counts.dirty = true;
+  auto& entry = now(tenant);
+  entry.counts.egressBytes += bytes;
+  entry.dirty = true;
 }
 
 kj::Promise<void> TenantUsage::start() {
   lastSample = mono();
-  if (!client) co_return;
-  // This hour's own rows, as the previous process of this node left them: the counts go on from there.
-  const auto hour = usageHour(wall());
+  if (!store) co_return;
+  // This hour's object, as the previous process of this node left it: the counts go on from there.
+  const auto hour = usageHour(wallTimeMsForTest());
   try {
-    auto raw = co_await client->range(nodeUsagePrefix(nodeId) + hour + "/");
-    for (const auto& [key, kv] : raw.values) {
+    auto response = co_await store->get(nodeUsageKey(nodeId, hour));
+    if (response.status == 200) {
       try {
-        auto row = decodeUsageRow(kv.value);
-        if (row.hour != hour || row.nodeId != nodeId || key != nodeUsageKey(nodeId, hour, row.tenant)) continue;
-        auto& counts = hours[hour][row.tenant];
-        counts.requests += row.requests; counts.logLines += row.logLines; counts.egressBytes += row.egressBytes;
-        counts.cpuMs += row.cpuMs; counts.isolateMs += row.isolateMs;
-        ++seededRows;
-      } catch (const kj::Exception&) {}
+        auto stored = decodeNodeUsageHour(response.bytes);
+        if (stored.nodeId == nodeId && stored.hour == hour) {
+          for (const auto& [tenant, counts] : stored.tenants) {
+            hours[hour][tenant].counts.add(counts);
+            ++seededTenants;
+          }
+          seededHour = hour;
+        }
+      } catch (const kj::Exception& error) {
+        lastError = std::string("this hour's usage object does not read: ") + error.getDescription().cStr();
+      }
+    } else {
+      KJ_REQUIRE(response.status == 404, "object store read failed", response.status);
     }
     co_await prune();
   } catch (const kj::Exception& error) {
-    // Usage is no reason not to serve: counted from zero, written when etcd answers.
+    // Usage is no reason not to serve: counted from zero, written when the store answers.
     lastError = error.getDescription().cStr();
   }
 }
@@ -74,15 +80,15 @@ kj::Promise<void> TenantUsage::sample() {
   lastSample = at;
   for (const auto& [tenant, ns] : sources.takeCpuNs()) {
     if (!ns) continue;
-    auto& counts = now(tenant);
-    counts.cpuMs += double(ns) / 1e6;
-    counts.dirty = true;
+    auto& entry = now(tenant);
+    entry.counts.cpuMs += double(ns) / 1e6;
+    entry.dirty = true;
   }
   for (const auto& [tenant, count] : sources.residentIsolates()) {
     if (!count) continue;
-    auto& counts = now(tenant);
-    counts.isolateMs += elapsed * double(count);
-    counts.dirty = true;
+    auto& entry = now(tenant);
+    entry.counts.isolateMs += elapsed * double(count);
+    entry.dirty = true;
   }
   std::string text;
   try { text = co_await sources.logLines(); } catch (const kj::Exception&) { co_return; }
@@ -102,7 +108,7 @@ kj::Promise<void> TenantUsage::sample() {
       auto& last = lastKept[tenant];
       if (total > last) {
         auto& counts = now(tenant);
-        counts.logLines += total - last;
+        counts.counts.logLines += total - last;
         counts.dirty = true;
       }
       last = total;
@@ -111,27 +117,20 @@ kj::Promise<void> TenantUsage::sample() {
 }
 
 kj::Promise<void> TenantUsage::flush() {
-  if (!client) co_return;
-  const auto current = usageHour(wall());
-  std::vector<std::pair<std::string, std::string>> rows;  // key, value
-  std::vector<std::pair<std::string, std::string>> flushed;  // hour, tenant
-  const auto updated = wall();
-  for (const auto& [hour, tenants] : hours) for (const auto& [tenant, counts] : tenants) {
-    if (!counts.dirty) continue;
-    rows.emplace_back(nodeUsageKey(nodeId, hour, tenant), usageRowJson({tenant, hour, nodeId, counts.requests, counts.logLines,
-        counts.egressBytes, counts.cpuMs, counts.isolateMs, updated}));
-    flushed.emplace_back(hour, tenant);
-  }
+  if (!store) co_return;
+  const auto at = wallTimeMsForTest();
+  const auto current = usageHour(at), previous = usageHour(at > 3600000 ? at - 3600000 : 0);
   try {
-    for (size_t start = 0; start < rows.size(); start += 100) {
-      std::string txn = "{\"compare\":[],\"success\":[";
-      for (size_t i = start; i < std::min(rows.size(), start + 100); ++i)
-        txn += std::string(i > start ? "," : "") + "{\"request_put\":{\"key\":" + quote(base64(rows[i].first)) + ",\"value\":" +
-            quote(base64(rows[i].second)) + "}}";
-      co_await client->request("/v3/kv/txn", txn + "]}");
+    // Each hour with a change: its object again, every tenant of the hour in it.
+    for (auto& [hour, tenants] : hours) {
+      if (std::none_of(tenants.begin(), tenants.end(), [](const auto& entry) { return entry.second.dirty; })) continue;
+      NodeUsageHour object{nodeId, hour, at, {}};
+      for (const auto& [tenant, entry] : tenants) object.tenants[tenant] = entry.counts;
+      co_await store->put(nodeUsageKey(nodeId, hour), nodeUsageHourJson(object));
+      for (auto& [tenant, entry] : tenants) entry.dirty = false;
+      ++objectsWritten;
+      rowsWritten += object.tenants.size();
     }
-    for (const auto& [hour, tenant] : flushed) hours[hour][tenant].dirty = false;
-    rowsWritten += rows.size();
     ++flushes;
     lastFlushAtUnixMs = wall();
     lastError.clear();
@@ -140,33 +139,36 @@ kj::Promise<void> TenantUsage::flush() {
     lastError = error.getDescription().cStr();
     co_return;
   }
-  // Hours that are over and written stay only in etcd.
-  bool rolled = false;
+  // Hours before the previous one that are written stay only in the store.
   for (auto it = hours.begin(); it != hours.end();) {
-    bool clean = std::all_of(it->second.begin(), it->second.end(), [](const auto& entry) { return !entry.second.dirty; });
-    if (it->first < current && clean) { it = hours.erase(it); rolled = true; } else ++it;
+    const bool clean = std::all_of(it->second.begin(), it->second.end(), [](const auto& entry) { return !entry.second.dirty; });
+    if (it->first < previous && clean) it = hours.erase(it); else ++it;
   }
-  if (rolled) co_await prune();
+  if (current != lastPruneHour) {
+    try { co_await prune(); } catch (const kj::Exception& error) { lastError = error.getDescription().cStr(); }
+  }
 }
 
+// Once an hour: this node's objects of the hours before retentionHours ago, found by listing its own prefix.
 kj::Promise<void> TenantUsage::prune() {
-  if (!client || !settings.retentionHours) co_return;
-  const auto now = wall(), keep = uint64_t(settings.retentionHours) * 3600000;
-  if (now <= keep) co_return;
-  const auto cutoff = usageHour(now - keep);
-  const auto prefix = nodeUsagePrefix(nodeId);
-  // Every row of an hour before the cutoff: [prefix, prefix + cutoff).
-  auto response = co_await client->request("/v3/kv/deleterange", "{\"key\":" + quote(base64(prefix)) + ",\"range_end\":" +
-      quote(base64(prefix + cutoff)) + "}");
-  capnp::MallocMessageBuilder message;
-  auto json = message.initRoot<Json>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-  prunes += integer(json, "deleted");
+  if (!store || !settings.retentionHours) co_return;
+  const auto at = wallTimeMsForTest(), keep = uint64_t(settings.retentionHours) * 3600000;
+  lastPruneHour = usageHour(at);
+  if (at <= keep) co_return;
+  const auto cutoff = usageHour(at - keep);
+  auto listing = co_await store->list(nodeUsagePrefix(nodeId));
+  for (const auto& object : listing.objects) {
+    auto parsed = parseNodeUsageKey(object.key);
+    if (!parsed || parsed->first != nodeId || parsed->second >= cutoff) continue;
+    co_await store->remove(object.key);
+    ++prunedObjects;
+  }
+  ++prunes;
   prunedThrough = cutoff;
 }
 
 kj::Promise<std::string> TenantUsage::flushNow() {
-  const auto rowsBefore = rowsWritten, failuresBefore = flushFailures;
+  const auto objectsBefore = objectsWritten, rowsBefore = rowsWritten, failuresBefore = flushFailures;
   std::string failure;
   try {
     co_await sample();
@@ -175,11 +177,11 @@ kj::Promise<std::string> TenantUsage::flushNow() {
     failure = error.getDescription().cStr();
   }
   size_t unwritten = 0;
-  for (const auto& [hour, tenants] : hours) for (const auto& [tenant, counts] : tenants) if (counts.dirty) ++unwritten;
+  for (const auto& [hour, tenants] : hours) for (const auto& [tenant, entry] : tenants) if (entry.dirty) ++unwritten;
   std::ostringstream out;
-  out << "{\"backend\":\"" << (client ? "etcd" : "none") << "\",\"rowsWritten\":" << (rowsWritten - rowsBefore)
-      << ",\"flushFailures\":" << (flushFailures - failuresBefore) << ",\"unwrittenRows\":" << unwritten
-      << ",\"lastError\":" << quote(failure.empty() ? lastError : failure) << "}";
+  out << "{\"backend\":\"" << (store ? "objectStore" : "none") << "\",\"objectsWritten\":" << (objectsWritten - objectsBefore)
+      << ",\"rowsWritten\":" << (rowsWritten - rowsBefore) << ",\"flushFailures\":" << (flushFailures - failuresBefore)
+      << ",\"unwrittenRows\":" << unwritten << ",\"lastError\":" << quote(failure.empty() ? lastError : failure) << "}";
   co_return out.str();
 }
 
@@ -197,19 +199,22 @@ kj::Promise<void> TenantUsage::run() {
 
 std::string TenantUsage::json() const {
   std::ostringstream out;
-  out << std::setprecision(17) << "{\"backend\":\"" << (client ? "etcd" : "none") << "\",\"flushIntervalMs\":" << settings.flushIntervalMs
+  out << std::setprecision(17) << "{\"backend\":\"" << (store ? "objectStore" : "none") << "\",\"prefix\":"
+      << quote(store ? nodeUsagePrefix(nodeId) : std::string()) << ",\"flushIntervalMs\":" << settings.flushIntervalMs
       << ",\"retentionHours\":" << settings.retentionHours << ",\"sampleIntervalMs\":" << settings.sampleIntervalMs
-      << ",\"flushes\":" << flushes << ",\"flushFailures\":" << flushFailures << ",\"rowsWritten\":" << rowsWritten
-      << ",\"seededRows\":" << seededRows << ",\"prunedRows\":" << prunes << ",\"prunedThrough\":" << quote(prunedThrough)
+      << ",\"flushes\":" << flushes << ",\"flushFailures\":" << flushFailures << ",\"objectsWritten\":" << objectsWritten
+      << ",\"rowsWritten\":" << rowsWritten << ",\"seededHour\":" << quote(seededHour) << ",\"seededRows\":" << seededTenants
+      << ",\"prunes\":" << prunes << ",\"prunedObjects\":" << prunedObjects << ",\"prunedThrough\":" << quote(prunedThrough)
       << ",\"lastFlushAtUnixMs\":" << lastFlushAtUnixMs << ",\"lastError\":" << quote(lastError) << ",\"hours\":{";
   size_t h = 0;
   for (const auto& [hour, tenants] : hours) {
     out << (h++ ? "," : "") << quote(hour) << ":{";
     size_t t = 0;
-    for (const auto& [tenant, c] : tenants) {
+    for (const auto& [tenant, entry] : tenants) {
+      const auto& c = entry.counts;
       out << (t++ ? "," : "") << quote(tenant) << ":{\"requests\":" << c.requests << ",\"cpuMs\":" << c.cpuMs << ",\"egressBytes\":"
           << c.egressBytes << ",\"logLines\":" << c.logLines << ",\"isolateMs\":" << c.isolateMs << ",\"unwritten\":"
-          << (c.dirty ? "true" : "false") << "}";
+          << (entry.dirty ? "true" : "false") << "}";
     }
     out << "}";
   }

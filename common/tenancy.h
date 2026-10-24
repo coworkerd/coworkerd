@@ -1,23 +1,17 @@
 #pragma once
 
-#include "etcd.h"
+#include "json.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
-// Tenants (docs/control-plane-api.md): the two-layer model tenant -> Worker, the v2 layout of etcd, and the
-// records the control plane and the nodes share -- tenants, credentials, Worker limits, usage rows.
+// Tenants (docs/control-plane-api.md): the two-layer model tenant -> Worker and the records the control plane and the
+// nodes share -- tenants, credentials, Worker limits, usage.
 namespace coworkerd {
 
-// The v2 layout of etcd (control-plane-api.md section 4). The control plane is the only writer of tenants/,
-// credentials/ and deploy/ (the deployment state, DEPLOYMENT_PREFIX in deployment.h); each node writes only below
-// nodes/<its id> -- its member key, its suspicions and its usage rows.
-inline constexpr const char* V2_PREFIX = "/coworkerd/v2/";
-inline constexpr const char* TENANTS_PREFIX = "/coworkerd/v2/tenants/";
-inline constexpr const char* CREDENTIALS_PREFIX = "/coworkerd/v2/credentials/";
-inline constexpr const char* NODES_PREFIX = "/coworkerd/v2/nodes/";
 // The tenant of the deployment tool's subcommands without --tenant (the tests and the daemon itself).
 inline constexpr const char* DEFAULT_TENANT = "default";
 
@@ -41,7 +35,7 @@ struct WorkerLimits {
 // {"cpuMs":..,"memoryMiB":..}, the set fields only ("{}" when none).
 std::string workerLimitsJson(const WorkerLimits& limits);
 // The fields of a JSON object: cpuMs and memoryMiB, positive integers (or null: unset). Throws with the field's name.
-WorkerLimits readWorkerLimits(etcd::Json::Reader object);
+WorkerLimits readWorkerLimits(json::Json::Reader object);
 
 // A tenant's quotas. The control plane refuses what would exceed one (QUOTA_EXCEEDED, the reason names it); the logs'
 // two are enforced by the nodes; the Worker limits' ceilings bound what a Worker may set.
@@ -61,7 +55,7 @@ struct TenantQuotas {
 };
 std::string tenantQuotasJson(const TenantQuotas& quotas);
 // Sets the fields an object names; an unknown name or a value that is not a positive integer throws with the name.
-void applyTenantQuotas(TenantQuotas& quotas, etcd::Json::Reader object);
+void applyTenantQuotas(TenantQuotas& quotas, json::Json::Reader object);
 
 struct TenantRecord {
   std::string name, status = "active";  // "active" or "deleting"
@@ -90,23 +84,34 @@ struct CredentialToken { std::string keyId, secret; };
 std::optional<CredentialToken> parseCredential(const std::string& value);
 std::string credentialText(const CredentialToken& token);
 
-// One node's usage of one tenant in one hour (UTC).
-struct UsageRow {
-  std::string tenant, hour, nodeId;
+// One node's usage in one hour (UTC), every tenant's counts in one object on the object store,
+// nodes/<nodeId>/usage/<hour>: the node overwrites it every usage.flushIntervalMs (when its counts changed) and removes
+// its own past retentionHours; the control plane lists nodes/ and sums the hours a request asks for, and removes what a
+// node that left kept past retentionHours.
+struct UsageCounts {
   uint64_t requests = 0, logLines = 0, egressBytes = 0;
   double cpuMs = 0, isolateMs = 0;
-  uint64_t updatedAtUnixMs = 0;
+  void add(const UsageCounts& other);
 };
-std::string usageRowJson(const UsageRow& row);
-UsageRow decodeUsageRow(const std::string& bytes);
+// "requests":..,"cpuMs":..,"egressBytes":..,"logLines":..,"isolateMs":.. (the fields, without braces).
+std::string usageCountsFields(const UsageCounts& counts);
+struct NodeUsageHour {
+  std::string nodeId, hour;
+  uint64_t updatedAtUnixMs = 0;
+  std::map<std::string, UsageCounts> tenants;
+};
+std::string nodeUsageHourJson(const NodeUsageHour& usage);
+// Lenient about fields a later version adds; an object without a valid node id, hour or tenant name throws.
+NodeUsageHour decodeNodeUsageHour(const std::string& bytes);
 // The hour a time falls in, "YYYY-MM-DDTHH" (UTC; sorts as text), and its start.
 std::string usageHour(uint64_t unixMs);
 uint64_t usageHourStartMs(const std::string& hour);  // throws on a malformed hour
 
-// A node's own keys (the only ones its etcd user may write): its member key, its suspicion of a tenant, its usage rows.
-std::string nodeMemberKey(const std::string& nodeId);
-std::string nodeSuspectKey(const std::string& nodeId, const std::string& tenant);
-std::string nodeUsagePrefix(const std::string& nodeId);
-std::string nodeUsageKey(const std::string& nodeId, const std::string& hour, const std::string& tenant);
+// The nodes' own objects: nodes/<nodeId>/... -- a node's identity writes only its own prefix (and members/<nodeId>/).
+inline constexpr const char* NODES_OBJECT_PREFIX = "nodes/";
+std::string nodeUsagePrefix(const std::string& nodeId);                         // nodes/<nodeId>/usage/
+std::string nodeUsageKey(const std::string& nodeId, const std::string& hour);  // nodes/<nodeId>/usage/<hour>
+// The node and the hour of a key nodes/<nodeId>/usage/<hour>; none for any other key.
+std::optional<std::pair<std::string, std::string>> parseNodeUsageKey(const std::string& key);
 
 }  // namespace coworkerd

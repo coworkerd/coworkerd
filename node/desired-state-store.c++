@@ -18,10 +18,10 @@
 // hint; when it names another revision, the index, then only the manifests whose revision the index changed, the
 // definitions they name by hash (immutable: each read once and verified), the secrets' values opened with the cluster's
 // secrets key -- all of it turned into the deployment state's keys and applied at the index's revision, so the
-// evaluation (DeploymentState) is the one etcd's keys had.
+// evaluation (DeploymentState) is the one 0.3's keys had.
 namespace coworkerd {
 namespace {
-using etcd::quote;
+using json::quote;
 
 uint64_t nowUnixMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -189,7 +189,7 @@ public:
     out << ',' << current.statusFields(STATUS_PROBLEM_LIMIT)
         << ",\"rejectedRevisions\":" << rejectedRevisions << ",\"lastRejectedRevision\":\"" << lastRejectedRevision
         << "\",\"lastRejectedReason\":" << quote(lastRejectedReason)
-        // The etcd backend's fields, as the poll has them: a full read at the start, no compaction; connected while
+        // The fields 0.3 reported for its watch, as the poll has them: a full read at the start, no compaction; connected while
         // the last poll reached the store.
         << ",\"fullRereads\":" << (started ? 1 : 0) << ",\"compactions\":0"
         << ",\"watchConnected\":" << (lastPollOk ? "true" : "false")

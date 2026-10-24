@@ -1,5 +1,5 @@
 #include "membership.h"
-#include "etcd.h"
+#include "json.h"
 #include "object-state.h"
 #include "tenancy.h"
 
@@ -12,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -19,14 +20,7 @@
 namespace coworkerd {
 namespace {
 
-// The member keys: /coworkerd/v2/nodes/<nodeId>. The keys below one are that node's own records (suspicions,
-// usage rows), not members.
-constexpr const char* PREFIX = NODES_PREFIX;
-bool memberKey(const std::string& key) {
-  return key.starts_with(PREFIX) && key.size() > std::string_view(PREFIX).size() &&
-      key.find('/', std::string_view(PREFIX).size()) == std::string::npos;
-}
-using namespace etcd;
+using namespace json;
 
 uint64_t nowUnixMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -108,445 +102,12 @@ private:
   MembershipView state;
 };
 
-class EtcdMembership final: public Membership {
-public:
-  EtcdMembership(MembershipConfig config, std::string serverId,
-      kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headerTable)
-      : config(std::move(config)), serverId(std::move(serverId)), network(network),
-        timer(timer), headerTable(headerTable), startedAtUnixMs(nowUnixMs()), expiresAt(timer.now()),
-        authority(this->config.endpoint, this->config.requestTimeoutMs, network, timer, headerTable),
-        // Changes only: the prefix also holds every node's suspicions and usage rows, which no member
-        // table needs mirrored.
-        watcher(authority, PREFIX, timer, this->config.retryMs,
-            EtcdWatcher::ApplyChanges([this](const EtcdBatch& batch) { return applyMembers(batch); })),
-        startupDeadline(timer.now()) {
-    state.backend = "etcd";
-  }
-
-  const MembershipView& view() const override {
-    const auto& observed = watcher.view();
-    state.watchConnected = observed.connected;
-    state.revision = observed.revision;
-    state.fullRereads = observed.fullRereads;
-    state.compactions = observed.compactions;
-    return state;
-  }
-
-  kj::Promise<void> start() override {
-    try {
-      startupDeadline = timer.now() + config.startupTimeoutMs * kj::MILLISECONDS;
-      co_await startRetry();
-    } catch (const kj::Exception& error) {
-      if (conflict) throw;
-      KJ_FAIL_REQUIRE("etcd membership startup failed before serving",
-          config.endpoint.c_str(), config.startupTimeoutMs, error.getDescription());
-    }
-  }
-
-  kj::Promise<void> run() override {
-    return maintainLease().exclusiveJoin(watcher.run());
-  }
-
-  kj::Promise<void> stop() override {
-    if (stopping) co_return;
-    // Renewal and re-registration end before the revocation: once revoked, the
-    // key must not come back from this process.
-    stopping = true;
-    state.leaseStatus = "stopping";
-    if (!state.leaseId.empty()) {
-      try {
-        co_await request("/v3/lease/revoke", "{\"ID\":" + quote(state.leaseId) + "}");
-        state.revokeStatus = "revoked";
-        std::cout << "[membership] revoked node=" << serverId
-                  << " lease=" << state.leaseId << std::endl;
-      } catch (const kj::Exception& error) {
-        // A disconnected authority cannot acknowledge graceful revocation.
-        // The remaining lease still expires; shutdown is bounded by the RPC timeout.
-        state.revokeStatus = std::string("failed: ") + error.getDescription().cStr();
-        std::cerr << "[membership] revoke failed node=" << serverId
-                  << " error=" << error.getDescription().cStr() << std::endl;
-      }
-    } else {
-      state.revokeStatus = "no-lease";
-    }
-    state.revokedAtUnixMs = nowUnixMs();
-    state.leaseStatus = "stopped";
-  }
-
-  kj::Promise<void> announceDraining() override {
-    state.draining = true;
-    ++state.drainAnnounceAttempts;
-    if (state.drainAnnounce == "announced") co_return;
-    if (stopping || state.leaseId.empty() || timer.now() >= expiresAt) {
-      state.drainAnnounce = stopping ? "failed: membership stopped" : "failed: no live lease";
-      KJ_FAIL_REQUIRE("no live lease to announce draining under", serverId.c_str());
-    }
-    state.drainAnnounce = "pending";
-    const auto leaseId = state.leaseId;
-    auto key = base64(std::string(PREFIX) + serverId);
-    Member member{serverId, config.advertisedAddress, leaseId, startedAtUnixMs, "draining"};
-    // Only a key this process holds under this lease is rewritten; the value keeps
-    // the lease, so renewal and revocation are unchanged.
-    std::string response;
-    try {
-      response = co_await request("/v3/kv/txn",
-          "{\"compare\":[{\"target\":\"LEASE\",\"result\":\"EQUAL\",\"key\":" + quote(key) +
-          ",\"lease\":" + quote(leaseId) + "}],\"success\":[{\"request_put\":{\"key\":" + quote(key) +
-          ",\"value\":" + quote(base64(memberJson(member))) + ",\"lease\":" + quote(leaseId) + "}}]}");
-    } catch (const kj::Exception& error) {
-      state.drainAnnounce = std::string("failed: ") + error.getDescription().cStr();
-      throw;
-    }
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    if (!boolean(json, "succeeded")) {
-      state.drainAnnounce = "failed: the member key is not held under this Server's lease";
-      KJ_FAIL_REQUIRE("member key is not held under this Server's lease", serverId.c_str(), leaseId.c_str());
-    }
-    state.drainAnnounce = "announced";
-    state.drainAnnouncedAtUnixMs = nowUnixMs();
-    std::cout << "[membership] draining announced node=" << serverId << " lease=" << leaseId << std::endl;
-  }
-
-private:
-  MembershipConfig config;
-  std::string serverId;
-  kj::Network& network;
-  kj::Timer& timer;
-  const kj::HttpHeaderTable& headerTable;
-  uint64_t startedAtUnixMs;
-  mutable MembershipView state;
-  bool conflict = false;
-  bool stopping = false;
-  bool collisionAllowanceUsed = false;
-  std::string retiredLeaseId;
-  kj::TimePoint expiresAt;
-  EtcdClient authority;
-  EtcdWatcher watcher;
-  kj::TimePoint startupDeadline;
-
-
-  kj::Promise<std::string> request(std::string path, std::string payload, bool firstFrame = false) {
-    return authority.request(std::move(path), std::move(payload), firstFrame);
-  }
-
-  kj::Promise<uint32_t> keepAlive() {
-    auto response = co_await request("/v3/lease/keepalive",
-        "{\"ID\":" + quote(state.leaseId) + "}", true);
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    auto result = field(json, "result");
-    auto ttl = integer(result, "TTL");
-    KJ_REQUIRE(ttl <= 86400, "etcd returned an unsupported lease TTL");
-    if (ttl > 0) {
-      state.grantedTtlSeconds = ttl;
-      expiresAt = timer.now() + ttl * kj::SECONDS;
-      ++state.keepAlives;
-    }
-    co_return static_cast<uint32_t>(ttl);
-  }
-
-  kj::Promise<void> registerOnce(bool starting = false) {
-    conflict = false;
-    if (!state.leaseId.empty() && co_await keepAlive() == 0) state.leaseId.clear();
-    if (state.leaseId.empty()) {
-      auto response = co_await request("/v3/lease/grant",
-          "{\"TTL\":" + quote(std::to_string(config.ttlSeconds)) + "}");
-      capnp::MallocMessageBuilder message;
-      auto json = message.initRoot<Json>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-      state.leaseId = text(json, "ID");
-      auto ttl = integer(json, "TTL");
-      KJ_REQUIRE(ttl > 0 && ttl <= 86400, "etcd returned an invalid lease TTL");
-      state.grantedTtlSeconds = ttl;
-      expiresAt = timer.now() + ttl * kj::SECONDS;
-    }
-    auto key = base64(std::string(PREFIX) + serverId);
-    Member member{serverId, config.advertisedAddress, state.leaseId, startedAtUnixMs};
-    // A registration still in flight when stop() revoked the lease must not
-    // create the key again.
-    KJ_REQUIRE(!stopping, "membership stopped during registration");
-    auto response = co_await request("/v3/kv/txn",
-        "{\"compare\":[{\"target\":\"VERSION\",\"result\":\"EQUAL\",\"key\":" + quote(key) +
-        ",\"version\":\"0\"}],\"success\":[{\"request_put\":{\"key\":" + quote(key) +
-        ",\"value\":" + quote(base64(memberJson(member))) + ",\"lease\":" + quote(state.leaseId) +
-        "}}],\"failure\":[{\"request_range\":{\"key\":" + quote(key) + "}}]}");
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-    if (!boolean(json, "succeeded")) {
-      auto responses = field(json, "responses").getArray();
-      auto kvs = field(field(responses[0], "response_range"), "kvs");
-      // A lost transaction response may already have committed our own lease.
-      // Only that exact lease is accepted; another process is never overwritten.
-      bool own = kvs.isArray() && kvs.getArray().size() == 1 &&
-          text(kvs.getArray()[0], "lease") == state.leaseId &&
-          unbase64(text(kvs.getArray()[0], "value")) == memberJson(member);
-      if (!own && !retiredLeaseId.empty() && kvs.isArray() && kvs.getArray().size() == 1 &&
-          text(kvs.getArray()[0], "lease") == retiredLeaseId) {
-        // If etcd restored an old lease after downtime, atomically reattach
-        // only our own key. A delete/create gap would defeat static stability
-        // during recovery. A competing identity never passes this comparison.
-        auto replacement = co_await request("/v3/kv/txn",
-            "{\"compare\":[{\"target\":\"LEASE\",\"result\":\"EQUAL\",\"key\":" + quote(key) +
-            ",\"lease\":" + quote(retiredLeaseId) + "}],\"success\":[{\"request_put\":{\"key\":" +
-            quote(key) + ",\"value\":" + quote(base64(memberJson(member))) +
-            ",\"lease\":" + quote(state.leaseId) + "}}]}");
-        capnp::MallocMessageBuilder replacementMessage;
-        auto replacementJson = replacementMessage.initRoot<Json>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(replacement.data(), replacement.size()), replacementJson);
-        own = boolean(replacementJson, "succeeded");
-        KJ_REQUIRE(own, "membership changed while retiring its old epoch; retry registration");
-      }
-      if (!own && starting && kvs.isArray() && kvs.getArray().size() == 1) {
-        co_await observeCollision(EtcdClient::decodeKv(kvs.getArray()[0]));
-        co_await registerOnce(true);
-        co_return;
-      }
-      if (!own) {
-        conflict = true;
-        state.leaseStatus = "conflict";
-        KJ_FAIL_REQUIRE("membership nodeId conflict: key already exists", serverId.c_str());
-      }
-    }
-    if (state.epoch != state.leaseId) {
-      state.epoch = state.leaseId;
-      state.heldEpochs.insert(state.epoch);
-      ++state.registrations;
-      std::cout << "[membership] registered node=" << serverId
-                << " epoch=" << state.epoch << " address=" << config.advertisedAddress
-                << " ttl-seconds=" << state.grantedTtlSeconds << std::endl;
-    }
-    state.leaseStatus = "active";
-    state.leaseConnected = true;
-    if (!retiredLeaseId.empty()) {
-      auto oldLease = std::exchange(retiredLeaseId, {});
-      try {
-        co_await request("/v3/lease/revoke", "{\"ID\":" + quote(oldLease) + "}");
-      } catch (const kj::Exception& error) {
-        // The key is already attached to the replacement lease; old-lease
-        // cleanup cannot delete it, and a failed cleanup expires on its own.
-        failed("retired-lease cleanup", error);
-      }
-    }
-  }
-
-  void failed(const char* operation, const kj::Exception& error) {
-    state.lastError = error.getDescription().cStr();
-    std::cerr << "[membership] " << operation << " failed node=" << serverId
-              << " revision=" << state.revision << " error=" << state.lastError << std::endl;
-  }
-
-  kj::Promise<void> startRetry() {
-    while (true) {
-      try {
-        KJ_REQUIRE(timer.now() < startupDeadline, "membership startup timeout", state.lastError.c_str());
-        co_await registerOnce(true);
-        co_await watcher.fullRead();
-        co_return;
-      } catch (const kj::Exception& error) {
-        if (conflict || timer.now() >= startupDeadline) throw;
-        state.leaseConnected = false;
-        failed("startup", error);
-      }
-      co_await timer.afterDelay(config.retryMs * kj::MILLISECONDS);
-    }
-  }
-
-  kj::Promise<void> maintainLease() {
-    uint32_t delayMs = state.grantedTtlSeconds * 1000 / 3;
-    while (true) {
-      co_await timer.afterDelay(delayMs * kj::MILLISECONDS);
-      // After stop() nothing renews or registers again; the promise stays pending
-      // (it is joined with the watch and the Server's other loops).
-      if (stopping) co_await kj::Promise<void>(kj::NEVER_DONE);
-      try {
-        if (state.draining) {
-          // An exiting Server keeps its lease while it drains but takes no new epoch:
-          // an expired lease (by the local clock, as below) stays expired.
-          if (!state.leaseId.empty() && timer.now() < expiresAt && co_await keepAlive() > 0) {
-            state.leaseConnected = true;
-          } else if (!state.leaseId.empty()) {
-            state.leaseStatus = "expired";
-            std::cout << "[membership] lease expired while draining node=" << serverId
-                      << " epoch=" << state.epoch << std::endl;
-            state.leaseId.clear();
-          }
-          delayMs = state.leaseId.empty() ? config.retryMs : state.grantedTtlSeconds * 1000 / 3;
-          continue;
-        }
-        if (state.leaseId.empty()) {
-          co_await registerOnce();
-        } else if (timer.now() >= expiresAt) {
-          // A stopped single-node etcd can restore the lease's full TTL on
-          // restart. Never resurrect an epoch whose local renewal deadline
-          // passed. Conditional registration can replace our restored key.
-          state.leaseStatus = "expired";
-          retiredLeaseId = std::exchange(state.leaseId, {});
-          co_await registerOnce();
-        } else if (co_await keepAlive() == 0) {
-          state.leaseStatus = "expired";
-          state.leaseId.clear();
-          std::cout << "[membership] lease expired node=" << serverId
-                    << " old-epoch=" << state.epoch << std::endl;
-          co_await registerOnce();
-        } else if (state.epoch != state.leaseId || state.leaseStatus == "conflict") {
-          co_await registerOnce();
-        }
-        state.leaseConnected = true;
-        state.leaseStatus = "active";
-        delayMs = state.grantedTtlSeconds * 1000 / 3;
-      } catch (const kj::Exception& error) {
-        state.leaseConnected = false;
-        if (!conflict) state.leaseStatus = timer.now() >= expiresAt ? "expired" : "uncertain";
-        failed("keepalive", error);
-        delayMs = config.retryMs;
-      }
-    }
-  }
-
-  std::string ttlSequence() const {
-    std::ostringstream out;
-    out << '[';
-    size_t index = 0;
-    for (auto ttl : state.startupConflictTtlSequence) { if (index++) out << ','; out << ttl; }
-    out << ']';
-    return out.str();
-  }
-
-  kj::Promise<void> observeCollision(const EtcdKv& held) {
-    const auto started = timer.now();
-    state.startupConflictTtlSequence.clear();
-    state.leaseStatus = "waiting-for-old-lease";
-    int64_t previous = -1;
-    kj::Maybe<kj::TimePoint> collisionDeadline;
-    // etcd truncates the reported TTL. One second covers truncation; two more
-    // seconds cover expiration processing and scheduling variation.
-    constexpr uint32_t EXPIRATION_MARGIN_MS = 2000;
-    while (true) {
-      auto response = co_await request("/v3/lease/timetolive", "{\"ID\":" + quote(held.lease) + "}");
-      capnp::MallocMessageBuilder message;
-      auto json = message.initRoot<Json>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.data(), response.size()), json);
-      auto ttlField = field(json, "TTL");
-      auto ttl = ttlField.isString() ? std::stoll(ttlField.getString().cStr()) : 0;
-      if (collisionDeadline == kj::none && ttl >= 0) {
-        collisionDeadline = timer.now() + (ttl + 1) * kj::SECONDS + EXPIRATION_MARGIN_MS * kj::MILLISECONDS;
-        // The original startup timeout remains the global bound. A collision
-        // receives one finite allowance; repeated collisions never add time.
-        if (!collisionAllowanceUsed) {
-          collisionAllowanceUsed = true;
-          KJ_IF_SOME(deadline, collisionDeadline) {
-            startupDeadline = kj::max(startupDeadline, deadline + 2 * config.requestTimeoutMs * kj::MILLISECONDS);
-          }
-        }
-      }
-      state.startupConflictTtlSequence.push_back(ttl);
-      state.startupCollisionWaitMs = (timer.now() - started) / kj::MILLISECONDS;
-      std::cout << "[membership] observe collision node=" << serverId << " held-lease=" << held.lease
-                << " ttl-sequence=" << ttlSequence() << " elapsed-ms=" << state.startupCollisionWaitMs << std::endl;
-      if (previous >= 0 && ttl > previous) {
-        conflict = true;
-        state.leaseStatus = "conflict";
-        auto reason = "membership nodeId conflict: observed renewed lease TTL sequence=" + ttlSequence();
-        KJ_FAIL_REQUIRE(reason.c_str(), serverId.c_str());
-      }
-      if (ttl < 0) co_return;
-      auto current = co_await authority.range(std::string(PREFIX) + serverId);
-      auto found = current.values.find(held.key);
-      if (found == current.values.end()) co_return;
-      if (found->second.lease != held.lease) {
-        conflict = true;
-        KJ_FAIL_REQUIRE("membership nodeId conflict: holder changed; TTL sequence", ttlSequence().c_str());
-      }
-      KJ_IF_SOME(deadline, collisionDeadline) {
-        if (timer.now() >= deadline) {
-          conflict = true;
-          state.leaseStatus = "conflict";
-          auto reason = "membership nodeId conflict: lease survived time bound; TTL sequence=" + ttlSequence();
-          KJ_FAIL_REQUIRE(reason.c_str(), serverId.c_str(), state.startupCollisionWaitMs);
-        }
-      }
-      KJ_REQUIRE(timer.now() < startupDeadline, "membership startup timeout while observing collision");
-      previous = ttl;
-      co_await timer.afterDelay(250 * kj::MILLISECONDS);
-    }
-  }
-
-  Member decodeMember(const EtcdKv& kv) {
-    const auto& key = kv.key;
-    KJ_REQUIRE(key.starts_with(PREFIX), "unexpected membership key");
-    const auto& value = kv.value;
-    capnp::MallocMessageBuilder message;
-    auto json = message.initRoot<Json>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(value.data(), value.size()), json);
-    auto id = text(json, "nodeId");
-    auto address = text(json, "address");
-    auto epoch = text(json, "epoch");
-    KJ_REQUIRE(safeId(id) && key == std::string(PREFIX) + id && advertised(address),
-        "invalid membership value", key.c_str());
-    KJ_REQUIRE(epoch == kv.lease, "membership epoch differs from its lease");
-    auto timestamp = field(json, "startedAtUnixMs");
-    KJ_REQUIRE(timestamp.isNumber() && timestamp.getNumber() > 0, "invalid member startup time");
-    auto stateField = field(json, "state");
-    std::string memberState = "active";
-    if (!stateField.isNull()) {
-      KJ_REQUIRE(stateField.isString(), "invalid member state", key.c_str());
-      memberState = stateField.getString().cStr();
-      KJ_REQUIRE(memberState == "active" || memberState == "draining", "invalid member state", key.c_str());
-    }
-    return {id, address, epoch, static_cast<uint64_t>(timestamp.getNumber()), memberState};
-  }
-
-  // A value that cannot be read is skipped -- its key is no member while it stays so -- and logged once; it never
-  // stops the other members from being applied, nor this node from starting.
-  kj::Promise<void> applyMembers(const EtcdBatch& batch) {
-    auto next = batch.full ? std::map<std::string, Member>() : state.members;
-    auto invalid = batch.full ? std::set<std::string>() : state.invalidMembers;
-    for (const auto& change : batch.changes) {
-      if (!memberKey(change.key)) continue;
-      const auto id = change.key.substr(std::string_view(PREFIX).size());
-      if (!change.kv) { next.erase(id); invalid.erase(change.key); continue; }
-      try {
-        auto member = decodeMember(*change.kv);
-        invalid.erase(change.key);
-        next[member.id] = std::move(member);
-      } catch (const kj::Exception& error) {
-        next.erase(id);
-        ++state.skippedMemberValues;
-        if (invalid.insert(change.key).second)
-          std::cout << "[membership] {\"event\":\"invalid-member\",\"nodeId\":" << quote(serverId) << ",\"key\":" << quote(change.key)
-                    << ",\"modRevision\":\"" << change.kv->modRevision << "\",\"reason\":" << quote(error.getDescription().cStr())
-                    << ",\"revision\":\"" << batch.revision << "\"}" << std::endl;
-      }
-    }
-    state.invalidMembers = std::move(invalid);
-    logMemberChanges(serverId, state.members, next, batch.revision, state);
-    state.members.swap(next);
-    return kj::READY_NOW;
-  }
-
-};
-
-// The membership on the object store (docs/s3-truth-and-durable-objects.md section 2; the keys in object-state.h).
-// Joining: list members/<id>/, wait while the id is in use (a heartbeat or the newest registration younger than the TTL
-// by the listing's Date), create epochs/<max+1> only if absent and read it back after createSettleMs -- another
-// process's bytes there mean the registration was lost, and the id is judged again; the store's create-if-absent need
-// not hold under concurrency. Then a heartbeat object per epoch, overwritten every heartbeatIntervalMs, and a listing
-// of members/ every listIntervalMs: a heartbeat more than TTL + livenessGraceMs behind its listing's Date is out
-// (the store's clock both); a new (node, epoch) is read once for its address. Each listing also reads this epoch's
-// own heartbeat back: another process's bytes there, or a newer epoch of this id, mean another process holds the id --
-// this one drains and exits with 3 (onIdentityTaken). Past the TTL without a heartbeat written, by this node's
-// monotonic clock, the epoch is over: no calls from other nodes, and a new epoch once the store answers (v20's rule:
-// an expired epoch is never revived). Without the store the last member table stays in use.
 class ObjectStoreMembership final: public Membership, private kj::TaskSet::ErrorHandler {
 public:
   ObjectStoreMembership(MembershipConfig config, std::string serverId, const ObjectStoreConfig& storeConfig,
       kj::Network& network, kj::Timer& timer)
       : config(std::move(config)), serverId(std::move(serverId)), store(storeConfig, network, timer), timer(timer),
-        startedAtUnixMs(nowUnixMs()), lastHeartbeatOk(timer.now()), startupDeadline(timer.now()) {
+        startedAtUnixMs(nowUnixMs()), lastHeartbeatOk(timer.now()), lastListOk(timer.now()), startupDeadline(timer.now()) {
     std::array<unsigned char, 16> random;
     KJ_REQUIRE(RAND_bytes(random.data(), random.size()) == 1, "cannot name this membership's instance");
     for (auto byte : random) { instance += "0123456789abcdef"[byte >> 4]; instance += "0123456789abcdef"[byte & 15]; }
@@ -567,6 +128,31 @@ public:
   void onIdentityTaken(std::function<void(std::string)> callback) override {
     identityCallback = std::move(callback);
     if (state.identityTaken && identityCallback) identityCallback(state.identityTakenReason);
+  }
+
+  void onSuspects(SuspectsCallback callback) override { suspectsCallback = std::move(callback); }
+
+  kj::Promise<void> writeSuspects(std::string bytes) override {
+    KJ_REQUIRE(epoch && !stopping && !state.identityTaken && !state.selfExpired, "no live epoch to write the suspects object for",
+        serverId.c_str());
+    const auto number = epoch;
+    const bool removing = bytes.empty();
+    ++writing;
+    KJ_DEFER(--writing);
+    try {
+      if (removing) {
+        co_await bounded(store.remove(memberSuspectsKey(serverId, number)));
+        ++state.suspectsRemoved;
+      } else {
+        co_await bounded(store.put(memberSuspectsKey(serverId, number), std::move(bytes)));
+        ++state.suspectsWritten;
+      }
+    } catch (const kj::Exception&) {
+      ++state.suspectsWriteFailures;
+      throw;
+    }
+    // Written for the epoch this process still holds (a new one gets its object from the next write).
+    if (number == epoch) state.suspectsObject = !removing;
   }
 
   kj::Promise<void> start() override {
@@ -602,7 +188,7 @@ public:
     // Heartbeats and registration end before the objects go: once removed, they never come back from this process.
     stopping = true;
     state.leaseStatus = "stopping";
-    for (auto until = timer.now() + boundMs() * kj::MILLISECONDS; writing && timer.now() < until;)
+    for (auto until = timer.now() + boundMs() * kj::MILLISECONDS; writing > 0 && timer.now() < until;)
       co_await timer.afterDelay(10 * kj::MILLISECONDS);
     if (state.identityTaken) {
       // The id is another process's now: its epoch's objects are left to it (it removes the old epochs' objects).
@@ -613,6 +199,11 @@ public:
       try {
         co_await bounded(store.remove(memberHeartbeatKey(serverId, epoch)));
         co_await bounded(store.remove(memberDrainKey(serverId, epoch)));
+        if (state.suspectsObject) {
+          co_await bounded(store.remove(memberSuspectsKey(serverId, epoch)));
+          state.suspectsObject = false;
+          ++state.suspectsRemoved;
+        }
         state.revokeStatus = "removed";
         std::cout << "[membership] removed node=" << serverId << " epoch=" << epoch << std::endl;
       } catch (const kj::Exception& error) {
@@ -663,9 +254,17 @@ private:
   MembershipView state;
   uint64_t epoch = 0;
   kj::TimePoint lastHeartbeatOk;
+  // The last listing of members/ that answered, and whether one failed since (the recovery anchor's blindness).
+  kj::TimePoint lastListOk;
+  bool listFailedSinceOk = false;
   kj::TimePoint startupDeadline;
-  bool fatal = false, stopping = false, writing = false, collisionAllowanceUsed = false;
+  bool fatal = false, stopping = false, collisionAllowanceUsed = false;
+  // Writes of this epoch's objects in flight (the heartbeat, the suspects object): stop() waits for them.
+  uint32_t writing = 0;
   std::function<void(std::string)> identityCallback;
+  SuspectsCallback suspectsCallback;
+  // (node, epoch) -> the ETag of its suspects object as this membership last read it.
+  std::map<std::pair<std::string, uint64_t>, std::string> suspectsEtags;
   // The registrations this process created (its epochs, once read back).
   std::set<uint64_t> created;
   // (node, epoch) -> its heartbeat's record, read once for its address.
@@ -864,8 +463,9 @@ private:
     KJ_REQUIRE(!stopping, "membership stopped during registration");
     epoch = number;
     state.epoch = std::to_string(number);
-    // A new epoch replaces any expired one: calls addressed to that one are refused from now on.
-    state.heldEpochs = {state.epoch};
+    // Beside the epochs this process held before: a stateless call addressed to an expired one is still served (an
+    // expired epoch is never renewed; re-registration takes a new one).
+    state.heldEpochs.insert(state.epoch);
     ++state.registrations;
     state.storeClient = store.stats().json();
     std::cout << "[membership] registered node=" << serverId << " epoch=" << epoch << " address=" << config.advertisedAddress
@@ -876,8 +476,8 @@ private:
     KJ_REQUIRE(epoch && !state.identityTaken && !stopping, "no epoch to write a heartbeat for");
     auto record = recordOf(state.draining ? "draining" : "active");
     const auto sent = timer.now();
-    writing = true;
-    KJ_DEFER(writing = false);
+    ++writing;
+    KJ_DEFER(--writing);
     try {
       co_await bounded(store.put(memberHeartbeatKey(serverId, epoch), memberRecordJson(record)));
     } catch (const kj::Exception&) {
@@ -891,8 +491,31 @@ private:
     state.leaseConnected = true;
   }
 
-  // The old epochs' heartbeats and markers of this id go once a new epoch holds it; of its registrations the newest two
-  // stay. Best effort: what is left is dropped by age and removed by the next epoch.
+  // A member's suspects object, handed to the callback (Suspects adopts what it holds) once it reads; its ETag is
+  // remembered so that the next listing reads it again only when it changed.
+  kj::Promise<void> readSuspects(std::string id, uint64_t number, std::string etag) {
+    if (!suspectsCallback) co_return;
+    ++state.suspectsReads;
+    ObjectResponse response;
+    try {
+      response = co_await bounded(store.get(memberSuspectsKey(id, number)));
+    } catch (const kj::Exception& error) {
+      ++state.suspectsReadFailures;
+      failed("suspects read", error);
+      co_return;
+    }
+    if (response.status != 200) {
+      // Gone since the listing (its node removed it): the next listing tells.
+      if (response.status != 404) ++state.suspectsReadFailures;
+      co_return;
+    }
+    suspectsEtags[{id, number}] = etag;
+    if (suspectsCallback) suspectsCallback(id, std::to_string(number), response.bytes);
+  }
+
+  // The old epochs' heartbeats, markers and suspects objects of this id go once a new epoch holds it (its suspicions are
+  // read first: a process that ended without removing them hands them to its successor); of its registrations the
+  // newest two stay. Best effort: what is left is dropped by age and removed by the next epoch.
   kj::Promise<void> removeOldObjects() {
     try {
       auto listing = co_await bounded(store.list(memberPrefix(serverId)));
@@ -904,6 +527,11 @@ private:
         if (number >= epoch) continue;
         if (listed.heartbeat) { co_await bounded(store.remove(memberHeartbeatKey(serverId, number))); ++state.oldObjectsRemoved; }
         if (listed.draining) { co_await bounded(store.remove(memberDrainKey(serverId, number))); ++state.oldObjectsRemoved; }
+        if (listed.suspects) {
+          co_await readSuspects(serverId, number, listed.suspectsEtag);
+          co_await bounded(store.remove(memberSuspectsKey(serverId, number)));
+          ++state.oldObjectsRemoved;
+        }
       }
       for (size_t i = 0; i + 2 < registered.size(); ++i) {
         if (registered[i] >= epoch) break;
@@ -945,6 +573,20 @@ private:
   // One listing of members/: the member table, this id's newer epochs, this epoch's own heartbeat, the clock.
   kj::Promise<void> listMembers() {
     auto [listing, sample] = co_await timedList(MEMBERS_PREFIX);
+    // The recovery anchor (v54): once this node could not list the store for longer than the TTL, the staleness that
+    // built up while it was blind is not counted -- an outage of the whole cluster stopped the others' heartbeats too.
+    // Until the recovery + TTL + grace the members it had whose heartbeat objects are still listed stay (a newer epoch
+    // of theirs takes their place as it appears); then, and for a member whose heartbeat object is gone, the usual rule.
+    const auto listedAt = timer.now();
+    if (listFailedSinceOk && listedAt - lastListOk > config.ttlSeconds * kj::SECONDS && sample.dateUnixMs) {
+      state.recoveredUntilUnixMs = sample.dateUnixMs + uint64_t(config.ttlSeconds) * 1000 + config.livenessGraceMs;
+      ++state.recoveries;
+      std::cout << "[membership] {\"event\":\"recovery-anchor\",\"nodeId\":" << quote(serverId) << ",\"blindMs\":"
+                << (listedAt - lastListOk) / kj::MILLISECONDS << ",\"untilUnixMs\":" << state.recoveredUntilUnixMs
+                << ",\"observedAtUnixMs\":" << nowUnixMs() << "}" << std::endl;
+    }
+    listFailedSinceOk = false;
+    lastListOk = listedAt;
     ++state.lists;
     state.lastListAtUnixMs = nowUnixMs();
     state.storeClient = store.stats().json();
@@ -970,9 +612,26 @@ private:
               (record ? record->instance : std::string("unreadable")) + ")");
       }
     }
+    auto current = liveMembers(nodes, config.ttlSeconds, config.livenessGraceMs);
+    state.keptMembers = 0;
+    if (state.recoveredUntilUnixMs && sample.dateUnixMs && sample.dateUnixMs < state.recoveredUntilUnixMs) {
+      for (const auto& [id, member] : state.members) {
+        if (id == serverId || std::any_of(current.begin(), current.end(), [&](const LiveMember& m) { return m.id == id; })) continue;
+        const auto number = std::strtoull(member.epoch.c_str(), nullptr, 10);
+        auto listed = nodes.find(id);
+        if (!number || listed == nodes.end()) continue;
+        auto heartbeat = listed->second.epochs.find(number);
+        if (heartbeat == listed->second.epochs.end() || !heartbeat->second.heartbeat) continue;
+        current.push_back({id, number, heartbeat->second.heartbeatUnixMs,
+            static_cast<int64_t>(sample.dateUnixMs) - static_cast<int64_t>(heartbeat->second.heartbeatUnixMs), heartbeat->second.draining});
+        ++state.keptMembers;
+      }
+    } else {
+      state.recoveredUntilUnixMs = 0;
+    }
     std::map<std::string, Member> next;
     std::set<std::pair<std::string, uint64_t>> seen;
-    for (const auto& live : liveMembers(nodes, config.ttlSeconds, config.livenessGraceMs)) {
+    for (const auto& live : current) {
       if (live.id == serverId) continue;
       seen.insert({live.id, live.epoch});
       auto record = co_await addressOf(live.id, live.epoch);
@@ -981,6 +640,15 @@ private:
           live.draining ? "draining" : "active", live.heartbeatUnixMs, live.ageMs};
     }
     std::erase_if(addresses, [&](const auto& entry) { return !seen.contains(entry.first); });
+    // The suspects objects ride this listing: a live member's is read only when its ETag changed since the last read.
+    for (const auto& [id, number] : seen) {
+      const auto& listed = nodes[id].epochs[number];
+      if (!listed.suspects) continue;
+      auto known = suspectsEtags.find({id, number});
+      if (known != suspectsEtags.end() && known->second == listed.suspectsEtag) continue;
+      co_await readSuspects(id, number, listed.suspectsEtag);
+    }
+    std::erase_if(suspectsEtags, [&](const auto& entry) { return !seen.contains(entry.first); });
     if (epoch && !state.identityTaken) next[serverId] = selfMember();
     state.lastListMembers = next.size();
     logMemberChanges(serverId, state.members, next, state.lists, state);
@@ -1024,6 +692,7 @@ private:
       } catch (const kj::Exception& error) {
         // Static stability: the last member table stays in use.
         ++state.listFailures;
+        listFailedSinceOk = true;
         state.watchConnected = false;
         failed("listing", error);
       }
@@ -1041,8 +710,8 @@ private:
       state.selfExpiredAtUnixMs = nowUnixMs();
       state.leaseStatus = "expired";
       state.leaseConnected = false;
-      // Never revived: calls addressed to this epoch are refused from now on.
-      state.heldEpochs.erase(state.epoch);
+      // Never renewed (once the store answers, a new epoch is registered); still held: the stateless calls addressed to
+      // it are served.
       std::cout << "[membership] lease expired node=" << serverId << " old-epoch=" << epoch << std::endl;
       std::cout << "[membership] {\"event\":\"self-expired\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
                 << "\",\"lastHeartbeatAtUnixMs\":" << state.lastHeartbeatAtUnixMs << ",\"observedAtUnixMs\":" << nowUnixMs()
@@ -1086,7 +755,8 @@ std::string MembershipView::json() const {
            << ",\"lastListAtUnixMs\":" << lastListAtUnixMs << ",\"lastListMembers\":" << lastListMembers
            << ",\"addressReads\":" << addressReads << ",\"ignoredKeys\":" << ignoredKeys
            << ",\"selfExpired\":" << (selfExpired ? "true" : "false") << ",\"selfExpiries\":" << selfExpiries
-           << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs
+           << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"recoveries\":" << recoveries
+           << ",\"recoveredUntilUnixMs\":" << recoveredUntilUnixMs << ",\"keptMembers\":" << keptMembers
            << ",\"clockSkewMs\":" << clockSkewMs << ",\"clockSkewMinMs\":" << clockSkewMinMs << ",\"clockSkewMaxMs\":" << clockSkewMaxMs
            << ",\"clockSkewToleranceMs\":" << clockSkewToleranceMs << ",\"clockCheckedAtUnixMs\":" << clockCheckedAtUnixMs
            << ",\"clockChecks\":" << clockChecks << ",\"clockWarnings\":" << clockWarnings
@@ -1095,7 +765,10 @@ std::string MembershipView::json() const {
            << ",\"startupCollisionWaitMs\":" << startupCollisionWaitMs
            << ",\"identityTaken\":" << (identityTaken ? "true" : "false") << ",\"identityTakenReason\":" << quote(identityTakenReason)
            << ",\"ownHeartbeatChecks\":" << ownHeartbeatChecks << ",\"ownHeartbeatMissing\":" << ownHeartbeatMissing
-           << ",\"oldObjectsRemoved\":" << oldObjectsRemoved << ",\"lastError\":" << quote(lastError)
+           << ",\"oldObjectsRemoved\":" << oldObjectsRemoved << ",\"suspectsObject\":" << (suspectsObject ? "true" : "false")
+           << ",\"suspectsWritten\":" << suspectsWritten << ",\"suspectsRemoved\":" << suspectsRemoved
+           << ",\"suspectsWriteFailures\":" << suspectsWriteFailures << ",\"suspectsReads\":" << suspectsReads
+           << ",\"suspectsReadFailures\":" << suspectsReadFailures << ",\"lastError\":" << quote(lastError)
            << ",\"draining\":" << (draining ? "true" : "false") << ",\"drainAnnounce\":" << quote(drainAnnounce)
            << ",\"drainAnnouncedAtUnixMs\":" << drainAnnouncedAtUnixMs << ",\"drainAnnounceAttempts\":" << drainAnnounceAttempts
            << ",\"revokeStatus\":" << quote(revokeStatus) << ",\"revokedAtUnixMs\":" << revokedAtUnixMs
@@ -1115,28 +788,13 @@ std::string MembershipView::json() const {
     output << "]}";
     return output.str();
   }
-  output << "{\"backend\":" << quote(backend) << ",\"epoch\":" << quote(epoch)
-         << ",\"leaseId\":" << quote(leaseId) << ",\"leaseStatus\":" << quote(leaseStatus)
-         << ",\"grantedTtlSeconds\":" << grantedTtlSeconds
-         << ",\"etcdConnected\":" << (leaseConnected && watchConnected ? "true" : "false")
-         << ",\"leaseConnected\":" << (leaseConnected ? "true" : "false")
-         << ",\"watchConnected\":" << (watchConnected ? "true" : "false")
-         << ",\"revision\":\"" << revision << "\",\"fullRereads\":" << fullRereads
-         << ",\"compactions\":" << compactions << ",\"registrations\":" << registrations
-         << ",\"keepAlives\":" << keepAlives
-         << ",\"startupCollisionWaitMs\":" << startupCollisionWaitMs
-         << ",\"startupConflictTtlSequence\":[";
-  for (size_t index = 0; index < startupConflictTtlSequence.size(); ++index) {
-    if (index) output << ',';
-    output << startupConflictTtlSequence[index];
-  }
-  output << "]" << ",\"lastError\":" << quote(lastError)
+  // The file membership: static members, this process's random epoch.
+  output << "{\"backend\":" << quote(backend) << ",\"epoch\":" << quote(epoch) << ",\"leaseStatus\":" << quote(leaseStatus)
+         << ",\"lastError\":" << quote(lastError)
          << ",\"draining\":" << (draining ? "true" : "false") << ",\"drainAnnounce\":" << quote(drainAnnounce)
          << ",\"drainAnnouncedAtUnixMs\":" << drainAnnouncedAtUnixMs << ",\"drainAnnounceAttempts\":" << drainAnnounceAttempts
          << ",\"revokeStatus\":" << quote(revokeStatus) << ",\"revokedAtUnixMs\":" << revokedAtUnixMs
-         << ",\"memberChanges\":" << memberChanges << ",\"invalidMembers\":" << invalidMembers.size()
-         << ",\"skippedMemberValues\":" << skippedMemberValues
-         << ",\"heldEpochs\":[";
+         << ",\"memberChanges\":" << memberChanges << ",\"heldEpochs\":[";
   size_t heldCount = 0;
   for (const auto& held : heldEpochs) {
     if (heldCount++) output << ',';
@@ -1165,30 +823,19 @@ std::string MembershipView::storageJson() const {
 kj::Own<Membership> newMembership(const MembershipConfig& config, const std::string& serverId,
     const std::string& peerListenAddress, const std::map<std::string, std::string>& staticPeers,
     kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headerTable, const ObjectStoreConfig& store) {
-  KJ_REQUIRE(config.backend == "file" || config.backend == "etcd" || config.backend == "objectStore",
-      "unknown membership backend");
+  KJ_REQUIRE(config.backend == "file" || config.backend == "objectStore", "unknown membership backend", config.backend.c_str());
   if (config.backend == "file") {
     return kj::heap<FileMembership>(serverId,
         config.advertisedAddress.empty() ? peerListenAddress : config.advertisedAddress, staticPeers);
   }
-  if (config.backend == "objectStore") {
-    KJ_REQUIRE(staticPeers.empty(), "the object store membership forbids static peers");
-    KJ_REQUIRE(advertised(config.advertisedAddress), "membership advertisedAddress must be a dialable address");
-    KJ_REQUIRE(store.backend == "s3" && !store.endpoint.empty(), "the object store membership needs the storage block");
-    KJ_REQUIRE(config.ttlSeconds >= 2 && config.heartbeatIntervalMs > 0 &&
-        uint64_t(config.heartbeatIntervalMs) * 2 < uint64_t(config.ttlSeconds) * 1000 &&
-        config.livenessGraceMs >= config.heartbeatIntervalMs && config.listIntervalMs > 0 && config.startupTimeoutMs > 0 &&
-        config.retryMs > 0, "invalid object store membership timing");
-    return kj::heap<ObjectStoreMembership>(config, serverId, store, network, timer);
-  }
-  KJ_REQUIRE(staticPeers.empty(), "etcd membership forbids static peers");
+  KJ_REQUIRE(staticPeers.empty(), "the object store membership forbids static peers");
   KJ_REQUIRE(advertised(config.advertisedAddress), "membership advertisedAddress must be a dialable address");
-  KJ_REQUIRE(config.endpoint.starts_with("http://") && !config.endpoint.ends_with('/'),
-      "membership endpoint must be an HTTP gateway URL without a trailing slash");
-  KJ_REQUIRE(config.ttlSeconds >= 1 && config.ttlSeconds <= 86400, "invalid membership TTL");
-  KJ_REQUIRE(config.requestTimeoutMs > 0 && config.retryMs > 0 && config.startupTimeoutMs > 0,
-      "membership timeouts must be positive");
-  return kj::heap<EtcdMembership>(config, serverId, network, timer, headerTable);
+  KJ_REQUIRE(store.backend == "s3" && !store.endpoint.empty(), "the object store membership needs the object store");
+  KJ_REQUIRE(config.ttlSeconds >= 2 && config.heartbeatIntervalMs > 0 &&
+      uint64_t(config.heartbeatIntervalMs) * 2 < uint64_t(config.ttlSeconds) * 1000 &&
+      config.livenessGraceMs >= config.heartbeatIntervalMs && config.listIntervalMs > 0 && config.startupTimeoutMs > 0 &&
+      config.retryMs > 0, "invalid object store membership timing");
+  return kj::heap<ObjectStoreMembership>(config, serverId, store, network, timer);
 }
 
 }  // namespace coworkerd

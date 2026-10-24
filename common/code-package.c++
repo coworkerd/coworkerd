@@ -10,7 +10,7 @@
 #include <sstream>
 
 namespace coworkerd {
-using namespace etcd;
+using namespace json;
 namespace {
 std::string read(const std::filesystem::path& path) {
   std::ifstream file(path, std::ios::binary);

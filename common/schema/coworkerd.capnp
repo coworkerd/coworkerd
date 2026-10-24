@@ -70,8 +70,8 @@ struct RemoteInvocation {
 }
 
 struct ServerConfig {
-  # The node's id: its member key /coworkerd/v2/nodes/<nodeId>, its etcd
-  # user's prefix and every record it writes.
+  # The node's id: the segment of its objects members/<nodeId>/ and nodes/<nodeId>/, which its
+  # object store identity alone writes, and of every record it writes.
   nodeId @0 :Text;
   peerListenAddress @1 :Text;
   peers @2 :List(Peer);
@@ -108,7 +108,7 @@ struct ServerConfig {
   loadCheck @24 :Bool = true;
 
   # The single configuration file of `coworkerd --config FILE`. A minimal file
-  # names serverId, etcdEndpoint and storage.endpoint; every other field has a default. The
+  # names nodeId and storage.endpoint; every other field has a default. The
   # legacy positional form (manifest, workerd, addresses on the command line) takes the
   # shortcuts below too, but not the four paths and addresses its arguments give.
   # Default /var/lib/coworkerd: logs/, run/, cache/, processes/ of this Server. Serve only.
@@ -119,23 +119,22 @@ struct ServerConfig {
   runtimePath @27 :Text;
   # The ingress. Default 0.0.0.0:8930. Serve only.
   listenAddress @28 :Text;
-  # etcd: the suspects and the usage rows (until 0.4's last round), and the membership unless membership.backend says
-  # objectStore (sets the membership's backend to etcd; membership.backend may name objectStore beside it). The desired
-  # state is not in etcd any more: it is the object store's (desiredState.backend objectStore).
-  etcdEndpoint @29 :Text;
+  # Ordinals 29 and 39 named a store 0.3 used beside the object store; 0.4 has no etcd, and a configuration that still
+  # names either field is refused at once (common/config.c++).
+  unused29 @29 :Text;
   # What other Servers dial for this one (membership.advertisedAddress); default
   # <hostname>:<port of peerListenAddress>, whose default is 0.0.0.0:8934 in serve.
   advertisedAddress @30 :Text;
   # The object store: the desired state (sets desiredState.objectStore and its cache, and the desired state's backend to
-  # objectStore unless desiredState.backend says otherwise), the code packages, and the members when membership.backend
-  # is objectStore.
+  # objectStore unless desiredState.backend says otherwise), the code packages, and the members (the membership's backend
+  # to objectStore unless membership.backend says otherwise) with the suspects and the usage beside them.
   storage @31 :StorageConfig;
   # The management endpoints (/__coworkerd/ except ready and probe); COWORKERD_MANAGEMENT_TOKEN
   # overrides the token.
   management @32 :ManagementConfig;
   # The control plane: `coworkerd-apiserver --config FILE` reads the same file -- the object store with the deploy
-  # identity (storage), the secrets key (secrets), etcd for the usage rows (etcdEndpoint), the management token
-  # (management) -- and this.
+  # identity (storage), the secrets key (secrets), the management token (management), the usage's retention (usage) --
+  # and this.
   control @33 :ControlConfig;
   # The Workers' logs: each Server's in-memory log of every Worker, the tenant log quota, and
   # the size rotation of logs/workerd.log.
@@ -143,8 +142,8 @@ struct ServerConfig {
   # The workerd processes' least-privilege environment: each workerd started through
   # coworkerd-launcher (launcher/PROTOCOL.md).
   sandbox @35 :SandboxConfig;
-  # Per-tenant usage: counted on each node and rolled up per hour under its own etcd prefix,
-  # /coworkerd/v2/nodes/<nodeId>/usage/<hour>/<tenant>.
+  # Per-tenant usage: counted on each node, one object per hour with every tenant's counts below its own prefix,
+  # nodes/<nodeId>/usage/<hour>.
   usage @36 :UsageConfig;
   # Tenant Workers' outbound requests (docs/egress-and-auth.md): a tenant's fetch() reaches this node's egress
   # service through <stack>/run/egress.sock; the node checks the destination against the policy, resolves the name and
@@ -154,9 +153,8 @@ struct ServerConfig {
   # The peer listener's authentication: every node signs its peer connections with the first key of a cluster
   # key file and accepts either of its keys. Unset: peer connections are not authenticated (a startup warning).
   peerAuth @38 :PeerAuthConfig;
-  # etcd's authentication: a JSON file {"user":"...","password":"..."} readable by its owner only; unset, the
-  # requests carry no credentials. COWORKERD_ETCD_CREDENTIALS_FILE overrides it.
-  etcdCredentialsFile @39 :Text;
+  # See ordinal 29.
+  unused39 @39 :Text;
   # The cluster's secrets key: secrets' values are sealed with it in the tenants' manifests on the object store (AES-256-GCM).
   # The control plane and every node with the objectStore desired state need it.
   secrets @40 :SecretsConfig;
@@ -168,9 +166,10 @@ struct ServerConfig {
   }
 
   struct UsageConfig {
-    # How often the current hour's counts are written (a node that stops loses at most this much).
+    # How often the hours whose counts changed are written (a node that stops loses at most this much).
     flushIntervalMs @0 :UInt32 = 60000;
-    # How long a node keeps its own hourly rows; older ones are deleted. 0 keeps them.
+    # How long the hourly objects are kept; older ones are removed -- by their node once an hour, and by the control plane
+    # once a day for the nodes that left. 0 keeps them.
     retentionHours @1 :UInt32 = 744;
     # How often the resident isolates are sampled for the isolate time.
     sampleIntervalMs @2 :UInt32 = 1000;
@@ -181,7 +180,7 @@ struct ServerConfig {
     mode @0 :Text = "on";
     # The destinations a tenant reaches without a rule of its own. public: public addresses on publicPorts. deny:
     # nothing; each tenant's allow list opens what it needs. Neither ever reaches the built-in denials: loopback,
-    # link-local, cloud metadata, unspecified and reserved addresses, the cluster's own addresses (its nodes, etcd,
+    # link-local, cloud metadata, unspecified and reserved addresses, the cluster's own addresses (its nodes,
     # the object store, clusterAddresses) -- and internal (private) addresses only through a tenant's allowInternal.
     defaultPolicy @1 :Text = "public";
     publicPorts @2 :List(UInt16) = [80, 443];
@@ -196,7 +195,7 @@ struct ServerConfig {
     caFile @7 :Text;
     systemTrustStore @8 :Bool = true;
     # The cluster's addresses the node cannot see on its own (the control plane, a load balancer): HOST[:PORT],
-    # an address or a CIDR. Denied like etcd, the object store and the members' addresses, whatever the port.
+    # an address or a CIDR. Denied like the object store and the members' addresses, whatever the port.
     clusterAddresses @9 :List(Text);
     # Each tenant's rules, by its name (until the tenant records carry them). Entries: a name (api.example.com), a wildcard
     # (*.example.com), an address or CIDR (203.0.113.7, 198.51.100.0/24, [2001:db8::/32]), each with an optional
@@ -405,13 +404,14 @@ struct PlacementConfig {
 }
 
 struct MembershipConfig {
-  # "file" (static peers), "etcd" (a key per node on an etcd lease, what etcdEndpoint sets) or "objectStore" (heartbeat
-  # objects and epoch registrations under members/ in the bucket of the storage block, which it needs; written with
-  # the node's storage identity).
+  # "file" (static peers) or "objectStore" (heartbeat objects and epoch registrations under members/ in the bucket of the
+  # storage block -- or of desiredState.objectStore -- which it needs; written with the node's storage identity; the
+  # default when the file has the storage block). The suspects ride it: objectStore keeps them beside the heartbeats.
   backend @0 :Text = "file";
+  # Unused since 0.4; accepted.
   endpoint @1 :Text;
   advertisedAddress @2 :Text;
-  # etcd: the lease's TTL. objectStore: how old a heartbeat may be before its identity is free again (and, with
+  # objectStore: how old a heartbeat may be before its identity is free again (and, with
   # livenessGraceMs, before the other members drop it); a node that wrote none for that long by its own monotonic
   # clock takes no calls from other nodes and registers again with a new epoch.
   ttlSeconds @3 :UInt32 = 15;
@@ -433,9 +433,9 @@ struct MembershipConfig {
 struct DesiredStateConfig {
   # "file" (a manifest file of the stack, the positional form) or "objectStore" (the tenant index and the tenants'
   # manifests in the bucket of the storage block, which `storage` sets): the node reads the index's hint every
-  # pollIntervalMs, and the index and the manifests it names when they change. etcd's backend was removed in 0.4.
+  # pollIntervalMs, and the index and the manifests it names when they change.
   backend @0 :Text = "file";
-  # Unused since 0.4 (etcd's backend); accepted.
+  # Unused since 0.4; accepted.
   endpoint @1 :Text;
   codeDirectory @2 :Text;
   requestTimeoutMs @3 :UInt32 = 750;
@@ -495,8 +495,8 @@ struct DeploymentDefinition {
   secrets @11 :List(Text);
 }
 
-# The etcd value of secrets/<workerId>/<name>: the secret string and when the
-# deployment tool set it.
+# The value of a secret's deployment key secrets/<workerId>/<name>: the secret string and when it
+# was set.
 struct SecretRecord {
   value @0 :Text;
   setAtUnixMs @1 :Float64;
@@ -529,7 +529,7 @@ struct WorkerLimits {
   memoryMiB @1 :UInt32;
 }
 
-# The etcd value of a route: /coworkerd/v2/deploy/routes/<host><pathPrefix>.
+# The value of a route's deployment key routes/<host><pathPrefix>.
 struct RouteRecord {
   host @0 :Text;
   pathPrefix @1 :Text;

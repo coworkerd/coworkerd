@@ -72,8 +72,8 @@ struct ProcessPoolConfig {
 };
 
 struct MembershipConfig {
-  std::string backend = "file";  // file, etcd or objectStore
-  std::string endpoint;
+  // file or objectStore; ServerConfig::load makes it objectStore when the file has the storage block and names none.
+  std::string backend = "file";
   std::string advertisedAddress;
   uint32_t ttlSeconds = 15;
   uint32_t requestTimeoutMs = 750;
@@ -101,8 +101,9 @@ struct WorkerLogSettings {
   uint32_t sinkFiles = 4;
 };
 
-// Per-tenant usage (ServerConfig.usage): counted on the node, the current hour written to its own etcd
-// prefix every flushIntervalMs, rows older than retentionHours deleted (0 keeps them).
+// Per-tenant usage (ServerConfig.usage): counted on the node, the hours that changed written to its own objects on the
+// object store every flushIntervalMs, objects older than retentionHours removed (0 keeps them) -- by the node, and for
+// the nodes that left by the control plane once a day.
 struct UsageSettings {
   uint32_t flushIntervalMs = 60000;
   uint32_t retentionHours = 744;
@@ -159,8 +160,8 @@ struct PeerAuthConfig {
 };
 
 struct ServerConfig {
-  // The node's id: `nodeId` in the configuration file, the last segment of its
-  // member key /coworkerd/v2/nodes/<nodeId>. The C++ name is `serverId` (the code calls the node's id this throughout).
+  // The node's id: `nodeId` in the configuration file, the segment of its objects members/<nodeId>/ and
+  // nodes/<nodeId>/. The C++ name is `serverId` (the code calls the node's id this throughout).
   std::string serverId = "local";
   std::string peerListenAddress;
   std::map<std::string, std::string> peers;
@@ -195,7 +196,7 @@ struct ServerConfig {
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;
-  std::string etcdEndpoint, storageCredentialsFile;
+  std::string storageCredentialsFile;
   bool serverIdGiven = false, cacheFollowsStack = false;
   // COWORKERD_MANAGEMENT_TOKEN overrides the file's management.token (run()).
   std::string managementToken;
@@ -210,18 +211,16 @@ struct ServerConfig {
   bool controlPathRouting = true;
   coworkerd::WorkerLogSettings logs;
   coworkerd::UsageSettings usage;
-  // Outbound requests, the peer listener's authentication, etcd's credentials (the file this configuration
-  // names; COWORKERD_ETCD_CREDENTIALS_FILE overrides it, see etcd.h).
+  // Outbound requests and the peer listener's authentication.
   coworkerd::EgressConfig egress;
   coworkerd::PeerAuthConfig peerAuth;
-  std::string etcdCredentialsFile;
   // The cluster's secrets key (secrets.keyFile; COWORKERD_SECRETS_KEY_FILE overrides it).
   std::string secretsKeyFile;
 
   // A management token: 16 to 4096 printable characters without spaces. Never echoed.
   static void checkToken(const std::string& token, const char* origin);
 
-  // {"accessKey": "...", "secretKey": "..."}: the Servers' read identity of the object store.
+  // {"accessKey": "...", "secretKey": "..."}: a daemon's identity of the object store.
   // Errors name the file and the rule, never its content.
   static std::pair<std::string, std::string> readCredentials(const std::filesystem::path& path);
 

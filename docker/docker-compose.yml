@@ -1,31 +1,31 @@
 # Coworkerd on one machine with Docker Compose.
 #
-#   docker compose up -d --wait                     one node (node-1), etcd, the object store and the
+#   docker compose up -d --wait                     one node (node-1), the object store and the
 #                                                   control plane (apiserver, the API of cowctl)
-#   docker compose --profile cluster up -d --wait   three nodes (node-1..3), members on the object store
+#   docker compose --profile cluster up -d --wait   three nodes (node-1..3)
 #   cowctl deploy                                    deploy a Wrangler project through the control plane
 #   docker compose run --rm tool upsert --manifest /work/manifest.json
 #                                                   deploy with the tool directly (the project directory:
 #                                                   COWORKERD_PROJECT_DIR)
 #   docker compose run --rm tool token              the management token
 #   docker compose run --rm tool admin-credential   the administrator's credential of the API (cowctl tenant ...)
+#   docker compose run --rm secrets add-node ID     a node joining the running cluster: its own identity and directory
+#                                                   (the object store takes the identity within seconds, no restart)
 #   docker compose --profile cluster down -v        stop and delete everything, data included
 #
 # Only the nodes' ingress ports and the control plane reach the host (COWORKERD_BIND, COWORKERD_HTTP_PORT
-# and the next two ports, COWORKERD_CONTROL_PORT). etcd and the object store live on an internal network. Every container runs as an
-# unprivileged user (10001). The first start generates every credential of the cluster into the `secrets` volume
-# (the object store's two identities, the management token unless COWORKERD_MANAGEMENT_TOKEN is set, the API's
-# administrator credential unless COWORKERD_ADMIN_CREDENTIAL is set, the cluster key the nodes sign their peer
-# connections with, the secrets key that seals the secrets' values in the tenants' manifests, etcd's users), one
-# directory per service that reads them, and each service mounts only its own: a node holds the store's node identity
-# (it reads, and writes its membership under members/), its own etcd user, the cluster key and the secrets key; the
-# control plane (and the tool) the deploy identity, its etcd user, the administrator's credential and the secrets key;
-# etcd's root stays with init. Rotation:
-# docs/guide/install.md.
+# and the next two ports, COWORKERD_CONTROL_PORT). The object store lives on an internal network: it holds the whole
+# state of the cluster (the members, the desired state, the suspects and the usage); the nodes and the control plane keep
+# none of their own. Every container runs as an unprivileged user (10001). The first start generates every credential of
+# the cluster into the `secrets` volume (the object store's identities -- deploy, and one per node --, the management
+# token unless COWORKERD_MANAGEMENT_TOKEN is set, the API's administrator credential unless COWORKERD_ADMIN_CREDENTIAL is
+# set, the cluster key the nodes sign their peer connections with, the secrets key that seals the secrets' values in the
+# tenants' manifests), one directory per service that reads them, and each service mounts only its own: a node holds its
+# own identity of the store (it reads what a node reads and writes only below members/<id>/ and nodes/<id>/), the cluster
+# key and the secrets key; the control plane (and the tool) the deploy identity, the administrator's credential and the
+# secrets key. Rotation: docs/guide/install.md.
 # Tenant Workers reach the network through their node only (egress.* in the node's configuration; by default public
-# addresses on ports 80 and 443, never the cluster's own). The members live in the object store (heartbeats under
-# members/ in the bucket); COWORKERD_MEMBERSHIP_BACKEND=etcd keeps them in etcd instead. Settings: .env (see
-# .env.example) or the environment.
+# addresses on ports 80 and 443, never the cluster's own). Settings: .env (see .env.example) or the environment.
 name: ${COWORKERD_PROJECT:-coworkerd}
 
 x-image: &image coworkerd:${COWORKERD_VERSION:-0.3.1}
@@ -37,8 +37,6 @@ x-node: &node
   # The Server drains its in-flight calls on SIGTERM (30 s by default) before it exits.
   stop_grace_period: 45s
   depends_on:
-    etcd:
-      condition: service_healthy
     init:
       condition: service_completed_successfully
   healthcheck:
@@ -50,44 +48,11 @@ x-node: &node
     start_interval: 1s
 
 x-node-environment: &node-environment
-  COWORKERD_ETCD_ENDPOINT: http://etcd:2379
   COWORKERD_STORAGE_ENDPOINT: http://storage:8333
-  COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
   COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
   COWORKERD_PROCESS_COUNT: ${COWORKERD_PROCESS_COUNT:-1}
 
 services:
-  etcd:
-    image: gcr.io/etcd-development/etcd:v3.6.15@sha256:5ed4e32061aa061f970d6500629213e8579ef17571dcf9789074966acb9afad1
-    user: "10001:10001"
-    restart: unless-stopped
-    # The secrets container mounts this volume first, so that it belongs to the unprivileged user.
-    depends_on:
-      secrets:
-        condition: service_completed_successfully
-    command:
-      - /usr/local/bin/etcd
-      - --name=coworkerd
-      - --data-dir=/etcd-data
-      - --listen-client-urls=http://0.0.0.0:2379
-      - --advertise-client-urls=http://etcd:2379
-      - --listen-peer-urls=http://127.0.0.1:2380
-      - --initial-advertise-peer-urls=http://127.0.0.1:2380
-      - --initial-cluster=coworkerd=http://127.0.0.1:2380
-      - --experimental-enable-lease-checkpoint=true
-      - --experimental-enable-lease-checkpoint-persist=true
-    volumes: [etcd-data:/etcd-data]
-    networks: [backend]
-    # With authentication on (init), as the user coworkerd-health, which may read and write nothing: etcd counts the
-    # refused read as healthy. Its password is not a secret (apiserver/etcd-auth.c++).
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/etcdctl", "--user", "coworkerd-health:coworkerd-health", "endpoint", "health"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 30s
-      start_interval: 1s
-
   storage:
     # 4.29 and later make create-if-absent hold under concurrency (the membership measures it at every start).
     image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
@@ -99,12 +64,20 @@ services:
     # Starts once the secrets step has written the S3 identities and security.toml (the store reads them at its
     # start). Only the S3 gateway listens on the container's network -- S3 itself, guarded by the identities'
     # signatures, and its gRPC interface, which security.toml closes to everyone; the master, volume and filer servers
-    # listen on its loopback only, where the gateway reaches them.
+    # (the filer's identity service among them) listen on its loopback only, where the gateway reaches them. An identity
+    # the secrets step adds while the store runs (add-node) comes as hotload/<id>.weed: every 2 s a loop beside the store
+    # applies each such file it has not applied yet with weed shell (s3.configure, kept in the filer and in force at
+    # once), its output discarded (it prints the identities).
     entrypoint:
       - /bin/sh
       - -c
       - >-
         until [ -s /config/s3.json ] && [ -s /config/security.toml ]; do sleep 0.2; done;
+        (applied=""; while sleep 2; do for f in /config/hotload/*.weed; do [ -f "$$f" ] || continue;
+        sum=$$(cksum < "$$f"); case "$$applied" in *"|$$sum|"*) continue;; esac; id=$${f##*/}; id=$${id%.weed};
+        cd /tmp && timeout 60 /usr/bin/weed shell < "$$f" > /dev/null 2>&1 &&
+        printf 's3.configure\n' | timeout 60 /usr/bin/weed shell 2>/dev/null | grep -q "\"name\": \"node-$$id\"" &&
+        applied="$$applied|$$sum|"; done; done) &
         cd /config && exec /usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=20
         -master.volumeSizeLimitMB=64 -s3 -s3.config=/config/s3.json
     volumes:
@@ -113,7 +86,8 @@ services:
     networks: [backend]
 
   # Every credential of the cluster, each into the directory of the service that reads it; then it exits. No
-  # network. `docker compose run --rm secrets rotate-cluster-key add|promote|retire` rotates the cluster key.
+  # network. `docker compose run --rm secrets rotate-cluster-key add|promote|retire` rotates the cluster key;
+  # `docker compose run --rm secrets add-node ID` adds a node's identity (and its directory nodes/ID).
   secrets:
     image: *image
     entrypoint: [coworkerd-entrypoint, secrets]
@@ -124,23 +98,19 @@ services:
       COWORKERD_NODE_IDS: node-1,node-2,node-3
     volumes:
       - secrets:/var/lib/coworkerd-secrets
-      - etcd-data:/var/lib/coworkerd-etcd
       - storage-data:/var/lib/coworkerd-storage
     network_mode: none
 
-  # The bucket and the store's self-check; etcd's users and roles (the v2 layout) and its authentication;
-  # the cluster's marker and empty indexes in the object store (coworkerd-apiserver tool init); then it exits.
+  # The bucket and the store's self-check (with the first node's identity: its prefix policy reported); the cluster's
+  # marker and empty indexes in the object store (coworkerd-apiserver tool init); then it exits.
   init:
     image: *image
     command: [init]
     restart: "no"
     depends_on:
-      etcd:
-        condition: service_started
       storage:
         condition: service_started
     environment:
-      COWORKERD_ETCD_ENDPOINT: http://etcd:2379
       COWORKERD_STORAGE_ENDPOINT: http://storage:8333
     volumes:
       - secrets:/var/lib/coworkerd-secrets
@@ -199,7 +169,7 @@ services:
       - node-3-data:/var/lib/coworkerd
       - {type: volume, source: secrets, target: /var/lib/coworkerd-secrets, read_only: true, volume: {subpath: nodes/node-3}}
 
-  # The control plane: coworkerd-apiserver, the API of cowctl, on the backend network (etcd, the object
+  # The control plane: coworkerd-apiserver, the API of cowctl, on the backend network (the object
   # store, the nodes' peer listeners) and published to the host. It keeps no state of its own: the desired state is the
   # object store's, which it holds a copy of in memory.
   apiserver:
@@ -208,14 +178,10 @@ services:
     restart: unless-stopped
     command: [apiserver]
     depends_on:
-      etcd:
-        condition: service_healthy
       init:
         condition: service_completed_successfully
     environment:
-      COWORKERD_ETCD_ENDPOINT: http://etcd:2379
       COWORKERD_STORAGE_ENDPOINT: http://storage:8333
-      COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
       COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
       COWORKERD_ADMIN_CREDENTIAL: ${COWORKERD_ADMIN_CREDENTIAL:-}
     healthcheck:
@@ -237,9 +203,7 @@ services:
     entrypoint: [coworkerd-entrypoint, tool]
     command: [version]
     environment:
-      COWORKERD_ETCD_ENDPOINT: http://etcd:2379
       COWORKERD_STORAGE_ENDPOINT: http://storage:8333
-      COWORKERD_MEMBERSHIP_BACKEND: ${COWORKERD_MEMBERSHIP_BACKEND:-objectStore}
       COWORKERD_MANAGEMENT_TOKEN: ${COWORKERD_MANAGEMENT_TOKEN:-}
       COWORKERD_ADMIN_CREDENTIAL: ${COWORKERD_ADMIN_CREDENTIAL:-}
     volumes:
@@ -248,7 +212,7 @@ services:
     networks: [backend]
 
 networks:
-  # etcd, the object store and the nodes' peer listeners: no gateway, so neither a route out nor one in from the
+  # The object store and the nodes' peer listeners: no gateway, so neither a route out nor one in from the
   # host; only the cluster's containers reach them.
   backend:
     internal: true
@@ -258,7 +222,6 @@ networks:
   frontend: {}
 
 volumes:
-  etcd-data:
   storage-data:
   secrets:
   node-1-data:

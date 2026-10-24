@@ -81,6 +81,8 @@ ClockCheck checkClock(const ClockSample& sample, uint32_t toleranceMs);
 //   members/<nodeId>/epochs/<epoch>     an epoch's registration: created only if absent, then read back
 //   members/<nodeId>/<epoch>            the epoch's heartbeat, overwritten every heartbeat interval
 //   members/<nodeId>/<epoch>.draining   its drain marker (seen in a listing; nobody reads its bytes)
+//   members/<nodeId>/<epoch>.suspects   its suspects (node/suspects.h): written while it has any, removed when it has none;
+//                                       the other members read it in their listing cycle when its ETag changed
 //   members/<nodeId>/probe/...          the node's own create-if-absent measurement at startup, removed after
 // <epoch> is written 20 digits wide in keys; the epoch is the positive integer (in call ids, `<nodeId>.<epoch>-...`).
 constexpr const char* MEMBERS_PREFIX = "members/";
@@ -89,6 +91,7 @@ std::string memberEpochsPrefix(const std::string& nodeId);  // members/<nodeId>/
 std::string memberRegistrationKey(const std::string& nodeId, uint64_t epoch);
 std::string memberHeartbeatKey(const std::string& nodeId, uint64_t epoch);
 std::string memberDrainKey(const std::string& nodeId, uint64_t epoch);
+std::string memberSuspectsKey(const std::string& nodeId, uint64_t epoch);
 std::string memberProbePrefix(const std::string& nodeId);  // members/<nodeId>/probe/
 
 // What a listing of members/ says about one epoch of one node: when its registration was created, when its heartbeat
@@ -97,8 +100,9 @@ std::string memberProbePrefix(const std::string& nodeId);  // members/<nodeId>/p
 struct ListedEpoch {
   uint64_t epoch = 0;
   uint64_t registeredUnixMs = 0, heartbeatUnixMs = 0, pageDateUnixMs = 0;
-  bool registered = false, heartbeat = false, draining = false;
-  uint64_t drainKeyUnixMs = 0;
+  bool registered = false, heartbeat = false, draining = false, suspects = false;
+  uint64_t drainKeyUnixMs = 0, suspectsUnixMs = 0;
+  std::string suspectsEtag;
 };
 struct ListedNode {
   std::string id;

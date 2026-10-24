@@ -1,5 +1,6 @@
 #include "object-store.h"
 #include "object-state.h"
+#include "support.h"
 #include "tenant-manifest.h"
 
 #include <kj/debug.h>
@@ -19,8 +20,12 @@ namespace coworkerd {
 // Reported but not required: a listing of members/ with the read identity (the 0.4 nodes' identity lists and writes
 // members/; a 0.3 read-only one does not) and whether create-if-absent holds under concurrency (8 writers on one key,
 // 20 rounds at once) -- `conditionalPutAtomic` (SeaweedFS before 4.29 answers false) -- and whether the bucket holds the
-// cluster's marker cluster/format/1 (`clusterFormat`: init writes it after this check). One JSON line per request, then
-// the contract's line.
+// cluster's marker cluster/format/1 (`clusterFormat`: init writes it after this check). Reported as well, and not
+// part of the contract either: when COWORKERD_READ_NODE_ID names the node the read identity belongs to, that identity's
+// prefix policy (`policy`) -- its writes below another node's prefixes (members/<id>x/, nodes/<id>x/: a policy without
+// the trailing slash would let them through) and below cluster/, and its read of cluster/credentials/current, must be
+// refused with AccessDenied, while its own prefixes take a write and a removal and cluster/format/1 and a listing of
+// members/ stay readable. One JSON line per request, then the contract's line.
 // SeaweedFS 4.48, compared with 3.97 (v22, b8): an object PUT into a bucket that does not exist still answers 200 (so the
 // bucket comes first, here and in init), but its gateway no longer keeps answering NoSuchBucket once the bucket exists,
 // and a read signed in the Authorization header no longer needs Write; it refuses the presigned read that also signs
@@ -89,6 +94,43 @@ int runStorageCheck(int argc, char** argv) {
       for (auto& c : membersListed) if (c == '\n') c = ' ';
     }
     auto measurement = coworkerd::measureConditionalPut(store, prefix + "concurrent-", 8, 20).wait(io.waitScope);
+    // The read identity's prefix policy, when it names its node (reported, not required).
+    std::string policy = "{\"checked\":false,\"reason\":\"COWORKERD_READ_NODE_ID names no node: the read identity's prefix policy "
+        "was not checked\"}";
+    if (const char* named = std::getenv("COWORKERD_READ_NODE_ID"); named != nullptr && *named) {
+      const std::string node = named, stamp = "check-" + std::to_string(coworkerd::realClockUnixMs()) + "-" + std::to_string(getpid());
+      KJ_REQUIRE(coworkerd::safeName(node), "COWORKERD_READ_NODE_ID is not a node id");
+      bool all = true;
+      std::string items;
+      auto item = [&](const char* name, kj::HttpMethod method, const std::string& key, bool allowed) {
+        auto response = reader.request(method, key, method == kj::HttpMethod::PUT ? std::string("coworkerd check storage\n") : std::string(),
+            true).wait(io.waitScope);
+        const auto code = coworkerd::objectErrorCode(response.bytes);
+        const bool denied = response.status == 403 && code == "AccessDenied";
+        const bool ok = allowed ? ((response.status >= 200 && response.status < 300) ||
+            (method == kj::HttpMethod::GET && response.status == 404)) : denied;
+        all = all && ok;
+        // A write the policy should have refused but the store took is removed again, with the deploy identity.
+        if (!allowed && method == kj::HttpMethod::PUT && response.status == 200) store.remove(key).wait(io.waitScope);
+        items += std::string(items.empty() ? "" : ",") + "{\"item\":\"" + name + "\",\"method\":\"" + kj::str(method).cStr() +
+            "\",\"key\":\"" + key + "\",\"status\":" + std::to_string(response.status) + ",\"code\":\"" + code +
+            "\",\"expected\":\"" + (allowed ? "allowed" : "denied") + "\",\"ok\":" + (ok ? "true" : "false") + "}";
+      };
+      item("write another node's members/", kj::HttpMethod::PUT, "members/" + node + "x/" + stamp, false);
+      item("write another node's nodes/", kj::HttpMethod::PUT, "nodes/" + node + "x/" + stamp, false);
+      item("write cluster/", kj::HttpMethod::PUT, "cluster/" + stamp, false);
+      item("read cluster/credentials/current", kj::HttpMethod::GET, "cluster/credentials/current", false);
+      item("write its own members/", kj::HttpMethod::PUT, "members/" + node + "/probe/" + stamp, true);
+      item("remove its own members/", kj::HttpMethod::DELETE, "members/" + node + "/probe/" + stamp, true);
+      item("write its own nodes/", kj::HttpMethod::PUT, "nodes/" + node + "/" + stamp, true);
+      item("remove its own nodes/", kj::HttpMethod::DELETE, "nodes/" + node + "/" + stamp, true);
+      item("read cluster/format/1", kj::HttpMethod::GET, coworkerd::CLUSTER_FORMAT_KEY, true);
+      bool listed = true;
+      try { reader.list(coworkerd::MEMBERS_PREFIX).wait(io.waitScope); } catch (const kj::Exception&) { listed = false; }
+      all = all && listed;
+      policy = "{\"checked\":true,\"nodeId\":\"" + node + "\",\"items\":[" + items + "],\"listMembers\":" + (listed ? "true" : "false") +
+          ",\"ok\":" + (all ? "true" : "false") + "}";
+    }
     // Reported, not required (init runs this check before it writes the marker): whether the bucket already holds the
     // cluster's marker, cluster/format/1, without which nodes and the control plane refuse to start.
     const auto marker = reader.get(coworkerd::CLUSTER_FORMAT_KEY).wait(io.waitScope);
@@ -104,7 +146,7 @@ int runStorageCheck(int argc, char** argv) {
         << ",\"ok\":" << (clockOk ? "true" : "false") << "},\"readIdentityLists\":{\"prefix\":\"members/\"," << membersListed
         << "},\"clusterFormat\":{\"key\":\"" << coworkerd::CLUSTER_FORMAT_KEY << "\",\"present\":"
         << (marker.status == 200 ? "true" : "false") << ",\"status\":" << marker.status
-        << "},\"conditionalPutAtomic\":" << (measurement.atomic() ? "true" : "false")
+        << "},\"policy\":" << policy << ",\"conditionalPutAtomic\":" << (measurement.atomic() ? "true" : "false")
         << ",\"concurrency\":" << measurement.json() << ",\"ok\":" << (ok ? "true" : "false") << "}}" << std::endl;
     KJ_REQUIRE(sequential, "the second create-if-absent of a key did not find it existing");
     KJ_REQUIRE(listing.dateUnixMs > 0 && lastModified, "the listing's answer lacks its Date header or LastModified");

@@ -1,5 +1,5 @@
 #pragma once
-#include "etcd.h"
+#include "json.h"
 #include <filesystem>
 #include <map>
 #include <string>
@@ -30,7 +30,7 @@ bool moduleSafeName(const std::string& name);
 // Starts with '/', normalized (no empty, "." or ".." segments, no trailing
 // '/'), no control characters or backslashes.
 bool assetSafePath(const std::string& path);
-std::string canonicalJson(etcd::Json::Reader value);
+std::string canonicalJson(json::Json::Reader value);
 std::string canonicalJson(const std::string& bytes);
 // A package manifest, validated: its code modules and its optional assets.
 PackageContents readPackage(const std::string& manifest, const AssetLimits& limits = AssetLimits::fromEnvironment());

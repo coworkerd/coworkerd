@@ -44,7 +44,7 @@ constexpr size_t MAX_LINE = 64 * 1024;
 constexpr std::array SOURCES = {"server", "execution", "decision", "decision-time",
   "static-attempt", "root", "refusal-count", "cold-start", "phase-time", "peer-send",
   "allocation", "refusal", "attempt", "peer-open", "process", "process-kill",
-  "process-pool", "suspect", "membership", "etcd-watch", "deployment", "kj", "stdout", "stderr"};
+  "process-pool", "suspect", "membership", "deployment", "kj", "stdout", "stderr"};
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
 

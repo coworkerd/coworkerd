@@ -2835,10 +2835,10 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
       capnp::MallocMessageBuilder message;
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), json);
-      auto list = etcd::field(json, "residentWorkers");
+      auto list = json::field(json, "residentWorkers");
       if (!list.isArray()) return;
       for (auto entry : list.getArray()) {
-        auto name = etcd::field(entry, "isolate");
+        auto name = json::field(entry, "isolate");
         if (!name.isString()) continue;
         std::string isolate = name.getString().cStr();
         const auto at = isolate.find('@');

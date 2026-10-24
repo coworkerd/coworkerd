@@ -1,6 +1,6 @@
 #include "config.h"
 #include "coworkerd.capnp.h"
-#include "etcd.h"
+#include "json.h"
 #include "support.h"
 #include "tenancy.h"
 
@@ -72,6 +72,32 @@ std::pair<std::string, std::string> ServerConfig::readCredentials(const fs::path
 ServerConfig ServerConfig::load(const fs::path& path) {
   if (path.empty()) return {};
   auto text = readFile(path);
+  // The file as plain JSON first: whether a field appears is read from the file itself (a reader returns a field's
+  // default, set or not), and what 0.4 removed is named before the schema's decoding refuses it as an unknown field.
+  capnp::MallocMessageBuilder rawMessage;
+  auto raw = rawMessage.initRoot<capnp::JsonValue>();
+  capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), raw);
+  auto given = [&](std::initializer_list<const char*> path) -> std::optional<std::string> {
+    capnp::JsonValue::Reader value = raw.asReader();
+    for (auto name : path) {
+      if (!value.isObject()) return std::nullopt;
+      bool found = false;
+      for (auto field : value.getObject()) {
+        if (field.getName() == name) { value = field.getValue(); found = true; break; }
+      }
+      if (!found) return std::nullopt;
+    }
+    return value.isString() ? std::string(value.getString().cStr()) : std::string();
+  };
+  // 0.4 has no etcd: a configuration that still names what it had is refused, in one sentence.
+  auto refuse = [](const std::string& what) {
+    kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str("0.4 has no etcd: ",
+        what.c_str(), " (the members, the desired state, the suspects and the usage are on the object store: the storage block)")));
+  };
+  for (auto name : {"etcdEndpoint", "etcdCredentialsFile"})
+    if (given({name})) refuse(std::string(name) + " is not a setting any more");
+  for (auto name : {"membership", "desiredState"})
+    if (given({name, "backend"}) == std::optional<std::string>("etcd")) refuse(std::string(name) + ".backend must be file or objectStore");
   capnp::MallocMessageBuilder message;
   auto root = message.initRoot<rpc::ServerConfig>();
   capnp::JsonCodec json;
@@ -154,7 +180,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.validate();
   auto membership = root.getMembership();
   result.membership = {
-    membership.getBackend().cStr(), membership.getEndpoint().cStr(),
+    membership.getBackend().cStr(),
     membership.getAdvertisedAddress().cStr(), membership.getTtlSeconds(),
     membership.getRequestTimeoutMs(), membership.getStartupTimeoutMs(), membership.getRetryMs(),
     membership.getHeartbeatIntervalMs(), membership.getListIntervalMs(), membership.getLivenessGraceMs(),
@@ -201,44 +227,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   }
 
   // The paths and addresses of `serve`, and the shortcuts. A shortcut and the nested field it
-  // fills may both appear only with the same value. Whether a field appears is read from the file
-  // itself: a reader returns a field's default, set or not.
-  capnp::MallocMessageBuilder rawMessage;
-  auto raw = rawMessage.initRoot<capnp::JsonValue>();
-  capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), raw);
-  auto given = [&](std::initializer_list<const char*> path) -> std::optional<std::string> {
-    capnp::JsonValue::Reader value = raw.asReader();
-    for (auto name : path) {
-      if (!value.isObject()) return std::nullopt;
-      bool found = false;
-      for (auto field : value.getObject()) {
-        if (field.getName() == name) { value = field.getValue(); found = true; break; }
-      }
-      if (!found) return std::nullopt;
-    }
-    return value.isString() ? std::string(value.getString().cStr()) : std::string();
-  };
+  // fills may both appear only with the same value.
   result.stackDirectory = root.getStackDirectory().cStr();
   result.workerdPath = root.getWorkerdPath().cStr();
   result.runtimePath = root.getRuntimePath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
-  // etcd's backend of the desired state was removed in 0.4: the desired state is the object store's.
-  KJ_REQUIRE(given({"desiredState", "backend"}) != std::optional<std::string>("etcd"),
-      "desiredState.backend must be file or objectStore: etcd's backend was removed in 0.4 (the desired state is the object "
-      "store's; desiredState.backend objectStore with the storage block)");
-  if (given({"etcdEndpoint"})) {
-    const std::string endpoint = root.getEtcdEndpoint().cStr();
-    KJ_REQUIRE(!endpoint.empty(), "etcdEndpoint is empty");
-    // etcd keeps the suspects and the usage rows, and the membership unless it lives on the object store
-    // (membership.backend objectStore, written out): a configuration that does not say so keeps it in etcd, as before.
-    const bool objectStoreMembership = given({"membership", "backend"}) == std::optional<std::string>("objectStore");
-    auto backend = given({"membership", "backend"}), nested = given({"membership", "endpoint"});
-    KJ_REQUIRE(!backend || *backend == "etcd" || objectStoreMembership, "etcdEndpoint sets the backend to etcd", "membership");
-    KJ_REQUIRE(!nested || *nested == endpoint, "etcdEndpoint and the endpoint differ", "membership");
-    result.etcdEndpoint = endpoint;
-    if (!objectStoreMembership) result.membership.backend = "etcd";
-    result.membership.endpoint = endpoint;
-  }
   if (given({"advertisedAddress"})) {
     const std::string address = root.getAdvertisedAddress().cStr();
     auto nested = given({"membership", "advertisedAddress"});
@@ -269,8 +262,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       if (given({"storage", "cacheDirectory"})) result.desiredState.cache.directory = storage.getCacheDirectory().cStr();
       else result.cacheFollowsStack = true;
     }
-    // The object store holds the desired state unless the configuration says file.
+    // The object store holds the desired state and the members unless the configuration says file.
     if (!given({"desiredState", "backend"})) result.desiredState.backend = "objectStore";
+    if (!given({"membership", "backend"})) result.membership.backend = "objectStore";
   }
   // The cluster's secrets key (secrets.keyFile; the environment's COWORKERD_SECRETS_KEY_FILE over it).
   if (given({"secrets", "keyFile"})) result.secretsKeyFile = root.getSecrets().getKeyFile().cStr();
@@ -298,11 +292,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   // The membership's backend, and the object store's settings it needs (the schema's MembershipConfig).
   {
     const auto& m = result.membership;
-    KJ_REQUIRE(m.backend == "file" || m.backend == "etcd" || m.backend == "objectStore",
-        "membership.backend must be file, etcd or objectStore", m.backend.c_str());
+    KJ_REQUIRE(m.backend == "file" || m.backend == "objectStore", "membership.backend must be file or objectStore", m.backend.c_str());
     if (m.backend == "objectStore") {
-      KJ_REQUIRE(given({"storage"}).has_value() && result.desiredState.objectStore.backend == "s3",
-          "membership.backend objectStore keeps the members in the object store: it needs the storage block");
+      KJ_REQUIRE(result.desiredState.objectStore.backend == "s3" && !result.desiredState.objectStore.endpoint.empty(),
+          "membership.backend objectStore keeps the members in the object store: it needs the storage block (or "
+          "desiredState.objectStore with an endpoint)");
       KJ_REQUIRE(m.ttlSeconds >= 2 && m.ttlSeconds <= 86400, "membership.ttlSeconds must be 2 to 86400");
       KJ_REQUIRE(m.heartbeatIntervalMs > 0 && uint64_t(m.heartbeatIntervalMs) * 2 < uint64_t(m.ttlSeconds) * 1000,
           "membership.heartbeatIntervalMs must be positive and less than half of ttlSeconds");
@@ -371,12 +365,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       e.defaultPolicy.c_str());
   KJ_REQUIRE(e.timeoutMs > 0 && e.concurrency > 0 && e.requestsPerSecond > 0,
       "egress.timeoutMs, egress.concurrency and egress.requestsPerSecond must be positive");
-  // The peer listener's authentication and etcd's credentials.
+  // The peer listener's authentication.
   result.peerAuth = {root.getPeerAuth().getKeyFile().cStr(), root.getPeerAuth().getWindowMs()};
   KJ_REQUIRE(result.peerAuth.windowMs >= 1000 && result.peerAuth.windowMs <= 600000, "peerAuth.windowMs must be 1000 to 600000");
-  result.etcdCredentialsFile = root.getEtcdCredentialsFile().cStr();
-  // The process's etcd identity (etcd.h): read now, so that a bad file stops the daemon at its start.
-  if (!result.etcdCredentialsFile.empty()) useEtcdCredentialsFile(result.etcdCredentialsFile);
   return result;
 }
 

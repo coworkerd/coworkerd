@@ -78,7 +78,7 @@ struct CreateResult {
 // Credentials are never included in diagnostics. This client deliberately uses
 // only path addressing and signed, single-chunk payloads, without an AWS SDK.
 // Keys: content by hash under bundles/, definitions/, modules/ and packages/ (lower-case hexadecimal paths), and
-// the cluster's state under members/, cluster/ and tenants/ (and check/, `coworkerd check`'s probes): '/'-separated segments of letters,
+// the cluster's state under members/, cluster/, tenants/ and nodes/ (and check/, `coworkerd check`'s probes): '/'-separated segments of letters,
 // digits, '.', '_' and '-', none of them "." or "..". Only the S3 backend keeps state: create, list and remove
 // refuse the directory backend.
 class ObjectStore {
@@ -138,6 +138,9 @@ private:
 };
 
 std::string objectSha256(const std::string& bytes);
+// The code of an error answer's body (<Error><Code>AccessDenied</Code>...), "" when it has none; never the rest of it (a
+// signature mismatch echoes the canonical request, with the access key's identifier).
+std::string objectErrorCode(const std::string& body);
 // "Sun, 06 Nov 1994 08:49:37 GMT" (an IMF-fixdate) as Unix milliseconds; 0 when it does not read as one. A header
 // that came twice reaches here joined with ", "; the first date counts.
 uint64_t httpDateUnixMs(std::string_view text);

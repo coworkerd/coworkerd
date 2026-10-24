@@ -12,7 +12,7 @@
 #include "async-log.h"
 #include "memory-watermark.h"
 #include "egress.h"
-#include "etcd.h"
+#include "json.h"
 #include "peer-auth.h"
 #include "tenancy.h"
 #include "tenant-manifest.h"
@@ -673,8 +673,6 @@ public:
   bool holdsEpoch(const std::string& candidate) const {
     return membership.view().heldEpochs.contains(candidate);
   }
-  // (objectStore) Past its TTL without a heartbeat written, by its own monotonic clock: the others drop this node.
-  bool selfExpired() const { return membership.view().selfExpired; }
 
   std::string invocationId(uint64_t sequence) const {
     return serverConfig.serverId + "." + membership.view().epoch +
@@ -700,8 +698,9 @@ public:
     // A member that announced its exit takes no new work. This Server, once draining,
     // ranks after every other candidate: only the trees it still runs place work here, and
     // only when no other Server takes it.
-    // (objectStore) So does this Server once its epoch expired by its own clock: the others drop it, and it takes
-    // no calls from them; what arrives at its ingress still executes here when no other member takes it.
+    // (objectStore) So does this Server once its epoch expired by its own clock: the others drop it; it still serves
+    // the calls at its ingress when no other member takes them, and the calls from the others addressed to an epoch
+    // it held.
     const bool lastResort = drain.draining || membership.view().selfExpired;
     for (const auto& [id, member] : membership.view().members) {
       if (id == serverConfig.serverId && lastResort) self = true;
@@ -1122,7 +1121,7 @@ public:
         capnp::MallocMessageBuilder arena;
         auto json = arena.initRoot<capnp::JsonValue>();
         capnp::JsonCodec().decodeRaw(kj::arrayPtr(probe.report.data(), probe.report.size()), json);
-        using coworkerd::etcd::field;
+        using coworkerd::json::field;
         auto flag = [&](const char* name) { auto value = field(json, name); return value.isBoolean() && value.getBoolean(); };
         auto string = [&](const char* name) { auto value = field(json, name); return value.isString() ? std::string(value.getString().cStr()) : std::string(); };
         coldLoad = flag("coldLoad");
@@ -1748,7 +1747,7 @@ public:
   }
 
   // Sections the state endpoint appends after the ones above, each from its own part of the node (egress,
-  // peerAuth, etcdAuth).
+  // peerAuth, storage).
   void addStateSection(std::string name, std::function<std::string()> section) {
     stateSections.emplace_back(std::move(name), std::move(section));
   }
@@ -1822,12 +1821,12 @@ public:
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), json);
     for (auto [list, kind] : {std::pair{"recentMemoryCrashes", "memory"}, std::pair{"recentKills", "cpu"}}) {
-      auto entries = coworkerd::etcd::field(json, list);
+      auto entries = coworkerd::json::field(json, list);
       if (!entries.isArray()) continue;
       for (auto entry : entries.getArray()) {
-        auto culprit = entry.isObject() ? coworkerd::etcd::field(entry, "culprit") : capnp::JsonValue::Reader();
+        auto culprit = entry.isObject() ? coworkerd::json::field(entry, "culprit") : capnp::JsonValue::Reader();
         if (!culprit.isObject()) continue;
-        auto id = coworkerd::etcd::field(culprit, "invocationId");
+        auto id = coworkerd::json::field(culprit, "invocationId");
         if (id.isString() && id.getString() == invocationId.c_str()) return kind;
       }
     }
@@ -3058,12 +3057,9 @@ public:
       reject(server.drainingRefusal(invocation.ingressRoot));
       co_return;
     }
-    if (server.selfExpired()) {
-      // The others drop this node: an invocation from one of them is refused before anything executes, and the
-      // sender places it elsewhere.
-      reject(server.refusal("PEER_UNAVAILABLE", "this node's membership expired (no heartbeat written for its TTL)"));
-      co_return;
-    }
+    // (objectStore) A node whose epoch expired by its own clock still serves the stateless calls addressed to any epoch
+    // it held (held epochs accumulate): a store outage longer than the TTL fails no call. Refusal after expiry is
+    // ownership work's (0.5).
     auto destinationEpoch = std::string(remote.getDestinationEpoch().cStr());
     if (!destinationEpoch.empty() && !server.holdsEpoch(destinationEpoch)) {
       reject(server.refusal("PEER_UNAVAILABLE", "target epoch changed before execution"));
@@ -3158,8 +3154,8 @@ public:
       capnp::MallocMessageBuilder message;
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), json);
-      instance = coworkerd::etcd::text(json, "instance");
-      auto list = coworkerd::etcd::field(json, "addresses");
+      instance = coworkerd::json::text(json, "instance");
+      auto list = coworkerd::json::field(json, "addresses");
       KJ_REQUIRE(list.isArray() && list.getArray().size() <= 64, "addresses");
       for (auto entry : list.getArray()) {
         KJ_REQUIRE(entry.isString(), "address");
@@ -3885,17 +3881,17 @@ private:
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
-    const auto workerId = coworkerd::etcd::text(json, "workerId"), versionId = coworkerd::etcd::text(json, "versionId");
+    const auto workerId = coworkerd::json::text(json, "workerId"), versionId = coworkerd::json::text(json, "versionId");
     if (!coworkerd::workerFullName(workerId) || !safeName(versionId) || versionId.size() > 255) {
       ++logRefusedPosts;
       KJ_FAIL_REQUIRE("a log post names an invalid Worker or version");
     }
-    auto entries = coworkerd::etcd::field(json, "lines");
+    auto entries = coworkerd::json::field(json, "lines");
     KJ_REQUIRE(entries.isArray(), "a log post holds {workerId, versionId, lines}");
     std::string lines;
     uint64_t kept = 0, cut = 0;
     for (auto entry : entries.getArray()) {
-      auto level = coworkerd::etcd::field(entry, "level"), text = coworkerd::etcd::field(entry, "message");
+      auto level = coworkerd::json::field(entry, "level"), text = coworkerd::json::field(entry, "message");
       if (!level.isString() || !text.isString()) { ++cut; continue; }
       const std::string name(level.getString().cStr());
       if (name != "debug" && name != "info" && name != "log" && name != "warn" && name != "error") { ++cut; continue; }
@@ -4112,7 +4108,7 @@ private:
 // and on the peer listener (a member's advertised address). The body names a
 // published version, {"workerId","versionId","definitionHash"}, with optional
 // "contentHash" (lets the definition be fetched from the object store),
-// "revision" (the etcd revision that published it, which this Server's view
+// "revision" (the tenant index's revision that published it, which this Server's view
 // must reach first), "timeoutMs" (whole trial, default 5000) and "routed"
 // (the Worker has routes, so its default export must serve fetch). The answer
 // is 200 with a verdict, 400 for a malformed request.
@@ -4386,7 +4382,7 @@ private:
           capnp::MallocMessageBuilder message;
           auto json = message.initRoot<capnp::JsonValue>();
           capnp::JsonCodec().decodeRaw(kj::arrayPtr(report.data(), report.size()), json);
-          using coworkerd::etcd::field;
+          using coworkerd::json::field;
           auto flag = [&](const char* name) { auto value = field(json, name); return value.isBoolean() && value.getBoolean(); };
           auto string = [&](const char* name) { auto value = field(json, name); return value.isString() ? std::string(value.getString().cStr()) : std::string(); };
           coldLoad = flag("coldLoad");
@@ -5049,7 +5045,7 @@ struct Launch {
 
 constexpr const char* USAGE =
     "usage: coworkerd --config FILE\n"
-    "       coworkerd check --config FILE  (the node's self-check: the configuration, etcd, the object store, the sandbox)\n"
+    "       coworkerd check --config FILE  (the node's self-check: the configuration, the object store, the sandbox)\n"
     "       coworkerd check storage ENDPOINT BUCKET  (the object store's self-check)\n"
     "       coworkerd --version\n"
     "       coworkerd <manifest> <workerd> <http-address> <binding-rpc-address> <source-address> [server-config]"
@@ -5078,9 +5074,9 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
   KJ_REQUIRE(c.desiredState.backend == "objectStore" && !c.desiredState.objectStore.endpoint.empty(),
       "serve reads the desired state from the object store: set storage.endpoint (the storage block)");
-  KJ_REQUIRE((c.membership.backend == "etcd" || c.membership.backend == "objectStore") && !c.etcdEndpoint.empty(),
-      "serve keeps the suspects and the usage rows in etcd until 0.4's last round, and the membership there or on the "
-      "object store: set etcdEndpoint (and membership.backend objectStore for the object store's)");
+  KJ_REQUIRE(c.membership.backend == "objectStore",
+      "serve keeps the members, the suspects and the usage on the object store: membership.backend objectStore (the default "
+      "with the storage block)");
   if (c.membership.advertisedAddress.empty()) {
     // What the other Servers dial: this host's name and the peer listener's port.
     char name[256] = {};
@@ -5176,7 +5172,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"workerdPath\":" << q(launch.workerd) << ",\"runtimePath\":" << q(launch.runtime)
       << ",\"listenAddress\":" << q(launch.listenAddress) << ",\"peerListenAddress\":" << q(c.peerListenAddress)
       << ",\"advertisedAddress\":" << q(m.advertisedAddress)
-      << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"endpoint\":" << q(m.endpoint) << ",\"ttlSeconds\":" << m.ttlSeconds
+      << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"ttlSeconds\":" << m.ttlSeconds
       << ",\"requestTimeoutMs\":" << m.requestTimeoutMs << ",\"startupTimeoutMs\":" << m.startupTimeoutMs << ",\"retryMs\":" << m.retryMs
       << (m.backend == "objectStore" ? ",\"heartbeatIntervalMs\":" + std::to_string(m.heartbeatIntervalMs) + ",\"listIntervalMs\":" +
           std::to_string(m.listIntervalMs) + ",\"livenessGraceMs\":" + std::to_string(m.livenessGraceMs) + ",\"clockSkewToleranceMs\":" +
@@ -5223,12 +5219,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"caFile\":" << q(c.egress.caFile) << ",\"systemTrustStore\":" << b(c.egress.systemTrustStore)
       << ",\"clusterAddresses\":" << c.egress.clusterAddresses.size() << ",\"tenants\":" << c.egress.tenants.size()
       << "},\"peerAuth\":{\"keyFile\":" << q(c.peerAuth.keyFile) << ",\"windowMs\":" << c.peerAuth.windowMs
-      << "},\"etcdCredentials\":" << [&] {
-           const auto* credentials = coworkerd::etcdCredentials();
-           return credentials ? "{\"user\":" + q(credentials->user) + ",\"file\":" + q(credentials->file) + ",\"origin\":" +
-               q(credentials->origin) + "}" : std::string("null");
-         }()
-      << ",\"forTest\":{\"clockOffsetMs\":" << c.clockOffsetMsForTest << ",\"disableAlreadyPlaced\":" << b(c.disableAlreadyPlacedForTest)
+      << "},\"forTest\":{\"clockOffsetMs\":" << c.clockOffsetMsForTest << ",\"disableAlreadyPlaced\":" << b(c.disableAlreadyPlacedForTest)
       << ",\"loadBand\":" << q(c.loadBandForTest) << ",\"equalLimits\":" << b(c.equalLimitsForTest)
       << ",\"versionResolution\":" << q(d.versionResolutionForTest) << ",\"deploymentApplyDelayMs\":" << d.deploymentApplyDelayMsForTest
       << ",\"drainAnnounceDelayMs\":" << c.drainAnnounceDelayMsForTest << "}}";
@@ -5298,22 +5289,15 @@ int run(Launch launch) {
     std::cout << "[server] {\"event\":\"peer-auth\",\"enabled\":false,\"warning\":\"peer connections are not authenticated: "
                  "whoever reaches this Server's peer address can open calls on it; set peerAuth.keyFile (the cluster key)\"}" << std::endl;
   }
-  std::cout << "[server] {\"event\":\"etcd-auth\",\"etcd\":" << coworkerd::etcdAuthJson() << "}" << std::endl;
   auto membership = coworkerd::newMembership(serverConfig.membership, serverConfig.serverId,
       serverConfig.peerListenAddress, serverConfig.peers,
       io.provider->getNetwork(), timer, *headerTable, serverConfig.desiredState.objectStore);
-  // Suspects and usage stay in etcd until 0.4's last round: with the members on the object store they get etcd's
-  // address from etcdEndpoint.
-  auto etcdAuthority = serverConfig.membership;
-  if (etcdAuthority.backend == "objectStore") {
-    etcdAuthority.backend = "etcd";
-    etcdAuthority.endpoint = serverConfig.etcdEndpoint;
-  }
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
       io.provider->getNetwork(), timer, *headerTable);
   const auto stackDirectory = launch.stackDirectory;
-  coworkerd::Suspects suspects(etcdAuthority, serverConfig.serverId, serverConfig.suspectBaseMs,
-      serverConfig.suspectMaxMs, io.provider->getNetwork(), timer, *headerTable);
+  // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).
+  coworkerd::Suspects suspects(membership.get(), serverConfig.serverId, serverConfig.suspectBaseMs,
+      serverConfig.suspectMaxMs, timer);
   // The tenants' records: deletion, log quotas (handed to the log drainer), default limits -- from the desired state's
   // manifests, at every revision it applies.
   coworkerd::TenantView tenantView;
@@ -5360,15 +5344,17 @@ int run(Launch launch) {
       stackDirectory.string(), bindingSocketAddress, sourceSocketAddress, *io.provider, io.unixEventPort,
       *headerTable, suspects);
   if (egressOn) runtime.enableEgress("unix:" + egressSocket);
-  // What the egress policy denies as the cluster's own, besides the members it learns from etcd (egress.h).
+  // What the egress policy denies as the cluster's own, besides the members it learns from the membership (egress.h).
   const auto egressConfig = serverConfig.egress;
   std::vector<std::string> ownEndpoints = {launch.listenAddress, serverConfig.peerListenAddress,
-      serverConfig.membership.advertisedAddress, serverConfig.membership.endpoint, serverConfig.etcdEndpoint,
-      serverConfig.desiredState.objectStore.endpoint};
+      serverConfig.membership.advertisedAddress, serverConfig.desiredState.objectStore.endpoint};
   for (const auto& [peerId, address] : serverConfig.peers) ownEndpoints.push_back(address);
-  // Each tenant's usage here: rolled up per hour below this node's own prefix.
-  coworkerd::TenantUsage tenantUsage(serverConfig.usage, serverConfig.serverId, etcdAuthority, io.provider->getNetwork(),
-      timer, *headerTable, {[&runtime]() { return runtime.takeCpuUsage(); }, [&runtime]() { return runtime.residentIsolatesByTenant(); },
+  // Each tenant's usage here: one object per hour below this node's own prefix, written with the membership's identity
+  // (a node without the object store membership only counts).
+  coworkerd::TenantUsage tenantUsage(serverConfig.usage, serverConfig.serverId,
+      serverConfig.membership.backend == "objectStore" ? std::optional(serverConfig.desiredState.objectStore) : std::nullopt,
+      io.provider->getNetwork(),
+      timer, {[&runtime]() { return runtime.takeCpuUsage(); }, [&runtime]() { return runtime.residentIsolatesByTenant(); },
       [&io]() { return coworkerd::WorkerdOutput::tenantLines(*io.lowLevelProvider); }});
   bool shuttingDown = false;
   int exitCode = 0;
@@ -5378,7 +5364,6 @@ int run(Launch launch) {
   try {
     desiredState->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     membership->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
-    suspects.start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     tenantUsage.start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     if (shuttingDown) {
       membership->stop().wait(waitScope);
@@ -5415,7 +5400,6 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
-  server.addStateSection("etcdAuth", []() { return coworkerd::etcdAuthJson(); });
   if (membership->view().backend == "objectStore")
     server.addStateSection("storage", [&membership]() { return membership->view().storageJson(); });
   HttpForwarder forwarder(server, httpOverCapnpFactory);
@@ -5501,7 +5485,7 @@ int run(Launch launch) {
 }
 
 // `coworkerd check --config FILE`: the node's self-check, against the configuration `coworkerd --config FILE`
-// starts with -- the configuration itself, etcd (suspects and usage), the object store (with this node's identity), the
+// starts with -- the configuration itself, the object store (with this node's identity), the
 // desired state there (the cluster's marker, the secrets key) and the sandbox's prerequisites: the process pool's startup check, which runs the
 // launcher's --check when the sandbox is on (it prints its own [sandbox] line). One [check] line per check, then the
 // result; exits 0 when this node would start, 1 otherwise. It changes nothing: the startup check runs in a
@@ -5533,8 +5517,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
   auto io = kj::setupAsyncIo();
   auto& timer = io.provider->getTimer();
   auto headerTable = kj::HttpHeaderTable::Builder().build();
-  // The outbound rules, the peer key file and etcd's identity (the configuration's file was read above), with the
-  // node's environment overrides.
+  // The outbound rules and the peer key file, with the node's environment overrides.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) c.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) c.egress.defaultPolicy = policy;
   if (const char* file = std::getenv("COWORKERD_PEER_KEY_FILE"); file != nullptr && *file) c.peerAuth.keyFile = file;
@@ -5553,17 +5536,6 @@ int runSelfCheck(const std::vector<std::string>& args) {
         jsonEscape(c.peerAuth.keyFile) + "\"");
   } catch (const kj::Exception& error) {
     report("peer-auth", false, ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
-  }
-  // etcd keeps the suspects and the usage rows (until 0.4's last round): it answers, with this node's identity, a read of
-  // the node's own usage rows. The desired state is not there any more.
-  try {
-    coworkerd::EtcdClient etcd(c.etcdEndpoint, 2000, io.provider->getNetwork(), timer, *headerTable);
-    auto raw = etcd.range(coworkerd::nodeUsagePrefix(c.serverId)).wait(io.waitScope);
-    report("etcd", true, ",\"endpoint\":\"" + jsonEscape(c.etcdEndpoint) + "\",\"revision\":\"" + std::to_string(raw.revision) +
-        "\",\"holds\":\"suspects and usage\"");
-  } catch (const kj::Exception& error) {
-    report("etcd", false, ",\"endpoint\":\"" + jsonEscape(c.etcdEndpoint) + "\",\"reason\":\"" +
-        jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
   }
   const auto& store = c.desiredState.objectStore;
   try {
@@ -5638,7 +5610,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
   KJ_REQUIRE(mkdtemp(pattern.data()) != nullptr, "cannot create the check's temporary directory", strerror(errno));
   const fs::path directory = pattern;
   try {
-    coworkerd::Suspects suspects(c.membership, c.serverId, c.suspectBaseMs, c.suspectMaxMs, io.provider->getNetwork(), timer, *headerTable);
+    coworkerd::Suspects suspects(nullptr, c.serverId, c.suspectBaseMs, c.suspectMaxMs, timer);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
     coworkerd::ProcessPool pool(c.processPool, launch->workerd, launch->runtime, directory.string(),
