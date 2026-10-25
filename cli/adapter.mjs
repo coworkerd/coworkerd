@@ -22,7 +22,7 @@ export function canonical(value) {
 const supported = new Set(["$schema", "name", "main", "compatibility_date", "compatibility_flags", "vars", "services",
   "build", "base_dir", "rules", "no_bundle", "find_additional_modules", "preserve_file_names", "minify", "tsconfig",
   "jsx_factory", "jsx_fragment", "alias", "define", "keep_names", "upload_source_maps", "send_metrics", "assets",
-  "durable_objects", "migrations"]);
+  "durable_objects", "migrations", "d1_databases"]);
 // Static assets: the directory, Cloudflare's not-found handling, the ASSETS binding (the Worker's own asset layer) and
 // run_worker_first (true, or Cloudflare's path rules); html_handling only at its default.
 const assetKeys = new Set(["directory", "html_handling", "not_found_handling", "binding", "run_worker_first"]);
@@ -57,6 +57,8 @@ export function exampleSecretNames(text) {
 }
 // Names as the deployment checks them: JavaScript identifiers of ASCII letters, digits, '_' and '$'; at most 64.
 const environmentName = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+// A name within a tenant (a database): the same shape as a tenant or Worker name.
+const resourceName = /^[a-z0-9][a-z0-9-]{0,62}$/;
 // Local value files: kept out of the staged copy of a project (the build does not need them).
 const localValues = name => (name === ".dev.vars" || name.startsWith(".dev.vars.") || name === ".env" || name.startsWith(".env.")) &&
   !name.endsWith(".example");
@@ -76,6 +78,13 @@ export function unsupportedKeys(raw) {
   for (const key of Object.keys(raw.build ?? {})) if (!["command", "cwd", "watch_dir"].includes(key)) found.push(`build.${key}`);
   // Durable Objects: a namespace Binding names a class of this Worker; migrations declare, delete and rename classes.
   for (const key of Object.keys(raw.durable_objects ?? {})) if (key !== "bindings") found.push(`durable_objects.${key}`);
+  // d1_databases: the Binding and the database it names (database_id is Cloudflare's account-scoped id; here a
+  // database is named within its tenant, so the name is what counts and an id is ignored).
+  for (const [index, binding] of (Array.isArray(raw.d1_databases) ? raw.d1_databases : []).entries()) {
+    for (const key of Object.keys(binding ?? {}))
+      if (!["binding", "database_name", "database_id", "preview_database_id"].includes(key))
+        found.push(`d1_databases[${index}].${key}`);
+  }
   for (const [index, binding] of (raw.durable_objects?.bindings ?? []).entries()) {
     for (const key of Object.keys(binding ?? {})) if (!["name", "class_name", "script_name"].includes(key)) found.push(`durable_objects.bindings[${index}].${key}`);
   }
@@ -97,7 +106,7 @@ export function classify(raw, { redirected = false } = {}) {
   for (const key of unsupportedKeys(raw)) {
     const service = /^services\[(\d+)\]\.(.+)$/.exec(key), build = /^build\.(.+)$/.exec(key), asset = /^assets\.(.+)$/.exec(key);
     // Durable Object keys outside the supported shape are refused whatever their value.
-    if (key.startsWith("durable_objects.") || key.startsWith("migrations[")) { rejected.push(key); continue; }
+    if (key.startsWith("durable_objects.") || key.startsWith("migrations[") || key.startsWith("d1_databases[")) { rejected.push(key); continue; }
     const topLevel = !service && !build && !asset;
     const value = service ? raw.services[Number(service[1])][service[2]] : build ? raw.build[build[1]] : asset ? raw.assets[asset[1]] : raw[key];
     const reason = topLevel && Object.hasOwn(platform, key) ? ["platform", platform[key]]
@@ -269,9 +278,22 @@ export function durableObjectsOf(config, names) {
     }
   }
   for (const binding of bindings)
-    if (!declared.includes(binding.className))
+    if (!binding.database && !declared.includes(binding.className))
       throw new Error(`Unsupported durable_objects binding ${binding.binding}: class ${binding.className} is not declared by the migrations ` +
         "(new_classes or new_sqlite_classes)");
+  // d1_databases: each Binding names one of the tenant's databases. Its class is the platform's own SQL Worker
+  // class, which no version declares, so these Bindings go beside the Durable Object ones with the database named.
+  for (const [index, binding] of (Array.isArray(config.d1_databases) ? config.d1_databases : []).entries()) {
+    const where = `d1_databases[${index}]`;
+    if (typeof binding?.binding !== "string" || !environmentName.test(binding.binding))
+      throw new Error(`Unsupported ${where}.binding: a JavaScript identifier`);
+    const name = binding.database_name;
+    if (typeof name !== "string" || !resourceName.test(name))
+      throw new Error(`Unsupported ${where}.database_name: a name of [a-z0-9][a-z0-9-]{0,62} (the database of this tenant)`);
+    if (bindings.some(one => one.binding === binding.binding))
+      throw new Error(`Unsupported ${where}.binding: ${binding.binding} is already a Durable Object Binding`);
+    bindings.push({ binding: binding.binding, className: "__coworkerdSqlDatabase", database: name });
+  }
   if (!bindings.length && !declared.length && !deleted.length && !renamed.length) return null;
   return { durableObjects: bindings, classes: { declared, deleted, renamed } };
 }

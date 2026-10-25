@@ -7,6 +7,7 @@ The guide is for running Coworkerd and deploying to it; the design documents exp
 - [Installing and running Coworkerd](guide/install.md): the release package, a cluster with one compose command and adding a node to it, bare metal with your own object store, configuration, upgrading, the sandbox and the system call allowlist, egress, the cluster key and the other credentials.
 - [Quickstart](guide/quickstart.md): from a wrangler project to the first request -- a tenant, a credential, `cowctl deploy`, logs, versions, secrets and usage.
 - [Compatibility scope](guide/compat.md): which features of a wrangler project work, and what is refused at deployment.
+- [Databases (D1's shape)](guide/databases.md): making one, binding it to a Worker, `env.DB`, the HTTP SQL endpoint and what is not there.
 - [Error codes](guide/errors.md): what calls, the control plane and the management endpoints answer when they fail, and what `fetch` throws for tenants' outgoing requests.
 
 ## Design

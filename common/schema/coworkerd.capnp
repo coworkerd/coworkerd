@@ -159,6 +159,11 @@ struct ObjectInvocation {
   ingressServerId @16 :Text;
   callerNamespaceId @17 :Text;
   callerObjectId @18 :Text;
+  # A tenant's database (the D1 shape): its name, so the owner runs the platform's own SQL Worker class for it.
+  database @19 :Text;
+  # The firing of the object's alarm: the time it was scheduled for and how many times the handler has been tried.
+  alarmAtUnixMs @20 :UInt64;
+  alarmRetryCount @21 :UInt32;
 }
 
 struct ServerConfig {
@@ -299,6 +304,12 @@ struct ServerConfig {
     # How many parts of a snapshot or segments a rebuild downloads at once (R5: more than four 16 MiB reads at once met
     # errors on a volume server of SeaweedFS 3.97).
     recoverParallelism @16 :UInt32 = 4;
+    # How many objects one durable process keeps resident. Past it the least recently used objects are evicted: a
+    # hibernatable WebSocket of an evicted object hibernates rather than closes, so the connection stays up and the
+    # next message wakes the object on the same storage. 0: no limit.
+    residentObjects @17 :UInt32 = 4096;
+    # How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
+    usagePublishMs @18 :UInt32 = 3600000;
   }
 
   struct IngressConfig {
@@ -676,6 +687,9 @@ struct VersionPin {
 struct DurableObjectBinding {
   binding @0 :Text;
   className @1 :Text;
+  # A d1_databases Binding: the tenant's database it names. Its class is then the platform's own SQL Worker class,
+  # which no version declares, and its namespace comes from the tenant's databases.
+  database @2 :Text;
 }
 
 # The Durable Object classes a version's migrations leave, applied in order: those declared (every class is a SQLite
@@ -865,6 +879,10 @@ struct InvocationDescriptor {
     name @0 :Text;
     className @1 :Text;
     namespaceId @2 :Text;
+    # A d1_databases Binding: the tenant's database it names and the id of the one object that database is, so the
+    # runtime needs no hash of its own for it.
+    database @3 :Text;
+    objectId @4 :Text;
   }
 
   struct DurableObjectTarget {
@@ -878,6 +896,14 @@ struct InvocationDescriptor {
     shard @4 :UInt32;
     shardEpoch @5 :UInt64;
     dataEpoch @6 :UInt64;
+    # A tenant's database (the D1 shape): its name. The class is then the platform's own SQL Worker class, which the
+    # Host takes from its SQL_CLASS Binding and runs as the object's facet -- no tenant code is loaded.
+    database @7 :Text;
+    # This request is the object's alarm, scheduled for this time (Unix milliseconds): the object's class runs its
+    # alarm() handler, and the answer says what its own database held.
+    alarmAtUnixMs @8 :UInt64;
+    # How many times its handler has already been tried (alarmInfo.retryCount).
+    alarmRetryCount @9 :UInt32;
   }
 }
 
@@ -911,5 +937,8 @@ struct BindingDescriptor {
     objectId @2 :Text;
     callerNamespaceId @3 :Text;
     callerObjectId @4 :Text;
+    # A d1_databases Binding's call: the tenant's database it names. The class is then the platform's own SQL Worker
+    # class, which no version declares.
+    database @5 :Text;
   }
 }

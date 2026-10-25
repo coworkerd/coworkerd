@@ -55,6 +55,8 @@ An inaccurate membership view can only make placement worse, never make calls wr
 | `do/<namespace>/shards/<shard>/epochs/<epoch>` | A Durable Object shard's ownership, created only if absent: the node and its membership epoch, when, why, the epoch before, the writer's instance and a random value (section 11) | The node that takes the shard |
 | `do/<namespace>/shards/<shard>/epochs/<epoch>.released` | That epoch's release marker: its owner let the shard go | The owner, when it drains |
 | `do/<namespace>/shards/<shard>/owner` | The hint: the latest epoch, its node and whether it was released | The owner, and any node that listed the shard's epochs |
+| `do/<namespace>/shards/<shard>/alarms/<object>` | The hint of an object's next alarm (its time and which of its databases holds it), so the shard's next owner knows which objects to wake; the object's own database decides (section 12) | The shard's owner, whenever one of its objects' alarms changes |
+| `nodes/<node>/durable-usage` | What that node's Durable Objects of each tenant hold, as it last published them (the `durableObjectBytes` quota, section 12) | The node itself |
 | `nodes/<nodeId>/usage/<hour>` | Every tenant's usage on this node in one UTC hour (section 9) | That node |
 | `check/` | `coworkerd check storage`'s probe keys, created and removed; its signed probe object stays as `bundles/<SHA-256 of its bytes>`, and with a node's identity (`COWORKERD_READ_ACCESS_KEY` and `COWORKERD_READ_SECRET_KEY`, and `COWORKERD_READ_NODE_ID` naming the node, as compose's `init` gives them) it also writes and removes a key below `members/<nodeId>/probe/` and `nodes/<nodeId>/` | The check, with the deploy identity (compose's `init` runs it) |
 
@@ -236,7 +238,9 @@ and never reads the previous owner's files.
   ordered by the shard's epoch and the owner's sequence, applied once each, and the frames of each are checked as
   SQLite's own recovery checks them. A record that does not follow the last fails the rebuild rather than serving the
   object with less than it had. The facet tree index beside the databases is written from the records, which carry each
-  facet's name and parent. A request waits at most `durableObjects.recoverTimeoutMs` (30 s) and is then answered `503
+  facet's name and parent. How long a rebuild takes is the history's size: a small object is milliseconds, and a
+  gibibyte takes about twenty seconds (measured: 19.5 s, with the snapshot's parts fetched four at a time, which is
+  what a store of this kind is held to). A request waits at most `durableObjects.recoverTimeoutMs` (30 s) and is then answered `503
   DO_RECOVERING`.
 - **This machine's files.** They are a cache of the history, bounded by `durableObjects.diskBytes` (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
@@ -244,8 +248,11 @@ and never reads the previous owner's files.
   node keeps the boot of the machine it ran on and a marker a clean exit writes: started again within the same boot, or
   after a clean exit, it reuses the files and cuts each database's WAL back to the last frame its log names -- a
   process that committed a transaction and died before its frames arrived leaves frames nobody was told about, and
-  nothing may read them. A machine that restarted without a clean exit (`synchronous=OFF` leaves no promise about what
-  the kernel wrote) loses them all, and every object is rebuilt from its history.
+  nothing may read them. Beside each object the node also writes the position its files are confirmed at (its facets,
+  their transaction numbers, the frame each is at, the last checkpoint and the last snapshot), so a start that may
+  trust the disk at all serves the object's first request from the files instead of replaying its whole history. A
+  machine that restarted without a clean exit (`synchronous=OFF` leaves no promise about what the kernel wrote) loses
+  them all, and every object is rebuilt from its history.
 - **The fence.** Every record carries the shard's epoch. A peer confirms only records of the epoch it knows the shard
   at, so an owner that lost its shard is confirmed by nobody, and a manifest revision is written only when the
   previous one's shard epoch is not newer: the old owner's segments reach no manifest and its writes reach no reader.
@@ -263,7 +270,26 @@ and never reads the previous owner's files.
   that was answered.
 - **One kind of object.** There is no hot standby tier: the peers buffer what is not on the store yet, and an object is
   rebuilt from the store. One object is at most `durableObjects.objectBytes` (10 GB, as on Cloudflare), judged by its
-  database file at a checkpoint; past it the object answers `413 DO_OBJECT_TOO_LARGE`.
+  databases as they last reported their size (at a checkpoint, and when a database is opened or closed); past it a
+  **write** is refused with `413 DO_OBJECT_TOO_LARGE` at the moment it would be made durable, and everything that
+  reads is served. The refused transaction reaches no peer, no segment and no manifest, so it is not part of the
+  object's history; it stays readable from the refusing node's own file until the object is next opened, and the
+  rebuild that follows drops it.
+- **The tenant's storage.** What all of a tenant's objects hold is bounded by the tenant's `durableObjectBytes` quota
+  (10 GB by default): past it a write is refused with `422 QUOTA_EXCEEDED`, and reads go on. Every node publishes what
+  its own objects of each tenant hold to `nodes/<id>/durable-usage` every `durableObjects.usagePublishMs` (an hour) and
+  reads the other members', so the figure is a bound rather than an account; the objects of a namespace or a database
+  that is being deleted stop counting.
+- **Alarms.** An object's alarm time is in its own database, so it is replicated and recovered with everything else.
+  The shard's owner keeps the schedule and fires the alarm as an event of the object's Worker, and a hint beside the
+  shard's epochs (`do/<namespace>/shards/<shard>/alarms/<object>`) names each object's next alarm so that the shard's
+  next owner knows which objects to wake; every firing then asks the object's own database, which decides -- an alarm
+  that already ran is not fired again, one still due is not lost. The hint carries no correctness: a stale one costs
+  one wake, a missing one a delay until the object is next opened.
+- **Resident objects.** A durable process keeps at most `durableObjects.residentObjects` (4096) objects resident and
+  evicts the least recently used past that, a facet before its root; an object with hibernatable WebSockets keeps them
+  connected while it is evicted and is woken by the next message. The state endpoint reports the resident count per
+  process, the limit, the evictions, the wakes and how long they took.
 
 The state endpoint's `durableLog` shows the confirmation latency (mean, p50, p99), the bytes not confirmed and not
 sealed, the segments and the last upload, the peers and the streams to them, the checkpoints, the rebuilds and their

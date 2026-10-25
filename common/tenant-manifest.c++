@@ -205,7 +205,16 @@ std::string tenantManifestJson(const TenantManifest& manifest) {
     }
     out += '}';
   }
-  return out + "}}";
+  out += '}';
+  // The tenant's databases, only where it has some (a manifest without them keeps its shape).
+  if (!manifest.databases.empty()) {
+    out += ",\"databases\":{";
+    size_t d = 0;
+    for (const auto& [name, entry] : manifest.databases)
+      out += (d++ ? "," : "") + quote(name) + ":" + manifestNamespaceJson(entry);
+    out += '}';
+  }
+  return out + "}";
 }
 
 std::string manifestNamespaceJson(const ManifestNamespace& entry) {
@@ -294,13 +303,30 @@ TenantManifest decodeTenantManifest(const std::string& bytes) {
       }
       manifest.workers.emplace(name, std::move(worker));
     }
+    if (auto databases = field(json, "databases"); !databases.isNull()) {
+      KJ_REQUIRE(databases.isObject(), "databases is an object");
+      for (auto entry : databases.getObject()) {
+        const std::string name = entry.getName().cStr();
+        KJ_REQUIRE(deploymentSafeName(name) && tenantName(name), "invalid database name");
+        auto record = entry.getValue();
+        ManifestNamespace item;
+        item.id = string(record, "id");
+        item.createdRevision = number(record, "createdRevision");
+        item.status = string(record, "status");
+        item.shards = static_cast<uint32_t>(number(record, "shards"));
+        KJ_REQUIRE(hexDigest(item.id), "a namespace id is 64 hexadecimal digits");
+        KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting");
+        KJ_REQUIRE(item.shards > 0, "a namespace has shards");
+        manifest.databases.emplace(name, std::move(item));
+      }
+    }
     return manifest;
   });
 }
 
 bool sameContent(const TenantManifest& a, const TenantManifest& b) {
   const auto record = [](const TenantManifest& m) { return m.record ? tenantRecordJson(*m.record) : std::string("null"); };
-  return a.tenant == b.tenant && record(a) == record(b) && a.workers == b.workers;
+  return a.tenant == b.tenant && record(a) == record(b) && a.workers == b.workers && a.databases == b.databases;
 }
 
 TenantIndexEntry indexEntryOf(const TenantManifest& manifest) {
@@ -458,6 +484,12 @@ std::map<std::string, std::string> tenantStateKeys(const TenantManifest& manifes
         namespaces.emplace(className, DurableObjectNamespace{entry.id, entry.status, entry.shards});
       keys.emplace(deploymentNamespacesKey(id), namespacesStateJson(namespaces));
     }
+  }
+  if (!manifest.databases.empty()) {
+    std::map<std::string, DurableObjectNamespace> databases;
+    for (const auto& [name, entry] : manifest.databases)
+      databases.emplace(name, DurableObjectNamespace{entry.id, entry.status, entry.shards});
+    keys.emplace(tenant + "/databases", namespacesStateJson(databases));
   }
   return keys;
 }

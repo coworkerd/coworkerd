@@ -125,6 +125,8 @@ struct TenantManifest {
   // tool writes (its default tenant).
   std::optional<TenantRecord> record;
   std::map<std::string, ManifestWorker> workers;
+  // The tenant's databases by name: each is a namespace of its own (one shard, one object).
+  std::map<std::string, ManifestNamespace> databases;
   std::string status() const { return record ? record->status : "active"; }
   std::vector<std::string> hostnames() const { return record ? record->hostnames : std::vector<std::string>{}; }
 };

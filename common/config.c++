@@ -198,6 +198,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.uploadRetryMs = durable.getUploadRetryMs();
   result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();
   result.durableLog.recoverParallelism = durable.getRecoverParallelism();
+  result.durableLog.residentObjects = durable.getResidentObjects();
+  result.durableLog.usagePublishMs = durable.getUsagePublishMs();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
   result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();
   result.processPool.heatIdleMs = result.idleMs;

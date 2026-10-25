@@ -25,6 +25,9 @@ namespace coworkerd {
 // The shard of an object: the first 8 bytes of its id (64 hexadecimal digits) as a big-endian number, modulo the
 // namespace's shards -- the same on every node.
 uint32_t durableShardOf(const std::string& objectId, uint32_t shards);
+// The object id a namespace's idFromName(name) gives (runtime.js, __coworkerdNamespace): the SHA-256 of the
+// namespace id's 32 bytes followed by "name" and the name, as 64 hexadecimal digits.
+std::string durableObjectIdFromName(const std::string& namespaceId, const std::string& name);
 
 // ---- The shards' objects ----
 //   do/<ns>/shards/<s>/epochs/<n>            the shard's n-th ownership, created only if absent (n 20 digits wide)
@@ -121,6 +124,10 @@ public:
   uint64_t knownShardEpoch(const std::string& namespaceId, uint32_t shard) const;
   // Called for every shard this node stops holding (released, lost or dropped), so its objects' data is left alone.
   void onShardGone(std::function<void(const std::string& namespaceId, uint32_t shard, const std::string& reason)> callback);
+  // This node has taken a shard (an epoch of its own): the replicator reads the alarm hints of its objects, so the
+  // alarms the node before it had scheduled go on being fired here (node/durable-log.h).
+  void onShardTaken(std::function<void(const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch,
+      const std::string& reason)> callback);
 
   // Whether this node may hold shards ("" when it may): processes, the store's create-if-absent, the membership.
   std::string unavailable() const;
@@ -195,6 +202,7 @@ private:
   std::map<std::pair<std::string, uint64_t>, Probe> probes;
   std::map<std::string, uint64_t> takeovers, refusals, forwards;
   std::function<void(const std::string&, uint32_t, const std::string&)> shardGone;
+  std::function<void(const std::string&, uint32_t, uint64_t, const std::string&)> shardTaken;
   uint64_t acquireAttempts = 0, acquireConflicts = 0, acquireFailures = 0, acquiredAfterReadBack = 0;
   uint64_t releases = 0, releaseFailures = 0, dropped = 0, drops = 0;
   uint64_t hintReads = 0, hintMisses = 0, hintsWritten = 0, hintsRepaired = 0, hintFailures = 0;

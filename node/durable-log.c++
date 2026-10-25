@@ -213,6 +213,13 @@ std::string objectSnapshotPartKey(const std::string& namespaceId, const std::str
     uint32_t facetId, uint64_t part) {
   return objectSnapshotPrefix(namespaceId, objectId, sequence) + wide(facetId) + "-" + wide(part);
 }
+std::string shardAlarmPrefix(const std::string& namespaceId, uint32_t shard) {
+  return "do/" + namespaceId + "/shards/" + std::to_string(shard) + "/alarms/";
+}
+std::string shardAlarmKey(const std::string& namespaceId, uint32_t shard, const std::string& objectId) {
+  return shardAlarmPrefix(namespaceId, shard) + objectId;
+}
+std::string nodeDurableUsageKey(const std::string& nodeId) { return "nodes/" + nodeId + "/durable-usage"; }
 
 std::string durableHostId(const std::string& uniqueKey, const std::string& name) {
   const auto key = sha256Bytes(uniqueKey);
@@ -619,11 +626,15 @@ void DatabaseReplay::finish() {
 namespace {
 // Messages from a durable process (patches/workerd 0013, coworkerd-wal-shipper.h).
 constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOINT = 4, FROM_RESET = 5,
-                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8;
+                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10;
 // Messages to one.
 constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4;
 // An answer's status.
-constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3;
+constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
+
+// Cloudflare's alarm retries: the first two seconds later, doubling, a quarter of jitter; six counted tries, and
+// past them the delay doubles to about seventeen minutes (src/workerd/server/alarm-scheduler.h).
+constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALARM_RETRY_BACKOFF_MAX = 9;
 // The facet tree index workerd keeps beside an object's databases (src/workerd/server/facet-tree-index.h): an
 // 8 byte magic number, then one entry per facet -- its parent (2 bytes), the length of its name (2) and the name.
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
@@ -648,6 +659,23 @@ constexpr double PEER_RETRY_MS = 1000;
 // The object a record belongs to, as this node keeps it: the name its Host was made with.
 std::string hostNameOf(const LogRecord& record) {
   return record.objectName + "/" + std::to_string(record.dataEpoch);
+}
+
+// A non-negative integer field written as a JSON number (the hints and the position file write small numbers that
+// way; the large ones are strings of decimal digits, read with decimal(json::text(...))).
+uint64_t numberField(const json::Json::Reader& object, const char* name) {
+  auto value = json::field(object, name);
+  if (!value.isNumber()) return 0;
+  const auto number = value.getNumber();
+  return number > 0 ? uint64_t(number) : 0;
+}
+
+// A value below `bound`, for the jitter of an alarm retry.
+uint64_t randomBelow(uint64_t bound) {
+  if (bound == 0) return 0;
+  static std::random_device device;
+  static std::mt19937_64 engine(device());
+  return engine() % bound;
 }
 
 std::string randomHex(size_t bytes) {
@@ -829,6 +857,7 @@ kj::Promise<void> DurableLog::start() {
     log("cache-dropped", "\"reason\":" + quote(reason) + ",\"entries\":" + std::to_string(removed));
   } else {
     co_await readOwnLog();
+    readPositions();
   }
   // From here on this node's files are its own: the marker says the next start may reuse them only after a clean
   // exit or within the same boot.
@@ -1182,6 +1211,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       facet.parentFacetId = parentFacetId;
       facet.facetName = facetName;
       facet.databaseBytes = databaseBytes;
+      sized(*object);
       // The position this node confirmed is the one the files must be at: a process that committed a transaction and
       // died before its frames arrived leaves frames nobody knows, and nothing may read them (experiment 25, B.6).
       const bool sameGeneration = facet.salt1 == salt1 && facet.salt2 == salt2;
@@ -1226,16 +1256,13 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       facet.salt1 = 0;
       facet.salt2 = 0;
       facet.generation = generation;
-      uint64_t bytes = 0;
-      for (const auto& [id, entry] : object->facets) bytes += entry.databaseBytes;
-      object->bytes = bytes;
+      sized(*object);
+      const auto bytes = object->bytes;
+      // The files are now at a position the node has confirmed: recorded beside them, so a restart of the daemon or
+      // of a durable process within the same boot reuses them instead of rebuilding from the whole history.
+      writePosition(*object);
       log("checkpoint", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId) + ",\"frames\":" +
               std::to_string(frames) + ",\"databaseBytes\":\"" + std::to_string(databaseBytes) + "\"");
-      if (bytes > settings.config.objectBytes && !object->overLimit) {
-        object->overLimit = true;
-        log("object-too-large", "\"object\":" + quote(objectName) + ",\"bytes\":\"" + std::to_string(bytes) +
-                "\",\"limit\":\"" + std::to_string(settings.config.objectBytes) + "\"");
-      }
       tasks.add(snapshotIfDue(objectName));
       return;
     }
@@ -1270,8 +1297,18 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       const auto objectName = key.substr(0, split);
       const auto facetId = uint32_t(decimal(key.substr(split + 1)));
       if (type == FROM_CLOSED) {
+        in.u64();  // when the process closed it, by its monotonic clock
+        const auto databaseBytes = in.u64();
         auto* object = objectOf(objectName);
-        if (object != nullptr) object->facets[facetId].open = false;
+        if (object == nullptr) return;
+        auto& facet = object->facets[facetId];
+        facet.open = false;
+        // The size as the instance left it: a small object may never checkpoint, and the tenant's storage and the
+        // object's own limit are judged on this.
+        if (in.ok && databaseBytes) {
+          facet.databaseBytes = databaseBytes;
+          sized(*object);
+        }
         return;
       }
       auto* object = objectOf(objectName);
@@ -1282,6 +1319,29 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       record.storageId = object->storageId;
       record.facetId = facetId;
       takeRecord(channel, std::move(record), 0);
+      return;
+    }
+    case FROM_ALARM: {
+      in.text();  // the key, which the fields below give again
+      const auto objectName = in.text();
+      const auto facetId = in.u32();
+      const auto set = in.u8();
+      const auto atUnixMs = in.u64();
+      if (!in.ok) return;
+      alarmReported(objectName, facetId, set ? atUnixMs : 0);
+      return;
+    }
+    case FROM_RESIDENCY: {
+      auto& entry = residency[channel.processId];
+      entry.resident = in.u64();
+      entry.limit = in.u64();
+      entry.evicted = in.u64();
+      entry.woken = in.u64();
+      entry.wakes = in.u64();
+      entry.wakeUsTotal = in.u64();
+      entry.wakeUsMax = in.u64();
+      if (!in.ok) return;
+      entry.atMs = monotonicTimeMs();
       return;
     }
     case FROM_GAVE_UP: {
@@ -1347,6 +1407,19 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     ++overLimitAnswers;
     if (request) answer(channel, request, ACK_TOO_LARGE);
     return;
+  }
+  // The tenant's durableObjectBytes quota: only the write is refused, and only while the tenant is over it. What the
+  // tenant holds is what the nodes published of their own objects (every hour), so this is approximate by design --
+  // it bounds the storage, it does not account for it.
+  if (hooks.tenantQuotaBytes && !object->tenant.empty()) {
+    const auto quota = hooks.tenantQuotaBytes(object->tenant);
+    if (quota && tenantBytes(object->tenant) > quota) {
+      ++quotaRefusals;
+      log("quota-exceeded", "\"tenant\":" + quote(object->tenant) + ",\"bytes\":\"" +
+              std::to_string(tenantBytes(object->tenant)) + "\",\"quota\":\"" + std::to_string(quota) + "\"");
+      if (request) answer(channel, request, ACK_QUOTA);
+      return;
+    }
   }
   if (object->state != ObjectState::LOCAL) {
     log("record-refused", "\"object\":" + quote(record.objectName) + ",\"reason\":" + quote(object->repairReason.empty()
@@ -1674,6 +1747,8 @@ kj::Promise<void> DurableLog::run() {
   if (!enabled()) co_await kj::Promise<void>(kj::NEVER_DONE);
   tasks.add(sealLoop());
   tasks.add(housekeeping());
+  tasks.add(alarmLoop());
+  tasks.add(usageLoop());
   co_await kj::Promise<void>(kj::NEVER_DONE);
 }
 
@@ -1802,6 +1877,10 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
     auto salts = saltsOf.find(key);
     if (salts == saltsOf.end()) continue;
     tellSealed(key, salts->second.first, salts->second.second, frame.first);
+  }
+  for (const auto& name : touched) {
+    auto* object = objectOf(name);
+    if (object != nullptr) writePosition(*object);
   }
 }
 
@@ -2187,16 +2266,14 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     object.storageId = durableHostId(settings.hostUniqueKey, objectName);
   }
   object.shard = identity.shard;
+  if (!identity.tenant.empty()) object.tenant = identity.tenant;
   if (identity.shardEpoch >= object.shardEpoch) {
     object.shardEpoch = identity.shardEpoch;
     if (object.state == ObjectState::GONE) object.state = ObjectState::UNKNOWN;
   }
   object.lastAccessMs = monotonicTimeMs();
-  if (object.overLimit) {
-    ++overLimitAnswers;
-    co_return ObjectReady{false, 413, "DO_OBJECT_TOO_LARGE",
-        "the object is larger than durableObjects.objectBytes"};
-  }
+  // An object past durableObjects.objectBytes is not turned away here: only its writes are refused, at the moment
+  // their frames would be confirmed (413 DO_OBJECT_TOO_LARGE), and everything that only reads is served.
   if (object.state == ObjectState::LOCAL) co_return ObjectReady{};
   if (object.state == ObjectState::GONE) {
     co_return ObjectReady{false, 409, "DO_SHARD_EPOCH_MISMATCH",
@@ -2313,6 +2390,7 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   ++object->rebuilds;
   lastRebuildMs = monotonicTimeMs() - start;
   object->lastRebuildMs = lastRebuildMs;
+  writePosition(*object);
   log("rebuilt", "\"object\":" + quote(objectName) + ",\"ms\":" + std::to_string(lastRebuildMs) + ",\"manifest\":\"" +
           std::to_string(object->manifestRevision) + "\",\"snapshot\":\"" + std::to_string(object->snapshotSequence) +
           "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\"");
@@ -2579,6 +2657,504 @@ void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector
   ::close(fd);
 }
 
+// ---- Alarms ----
+// An object's alarm lives in its own database (SQLite's _cf_METADATA), so it is replicated and recovered with the
+// object; the durable process reports every change and every open, and this node keeps the schedule. Firing is a
+// request to the object like any other -- only the node can make one, which is why the schedule is here and not in
+// the process: the object's class comes from the Worker version the node names, the CPU is topped up for the event,
+// the lease is renewed and the lines are kept. A hint beside the shard's epochs names each object's next alarm, so
+// the node that takes the shard over knows which objects to wake; the object's own database then decides.
+// The object's size as its databases last reported it, and the single-object limit judged on it: past the limit only
+// its writes are refused (413 DO_OBJECT_TOO_LARGE); everything that reads is served.
+void DurableLog::sized(Object& object) {
+  uint64_t bytes = 0;
+  for (const auto& [id, entry] : object.facets) bytes += entry.databaseBytes;
+  object.bytes = bytes;
+  if (bytes > settings.config.objectBytes && !object.overLimit) {
+    object.overLimit = true;
+    log("object-too-large", "\"object\":" + quote(object.objectName) + ",\"bytes\":\"" + std::to_string(bytes) +
+            "\",\"limit\":\"" + std::to_string(settings.config.objectBytes) + "\"");
+  } else if (bytes <= settings.config.objectBytes && object.overLimit) {
+    object.overLimit = false;
+    log("object-within-limit", "\"object\":" + quote(object.objectName) + ",\"bytes\":\"" +
+            std::to_string(bytes) + "\"");
+  }
+}
+
+void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, uint64_t atUnixMs) {
+  auto* object = objectOf(objectName);
+  if (object == nullptr) {
+    log("alarm-unknown", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId));
+    return;
+  }
+  const auto key = object->namespaceId + "/" + object->objectId + "/" + std::to_string(facetId);
+  const auto found = object->alarms.find(facetId);
+  const uint64_t previous = found == object->alarms.end() ? 0 : found->second;
+  object->alarms[facetId] = atUnixMs;
+  if (atUnixMs == 0) {
+    if (previous) ++alarmsCleared;
+    const bool had = alarms.erase(key) > 0;
+    if (previous || had) {
+      log("alarm-cleared", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
+              ",\"was\":" + std::to_string(previous));
+      tasks.add(writeAlarmHint(object->namespaceId, object->objectId, object->shard, 0, facetId));
+    }
+    return;
+  }
+  auto& state = alarms[key];
+  const bool fresh = state.atUnixMs != atUnixMs || state.fromHint;
+  state.objectName = object->objectName;
+  state.namespaceId = object->namespaceId;
+  state.objectId = object->objectId;
+  state.tenant = object->tenant;
+  state.shard = object->shard;
+  state.facetId = facetId;
+  state.dataEpoch = object->dataEpoch;
+  state.shardEpoch = object->shardEpoch;
+  state.atUnixMs = atUnixMs;
+  state.fromHint = false;
+  if (fresh) {
+    ++alarmsSet;
+    state.retries = 0;
+    state.countedRetries = 0;
+    state.backoff = 0;
+    state.notBeforeMs = 0;
+    log("alarm-set", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
+            ",\"atUnixMs\":" + std::to_string(atUnixMs));
+    tasks.add(writeAlarmHint(object->namespaceId, object->objectId, object->shard, atUnixMs, facetId));
+  }
+}
+
+// The hint: written when an object's alarm changes, removed when it is cleared. It is overwritable and carries no
+// correctness -- a stale one costs one wake, a missing one costs a delay until the object is next opened.
+kj::Promise<void> DurableLog::writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard,
+    uint64_t atUnixMs, uint32_t facetId) {
+  if (!enabled()) co_return;
+  const auto key = shardAlarmKey(namespaceId, shard, objectId);
+  try {
+    if (atUnixMs == 0) {
+      co_await store->remove(key);
+    } else {
+      co_await store->put(key, "{\"atUnixMs\":" + std::to_string(atUnixMs) + ",\"facetId\":" +
+              std::to_string(facetId) + ",\"nodeId\":" + quote(settings.nodeId) + ",\"writtenAtUnixMs\":" +
+              std::to_string(realClockUnixMs()) + "}\n");
+    }
+    ++alarmHintWrites;
+  } catch (const kj::Exception& error) {
+    ++alarmHintFailures;
+    log("alarm-hint-failed", "\"key\":" + quote(key) + ",\"error\":" +
+            quote(std::string(error.getDescription().cStr())));
+  }
+}
+
+// The hints of a shard this node has just taken: each becomes an alarm to fire, marked as coming from a hint. The
+// first firing opens the object, which reports what its own database holds -- a hint for an alarm that already ran
+// is dropped then, so an alarm is never fired twice for one scheduled time.
+kj::Promise<void> DurableLog::readAlarmHints(std::string namespaceId, uint32_t shard, uint64_t shardEpoch,
+    std::string tenant) {
+  if (!enabled()) co_return;
+  ObjectListing listing;
+  try {
+    listing = co_await store->list(shardAlarmPrefix(namespaceId, shard), 1000);
+  } catch (const kj::Exception& error) {
+    log("alarm-hints-failed", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+            ",\"error\":" + quote(std::string(error.getDescription().cStr())));
+    co_return;
+  }
+  uint32_t adopted = 0;
+  for (const auto& listed : listing.objects) {
+    const auto slash = listed.key.rfind('/');
+    if (slash == std::string::npos) continue;
+    const auto objectId = listed.key.substr(slash + 1);
+    if (objectId.size() != 64) continue;
+    uint64_t atUnixMs = 0;
+    uint32_t facetId = 1;
+    try {
+      auto answer = co_await store->get(listed.key);
+      if (answer.status != 200) continue;
+      capnp::MallocMessageBuilder message;
+      auto value = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.bytes.data(), answer.bytes.size()), value);
+      auto reader = value.asReader();
+      atUnixMs = uint64_t(numberField(reader, "atUnixMs"));
+      const auto facet = numberField(reader, "facetId");
+      if (facet > 0) facetId = uint32_t(facet);
+    } catch (const kj::Exception&) {
+      continue;
+    }
+    if (!atUnixMs) continue;
+    const auto key = namespaceId + "/" + objectId + "/" + std::to_string(facetId);
+    auto found = alarms.find(key);
+    // An alarm the objects here already reported is the truth: a hint never replaces it.
+    if (found != alarms.end() && !found->second.fromHint) continue;
+    auto& state = alarms[key];
+    state.namespaceId = namespaceId;
+    state.objectId = objectId;
+    state.tenant = tenant;
+    state.shard = shard;
+    state.facetId = facetId;
+    state.shardEpoch = shardEpoch;
+    state.atUnixMs = atUnixMs;
+    state.fromHint = true;
+    state.notBeforeMs = 0;
+    ++adopted;
+  }
+  alarmsAdopted += adopted;
+  if (adopted) log("alarms-adopted", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" +
+          std::to_string(shard) + ",\"shardEpoch\":\"" + std::to_string(shardEpoch) + "\",\"alarms\":" +
+          std::to_string(adopted));
+}
+
+kj::Promise<void> DurableLog::alarmLoop() {
+  for (;;) {
+    co_await timer.afterDelay(200 * kj::MILLISECONDS);
+    if (!hooks.fireAlarm) continue;
+    const auto now = realClockUnixMs();
+    const auto mono = monotonicTimeMs();
+    std::vector<std::string> due;
+    for (const auto& [key, state] : alarms) {
+      if (state.firing || !state.atUnixMs || state.atUnixMs > now || state.notBeforeMs > mono) continue;
+      due.push_back(key);
+    }
+    for (auto& key : due) tasks.add(fireAlarm(key));
+  }
+}
+
+kj::Promise<void> DurableLog::fireAlarm(std::string key) {
+  auto found = alarms.find(key);
+  if (found == alarms.end() || found->second.firing) co_return;
+  found->second.firing = true;
+  DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
+      found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
+      found->second.retries};
+  const auto started = monotonicTimeMs();
+  AlarmResult result;
+  try {
+    result = co_await hooks.fireAlarm(ask);
+  } catch (const kj::Exception& error) {
+    result = AlarmResult{AlarmOutcome::UNAVAILABLE, 0, std::string(error.getDescription().cStr())};
+  }
+  // Counted from the outcome, before the schedule is looked at again: the object's own clearing of its alarm is
+  // reported as soon as the handler's transaction is confirmed, which is usually before this answer arrives.
+  switch (result.outcome) {
+    case AlarmOutcome::FIRED: ++alarmsFired; break;
+    case AlarmOutcome::NOT_DUE: ++alarmsNotDue; break;
+    case AlarmOutcome::FAILED: ++alarmFailures; break;
+    case AlarmOutcome::UNAVAILABLE: break;
+  }
+  auto again = alarms.find(key);
+  const auto gone = again == alarms.end();
+  const auto fields = "\"namespaceId\":" + quote(ask.namespaceId) + ",\"objectId\":" + quote(ask.objectId.substr(0, 12)) +
+      ",\"facet\":" + std::to_string(ask.facetId) + ",\"atUnixMs\":" + std::to_string(ask.atUnixMs) +
+      ",\"elapsedMs\":" + std::to_string(monotonicTimeMs() - started);
+  if (gone) {
+    // Its schedule is gone (the object reported the clearing, or the shard left this node): the hint goes with it.
+    log(result.outcome == AlarmOutcome::FIRED ? "alarm-fired" : "alarm-done", fields + ",\"scheduled\":false");
+    if (result.outcome == AlarmOutcome::FIRED)
+      tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+    co_return;
+  }
+  auto& state = again->second;
+  state.firing = false;
+  switch (result.outcome) {
+    case AlarmOutcome::FIRED: {
+      log("alarm-fired", fields + ",\"retries\":" + std::to_string(state.retries));
+      // The handler cleared the object's own alarm, and the report of that clears the schedule. A report that did
+      // not come (the object went away with the answer in flight) leaves this entry behind, so it goes now; the
+      // object's database is still the truth and reports again at its next open.
+      if (state.atUnixMs == ask.atUnixMs) {
+        alarms.erase(key);
+        tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+      }
+      co_return;
+    }
+    case AlarmOutcome::NOT_DUE: {
+      log("alarm-not-due", fields + ",\"holds\":" + std::to_string(result.atUnixMs));
+      state.fromHint = false;
+      if (result.atUnixMs == 0) {
+        alarms.erase(key);
+        tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+      } else {
+        state.atUnixMs = result.atUnixMs;
+        state.retries = 0;
+        state.countedRetries = 0;
+        state.backoff = 0;
+        state.notBeforeMs = 0;
+      }
+      co_return;
+    }
+    case AlarmOutcome::FAILED: {
+      ++alarmRetries;
+      ++state.retries;
+      if (state.countedRetries < ALARM_RETRY_MAX_TRIES) {
+        ++state.countedRetries;
+      } else {
+        state.backoff = std::min<uint32_t>(state.backoff + 1, ALARM_RETRY_BACKOFF_MAX);
+      }
+      const uint32_t steps = state.countedRetries >= ALARM_RETRY_MAX_TRIES
+          ? ALARM_RETRY_MAX_TRIES - 1 + state.backoff
+          : state.retries - 1;
+      const uint64_t seconds = uint64_t(ALARM_RETRY_START_SECONDS) << std::min<uint32_t>(steps, ALARM_RETRY_BACKOFF_MAX);
+      // A quarter of jitter, so the retries of many objects do not land together.
+      const auto jitter = seconds * 1000 / 4;
+      const uint64_t delay = seconds * 1000 - jitter / 2 + (jitter ? (randomBelow(jitter)) : 0);
+      state.notBeforeMs = monotonicTimeMs() + double(delay);
+      log("alarm-failed", fields + ",\"retries\":" + std::to_string(state.retries) + ",\"afterMs\":" +
+              std::to_string(delay) + ",\"reason\":" + quote(result.reason.substr(0, 200)));
+      co_return;
+    }
+    case AlarmOutcome::UNAVAILABLE: {
+      // Nothing ran: this node may not own the shard any more, or the object could not be rebuilt. Not counted
+      // against the retries; tried again shortly, and the shard's new owner has the hint either way.
+      state.notBeforeMs = monotonicTimeMs() + 1000;
+      log("alarm-unavailable", fields + ",\"reason\":" + quote(result.reason.substr(0, 200)));
+      co_return;
+    }
+  }
+}
+
+void DurableLog::shardTaken(const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch,
+    const std::string& tenant) {
+  if (!enabled()) return;
+  tasks.add(readAlarmHints(namespaceId, shard, shardEpoch, tenant));
+}
+
+// ---- What this machine's files are at, so the same boot reuses them ----
+// This machine's files are a cache, and v61 threw the cache away at the first request after a restart of the daemon
+// or of a durable process: the node kept "I have served this data epoch" in memory alone, so an object was rebuilt
+// from its whole history (a gibibyte took 19.5 s). The position beside the files says how far they are confirmed, so
+// a start that may trust the disk at all (the same boot, or a clean exit) trusts them and serves at once.
+std::filesystem::path DurableLog::positionPath(const std::string& storageId) const {
+  return durableDirectory() / (storageId + ".position");
+}
+
+void DurableLog::writePosition(const Object& object) {
+  if (object.state != ObjectState::LOCAL || object.storageId.empty()) return;
+  std::ostringstream out;
+  out << "{\"objectName\":" << quote(object.objectName) << ",\"namespaceId\":" << quote(object.namespaceId)
+      << ",\"objectId\":" << quote(object.objectId) << ",\"tenant\":" << quote(object.tenant)
+      << ",\"dataEpoch\":\"" << object.dataEpoch << "\",\"shardEpoch\":\"" << object.shardEpoch
+      << "\",\"shard\":" << object.shard << ",\"nodeId\":" << quote(settings.nodeId)
+      << ",\"snapshotSequence\":\"" << object.snapshotSequence << "\",\"snapshotAtUnixMs\":"
+      << object.snapshotAtUnixMs << ",\"sinceSnapshotBytes\":\"" << object.sinceSnapshotBytes
+      << "\",\"bytes\":\"" << object.bytes << "\",\"atUnixMs\":" << realClockUnixMs() << ",\"facets\":[";
+  bool first = true;
+  for (const auto& [facetId, facet] : object.facets) {
+    out << (first ? "" : ",") << "{\"facetId\":" << facetId << ",\"parentFacetId\":" << facet.parentFacetId
+        << ",\"facetName\":" << quote(facet.facetName) << ",\"txn\":\"" << facet.txn << "\",\"generation\":\""
+        << facet.generation << "\",\"lastSeq\":\"" << facet.lastSeq << "\",\"checkpointedSeq\":\""
+        << facet.checkpointedSeq << "\",\"lastFrame\":" << facet.lastFrame << ",\"salt1\":" << facet.salt1
+        << ",\"salt2\":" << facet.salt2 << ",\"databaseBytes\":\"" << facet.databaseBytes << "\"}";
+    first = false;
+  }
+  out << "]}\n";
+  const auto path = positionPath(object.storageId);
+  const auto temporary = std::filesystem::path(path.string() + ".new");
+  const auto bytes = out.str();
+  const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return;
+  size_t done = 0;
+  while (done < bytes.size()) {
+    const auto written = ::write(fd, bytes.data() + done, bytes.size() - done);
+    if (written <= 0) break;
+    done += size_t(written);
+  }
+  ::close(fd);
+  std::error_code code;
+  if (done == bytes.size()) {
+    std::filesystem::rename(temporary, path, code);
+    ++positionWrites;
+  } else {
+    std::filesystem::remove(temporary, code);
+  }
+}
+
+void DurableLog::readPositions() {
+  std::error_code code;
+  uint64_t restored = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(durableDirectory(), code)) {
+    if (entry.path().extension() != ".position") continue;
+    std::string bytes;
+    try {
+      bytes = readFile(entry.path());
+    } catch (const kj::Exception&) {
+      continue;
+    }
+    try {
+      capnp::MallocMessageBuilder message;
+      auto value = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
+      auto reader = value.asReader();
+      const auto objectName = json::text(reader, "objectName");
+      const auto namespaceId = json::text(reader, "namespaceId");
+      const auto objectId = json::text(reader, "objectId");
+      if (objectName.empty() || namespaceId.size() != 64 || objectId.size() != 64) continue;
+      auto& object = objects[objectName];
+      // What this node's own log held wins: readOwnLog() has already put the records no segment covers back into
+      // the files and cut their WAL back, and it names the facets it touched.
+      const bool known = !object.objectName.empty();
+      object.objectName = objectName;
+      object.namespaceId = namespaceId;
+      object.objectId = objectId;
+      object.tenant = json::text(reader, "tenant");
+      object.dataEpoch = decimal(json::text(reader, "dataEpoch"));
+      object.shardEpoch = decimal(json::text(reader, "shardEpoch"));
+      object.shard = uint32_t(numberField(reader, "shard"));
+      object.storageId = durableHostId(settings.hostUniqueKey, objectName);
+      object.snapshotSequence = decimal(json::text(reader, "snapshotSequence"));
+      object.snapshotAtUnixMs = uint64_t(numberField(reader, "snapshotAtUnixMs"));
+      object.sinceSnapshotBytes = decimal(json::text(reader, "sinceSnapshotBytes"));
+      object.bytes = decimal(json::text(reader, "bytes"));
+      object.state = ObjectState::LOCAL;
+      auto facetList = json::field(reader, "facets");
+      if (!facetList.isArray()) continue;
+      for (auto facet : facetList.getArray()) {
+        const auto facetId = uint32_t(numberField(facet, "facetId"));
+        auto& held = object.facets[facetId];
+        const bool seen = held.facetId == facetId && known;
+        held.facetId = facetId;
+        held.parentFacetId = uint32_t(numberField(facet, "parentFacetId"));
+        held.facetName = json::text(facet, "facetName");
+        held.databaseBytes = decimal(json::text(facet, "databaseBytes"));
+        if (seen) continue;
+        held.txn = decimal(json::text(facet, "txn"));
+        held.generation = decimal(json::text(facet, "generation"));
+        held.lastSeq = decimal(json::text(facet, "lastSeq"));
+        held.checkpointedSeq = decimal(json::text(facet, "checkpointedSeq"));
+        held.lastFrame = uint32_t(numberField(facet, "lastFrame"));
+        held.salt1 = uint32_t(numberField(facet, "salt1"));
+        held.salt2 = uint32_t(numberField(facet, "salt2"));
+      }
+      ++restored;
+    } catch (const kj::Exception&) {
+      continue;
+    }
+  }
+  positionsReused += restored;
+  if (restored) log("positions-reused", "\"objects\":" + std::to_string(restored));
+}
+
+// ---- Durable Object storage per tenant (the durableObjectBytes quota) ----
+// Whether a namespace still counts: a deleted class's or a deleted database's objects are not served any more.
+bool DurableLog::namespaceCounts(const std::string& namespaceId) const {
+  return !hooks.namespaceActive || hooks.namespaceActive(namespaceId);
+}
+
+uint64_t DurableLog::tenantBytesHere(const std::string& tenant) const {
+  uint64_t bytes = 0;
+  for (const auto& [name, object] : objects) {
+    if (object.tenant != tenant || object.state == ObjectState::GONE) continue;
+    if (!namespaceCounts(object.namespaceId)) continue;
+    bytes += object.bytes;
+  }
+  return bytes;
+}
+
+uint64_t DurableLog::tenantBytes(const std::string& tenant) const {
+  uint64_t bytes = tenantBytesHere(tenant);
+  for (const auto& [nodeId, tenants] : publishedBytes) {
+    if (nodeId == settings.nodeId) continue;
+    const auto found = tenants.find(tenant);
+    if (found != tenants.end()) bytes += found->second;
+  }
+  return bytes;
+}
+
+std::string DurableLog::namespacesJson(const std::string& tenant) const {
+  std::map<std::string, std::pair<uint64_t, uint64_t>> byNamespace;  // objects, bytes
+  std::map<std::string, std::set<uint32_t>> shardsOf;
+  for (const auto& [name, object] : objects) {
+    if (!tenant.empty() && object.tenant != tenant) continue;
+    if (object.state == ObjectState::GONE) continue;
+    auto& entry = byNamespace[object.namespaceId];
+    ++entry.first;
+    entry.second += object.bytes;
+    shardsOf[object.namespaceId].insert(object.shard);
+  }
+  std::ostringstream out;
+  out << "{\"atUnixMs\":" << realClockUnixMs() << ",\"namespaces\":[";
+  bool first = true;
+  for (const auto& [namespaceId, entry] : byNamespace) {
+    out << (first ? "" : ",") << "{\"namespaceId\":" << quote(namespaceId) << ",\"objects\":" << entry.first
+        << ",\"bytes\":\"" << entry.second << "\",\"shards\":[";
+    bool firstShard = true;
+    for (const auto shard : shardsOf[namespaceId]) {
+      out << (firstShard ? "" : ",") << shard;
+      firstShard = false;
+    }
+    out << "]}";
+    first = false;
+  }
+  out << "]}";
+  return out.str();
+}
+
+kj::Promise<void> DurableLog::usageLoop() {
+  for (;;) {
+    try {
+      co_await publishUsage();
+      co_await readUsage();
+    } catch (const kj::Exception& error) {
+      log("usage-failed", "\"error\":" + quote(std::string(error.getDescription().cStr())));
+    }
+    co_await timer.afterDelay(std::max<uint32_t>(settings.config.usagePublishMs, 1000) * kj::MILLISECONDS);
+  }
+}
+
+kj::Promise<void> DurableLog::publishUsage() {
+  if (!enabled()) co_return;
+  std::map<std::string, uint64_t> mine;
+  for (const auto& [name, object] : objects) {
+    if (object.tenant.empty() || object.state == ObjectState::GONE) continue;
+    if (!namespaceCounts(object.namespaceId)) continue;
+    mine[object.tenant] += object.bytes;
+  }
+  std::ostringstream out;
+  out << "{\"nodeId\":" << quote(settings.nodeId) << ",\"atUnixMs\":" << realClockUnixMs() << ",\"tenants\":{";
+  bool first = true;
+  for (const auto& [tenant, bytes] : mine) {
+    out << (first ? "" : ",") << quote(tenant) << ":\"" << bytes << "\"";
+    first = false;
+  }
+  out << "}}\n";
+  try {
+    co_await store->put(nodeDurableUsageKey(settings.nodeId), out.str());
+    ++usagePublishes;
+    lastUsagePublishMs = monotonicTimeMs();
+    publishedBytes[settings.nodeId] = std::move(mine);
+  } catch (const kj::Exception& error) {
+    ++usagePublishFailures;
+    log("usage-publish-failed", "\"error\":" + quote(std::string(error.getDescription().cStr())));
+  }
+}
+
+kj::Promise<void> DurableLog::readUsage() {
+  if (!enabled()) co_return;
+  for (const auto& [nodeId, member] : membership.members) {
+    if (nodeId == settings.nodeId) continue;
+    try {
+      auto answer = co_await store->get(nodeDurableUsageKey(nodeId));
+      if (answer.status != 200) continue;
+      capnp::MallocMessageBuilder message;
+      auto value = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.bytes.data(), answer.bytes.size()), value);
+      auto reader = value.asReader();
+      std::map<std::string, uint64_t> theirs;
+      if (auto tenants = json::field(reader, "tenants"); tenants.isObject()) {
+        for (auto field : tenants.getObject()) {
+          if (!field.getValue().isString()) continue;
+          theirs[std::string(field.getName().cStr())] = decimal(std::string(field.getValue().getString().cStr()));
+        }
+      }
+      publishedBytes[nodeId] = std::move(theirs);
+      ++usageReads;
+    } catch (const kj::Exception&) {
+      continue;
+    }
+  }
+  lastUsageReadMs = monotonicTimeMs();
+}
+
 void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const std::string& reason) {
   uint32_t count = 0;
   for (auto& [name, object] : objects) {
@@ -2586,8 +3162,20 @@ void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const
     if (object.state == ObjectState::LOCAL || object.state == ObjectState::REPAIR) object.state = ObjectState::GONE;
     ++count;
   }
-  if (count) log("shard-gone", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
-          ",\"objects\":" + std::to_string(count) + ",\"reason\":" + quote(reason));
+  uint32_t droppedAlarms = 0;
+  for (auto it = alarms.begin(); it != alarms.end();) {
+    if (it->second.namespaceId == namespaceId && it->second.shard == shard && !it->second.firing) {
+      it = alarms.erase(it);
+      ++droppedAlarms;
+    } else {
+      ++it;
+    }
+  }
+  alarmsDropped += droppedAlarms;
+  if (count || droppedAlarms)
+    log("shard-gone", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+            ",\"objects\":" + std::to_string(count) + ",\"alarms\":" + std::to_string(droppedAlarms) +
+            ",\"reason\":" + quote(reason));
 }
 
 // ---- As a peer of other nodes ----
@@ -2868,12 +3456,95 @@ std::string DurableLog::json() const {
         << (channel.open ? "true" : "false") << ",\"messages\":" << channel.messages << ",\"frames\":"
         << channel.frames << ",\"bytes\":\"" << channel.bytes << "\"}";
   }
-  out << "],\"settings\":{\"confirmTimeoutMs\":" << settings.config.confirmTimeoutMs << ",\"recoverTimeoutMs\":"
+  // The resident objects of each durable process, as it reports them, and the alarms this node has to fire.
+  out << "],\"resident\":[";
+  first = true;
+  for (const auto& [processId, entry] : residency) {
+    if (!first) out << ",";
+    first = false;
+    out << "{\"processId\":" << quote(processId) << ",\"objects\":" << entry.resident << ",\"limit\":"
+        << entry.limit << ",\"evicted\":" << entry.evicted << ",\"woken\":" << entry.woken
+        << ",\"wakeMsTotal\":" << double(entry.wakeUsTotal) / 1000.0 << ",\"wakeMsMax\":"
+        << double(entry.wakeUsMax) / 1000.0 << ",\"wakeMsMean\":"
+        << (entry.wakes ? double(entry.wakeUsTotal) / double(entry.wakes) / 1000.0 : 0.0) << "}";
+  }
+  out << "],\"alarms\":{\"scheduled\":" << alarms.size() << ",\"set\":" << alarmsSet << ",\"cleared\":"
+      << alarmsCleared << ",\"fired\":" << alarmsFired << ",\"failed\":" << alarmFailures << ",\"retries\":"
+      << alarmRetries << ",\"notDue\":" << alarmsNotDue << ",\"adopted\":" << alarmsAdopted << ",\"dropped\":"
+      << alarmsDropped << ",\"hintWrites\":" << alarmHintWrites << ",\"hintFailures\":" << alarmHintFailures
+      << ",\"next\":[";
+  first = true;
+  {
+    std::vector<const AlarmState*> soonest;
+    for (const auto& [key, state] : alarms) soonest.push_back(&state);
+    std::sort(soonest.begin(), soonest.end(),
+        [](const AlarmState* a, const AlarmState* b) { return a->atUnixMs < b->atUnixMs; });
+    if (soonest.size() > 16) soonest.resize(16);
+    for (const auto* state : soonest) {
+      if (!first) out << ",";
+      first = false;
+      out << "{\"namespaceId\":" << quote(state->namespaceId.substr(0, 12)) << ",\"objectId\":"
+          << quote(state->objectId.substr(0, 12)) << ",\"facet\":" << state->facetId << ",\"shard\":"
+          << state->shard << ",\"atUnixMs\":" << state->atUnixMs << ",\"retries\":" << state->retries
+          << ",\"fromHint\":" << (state->fromHint ? "true" : "false") << "}";
+    }
+  }
+  // The namespaces this node owns shards of: how many objects it holds of each, their bytes and the shards.
+  out << "]},\"namespaces\":[";
+  first = true;
+  {
+    std::map<std::string, std::tuple<std::string, uint64_t, uint64_t>> byNamespace;  // tenant, objects, bytes
+    std::map<std::string, std::set<uint32_t>> shardsOf;
+    for (const auto& [name, object] : objects) {
+      if (object.state == ObjectState::GONE || !namespaceCounts(object.namespaceId)) continue;
+      auto& entry = byNamespace[object.namespaceId];
+      if (std::get<0>(entry).empty()) std::get<0>(entry) = object.tenant;
+      ++std::get<1>(entry);
+      std::get<2>(entry) += object.bytes;
+      shardsOf[object.namespaceId].insert(object.shard);
+    }
+    for (const auto& [namespaceId, entry] : byNamespace) {
+      if (!first) out << ",";
+      first = false;
+      out << "{\"namespaceId\":" << quote(namespaceId) << ",\"tenant\":" << quote(std::get<0>(entry))
+          << ",\"objects\":" << std::get<1>(entry) << ",\"bytes\":\"" << std::get<2>(entry) << "\",\"shards\":[";
+      bool firstShard = true;
+      for (const auto shard : shardsOf[namespaceId]) {
+        out << (firstShard ? "" : ",") << shard;
+        firstShard = false;
+      }
+      out << "]}";
+    }
+  }
+  // What the tenants' objects hold: this node's own, and every node's as they last published it.
+  out << "],\"storage\":{\"quotaRefusals\":" << quotaRefusals << ",\"publishes\":" << usagePublishes
+      << ",\"publishFailures\":" << usagePublishFailures << ",\"reads\":" << usageReads
+      << ",\"positionsReused\":" << positionsReused << ",\"positionWrites\":" << positionWrites
+      << ",\"tenants\":[";
+  first = true;
+  {
+    std::set<std::string> names;
+    for (const auto& [name, object] : objects) {
+      if (!object.tenant.empty()) names.insert(object.tenant);
+    }
+    for (const auto& [nodeId, tenants] : publishedBytes) {
+      for (const auto& [tenant, bytes] : tenants) names.insert(tenant);
+    }
+    for (const auto& tenant : names) {
+      if (!first) out << ",";
+      first = false;
+      out << "{\"tenant\":" << quote(tenant) << ",\"bytesHere\":\"" << tenantBytesHere(tenant)
+          << "\",\"bytes\":\"" << tenantBytes(tenant) << "\",\"quotaBytes\":\""
+          << (hooks.tenantQuotaBytes ? hooks.tenantQuotaBytes(tenant) : 0) << "\"}";
+    }
+  }
+  out << "]},\"settings\":{\"confirmTimeoutMs\":" << settings.config.confirmTimeoutMs << ",\"recoverTimeoutMs\":"
       << settings.config.recoverTimeoutMs << ",\"segmentIntervalMs\":" << settings.config.segmentIntervalMs
       << ",\"segmentBytes\":\"" << settings.config.segmentBytes << "\",\"snapshotBytes\":\""
       << settings.config.snapshotBytes << "\",\"objectBytes\":\"" << settings.config.objectBytes
       << "\",\"checkpointBytes\":\"" << settings.config.checkpointBytes << "\",\"recoverParallelism\":"
-      << settings.config.recoverParallelism << "}}";
+      << settings.config.recoverParallelism << ",\"residentObjects\":" << settings.config.residentObjects
+      << ",\"usagePublishMs\":" << settings.config.usagePublishMs << "}}";
   return out.str();
 }
 

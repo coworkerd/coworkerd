@@ -51,6 +51,12 @@ usage: cowctl <command> [options]              (in the project's directory)
   status                      the cluster's nodes, their processes and versions
   logs [--follow] [--since 10m|2h|<ISO time>|<unix ms>] [--limit N] [--json]
                               the Worker's console output from every node, merged by time
+  do list [--json]            the Worker's Durable Object namespaces
+  do inspect <class> [--json] one namespace: its shards, the owner of each shard taken, objects and bytes
+  d1 create <name> [--no-wait] | list | delete <name> [--yes] [--no-wait]
+     execute <name> --sql SQL [--param V]... [--json]
+                              the tenant's databases; execute sends one statement to the database. A created database
+                              is waited for until every node serves it (at most 15 s)
 
   administrator (the administrator's credential):
   tenant create <name> [--hostname HOST]... [--quota NAME=N]... [--default-cpu-ms N] [--default-memory-mib N]
@@ -224,7 +230,8 @@ async function call(config, method, path, { body, headers = {}, expect = [200] }
 // index's revision naming the change (its state's storage.appliedTenantsRevision, which /v1/status shows), at most 15 s.
 // A node that has not by then is named: the change is made, and it serves the change at its next read of the index.
 const WAIT_MS = 15000;
-async function waitForNodes(config, revision) {
+async function waitForNodes(config, revision, { quiet = false } = {}) {
+  const say = quiet ? () => {} : console.log;
   if (!(revision > 0)) return;
   const started = performance.now();
   let pending = [], nodes = [];
@@ -237,13 +244,13 @@ async function waitForNodes(config, revision) {
     }
     if (!pending.length) break;
     if (performance.now() - started >= WAIT_MS) {
-      console.log(`  not served yet by ${pending.map(n => n.nodeId).join(", ")} after ${WAIT_MS / 1000} s (the change is made; ` +
+      say(`  not served yet by ${pending.map(n => n.nodeId).join(", ")} after ${WAIT_MS / 1000} s (the change is made; ` +
         "a node serves it once it reads the tenant index again)");
       return;
     }
     await new Promise(done => setTimeout(done, 250));
   }
-  if (nodes.length) console.log(`  served by ${nodes.length} node${nodes.length === 1 ? "" : "s"} (tenant index revision ${revision}) ` +
+  if (nodes.length) say(`  served by ${nodes.length} node${nodes.length === 1 ? "" : "s"} (tenant index revision ${revision}) ` +
     `in ${((performance.now() - started) / 1000).toFixed(1)} s`);
 }
 
@@ -548,6 +555,116 @@ async function secret(args) {
   if (!options["no-wait"]) await waitForNodes(config, Number(answer.revision ?? 0));
 }
 
+// cowctl do list | do inspect <class>: the Worker's Durable Object namespaces, and one namespace's numbers (the
+// shards' owners come from the store, the objects and bytes from the nodes, so they are a summary of a moment).
+async function durable(args) {
+  const [operation, ...rest] = args;
+  if (!["list", "inspect"].includes(operation ?? "")) throw usage("do list | do inspect <class>");
+  const { options, positional } = parse(rest, { worker: "value", tenant: "value", json: "flag" });
+  const config = loadConfig(), tenant = tenantOf(options, config), worker = workerOf(options, config);
+  if (operation === "list") {
+    if (positional.length) throw usage("do list takes no arguments");
+    const answer = (await call(config, "GET", `${workerPath(tenant, worker)}/namespaces`)).json;
+    if (options.json) { console.log(JSON.stringify(answer, null, 2)); return; }
+    console.log(`${tenant}/${worker}: ${answer.namespaces.length} Durable Object namespace${answer.namespaces.length === 1 ? "" : "s"}`);
+    for (const space of answer.namespaces)
+      console.log(`  ${space.name.padEnd(24)} ${space.namespaceId.slice(0, 12)}  ${space.shards} shards  ${space.status}`);
+    return;
+  }
+  if (positional.length !== 1) throw usage("do inspect takes the class: cowctl do inspect <class>");
+  const [className] = positional;
+  const answer = (await call(config, "GET", `${workerPath(tenant, worker)}/namespaces/${encodeURIComponent(className)}`)).json;
+  if (options.json) { console.log(JSON.stringify(answer, null, 2)); return; }
+  console.log(`${tenant}/${worker} class ${answer.className}: namespace ${answer.namespaceId.slice(0, 12)}, ${answer.shards} shards, ${answer.status}`);
+  console.log(`  ${answer.objects} object${answer.objects === 1 ? "" : "s"}, ${bytesText(answer.bytes)} held` +
+    `${answer.approximate ? " (a summary of " + new Date(answer.atUnixMs).toISOString() + ", from " + answer.nodesAnswered + " of " + answer.nodes + " nodes)" : ""}`);
+  console.log(`  ${answer.shardsTaken} shard${answer.shardsTaken === 1 ? "" : "s"} taken` + (answer.problem ? `; problem: ${answer.problem}` : ""));
+  for (const owner of answer.owners)
+    console.log(`    shard ${String(owner.shard).padEnd(6)} ${owner.nodeId.padEnd(16)} epoch ${owner.epoch}${owner.released ? " (released)" : ""}`);
+}
+
+function bytesText(value) {
+  const bytes = Number(value ?? 0);
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let scaled = bytes / 1024, unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit++; }
+  return `${scaled.toFixed(scaled < 10 ? 2 : 1)} ${units[unit]}`;
+}
+
+// cowctl d1 create|list|delete|execute: the tenant's databases. `execute` goes through the HTTP SQL interface, which
+// takes D1's own request and gives D1's own answer.
+async function d1(args) {
+  const [operation, ...rest] = args;
+  if (!["create", "list", "delete", "execute"].includes(operation ?? ""))
+    throw usage("d1 create <name> | d1 list | d1 delete <name> | d1 execute <name> --sql SQL");
+  const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", param: "list",
+    "no-wait": "flag" });
+  const config = loadConfig(), tenant = tenantOf(options, config);
+  const show = (answer) => { console.log(JSON.stringify(answer, null, 2)); };
+  if (operation === "list") {
+    if (positional.length) throw usage("d1 list takes no arguments");
+    const answer = (await call(config, "GET", `${tenantPath(tenant)}/databases`)).json;
+    if (options.json) return show(answer);
+    console.log(`tenant ${tenant}: ${answer.databases.length} database${answer.databases.length === 1 ? "" : "s"}`);
+    for (const database of answer.databases)
+      console.log(`  ${database.name.padEnd(24)} ${database.namespaceId.slice(0, 12)}  ${database.status}`);
+    return;
+  }
+  if (positional.length !== 1) throw usage(`d1 ${operation} takes the database's name`);
+  const [name] = positional;
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw usage(`not a database name: ${name}`);
+  if (operation === "create") {
+    const answer = (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}`, { expect: [200, 201] })).json;
+    // A database is usable once every node has read it (the deployment poll), as a deployment is: waited for by
+    // asking the database itself, since the nodes read the tenant's manifest on their own poll.
+    if (!options["no-wait"]) {
+      await waitForNodes(config, Number(answer.revision ?? 0), { quiet: options.json });
+      const until = Date.now() + 15000;
+      for (;;) {
+        let served = false;
+        try {
+          await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
+            { body: JSON.stringify({ sql: "SELECT 1" }), headers: { "content-type": "application/json" } });
+          served = true;
+        } catch (error) {
+          if (!(error instanceof Failure)) throw error;
+        }
+        if (served) break;
+        if (Date.now() >= until) throw new Failure(`database ${tenant}/${name} was created but no node serves it yet`);
+        await new Promise((done) => setTimeout(done, 200));
+      }
+    }
+    if (options.json) return show(answer);
+    console.log(`database ${tenant}/${name}: namespace ${answer.database.namespaceId.slice(0, 12)}, ${answer.database.status}`);
+    console.log(`  bind it with d1_databases = [{ binding = "DB", database_name = "${name}" }] in the Wrangler configuration`);
+    return;
+  }
+  if (operation === "delete") {
+    if (!options.yes) {
+      const reply = await prompt(`delete database ${tenant}/${name}? its objects stop being reachable [y/N] `);
+      if (!/^y(es)?$/i.test(reply.trim())) throw new Failure("not deleted", { code: 1 });
+    }
+    const answer = (await call(config, "DELETE", `${tenantPath(tenant)}/databases/${name}`)).json;
+    if (!options["no-wait"]) await waitForNodes(config, Number(answer.revision ?? 0), { quiet: options.json });
+    if (options.json) return show(answer);
+    console.log(`database ${tenant}/${name}: ${answer.database.status}`);
+    return;
+  }
+  if (typeof options.sql !== "string" || !options.sql.trim()) throw usage("d1 execute takes --sql SQL");
+  const body = JSON.stringify({ sql: options.sql, params: options.param ?? [] });
+  const answer = (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
+    { body, headers: { "content-type": "application/json" } })).json;
+  if (options.json) return show(answer);
+  const one = Array.isArray(answer) ? answer[0] : answer;
+  if (!one?.success) throw new Failure(`the statement failed: ${one?.error ?? "no answer"}`);
+  const rows = Array.isArray(one.results) ? one.results : [];
+  console.log(`${rows.length} row${rows.length === 1 ? "" : "s"}; ${one.meta?.rows_read ?? 0} read, ` +
+    `${one.meta?.rows_written ?? 0} written, ${one.meta?.changes ?? 0} change${one.meta?.changes === 1 ? "" : "s"}`);
+  for (const row of rows.slice(0, 100)) console.log(`  ${JSON.stringify(row)}`);
+  if (rows.length > 100) console.log(`  ... ${rows.length - 100} more (--json for all of them)`);
+}
+
 async function status(args) {
   const { options, positional } = parse(args, { json: "flag" });
   if (positional.length) throw usage("status takes no arguments");
@@ -828,7 +945,8 @@ function prompt(question, { hidden = false } = {}) {
 }
 
 // ---- main -------------------------------------------------------------------------------------------------
-const COMMANDS = { init, deploy, versions, rollback, remove, secret, status, logs, tenant, credential, node, usage: usage_ };
+const COMMANDS = { init, deploy, versions, rollback, remove, secret, status, logs, tenant, credential, node, usage: usage_,
+  do: durable, d1 };
 async function main(argv) {
   const [command, ...args] = argv;
   if (!command || command === "--help" || command === "-h" || command === "help") { console.log(USAGE); return 0; }

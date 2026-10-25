@@ -41,6 +41,12 @@ Every request carries `Authorization: Bearer <credential>`. Answers are JSON, ap
 | `PUT .../workers/{w}/routes` | The tenant or the administrator | Replace the Worker's routes |
 | `GET .../workers/{w}/secrets`, `GET`, `PUT`, `DELETE .../secrets/{name}` | The tenant or the administrator | List names and lengths; show one; set, delete a value |
 | `GET .../workers/{w}/logs` | The tenant or the administrator | The Worker's recent log lines from every node, or a stream with `follow` |
+| `GET .../workers/{w}/namespaces` | The tenant or the administrator | The Worker's Durable Object namespaces by class: the namespace id, the shards, the status |
+| `GET .../workers/{w}/namespaces/{class}` | The tenant or the administrator | One namespace: the owner of each shard an epoch was taken for, and the objects and bytes the nodes report |
+| `DELETE .../workers/{w}/namespaces/{class}` | The tenant or the administrator | Mark the namespace deleting, as a version's `deleted_classes` does: no Binding to it and no new request; the data stays |
+| `POST /v1/tenants/{t}/databases/{d}`, `GET`, `DELETE` | The tenant or the administrator | Make, show and delete a database (D1's shape): a namespace of its own with one object |
+| `GET /v1/tenants/{t}/databases` | The tenant or the administrator | The tenant's databases |
+| `POST /v1/tenants/{t}/databases/{d}/query` | The tenant or the administrator | One or more SQL statements on the database, in D1's own request and answer |
 
 Below `/v1/tenants/{t}/`, a tenant that is being deleted accepts only reads: a write is refused with `409 CONFLICT` (`tenant <t> is being deleted`).
 
@@ -70,7 +76,8 @@ The control plane writes the desired state -- the tenant index, the tenants' man
 | `secrets`, `hostnames` | 1,000, 100 | By the control plane when a new secret is set or the hostnames change |
 | `logLinesPerSecond`, `logBufferBytes` | 100, 1 MiB | By every node, for the tenant's log lines |
 | `maxWorkerCpuMs`, `maxWorkerMemoryMiB` | 30,000, 512 | By the control plane when a Worker's limits or the tenant's default limits are set |
-| `durableObjectNamespaces` | 16 | By the control plane when an upload declares a Durable Object class that has no namespace yet (0.5, in development): every namespace of the tenant counts, those of deleted classes included |
+| `durableObjectNamespaces` | 16 | By the control plane when an upload declares a Durable Object class that has no namespace yet, or a database is made (0.5, in development): every namespace of the tenant counts, the databases and those of deleted classes included |
+| `durableObjectBytes` | 10737418240 | By the node that owns an object's shard, at the moment a write would be made durable: past it the write answers `422 QUOTA_EXCEEDED` and reads go on. What the tenant holds is what the nodes publish of their own objects (`nodes/<id>/durable-usage`, every `durableObjects.usagePublishMs`), so it bounds the storage rather than accounting for it; the objects of a deleted namespace or database stop counting |
 
 A change over a quota is refused with `422 QUOTA_EXCEEDED` and the quota's name at the start of the reason (`defaultLimits:` for default limits above the maxima), and nothing is written; a package larger than `packageBytes` or `control.maxUploadBytes` -- one of exactly that size is accepted -- is `413 PACKAGE_TOO_LARGE` instead unless the tenant's `packageBytes` is below `control.maxUploadBytes` -- so at the defaults, both 160 MiB, it is 413. The control plane checks these quotas when it admits a change; the log quotas refuse nothing: every node enforces them on the tenant's lines, dropping lines over the rate and the oldest lines over the buffer -- except that a node keeps the tenant's previous values when the buffer quota is larger than its own `logs.totalBufferBytes`. `workers` counts every Worker the tenant's manifest names, a removed one whose versions remain included, and a secret set for a Worker the tenant does not have yet makes one, so it is checked against `workers` too; lowering a maximum leaves Workers' own limits above it as they are, and is refused below the tenant's default limits.
 

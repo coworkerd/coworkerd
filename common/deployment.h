@@ -39,6 +39,9 @@ struct EnvironmentVariable { std::string name, type, value; };
 // Worker is not supported).
 struct DurableObjectBindingDefinition {
   std::string binding, className;
+  // A d1_databases Binding: the tenant's database it names. Its class is then the platform's own SQL Worker class
+  // (DATABASE_CLASS_NAME), which the version does not declare, and its namespace comes from the tenant's databases.
+  std::string database;
   bool operator==(const DurableObjectBindingDefinition&) const = default;
 };
 struct DurableObjectRename {
@@ -176,6 +179,15 @@ std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::s
 // A Durable Object namespace as the nodes use it: its id (32 random bytes, hexadecimal, made by the control plane),
 // status ("active", or "deleting": no new request and no Binding to it) and how many shards its objects fall into
 // (fixed when it was made; an object's shard is the first 8 bytes of its id, big-endian, modulo this number).
+// A tenant's database (the D1 shape, docs/compatibility.md section 7): a Durable Object namespace of its own whose
+// class is the platform's own SQL Worker, so a database is one object with one shard. It counts against the tenant's
+// durableObjectNamespaces quota like any other namespace.
+inline constexpr const char* DATABASE_CLASS_NAME = "__coworkerdSqlDatabase";
+// The Worker name a tenant's databases run under. A tenant's own Worker names never begin with an underscore, so
+// this one can never clash with one.
+inline constexpr const char* DATABASE_WORKER_NAME = "__databases";
+inline constexpr const char* DATABASE_OBJECT_NAME = "database";
+
 struct DurableObjectNamespace {
   std::string id, status = "active";
   uint32_t shards = 1024;
@@ -318,6 +330,18 @@ public:
   // A Worker's Durable Object namespaces by class (the <tenant>/namespaces/<worker> key: the tenant manifest's), or null.
   const std::map<std::string, DurableObjectNamespace>* namespaces(const std::string& workerId) const;
   const DurableObjectNamespace* durableNamespace(const std::string& workerId, const std::string& className) const;
+  // A tenant's databases by name (the <tenant>/databases key): each is a Durable Object namespace of its own whose
+  // class is the platform's SQL Worker (docs/compatibility.md, section 7).
+  const std::map<std::string, DurableObjectNamespace>* databases(const std::string& tenant) const;
+  const DurableObjectNamespace* database(const std::string& tenant, const std::string& name) const;
+  // Whose namespace this is: a Worker's class, or a tenant's database. None when no key names it.
+  struct NamespaceOwner {
+    std::string tenant, workerId, className, database, status;
+    uint32_t shards = 1024;
+    bool isDatabase() const { return !database.empty(); }
+    bool active() const { return status == "active"; }
+  };
+  std::optional<NamespaceOwner> namespaceOwner(const std::string& namespaceId) const;
 
 private:
   uint64_t revisionValue = 0;
@@ -328,6 +352,7 @@ private:
   std::map<std::string, Route> routeMap;              // key without "routes/"
   std::map<std::string, std::set<std::string>> workerRoutes;   // route value workerId -> keys
   std::map<std::string, std::set<std::string>> binders;        // target -> own-usable Workers binding it
+  std::map<std::string, std::map<std::string, DurableObjectNamespace>> databaseMap;  // tenant -> name -> namespace
   std::map<size_t, size_t> slotLengths;                        // prefix length -> slots
   std::map<size_t, size_t> closureSizes;                       // closure size -> valid Workers
   std::set<std::string> invalidWorkers, invalidRoutes, invalidDefinitions;

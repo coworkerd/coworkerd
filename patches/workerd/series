@@ -10,3 +10,4 @@
 0011-gc-pauses.patch
 0012-event-cpu-top-up.patch
 0013-durable-object-log.patch
+0014-durable-object-hibernation-alarms.patch

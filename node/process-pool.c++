@@ -1978,7 +1978,8 @@ public:
         "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
         << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
             p->egressToken + "\"),\n")
-        << (p->durable ? "(name = \"HOST\", durableObjectNamespace = \"Host\"),\n" : "") <<
+        << (p->durable ? "(name = \"HOST\", durableObjectNamespace = \"Host\"),\n"
+            "(name = \"SQL_CLASS\", durableObjectClass = (name = \"runtime\", entrypoint = \"SqlDatabase\")),\n" : "") <<
         "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
         << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
         << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\""
@@ -2088,6 +2089,7 @@ public:
       childEnvironment.push_back("COWORKERD_DO_WAL_FD=" + std::to_string(DURABLE_LOG_FD));
       childEnvironment.push_back("COWORKERD_DO_CONFIRM_TIMEOUT_MS=" + std::to_string(durableLog.confirmTimeoutMs));
       childEnvironment.push_back("COWORKERD_DO_CHECKPOINT_BYTES=" + std::to_string(durableLog.checkpointBytes));
+      childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.

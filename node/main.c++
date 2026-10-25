@@ -352,6 +352,14 @@ struct DurableTarget {
   uint16_t hops = 0;
   uint32_t shard = 0;
   uint64_t shardEpoch = 0, dataEpoch = 0;
+  // A tenant's database (the D1 shape): its tenant and name. The object's class is then the platform's own SQL
+  // Worker class, which the Host runs as the facet -- there is no tenant version and no code package.
+  std::string tenant, database;
+  // This request is the object's alarm, scheduled for this time (Unix milliseconds); 0 otherwise, with how many
+  // times its handler has already been tried.
+  uint64_t alarmAtUnixMs = 0;
+  uint32_t alarmRetryCount = 0;
+  bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
 // More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
@@ -1515,6 +1523,22 @@ public:
     if (auto at = found->second.inFlight.find(hops); at != found->second.inFlight.end()) found->second.inFlight.erase(at);
     found->second.lastAt = monotonicTimeMs();
   }
+  // A tenant's database by name, as the deployment state holds it (null when it has none).
+  const coworkerd::DurableObjectNamespace* database(const std::string& tenant, const std::string& name) const {
+    return desiredState.state().database(tenant, name);
+  }
+  const std::map<std::string, coworkerd::DurableObjectNamespace>* databases(const std::string& tenant) const {
+    return desiredState.state().databases(tenant);
+  }
+  // Whose namespace this is: a Worker's class, or a tenant's database (none when no key names it).
+  std::optional<coworkerd::DeploymentState::NamespaceOwner> namespaceOwner(const std::string& namespaceId) const {
+    return desiredState.state().namespaceOwner(namespaceId);
+  }
+  // The tenant's quotas as its record holds them (the defaults when it has none).
+  coworkerd::TenantQuotas tenantQuotas(const std::string& tenant) const {
+    const auto* record = tenants ? tenants->tenant(tenant) : nullptr;
+    return record ? record->quotas : coworkerd::TenantQuotas{};
+  }
   // How many shards the class's namespace has (fixed when it was made).
   uint32_t durableShardCount(const std::string& workerId, const std::string& className) const {
     const auto* space = desiredState.state().durableNamespace(workerId, className);
@@ -1542,6 +1566,28 @@ public:
     }
     return worker->version;
   }
+  // The "version" a request to a database's object runs. A database's class is the platform's own SQL Worker class,
+  // which the Host takes from its SQL_CLASS Binding: there is no tenant code and no package, so this definition
+  // carries only the identity the node's accounting, its leases and the runtime's descriptor need. Its Worker name
+  // cannot be a tenant's (a Worker name never begins with an underscore), so the databases of a tenant have their
+  // own lines, their own usage rows and their own admission.
+  std::shared_ptr<const VersionDefinition> databaseVersion(const std::string& tenant) const {
+    auto found = databaseVersions.find(tenant);
+    if (found != databaseVersions.end()) return found->second;
+    auto version = std::make_shared<VersionDefinition>();
+    version->workerId = tenant + "/" + coworkerd::DATABASE_WORKER_NAME;
+    version->versionId = "databases";
+    version->compatibilityDate = "2026-08-27";
+    version->format = "v2";
+    // Not a content hash of anything: no package is ever fetched for it. It is the identity of "this tenant's
+    // databases" and must be the same on every node, so it is derived from the name alone.
+    version->contentHash = coworkerd::sha256Hex(version->workerId + "/databases/content");
+    version->definitionHash = coworkerd::sha256Hex(version->workerId + "/databases/definition");
+    version->declaredClasses.push_back(coworkerd::DATABASE_CLASS_NAME);
+    databaseVersions.emplace(tenant, version);
+    return version;
+  }
+
   // A request to an object, on the object's durable process: from a stateless Worker a child of its call tree
   // (`allocation`, charged to its budget as a Binding call is), from an object the root of a new call tree.
   OpenEvent openDurable(std::shared_ptr<const VersionDefinition> version, const DurableTarget& target,
@@ -2284,6 +2330,19 @@ private:
         const auto& binding = version.durableObjects[i];
         namespaces[i].setName(binding.binding.c_str());
         namespaces[i].setClassName(binding.className.c_str());
+        // A database Binding names one of the tenant's databases: its namespace is the database's, and the one
+        // object it holds is named "database" in it (the id is computed here, so the runtime needs no hash for it).
+        if (!binding.database.empty()) {
+          const auto* space = desiredState.state().database(coworkerd::tenantOf(version.workerId), binding.database);
+          const bool usable = space != nullptr && space->status == "active";
+          namespaces[i].setDatabase(binding.database.c_str());
+          namespaces[i].setNamespaceId(usable ? space->id.c_str() : "");
+          if (usable) {
+            namespaces[i].setObjectId(
+                coworkerd::durableObjectIdFromName(space->id, coworkerd::DATABASE_OBJECT_NAME).c_str());
+          }
+          continue;
+        }
         const auto* space = desiredState.state().durableNamespace(version.workerId, binding.className);
         namespaces[i].setNamespaceId(space && space->status == "active" ? space->id.c_str() : "");
       }
@@ -2299,6 +2358,9 @@ private:
       target.setShard(durable->shard);
       target.setShardEpoch(durable->shardEpoch);
       target.setDataEpoch(durable->dataEpoch);
+      target.setDatabase(durable->database.c_str());
+      target.setAlarmAtUnixMs(durable->alarmAtUnixMs);
+      target.setAlarmRetryCount(durable->alarmRetryCount);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       return json.encode(descriptor.asReader());
@@ -2437,6 +2499,8 @@ private:
   uint64_t versionUnavailableRejections = 0;
   uint64_t secretUnavailableRejections = 0;
   mutable std::map<coworkerd::DeploymentState::Selection::Kind, uint64_t> routeRejections;
+  // The synthetic definition of each tenant's databases (databaseVersion), made once.
+  mutable std::map<std::string, std::shared_ptr<const VersionDefinition>> databaseVersions;
   std::map<std::string, std::array<AssetCounters, 3>> assetStats;
   static std::string assetCountersJson(const AssetCounters& c) {
     return "{\"requests\":" + std::to_string(c.requests) + ",\"hits\":" + std::to_string(c.hits) +
@@ -3622,6 +3686,10 @@ public:
       remote.setCallerObjectId(invocation.callerObjectId.c_str());
       remote.setIngressServerId(config.serverId.c_str());
     }
+    // A database's object, and the firing of an object's alarm, whoever the caller is.
+    remote.setDatabase(target.database.c_str());
+    remote.setAlarmAtUnixMs(target.alarmAtUnixMs);
+    remote.setAlarmRetryCount(target.alarmRetryCount);
     const auto remaining = std::max(0.0, deadline - monotonicTimeMs());
     if (remaining == 0) {
       server.rejectExpiredLease("lease expired before forwarding");
@@ -4393,6 +4461,49 @@ private:
   const kj::HttpHeaderTable& headerTable;
 };
 
+// An answer the node collects for itself: a request it makes of an object (an alarm, a SQL statement) has no client
+// to relay to, so the status and the body are kept here.
+class CollectedResponse final: public kj::HttpService::Response {
+public:
+  kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    this->status = status;
+    return kj::heap<Collector>(body);
+  }
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+    KJ_FAIL_REQUIRE("this request cannot become a connection");
+  }
+  uint status = 0;
+  std::string body;
+
+private:
+  class Collector final: public kj::AsyncOutputStream {
+  public:
+    explicit Collector(std::string& into): into(into) {}
+    kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
+      if (into.size() < BODY_LIMIT) into.append(reinterpret_cast<const char*>(buffer.begin()), buffer.size());
+      return kj::READY_NOW;
+    }
+    kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+      for (auto& piece : pieces) {
+        if (into.size() >= BODY_LIMIT) break;
+        into.append(reinterpret_cast<const char*>(piece.begin()), piece.size());
+      }
+      return kj::READY_NOW;
+    }
+    kj::Promise<void> whenWriteDisconnected() override { return kj::Promise<void>(kj::NEVER_DONE); }
+
+  private:
+    static constexpr size_t BODY_LIMIT = 8u << 20;
+    std::string& into;
+  };
+};
+
+// One SQL statement on a tenant's database, defined with the other requests the node makes of an object (below).
+kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
+    std::string database, std::string body);
+
 class PeerRpcService final: public kj::HttpService {
 public:
   PeerRpcService(
@@ -4408,7 +4519,7 @@ public:
       : server(server), headerTable(headerTable),
         rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
             server, peerForwarder, durable, durableLog, factory, headerTable))), trial(kj::mv(trial)), logs(logs), state(kj::mv(state)),
-        peerAuth(peerAuth), controlPlane(controlPlane) {}
+        peerAuth(peerAuth), controlPlane(controlPlane), durable(durable), factory(factory) {}
 
   // Besides the Cap'n Proto CONNECT, the peer listener (the address a member
   // advertises) answers the deployment tool's trial loads, and the control
@@ -4465,6 +4576,11 @@ public:
         return sendJson(response, 413, "Payload Too Large", "{\"ok\":false,\"reason\":\"an announcement is at most 16 KiB\"}");
       });
     }
+    // One SQL statement on a tenant's database, as the control plane forwards it (POST
+    // /v1/tenants/{t}/databases/{d}/query): sent on to the shard's owner like any request to an object.
+    if (std::string_view(url.cStr()).starts_with("/__coworkerd/databases/") && method == kj::HttpMethod::POST) {
+      return sqlQuery(url, body, response);
+    }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
       auto text = kj::heap<std::string>(state());
       kj::HttpHeaders headers(headerTable);
@@ -4474,6 +4590,44 @@ public:
       return write.attach(kj::mv(stream), kj::mv(text));
     }
     return response.sendError(404, "Cap'n Proto CONNECT required", headerTable);
+  }
+
+  // POST /__coworkerd/databases/<tenant>/<database>/query, with the management token: the statement's body goes to
+  // the database's object (the control plane has already checked the caller's credential and the tenant).
+  kj::Promise<void> sqlQuery(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
+    constexpr uint64_t LIMIT = 1u << 20;
+    std::string path(url.cStr());
+    path = path.substr(std::string("/__coworkerd/databases/").size());
+    if (!path.ends_with("/query")) {
+      co_await sendJson(response, 404, "Not Found",
+          "{\"code\":\"NOT_FOUND\",\"reason\":\"POST /__coworkerd/databases/<tenant>/<database>/query\"}");
+      co_return;
+    }
+    path.resize(path.size() - std::string("/query").size());
+    const auto slash = path.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 == path.size()) {
+      co_await sendJson(response, 400, "Bad Request",
+          "{\"code\":\"INVALID_REQUEST\",\"reason\":\"the path names a tenant and a database\"}");
+      co_return;
+    }
+    const auto tenant = path.substr(0, slash), database = path.substr(slash + 1);
+    if (!coworkerd::tenantName(tenant) || !coworkerd::tenantName(database)) {
+      co_await sendJson(response, 400, "Bad Request",
+          "{\"code\":\"INVALID_REQUEST\",\"reason\":\"a tenant and a database are named [a-z0-9][a-z0-9-]{0,62}\"}");
+      co_return;
+    }
+    auto text = co_await body.readAllText(LIMIT + 1);
+    if (text.size() > LIMIT) {
+      co_await sendJson(response, 413, "Payload Too Large",
+          "{\"code\":\"REQUEST_TOO_LARGE\",\"reason\":\"a statement is at most 1 MiB\"}");
+      co_return;
+    }
+    auto answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
+        std::string(text.cStr(), text.size()));
+    co_await sendJson(response, answer.status ? answer.status : 503,
+        answer.status == 200 ? "OK" : "Error",
+        answer.body.empty() ? std::string("{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the database answered nothing\"}")
+                            : std::move(answer.body));
   }
 
   kj::Promise<void> connect(
@@ -4506,6 +4660,8 @@ private:
   kj::Function<std::string()> state;
   coworkerd::PeerAuth& peerAuth;
   ControlPlaneAddresses& controlPlane;
+  DurableDispatch& durable;
+  capnp::HttpOverCapnpFactory& factory;
 };
 
 // The path of a request target, origin-form ("/a?b") or absolute
@@ -4927,15 +5083,20 @@ private:
       reason = "more than " + std::to_string(MAX_DURABLE_HOPS) + " Durable Object calls in a row (an object calling an object, ...)";
       return nullptr;
     }
-    auto version = server.durableVersion(request.workerId, target, code, reason);
+    auto version = target.isDatabase() ? server.databaseVersion(target.tenant)
+                                       : server.durableVersion(request.workerId, target, code, reason);
     if (!version) return nullptr;
+    line.workerId = version->workerId;
     line.versionId = version->versionId;
-    if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(request.workerId)); !unavailable.empty()) {
+    if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(version->workerId)); !unavailable.empty()) {
       code = "TENANT_UNAVAILABLE";
       reason = unavailable;
       return nullptr;
     }
-    target.shard = coworkerd::durableShardOf(target.objectId, server.durableShardCount(request.workerId, target.className));
+    // A database is one object with one shard; a Worker's namespace has the shards it was made with.
+    target.shard = target.isDatabase()
+        ? 0u
+        : coworkerd::durableShardOf(target.objectId, server.durableShardCount(request.workerId, target.className));
     return version;
   }
 
@@ -4954,8 +5115,8 @@ private:
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
-    auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId, target.dataEpoch,
-        target.shardEpoch, target.shard});
+    auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
+        coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard});
     if (!ready.ready) {
       line.recovered = ready.elapsedMs;
       co_return refused(server.refusal(ready.code, ready.reason, ready.status));
@@ -4966,12 +5127,16 @@ private:
     auto slot = server.reserve(false);
     slot->durable = true;
     slot->timing = request.timing;
-    auto unavailable = co_await server.ensureCode(*version, deadline);
-    if (!unavailable.empty()) {
-      server.rejectVersionUnavailable(unavailable);
-      co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409));
+    // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
+    // and no secret to look for.
+    if (!target.isDatabase()) {
+      auto unavailable = co_await server.ensureCode(*version, deadline);
+      if (!unavailable.empty()) {
+        server.rejectVersionUnavailable(unavailable);
+        co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409));
+      }
+      if (auto missing = server.secretRefusal(*version, false)) co_return refused(*missing);
     }
-    if (auto missing = server.secretRefusal(*version, false)) co_return refused(*missing);
     // A call another node sent carries no lock table: its lease names the object's version here.
     if (request.allocation && !request.allocation->pins)
       request.allocation->pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
@@ -5031,6 +5196,109 @@ private:
   const kj::HttpHeaderTable& headerTable;
 };
 
+// One request the node makes of an object itself, through the ordinary dispatch: the shard's owner runs it, which
+// may be another node. There is no caller's call tree, so it opens one of its own, as an object's call does.
+kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOverCapnpFactory& factory,
+    const kj::HttpHeaderTable& headerTable, DurableDispatch::Request request, kj::StringPtr path, std::string body) {
+  auto dispatched = co_await durable.dispatch(std::move(request));
+  auto ready = kj::mv(dispatched.ready).eagerlyEvaluate([](kj::Exception&&) {});
+  auto getHttp = dispatched.dispatcher.getHttpServiceRequest().send();
+  auto service = factory.capnpToKj(getHttp.getHttp());
+  auto held = kj::heap<std::string>(std::move(body));
+  kj::HttpHeaders headers(headerTable);
+  headers.set(kj::HttpHeaderId::HOST, "coworkerd-node");
+  headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+  auto pipe = kj::newOneWayPipe(held->size());
+  auto upload = pipe.out->write(kj::arrayPtr(held->data(), held->size()).asBytes())
+                    .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; });
+  CollectedResponse collected;
+  co_await kj::joinPromisesFailFast(kj::arr(kj::mv(upload),
+      service->request(kj::HttpMethod::POST, path, headers, *pipe.in, collected)));
+  co_return kj::mv(collected);
+}
+
+// The path the runtime answers for an alarm, and for one SQL statement on a database's object.
+// Absolute: the runtime remakes the request for the object's facet, and a Request is made from a full URL.
+constexpr const char* DURABLE_ALARM_PATH = "http://coworkerd-node/__coworkerd/durable-alarm";
+// The object answers D1's own protocol, so a statement from the control plane goes to /query like one from a
+// d1_databases Binding does (src/cloudflare/internal/d1-api.ts).
+constexpr const char* DURABLE_QUERY_PATH = "http://coworkerd-node/query?resultsFormat=ARRAY_OF_OBJECTS";
+
+// Fires one object's alarm. The firing is a request to the object like any other: its Worker's active version and
+// class, admission, the CPU topped up for the event, a lease of its own, its lines kept and one [do] line. The
+// answer says what the object's own database held -- that is the truth, so a schedule that has fallen behind it
+// fires nothing and is corrected instead.
+kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, ServerCore& server,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, coworkerd::DurableAlarm alarm) {
+  auto owner = server.namespaceOwner(alarm.namespaceId);
+  if (!owner) {
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
+        "no Worker class or database of this cluster names that namespace"};
+  }
+  DurableDispatch::Request request;
+  request.workerId = owner->isDatabase()
+      ? owner->tenant + "/" + coworkerd::DATABASE_WORKER_NAME
+      : owner->workerId;
+  request.target.namespaceId = alarm.namespaceId;
+  request.target.objectId = alarm.objectId;
+  request.target.className = owner->className;
+  request.target.tenant = owner->tenant;
+  request.target.database = owner->database;
+  request.target.alarmAtUnixMs = alarm.atUnixMs;
+  request.target.alarmRetryCount = alarm.retryCount;
+  CollectedResponse answer;
+  try {
+    answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
+  } catch (const kj::Exception& error) {
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
+        std::string(error.getDescription().cStr())};
+  }
+  // The runtime answers {"outcome":"fired"|"notDue"|"failed","atUnixMs":N,"reason":...}; anything else is a refusal
+  // of the dispatch (no owner, the object being rebuilt, a limit) and counts against nothing.
+  std::string outcome, reason;
+  uint64_t atUnixMs = 0;
+  try {
+    capnp::MallocMessageBuilder message;
+    auto value = message.initRoot<capnp::JsonValue>();
+    capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.body.data(), answer.body.size()), value);
+    auto reader = value.asReader();
+    if (auto field = coworkerd::json::field(reader, "outcome"); field.isString()) outcome = field.getString().cStr();
+    if (auto field = coworkerd::json::field(reader, "reason"); field.isString()) reason = field.getString().cStr();
+    if (auto field = coworkerd::json::field(reader, "atUnixMs"); field.isNumber() && field.getNumber() > 0)
+      atUnixMs = uint64_t(field.getNumber());
+  } catch (const kj::Exception&) {
+    outcome.clear();
+  }
+  if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
+  if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
+  if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
+  co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
+      reason.empty() ? "the object answered " + std::to_string(answer.status) : reason};
+}
+
+// One SQL statement on a database's object (POST /v1/tenants/{t}/databases/{d}/query, forwarded by the control
+// plane to any node, which sends it on to the shard's owner).
+kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
+    std::string database, std::string body) {
+  CollectedResponse refusal;
+  const auto* space = server.database(tenant, database);
+  if (space == nullptr || space->status != "active") {
+    refusal.status = 404;
+    refusal.body = std::string("{\"code\":\"NOT_FOUND\",\"reason\":\"tenant ") + tenant + " has no database " +
+        database + (space != nullptr ? " (it is being deleted)" : "") + "\"}";
+    co_return kj::mv(refusal);
+  }
+  DurableDispatch::Request request;
+  request.workerId = tenant + "/" + coworkerd::DATABASE_WORKER_NAME;
+  request.target.namespaceId = space->id;
+  request.target.objectId = coworkerd::durableObjectIdFromName(space->id, coworkerd::DATABASE_OBJECT_NAME);
+  request.target.className = coworkerd::DATABASE_CLASS_NAME;
+  request.target.tenant = tenant;
+  request.target.database = database;
+  co_return co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_QUERY_PATH, std::move(body));
+}
+
 // A request to an object whose shard this node is expected to own (or to take): the fields checked as an invocation
 // from another node is, the caller's call tree rebuilt from what it carries, then DurableDispatch::receive.
 kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContext context) {
@@ -5042,6 +5310,15 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   DurableDispatch::Request request;
   request.workerId = remote.getWorkerId().cStr();
   request.target = {remote.getNamespaceId().cStr(), remote.getObjectId().cStr(), remote.getClassName().cStr(), remote.getHops()};
+  request.target.database = remote.getDatabase().cStr();
+  request.target.alarmAtUnixMs = remote.getAlarmAtUnixMs();
+  request.target.alarmRetryCount = remote.getAlarmRetryCount();
+  if (!request.target.database.empty()) {
+    request.target.tenant = coworkerd::tenantOf(request.workerId);
+    KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&
+            request.target.className == coworkerd::DATABASE_CLASS_NAME,
+        "invalid remote database call: the database's name or class");
+  }
   const std::string origin = remote.getOriginServerId().cStr(), treeId = remote.getTreeId().cStr();
   KJ_REQUIRE(coworkerd::workerFullName(request.workerId), "invalid remote Durable Object call: workerId");
   KJ_REQUIRE(validSha256(request.target.namespaceId) && validSha256(request.target.objectId) &&
@@ -5131,6 +5408,18 @@ public:
       request.workerId = workerId;
       request.timing = timing;
       request.target = {call.getNamespaceId().cStr(), call.getObjectId().cStr(), call.getClassName().cStr(), 0};
+      // A d1_databases Binding's call: the database is the tenant's, and its class is the platform's own -- the
+      // calling Worker's version declares nothing for it, so the dispatch takes its own path (databaseVersion).
+      request.target.database = call.getDatabase().cStr();
+      if (!request.target.database.empty()) {
+        request.target.tenant = coworkerd::tenantOf(workerId);
+        KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&
+                request.target.className == coworkerd::DATABASE_CLASS_NAME,
+            "invalid database call: the database's name or class");
+        const auto* space = server.database(request.target.tenant, request.target.database);
+        KJ_REQUIRE(space != nullptr && space->id == request.target.namespaceId,
+            "invalid database call: the Binding names another namespace");
+      }
       const std::string callerNamespace = call.getCallerNamespaceId().cStr(), callerObject = call.getCallerObjectId().cStr();
       KJ_REQUIRE(coworkerd::workerFullName(workerId) && safeName(versionId) && validSha256(contentHash) && validSha256(definitionHash),
           "invalid Durable Object call: the calling version");
@@ -7152,7 +7441,25 @@ int run(Launch launch) {
   shards.onShardGone([&durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
     durableLog.shardGone(namespaceId, shard, reason);
   });
+  // A shard taken: the alarms its objects had scheduled are read from their hints, so the node that lost it does not
+  // take its objects' alarms with it (node/durable-log.h).
+  shards.onShardTaken([&durableLog, &server](const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch,
+                          const std::string& reason) {
+    auto owner = server.namespaceOwner(namespaceId);
+    durableLog.shardTaken(namespaceId, shard, shardEpoch, owner ? owner->tenant : std::string());
+  });
   DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable);
+  // Firing an alarm is a request to the object, so it needs the dispatcher; the quota is the tenant's record.
+  durableLog.setAlarmHook([&durable, &server, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {
+    return fireDurableAlarm(durable, server, httpOverCapnpFactory, *headerTable, std::move(alarm));
+  });
+  durableLog.setQuotaHook([&server](const std::string& tenant) {
+    return server.tenantQuotas(tenant).durableObjectBytes;
+  });
+  durableLog.setNamespaceHook([&server](const std::string& namespaceId) {
+    auto owner = server.namespaceOwner(namespaceId);
+    return owner && owner->active();
+  });
   server.addStateSection("durableShards", [&shards]() { return shards.json(); });
   server.addStateSection("durableLog", [&durableLog]() { return durableLog.json(); });
   // The control plane's addresses as it announces them (ControlPlaneAddresses), beside the members' and this node's own.

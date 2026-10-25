@@ -506,6 +506,27 @@ private:
       if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
       co_return co_await usage(tenant, query, response);
     }
+    // The tenant's databases (the D1 shape): the record, and one SQL statement on the database's object.
+    if (area == "databases") {
+      if (n == 4) {
+        if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
+        co_return co_await send(response, coworkerd::listDatabases(state, tenant));
+      }
+      const auto& database = segments[4];
+      if (!coworkerd::apiName(database))
+        co_return co_await fail(response, 400, "INVALID_REQUEST", "invalid database name ([a-z0-9][a-z0-9-]{0,62})");
+      if (n == 5) {
+        if (is(kj::HttpMethod::POST)) co_return co_await send(response, co_await coworkerd::createDatabase(state, tenant, database));
+        if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::readDatabaseRecord(state, tenant, database));
+        if (is(kj::HttpMethod::DELETE)) co_return co_await send(response, co_await coworkerd::deleteDatabase(state, tenant, database));
+        co_return co_await methodNotAllowed(response, "POST, GET, DELETE");
+      }
+      if (n == 6 && segments[5] == "query") {
+        if (!is(kj::HttpMethod::POST)) co_return co_await methodNotAllowed(response, "POST");
+        co_return co_await sqlQuery(tenant, database, body, response);
+      }
+      co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
+    }
     if (area != "workers") co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
     if (n == 4) {
       if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
@@ -551,6 +572,19 @@ private:
     if (part == "logs" && n == 6) {
       if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
       co_return co_await logs(id, query, response);
+    }
+    // The Worker's Durable Object namespaces: the records, one with the numbers the nodes report, and one marked
+    // deleting (the semantics of a version's deleted_classes).
+    if (part == "namespaces" && n == 6) {
+      if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
+      co_return co_await send(response, coworkerd::listNamespaceRecords(state, tenant, worker));
+    }
+    if (part == "namespaces" && n == 7) {
+      const auto& className = segments[6];
+      if (is(kj::HttpMethod::GET)) co_return co_await namespaceView(tenant, worker, className, response);
+      if (is(kj::HttpMethod::DELETE))
+        co_return co_await send(response, co_await coworkerd::deleteNamespaceRecord(state, tenant, worker, className));
+      co_return co_await methodNotAllowed(response, "GET, DELETE");
     }
     co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
   }
@@ -845,6 +879,33 @@ public:
   }
 
 private:
+  // A POST whose answer the caller reads (the SQL statements): the status and the body, or why it did not answer.
+  kj::Promise<Fetched> ask(std::string url, std::string body, uint32_t timeoutMs) {
+    Fetched result;
+    try {
+      auto client = kj::newHttpClient(timer, headerTable, network, kj::none);
+      kj::HttpHeaders headers(headerTable);
+      headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
+      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+      if (!settings.token.empty()) headers.addPtr("Authorization", kj::str("Bearer ", settings.token.c_str()));
+      auto call = client->request(kj::HttpMethod::POST, url.c_str(), headers, body.size());
+      auto work = [&]() -> kj::Promise<void> {
+        co_await call.body->write(kj::arrayPtr(body.data(), body.size()).asBytes());
+        call.body = nullptr;
+        auto answer = co_await call.response;
+        auto text = co_await answer.body->readAllText(8 << 20);
+        result.status = answer.statusCode;
+        result.body = text.cStr();
+      };
+      co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, work());
+      result.ok = result.status != 0;
+      if (!result.ok) result.error = "no answer";
+    } catch (const kj::Exception& error) {
+      result.error = cleanReason(error.getDescription().cStr());
+    }
+    co_return result;
+  }
+
   kj::Promise<void> post(std::string url, std::string body) {
     try {
       auto client = kj::newHttpClient(timer, headerTable, network, kj::none);
@@ -956,6 +1017,129 @@ private:
     std::string out = only ? std::string() : "{\"nodes\":[";
     for (size_t i = 0; i < list.size(); ++i) out += (i ? "," : "") + nodeSummary(list[i], states[i], true, false);
     co_return co_await sendJson(response, 200, only ? out : out + "]}");
+  }
+
+  // GET /v1/tenants/{t}/workers/{w}/namespaces/{class}: the namespace's record, the owner of each shard an epoch
+  // has been taken for (the store's hints), and the objects and bytes the nodes report of it. The numbers are a
+  // summary of what the nodes last said, so the answer says when it was made.
+  kj::Promise<void> namespaceView(std::string tenant, std::string worker, std::string className,
+      ControlResponse& response) {
+    auto record = coworkerd::listNamespaceRecords(state, tenant, worker);
+    if (record.status != 200) co_return co_await send(response, record);
+    const auto* manifest = state.tenant(tenant);
+    const coworkerd::ManifestNamespace* space = nullptr;
+    if (manifest != nullptr) {
+      auto found = manifest->workers.find(worker);
+      if (found != manifest->workers.end()) {
+        auto entry = found->second.namespaces.find(className);
+        if (entry != found->second.namespaces.end()) space = &entry->second;
+      }
+    }
+    if (space == nullptr)
+      co_return co_await fail(response, 404, "NOT_FOUND", "Worker " + worker + " of tenant " + tenant +
+          " has no Durable Object namespace for class " + className);
+    std::string head = std::string("{\"tenant\":\"") + jsonEscape(tenant) + "\",\"worker\":\"" + jsonEscape(worker) +
+        "\",\"className\":\"" + jsonEscape(className) + "\",\"namespaceId\":\"" + jsonEscape(space->id) +
+        "\",\"status\":\"" + jsonEscape(space->status) + "\",\"shards\":" + std::to_string(space->shards) +
+        ",\"createdRevision\":" + std::to_string(space->createdRevision);
+    co_return co_await send(response, co_await namespaceAnswer(tenant, std::move(head), space->id));
+  }
+
+  // The owners of a namespace's shards and the numbers the nodes report, appended to `head` (which is left open).
+  kj::Promise<coworkerd::ApiAnswer> namespaceAnswer(const std::string& tenant, std::string head,
+      const std::string& namespaceId) {
+    std::string owners = "[", problem;
+    uint64_t objects = 0, bytes = 0;
+    size_t taken = 0;
+    try {
+      // do/<ns>/shards/<s>/owner: the hint beside each shard's epochs, written by whoever took it.
+      auto listing = co_await storage.list("do/" + namespaceId + "/shards/", 1000);
+      for (const auto& listed : listing.objects) {
+        if (!listed.key.ends_with("/owner")) continue;
+        const auto rest = listed.key.substr(("do/" + namespaceId + "/shards/").size());
+        const auto slash = rest.find('/');
+        if (slash == std::string::npos) continue;
+        const auto shard = rest.substr(0, slash);
+        auto answer = co_await storage.get(listed.key);
+        if (answer.status != 200) continue;
+        std::string nodeId, epoch;
+        bool released = false;
+        try {
+          capnp::MallocMessageBuilder message;
+          auto value = message.initRoot<capnp::JsonValue>();
+          capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.bytes.data(), answer.bytes.size()), value);
+          auto reader = value.asReader();
+          nodeId = coworkerd::json::text(reader, "nodeId");
+          epoch = coworkerd::json::text(reader, "epoch");
+          released = coworkerd::json::boolean(reader, "released");
+        } catch (const kj::Exception&) {
+          continue;
+        }
+        owners += std::string(taken++ ? "," : "") + "{\"shard\":" + shard + ",\"nodeId\":\"" +
+            jsonEscape(nodeId) + "\",\"epoch\":\"" + jsonEscape(epoch) + "\",\"released\":" +
+            (released ? "true" : "false") + "}";
+      }
+    } catch (const kj::Exception& error) {
+      problem = cleanReason(error.getDescription().cStr());
+    }
+    owners += ']';
+    // The objects and the bytes: every node's state endpoint, summed over the nodes that answered.
+    std::vector<Member> list;
+    size_t answered = 0;
+    try { list = co_await members(); } catch (const kj::Exception&) {}
+    if (!list.empty()) {
+      kj::Vector<kj::Promise<Fetched>> pending;
+      for (const auto& member : list) pending.add(fetch("http://" + member.address + "/__coworkerd/state"));
+      auto states = co_await kj::joinPromises(pending.releaseAsArray());
+      for (const auto& fetched : states) {
+        if (!fetched.ok) continue;
+        ++answered;
+        try {
+          capnp::MallocMessageBuilder message;
+          auto value = message.initRoot<capnp::JsonValue>();
+          capnp::JsonCodec().decodeRaw(kj::arrayPtr(fetched.body.data(), fetched.body.size()), value);
+          auto log = coworkerd::json::field(value.asReader(), "durableLog");
+          if (!log.isObject()) continue;
+          auto spaces = coworkerd::json::field(log, "namespaces");
+          if (!spaces.isArray()) continue;
+          for (auto entry : spaces.getArray()) {
+            if (coworkerd::json::text(entry, "namespaceId") != namespaceId) continue;
+            auto count = coworkerd::json::field(entry, "objects");
+            if (count.isNumber()) objects += uint64_t(count.getNumber());
+            bytes += coworkerd::json::integer(entry, "bytes");
+          }
+        } catch (const kj::Exception&) {
+          continue;
+        }
+      }
+    }
+    head += ",\"shardsTaken\":" + std::to_string(taken) + ",\"owners\":" + owners + ",\"objects\":" +
+        std::to_string(objects) + ",\"bytes\":\"" + std::to_string(bytes) + "\",\"approximate\":true,\"atUnixMs\":" +
+        std::to_string(wallTimeMsForTest()) + ",\"nodesAnswered\":" + std::to_string(answered) + ",\"nodes\":" +
+        std::to_string(list.size());
+    if (!problem.empty()) head += std::string(",\"problem\":\"") + jsonEscape(problem) + "\"";
+    co_return coworkerd::ApiAnswer::ok(head + "}");
+  }
+
+  // POST /v1/tenants/{t}/databases/{d}/query: the statement goes to a node, which sends it to the shard's owner. The
+  // body and the answer are D1's own (src/cloudflare/internal/d1-api.ts): {"sql","params"} or an array of them.
+  kj::Promise<void> sqlQuery(std::string tenant, std::string database, kj::AsyncInputStream& body,
+      ControlResponse& response) {
+    auto record = coworkerd::readDatabaseRecord(state, tenant, database);
+    if (record.status != 200) co_return co_await send(response, record);
+    auto text = co_await readBody(body, 1024 * 1024);
+    auto list = co_await members();
+    if (list.empty())
+      co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "no node is a live member of the cluster");
+    // Any node: it sends the statement on to the owner of the database's shard.
+    std::string problem;
+    for (const auto& member : list) {
+      auto answer = co_await ask("http://" + member.address + "/__coworkerd/databases/" + tenant + "/" + database +
+          "/query", text, 15000);
+      if (answer.ok) co_return co_await sendJson(response, answer.status ? answer.status : 200, answer.body);
+      problem = answer.error;
+    }
+    co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "no node answered the statement: " + problem);
   }
 
   // ?from&to (Unix ms; default the last 24 hours) &by=hour (the only grouping).

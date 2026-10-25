@@ -193,6 +193,12 @@ struct DurableLogConfig {
   uint32_t idleCheckpointMs = 10000;
   uint32_t uploadRetryMs = 500, uploadRetryMaxMs = 30000;
   uint32_t recoverParallelism = 4;
+  // How many objects one durable process keeps resident (COWORKERD_DO_RESIDENT_OBJECTS; 0: no limit). Past it the
+  // least recently used objects are evicted: their hibernatable WebSockets hibernate, so the connections stay up
+  // and the next message wakes the object on the same storage.
+  uint32_t residentObjects = 4096;
+  // How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
+  uint32_t usagePublishMs = 3600000;
   void validate() const;
 };
 

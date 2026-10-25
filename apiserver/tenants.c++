@@ -417,6 +417,148 @@ kj::Promise<ApiAnswer> createCredential(ManifestStore& state, std::string tenant
       std::to_string(record.createdAtUnixMs) + ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + "}");
 }
 
+// ---- The tenant's databases and its Workers' Durable Object namespaces ----
+namespace {
+std::string namespaceRecordJson(const std::string& name, const ManifestNamespace& entry) {
+  return "{\"name\":" + quote(name) + ",\"namespaceId\":" + quote(entry.id) + ",\"status\":" + quote(entry.status) +
+      ",\"shards\":" + std::to_string(entry.shards) + ",\"createdRevision\":" + std::to_string(entry.createdRevision) + "}";
+}
+}  // namespace
+
+// POST /v1/tenants/{t}/databases/{d}: a namespace of one shard whose class is the platform's SQL Worker. Creating one
+// that is already there answers it (the same request twice is one database), one that is being deleted is refused.
+kj::Promise<ApiAnswer> createDatabase(ManifestStore& state, std::string tenantName, std::string name) {
+  std::optional<ApiAnswer> refused;
+  ManifestNamespace made;
+  uint64_t revision = 0;
+  try {
+    auto written = co_await state.writeTenant(tenantName, [&](TenantManifest& next) -> kj::Promise<void> {
+      if (!next.record) refuseWith(refused, notFound(tenantName));
+      if (next.record->status != "active")
+        refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "tenant " + tenantName + " is being deleted"));
+      auto found = next.databases.find(name);
+      if (found != next.databases.end()) {
+        if (found->second.status != "active")
+          refuseWith(refused, ApiAnswer::error(409, "CONFLICT", "database " + name + " of tenant " + tenantName +
+              " is being deleted"));
+        made = found->second;
+        refuseWith(refused, ApiAnswer::ok("{\"tenant\":" + quote(tenantName) + ",\"database\":" +
+            namespaceRecordJson(name, made) + "}"));
+      }
+      // Every namespace of the tenant counts, the deleting ones and the Workers' classes included.
+      size_t namespaces = next.databases.size() + 1;
+      for (const auto& [worker, entry] : next.workers) namespaces += entry.namespaces.size();
+      const auto quota = next.record->quotas.durableObjectNamespaces;
+      if (namespaces > quota)
+        refuseWith(refused, ApiAnswer::error(422, "QUOTA_EXCEEDED", "durableObjectNamespaces: tenant " + tenantName +
+            " would have " + std::to_string(namespaces) + " Durable Object namespaces, its quota is " +
+            std::to_string(quota)));
+      made = ManifestNamespace{newNamespaceId(), next.revision + 1, "active", 1};
+      next.databases.emplace(name, made);
+      co_return;
+    }, false);
+    revision = written.manifest.revision;
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the database");
+  }
+  // The revision a caller waits for: a database is usable once every node has read it (the deployment poll).
+  co_return ApiAnswer::ok("{\"tenant\":" + quote(tenantName) + ",\"revision\":" + std::to_string(revision) +
+      ",\"database\":" + namespaceRecordJson(name, made) + "}");
+}
+
+ApiAnswer listDatabases(const ManifestStore& state, std::string tenantName) {
+  auto read = readTenant(state, tenantName);
+  if (!read.tenant) return notFound(tenantName);
+  const auto* manifest = state.tenant(tenantName);
+  std::string out = "{\"tenant\":" + quote(tenantName) + ",\"databases\":[";
+  size_t index = 0;
+  if (manifest != nullptr)
+    for (const auto& [name, entry] : manifest->databases)
+      out += std::string(index++ ? "," : "") + namespaceRecordJson(name, entry);
+  return ApiAnswer::ok(out + "]}");
+}
+
+ApiAnswer readDatabaseRecord(const ManifestStore& state, std::string tenantName, std::string name) {
+  auto read = readTenant(state, tenantName);
+  if (!read.tenant) return notFound(tenantName);
+  const auto* manifest = state.tenant(tenantName);
+  if (manifest == nullptr) return ApiAnswer::error(404, "NOT_FOUND", "tenant " + tenantName + " has no database " + name);
+  auto found = manifest->databases.find(name);
+  if (found == manifest->databases.end())
+    return ApiAnswer::error(404, "NOT_FOUND", "tenant " + tenantName + " has no database " + name);
+  return ApiAnswer::ok("{\"tenant\":" + quote(tenantName) + ",\"database\":" + namespaceRecordJson(name, found->second) + "}");
+}
+
+// DELETE /v1/tenants/{t}/databases/{d}: marked deleting, as a version's deleted_classes marks a class -- no Binding
+// to it, no new request, and its objects' data stays until a later release's cleanup.
+kj::Promise<ApiAnswer> deleteDatabase(ManifestStore& state, std::string tenantName, std::string name) {
+  std::optional<ApiAnswer> refused;
+  ManifestNamespace marked;
+  uint64_t revision = 0;
+  try {
+    co_await state.writeTenant(tenantName, [&](TenantManifest& next) -> kj::Promise<void> {
+      if (!next.record) refuseWith(refused, notFound(tenantName));
+      auto found = next.databases.find(name);
+      if (found == next.databases.end())
+        refuseWith(refused, ApiAnswer::error(404, "NOT_FOUND", "tenant " + tenantName + " has no database " + name));
+      found->second.status = "deleting";
+      marked = found->second;
+      co_return;
+    }, false).then([&](ManifestStore::Written written) { revision = written.manifest.revision; });
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the database");
+  }
+  co_return ApiAnswer::ok("{\"tenant\":" + quote(tenantName) + ",\"revision\":" + std::to_string(revision) +
+      ",\"database\":" + namespaceRecordJson(name, marked) + "}");
+}
+
+ApiAnswer listNamespaceRecords(const ManifestStore& state, std::string tenantName, std::string worker) {
+  auto read = readTenant(state, tenantName);
+  if (!read.tenant) return notFound(tenantName);
+  const auto* manifest = state.tenant(tenantName);
+  const ManifestWorker* entry = nullptr;
+  if (manifest != nullptr) {
+    auto found = manifest->workers.find(worker);
+    if (found != manifest->workers.end()) entry = &found->second;
+  }
+  if (entry == nullptr)
+    return ApiAnswer::error(404, "NOT_FOUND", "tenant " + tenantName + " has no Worker " + worker);
+  std::string out = "{\"tenant\":" + quote(tenantName) + ",\"worker\":" + quote(worker) + ",\"namespaces\":[";
+  size_t index = 0;
+  for (const auto& [className, space] : entry->namespaces)
+    out += std::string(index++ ? "," : "") + namespaceRecordJson(className, space);
+  return ApiAnswer::ok(out + "]}");
+}
+
+kj::Promise<ApiAnswer> deleteNamespaceRecord(ManifestStore& state, std::string tenantName, std::string worker,
+    std::string className) {
+  std::optional<ApiAnswer> refused;
+  ManifestNamespace marked;
+  uint64_t revision = 0;
+  try {
+    co_await state.writeTenant(tenantName, [&](TenantManifest& next) -> kj::Promise<void> {
+      if (!next.record) refuseWith(refused, notFound(tenantName));
+      auto found = next.workers.find(worker);
+      if (found == next.workers.end())
+        refuseWith(refused, ApiAnswer::error(404, "NOT_FOUND", "tenant " + tenantName + " has no Worker " + worker));
+      auto space = found->second.namespaces.find(className);
+      if (space == found->second.namespaces.end())
+        refuseWith(refused, ApiAnswer::error(404, "NOT_FOUND", "Worker " + worker + " of tenant " + tenantName +
+            " has no Durable Object namespace for class " + className));
+      space->second.status = "deleting";
+      marked = space->second;
+      co_return;
+    }, false).then([&](ManifestStore::Written written) { revision = written.manifest.revision; });
+  } catch (const kj::Exception& error) {
+    if (refused) co_return *refused;
+    co_return writeFailure(error, "the namespace");
+  }
+  co_return ApiAnswer::ok("{\"tenant\":" + quote(tenantName) + ",\"worker\":" + quote(worker) + ",\"revision\":" +
+      std::to_string(revision) + ",\"namespace\":" + namespaceRecordJson(className, marked) + "}");
+}
+
 ApiAnswer listCredentials(const ManifestStore& state, std::string tenantName) {
   if (!readTenant(state, tenantName).tenant) return notFound(tenantName);
   std::string out = "{\"tenant\":" + quote(tenantName) + ",\"credentials\":[";

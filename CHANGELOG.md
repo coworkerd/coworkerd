@@ -188,6 +188,68 @@ and never reads the previous owner's files. A write that was answered `200` is i
   peer taking another's place and a confirmation that failed with the records it isolated; a `[do]` line says how long a
   request waited for a rebuild.
 
+Durable Objects a team can use: hibernatable connections, a resident limit, alarms, a database (D1), the namespace and
+database endpoints of `/v1`, `cowctl do` and `cowctl d1`, and the storage quotas. There is still one kind of object --
+the peers buffer, the segments go to the object store, an object rebuilds from them, and an object is at most 10 GB, as
+on Cloudflare.
+
+- **Hibernatable WebSockets.** A class's `ctx.acceptWebSocket(ws, tags)` with `webSocketMessage`, `webSocketClose` and
+  `webSocketError` handlers, `ctx.getWebSockets()`, `ctx.getTags()` and `ctx.setWebSocketAutoResponse()` all work: an
+  object with none of its connections sending anything may be evicted while they stay connected -- at the entry and at
+  the owner the relay is unchanged, so the client notices nothing -- and the next message wakes the object with them.
+  Each message is still an event of its Worker: its CPU is topped up, its lines are kept and it counts in the usage.
+- **A resident limit.** A durable process keeps at most `durableObjects.residentObjects` (4096) objects resident; past
+  it the least recently used go, a facet before its root, and an object a request is running in is left alone. An
+  evicted object's hibernatable connections hibernate rather than close. The state endpoint's `durableLog.resident`
+  reports, per process, how many are resident, the limit, how many were evicted and woken, and how long the wakes took.
+- **Alarms.** `ctx.storage.setAlarm`, `getAlarm` and `deleteAlarm` and the `alarm(alarmInfo)` handler. The time lives in
+  the object's own database, so it is replicated and recovered with everything else; the owner node schedules the firing
+  and fires it as an event of the object's Worker (the version's class, admission, the CPU topped up, a lease, a `[do]`
+  line). A hint beside the shard's epochs (`do/<ns>/shards/<s>/alarms/<id>`) names each object's next alarm, so the node
+  that takes the shard over goes on firing what is left -- the object's own database decides, so an alarm that already
+  ran is not fired again, and one still due is not lost. A handler that throws is retried with Cloudflare's backoff (two
+  seconds, doubling, a quarter of jitter, six counted tries and then up to about seventeen minutes), and
+  `alarmInfo.retryCount` says which try it is; a successful handler clears the alarm in its own transaction, which its
+  peers confirm before the answer, so the semantics are Cloudflare's. A class without an `alarm()` handler has its alarm
+  dropped rather than retried for ever. Upstream workerd refuses `setAlarm()` on a facet, and a Coworkerd object runs
+  the tenant's class as one; patch 0014 lets the hook report to the node instead.
+- **A database (D1's shape).** `POST /v1/tenants/{t}/databases/{d}` makes one: a Durable Object namespace of its own
+  with one shard and one object, whose class is the platform's own SQL Worker in the static runtime -- run through the
+  Host as a facet, like a tenant's class, with the same replication, rebuild and 10 GB limit. A `d1_databases` Binding
+  in wrangler's configuration gives `env.DB` the D1 API over D1's own wire protocol: `prepare().bind().run()`, `all()`,
+  `first(column?)`, `raw({columnNames})`, `batch()` and `exec()`, with D1's `meta` (`changes`, `last_row_id`,
+  `rows_read`, `rows_written`, `changed_db`, `size_after`) and its errors (`D1_ERROR:`, `D1_EXEC_ERROR:`,
+  `D1_TYPE_ERROR:`, `D1_COLUMN_NOTFOUND:`). The same protocol is the HTTP SQL interface,
+  `POST /v1/tenants/{t}/databases/{d}/query`, with the tenant's own credential. No migration tool, no import or export,
+  no restore to a point in time, no read replicas and no Sessions API (`withSession()` is refused).
+- **`/v1`**: `GET .../workers/{w}/namespaces` and `.../namespaces/{class}` (the shards, the owner of each shard an epoch
+  was taken for, the objects and the bytes, summed from the nodes and marked `approximate` with the time it was made),
+  `DELETE .../namespaces/{class}` (the semantics of a version's `deleted_classes`: no new request, the data stays), and
+  `POST`, `GET`, `DELETE /v1/tenants/{t}/databases[/{d}]`.
+- **`cowctl`**: `do list`, `do inspect <class>`, and `d1 create|list|execute|delete`. A created database is waited for
+  until every node serves it, as a deployment is.
+- **Quotas.** Each tenant's Durable Objects hold at most `durableObjectBytes` (10 GB by default): past it a write is
+  refused with `422 QUOTA_EXCEEDED` and reads go on. What a tenant holds is what the nodes publish of their own objects
+  (`nodes/<id>/durable-usage`, every `durableObjects.usagePublishMs`, an hour by default), so it bounds the storage
+  rather than accounting for it. A database or a class counts against `durableObjectNamespaces` (16) alike, and the
+  objects of a deleted one stop counting.
+- **An object past its own limit refuses only writes.** `413 DO_OBJECT_TOO_LARGE` is answered at the moment a write
+  would be made durable, not before the request is dispatched: everything that reads is served and the object is not
+  reset, as on Cloudflare (0.5's fourth part refused the object as a whole). A refused write is not durable -- no peer
+  holds it and no manifest names it -- but on the node that refused it, it stays readable from that machine's file
+  until the object is next opened, and the rebuild that follows drops it.
+- **The same boot reuses this machine's files.** The position each database is confirmed at is written beside it, so a
+  restart of the daemon or of a durable process within the same boot serves the object's first request from the files
+  instead of replaying its whole history. An unclean machine restart still throws the files away.
+- **Configuration** (`durableObjects`): `residentObjects` (4096; `0`: no limit) and `usagePublishMs` (3600000). Quota:
+  `durableObjectBytes` (10737418240).
+- **Measured** on three nodes of a Mac: 100 hibernatable connections on one object, which was evicted for a resident
+  limit of two with 0 connections closed, and the first message answered in 5 ms and reached all 99 others; 24 objects
+  against a limit of three, 46 evictions and 52 wakes, every wake under a millisecond; an alarm whose handler threw
+  retried 2,012 ms later with `retryCount` 1, and one set for 12 s fired exactly once, 144 ms after its time, on the
+  node that took the shard over when its owner was drained; a database's three rows still there after its owner was
+  drained; a write past a 1 MiB object limit refused after 128 rows, with the read right after it still answered.
+
 Fixed: a node no longer drops members on a listing that does not hold its own heartbeat. The first second of a stopped
 object store answered a listing of `members/` with `200` and an empty list, and two nodes dropped each other on it
 (seen in 0.5's development). A node that wrote its own heartbeat within the TTL now treats such a listing as a failed

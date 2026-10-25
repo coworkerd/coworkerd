@@ -51,8 +51,12 @@ struct TenantQuotas {
   uint64_t logBufferBytes = 1048576;
   uint64_t maxWorkerCpuMs = 30000;
   uint64_t maxWorkerMemoryMiB = 512;
-  // Durable Object namespaces over all the tenant's Workers, the deleting ones included (their data is still there).
+  // Durable Object namespaces over all the tenant's Workers, the deleting ones included (their data is still there),
+  // and the tenant's databases, which are namespaces too.
   uint64_t durableObjectNamespaces = 16;
+  // What the tenant's Durable Objects may hold together, as the objects' manifests and snapshots add up (the nodes
+  // publish what they own every hour): a write past it is refused with 413 QUOTA_EXCEEDED, reads go on.
+  uint64_t durableObjectBytes = 10ull << 30;
   bool operator==(const TenantQuotas&) const = default;
 };
 std::string tenantQuotasJson(const TenantQuotas& quotas);

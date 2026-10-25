@@ -1,6 +1,6 @@
 # Egress and authentication
 
-This document is for operators and security reviewers. It describes how tenant code reaches the network -- through one policy point per node, with built-in refusals, pinned resolution, per-tenant rules, limits and metering -- and how the components authenticate each other: the signed peer connection, an object storage identity for every node and one for the control plane, the secrets key, the management token and the `/v1` credentials. The last section lists what is not done yet. The configuration keys and their defaults are in the [installation guide](guide/install.md), section 5, and its sections 11 and 12 describe egress and the cluster key; the errors tenant code sees are in [error codes](guide/errors.md), section 4.
+This document is for operators and security reviewers. It describes how tenant code reaches the network -- through one policy point per node, with built-in refusals, pinned resolution, per-tenant rules, limits and metering -- and how the components authenticate each other: the signed peer connection, an object storage identity for every node and one for the control plane, the secrets key, the management token and the `/v1` credentials. The last section lists what is not done yet. The configuration keys and their defaults are in the [installation guide](guide/install.md), section 5, and its sections 11 and 12 describe egress and the cluster key; the errors tenant code sees are in [error codes](guide/errors.md), section 5.
 
 ## 1. What has to hold
 

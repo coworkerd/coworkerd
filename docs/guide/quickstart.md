@@ -214,6 +214,8 @@ with the admin credential it also shows each node's processes and the revision o
 | `cowctl tenant create\|list\|get\|update\|delete` (administrator) | Tenants: hostnames (`--hostname`), quotas (`--quota name=value`), default limits |
 | `cowctl credential create\|list\|revoke` (administrator; a tenant can revoke its own) | Tenant credentials |
 | `cowctl node list` (administrator) | Each node's processes, sandbox, rotation, suspects |
+| `cowctl do list`, `cowctl do inspect <class>` | This Worker's Durable Object namespaces, and one of them: its shards, the owner of each shard an epoch was taken for, the objects and the bytes |
+| `cowctl d1 create <name>`, `d1 list`, `d1 execute <name> --sql SQL [--param V]...`, `d1 delete <name> [--yes]` | The tenant's databases ([databases](databases.md)) |
 
 `--tenant T` names the tenant (default from `cowctl.json`), `--worker NAME` the Worker (default from `cowctl.json`, then `name` in the wrangler configuration);
 `COWCTL_CONTROL_PLANE` overrides the control plane's address. On failure it prints one sentence plus the reason the control plane gave (cleaned: no secret values or absolute paths) and exits with 1; a usage error exits with 2, an interrupted command with 130.

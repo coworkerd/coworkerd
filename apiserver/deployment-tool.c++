@@ -144,6 +144,16 @@ void declareNamespaces(ManifestWorker& worker, const VersionDefinition& version,
 // The version's migrations when it becomes the active one: its renames in order (a namespace moves to its new name), its
 // deletions (the namespace is marked deleting: its data stays until a later release cleans it), a namespace for every
 // declared class that has none yet, and every Binding's class with an active namespace.
+// A version's database Bindings: each names one of the tenant's databases, which must exist and not be deleting.
+void requireDatabases(const TenantManifest& manifest, const VersionDefinition& version) {
+  for (const auto& binding : version.durableObjects) {
+    if (binding.database.empty()) continue;
+    auto found = manifest.databases.find(binding.database);
+    if (found == manifest.databases.end() || found->second.status != "active")
+      refuse("database Binding " + binding.binding + " of " + version.key() + " names database " + binding.database +
+          ", which " + (found == manifest.databases.end() ? "does not exist" : "is being deleted"));
+  }
+}
 void activateNamespaces(ManifestWorker& worker, const VersionDefinition& version, uint64_t revision) {
   for (const auto& rename : version.renamedClasses) {
     auto from = worker.namespaces.find(rename.from);
@@ -158,6 +168,7 @@ void activateNamespaces(ManifestWorker& worker, const VersionDefinition& version
     if (auto found = worker.namespaces.find(className); found != worker.namespaces.end()) found->second.status = "deleting";
   declareNamespaces(worker, version, revision);
   for (const auto& binding : version.durableObjects) {
+    if (!binding.database.empty()) continue;  // a database Binding: checked against the tenant's databases
     auto found = worker.namespaces.find(binding.className);
     if (found == worker.namespaces.end() || found->second.status != "active")
       refuse("Durable Object Binding " + binding.binding + " of " + version.key() + " names class " + binding.className +
@@ -168,7 +179,7 @@ void activateNamespaces(ManifestWorker& worker, const VersionDefinition& version
 // adds namespaces beyond it is refused.
 void requireNamespaceQuota(const TenantManifest& base, const TenantManifest& next) {
   auto count = [](const TenantManifest& manifest) {
-    size_t total = 0;
+    size_t total = manifest.databases.size();  // a database is a namespace of its own
     for (const auto& [name, worker] : manifest.workers) total += worker.namespaces.size();
     return total;
   };
@@ -246,8 +257,10 @@ Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state,
       // The Worker's own limits stay with its pointer whatever version it names.
       const WorkerLimits limits = worker.active ? worker.active->limits : WorkerLimits{};
       worker.active = ManifestPointer{pin.versionId, pin.definitionHash, limits};
-      if (auto version = desired.versions.find(id + "@" + pin.versionId); version != desired.versions.end())
+      if (auto version = desired.versions.find(id + "@" + pin.versionId); version != desired.versions.end()) {
         activateNamespaces(worker, *version->second, base.revision + 1);
+        requireDatabases(next, *version->second);
+      }
       auto list = routes[id];
       std::sort(list.begin(), list.end());
       worker.routes = std::move(list);

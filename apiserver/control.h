@@ -104,6 +104,18 @@ kj::Promise<ApiAnswer> updateTenant(ManifestStore& state, std::string tenant, st
 // objects only it uses, its credentials, then it leaves the index -- its routes and pointers with it -- and its manifests
 // go. Each step is recorded in the record's `deletion`; running it again resumes.
 kj::Promise<ApiAnswer> deleteTenant(ControlContext& context, std::string tenant);
+// A tenant's databases (the D1 shape, docs/compatibility.md section 7): each is a Durable Object namespace of its
+// own whose class is the platform's SQL Worker, so it counts against durableObjectNamespaces like any other.
+kj::Promise<ApiAnswer> createDatabase(ManifestStore& state, std::string tenant, std::string name);
+ApiAnswer listDatabases(const ManifestStore& state, std::string tenant);
+ApiAnswer readDatabaseRecord(const ManifestStore& state, std::string tenant, std::string name);
+kj::Promise<ApiAnswer> deleteDatabase(ManifestStore& state, std::string tenant, std::string name);
+// A Worker's Durable Object namespaces as the manifest holds them, and one of them marked deleting (the semantics of
+// a version's deleted_classes: no Binding to it and no new request; its data stays).
+ApiAnswer listNamespaceRecords(const ManifestStore& state, std::string tenant, std::string worker);
+kj::Promise<ApiAnswer> deleteNamespaceRecord(ManifestStore& state, std::string tenant, std::string worker,
+    std::string className);
+
 kj::Promise<ApiAnswer> createCredential(ManifestStore& state, std::string tenant, std::string body);
 ApiAnswer listCredentials(const ManifestStore& state, std::string tenant);
 kj::Promise<ApiAnswer> revokeCredential(ManifestStore& state, std::string tenant, std::string keyId);

@@ -9,6 +9,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -83,6 +84,16 @@ std::optional<Hint> parseHint(const std::string& bytes) {
   }
 }
 }  // namespace
+
+std::string durableObjectIdFromName(const std::string& namespaceId, const std::string& name) {
+  std::string bytes;
+  bytes.reserve(32 + 4 + name.size());
+  for (size_t i = 0; i + 1 < namespaceId.size(); i += 2)
+    bytes.push_back(char(std::strtoul(namespaceId.substr(i, 2).c_str(), nullptr, 16)));
+  bytes += "name";
+  bytes += name;
+  return sha256Hex(bytes);
+}
 
 uint32_t durableShardOf(const std::string& objectId, uint32_t shards) {
   KJ_REQUIRE(shards > 0 && objectId.size() >= 16, "an object id has 64 hexadecimal digits and a namespace at least one shard");
@@ -581,6 +592,7 @@ kj::Promise<ShardRoute> DurableShards::acquireNow(std::string namespaceId, uint3
              << ",\"elapsedMs\":" << elapsed;
       log("acquired", namespaceId, shard, fields.str());
       writeHint(namespaceId, shard, record, false);
+      if (shardTaken) shardTaken(namespaceId, shard, record.epoch, reason);
       ShardRoute route;
       route.kind = ShardRoute::Kind::LOCAL;
       route.nodeId = settings.nodeId; route.nodeEpoch = record.nodeEpoch;
@@ -643,6 +655,11 @@ uint64_t DurableShards::knownShardEpoch(const std::string& namespaceId, uint32_t
 
 void DurableShards::onShardGone(std::function<void(const std::string&, uint32_t, const std::string&)> callback) {
   shardGone = std::move(callback);
+}
+
+void DurableShards::onShardTaken(
+    std::function<void(const std::string&, uint32_t, uint64_t, const std::string&)> callback) {
+  shardTaken = std::move(callback);
 }
 
 uint32_t DurableShards::dropAll(const std::string& reason) {

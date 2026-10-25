@@ -1,0 +1,483 @@
+From 9d33c90b10643759a364d45565cdfc21a91c19a0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 03:03:51 +0800
+Subject: [PATCH] Hibernate a Durable Object's connections, bound how many stay
+ resident, and let a facet's alarm reach the node
+
+Coworkerd v62, on top of v61's Durable Object log (0013). Three things the objects a team uses need,
+all within src/workerd/server/.
+
+A facet's alarm. The alarm scheduler of a namespace can only deliver to its root actors, so upstream
+refuses setAlarm() on a facet -- and a Coworkerd object runs the tenant's class as a facet of the
+Host. The time itself needs nothing new: ActorSqlite writes it into the facet's own database
+(_cf_METADATA), which the shipper replicates and a rebuild restores with everything else. What was
+missing is who fires it, and that can only be the node: the facet's class comes from the Worker
+version the node names, and the firing has to be an event of that Worker (its CPU topped up, its
+lease renewed, its lines kept). So FacetAlarmHooks, with the log on, reports every change to the
+node over the shipper's channel instead of throwing, and every database reports what it holds as its
+alarm when it is opened -- which is how a node that took the shard over learns, from the object's own
+files, what is still due and what has already run. The per-process alarm record is rebuilt from the
+object's databases and never carried over from the node that had them. Without the log the hook fails
+as it did before.
+
+A resident limit. The objects of a durable process cost memory even when they are idle, so at most
+COWORKERD_DO_RESIDENT_OBJECTS of them (0: no limit) keep their Worker::Actor. Past it the least
+recently used objects are evicted, a facet before its root: their hibernatable WebSockets hibernate
+rather than close, so the connections stay up and the next message wakes the object on the same
+storage. An object a request is running in is left alone and the next one taken instead. The count,
+the evictions, the wakes and the time they took go to the node when they change (the state endpoint
+reports them).
+
+A write refused with its own code. The replicator's refusal of a commit now says what it was: the
+object is past its own size limit (DO_OBJECT_TOO_LARGE) or the tenant's storage quota is exhausted
+(QUOTA_EXCEEDED), not only that the storage is unavailable, and a database reports its size when it
+is closed so a small object that never checkpoints still has one. Only the write is refused; nothing
+that reads is.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/workerd/server/coworkerd-wal-shipper.c++ |  70 ++++++-
+ src/workerd/server/coworkerd-wal-shipper.h   |  17 ++
+ src/workerd/server/server.c++                | 196 ++++++++++++++++++-
+ 3 files changed, 269 insertions(+), 14 deletions(-)
+
+diff --git a/src/workerd/server/coworkerd-wal-shipper.c++ b/src/workerd/server/coworkerd-wal-shipper.c++
+index 432c403..c024f42 100644
+--- a/src/workerd/server/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/coworkerd-wal-shipper.c++
+@@ -155,11 +155,27 @@ struct Writer {
+ 
+ // To the replicator.
+ constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 4, MSG_RESET = 5,
+-                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8;
++                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
+ // From the replicator.
+ constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
+-// An ACK's status.
+-constexpr uint8_t ACK_OK = 0;
++// An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
++// object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
++// refused for any of them -- only the write is.
++constexpr uint8_t ACK_OK = 0, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
++
++kj::StringPtr ackRefusal(uint8_t status) {
++  switch (status) {
++    case ACK_TOO_LARGE:
++      return "jsg.Error: Durable Object is too large: the write would take it past "
++             "durableObjects.objectBytes (DO_OBJECT_TOO_LARGE)"_kj;
++    case ACK_QUOTA:
++      return "jsg.Error: the tenant's Durable Object storage quota is exhausted: the write was refused "
++             "(QUOTA_EXCEEDED)"_kj;
++    default:
++      return "jsg.Error: Durable Object storage is unavailable: the node refused the write "
++             "(STORAGE_UNAVAILABLE)"_kj;
++  }
++}
+ 
+ kj::LowLevelAsyncIoProvider* logProvider = nullptr;
+ 
+@@ -344,9 +360,9 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+           if (status == ACK_OK) {
+             p.fulfiller->fulfill();
+           } else {
+-            p.fulfiller->reject(KJ_EXCEPTION(FAILED,
+-                "jsg.Error: Durable Object storage is unavailable: the node refused the write "
+-                "(STORAGE_UNAVAILABLE)"));
++            // kj::str, so the description is the message alone: KJ_EXCEPTION labels anything else, and a jsg.Error
++            // is only recognised when its prefix starts the description.
++            p.fulfiller->reject(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
+           }
+           pending.erase(request);
+           KJ_IF_SOME(shipper, shippers.find(key)) {
+@@ -408,6 +424,45 @@ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
+   Replicator::get().send(w.finish());
+ }
+ 
++void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
++  if (!durableLogEnabled()) return;
++  Writer w;
++  w.u8(MSG_ALARM);
++  w.str(kj::str(objectName, "/", facetId));
++  w.str(objectName);
++  w.u32(facetId);
++  KJ_IF_SOME(time, scheduledTime) {
++    w.u8(1);
++    w.u64(uint64_t((time - kj::UNIX_EPOCH) / kj::MILLISECONDS));
++  } else {
++    w.u8(0);
++    w.u64(0);
++  }
++  w.u64(monoNs());
++  Replicator::get().send(w.finish());
++}
++
++void durableLogResidency(const DurableResidency& residency) {
++  if (!durableLogEnabled()) return;
++  Writer w;
++  w.u8(MSG_RESIDENCY);
++  w.u64(residency.resident);
++  w.u64(residency.limit);
++  w.u64(residency.evicted);
++  w.u64(residency.woken);
++  w.u64(residency.wakes);
++  w.u64(residency.wakeUsTotal);
++  w.u64(residency.wakeUsMax);
++  w.u64(monoNs());
++  Replicator::get().send(w.finish());
++}
++
++uint64_t durableResidentLimit() {
++  static const uint64_t value =
++      numberFromEnvironment("COWORKERD_DO_RESIDENT_OBJECTS", 4096, 1ull << 32);
++  return value;
++}
++
+ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+     kj::Path walPath,
+     kj::Path databasePath,
+@@ -447,6 +502,9 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
+   w.u8(MSG_CLOSED);
+   w.str(key);
+   w.u64(monoNs());
++  // The database's size as this instance leaves it: a small object may never checkpoint, and the node needs its
++  // size for the tenant's storage and for the object's own limit.
++  w.u64(databaseBytes());
+   Replicator::get().send(w.finish());
+ }
+ 
+diff --git a/src/workerd/server/coworkerd-wal-shipper.h b/src/workerd/server/coworkerd-wal-shipper.h
+index 003258e..534c9cd 100644
+--- a/src/workerd/server/coworkerd-wal-shipper.h
++++ b/src/workerd/server/coworkerd-wal-shipper.h
+@@ -31,6 +31,23 @@ bool durableLogEnabled();
+ // A facet's files were removed outside its own transactions (deleteFacet(), or the parent's deleteAll()).
+ void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId);
+ 
++// The alarm of one database, as that database itself holds it (_cf_METADATA): the node schedules the firing, so it
++// is told at every change (ActorSqlite's scheduleRun hook) and whenever a database is opened -- which is how a node
++// that took the shard over learns, from the object's own files, what is still due and what has already run.
++void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime);
++
++// How many objects this process holds resident, how many it has evicted for the resident limit and how many it has
++// woken again, with the time the wakes took. Sent when the numbers change, at most once a second.
++struct DurableResidency {
++  uint64_t resident = 0, limit = 0, evicted = 0, woken = 0, wakes = 0;
++  // Microseconds: waking an object whose class is still loaded takes well under a millisecond.
++  uint64_t wakeUsTotal = 0, wakeUsMax = 0;
++};
++void durableLogResidency(const DurableResidency& residency);
++
++// The resident object limit of this process (COWORKERD_DO_RESIDENT_OBJECTS; 0: no limit).
++uint64_t durableResidentLimit();
++
+ // Which database this is, in the node's terms. `objectName` is the name the object's Host was made with --
+ // "<namespace>/<object>/<data epoch>" -- so the node needs no map from a path to an object; `storageId` is the
+ // hexadecimal actor id its files are named after. `facetId` is 0 for the object itself, and a facet also carries its
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 598808a..b9e6852 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -65,6 +65,7 @@
+ #include <kj/glob-filter.h>
+ #include <kj/map.h>
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <ctime>
+ 
+@@ -162,6 +163,18 @@ static kj::Maybe<AccessBlobFields> parseAccessBlob(kj::Maybe<kj::String> blobJso
+ 
+ namespace {
+ 
++// Coworkerd: the alarm an actor's own database holds (SqliteMetadata's key 1, in nanoseconds since the epoch), read
++// without creating the table -- a database that has never had an alarm has no _cf_METADATA at all.
++kj::Maybe<kj::Date> alarmOf(SqliteDatabase& db) {
++  {
++    auto exists = db.run("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_cf_METADATA'");
++    if (exists.isDone()) return kj::none;
++  }
++  auto query = db.run("SELECT value FROM _cf_METADATA WHERE key = 1");
++  if (query.isDone() || query.isNull(0)) return kj::none;
++  return kj::UNIX_EPOCH + query.getInt64(0) * kj::NANOSECONDS;
++}
++
+ struct PemData {
+   kj::String type;
+   kj::Array<byte> data;
+@@ -624,6 +637,10 @@ class Server::ActorNamespace final {
+       requireNotBroken();
+ 
+       if (actor == kj::none) {
++        // Coworkerd: this object was evicted and is being woken again -- how long that takes is reported with the
++        // resident count (the class may have to be loaded and the storage opened again).
++        auto wokeFrom = wasEvicted ? kj::Maybe<kj::TimePoint>(timer.now()) : kj::none;
++
+         KJ_IF_SOME(promise, classAndId.tryGet<kj::ForkedPromise<void>>()) {
+           co_await promise;
+           requireNotBroken();
+@@ -639,6 +656,11 @@ class Server::ActorNamespace final {
+         // A concurrent request could have started the actor, so check again.
+         if (actor == kj::none) {
+           start(actorClass, id);
++          KJ_IF_SOME(from, wokeFrom) {
++            wasEvicted = false;
++            ns.objectWoken(timer.now() - from);
++          }
++          ns.objectResident(*this);
+         }
+       }
+ 
+@@ -851,9 +873,47 @@ class Server::ActorNamespace final {
+       KJ_UNREACHABLE;
+     }
+ 
++   public:
++    // Coworkerd: whether this object is resident (its Worker::Actor is alive) and whether it was evicted once, so
++    // that its next start counts as a wake.
++    bool isResident() const {
++      if (actor != kj::none) return true;
++      // A facet holds the tenant's class and its storage, so an object is resident while any of its facets is.
++      for (auto& facet: facets) {
++        if (facet.value->isResident()) return true;
++      }
++      return false;
++    }
++    bool isRoot() const {
++      return parent == kj::none;
++    }
++    // Evicts this object and its facets for the resident limit: their hibernatable WebSockets are hibernated (they
++    // stay connected) and their Worker::Actors are destroyed, so the next request starts them again on the same
++    // storage. False when nothing could be evicted -- a request was running in all of them.
++    kj::Promise<bool> evictForResidentLimit() {
++      bool any = false;
++      // A facet first: it is the one that holds the tenant's class, and the root's own eviction does not touch it.
++      kj::Vector<kj::Own<ActorContainer>> children(facets.size());
++      for (auto& facet: facets) children.add(facet.value->addRef());
++      for (auto& child: children) {
++        if (co_await child->evictForResidentLimit()) any = true;
++      }
++      if (actor != kj::none) {
++        if (co_await tryEvict("broken.dropped; Actor evicted for the resident object limit"_kj,
++                IoChannelFactory::EvictWebSocketMode::HIBERNATE)) {
++          any = true;
++          wasEvicted = true;
++          shutdownTask = kj::none;
++        }
++      }
++      co_return any;
++    }
++
+    private:
+     // The actor is constructed after the ActorContainer so it starts off empty.
+     kj::Maybe<kj::Own<Worker::Actor>> actor;
++    // Coworkerd: this object has been evicted at least once, so its next start is a wake.
++    bool wasEvicted = false;
+ 
+     kj::String key;
+     kj::Own<RequestTracker> tracker;
+@@ -1121,6 +1181,9 @@ class Server::ActorNamespace final {
+       }
+       // Destroy the last strong Worker::Actor reference.
+       actor = kj::none;
++      // Coworkerd: idle eviction counts like one for the resident limit -- the next start is a wake.
++      wasEvicted = true;
++      ns.objectEvicted();
+ 
+       // Drop our reference to the ContainerClient
+       // If setInactivityTimeout() was called, the timer still holds a reference
+@@ -1298,6 +1361,12 @@ class Server::ActorNamespace final {
+         return ns.config.tryGet<Durable>().map(
+             [&](const Durable& d) -> kj::Own<ActorCacheInterface> {
+           KJ_IF_SOME(as, ns.actorStorage) {
++            uint selfId = getFacetId();
++            // Coworkerd: the name the object's Host was made with, which is how the node knows it.
++            auto shippedName = root.durableObjectName.map([](kj::String& n) {
++              return kj::str(n);
++            }).orDefault([&]() { return kj::str(root.key); });
++
+             kj::Own<ActorSqlite::Hooks> sqliteHooks;
+             if (parent == kj::none) {
+               KJ_IF_SOME(a, ns.alarmScheduler) {
+@@ -1307,12 +1376,18 @@ class Server::ActorNamespace final {
+                 // No alarm scheduler available, use default hooks instance.
+                 sqliteHooks = fakeOwn(ActorSqlite::Hooks::getDefaultHooks());
+               }
++            } else if (durableLogEnabled()) {
++              // Coworkerd: a facet's alarm is scheduled by the node, not by this process's scheduler. Only the
++              // node can start a facet that is not running -- the facet's class comes from the Worker version the
++              // node names -- and the firing has to be an event of the object's Worker (its CPU topped up, its
++              // lease renewed, its lines kept). The time itself stays in this facet's own database, so it is
++              // replicated and recovered with the object; the hook only tells the node of every change.
++              sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
+             } else {
+               // A non-null `parent` means this is a facet, which has no alarm scheduler.
+               sqliteHooks = kj::heap<FacetAlarmHooks>();
+             }
+ 
+-            uint selfId = getFacetId();
+             auto path = getSqlitePathForId(selfId);
+             auto db = kj::heap<SqliteDatabase>(
+                 as.vfs, kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+@@ -1332,9 +1407,7 @@ class Server::ActorNamespace final {
+                 facetName = kj::str(key);
+               }
+               DurableObjectName name{
+-                .objectName = root.durableObjectName.map([](kj::String& n) {
+-                  return kj::str(n);
+-                }).orDefault([&]() { return kj::str(root.key); }),
++                .objectName = kj::str(shippedName),
+                 .storageId = kj::str(root.key),
+                 .facetId = selfId,
+                 .parentFacetId = parentFacetId,
+@@ -1371,6 +1444,13 @@ class Server::ActorNamespace final {
+                 return s->onCommit();
+               };
+             }
++            // Coworkerd: what this database holds as its alarm, told to the node at every open. A node that
++            // took the shard over has rebuilt these files from the object's replicated history, so this is where
++            // it learns what is still due and what has already run -- the per-process alarm record is rebuilt
++            // from the object's own databases, never carried over from the node that had it.
++            if (durableLogEnabled() && parent != kj::none) {
++              durableLogAlarm(shippedName, selfId, alarmOf(*db));
++            }
+             return kj::heap<ActorSqlite>(
+                 kj::mv(db), outputGate, kj::mv(commitCallback), *sqliteHooks)
+                 .attach(kj::mv(sqliteHooks));
+@@ -1651,7 +1731,85 @@ class Server::ActorNamespace final {
+     }
+   }
+ 
++  // ---- Coworkerd: the resident object limit ----
++  // One more object is resident: past the limit, the least recently used objects with nothing in flight are
++  // evicted until the count is back within it.
++  void objectResident(ActorContainer& container) {
++    if (!container.isRoot()) return;
++    countResident();
++    if (durableResidentLimit() == 0 || residency.resident <= durableResidentLimit()) return;
++    // One pass at a time, and never cleared from inside the pass: a promise's callback must not destroy itself.
++    if (enforcing) return;
++    enforcing = true;
++    residentTask = enforceResidentLimit().eagerlyEvaluate(
++        [](kj::Exception&& e) { KJ_LOG(ERROR, "the resident object limit could not be enforced", e); });
++  }
++  void objectEvicted() {
++    ++residency.evicted;
++    countResident();
++  }
++  void objectWoken(kj::Duration took) {
++    ++residency.woken;
++    ++residency.wakes;
++    uint64_t us = took / kj::MICROSECONDS;
++    residency.wakeUsTotal += us;
++    residency.wakeUsMax = kj::max(residency.wakeUsMax, us);
++    // A facet's wake does not change the resident count, so the report is asked for here.
++    countResident();
++  }
++
+  private:
++  void countResident() {
++    uint64_t resident = 0;
++    for (auto& entry: actors) {
++      if (entry.value->isResident()) ++resident;
++    }
++    residency.resident = resident;
++    residency.limit = durableResidentLimit();
++    reportResidency();
++  }
++  // Reported when the numbers change -- at most once per object started, evicted or woken, which is the same order
++  // as the messages a database's own open already costs.
++  void reportResidency() {
++    if (!durableLogEnabled()) return;
++    if (residency.resident == reported.resident && residency.limit == reported.limit &&
++        residency.evicted == reported.evicted && residency.woken == reported.woken &&
++        residency.wakeUsTotal == reported.wakeUsTotal) {
++      return;
++    }
++    reported = residency;
++    durableLogResidency(residency);
++  }
++  // The least recently used objects, evicted until the resident count is within the limit. An object a request
++  // reached in the meantime is left alone and the next one taken instead.
++  kj::Promise<void> enforceResidentLimit() {
++    auto release = kj::defer([this]() { enforcing = false; });
++    const uint64_t limit = durableResidentLimit();
++    countResident();
++    if (limit == 0 || residency.resident <= limit) co_return;
++    // The objects that may go, least recently used first: resident, with no client holding them. Pinned for the
++    // whole pass, since evicting one awaits the isolate lock and the map may change under us.
++    kj::Vector<kj::Own<ActorContainer>> pinned(actors.size());
++    kj::Vector<ActorContainer*> order(actors.size());
++    for (auto& entry: actors) {
++      auto& candidate = *entry.value;
++      if (!candidate.isResident()) continue;
++      pinned.add(candidate.addRef());
++      order.add(&candidate);
++    }
++    std::sort(order.begin(), order.end(), [](ActorContainer* a, ActorContainer* b) {
++      return a->getLastAccess() < b->getLastAccess();
++    });
++    for (auto* victim: order) {
++      countResident();
++      if (residency.resident <= limit) break;
++      if (!victim->isResident()) continue;
++      // False means a request reached it while we waited for the isolate lock: leave it and take the next one.
++      if (co_await victim->evictForResidentLimit()) ++residency.evicted;
++    }
++    countResident();
++  }
++
+   kj::Rc<ActorClass> actorClass;
+   const ActorConfig& config;
+   const kj::Clock& clock;
+@@ -1704,6 +1862,13 @@ class Server::ActorNamespace final {
+   ActorMap actors;
+ 
+   kj::Maybe<kj::Promise<void>> cleanupTask;
++  // Coworkerd: the resident object limit. The objects of a durable process cost memory even when they are idle, so
++  // at most `durableResidentLimit()` of them keep their Worker::Actor; past that the least recently used ones are
++  // evicted -- their hibernatable WebSockets hibernate rather than close, so the connections stay up and the next
++  // message wakes the object on the same storage. The numbers go to the node (the state endpoint reports them).
++  kj::Maybe<kj::Promise<void>> residentTask;
++  bool enforcing = false;
++  DurableResidency residency, reported;
+   kj::Timer& timer;
+   capnp::ByteStreamFactory& byteStreamFactory;
+   ChannelTokenHandler& channelTokenHandler;
+@@ -1861,18 +2026,33 @@ class Server::ActorNamespace final {
+     ActorKey actor;
+   };
+ 
+-  // Hooks used by facets, which have their own storage but no way to schedule alarms: the alarm
+-  // scheduler only knows how to deliver alarms to the root actor of a namespace.
+-  //
+-  // TODO(someday): Support alarms in facets, somehow.
++  // Hooks used by facets. The alarm scheduler of a namespace only knows how to deliver alarms to its root actors,
++  // so a facet's alarm is left to whoever can start that facet: with the Durable Object log on (Coworkerd), the
++  // node is told of every change and schedules the firing itself; without it, setting an alarm on a facet fails as
++  // it does upstream.
+   class FacetAlarmHooks final: public ActorSqlite::Hooks {
+    public:
++    FacetAlarmHooks() = default;
++    FacetAlarmHooks(kj::String objectName, uint facetId)
++        : shipped(ShippedFacet{kj::mv(objectName), facetId}) {}
++
+     kj::Promise<void> scheduleRun(
+         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
++      KJ_IF_SOME(facet, shipped) {
++        durableLogAlarm(facet.objectName, facet.facetId, newAlarmTime);
++        return kj::READY_NOW;
++      }
+       // Keep this message in sync with the equivalent error produced in actor-storage-factory.c++
+       // in the internal codebase.
+       JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
+     }
++
++   private:
++    struct ShippedFacet {
++      kj::String objectName;
++      uint facetId;
++    };
++    kj::Maybe<ShippedFacet> shipped;
+   };
+ };
+ 

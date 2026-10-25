@@ -187,6 +187,36 @@ private:
   uint32_t magic = 0, pageSize = 0, salt1 = 0, salt2 = 0, cksum1 = 0, cksum2 = 0, nextFrame = 0;
 };
 
+// ---- Alarms ----
+//   do/<ns>/shards/<s>/alarms/<objectId>   a hint: the next alarm of that object, so the node that takes the shard
+//                                          over knows which objects to wake. The time itself is in the object's own
+//                                          database (SQLite's _cf_METADATA), replicated and recovered with it, so
+//                                          this object is only ever a hint -- it is never read for correctness.
+std::string shardAlarmPrefix(const std::string& namespaceId, uint32_t shard);
+std::string shardAlarmKey(const std::string& namespaceId, uint32_t shard, const std::string& objectId);
+// What one node's objects hold, by tenant (nodes/<id>/durable-usage, overwritable): every node publishes its own
+// every hour and reads the others' for the durableObjectBytes quota.
+std::string nodeDurableUsageKey(const std::string& nodeId);
+
+// One database's alarm, as the durable process reports it (patches/workerd 0014).
+struct DurableAlarm {
+  std::string namespaceId, objectId, tenant;
+  uint32_t shard = 0, facetId = 0;
+  uint64_t dataEpoch = 0, shardEpoch = 0, atUnixMs = 0;
+  // How many times the handler has already been tried, for alarmInfo.retryCount.
+  uint32_t retryCount = 0;
+};
+// What firing one came to. FIRED: the handler ran and the object cleared its own alarm. NOT_DUE: the object's own
+// database holds another time (`atUnixMs`), which is the truth. FAILED: the handler threw, so it is tried again with
+// Cloudflare's backoff. UNAVAILABLE: the object could not be reached at all (this node no longer owns the shard, the
+// store is down), so nothing is counted against the retry limit.
+enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE };
+struct AlarmResult {
+  AlarmOutcome outcome = AlarmOutcome::FIRED;
+  uint64_t atUnixMs = 0;
+  std::string reason;
+};
+
 // ---- The replicator ----
 // What a node asks another for when it rebuilds an object of a shard it took over.
 struct DurableTailAsk {
@@ -239,6 +269,14 @@ public:
     std::function<kj::Promise<DurableTailAnswer>(std::string nodeId, DurableTailAsk ask)> fetchTail;
     std::function<uint64_t(const std::string& namespaceId, uint32_t shard)> knownShardEpoch;
     std::function<kj::Promise<void>(std::string reason)> closeObjects;
+    // Runs one object's alarm handler as an event of its Worker (its CPU topped up, its lease renewed, its lines
+    // kept): the firing of an alarm is a request to the object like any other, so only the node can do it.
+    std::function<kj::Promise<AlarmResult>(DurableAlarm alarm)> fireAlarm;
+    // The tenant's durableObjectBytes quota (0: none), as this node's deployment state holds it.
+    std::function<uint64_t(const std::string& tenant)> tenantQuotaBytes;
+    // Whether the namespace is still a tenant's active one: a deleted class's or a deleted database's objects are
+    // not served and stop counting against the tenant's storage.
+    std::function<bool(const std::string& namespaceId)> namespaceActive;
   };
   DurableLog(Settings settings, const ObjectStoreConfig& store, kj::Network& network, kj::Timer& timer,
       kj::LowLevelAsyncIoProvider& lowLevel, const MembershipView& membership, Hooks hooks);
@@ -246,6 +284,17 @@ public:
 
   // The node's membership epoch, as its records carry it; set at registration and at every new epoch.
   void setNodeEpoch(uint64_t nodeEpoch);
+  // The two hooks that need the dispatcher, which is built after this: firing an object's alarm as a request of its
+  // Worker, and the tenant's durableObjectBytes quota.
+  void setAlarmHook(std::function<kj::Promise<AlarmResult>(DurableAlarm alarm)> hook) {
+    hooks.fireAlarm = std::move(hook);
+  }
+  void setQuotaHook(std::function<uint64_t(const std::string& tenant)> hook) {
+    hooks.tenantQuotaBytes = std::move(hook);
+  }
+  void setNamespaceHook(std::function<bool(const std::string& namespaceId)> hook) {
+    hooks.namespaceActive = std::move(hook);
+  }
   // Reads this machine's Durable Object directory: the files are reused when the machine did not restart unclean
   // (the boot id beside them, and the marker a clean exit writes), and otherwise thrown away. Then this node's own
   // log files are read and the records no segment covers are replayed into the files they belong to, so that what a
@@ -266,7 +315,7 @@ public:
 
   // ---- The objects ----
   struct ObjectIdentity {
-    std::string namespaceId, objectId;
+    std::string namespaceId, objectId, tenant;
     uint64_t dataEpoch = 0, shardEpoch = 0;
     uint32_t shard = 0;
   };
@@ -283,6 +332,16 @@ public:
   kj::Promise<ObjectReady> openObject(ObjectIdentity identity);
   // The shard is this node's no longer (released, lost or dropped): its objects' records stop going out.
   void shardGone(const std::string& namespaceId, uint32_t shard, const std::string& reason);
+  // This node has taken the shard: the alarm hints of its objects are read, so the alarms the node before it had
+  // scheduled go on being fired here. Each one is checked against the object's own database when it fires.
+  void shardTaken(const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch, const std::string& tenant);
+
+  // ---- Durable Object storage per tenant (the durableObjectBytes quota) ----
+  // What this node's objects of the tenant hold, and what the cluster holds as the nodes last published it.
+  uint64_t tenantBytesHere(const std::string& tenant) const;
+  uint64_t tenantBytes(const std::string& tenant) const;
+  // The tenant's namespaces this node owns shards of, with their objects and bytes (the /v1 namespace view).
+  std::string namespacesJson(const std::string& tenant) const;
 
   // ---- As a peer ----
   // A log stream another node opens here: "" and a stream id, or the refusal.
@@ -321,7 +380,7 @@ private:
   };
   enum class ObjectState { UNKNOWN, REBUILDING, LOCAL, REPAIR, GONE };
   struct Object {
-    std::string namespaceId, objectId, storageId, objectName;
+    std::string namespaceId, objectId, storageId, objectName, tenant;
     uint64_t dataEpoch = 0, shardEpoch = 0;
     uint32_t shard = 0;
     ObjectState state = ObjectState::UNKNOWN;
@@ -338,6 +397,29 @@ private:
     std::string repairReason;
     uint64_t rebuilds = 0, repairs = 0;
     double lastRebuildMs = 0;
+    // What each of its databases holds as its alarm (0: none), as the durable process reports it.
+    std::map<uint32_t, uint64_t> alarms;
+  };
+  // One alarm this node has to fire, with its retries. Cloudflare's backoff: the first retry two seconds later,
+  // doubling, a quarter of jitter, and once the counted retries run out the delay doubles to about seventeen
+  // minutes. The time itself is the object's; this is only the schedule.
+  struct AlarmState {
+    std::string objectName, namespaceId, objectId, tenant;
+    uint32_t shard = 0, facetId = 0;
+    uint64_t dataEpoch = 0, shardEpoch = 0, atUnixMs = 0;
+    double notBeforeMs = 0;   // monotonic: a retry waits for it
+    uint32_t retries = 0, countedRetries = 0, backoff = 0;
+    bool firing = false;
+    // Read from the hint in the store rather than reported by the object: the object's own database decides when it
+    // is opened, and a hint that turns out to be stale is dropped.
+    bool fromHint = false;
+  };
+  // What one durable process reports of its resident objects (patches/workerd 0014).
+  struct Residency {
+    uint64_t resident = 0, limit = 0, evicted = 0, woken = 0, wakes = 0;
+    // As the process reports them, in microseconds: waking an object whose class is still loaded is sub-millisecond.
+    uint64_t wakeUsTotal = 0, wakeUsMax = 0;
+    double atMs = 0;
   };
   // A record this node sent and is waiting for its peers on.
   struct InFlight {
@@ -436,6 +518,28 @@ private:
   kj::Promise<void> resealEarlier();
   kj::Promise<void> dropColdFiles();
 
+  // The object's size from its databases, and the single-object limit judged on it.
+  void sized(Object& object);
+  bool namespaceCounts(const std::string& namespaceId) const;
+
+  // ---- alarms ----
+  void alarmReported(const std::string& objectName, uint32_t facetId, uint64_t atUnixMs);
+  kj::Promise<void> writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard, uint64_t atUnixMs,
+      uint32_t facetId);
+  kj::Promise<void> readAlarmHints(std::string namespaceId, uint32_t shard, uint64_t shardEpoch, std::string tenant);
+  kj::Promise<void> alarmLoop();
+  kj::Promise<void> fireAlarm(std::string key);
+
+  // ---- what this machine's files are at, so the same boot reuses them ----
+  std::filesystem::path positionPath(const std::string& storageId) const;
+  void writePosition(const Object& object);
+  void readPositions();
+
+  // ---- Durable Object storage per tenant ----
+  kj::Promise<void> usageLoop();
+  kj::Promise<void> publishUsage();
+  kj::Promise<void> readUsage();
+
   // ---- rebuilding an object ----
   kj::Promise<void> rebuild(std::string objectName, std::string reason);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
@@ -475,6 +579,12 @@ private:
   std::map<uint64_t, std::map<uint64_t, LogRecord>> earlier;
 
   std::map<std::string, Object> objects;         // objectName -> object
+  std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
+  std::map<std::string, Residency> residency;    // processId -> its resident objects
+  // What each node published of its tenants' Durable Object bytes, and what this node published last.
+  std::map<std::string, std::map<std::string, uint64_t>> publishedBytes;  // nodeId -> tenant -> bytes
+  double lastUsagePublishMs = 0, lastUsageReadMs = 0;
+  uint64_t usagePublishes = 0, usagePublishFailures = 0, usageReads = 0;
   std::map<std::string, Channel> channels;       // processId -> channel
   std::map<std::string, PeerStream> peers;       // nodeId -> stream
   std::map<uint64_t, InFlight> inFlight;         // nodeSeq -> what waits for its peers
@@ -493,6 +603,9 @@ private:
   uint64_t recordsTaken = 0, framesTaken = 0, bytesTaken = 0, overLimitAnswers = 0, recoverTimeouts = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0;
   uint64_t walCutBacks = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
+  uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
+  uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
+  uint64_t positionsReused = 0, positionWrites = 0, quotaRefusals = 0;
   bool sealing = false, noPeerWarned = false;
   double confirmMsTotal = 0, lastSegmentAtMs = 0, lastUploadAtMs = 0, lastRebuildMs = 0;
   std::vector<double> confirmSamples;

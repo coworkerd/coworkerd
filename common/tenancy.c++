@@ -108,6 +108,7 @@ constexpr QuotaField QUOTA_FIELDS[] = {
   {"logLinesPerSecond", &TenantQuotas::logLinesPerSecond}, {"logBufferBytes", &TenantQuotas::logBufferBytes},
   {"maxWorkerCpuMs", &TenantQuotas::maxWorkerCpuMs}, {"maxWorkerMemoryMiB", &TenantQuotas::maxWorkerMemoryMiB},
   {"durableObjectNamespaces", &TenantQuotas::durableObjectNamespaces},
+  {"durableObjectBytes", &TenantQuotas::durableObjectBytes},
 };
 }  // namespace
 

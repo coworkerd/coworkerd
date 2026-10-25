@@ -230,6 +230,10 @@ function __coworkerdTrial(namespace, classes, requested, durableClasses) {
 // Durable Object Bindings.
 const DO_OBJECT_HEADER = "x-coworkerd-do-object";
 const DO_HOPS_HEADER = "x-coworkerd-do-hops";
+// The object's alarm: the time the node scheduled and how many times the handler has been tried. The node sets them
+// on a request of its own; a tenant cannot reach the Host, and the Host sets them from the descriptor alone.
+const DO_ALARM_HEADER = "x-coworkerd-do-alarm";
+const DO_ALARM_RETRY_HEADER = "x-coworkerd-do-alarm-retry";
 const DURABLE_EXPORT_PREFIX = "__coworkerd_do_";
 const DURABLE_SOURCE = `
 const __coworkerdK = new Uint32Array([0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -323,16 +327,191 @@ function __coworkerdNamespace(entry) {
   };
   return Object.freeze(space);
 }
-// Each Durable Object Binding of a call or an object, by name.
+// Each Durable Object Binding of a call or an object, by name; a d1_databases Binding is a D1Database instead.
 function __coworkerdNamespaces(entries) {
   const out = {};
-  for (const entry of Array.isArray(entries) ? entries : []) out[entry.binding] = __coworkerdNamespace(entry);
+  for (const entry of Array.isArray(entries) ? entries : [])
+    out[entry.binding] = entry.database ? __coworkerdD1(entry) : __coworkerdNamespace(entry);
   return out;
+}
+// A d1_databases Binding. The wire protocol is the one workerd's own D1 wrapper speaks
+// (src/cloudflare/internal/d1-api.ts): POST /query and /execute on the database with {sql, params} (or an array of
+// them) and resultsFormat, answered with {success, meta, results} -- rows and columns, or an array of objects. The
+// database is one Durable Object of the platform's own SQL Worker class, so every statement goes to its owner over
+// the same path a Durable Object call takes. prepare/bind/first/run/all/raw, batch and exec are all this protocol;
+// Sessions (withSession, query) and dump are not part of this release (docs/compatibility.md, section 7).
+function __coworkerdD1Values(values) {
+  return values.map((value) => {
+    const kind = typeof value;
+    if (kind === "number" || kind === "string") return value;
+    if (kind === "boolean") return value ? 1 : 0;
+    if (kind === "object") {
+      if (value == null) return value;
+      if (Array.isArray(value) && value.every((b) => typeof b === "number" && b >= 0 && b < 256)) return value;
+      if (value instanceof ArrayBuffer) return Array.from(new Uint8Array(value));
+      if (ArrayBuffer.isView(value)) return Array.from(value);
+    }
+    throw new Error("D1_TYPE_ERROR: Type '" + kind + "' not supported for value '" + value + "'",
+      { cause: new Error("Type '" + kind + "' not supported for value '" + value + "'") });
+  });
+}
+const __coworkerdD1First = (results) => Array.isArray(results) ? results.at(0) : results;
+// The shim D1's own wrapper applies: rows and columns become an array of objects, a missing results an empty one.
+function __coworkerdD1Objects(answer) {
+  if (!("results" in answer)) return { ...answer, results: [] };
+  const results = answer.results;
+  if (Array.isArray(results)) return { ...answer, results };
+  const { rows, columns } = results;
+  return { ...answer, results: rows.map((row) => Object.fromEntries(row.map((cell, i) => [columns[i], cell]))) };
+}
+async function __coworkerdD1Send(entry, endpoint, query, params, resultsFormat) {
+  const body = JSON.stringify(Array.isArray(query)
+    ? query.map((sql, index) => ({ sql, params: params[index] }))
+    : { sql: query, params });
+  const headers = new Headers({ "content-type": "application/json" });
+  headers.set(${JSON.stringify(DO_OBJECT_HEADER)}, entry.objectId);
+  const url = "http://d1" + endpoint + "?resultsFormat=" + resultsFormat;
+  let answer;
+  try {
+    const response = await entry.fetcher.fetch(new Request(url, { method: "POST", headers, body }));
+    answer = await response.json();
+  } catch (error) {
+    const message = String(error?.cause?.message ?? error?.message ?? error) || "Something went wrong";
+    throw new Error("D1_ERROR: " + message, { cause: new Error(message) });
+  }
+  // A statement that failed carries an error alone; a refusal of the platform (the object too large, the tenant's
+  // quota, the storage) carries its code as well, which goes into the message the caller sees.
+  const failed = (one) => ({ success: false, error: one.code ? one.code + ": " + (one.reason ?? one.error) : one.error });
+  return Array.isArray(answer)
+    ? answer.map((one) => (one?.error ? failed(one) : one))
+    : answer?.error ? failed(answer) : answer;
+}
+async function __coworkerdD1SendOrThrow(entry, endpoint, query, params, resultsFormat) {
+  const results = await __coworkerdD1Send(entry, endpoint, query, params, resultsFormat);
+  const first = __coworkerdD1First(results);
+  if (!first?.success) {
+    const message = first?.error ?? "Something went wrong";
+    throw new Error("D1_ERROR: " + message, { cause: new Error(message) });
+  }
+  return results;
+}
+class __coworkerdD1PreparedStatement {
+  #entry;
+  constructor(entry, statement, values) {
+    this.#entry = entry;
+    this.statement = statement;
+    this.params = values || [];
+  }
+  bind(...values) {
+    return new __coworkerdD1PreparedStatement(this.#entry, this.statement, __coworkerdD1Values(values));
+  }
+  async first(column) {
+    const info = __coworkerdD1First(
+      await __coworkerdD1SendOrThrow(this.#entry, "/query", this.statement, this.params, "ROWS_AND_COLUMNS"));
+    const results = __coworkerdD1Objects(info).results;
+    if (results.length === 0) return null;
+    const first = results.at(0);
+    if (column === undefined) return first;
+    if (first?.[column] === undefined) {
+      throw new Error("D1_COLUMN_NOTFOUND: Column not found (" + column + ")", { cause: new Error("Column not found") });
+    }
+    return first[column];
+  }
+  async run() {
+    return __coworkerdD1First(
+      await __coworkerdD1SendOrThrow(this.#entry, "/execute", this.statement, this.params, "NONE"));
+  }
+  async all() {
+    return __coworkerdD1Objects(__coworkerdD1First(
+      await __coworkerdD1SendOrThrow(this.#entry, "/query", this.statement, this.params, "ROWS_AND_COLUMNS")));
+  }
+  async raw(options) {
+    const answer = __coworkerdD1First(
+      await __coworkerdD1SendOrThrow(this.#entry, "/query", this.statement, this.params, "ROWS_AND_COLUMNS"));
+    if (!("results" in answer)) return [];
+    const results = answer.results;
+    if (Array.isArray(results)) {
+      const raw = [];
+      for (const row of results) {
+        if (options?.columnNames && raw.length === 0) raw.push(Array.from(Object.keys(row)));
+        raw.push(Object.keys(row).map((key) => row[key]));
+      }
+      return raw;
+    }
+    return [...(options?.columnNames ? [results.columns] : []), ...results.rows];
+  }
+}
+function __coworkerdD1(entry) {
+  const unavailable = () => new Error("D1_ERROR: the database " + (entry?.database ?? "") +
+    " cannot be used (it does not exist, or it is being deleted)");
+  const usable = typeof entry?.objectId === "string" && entry.objectId.length === 64 && entry.fetcher;
+  const database = {
+    prepare(statement) {
+      if (!usable) throw unavailable();
+      return new __coworkerdD1PreparedStatement(entry, statement);
+    },
+    async batch(statements) {
+      if (!usable) throw unavailable();
+      const list = Array.from(statements ?? []);
+      const answers = await __coworkerdD1SendOrThrow(entry, "/query", list.map((one) => one.statement),
+        list.map((one) => one.params), "ROWS_AND_COLUMNS");
+      return (Array.isArray(answers) ? answers : [answers]).map(__coworkerdD1Objects);
+    },
+    async exec(query) {
+      if (!usable) throw unavailable();
+      const lines = String(query).trim().split("\\n");
+      const answers = await __coworkerdD1Send(entry, "/execute", lines, [], "NONE");
+      const results = Array.isArray(answers) ? answers : [answers];
+      let duration = 0;
+      for (const [index, one] of results.entries()) {
+        if (!one?.success) {
+          const message = one?.error || "Something went wrong";
+          const legacy = "Error in line " + (index + 1) + ": " + lines[index] + ": " + message;
+          throw new Error("D1_EXEC_ERROR: " + legacy, { cause: new Error(legacy) });
+        }
+        duration += one.meta?.duration ?? 0;
+      }
+      return { count: results.length, duration };
+    },
+    async dump() {
+      throw new Error("D1_ERROR: dump() is not supported on this platform");
+    },
+    withSession() {
+      throw new Error("D1_ERROR: the D1 Sessions API is not supported on this platform");
+    },
+    async query() {
+      throw new Error("D1_ERROR: D1Database.query() is not supported on this platform");
+    },
+  };
+  return Object.freeze(database);
 }
 const __coworkerdObjectEnvs = new WeakMap();
 // The class a declared class runs as: the tenant's, constructed with its object's env, and its fetch run within it
 // (import { env } from "cloudflare:workers" sees the same). A class that is not exported fails when its object starts
 // (the trial load refuses such a version first).
+// The object's alarm, which the node schedules and fires as an event of this Worker. The time in the object's own
+// database is the truth: a firing the node asked for that the database does not hold any more runs nothing. A
+// handler that ran leaves no alarm behind -- the delete is part of the object's own transaction, which its peers
+// confirm before this answer leaves, so the shard's next owner never fires it again.
+async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
+  const storage = object?.ctx?.storage;
+  if (!storage) return Response.json({ outcome: "notDue", atUnixMs: 0, reason: "the object has no storage" });
+  const held = await storage.getAlarm();
+  if (held === null || held === undefined) return Response.json({ outcome: "notDue", atUnixMs: 0 });
+  if (held > Date.now()) return Response.json({ outcome: "notDue", atUnixMs: held });
+  if (typeof object.alarm !== "function") {
+    // Nothing can ever run it: the alarm goes rather than being retried for ever.
+    await storage.deleteAlarm();
+    return Response.json({ outcome: "fired", atUnixMs: 0, reason: "the class has no alarm() handler" });
+  }
+  try {
+    await object.alarm({ retryCount, isRetry: retryCount > 0 });
+  } catch (error) {
+    return Response.json({ outcome: "failed", reason: String(error?.message ?? error).slice(0, 300) });
+  }
+  if ((await storage.getAlarm()) === held) await storage.deleteAlarm();
+  return Response.json({ outcome: "fired", atUnixMs: 0 });
+}
 function __coworkerdDurableClass(namespace, name) {
   const base = Object.prototype.hasOwnProperty.call(namespace, name) ? namespace[name] : undefined;
   const missing = class { constructor() { throw new Error("Durable Object class " + name + " is not a class of this version"); } };
@@ -346,11 +525,18 @@ function __coworkerdDurableClass(namespace, name) {
       }
     };
     const fetch = base.prototype?.fetch;
-    if (typeof fetch === "function") {
-      Object.defineProperty(wrapped.prototype, "fetch", { configurable: true, writable: true, value: function (...args) {
-        return withEnv(__coworkerdObjectEnvs.get(this), () => fetch.apply(this, args));
-      } });
-    }
+    Object.defineProperty(wrapped.prototype, "fetch", { configurable: true, writable: true, value: function (...args) {
+      const env = __coworkerdObjectEnvs.get(this);
+      let scheduled = null, retry = 0;
+      try {
+        scheduled = args[0]?.headers?.get(${JSON.stringify(DO_ALARM_HEADER)}) ?? null;
+        retry = Number(args[0]?.headers?.get(${JSON.stringify(DO_ALARM_RETRY_HEADER)}) ?? 0) || 0;
+      } catch {}
+      if (scheduled !== null) return withEnv(env, () => __coworkerdAlarm(this, Number(scheduled), retry));
+      if (typeof fetch !== "function")
+        throw new Error("Durable Object class " + name + " has no fetch handler");
+      return withEnv(env, () => fetch.apply(this, args));
+    } });
     Object.defineProperty(wrapped, "name", { value: name });
     return wrapped;
   } catch {
@@ -385,14 +571,19 @@ const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const DECIMAL = /^[0-9]{1,20}$/;
 // The descriptor's Durable Object fields, when present: the version's namespace Bindings, a request's object, the
 // declared classes.
+const RESOURCE_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 function durableFieldsValid(value) {
   const bindings = value.durableObjects, target = value.durableObject, classes = value.durableObjectClasses;
   if (bindings !== undefined && !(Array.isArray(bindings) && bindings.every(b => b !== null && typeof b === "object" &&
-      typeof b.name === "string" && CLASS_NAME.test(b.className ?? "") && (b.namespaceId === "" || SHA256_HEX.test(b.namespaceId ?? ""))))) return false;
+      typeof b.name === "string" && CLASS_NAME.test(b.className ?? "") && (b.namespaceId === "" || SHA256_HEX.test(b.namespaceId ?? "")) &&
+      (b.database === undefined || b.database === "" || RESOURCE_NAME.test(b.database)) &&
+      (b.objectId === undefined || b.objectId === "" || SHA256_HEX.test(b.objectId))))) return false;
   if (target !== undefined && !(target !== null && typeof target === "object" && SHA256_HEX.test(target.namespaceId ?? "") &&
       SHA256_HEX.test(target.objectId ?? "") && CLASS_NAME.test(target.className ?? "") && Number.isInteger(target.hops ?? 0) &&
       Number.isInteger(target.shard ?? 0) && DECIMAL.test(String(target.shardEpoch ?? "0")) &&
-      DECIMAL.test(String(target.dataEpoch ?? "0")))) return false;
+      DECIMAL.test(String(target.dataEpoch ?? "0")) &&
+      (target.database === undefined || target.database === "" || RESOURCE_NAME.test(target.database)) &&
+      (target.alarmAtUnixMs === undefined || DECIMAL.test(String(target.alarmAtUnixMs))))) return false;
   if (classes !== undefined && !(Array.isArray(classes) && classes.every(name => typeof name === "string" && CLASS_NAME.test(name)))) return false;
   return true;
 }
@@ -645,8 +836,8 @@ function tenantCf(descriptor, env) {
 // or the calling object.
 export class DurableNamespace extends WorkerEntrypoint {
   async fetch(request) {
-    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, treeId, parentInvocationId, orderSequence,
-      expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
+    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, treeId, parentInvocationId,
+      orderSequence, expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
     const objectId = request.headers.get(DO_OBJECT_HEADER);
     if (typeof workerId !== "string" || typeof versionId !== "string" || !SHA256_HEX.test(contentHash ?? "") ||
         !SHA256_HEX.test(definitionHash ?? "") || !SHA256_HEX.test(namespaceId ?? "") || !CLASS_NAME.test(className ?? "") ||
@@ -663,7 +854,7 @@ export class DurableNamespace extends WorkerEntrypoint {
         treeId: fromObject ? "" : treeId, parentInvocationId: fromObject ? "" : parentInvocationId,
         callSequence, orderSequence: !fromObject && requiresChildSequence ? (orderSequence || callSequence) : 0,
         expiresAtMonotonicMs: fromObject ? 0 : expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: "",
-        durableObject: { namespaceId, className, objectId,
+        durableObject: { namespaceId, className, objectId, database: database ?? "",
           callerNamespaceId: fromObject ? caller.namespaceId : "", callerObjectId: fromObject ? caller.objectId : "" },
       },
     });
@@ -674,10 +865,11 @@ export class DurableNamespace extends WorkerEntrypoint {
 // namespace that cannot be used).
 function durableBindings(descriptor, ctx, caller) {
   return (descriptor.durableObjects ?? []).map(binding => ({ binding: binding.name, className: binding.className,
-    namespaceId: binding.namespaceId,
+    namespaceId: binding.namespaceId, database: binding.database ?? "", objectId: binding.objectId ?? "",
     fetcher: binding.namespaceId ? ctx.exports.DurableNamespace({ props: {
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
-      definitionHash: descriptor.definitionHash, namespaceId: binding.namespaceId, className: binding.className, ...caller,
+      definitionHash: descriptor.definitionHash, namespaceId: binding.namespaceId, className: binding.className,
+      database: binding.database ?? "", ...caller,
     } }) : null }));
 }
 
@@ -689,6 +881,7 @@ function facetCode(error) {
   const reason = String(error?.message ?? error);
   if (reason.includes("STORAGE_UNAVAILABLE")) return "STORAGE_UNAVAILABLE";
   if (reason.includes("DO_OBJECT_TOO_LARGE")) return "DO_OBJECT_TOO_LARGE";
+  if (reason.includes("QUOTA_EXCEEDED")) return "QUOTA_EXCEEDED";
   if (error?.remote === true) return "EXECUTION_FAILED";
   return reason.includes("CPU_LIMIT_EXCEEDED") ? "CPU_LIMIT_EXCEEDED"
     : reason.includes("MEMORY_LIMIT_EXCEEDED") ? "MEMORY_LIMIT_EXCEEDED" : "EXECUTION_FAILED";
@@ -709,13 +902,26 @@ export class Host extends DurableObject {
     const descriptor = descriptorFrom(request);
     const target = descriptor.durableObject;
     if (!target) throw new Error("Missing Durable Object target");
-    const key = loaderKey(descriptor) + "#" + target.className;
+    // A database's object runs this runtime's own SQL Worker class, so its facet does not depend on a version; a
+    // Worker's class does, and a version activated since starts the new class on the same storage.
+    const key = target.database ? "database#" + target.database : loaderKey(descriptor) + "#" + target.className;
     if (this.facetKey !== undefined && this.facetKey !== key) this.abortFacet("the Worker's active version changed");
     this.facetKey = key;
     try {
       const facet = this.ctx.facets.get("app", () => this.start(descriptor));
       const headers = new Headers(request.headers);
       headers.set(DO_HOPS_HEADER, String(target.hops ?? 0));
+      // The node's own request: the object's alarm. Only the node can send one (a tenant never reaches the Host),
+      // and the headers come from the descriptor, never from the request the node relayed.
+      // A 64-bit field comes through as a string of decimal digits (Cap'n Proto's JSON).
+      const alarmAtUnixMs = Number(target.alarmAtUnixMs ?? 0);
+      if (alarmAtUnixMs > 0) {
+        headers.set(DO_ALARM_HEADER, String(alarmAtUnixMs));
+        headers.set(DO_ALARM_RETRY_HEADER, String(Number(target.alarmRetryCount ?? 0)));
+      } else {
+        headers.delete(DO_ALARM_HEADER);
+        headers.delete(DO_ALARM_RETRY_HEADER);
+      }
       return await facet.fetch(new Request(request, { headers, cf: tenantCf(descriptor, this.env) }));
     } catch (error) {
       const reason = String(error?.message ?? error);
@@ -727,8 +933,10 @@ export class Host extends DurableObject {
         return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
           code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
           code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
-          code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" : "Durable Object reset",
-          code, reason: reason.slice(0, 300) }, { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : 503 });
+          code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" :
+          code === "QUOTA_EXCEEDED" ? "the tenant's Durable Object storage quota is exhausted" : "Durable Object reset",
+          code, reason: reason.slice(0, 300) },
+          { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : code === "QUOTA_EXCEEDED" ? 422 : 503 });
       }
       // The class threw: the object stays, as on Cloudflare -- the same instance takes the next request -- and the
       // caller gets the exception's message.
@@ -741,10 +949,83 @@ export class Host extends DurableObject {
   }
   start(descriptor) {
     const target = descriptor.durableObject, env = this.env, ctx = this.ctx;
+    // A database: this runtime's own SQL Worker class, taken from the SQL_CLASS Binding (a Durable Object class
+    // Binding without a namespace of its own, which is what a facet's class may be). No tenant code is loaded.
+    if (target.database) return { class: env.SQL_CLASS, id: target.objectId };
     const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx));
     const durableObjects = durableBindings(descriptor, ctx, { caller: { namespaceId: target.namespaceId, objectId: target.objectId } });
     return { class: worker.getDurableObjectClass(DURABLE_EXPORT_PREFIX + target.className, { props: { durableObjects } }),
       id: target.objectId };
+  }
+}
+
+// The platform's own SQL Worker class: a tenant's database is one object of it (docs/compatibility.md, section 7).
+// It answers the protocol workerd's own D1 wrapper speaks -- POST /query and /execute with {sql, params} or an array
+// of them and a resultsFormat, answered with {success, meta, results} -- so the same statements reach it from a
+// d1_databases Binding and from the HTTP SQL interface of /v1. Its storage is the object's own SQLite, which the
+// node replicates and rebuilds like any other object's.
+export class SqlDatabase extends DurableObject {
+  async fetch(request) {
+    // The node's own alarm request: a database has no alarm handler, so the alarm goes rather than being retried.
+    const scheduled = request.headers.get(DO_ALARM_HEADER);
+    if (scheduled !== null) {
+      const held = await this.ctx.storage.getAlarm();
+      if (held !== null && held !== undefined) await this.ctx.storage.deleteAlarm();
+      return Response.json({ outcome: "fired", atUnixMs: 0, reason: "a database has no alarm() handler" });
+    }
+    const { pathname, searchParams } = new URL(request.url);
+    const query = pathname === "/query", execute = pathname === "/execute";
+    if (request.method !== "POST" || (!query && !execute)) {
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "the body of a statement is JSON" }, { status: 400 });
+    }
+    const asked = searchParams.get("resultsFormat");
+    const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
+    const one = (statement) => {
+      try {
+        return this.runStatement(statement, resultsFormat);
+      } catch (error) {
+        // What D1 does with a failing statement: the answer says so, it is not an exception of the object.
+        return { success: false, error: String(error instanceof Error ? error.message : error) };
+      }
+    };
+    return Response.json(Array.isArray(body) ? body.map(one) : one(body));
+  }
+
+  runStatement(statement, resultsFormat) {
+    const { sql, params = [] } = statement ?? {};
+    if (typeof sql !== "string") throw new Error("a statement names its sql");
+    const sqlite = this.ctx.storage.sql;
+    const counters = sqlite.prepare("SELECT total_changes() AS changes, last_insert_rowid() AS last_row_id");
+    const sizeBefore = sqlite.databaseSize;
+    const [[changesBefore, lastRowBefore]] = Array.from(counters().raw());
+    const cursor = sqlite.prepare(sql)(...params);
+    const columns = cursor.columnNames;
+    const rows = Array.from(cursor.raw());
+    const results = resultsFormat === "ROWS_AND_COLUMNS"
+      ? { columns, rows }
+      : rows.map((row) => Object.fromEntries(columns.map((column, i) => [column, row[i]])));
+    const [[changesAfter, lastRowAfter]] = Array.from(counters().raw());
+    const sizeAfter = sqlite.databaseSize;
+    const changes = changesAfter - changesBefore;
+    return {
+      success: true,
+      results,
+      meta: {
+        duration: 0,
+        changes,
+        last_row_id: lastRowAfter,
+        changed_db: changes !== 0 || lastRowAfter !== lastRowBefore || sizeAfter !== sizeBefore,
+        size_after: sizeAfter,
+        rows_read: cursor.rowsRead,
+        rows_written: cursor.rowsWritten,
+      },
+    };
   }
 }
 

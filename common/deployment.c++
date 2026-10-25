@@ -174,6 +174,14 @@ void validateDurableObjects(const VersionDefinition& version, std::set<std::stri
     KJ_REQUIRE(environmentName(binding.binding), "invalid Durable Object Binding name", binding.binding.c_str());
     KJ_REQUIRE(names.insert(binding.binding).second, "duplicate Durable Object Binding or a collision with a variable, secret or Binding",
         binding.binding.c_str());
+    // A database Binding names one of the tenant's databases, not a class of this version: its class is the
+    // platform's own SQL Worker class, which no version declares.
+    if (!binding.database.empty()) {
+      KJ_REQUIRE(binding.className == DATABASE_CLASS_NAME, "a database Binding names another class",
+          binding.binding.c_str(), binding.className.c_str());
+      KJ_REQUIRE(deploymentSafeName(binding.database), "invalid database name", binding.database.c_str());
+      continue;
+    }
     KJ_REQUIRE(declared.contains(binding.className), "a Durable Object Binding names a class the version does not declare",
         binding.binding.c_str(), binding.className.c_str());
   }
@@ -331,6 +339,15 @@ std::string definitionEncoding(const VersionDefinition& version) {
     }
     uint32(out, version.renamedClasses.size());
     for (const auto& rename : version.renamedClasses) { stringField(out, rename.from); stringField(out, rename.to); }
+    // The database Bindings, appended only when the version has any: a version with Durable Objects alone keeps its
+    // bytes and its hash.
+    std::vector<const DurableObjectBindingDefinition*> d1;
+    for (const auto& binding : bindings) if (!binding.database.empty()) d1.push_back(&binding);
+    if (!d1.empty()) {
+      stringField(out, "databases");
+      uint32(out, d1.size());
+      for (const auto* binding : d1) { stringField(out, binding->binding); stringField(out, binding->database); }
+    }
   }
   return out;
 }
@@ -394,7 +411,8 @@ std::string definitionJson(const VersionDefinition& version) {
 std::string durableObjectsJson(const VersionDefinition& version) {
   std::string out = "[";
   for (const auto& binding : sortedDurableBindings(version))
-    out += std::string(out.size() > 1 ? "," : "") + "{\"binding\":" + quote(binding.binding) + ",\"className\":" + quote(binding.className) + '}';
+    out += std::string(out.size() > 1 ? "," : "") + "{\"binding\":" + quote(binding.binding) + ",\"className\":" +
+        quote(binding.className) + (binding.database.empty() ? std::string() : ",\"database\":" + quote(binding.database)) + '}';
   return out + ']';
 }
 std::string durableClassesJson(const VersionDefinition& version) {
@@ -527,7 +545,9 @@ std::string routeValueJson(const RouteDefinition& route) {
 namespace {
 void readDurableObjects(VersionDefinition& version, capnp::List<rpc::DurableObjectBinding>::Reader bindings,
     kj::Maybe<rpc::DurableObjectClasses::Reader> classes) {
-  for (auto binding : bindings) version.durableObjects.push_back({binding.getBinding().cStr(), binding.getClassName().cStr()});
+  for (auto binding : bindings)
+    version.durableObjects.push_back(
+        {binding.getBinding().cStr(), binding.getClassName().cStr(), binding.getDatabase().cStr()});
   KJ_IF_SOME(value, classes) {
     for (auto name : value.getDeclared()) version.declaredClasses.emplace_back(name.cStr());
     for (auto name : value.getDeleted()) version.deletedClasses.emplace_back(name.cStr());
@@ -993,6 +1013,20 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
       if (usableBefore != usableAfter && workerMap.contains(worker)) { observe(worker); retract(worker); touched.insert(worker); }
       continue;
     }
+    if (local == "databases") {
+      // <tenant>/databases: the tenant's databases, each a namespace of its own. Like the namespaces key, it changes
+      // no definition, pin or validity -- a request to a database's object reads it when it is dispatched.
+      databaseMap.erase(tenant);
+      if (!change.value) { unknownKeys.erase(key); continue; }
+      try {
+        auto decoded = decodeNamespacesState(*change.value);
+        if (!decoded.empty()) databaseMap.emplace(tenant, std::move(decoded));
+        unknownKeys.erase(key);
+      } catch (const kj::Exception&) {
+        unknown();
+      }
+      continue;
+    }
     if (local.starts_with("namespaces/")) {
       // <tenant>/namespaces/<worker>: the Worker's Durable Object namespaces. They change no definition, pin or validity:
       // a request to an object reads them when it is dispatched.
@@ -1450,6 +1484,33 @@ const DurableObjectNamespace* DeploymentState::durableNamespace(const std::strin
   if (!all) return nullptr;
   auto found = all->find(className);
   return found == all->end() ? nullptr : &found->second;
+}
+
+const std::map<std::string, DurableObjectNamespace>* DeploymentState::databases(const std::string& tenant) const {
+  auto found = databaseMap.find(tenant);
+  return found == databaseMap.end() ? nullptr : &found->second;
+}
+const DurableObjectNamespace* DeploymentState::database(const std::string& tenant, const std::string& name) const {
+  const auto* all = databases(tenant);
+  if (!all) return nullptr;
+  auto found = all->find(name);
+  return found == all->end() ? nullptr : &found->second;
+}
+
+std::optional<DeploymentState::NamespaceOwner> DeploymentState::namespaceOwner(const std::string& namespaceId) const {
+  for (const auto& [workerId, spaces] : namespaceMap) {
+    for (const auto& [className, space] : spaces) {
+      if (space.id != namespaceId) continue;
+      return NamespaceOwner{tenantOf(workerId), workerId, className, {}, space.status, space.shards};
+    }
+  }
+  for (const auto& [tenant, names] : databaseMap) {
+    for (const auto& [name, space] : names) {
+      if (space.id != namespaceId) continue;
+      return NamespaceOwner{tenant, {}, DATABASE_CLASS_NAME, name, space.status, space.shards};
+    }
+  }
+  return std::nullopt;
 }
 
 const SecretValue* DeploymentState::secret(const std::string& workerId, const std::string& name) const {
