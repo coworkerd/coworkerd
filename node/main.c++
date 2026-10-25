@@ -316,6 +316,12 @@ struct InvocationLeaseState {
   double expiresAtMonotonicMs;
   SharedVersionPins pins;
   std::string ingressServerId;
+  // A WebSocket connection's lease (ServerCore::renewLease): the deadline the runtime was given, which its Binding calls
+  // present, once the lease was renewed past it (0: never renewed), and whether the open connection holds the lease, so
+  // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
+  double presentedExpiresAtMonotonicMs = 0;
+  bool held = false;
+  bool presents(double value) const { return value == (presentedExpiresAtMonotonicMs > 0 ? presentedExpiresAtMonotonicMs : expiresAtMonotonicMs); }
 };
 
 struct ChildAllocation {
@@ -375,11 +381,17 @@ bool rerouteAfter(const InvocationRejection& refusal) {
   return refusal.code != "RESULT_UNCERTAIN" && (refusal.code != "LOAD_FAILED" || refusal.category == PACKAGE_UNAVAILABLE);
 }
 
+class ServerCore;
 struct AdmissionSlot {
   std::function<void()> release;
   std::shared_ptr<coworkerd::ProcessCall> process;
   SharedPathTiming timing;
   std::string entrypoint;
+  // An ingress root's (here or forwarded from another ingress), and that ingress: its response may become a WebSocket
+  // connection (AdmissionHttpService), which gives the slot back at the 101.
+  ServerCore* server = nullptr;
+  bool root = false;
+  std::string ingressNodeId;
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
   ~AdmissionSlot() { finish(); }
   void finish() { if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
@@ -406,6 +418,120 @@ TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& n
     bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB);
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call = {});
+
+// ---- Inbound WebSocket connections (docs/compatibility.md, section 7) ----
+// A connection is a request whose Worker answered 101. It has a relay on the node whose ingress holds the client's
+// connection and one on the node that executes the Worker -- back to back when that is the same node --, each passing
+// messages and close frames on as they come (WebSocketRelay, below). The registry holds this node's relays: the drain and
+// a retiring process generation tell theirs to go away (1001), it counts the ingress's connections per tenant against
+// ingress.webSocketsPerTenant, and it keeps the counts the state endpoint shows.
+class WebSocketRegistry final {
+public:
+  enum class Role { INGRESS, EXECUTION };
+  static const char* roleName(Role role) { return role == Role::INGRESS ? "ingress" : "execution"; }
+  class Relay {
+  public:
+    virtual void goAway(const std::string& cause) = 0;
+    Role role = Role::INGRESS;
+    std::string tenant, processId;
+    uint64_t generation = 0;
+  protected:
+    ~Relay() = default;
+  };
+  // What a relay counted when it ended: the close code its outer side ended with (1006: no close frame), who closed
+  // first, why the node ended it, its messages.
+  struct Ended {
+    uint16_t code = 1006;
+    std::string direction, cause;
+    uint64_t toWorker = 0, toClient = 0;
+  };
+  explicit WebSocketRegistry(uint32_t perTenant): perTenant(perTenant) {}
+  uint32_t limitPerTenant() const { return perTenant; }
+  // An upgrade at the ingress takes one of its tenant's places before it is sent on, and gives it back when its request
+  // ends -- a refused upgrade at once, a connection when it closes --, so that upgrades in flight count as well. False:
+  // the tenant holds as many places on this node as the limit allows.
+  bool reserve(const std::string& tenant) {
+    if (perTenant != 0 && placesOf(tenant) >= perTenant) {
+      ++refusedByTenant[tenant];
+      return false;
+    }
+    ++places[tenant];
+    return true;
+  }
+  void release(const std::string& tenant) {
+    auto found = places.find(tenant);
+    KJ_ASSERT(found != places.end() && found->second > 0, "WebSocket place underflow");
+    if (--found->second == 0) places.erase(found);
+  }
+  uint32_t placesOf(const std::string& tenant) const {
+    auto found = places.find(tenant);
+    return found == places.end() ? 0 : found->second;
+  }
+  void opened(Relay& relay) {
+    relays.insert(&relay);
+    ++open[index(relay.role)][relay.tenant];
+    ++openedTotal[index(relay.role)];
+  }
+  void closed(Relay& relay, const Ended& ended) {
+    relays.erase(&relay);
+    auto& tenants = open[index(relay.role)];
+    if (auto found = tenants.find(relay.tenant); found != tenants.end() && --found->second == 0) tenants.erase(found);
+    auto& totals = closedTotals[index(relay.role)];
+    ++totals.codes[std::to_string(ended.code)];
+    if (!ended.cause.empty()) ++totals.causes[ended.cause];
+    totals.toWorker += ended.toWorker;
+    totals.toClient += ended.toClient;
+  }
+  // Every relay here (the drain), or those executing on one process generation (its rotation), told to go away.
+  uint32_t goAway(const std::string& cause) { return goAwayWhere(cause, [](const Relay&) { return true; }); }
+  uint32_t goAwayGeneration(const std::string& processId, uint64_t generation, const std::string& cause) {
+    return goAwayWhere(cause, [&](const Relay& relay) {
+      return relay.role == Role::EXECUTION && relay.processId == processId && relay.generation == generation;
+    });
+  }
+  size_t openCount() const { return relays.size(); }
+  size_t openCount(Role role) const {
+    return static_cast<size_t>(std::count_if(relays.begin(), relays.end(), [role](const Relay* relay) { return relay->role == role; }));
+  }
+  std::string json() const {
+    auto counts = [](const std::map<std::string, uint64_t>& values) {
+      std::string out = "{";
+      for (const auto& [key, count] : values) out += (out.size() > 1 ? "," : "") + ("\"" + jsonEscape(key) + "\":") + std::to_string(count);
+      return out + "}";
+    };
+    std::string out = "{\"limitPerTenant\":" + std::to_string(perTenant) + ",\"open\":" + std::to_string(relays.size());
+    for (auto role : {Role::INGRESS, Role::EXECUTION}) {
+      const auto i = index(role);
+      uint64_t total = 0;
+      for (const auto& [tenant, count] : open[i]) total += count;
+      out += ",\"" + std::string(roleName(role)) + "\":{\"open\":" + std::to_string(total) + ",\"tenants\":" + counts(open[i]) +
+          ",\"opened\":" + std::to_string(openedTotal[i]) + ",\"closeCodes\":" + counts(closedTotals[i].codes) +
+          ",\"endedBy\":" + counts(closedTotals[i].causes) + ",\"messages\":{\"toWorker\":" + std::to_string(closedTotals[i].toWorker) +
+          ",\"toClient\":" + std::to_string(closedTotals[i].toClient) + "}}";
+    }
+    return out + ",\"places\":" + counts({places.begin(), places.end()}) + ",\"refused\":" + counts(refusedByTenant) +
+        ",\"toldToGoAway\":" + counts(goneAway) + "}";
+  }
+
+private:
+  static size_t index(Role role) { return role == Role::INGRESS ? 0 : 1; }
+  template <typename Which>
+  uint32_t goAwayWhere(const std::string& cause, Which which) {
+    std::vector<Relay*> chosen;
+    for (auto* relay : relays) if (which(*relay)) chosen.push_back(relay);
+    for (auto* relay : chosen) relay->goAway(cause);
+    goneAway[cause] += chosen.size();
+    return static_cast<uint32_t>(chosen.size());
+  }
+  struct Totals { std::map<std::string, uint64_t> codes, causes; uint64_t toWorker = 0, toClient = 0; };
+  const uint32_t perTenant;
+  std::set<Relay*> relays;
+  std::map<std::string, uint32_t> places;
+  std::array<std::map<std::string, uint64_t>, 2> open;
+  std::array<uint64_t, 2> openedTotal{};
+  std::array<Totals, 2> closedTotals;
+  std::map<std::string, uint64_t> refusedByTenant, goneAway;
+};
 
 class ServerCore final {
 public:
@@ -637,13 +763,14 @@ public:
   // The version pins of a live parent lease. An ASSETS Binding call runs no child
   // invocation: it takes no subrequest budget, but the lease it was granted under
   // must still be live, as for any Binding call.
+  // `deadline`: the lease's own (a WebSocket connection's lease is renewed past the one presented).
   SharedVersionPins livePins(const std::string& treeId, const std::string& parentInvocationId,
-      double presentedExpiresAtMonotonicMs) {
+      double presentedExpiresAtMonotonicMs, double* deadline = nullptr) {
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     auto parent = leases.find(parentInvocationId);
     if (parent == leases.end() || parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
-        presentedExpiresAtMonotonicMs != parent->second.expiresAtMonotonicMs) {
+        !parent->second.presents(presentedExpiresAtMonotonicMs)) {
       ++expiredLeaseRejections;
       lastRejection = "lease expired before execution for parent=" + parentInvocationId + " tree=" + treeId +
           " (ASSETS Binding) nowMonotonicMs=" + std::to_string(nowMonotonicMs) +
@@ -651,6 +778,7 @@ public:
       std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
       KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
+    if (deadline) *deadline = parent->second.expiresAtMonotonicMs;
     return parent->second.pins;
   }
   kj::Promise<coworkerd::AssetRead> assetBytes(const coworkerd::CodeAsset& asset, double deadline) {
@@ -722,6 +850,40 @@ public:
   std::string requestRotation(const std::vector<std::string>& processes) { return runtime.requestRotation(processes, "manual"); }
   std::string rotationJson(const std::vector<uint64_t>& requests) const { return runtime.rotationJson(requests); }
 
+  // ---- Inbound WebSocket connections ----
+  WebSocketRegistry& webSockets() { return webSocketRegistry; }
+  kj::Timer& clock() { return timer; }
+  // A connection's lease, on the node that executes it: held while the connection is open, and renewed at each message
+  // toward the Worker -- an event of the call tree, as workerd tops up the request's CPU for it -- as a new root's would
+  // be: the deadline becomes now plus the lease time, and the budget of subrequests starts again from the root's own
+  // (its grant), so that the message's Binding calls are neither refused as expired however long the connection has
+  // lasted nor limited by the calls of earlier messages. The budget is conserved per message: its Binding calls and
+  // their own share it, a child never getting more than its parent has left. Its Binding calls present the deadline the
+  // runtime was given at the start (presents()).
+  void holdLease(const std::string& invocationId) {
+    auto lease = leases.find(invocationId);
+    if (lease != leases.end()) lease->second.held = true;
+  }
+  void renewLease(const std::string& invocationId) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end()) return;
+    auto& state = lease->second;
+    state.remainingSubrequests = state.grant;
+    const auto renewed = monotonicTimeMs() + static_cast<double>(leaseConfig.ttlMs);
+    if (renewed <= state.expiresAtMonotonicMs) return;
+    if (state.presentedExpiresAtMonotonicMs == 0) state.presentedExpiresAtMonotonicMs = state.expiresAtMonotonicMs;
+    state.expiresAtMonotonicMs = renewed;
+    leaseExpiries.push({renewed, invocationId});
+    ++renewedLeases;
+  }
+  // The connection ended: its lease expires as any other from here on.
+  void releaseLease(const std::string& invocationId) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end()) return;
+    lease->second.held = false;
+    leaseExpiries.push({lease->second.expiresAtMonotonicMs, invocationId});
+  }
+
   // ---- The Server's exit ----
   // Once draining: new roots at the ingress and every invocation arriving from another
   // Server are refused before execution (SERVER_DRAINING, retryable elsewhere); what is in
@@ -736,6 +898,9 @@ public:
     std::string close = "null", usage = "null";
     uint32_t killedCalls = 0, killedProcesses = 0, emergencyKilledCalls = 0, emergencyKilledProcesses = 0;
     uint64_t killedContexts = 0, emergencyKilledContexts = 0, cutIngress = 0;
+    // The WebSocket connections at the start, all told to go away (1001) then: those whose client this node's ingress
+    // held, and those it executed (a connection of this node's own ingress executed here is in both).
+    uint32_t webSocketsIngress = 0, webSocketsExecution = 0, webSocketsToldToGoAway = 0;
     std::map<std::string, uint64_t> refused;
     int exitCode = -1;
     uint64_t deploymentRevisionAtStart = 0, deploymentGenerationAtStart = 0;
@@ -773,8 +938,13 @@ public:
     drain.inFlightAtStart = inFlightJson(processes);
     drain.deploymentRevisionAtStart = desiredState.state().revision();
     drain.deploymentGenerationAtStart = desiredState.state().generation();
+    // The WebSocket connections end now, with 1001 (going away): the clients reconnect through the platform's front, which
+    // no longer sends them here; a connection forwarded here from another ingress ends there with the same code.
+    drain.webSocketsIngress = static_cast<uint32_t>(webSocketRegistry.openCount(WebSocketRegistry::Role::INGRESS));
+    drain.webSocketsExecution = static_cast<uint32_t>(webSocketRegistry.openCount(WebSocketRegistry::Role::EXECUTION));
+    drain.webSocketsToldToGoAway = webSocketRegistry.goAway("drain");
     drainStep("announce", "\"trigger\":\"" + jsonEscape(trigger) + "\",\"timeoutMs\":" + std::to_string(serverConfig.drainTimeoutMs) +
-        ",\"inFlight\":" + drain.inFlightAtStart);
+        ",\"inFlight\":" + drain.inFlightAtStart + ",\"webSockets\":" + std::to_string(drain.webSocketsToldToGoAway));
   }
   InvocationRejection drainingRefusal(bool root) {
     auto value = refusal("SERVER_DRAINING", "the Server is draining for its exit; nothing new starts here", 503, root);
@@ -820,7 +990,8 @@ public:
         << ",\"inFlightAtStart\":" << r.inFlightAtStart << ",\"inFlightNow\":" << inFlightJson(r.progress)
         << ",\"inFlightAtDeadline\":" << r.inFlightAtDeadline << ",\"killedCalls\":" << r.killedCalls
         << ",\"killedContexts\":" << r.killedContexts << ",\"killedProcesses\":" << r.killedProcesses
-        << ",\"cutIngress\":" << r.cutIngress << ",\"refused\":{";
+        << ",\"cutIngress\":" << r.cutIngress << ",\"webSockets\":{\"ingress\":" << r.webSocketsIngress
+        << ",\"execution\":" << r.webSocketsExecution << ",\"toldToGoAway\":" << r.webSocketsToldToGoAway << "},\"refused\":{";
     size_t n = 0;
     for (const auto& [source, count] : r.refused) out << (n++ ? "," : "") << "\"" << source << "\":" << count;
     out << "},\"processesClosedAtUnixMs\":" << r.processesClosedAtUnixMs << ",\"close\":" << r.close << ",\"usage\":" << r.usage
@@ -899,11 +1070,14 @@ public:
 
   std::shared_ptr<AdmissionSlot> reserve(bool root) {
     if (root) ++inFlightRoots; else ++inFlightNested;
-    return std::make_shared<AdmissionSlot>([this, root]() {
+    auto slot = std::make_shared<AdmissionSlot>([this, root]() {
       auto& count = root ? inFlightRoots : inFlightNested;
       KJ_ASSERT(count > 0, "admission count underflow");
       --count;
     });
+    slot->server = this;
+    slot->root = root;
+    return slot;
   }
 
   void setLoadBand(std::string value) {
@@ -1239,8 +1413,8 @@ public:
     auto parent = leases.find(parentInvocationId);
     if (parent == leases.end() ||
         parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
-        presentedExpiresAtMonotonicMs != parent->second.expiresAtMonotonicMs) {
-      if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs) {
+        !parent->second.presents(presentedExpiresAtMonotonicMs)) {
+      if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs && !parent->second.held) {
         leases.erase(parent);
       }
       ++expiredLeaseRejections;
@@ -1490,7 +1664,7 @@ private:
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
-    if (slot) slot->process = process;
+    if (slot) { slot->process = process; slot->ingressNodeId = ingressServerId; }
     if (executions.size() == MAX_EXECUTION_RECORDS) {
       executions.pop_front();
       ++droppedExecutions;
@@ -1652,6 +1826,7 @@ public:
            << ",\"serverNowMonotonicMs\":" << monotonicTimeMs()
            << ",\"expiredLeases\":" << expiredLeases
            << ",\"expiredLeaseRejections\":" << expiredLeaseRejections
+           << ",\"renewedLeases\":" << renewedLeases
            << ",\"leaseReaperIntervalMs\":" << LEASE_REAPER_INTERVAL_MS
            << ",\"leaseReaperRuns\":" << leaseReaperRuns
            << ",\"rootBudget\":" << leaseConfig.rootBudget
@@ -1960,7 +2135,7 @@ private:
       auto expiry = leaseExpiries.top();
       leaseExpiries.pop();
       auto lease = leases.find(expiry.invocationId);
-      if (lease != leases.end() &&
+      if (lease != leases.end() && !lease->second.held &&
           lease->second.expiresAtMonotonicMs == expiry.expiresAtMonotonicMs) {
         leases.erase(lease);
         ++expiredLeases;
@@ -1981,6 +2156,7 @@ private:
   std::map<std::string, uint64_t> nextArrivalOrder;
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
+  WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerTenant};
   coworkerd::Membership& membership;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headers;
@@ -2032,6 +2208,7 @@ private:
   uint64_t nextChildSequencesSize = 0;
   uint64_t expiredLeases = 0;
   uint64_t expiredLeaseRejections = 0;
+  uint64_t renewedLeases = 0;
   uint64_t leaseReaperRuns = 0;
   uint64_t sourceFetches = 0;
   uint64_t nextSequence = 1;
@@ -2261,6 +2438,281 @@ InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
       value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr()};
 }
 
+// One relay of an inbound WebSocket connection (WebSocketRegistry): `outer` toward the client -- the client itself at the
+// ingress, the ingress node at the node that executes it -- and `inner` toward the Worker -- the executing node, or
+// workerd. Text and binary messages and close frames pass on as they come, each direction in order (fragments, pings and
+// pongs are KJ's own); a message is at most MAX_MESSAGE_BYTES, workerd's default. A close frame from one side goes to
+// the other, which has CLOSE_GRACE_MS to answer with its own; without an answer the relay answers the first side itself
+// and ends. A side that ends without a close frame ends the other abruptly, so its peer sees an abnormal closure (1006):
+// the client vanished, or the node the connection runs on can no longer be reached. On the executing node a Worker side
+// that fails -- a limit ended the request, its process exited -- closes the ingress side with 1011 and the code an HTTP
+// answer would carry (CPU_LIMIT_EXCEEDED, MEMORY_LIMIT_EXCEEDED, RESULT_UNCERTAIN). goAway() closes both sides with 1001.
+// One [websocket] line when the relay starts and one when it ends.
+class WebSocketRelay final: public WebSocketRegistry::Relay {
+public:
+  static constexpr size_t MAX_MESSAGE_BYTES = 32u << 20;
+  static constexpr uint32_t CLOSE_GRACE_MS = 2000;
+  // The close capnp's HTTP-over-capnp sends on a WebSocket whose request failed with OVERLOADED: workerd ends a request
+  // that way when a limit ended it.
+  static constexpr const char* OVERLOAD_REASON = "Service overloaded; retry later.";
+  struct Identity {
+    std::string nodeId, workerId, versionId, treeId, invocationId;
+    // The other node of the connection: the executing one at the ingress (empty while it is this one), the ingress one
+    // at the executing node.
+    std::string peerNodeId;
+    bool forwarded = false;
+    std::string protocol;
+    double handshakeMs = 0;
+  };
+  struct Hooks {
+    std::function<void()> message;           // each message toward the Worker
+    std::function<std::string()> limitCode;  // the code a limit ended the request with, "" when none did
+    std::function<void()> ended;
+  };
+  WebSocketRelay(WebSocketRegistry& registry, kj::Timer& timer, WebSocketRegistry::Role role, Identity identity,
+      kj::Own<kj::WebSocket> outerSocket, kj::Own<kj::WebSocket> innerSocket, Hooks hooks)
+      : registry(registry), timer(timer), identity(std::move(identity)), hooks(std::move(hooks)),
+        outer(std::move(outerSocket)), inner(std::move(innerSocket)), outerWriter(*outer), innerWriter(*inner) {
+    this->role = role;
+    this->tenant = coworkerd::tenantOf(this->identity.workerId);
+  }
+  ~WebSocketRelay() noexcept(false) {
+    if (!started) return;
+    // Ended from outside before its own end: the request it runs in was canceled -- at the executing node, because the
+    // ingress side went away (its peer session broke).
+    if (!runEnded && cause.empty()) {
+      cause = role == WebSocketRegistry::Role::EXECUTION ? "ingress-lost" : "cancelled";
+      if (direction.empty()) direction = "client";
+    }
+    registry.closed(*this, ended());
+    log("close");
+    if (hooks.ended) hooks.ended();
+  }
+  void setPlace(std::string processId, uint64_t generation) { this->processId = std::move(processId); this->generation = generation; }
+  // Until both directions have ended -- each with its close frame, or one abruptly --, or the grace after the first
+  // close ran out.
+  kj::Promise<void> run() {
+    started = true;
+    startedAt = monotonicTimeMs();
+    registry.opened(*this);
+    log("open");
+    co_await kj::joinPromises(kj::arr(pump(true), pump(false))).exclusiveJoin(end.addBranch());
+    runEnded = true;
+  }
+  void goAway(const std::string& why) override {
+    if (closing) return;
+    nodeClose(1001, why == "drain" ? "the node is draining" : "the process is being replaced", why);
+  }
+  // The executing node: the request toward workerd ended -- its failure, if it failed.
+  void innerSettled(kj::Maybe<kj::Exception> failure) {
+    innerFailed = failure != kj::none;
+    if (innerDoneFulfiller->isWaiting()) innerDoneFulfiller->fulfill();
+  }
+
+private:
+  // Sends on one socket in order, one at a time (a pump and goAway() both send), nothing after its close.
+  class Writer {
+  public:
+    explicit Writer(kj::WebSocket& socket): socket(socket) {}
+    kj::Promise<void> send(kj::WebSocket::Message message) {
+      if (closed) return kj::READY_NOW;
+      return enqueue([this, message = kj::mv(message)]() mutable -> kj::Promise<void> {
+        KJ_SWITCH_ONEOF(message) {
+          KJ_CASE_ONEOF(text, kj::String) { return socket.send(text).attach(kj::mv(text)); }
+          KJ_CASE_ONEOF(bytes, kj::Array<kj::byte>) { return socket.send(bytes).attach(kj::mv(bytes)); }
+          KJ_CASE_ONEOF(close, kj::WebSocket::Close) { KJ_FAIL_ASSERT("a close frame goes through close()"); }
+        }
+        KJ_UNREACHABLE;
+      });
+    }
+    kj::Promise<void> close(uint16_t code, std::string reason) {
+      if (closed) return kj::READY_NOW;
+      closed = true;
+      closeCode = code;
+      closeReason = reason;
+      return enqueue([this, code, reason = kj::str(reason.c_str())]() mutable { return socket.close(code, reason).attach(kj::mv(reason)); });
+    }
+    bool hasClosed() const { return closed; }
+    uint16_t sentCode() const { return closeCode; }
+    const std::string& sentReason() const { return closeReason; }
+  private:
+    template <typename Step>
+    kj::Promise<void> enqueue(Step&& step) {
+      auto next = last.addBranch().then(kj::fwd<Step>(step)).fork();
+      last = kj::mv(next);
+      return last.addBranch();
+    }
+    kj::WebSocket& socket;
+    kj::ForkedPromise<void> last = kj::Promise<void>(kj::READY_NOW).fork();
+    bool closed = false;
+    uint16_t closeCode = 0;
+    std::string closeReason;
+  };
+
+  // One direction: toward the Worker reads `outer` and writes `inner`, toward the client the other way round.
+  kj::Promise<void> pump(bool towardWorker) {
+    auto& from = towardWorker ? *outer : *inner;
+    auto& to = towardWorker ? innerWriter : outerWriter;
+    while (true) {
+      kj::Maybe<kj::WebSocket::Message> received;
+      bool failed = false;
+      try {
+        received = co_await from.receive(MAX_MESSAGE_BYTES);
+      } catch (const kj::Exception&) {
+        failed = true;
+      }
+      if (failed) { co_await sideFailed(!towardWorker); co_return; }
+      auto message = kj::mv(KJ_ASSERT_NONNULL(received));
+      if (message.is<kj::WebSocket::Close>()) {
+        auto& close = message.get<kj::WebSocket::Close>();
+        co_await closeFrom(towardWorker, close.code, close.reason.cStr());
+        co_return;
+      }
+      ++(towardWorker ? toWorker : toClient);
+      if (towardWorker && hooks.message) hooks.message();
+      bool sent = true;
+      try {
+        co_await to.send(kj::mv(message));
+      } catch (const kj::Exception&) {
+        sent = false;
+      }
+      if (!sent) { co_await sideFailed(towardWorker); co_return; }
+    }
+  }
+
+  // A close frame from the client side (towardWorker) or the Worker side, passed on to the other; at the executing node
+  // the close capnp sends for a request a limit ended becomes 1011 with the limit's code.
+  kj::Promise<void> closeFrom(bool towardWorker, uint16_t code, std::string reason) {
+    if (direction.empty()) { direction = towardWorker ? "client" : "worker"; firstCode = code; firstReason = reason; }
+    (towardWorker ? outerClosed : innerClosed) = true;
+    if (!towardWorker && role == WebSocketRegistry::Role::EXECUTION && code == 1013 && reason == OVERLOAD_REASON) {
+      auto limit = co_await failureCode(false);
+      if (!limit.empty()) { code = 1011; reason = limit; cause = "limit"; failure = limit; }
+    }
+    beginClosing();
+    try {
+      co_await (towardWorker ? innerWriter : outerWriter).close(code, reason);
+    } catch (const kj::Exception&) {}
+  }
+
+  // A side ended without a close frame (its socket failed). The other ends abruptly, except at the executing node, where a
+  // failed Worker side closes the ingress side with 1011.
+  kj::Promise<void> sideFailed(bool innerSide) {
+    if ((innerSide ? innerBroken : outerBroken)) co_return;
+    (innerSide ? innerBroken : outerBroken) = true;
+    if (innerSide && role == WebSocketRegistry::Role::EXECUTION && !outerBroken && !outerWriter.hasClosed()) {
+      auto code = co_await failureCode(true);
+      if (direction.empty()) direction = "node";
+      if (cause.empty()) cause = code == "RESULT_UNCERTAIN" ? "worker-lost" : "limit";
+      failure = code;
+      beginClosing();
+      try { co_await outerWriter.close(1011, code); } catch (const kj::Exception&) {}
+      co_return;
+    }
+    if (cause.empty()) {
+      cause = innerSide ? (identity.forwarded ? "peer-lost" : "worker-lost") : (role == WebSocketRegistry::Role::INGRESS ? "client-lost" : "ingress-lost");
+      if (direction.empty()) direction = innerSide ? "worker" : "client";
+    }
+    finish();
+  }
+
+  // The code a failed Worker side ends the connection with: the limit that ended the request, else RESULT_UNCERTAIN. The
+  // request toward workerd ends after its socket (capnp closes the socket, then rethrows), so its outcome is awaited a
+  // little when no limit row is there yet.
+  kj::Promise<std::string> failureCode(bool failed) {
+    auto code = hooks.limitCode ? hooks.limitCode() : std::string();
+    if (code.empty()) {
+      co_await innerDone.addBranch().exclusiveJoin(timer.afterDelay(1000 * kj::MILLISECONDS));
+      code = hooks.limitCode ? hooks.limitCode() : std::string();
+    }
+    if (code.empty() && (failed || innerFailed)) code = "RESULT_UNCERTAIN";
+    co_return code;
+  }
+
+  // The node ends the connection: both sides get `code` (1001 going away).
+  void nodeClose(uint16_t code, const std::string& reason, const std::string& why) {
+    if (direction.empty()) { direction = "node"; firstCode = code; firstReason = reason; }
+    if (cause.empty()) cause = why;
+    beginClosing();
+    if (!outerBroken) tasks.add(outerWriter.close(code, reason).catch_([](kj::Exception&&) {}));
+    if (!innerBroken) tasks.add(innerWriter.close(code, reason).catch_([](kj::Exception&&) {}));
+  }
+
+  // After the first close frame the other side has the grace to answer; then the relay answers what is still open with the
+  // first side's code and ends.
+  void beginClosing() {
+    if (closing) return;
+    closing = true;
+    grace = timer.afterDelay(CLOSE_GRACE_MS * kj::MILLISECONDS).then([this]() -> kj::Promise<void> {
+      if (cause.empty()) cause = "grace";
+      auto answer = [this](Writer& writer, bool broken) -> kj::Promise<void> {
+        if (broken || writer.hasClosed()) return kj::READY_NOW;
+        return writer.close(firstCode ? firstCode : 1000, firstReason).catch_([](kj::Exception&&) {});
+      };
+      return kj::joinPromises(kj::arr(answer(outerWriter, outerBroken), answer(innerWriter, innerBroken)))
+          .exclusiveJoin(timer.afterDelay(200 * kj::MILLISECONDS));
+    }).then([this]() { finish(); }).eagerlyEvaluate(nullptr);
+  }
+  void finish() { if (endFulfiller->isWaiting()) endFulfiller->fulfill(); }
+
+  WebSocketRegistry::Ended ended() const {
+    WebSocketRegistry::Ended out;
+    // The code of the connection as the outer side has it: the one it sent first, else the one it was sent, else none.
+    out.code = direction == "client" && outerClosed ? firstCode : outerWriter.hasClosed() ? outerWriter.sentCode() : 1006;
+    if (out.code == 0) out.code = 1006;
+    out.direction = direction.empty() ? "node" : direction;
+    out.cause = cause;
+    out.toWorker = toWorker;
+    out.toClient = toClient;
+    return out;
+  }
+  void log(const char* event) const {
+    std::ostringstream out;
+    out << std::setprecision(17) << "[websocket] {\"event\":\"" << event << "\",\"nodeId\":\"" << jsonEscape(identity.nodeId)
+        << "\",\"role\":\"" << WebSocketRegistry::roleName(role) << "\",\"tenant\":\"" << jsonEscape(tenant)
+        << "\",\"workerId\":\"" << jsonEscape(identity.workerId) << "\",\"versionId\":\"" << jsonEscape(identity.versionId)
+        << "\",\"treeId\":\"" << jsonEscape(identity.treeId) << "\",\"invocationId\":\"" << jsonEscape(identity.invocationId)
+        << "\",\"peerNodeId\":\"" << jsonEscape(identity.peerNodeId) << "\",\"forwarded\":" << (identity.forwarded ? "true" : "false");
+    if (role == WebSocketRegistry::Role::EXECUTION)
+      out << ",\"processId\":\"" << jsonEscape(processId) << "\",\"processGeneration\":" << generation;
+    if (std::string_view(event) == "open") {
+      out << ",\"protocol\":\"" << jsonEscape(identity.protocol) << "\",\"handshakeMs\":" << identity.handshakeMs;
+    } else {
+      const auto e = ended();
+      const auto& reason = direction == "client" && outerClosed ? firstReason : outerWriter.hasClosed() ? outerWriter.sentReason() : std::string();
+      out << ",\"direction\":\"" << e.direction << "\",\"code\":" << e.code << ",\"reason\":\"" << jsonEscape(cleanReason(reason))
+          << "\",\"cause\":\"" << e.cause << "\",\"messages\":{\"toWorker\":" << e.toWorker
+          << ",\"toClient\":" << e.toClient << "},\"durationMs\":" << monotonicTimeMs() - startedAt;
+    }
+    out << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}";
+    std::cout << out.str() << std::endl;
+  }
+  WebSocketRegistry& registry;
+  kj::Timer& timer;
+  Identity identity;
+  Hooks hooks;
+  kj::Own<kj::WebSocket> outer, inner;
+  Writer outerWriter, innerWriter;
+  struct Errors final: public kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } errors;
+  kj::TaskSet tasks{errors};
+  static kj::ForkedPromise<void> fulfilledBy(kj::Own<kj::PromiseFulfiller<void>>& fulfiller) {
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    fulfiller = kj::mv(paf.fulfiller);
+    return paf.promise.fork();
+  }
+  kj::Own<kj::PromiseFulfiller<void>> endFulfiller, innerDoneFulfiller;
+  kj::ForkedPromise<void> end = fulfilledBy(endFulfiller), innerDone = fulfilledBy(innerDoneFulfiller);
+  kj::Promise<void> grace = nullptr;
+  bool started = false, runEnded = false, closing = false, outerClosed = false, innerClosed = false, outerBroken = false,
+      innerBroken = false, innerFailed = false;
+  double startedAt = 0;
+  uint64_t toWorker = 0, toClient = 0;
+  // Who closed first (client, worker, node), with what; why the node ended it (drain, rotation, limit, peer-lost, ...);
+  // the code a failed Worker side closed the ingress side with.
+  std::string direction, cause, failure, firstReason;
+  uint16_t firstCode = 0;
+};
+
 class TrackingHttpResponse final: public kj::HttpService::Response {
 public:
   explicit TrackingHttpResponse(Response& inner, SharedPathTiming timing = {}): inner(inner), timing(std::move(timing)) {}
@@ -2296,6 +2748,87 @@ void phaseTiming(const char* stage, double started, const std::shared_ptr<cowork
       << "\",\"processId\":\"" << call->processId << "\",\"processGeneration\":" << call->generation;
   std::cout << "}" << std::endl;
 }
+// A response header by name, whatever its case ("" when absent).
+std::string headerValue(const kj::HttpHeaders& headers, std::string_view name) {
+  std::string value;
+  headers.forEach([&](kj::StringPtr key, kj::StringPtr text) {
+    if (value.empty() && key.size() == name.size() &&
+        std::equal(name.begin(), name.end(), key.begin(), [](char a, char b) { return std::tolower(a) == std::tolower(b); }))
+      value = text.cStr();
+  });
+  return value;
+}
+
+// The response of an ingress root on the node that executes it -- this node's ingress or another's --, when the request
+// asks for a WebSocket. When the Worker accepts it (101), the response's WebSocket toward the ingress and one end of a
+// pipe, whose other end goes back toward workerd, become the connection's relay on this node (WebSocketRelay): the
+// connection holds its call tree's lease, renewed at each message toward the Worker, and gives its admission slot back
+// at once -- between two messages it is not executing --; a limit that ends the request closes it with 1011 and the
+// limit's code. Otherwise it is an HTTP response like TrackingHttpResponse's.
+class ExecutionResponse final: public kj::HttpService::Response {
+public:
+  ExecutionResponse(Response& inner, std::shared_ptr<AdmissionSlot> slot)
+      : inner(inner), slot(std::move(slot)), startedAt(monotonicTimeMs()) {}
+  kj::Own<kj::AsyncOutputStream> send(
+      uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    pathMark(slot->timing, "workerd-headers");
+    auto body = inner.send(status, statusText, headers, expectedBodySize);
+    started = true;
+    return body;
+  }
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+    pathMark(slot->timing, "workerd-headers");
+    auto ingress = inner.acceptWebSocket(headers);
+    started = true;
+    auto& server = *slot->server;
+    auto process = slot->process;
+    KJ_ASSERT(process != nullptr, "a WebSocket answered without a process call");
+    WebSocketRelay::Identity identity;
+    identity.nodeId = server.placementConfig().serverId;
+    identity.workerId = process->workerId; identity.versionId = process->versionId;
+    identity.treeId = process->treeId; identity.invocationId = process->invocationId;
+    identity.peerNodeId = slot->ingressNodeId;
+    identity.forwarded = !slot->ingressNodeId.empty() && slot->ingressNodeId != identity.nodeId;
+    identity.protocol = headerValue(headers, "sec-websocket-protocol");
+    identity.handshakeMs = monotonicTimeMs() - startedAt;
+    const auto invocation = process->invocationId;
+    WebSocketRelay::Hooks hooks;
+    hooks.message = [&server, invocation]() { server.renewLease(invocation); };
+    hooks.limitCode = [process]() -> std::string {
+      if (process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
+      if (process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
+      return {};
+    };
+    hooks.ended = [&server, invocation]() { server.releaseLease(invocation); };
+    auto pipe = kj::newWebSocketPipe();
+    relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::EXECUTION, std::move(identity),
+        kj::mv(ingress), kj::mv(pipe.ends[1]), std::move(hooks));
+    relay->setPlace(process->processId, process->generation);
+    server.holdLease(invocation);
+    // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
+    // leave it; its request context stays open in workerd until the connection ends.
+    slot->finish();
+    running = relay->run().fork();
+    return kj::mv(pipe.ends[0]);
+  }
+  bool hasStarted() const { return started; }
+  bool upgraded() const { return relay.get() != nullptr; }
+  // The request toward workerd ended (its failure, if it failed): the relay may still be closing the connection.
+  kj::Promise<void> settled(kj::Maybe<kj::Exception> failure) {
+    relay->innerSettled(kj::mv(failure));
+    return KJ_ASSERT_NONNULL(running).addBranch();
+  }
+
+private:
+  Response& inner;
+  std::shared_ptr<AdmissionSlot> slot;
+  double startedAt;
+  bool started = false;
+  kj::Own<WebSocketRelay> relay;
+  kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relay
+};
+
 class AdmissionHttpService final: public kj::HttpService {
 public:
   AdmissionHttpService(kj::Own<kj::HttpService> inner, std::shared_ptr<AdmissionSlot> slot,
@@ -2303,6 +2836,8 @@ public:
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& requestHeaders,
       kj::AsyncInputStream& body, Response& response) override {
     auto finish = kj::defer([slot = slot] { slot->finish(); });
+    if (slot->root && slot->server != nullptr && method == kj::HttpMethod::GET && requestHeaders.isWebSocket())
+      co_return co_await webSocketRequest(method, url, requestHeaders, body, response);
     auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing);
     auto started = monotonicTimeMs();
     std::string failure;
@@ -2319,12 +2854,42 @@ public:
       if (tracked->hasStarted()) throw;
       failure = error.getDescription().cStr();
     }
+    co_await refuse(*tracked, failure);
+  }
+private:
+  // An ingress root that asks for a WebSocket. Once the Worker answered 101 the connection is the response: when the request
+  // toward workerd ends, its relay finishes the closing (1011 and a code for a request a limit ended), and the request here
+  // ends normally after it, so that every node on the way keeps the connection until its close frames have passed.
+  kj::Promise<void> webSocketRequest(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& requestHeaders,
+      kj::AsyncInputStream& body, Response& response) {
+    auto tracked = kj::heap<ExecutionResponse>(response, slot);
+    kj::Maybe<kj::Exception> failed;
+    std::string failure;
+    try {
+      pathMark(slot->timing, "http-dispatch");
+      auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
+      co_await request;
+    } catch (const kj::Exception& error) {
+      failed = error.clone();
+      failure = error.getDescription().cStr();
+    }
+    if (tracked->upgraded()) {
+      co_await tracked->settled(kj::mv(failed));
+      co_return;
+    }
+    KJ_IF_SOME(error, failed) {
+      if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
+      co_await refuse(*tracked, failure);
+    }
+  }
+  // A failure before the response started: the code the call's limits or its process say.
+  kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure) {
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, 503, "Service Unavailable",
         rejectionJson(slot->process && slot->process->memoryLimitExceeded() ? "MEMORY_LIMIT_EXCEEDED" :
             slot->process && slot->process->cpuLimitExceeded() ? "CPU_LIMIT_EXCEEDED" : "RESULT_UNCERTAIN", failure, 0));
-    co_await rejection->respond(*tracked);
+    co_await rejection->respond(tracked);
   }
-private:
   kj::Own<kj::HttpService> inner;
   std::shared_ptr<AdmissionSlot> slot;
   const kj::HttpHeaderTable& headers;
@@ -2668,8 +3233,9 @@ public:
     out << "]"; return out.str();
   }
 
+  // `forwarded`: the call went to another node; `placedOn`: the node it went to.
   kj::Promise<rpc::EventDispatcher::Client> place(std::shared_ptr<const VersionDefinition> version,
-      ChildAllocation allocation, bool* forwarded = nullptr) {
+      ChildAllocation allocation, bool* forwarded = nullptr, std::string* placedOn = nullptr) {
     if (allocation.timing) allocation.timing->treeId = allocation.treeId;
     pathMark(allocation.timing, "placement-start");
     const auto& config = server.placementConfig();
@@ -2803,6 +3369,7 @@ public:
       if (!result.failure) {
         avoidance.erase(id);
         if (forwarded) *forwarded = id != config.serverId;
+        if (placedOn) *placedOn = id;
         if (!localFirst) server.decision(id == config.serverId && homeFailed ? "homeFailureLocal" :
             id == config.serverId && id == home ? "localHome" : id == home ? "toHome" : "candidate" + std::to_string(rank), allocation.ingressRoot);
         co_return std::move(result.dispatcher);
@@ -3762,7 +4329,7 @@ public:
     try {
       if (assetsCall) {
         KJ_REQUIRE(entrypoint.empty(), "an ASSETS Binding call names no entrypoint");
-        auto pins = server.livePins(treeId, parentInvocationId, expiresAtMonotonicMs);
+        auto pins = server.livePins(treeId, parentInvocationId, expiresAtMonotonicMs, &expiresAtMonotonicMs);
         VersionPin pin{workerId, versionId, contentHash, definitionHash};
         if (!server.perCallForTest() && !server.pinMatches(pins, pin)) {
           auto reason = "ASSETS Binding version fields disagree with parent lease version pins";
@@ -3796,6 +4363,8 @@ public:
           callSequence,
           orderSequence,
           expiresAtMonotonicMs);
+      // From here on the lease's own deadline: a WebSocket connection's is renewed past the one its runtime presents.
+      expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
       allocation.timing = timing;
       allocation.entrypoint = entrypoint;
       pathMark(timing, "allocate-child");
@@ -4008,18 +4577,32 @@ private:
 // the response is complete fails this request (the client sees it cut off). The backend's
 // call is never cancelled by an early end, so the call accounting -- in-flight calls, the contexts a
 // drain waits for -- still follows the backend.
+// An upgrade request at the ingress (GatewayService): one of its tenant's places under ingress.webSocketsPerTenant, held
+// until the request ends, and what the relay of the connection it may become names.
+struct IngressWebSocket {
+  WebSocketRegistry& registry;
+  std::string tenant, workerId, versionId, treeId, executingNodeId;
+  bool forwarded = false;
+  double receivedAtMonotonicMs = monotonicTimeMs();
+  IngressWebSocket(WebSocketRegistry& registry, std::string tenant): registry(registry), tenant(std::move(tenant)) {}
+  ~IngressWebSocket() { registry.release(tenant); }
+};
+
 class HttpForwarder final: private kj::TaskSet::ErrorHandler {
 public:
   HttpForwarder(ServerCore& server, capnp::HttpOverCapnpFactory& factory): server(server), factory(factory), tasks(*this) {}
 
+  // `webSocket`: the request is an upgrade the ingress let through; a 101 from the Worker makes it a connection, relayed
+  // here until it ends.
   kj::Promise<void> forward(
       OpenEvent opened,
       kj::HttpMethod method,
       kj::String url,
       kj::HttpHeaders headers,
       kj::AsyncInputStream& requestBody,
-      kj::HttpService::Response& response, SharedPathTiming timing = {}, std::string target = {}) {
-    auto exchange = kj::heap<Exchange>(server, response, method, timing, std::move(target));
+      kj::HttpService::Response& response, SharedPathTiming timing = {}, std::string target = {},
+      std::shared_ptr<IngressWebSocket> webSocket = {}) {
+    auto exchange = kj::heap<Exchange>(server, response, method, timing, std::move(target), std::move(webSocket));
     auto& ref = *exchange;
     auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
     auto workerService = factory.capnpToKj(getHttp.getHttp());
@@ -4037,6 +4620,8 @@ public:
     co_await kj::joinPromisesFailFast(kj::arr(kj::mv(upload), ref.whenDone()));
     pathMark(timing, "response-end");
     if (timing) timing->emit();
+    // A connection's relay ended: its socket to the client goes before the request here returns, as KJ requires.
+    ref.endWebSocket();
     // The response is complete; the backend's return may still be on its way.
     if (!ref.backendSettled()) tasks.add(ref.releaseBackend().attach(kj::mv(exchange)));
   }
@@ -4046,8 +4631,9 @@ private:
   class Exchange final: public kj::HttpService::Response {
   public:
     Exchange(ServerCore& server, kj::HttpService::Response& client, kj::HttpMethod method, SharedPathTiming timing,
-        std::string target)
-        : server(server), client(client), method(method), timing(std::move(timing)), target(std::move(target)) {
+        std::string target, std::shared_ptr<IngressWebSocket> webSocket)
+        : server(server), client(client), method(method), timing(std::move(timing)), target(std::move(target)),
+          webSocket(std::move(webSocket)) {
       auto paf = kj::newPromiseAndFulfiller<void>();
       done = kj::mv(paf.promise);
       doneFulfiller = kj::mv(paf.fulfiller);
@@ -4076,8 +4662,33 @@ private:
       }
       return kj::heap<Relay>(*this);
     }
-    kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders&) override {
-      KJ_FAIL_REQUIRE("a WebSocket was not requested");
+    // The Worker answered the upgrade with 101: KJ answers the client's handshake (Sec-WebSocket-Accept) with the Worker's
+    // headers, and the connection's relay on this node runs between the client and a pipe whose other end goes back
+    // toward the node that executes it (this one or another).
+    kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+      KJ_REQUIRE(webSocket != nullptr && !started, "a WebSocket was not requested");
+      pathMark(timing, "response-headers");
+      started = true;
+      auto socket = client.acceptWebSocket(headers);
+      WebSocketRelay::Identity identity;
+      identity.nodeId = server.placementConfig().serverId;
+      identity.workerId = webSocket->workerId; identity.versionId = webSocket->versionId; identity.treeId = webSocket->treeId;
+      identity.forwarded = webSocket->forwarded;
+      identity.peerNodeId = webSocket->forwarded ? webSocket->executingNodeId : std::string();
+      identity.protocol = headerValue(headers, "sec-websocket-protocol");
+      identity.handshakeMs = monotonicTimeMs() - webSocket->receivedAtMonotonicMs;
+      auto pipe = kj::newWebSocketPipe();
+      relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::INGRESS, std::move(identity),
+          kj::mv(socket), kj::mv(pipe.ends[1]), WebSocketRelay::Hooks{});
+      relayTask = relay->run().then([this]() { complete(); }, [this](kj::Exception&&) { complete(); }).eagerlyEvaluate(nullptr);
+      return kj::mv(pipe.ends[0]);
+    }
+    // The connection's place under ingress.webSocketsPerTenant goes back with it, not with this exchange, which may wait a
+    // little longer for the backend's return.
+    void endWebSocket() {
+      relayTask = kj::none;
+      relay = nullptr;
+      if (started) webSocket = nullptr;
     }
 
   private:
@@ -4115,6 +4726,8 @@ private:
     }
     void settled(kj::Maybe<kj::Exception> failure) {
       isSettled = true;
+      // A connection ends with its relay, which sees the backend's failure on its own side.
+      if (relay.get() != nullptr) return;
       KJ_IF_SOME(error, failure) {
         if (completed) {
           server.lateBackendFailure(target, error, completedAtUnixMs);
@@ -4149,6 +4762,9 @@ private:
     kj::Maybe<uint64_t> expected;
     uint64_t written = 0, completedAtUnixMs = 0;
     bool started = false, completed = false, isSettled = false;
+    std::shared_ptr<IngressWebSocket> webSocket;
+    kj::Own<WebSocketRelay> relay;
+    kj::Maybe<kj::Promise<void>> relayTask;  // destroyed before the relay
     // Last: destroyed first, with the backend's relay into this exchange.
     kj::Promise<void> backend = nullptr;
   };
@@ -4758,16 +5374,38 @@ private:
         response, deadline)) co_return;
     if (timing) timing->target = selected.version->key();
     pathMark(timing, "route");
+    // An upgrade to a WebSocket takes one of its tenant's places on this node before anything is sent on: beyond
+    // ingress.webSocketsPerTenant it is refused here, and nothing executes. The request keeps its handshake headers.
+    std::shared_ptr<IngressWebSocket> webSocket;
+    if (method == kj::HttpMethod::GET && headers.isWebSocket()) {
+      const auto tenant = coworkerd::tenantOf(selected.version->workerId);
+      auto& sockets = server.webSockets();
+      if (!sockets.reserve(tenant)) {
+        auto refused = server.refusal("WEBSOCKET_LIMIT", "the tenant holds " + std::to_string(sockets.limitPerTenant()) +
+            " WebSocket connections on this node, the limit of ingress.webSocketsPerTenant", 429, true);
+        refused.inFlight = sockets.placesOf(tenant);
+        refused.limit = sockets.limitPerTenant();
+        server.observeLocalRefusal(refused, "localIngress");
+        co_return co_await sendText(response, 429, "Too Many Requests", refusalBody(refused, deadline), "application/json");
+      }
+      webSocket = std::make_shared<IngressWebSocket>(sockets, tenant);
+      webSocket->workerId = selected.version->workerId;
+      webSocket->versionId = selected.version->versionId;
+    }
     if (server.placementConfig().ingressPlacement && !server.placementConfig().hasPlacement(selected.version->workerId)) {
       auto allocation = server.allocateRoot(selected.pins, deadline);
       allocation.timing = timing;
       pathMark(timing, "allocate-root");
+      if (webSocket) webSocket->treeId = allocation.treeId;
       bool proxy = false;
-      auto dispatcher = co_await peerForwarder.place(selected.version, allocation, &proxy);
+      std::string placedOn;
+      auto dispatcher = co_await peerForwarder.place(selected.version, allocation, &proxy, &placedOn);
+      if (webSocket) { webSocket->forwarded = proxy; webSocket->executingNodeId = placedOn; }
       if (proxy) server.proxyIngress(true);
       auto proxySlot = kj::defer([&] { if (proxy) server.proxyIngress(false); });
       co_return co_await forwarder.forward({std::move(dispatcher), kj::READY_NOW}, method,
-          kj::str("http://", host.c_str(), url), headers.clone(), requestBody, response, timing, selected.version->key());
+          kj::str("http://", host.c_str(), url), headers.clone(), requestBody, response, timing, selected.version->key(),
+          std::move(webSocket));
     }
     auto refusal = server.admission(selected.version->workerId, selected.version->definitionHash, true, deadline);
     pathMark(timing, "admission-end");
@@ -4806,7 +5444,9 @@ private:
     std::optional<InvocationRejection> processFailure;
     try {
     auto targetKey = selected.version->key();
+    auto opening = slot;
     auto opened = server.open(std::move(selected.version), "ingress", std::move(selected.pins), deadline, std::move(slot), check);
+    if (webSocket && opening->process) webSocket->treeId = opening->process->treeId;
     auto forwardedUrl = kj::str("http://", host.c_str(), url);
     auto forwardedHeaders = headers.clone();
     co_return co_await forwarder.forward(
@@ -4815,7 +5455,7 @@ private:
         std::move(forwardedUrl),
         std::move(forwardedHeaders),
         requestBody,
-        response, timing, std::move(targetKey));
+        response, timing, std::move(targetKey), std::move(webSocket));
     } catch (const ProcessUnavailable& error) {
       processFailure = server.processRefusal(error, true);
     }
@@ -5307,6 +5947,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"memoryWatermark\":{\"enabled\":" << b(c.memoryWatermarkEnabled) << ",\"budgetBytes\":" << c.memoryBudgetBytes
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
+      << ",\"ingress\":{\"webSocketsPerTenant\":" << c.webSocketsPerTenant << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
       << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
       << "},\"logs\":{\"tenantBufferBytes\":" << c.logs.tenantBufferBytes << ",\"totalBufferBytes\":" << c.logs.totalBufferBytes
@@ -5519,6 +6160,11 @@ int run(Launch launch) {
       return out + (out.size() > 1 ? "," : "") + "\"appliedTenantsRevision\":\"" + std::to_string(desiredState->state().revision()) + "\"}";
     });
   }
+  // Inbound WebSocket connections: a retiring process generation's go away (1001) at the rotation's switch.
+  runtime.setRetiring([&server](const std::string& processId, uint64_t generation) {
+    return server.webSockets().goAwayGeneration(processId, generation, "rotation");
+  });
+  server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {
     return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +
         runtime.quarantineReadinessJson() + "}";

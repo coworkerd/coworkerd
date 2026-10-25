@@ -162,6 +162,14 @@ struct ServerConfig {
   # collection out of the request it ran in, as far as its Worker's budget goes; long pauses are named; an idle
   # Worker's isolate is collected between its requests; the runtime's heap is sized for its working set.
   gc @41 :GcConfig;
+  # The ingress's inbound WebSocket connections (docs/compatibility.md, section 7).
+  ingress @42 :IngressConfig;
+
+  struct IngressConfig {
+    # The open WebSocket connections this node's ingress holds for one tenant: an upgrade beyond them is refused before
+    # the Worker runs, 429 WEBSOCKET_LIMIT, while other requests go on as usual. 0: no limit.
+    webSocketsPerTenant @0 :UInt32 = 1000;
+  }
 
   struct SecretsConfig {
     # A JSON file {"key":"<64 hexadecimal digits>"} (32 bytes) readable by its owner only; compose's secrets step writes

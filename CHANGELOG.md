@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+Inbound WebSocket connections for stateless Workers. A Worker that answers an upgrade with `101` and a WebSocket now gets
+its connection: the node that received the upgrade relays text and binary messages and close frames, with their code and
+reason, both ways -- also when the Worker runs on another node, through the signed peer session, which the connection
+keeps for its life. Outgoing WebSockets (a Worker's `fetch()` upgrade, through the egress service) do not change.
+
+- **A connection is one request, and its messages are the request's events**: each message the Worker receives starts
+  with the request's CPU topped up -- workerd's patch 0012; upstream does that for Durable Objects only -- and renews
+  the call tree's lease as a new root's (the deadline to the lease time from then, the budget of subrequests to the
+  root's), so a connection's handlers are limited and leased message by message however long it lasts: a message's
+  Service Binding calls and theirs share the root's budget (four calls by default), as a request's do. A message over
+  the CPU or memory limit closes the connection with `1011` and `CPU_LIMIT_EXCEEDED` or `MEMORY_LIMIT_EXCEEDED`, the
+  codes an HTTP answer carries, and the isolate is replaced as for a request. A message is at most 32 MiB (workerd's
+  default); there is no idle timeout and no compression.
+- **Admission and a limit per tenant**: an upgrade's admission slot is given back at its `101` -- between two messages a
+  connection is not executing --, and each node holds at most `ingress.webSocketsPerTenant` (1000) open connections of
+  one tenant: an upgrade beyond them gets `429 WEBSOCKET_LIMIT` before the Worker runs, and other requests are not
+  affected. The state endpoint's `webSockets` counts the open connections per tenant, and each relay of a connection
+  writes a `[websocket]` line when it opens and one when it closes (tenant, Worker, which side closed, the code, the
+  cause).
+- **Draining and process rotation close connections with `1001`**: a draining node closes its connections at once --
+  those it runs for another node's ingress through that ingress -- and its drain record counts them; a process
+  generation being replaced closes its connections at the rotation's switch, and the rotation's record counts them. A
+  client whose ingress lost the node its connection ran on sees an abnormal closure (`1006`).
+- **Usage and logs**: a connection counts as one request; its CPU is metered while its messages run (workerd reports a
+  lasting request's CPU at most once a second), not only when it closes; the lines its handlers write reach the tenant's
+  logs only when it closes, as a call's do when it ends -- a known limitation.
+- **Configuration**: `ingress.webSocketsPerTenant` (1000; `0`: no limit).
+
 ## 0.4.1
 
 A full garbage collection is no longer taken for a CPU overrun, and processes are no longer replaced every hour. V8

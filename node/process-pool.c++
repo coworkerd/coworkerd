@@ -797,6 +797,9 @@ struct ProcessGeneration {
   struct OpenContext { std::string workerId, versionId; double finishedAt = 0; };
   bool contextsVisible = false;
   std::unordered_map<std::string, OpenContext> openContexts;
+  // The CPU a request that lasts -- a WebSocket connection, whose context ends with it -- has already been metered with,
+  // from its cpu-progress rows, until its completed row comes.
+  std::unordered_map<std::string, uint64_t> meteredCpu;
   uint64_t contextsCompleted = 0, contextsCleared = 0, contextsDropped = 0;
   double drainLifecycleCheck = 0;  // the Server drain's lifecycle reads
   // The workerd file the Server opened for this generation: its identity, which becomes the
@@ -949,11 +952,20 @@ struct ProcessGeneration {
         if (event == "completed" && !openContexts.empty() &&
             openContexts.erase(std::string(report.getInvocationId().cStr()))) ++contextsCompleted;
         // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
-        // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same.
-        if (event == "completed" && cpuUsage && std::string_view(report.getInvocationId().cStr()).find("-invocation-") != std::string_view::npos) {
+        // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same. A request that lasts reports its CPU
+        // so far in cpu-progress rows (at most once a second, at its events), each counted for what it adds, and its
+        // completed row the rest.
+        if ((event == "completed" || event == "cpu-progress") && cpuUsage &&
+            std::string_view(report.getInvocationId().cStr()).find("-invocation-") != std::string_view::npos) {
           const auto tenant = tenantOf(report.getWorkerId().cStr());
-          if (!tenant.empty()) (*cpuUsage)[tenant] += report.getCpuUsedNs() + report.getGcExcludedNs();
+          const uint64_t total = report.getCpuUsedNs() + report.getGcExcludedNs();
+          auto metered = meteredCpu.find(report.getInvocationId().cStr());
+          const uint64_t before = metered == meteredCpu.end() ? 0 : metered->second;
+          if (!tenant.empty() && total > before) (*cpuUsage)[tenant] += total - before;
+          if (event == "completed") { if (metered != meteredCpu.end()) meteredCpu.erase(metered); }
+          else if (total > before) meteredCpu[report.getInvocationId().cStr()] = total;
         }
+        if (event == "cpu-progress") continue;
         if (event == "culprit") {
           culpritRow = row; culpritInvocation = report.getInvocationId().cStr();
         } else if ((event == "terminated" || event == "memory-terminated") && !culpritRow.empty() &&
@@ -1064,7 +1076,12 @@ public:
     uint64_t clearedContexts = 0;
     bool backgroundVisible = false, sigkill = false;
     std::string oldBinarySha256, oldLifecycle = "null";
+    // The WebSocket connections of the previous generation told at the switch to go away (1001).
+    uint32_t webSocketsClosed = 0;
   };
+  // A generation stops taking calls (a rotation's switch): its WebSocket connections are told to go away, as many as the
+  // callback returns (set by the node, setRetiring).
+  std::function<uint32_t(const std::string&, uint64_t)> retiring;
   ProcessPoolConfig config;
   std::string executable, runtimeFile, directory, runDirectory, bindingAddress, sourceAddress;
   std::string egressAddress;  // empty while tenant Workers have no network
@@ -2594,6 +2611,7 @@ public:
       if (old->state == "ready" || old->state == "paused") old->state = "draining";
       s.retiring.push_back(old);
       event(*old, "drain", r.reason);
+      if (retiring) r.webSocketsClosed = retiring(old->id, old->generation);
     } else {
       // The previous generation exited while the next one started: nothing to drain.
       r.drainOutcome = "gone";
@@ -2715,7 +2733,7 @@ public:
         << ",\"backgroundAtSwitch\":" << r.backgroundAtSwitch << ",\"backgroundVisible\":" << (r.backgroundVisible ? "true" : "false")
         << ",\"drainOutcome\":\"" << r.drainOutcome << "\",\"killedCalls\":" << r.killedCalls
         << ",\"killedContexts\":" << r.killedContexts << ",\"clearedContexts\":" << r.clearedContexts
-        << ",\"sigkill\":" << (r.sigkill ? "true" : "false")
+        << ",\"sigkill\":" << (r.sigkill ? "true" : "false") << ",\"webSocketsClosed\":" << r.webSocketsClosed
         << ",\"oldExit\":\"" << (r.old ? escape(r.old->exitStatus) : "") << "\",\"oldExitReason\":\"" << (r.old ? escape(r.old->lastReason) : "")
         << "\",\"oldDispatched\":" << (r.old ? r.old->dispatched : 0)
         << ",\"newDispatched\":" << (r.next ? r.next->dispatched : 0)
@@ -2869,6 +2887,9 @@ bool ProcessPool::available(const std::string& worker) {
   const auto quarantine = quarantined(worker);
   for (const auto& s : impl->slots) if (s.quarantine == quarantine && s.current && impl->admitted(*s.current)) return true;
   return false;
+}
+void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
+  impl->retiring = std::move(callback);
 }
 void ProcessPool::enableEgress(std::string address) {
   impl->egressAddress = std::move(address);

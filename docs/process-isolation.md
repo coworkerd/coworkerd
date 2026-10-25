@@ -109,7 +109,7 @@ A request executing on the node that received it is never refused by the band. M
 A slot is replaced by a new generation in steps, at most one rotation at a time on a node:
 
 1. start the new generation next to the old one and wait until it is ready;
-2. switch dispatch: new calls go to the new generation, calls already dispatched stay where they are;
+2. switch dispatch: new calls go to the new generation, calls already dispatched stay where they are; the old generation's WebSocket connections are closed with `1001` (going away) at once, so that their clients reconnect to the new one instead of being cut when the old one exits, and the rotation's record counts them (`webSocketsClosed`);
 3. drain the old generation until its calls and request contexts -- `waitUntil` work included -- have ended, for at most `rotation.drainTimeoutMs` (30 s); what is still running then is killed and ends as `RESULT_UNCERTAIN`;
 4. close the node's connections to it, send SIGTERM, and SIGKILL after `rotation.termGraceMs` (5 s).
 
@@ -121,7 +121,7 @@ A slot is replaced by a new generation in steps, at most one rotation at a time 
 
 - **The node's own output** goes through a shared-memory ring of 4 MiB to a separate writer process, `coworkerd-log`, which writes it to the node's original standard output and error (the journal, or `docker compose logs`), so a slow receiver never makes the event loop wait. When the ring is full, lines are dropped and counted, and a `[log-dropped]` line reports them; lines already in the ring are written even after the node is killed.
 - **workerd's output** goes through pipes to the reader process `coworkerd-wlog`, which keeps a backlog of 4 MiB per process and drops whole lines beyond it, counted and reported; workerd never waits for a slow disk. It writes `logs/workerd.log`, renamed at 256 MiB, with four files kept.
-- **Tenants' logs** are kept for `cowctl logs` in the reader's memory, per tenant. A Worker's `console.*` lines leave its isolate over the tail channel workerd gives each loaded Worker, under that Worker's own identity: the runtime's tail entry posts them to the node over a socket only the runtime can reach (`POST /v1/log`), and the node stores them in the tenant's buffer under the Worker and version the channel names. Nothing tenant code can read or write decides whose lines they are: whatever a tenant writes counts as its own. A call's lines are delivered when the call ends (workerd caps one call's trace at 256 KB and says so in the last line).
+- **Tenants' logs** are kept for `cowctl logs` in the reader's memory, per tenant. A Worker's `console.*` lines leave its isolate over the tail channel workerd gives each loaded Worker, under that Worker's own identity: the runtime's tail entry posts them to the node over a socket only the runtime can reach (`POST /v1/log`), and the node stores them in the tenant's buffer under the Worker and version the channel names. Nothing tenant code can read or write decides whose lines they are: whatever a tenant writes counts as its own. A call's lines are delivered when the call ends -- a WebSocket connection's when it closes -- (workerd caps one call's trace at 256 KB and says so in the last line).
 
 ## 11. The channels between a node and its processes
 

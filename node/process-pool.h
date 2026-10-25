@@ -96,6 +96,9 @@ public:
       const std::string& definitionHash);
   std::string json(uint32_t idleMs) const;
   std::string placementJson(const std::vector<std::string>& workers);
+  // A rotation's switch from a generation: `callback(processId, generation)` tells that generation's WebSocket
+  // connections to go away (1001) and returns how many it told; the rotation's record keeps the number.
+  void setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback);
   // Queues a rotation of each named slot (all slots when empty); returns the request ids as JSON.
   // Throws for an unknown slot. Slots rotate one at a time on this machine.
   std::string requestRotation(const std::vector<std::string>& processIds, const std::string& reason);

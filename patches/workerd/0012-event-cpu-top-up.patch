@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 18:00:00 +0800
+Subject: [PATCH] Top up every request's CPU for each new event and report it
+ while it lasts
+
+topUpActor() is called for each new event a request receives -- each message of a
+WebSocket it accepted (api/web-socket.c++), each call on an RPC target it handed out,
+an actor's requests -- but topped up actors only, as upstream's interface describes it.
+It now tops up every request: a stateless Worker's WebSocket connection is one request
+whose context lasts as long as the connection, and its messages are limited one by one,
+as requests are, instead of together. What each event charged stays in the request's
+completed row. While the request lasts, its CPU so far is written on the event pipe as a
+cpu-progress row at most once a second at a top-up (never in the log), so that the node
+meters a long connection as it runs and not only when it ends.
+
+diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+index 2cf65d0f60ed3eb76a4faf3d41f4a19135c780ed..ba0e6a15d5ecb352e4403545f89ecd45fefeb26b 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/coworkerd-cpu-limit.c++
+@@ -236,14 +236,23 @@ class RequestLimits final: public LimitEnforcer {
+       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
+       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
+     }
+-    // Upstream's contract: each new event delivered to an actor starts with its limits topped up -- an actor's
+-    // requests share one IoContext, and this enforcer, for the actor's whole life -- and nothing happens for any
+-    // other request. The idle reaper hears of the event too (coworkerd-idle-eviction.h).
++    // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
++    // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
++    // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
++    // thus limited one by one, as requests are, instead of together; what each charged stays in the completed row, and
++    // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
++    // node meters a long connection as it runs. The idle reaper hears of an actor's events (coworkerd-idle-eviction.h);
++    // a request's own events need not tell it, the request being open.
+     void topUpActor() override {
+-      if (!actor) return;
+       toppedUp += cpuUsed;
+       cpuUsed = 0;
+-      idleWorkerActorEvent(limits->activity());
++      if (actor) idleWorkerActorEvent(limits->activity());
++      const auto now = LimitWatchdog::now();
++      if (toppedUp + gcExcluded > reported && now - lastProgress >= PROGRESS_INTERVAL) {
++        lastProgress = now;
++        reported = toppedUp + gcExcluded;
++        limits->progress(identity, toppedUp, gcExcluded);
++      }
+     }
+     void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
+     void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
+@@ -271,6 +280,10 @@ class RequestLimits final: public LimitEnforcer {
+     bool actor;
+     // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
+     uint64_t cpuUsed = 0, toppedUp = 0, gcExcluded = 0;
++    // The last progress row: when, and the CPU it reported.
++    static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
++    kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
++    uint64_t reported = 0;
+   };
+ 
+ 
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index 679764cafe370255aef62762a25d6d45e6f9a073..2c3f2c4b157047adf106f82d9c05e552fa3e4b9b 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -243,6 +243,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+     if (dynamic) record("completed", identity, used, gcExcluded);
+   }
++  // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
++  // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
++  void progress(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
++    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
++  }
+   // Written while a termination has not taken effect; a later terminated row for the same
+   // invocation withdraws it.
+   void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }

@@ -166,7 +166,7 @@ An interrupted request leaves at most immutable objects -- a package's objects, 
 
 A node that receives SIGTERM or SIGINT, or `POST /__coworkerd/drain`:
 
-1. **announces** it: at once its readiness endpoint answers 503 and new root calls and calls from other nodes get `503 SERVER_DRAINING`, not executed; it creates its drain marker `members/<nodeId>/<epoch>.draining` and writes `draining` into its heartbeat, so the other nodes stop placing calls on it at their next listing. It applies no further deployments.
+1. **announces** it: at once its readiness endpoint answers 503 and new root calls and calls from other nodes get `503 SERVER_DRAINING`, not executed; it creates its drain marker `members/<nodeId>/<epoch>.draining` and writes `draining` into its heartbeat, so the other nodes stop placing calls on it at their next listing. It applies no further deployments. Its WebSocket connections are closed with `1001` (going away) at once -- those another node's ingress forwarded to it through that ingress, which passes the code on -- and the drain record counts them.
 2. **drains**: it waits until its ingress requests, the calls admitted on it and its processes' work -- `waitUntil` included -- reach zero, for at most `drainTimeoutMs` (30 s); what is still running then is killed and ends as `RESULT_UNCERTAIN`.
 3. **leaves**: it closes its workerd processes, writes its last usage, removes its heartbeat, drain marker and suspects object, closes its listeners and exits with 0 -- or with 3 when the drain began because another process took its identity (section 3).
 

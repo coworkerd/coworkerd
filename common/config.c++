@@ -166,6 +166,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.suspectMaxMs = root.getSuspectMaxMs();
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
+  result.webSocketsPerTenant = root.getIngress().getWebSocketsPerTenant();
   auto rotation = root.getRotation();
   result.processPool.rotationDrainTimeoutMs = rotation.getDrainTimeoutMs();
   result.processPool.rotationTermGraceMs = rotation.getTermGraceMs();

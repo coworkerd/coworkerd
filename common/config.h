@@ -204,6 +204,8 @@ struct ServerConfig {
   uint32_t drainAnnounceDelayMsForTest = 0;
   // The load check before a version's first dispatch to a process; COWORKERD_LOAD_CHECK overrides it.
   bool loadCheck = true;
+  // ingress.webSocketsPerTenant: the open WebSocket connections the ingress holds for one tenant; 0, no limit.
+  uint32_t webSocketsPerTenant = 1000;
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;
