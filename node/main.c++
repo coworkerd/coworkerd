@@ -24,6 +24,7 @@
 #include <capnp/compat/byte-stream.h>
 #include <capnp/compat/http-over-capnp.h>
 #include <capnp/compat/json.h>
+#include <capnp/membrane.h>
 #include <capnp/message.h>
 #include <capnp/rpc-twoparty.h>
 #include <kj/async-io.h>
@@ -566,6 +567,145 @@ private:
   std::map<std::string, uint64_t> refusedByTenant, goneAway;
 };
 
+// =====================================================================================================================
+// JS RPC: a method call on a Service Binding or on a Durable Object stub (docs/compatibility.md, section 7), carried by
+// workerd's own `EventDispatcher.jsRpcSession` (src/workerd/io/worker-interface.capnp). The node routes capabilities
+// and nothing else: of a call it reads only the name of the method -- our envelope, which the runtime's shim put
+// there -- and copies the arguments, the caller's pusher and the answer from one message to the other, capabilities
+// inside them included. A tenant's arguments are therefore serialized in the calling isolate and decoded in the
+// target's, never here, and a capability the target returns reaches the caller as the target's own.
+//
+// Why the envelope travels as a method name: workerd sends no `cf` with a JS RPC session, in either direction
+// (`Fetcher::getClientForOneCall` passes none, and `EventDispatcherImpl::getWorker()` starts the request without the
+// one `startEvent` carried), so the channel that carries our descriptor for a `fetch` carries nothing for a method
+// call. The name of the one method a session takes is the only text of our own on the way in.
+constexpr uint64_t JS_RPC_TARGET_TYPE_ID = 0xa1a96525142a9d98ull;
+// What one node names when it asks another's session for the target's entrypoint; the node that executes the call
+// puts its own descriptor in its place (RpcDescriptorTarget), so a descriptor never travels between nodes.
+constexpr kj::StringPtr JS_RPC_BIND_METHOD = "coworkerd-bind"_kj;
+// The property of the runtime's top-level RPC target that answers with a version's entrypoint or an object's facet
+// (runtime/runtime.js, __coworkerdRpcBind): the descriptor is the name of the property read from it.
+constexpr kj::StringPtr JS_RPC_RUNTIME_PROPERTY = "__coworkerdRpcBind"_kj;
+
+// One call's parameters copied into another request, except the method it names: a serialized JavaScript value is
+// copied as the pointer it is, so nothing of it is decoded here.
+void copyCallParams(rpc::JsRpcTarget::CallParams::Reader from, rpc::JsRpcTarget::CallParams::Builder to) {
+  auto operation = from.getOperation();
+  switch (operation.which()) {
+    case rpc::JsRpcTarget::CallParams::Operation::CALL_WITH_ARGS:
+      to.getOperation().initCallWithArgs().set(operation.getCallWithArgs());
+      break;
+    case rpc::JsRpcTarget::CallParams::Operation::GET_PROPERTY:
+      to.getOperation().setGetProperty();
+      break;
+  }
+  auto handler = from.getResultsStreamHandler();
+  if (handler.which() == rpc::JsRpcTarget::CallParams::ResultsStreamHandler::EXTERNAL_PUSHER) {
+    to.getResultsStreamHandler().setExternalPusher(handler.getExternalPusher());
+  }
+  if (from.hasCallerSpanContext()) to.getCallerSpanContext().set(from.getCallerSpanContext());
+}
+
+// Everything a capability the node handed out may be used for, for as long as the call tree's lease lasts: the
+// membrane wraps every capability that crosses it, in both directions, so a stub or a stream the target returned is
+// revoked with the lease it was made under (docs/guide/errors.md). A call that crosses it is one method call of the
+// session, which the node counts.
+class LeaseMembrane final: public capnp::MembranePolicy, public kj::Refcounted {
+public:
+  LeaseMembrane(kj::Promise<void> revoked, std::function<void()> counted,
+      rpc::JsRpcSession::Client session, kj::Promise<void> opened,
+      kj::Own<kj::PromiseFulfiller<void>> done, std::function<void()> released)
+      : revoked(revoked.fork()), counted(std::move(counted)), session(kj::mv(session)),
+        opened(kj::mv(opened).eagerlyEvaluate([](kj::Exception&&) {})), done(kj::mv(done)),
+        released(std::move(released)) {}
+
+  kj::Maybe<capnp::Capability::Client> inboundCall(
+      uint64_t interfaceId, uint16_t methodId, capnp::Capability::Client) override {
+    if (interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0 && counted) counted();
+    return kj::none;
+  }
+  kj::Maybe<capnp::Capability::Client> outboundCall(
+      uint64_t, uint16_t, capnp::Capability::Client) override {
+    return kj::none;
+  }
+  kj::Own<capnp::MembranePolicy> addRef() override { return kj::addRef(*this); }
+  kj::Maybe<kj::Promise<void>> onRevoked() override { return revoked.addBranch(); }
+  // The caller's session is over once every capability of this membrane is gone -- what workerd's own session
+  // capability means (src/workerd/io/worker-interface.capnp): the target's stubs are the ones it introduced.
+  ~LeaseMembrane() noexcept(false) { done->fulfill(); if (released) released(); }
+
+private:
+  kj::ForkedPromise<void> revoked;
+  std::function<void()> counted;
+  // The session the target opened: it lasts as long as any capability of this membrane, since the target's stubs are
+  // the ones it introduced (src/workerd/io/worker-interface.capnp, jsRpcSession).
+  rpc::JsRpcSession::Client session;
+  kj::Promise<void> opened;
+  kj::Own<kj::PromiseFulfiller<void>> done;
+  std::function<void()> released;
+};
+
+// The top-level target of a session on the node that executes the call: the runtime's own target takes our
+// descriptor as the name of the property it answers with the version's entrypoint (or the object's facet), so the
+// tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
+class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
+public:
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor)
+      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)) {}
+
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
+    return {forward(interfaceId, methodId, kj::mv(context)), false, true};
+  }
+
+private:
+  kj::Promise<void> forward(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
+    KJ_REQUIRE(interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0,
+        "a Coworkerd JS RPC session carries one method call");
+    auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
+    auto request = runtimeTarget.typelessRequest(interfaceId, methodId, params.totalSize(), {});
+    auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
+    auto path = builder.initMethodPath(2);
+    path.set(0, JS_RPC_RUNTIME_PROPERTY);
+    path.set(1, descriptor);
+    copyCallParams(params, builder);
+    // The runtime answers with a capability, not by running a method: the property is read.
+    builder.getOperation().setGetProperty();
+    context.releaseParams();
+    return context.tailCall(kj::mv(request));
+  }
+
+  capnp::Capability::Client runtimeTarget;
+  kj::String descriptor;
+};
+
+// A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
+// always was, and `jsRpcSession` is the same event as a JS RPC session, whose top-level target carries the
+// descriptor into the runtime.
+class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
+public:
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor)
+      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)) {}
+
+  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+    context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    auto opened = inner.jsRpcSessionRequest().send();
+    auto results = context.initResults(capnp::MessageSize{4, 2});
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor)));
+    results.setSession(opened.getSession());
+    return kj::READY_NOW;
+  }
+
+private:
+  rpc::EventDispatcher::Client inner;
+  kj::String descriptor;
+};
+
 class ServerCore final {
 public:
   static constexpr size_t MAX_EXECUTION_RECORDS = 1024;
@@ -886,6 +1026,65 @@ public:
   // ---- Inbound WebSocket connections ----
   WebSocketRegistry& webSockets() { return webSocketRegistry; }
   kj::Timer& clock() { return timer; }
+
+  // ---- Where a stateless subcall executes (placement.subcalls) ----
+  // What the policy point knows about the call: the node its caller runs on, and the Worker it is addressed to. A
+  // future rule may read a Worker's own preference from the definition; nothing else about the call is needed.
+  struct SubcallHint {
+    std::string callerNodeId;
+    std::string workerId;
+  };
+  std::vector<std::string> subcallOrder(const SubcallHint& hint, std::vector<std::string> ordered) {
+    if (serverConfig.subcalls != "local") return ordered;
+    const bool known = std::find(ordered.begin(), ordered.end(), hint.callerNodeId) != ordered.end();
+    if (!known) return ordered;  // the caller's node takes no calls of this Worker: the order stands
+    decision("localSubcall", false);
+    ordered.erase(std::remove(ordered.begin(), ordered.end(), hint.callerNodeId), ordered.end());
+    ordered.insert(ordered.begin(), hint.callerNodeId);
+    return ordered;
+  }
+
+  // ---- JS RPC (docs/compatibility.md, section 7) ----
+  // The call tree's lease, as a promise that fails when it runs out: a capability this node handed a caller for a
+  // method call is revoked with it, so a stub or a stream of the target cannot outlive the tree it was made in.
+  kj::Promise<void> whenLeaseExpires(double expiresAtMonotonicMs) {
+    const auto remaining = expiresAtMonotonicMs - monotonicTimeMs();
+    return timer.afterDelay(static_cast<int64_t>(remaining > 0 ? remaining : 0) * kj::MILLISECONDS)
+        .then([]() -> kj::Promise<void> {
+      // A failure, not a disconnection: the caller is told why, and `jsg.` is what carries the message through
+      // workerd rather than the "Network connection lost." a broken connection gives (docs/guide/errors.md).
+      return KJ_EXCEPTION(FAILED,
+          "jsg.Error: LEASE_EXPIRED: the call tree's lease expired, so the capabilities of its method calls are gone");
+    });
+  }
+  void observeRpcSession(bool durableObject) {
+    ++rpcSessions;
+    if (durableObject) ++rpcDurableSessions;
+  }
+  void observeRpcCall(bool durableObject) {
+    ++rpcCalls;
+    if (durableObject) ++rpcDurableCalls;
+  }
+  void observeRpcFailure(const std::string& code) { ++rpcFailures[code]; }
+  // A capability the node proxies for a caller: the target's entrypoint, and everything reached through it, which
+  // the same membrane wraps. Held until the caller has let go of all of them.
+  void observeRpcProxied() { ++rpcProxied; ++rpcHeld; }
+  void observeRpcReleased() { if (rpcHeld) --rpcHeld; }
+  std::string jsRpcJson() const {
+    std::ostringstream out;
+    out << "{\"sessions\":" << rpcSessions << ",\"calls\":" << rpcCalls
+        << ",\"durableObjectSessions\":" << rpcDurableSessions << ",\"durableObjectCalls\":" << rpcDurableCalls
+        << ",\"proxiedCapabilities\":" << rpcProxied << ",\"heldCapabilities\":" << rpcHeld
+        << ",\"failures\":{";
+    size_t index = 0;
+    for (const auto& [code, count] : rpcFailures) {
+      if (index++) out << ',';
+      out << '"' << jsonEscape(code) << "\":" << count;
+    }
+    out << "}}";
+    return out.str();
+  }
+  void observeRpcProxied(uint64_t capabilities) { rpcProxied += capabilities; }
   // A connection's lease, on the node that executes it: held while the connection is open, and renewed at each message
   // toward the Worker -- an event of the call tree, as workerd tops up the request's CPU for it -- as a new root's would
   // be: the deadline becomes now plus the lease time, and the budget of subrequests starts again from the root's own
@@ -1922,6 +2121,10 @@ private:
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
     auto opened = runtime.open(process, descriptor, version->definitionHash);
+    // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
+    // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
+    opened.dispatcher = rpc::EventDispatcher::Client(
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor)));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -2027,6 +2230,7 @@ public:
            << ",\"deployment\":" << desiredState.json()
            << ",\"generation\":" << desiredState.state().generation()
            << ",\"routeRejections\":" << routeRejectionsJson()
+           << ",\"jsRpc\":" << jsRpcJson()
            << ",\"assets\":" << assetsJson()
            << ",\"maxExecutionRecords\":" << MAX_EXECUTION_RECORDS
            << ",\"droppedExecutions\":" << droppedExecutions
@@ -2431,6 +2635,9 @@ private:
   coworkerd::Membership& membership;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headers;
+  // JS RPC: sessions opened, method calls that crossed this node, the capabilities it proxied, failures by code.
+  uint64_t rpcSessions = 0, rpcCalls = 0, rpcDurableSessions = 0, rpcDurableCalls = 0, rpcProxied = 0, rpcHeld = 0;
+  std::map<std::string, uint64_t> rpcFailures;
   kj::Timer& timer;
   // The load check: when a version last loaded on a process (process:generation:hash#entrypoint).
   std::map<std::string, double> loadConfirmed;
@@ -2611,12 +2818,14 @@ public:
       const kj::HttpHeaderTable& headerTable,
       uint status,
       std::string statusText,
-      std::string body)
+      std::string body,
+      std::string code)
       : factory(factory),
         headerTable(headerTable),
         status(status),
         statusText(std::move(statusText)),
-        body(std::move(body)) {}
+        body(std::move(body)),
+        code(std::move(code)) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     auto service = kj::heap<LeaseRejectionHttpService>(
@@ -2626,12 +2835,27 @@ public:
     return kj::READY_NOW;
   }
 
+  // The same refusal for a method call: our code is the start of the RPC error's message, and the body follows it,
+  // so a tenant's `catch` sees the code it would read from a `fetch` through the Binding (docs/guide/errors.md).
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext) override {
+    // `jsg.` is what workerd passes on to the caller rather than hiding behind "internal error"
+    // (src/workerd/jsg/exception.c++, tunneledErrorType): our code is then the start of the message the tenant
+    // catches, and the Binding's shim makes it the error's `code` too (runtime/runtime.js).
+    // The description is built here and set as it is: KJ's macros label every argument that is not a string literal
+    // with the expression it came from (`code.c_str() = ...`), and the label would stand between the `jsg.` prefix
+    // and the code -- workerd passes a message on only when the description starts with `jsg.` (v62 met the same
+    // thing on the Durable Object log's refusals).
+    const auto message = "jsg.Error: " + code + ": " + body;
+    kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(message.c_str())));
+  }
+
 private:
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headerTable;
   uint status;
   std::string statusText;
   std::string body;
+  std::string code;
 };
 
 std::string rejectionJson(
@@ -2660,7 +2884,7 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
     double expiresAtMonotonicMs = 0) {
   return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
       factory, headerTable, status, std::move(statusText),
-      rejectionJson(code, reason, expiresAtMonotonicMs)));
+      rejectionJson(code, reason, expiresAtMonotonicMs), code));
 }
 
 const char* statusText(uint status) {
@@ -2703,7 +2927,7 @@ std::string refusalBody(const InvocationRejection& refusal, double deadline) {
 rpc::EventDispatcher::Client rejectedDispatcher(capnp::HttpOverCapnpFactory& factory,
     const kj::HttpHeaderTable& headers, const InvocationRejection& refusal, double deadline) {
   return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
-      factory, headers, refusal.status, statusText(refusal.status), refusalBody(refusal, deadline)));
+      factory, headers, refusal.status, statusText(refusal.status), refusalBody(refusal, deadline), refusal.code));
 }
 
 void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRejection& value) {
@@ -3208,6 +3432,14 @@ public:
     // Resolution failures travel through the pipelined service and are classified there.
     return kj::READY_NOW;
   }
+  // The same event as a JS RPC session: the slot is held for the session's life, as it is for a request's.
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    auto opened = inner.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
+    auto results = context.initResults(capnp::MessageSize{4, 2});
+    results.setTopLevel(opened.getTopLevel());
+    results.setSession(opened.getSession());
+    return kj::READY_NOW;
+  }
 private:
   rpc::EventDispatcher::Client inner;
   std::shared_ptr<AdmissionSlot> slot;
@@ -3352,6 +3584,26 @@ private:
   double expiresAtMonotonicMs;
 };
 
+// A capability of another node with this node's peer session attached: the session is held for as long as the
+// capability is, as it is for a request relayed over it (AttachedHttpService). Every call is sent on as it arrived.
+class AttachedCapability final: public rpc::JsRpcTarget::Server {
+public:
+  AttachedCapability(capnp::Capability::Client inner, kj::Rc<PeerConnection> connection)
+      : inner(kj::mv(inner)), connection(kj::mv(connection)) {}
+
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
+    auto request = inner.typelessRequest(interfaceId, methodId, context.getParams().targetSize(), {});
+    request.set(context.getParams());
+    context.releaseParams();
+    return {context.tailCall(kj::mv(request)), false, true};
+  }
+
+private:
+  capnp::Capability::Client inner;
+  kj::Rc<PeerConnection> connection;
+};
+
 class PeerProxyEventDispatcher final: public rpc::EventDispatcher::Server {
 public:
   PeerProxyEventDispatcher(
@@ -3376,6 +3628,16 @@ public:
         .setHttp(factory.kjToCapnp(std::move(attached)));
     // The pipelined HTTP capability carries resolution failures into the service
     // wrapper, where pre-header failures can be classified as uncertain.
+    return kj::READY_NOW;
+  }
+
+  // A method call placed on another node: the session is opened there and its capabilities are proxied over this
+  // peer session, which is held for as long as they are. Nothing of the call is read here.
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    auto opened = remote.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
+    auto results = context.initResults(capnp::MessageSize{4, 2});
+    results.setTopLevel(kj::heap<AttachedCapability>(opened.getTopLevel(), connection.addRef()));
+    results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
 
@@ -3758,6 +4020,12 @@ public:
       ordered.erase(std::remove(ordered.begin(), ordered.end(), config.serverId), ordered.end());
       ordered.insert(ordered.begin(), config.serverId);
     }
+    // The policy point for where a stateless subcall executes (placement.subcalls, docs/architecture.md, section 4):
+    // it is given the caller's node -- this one, since a Binding call is allocated where its caller runs -- and the
+    // order the rules above produced, and returns the order to try. "home" leaves it as it is; "local" puts the
+    // caller's node first, as Cloudflare's Service Bindings run in the caller's own place. Both are kept, so that a
+    // mixed rule can take their place without touching anything else here.
+    if (!allocation.ingressRoot) ordered = server.subcallOrder({config.serverId, version->workerId}, std::move(ordered));
     // Preserve Home -> local -> ranked order within both avoidance partitions.
     // A hot, admitted local version stays first; no candidate is removed.
     auto first = ordered.begin(); if (localFirst && first != ordered.end()) ++first;
@@ -3899,7 +4167,7 @@ public:
     body += ",\"attempts\":" + failures + ",\"hopsExhausted\":" + (hops == 0 ? "true" : "false") +
         ",\"error\":\"execution rejected before start\"}";
     co_return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(factory, headerTable, 503,
-        "Service Unavailable", std::move(body)));
+        "Service Unavailable", std::move(body), refusal.code));
   }
 
 
@@ -4806,7 +5074,7 @@ public:
       : server(server), peerForwarder(peerForwarder), factory(factory), headerTable(headerTable) {}
 
   struct Dispatched {
-    rpc::EventDispatcher::Client dispatcher;
+    rpc::EventDispatcher::Client dispatcher = nullptr;
     kj::Promise<void> ready = kj::READY_NOW;  // the opened event, for a local execution
   };
 
@@ -4917,6 +5185,15 @@ public:
     co_await http->request(method, url, headers, body, response);
   }
 
+  // A method call on the Binding: the asset layer answers requests, never a method, so the call goes to the Worker.
+  kj::Promise<rpc::EventDispatcher::Client> openWorker() {
+    KJ_REQUIRE(!used, "a Binding call carries one request");
+    used = true;
+    KJ_REQUIRE(allocation.has_value(), "the ASSETS Binding has no methods");
+    auto dispatched = co_await dispatch.dispatch(version, std::move(*allocation), workerId);
+    co_return kj::mv(dispatched.dispatcher);
+  }
+
 private:
   AssetLayer& assets;
   BindingDispatch& dispatch;
@@ -4936,6 +5213,15 @@ public:
     KJ_REQUIRE(service.get() != nullptr, "a Binding call carries one request");
     context.initResults(capnp::MessageSize{4, 1}).setHttp(factory.kjToCapnp(kj::mv(service)));
     return kj::READY_NOW;
+  }
+  // The same event as a method call: it goes to the Worker, since the asset layer has no methods.
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    KJ_REQUIRE(service.get() != nullptr, "a Binding call carries one request");
+    auto dispatcher = co_await service->openWorker();
+    auto opened = dispatcher.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
+    auto results = context.initResults(capnp::MessageSize{4, 2});
+    results.setTopLevel(opened.getTopLevel());
+    results.setSession(opened.getSession());
   }
 private:
   capnp::HttpOverCapnpFactory& factory;
@@ -5361,6 +5647,48 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   context.initResults().initResult().setAccepted(kj::mv(received.dispatcher));
 }
 
+class BindingBootstrap;
+
+// The node's end of a session its own runtime opened for a method call (runtime/runtime.js: the Binding shim's
+// rpcTarget). It carries no HTTP request; its one method call is the envelope.
+class RpcSessionDispatcher final: public rpc::EventDispatcher::Server {
+public:
+  explicit RpcSessionDispatcher(BindingBootstrap& bootstrap): bootstrap(bootstrap) {}
+  kj::Promise<void> getHttpService(GetHttpServiceContext) override {
+    KJ_FAIL_REQUIRE("a JS RPC session carries no HTTP request");
+  }
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
+
+private:
+  BindingBootstrap& bootstrap;
+};
+
+// The top-level target of such a session: the one call made on it names the envelope and is answered with the
+// target's own entrypoint, behind the call tree's lease. The session this object holds -- the caller's view of it and
+// the one the executing node opened -- lasts exactly as long as this object, which the caller drops when it has let
+// go of the entrypoint and everything reached through it.
+class RpcBindTarget final: public rpc::JsRpcTarget::Server {
+public:
+  RpcBindTarget(BindingBootstrap& bootstrap, kj::Own<kj::PromiseFulfiller<void>> done)
+      : bootstrap(bootstrap), done(kj::mv(done)) {}
+  // Nothing was handed out: the session is over with this object. Once the bind answered, the capability's own
+  // membrane holds the fulfiller instead, so the session lasts as long as the caller's capabilities.
+  ~RpcBindTarget() noexcept(false) { if (done.get() != nullptr) done->fulfill(); }
+  KJ_DISALLOW_COPY_AND_MOVE(RpcBindTarget);
+
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
+    return {bind(interfaceId, methodId, kj::mv(context)), false, true};
+  }
+
+private:
+  kj::Promise<void> bind(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context);
+  BindingBootstrap& bootstrap;
+  kj::Own<kj::PromiseFulfiller<void>> done;
+  bool used = false;
+};
+
 class BindingBootstrap final: public rpc::WorkerdBootstrap::Server {
 public:
   BindingBootstrap(
@@ -5376,16 +5704,25 @@ public:
         dispatcher(server, peerForwarder, factory, headerTable),
         durable(durable) {}
 
-  kj::Promise<void> startEvent(StartEventContext context) override {
-    auto timing = pathTiming("binding");
-    auto params = context.getParams();
-    auto metadata = params.getCfBlobJson();
-    KJ_REQUIRE(metadata.size() > 0, "missing trusted Binding descriptor");
-    capnp::MallocMessageBuilder message;
-    auto descriptor = message.initRoot<rpc::BindingDescriptor>();
-    capnp::JsonCodec json;
-    json.setRejectUnknownFields(true);
-    json.decode(metadata, descriptor);
+  // A Binding call's own event: the descriptor the caller's runtime sent, decoded, then either a call to a Durable
+  // Object of the Worker or a Service Binding call -- allocated in the caller's call tree, placed, dispatched. The
+  // dispatcher goes to `out` exactly where the results used to take it, so that the `fetch` path and a JS RPC
+  // session (jsRpcSession below) open an event in one and the same way. With `awaitReady` this promise waits for
+  // the opened event, as `startEvent` always did; a session does not, because its answer is the target's own
+  // capability and the open travels with it.
+  kj::Promise<void> openBinding(rpc::BindingDescriptor::Reader descriptor, SharedPathTiming timing,
+      BindingDispatch::Dispatched& out, bool awaitReady) {
+    // `context` below is this one, not the RPC call's: the body is what `startEvent` has always been, and it names
+    // the dispatcher it chose in the one way it always has, so that the `fetch` path's behaviour is unchanged while a
+    // method call opens its event through the very same code.
+    struct Results {
+      BindingDispatch::Dispatched& out;
+      void setDispatcher(rpc::EventDispatcher::Client client) { out.dispatcher = kj::mv(client); }
+    };
+    struct Context {
+      BindingDispatch::Dispatched& out;
+      Results initResults(capnp::MessageSize = capnp::MessageSize{4, 1}) { return Results{out}; }
+    } context{out};
     auto workerId = std::string(descriptor.getWorkerId().cStr());
     auto versionId = std::string(descriptor.getVersionId().cStr());
     auto contentHash = std::string(descriptor.getContentHash().cStr());
@@ -5464,7 +5801,9 @@ public:
       }
       auto dispatched = co_await durable.dispatch(std::move(request));
       context.initResults().setDispatcher(std::move(dispatched.dispatcher));
-      co_return co_await std::move(dispatched.ready);
+      if (awaitReady) co_return co_await std::move(dispatched.ready);
+      out.ready = std::move(dispatched.ready);
+      co_return;
     }
     KJ_REQUIRE(coworkerd::workerFullName(workerId), "invalid bound workerId");
     KJ_REQUIRE(safeName(versionId), "invalid bound versionId");
@@ -5553,7 +5892,9 @@ public:
       }
       auto dispatched = co_await dispatcher.dispatch(std::move(version), std::move(allocation), workerId);
       context.initResults().setDispatcher(std::move(dispatched.dispatcher));
-      co_return co_await std::move(dispatched.ready);
+      if (awaitReady) co_return co_await std::move(dispatched.ready);
+      out.ready = std::move(dispatched.ready);
+      co_return;
     } catch (const kj::Exception& error) {
       std::string reason = error.getDescription().cStr();
       const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
@@ -5578,8 +5919,83 @@ public:
           std::move(detail),
           expiresAtMonotonicMs));
       co_return;
+    }  }
+
+  kj::Promise<void> startEvent(StartEventContext context) override {
+    auto metadata = context.getParams().getCfBlobJson();
+    // A JS RPC session carries no cf: workerd sends none for one, in either direction (see JS_RPC_TARGET_TYPE_ID
+    // above), so the envelope arrives as the name of the one method the session takes.
+    if (metadata.size() == 0) {
+      context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::heap<RpcSessionDispatcher>(*this));
+      return kj::READY_NOW;
     }
+    return startFetchEvent(context);
   }
+
+  kj::Promise<void> startFetchEvent(StartEventContext context) {
+    auto timing = pathTiming("binding");
+    auto metadata = context.getParams().getCfBlobJson();
+    capnp::MallocMessageBuilder message;
+    auto descriptor = message.initRoot<rpc::BindingDescriptor>();
+    capnp::JsonCodec json;
+    json.setRejectUnknownFields(true);
+    json.decode(metadata, descriptor);
+    BindingDispatch::Dispatched out;
+    co_await openBinding(descriptor.asReader(), std::move(timing), out, true);
+    context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::mv(out.dispatcher));
+  }
+
+  // The target of a method call, for the session the runtime opened: the envelope is the method's name, the event it
+  // opens is the same one a `fetch` through the Binding would open, and the answer is the target's own entrypoint --
+  // workerd's own capability, behind this call tree's lease. Every method call the tenant then makes on it goes
+  // straight to the target through this node, its arguments never decoded here.
+  void observeRpcFailure(const std::string& code) { server.observeRpcFailure(code); }
+
+  kj::Promise<capnp::Capability::Client> openRpcTarget(kj::StringPtr envelope,
+      kj::Own<kj::PromiseFulfiller<void>> done) {
+    auto timing = pathTiming("rpc");
+    capnp::MallocMessageBuilder message;
+    auto descriptor = message.initRoot<rpc::BindingDescriptor>();
+    capnp::JsonCodec json;
+    json.setRejectUnknownFields(true);
+    json.decode(envelope, descriptor);
+    // An object's call to an object starts a call tree of its own, so its envelope names no deadline: the capability
+    // then lives as long as a root's lease, which is what the request path gives such a tree (DurableDispatch).
+    const double presented = descriptor.getExpiresAtMonotonicMs();
+    const double deadline = presented > 0 ? presented : server.rootDeadline();
+    const bool durableCall = descriptor.hasDurableObject();
+    const auto startedAt = monotonicTimeMs();
+    BindingDispatch::Dispatched out;
+    co_await openBinding(descriptor.asReader(), std::move(timing), out, false);
+    auto started = out.dispatcher.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
+    server.observeRpcSession(durableCall);
+    server.observeRpcProxied();
+    // One [rpc] line per method call of a Binding, in the shape of a [do] line: who called, what it is addressed to
+    // and how long the target's own capability took to come back.
+    std::cout << std::setprecision(17) << "[rpc] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId)
+              << "\",\"target\":\"" << jsonEscape(std::string(descriptor.getWorkerId().cStr()) + "@" +
+                     descriptor.getVersionId().cStr())
+              << "\",\"entrypoint\":\"" << jsonEscape(descriptor.getEntrypoint().cStr())
+              << "\",\"kind\":\"" << (durableCall ? "durableObject" : "serviceBinding")
+              << "\",\"namespaceId\":\"" << (durableCall ? std::string(descriptor.getDurableObject().getNamespaceId().cStr()).substr(0, 12) : std::string())
+              << "\",\"objectId\":\"" << (durableCall ? std::string(descriptor.getDurableObject().getObjectId().cStr()).substr(0, 12) : std::string())
+              << "\",\"treeId\":\"" << jsonEscape(descriptor.getTreeId().cStr())
+              << "\",\"parentInvocationId\":\"" << jsonEscape(descriptor.getParentInvocationId().cStr())
+              << "\",\"elapsedMs\":" << monotonicTimeMs() - startedAt
+              << ",\"expiresAtMonotonicMs\":" << deadline
+              << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    // The lease: a capability the target returned is the caller's for as long as the call tree lives, and no longer.
+    // The lease running out is a failure of this call tree's capabilities, counted once under its own code.
+    auto revoked = server.whenLeaseExpires(deadline).catch_([&server = server](kj::Exception&& error) -> kj::Promise<void> {
+      server.observeRpcFailure("LEASE_EXPIRED");
+      return kj::Promise<void>(kj::mv(error));
+    });
+    co_return capnp::membrane(capnp::Capability::Client(started.getTopLevel()),
+        kj::refcounted<LeaseMembrane>(kj::mv(revoked), [&server = server, durableCall]() {
+          server.observeRpcCall(durableCall);
+        }, started.getSession(), kj::mv(out.ready), kj::mv(done), [&server = server]() { server.observeRpcReleased(); }));
+  }
+
 
 private:
   ServerCore& server;
@@ -5589,6 +6005,50 @@ private:
   BindingDispatch dispatcher;
   DurableDispatch& durable;
 };
+
+kj::Promise<void> RpcSessionDispatcher::jsRpcSession(JsRpcSessionContext context) {
+  auto paf = kj::newPromiseAndFulfiller<void>();
+  auto results = context.initResults(capnp::MessageSize{4, 2});
+  results.setTopLevel(kj::heap<RpcBindTarget>(bootstrap, kj::mv(paf.fulfiller)));
+  // Resolves to a null capability once the caller has dropped the target: workerd's own signal that the session is
+  // over (src/workerd/api/worker-rpc.c++, JsRpcSessionCustomEvent).
+  results.setSession(paf.promise.then([]() { return rpc::JsRpcSession::Client(nullptr); },
+      [](kj::Exception&&) { return rpc::JsRpcSession::Client(nullptr); }));
+  return kj::READY_NOW;
+}
+
+kj::Promise<void> RpcBindTarget::bind(uint64_t interfaceId, uint16_t methodId,
+    capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
+  KJ_REQUIRE(interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0,
+      "a Binding's JS RPC session carries one method call");
+  KJ_REQUIRE(!used, "a Binding's JS RPC session carries one method call");
+  used = true;
+  auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
+  KJ_REQUIRE(params.which() == rpc::JsRpcTarget::CallParams::METHOD_NAME,
+      "a Binding's JS RPC session names its envelope");
+  try {
+    auto target = co_await bootstrap.openRpcTarget(params.getMethodName(), kj::mv(done));
+    auto request = target.typelessRequest(interfaceId, methodId, params.totalSize(), {});
+    auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
+    builder.setMethodName(JS_RPC_BIND_METHOD);
+    copyCallParams(params, builder);
+    context.releaseParams();
+    co_return co_await context.tailCall(kj::mv(request));
+  } catch (const kj::Exception& error) {
+    // Our codes are the start of an RPC error's message (docs/guide/errors.md): the first word of one is what this
+    // failure is counted as, anything else as EXECUTION_FAILED. workerd's own tag for a message it passes on
+    // (`jsg.Error: `) and the `remote.` a hop adds stand in front of it and are skipped first.
+    std::string reason = error.getDescription().cStr();
+    for (const auto& tag : {"remote.", "jsg.Error: ", "jsg.TypeError: ", "jsg.RangeError: "}) {
+      while (reason.starts_with(tag)) reason.erase(0, std::strlen(tag));
+    }
+    const auto colon = reason.find(':');
+    std::string code = colon == std::string::npos ? std::string() : reason.substr(0, colon);
+    const bool ours = !code.empty() && code.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ_") == std::string::npos;
+    bootstrap.observeRpcFailure(ours ? code : "EXECUTION_FAILED");
+    throw;
+  }
+}
 
 class BindingRpcService final: public kj::HttpService {
 public:

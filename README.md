@@ -39,8 +39,9 @@ Boundaries to know about:
 
 - **One region.** A cluster lives in one region or an equivalent low-latency network; no routing or failover across regions.
 - **Stateless Workers only, in this release.** Stateful bindings (Durable Objects come in 0.5) and several Cloudflare
-  features (scheduled triggers, Tail Workers and others) are refused when a project is converted, and JS RPC is not supported: a Service Binding reaches only the other
-  Worker's `fetch()`; the full list is in [docs/guide/compat.md](docs/guide/compat.md).
+  features (scheduled triggers, Tail Workers and others) are refused when a project is converted; a Service Binding
+  reaches the other Worker's `fetch()` and, in 0.5, its `WorkerEntrypoint` methods (JS RPC), and only within the
+  tenant; the full list is in [docs/guide/compat.md](docs/guide/compat.md).
 - **The sandbox needs host support.** The launcher needs unprivileged user namespaces; under Docker's default seccomp
   and AppArmor profiles it cannot set up its environment, so the default compose cluster runs without the sandbox and
   says so in its logs ([docs/guide/install.md](docs/guide/install.md), sections 3 and 4). The system call allowlist

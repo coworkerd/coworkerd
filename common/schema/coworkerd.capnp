@@ -15,7 +15,51 @@ interface EventDispatcher @0xf20697475ec1752d {
   unused6 @6 ();
   unused7 @7 ();
   unused8 @8 ();
-  unused9 @9 ();
+  # A JS RPC session on this event: workerd's own mechanism for a method call on a Service Binding or a Durable
+  # Object stub (src/workerd/io/worker-interface.capnp). `topLevel` takes exactly one method call, and dropping
+  # `session` ends the session. The node implements it on the channel its runtime's SERVER Binding opens and on the
+  # peer session, where it only proxies capabilities: it reads the method's name -- our envelope -- and never a
+  # serialized JavaScript value (docs/architecture.md, section 3).
+  jsRpcSession @9 () -> (topLevel :JsRpcTarget, session :JsRpcSession);
+}
+
+# Mirrors of workerd's JS RPC types (src/workerd/io/worker-interface.capnp), with the interface ids workerd's own
+# clients and servers send and a layout equal to theirs field for field: a serialized JavaScript value (`JsValue`) and
+# a span context are `AnyPointer` here, because the node copies them from one message to the other -- capabilities
+# inside them included -- and never decodes them. Everything the node reads is text: the name of the method.
+interface JsRpcTarget @0xa1a96525142a9d98 {
+  struct CallParams @0xaff95bff9d8bfd33 {
+    union {
+      methodName @0 :Text;
+      methodPath @2 :List(Text);
+    }
+    operation :union {
+      # A `JsValue` holding the call's arguments, or no arguments at all.
+      callWithArgs @1 :AnyPointer;
+      getProperty @3 :Void;
+    }
+    resultsStreamHandler :union {
+      obsolete4 @4 :Capability;
+      # The caller's `JsValue.ExternalPusher`, through which the callee pushes the streams and stubs its answer
+      # carries: the node passes the capability on, so they are pushed into the calling isolate itself.
+      externalPusher @5 :Capability;
+    }
+    callerSpanContext @6 :AnyPointer;
+  }
+
+  struct CallResults @0xf8796f556942bdc7 {
+    # The returned `JsValue`.
+    result @0 :AnyPointer;
+    callPipeline @1 :JsRpcTarget;
+    hasDisposer @2 :Bool;
+    obsolete3 @3 :Capability;
+  }
+
+  call @0 CallParams -> CallResults;
+}
+
+interface JsRpcSession @0xbbfec607777f1620 {
+  # No methods: the session lasts as long as the capability is held.
 }
 
 interface WorkerdBootstrap @0x878048cda334ade3 {
@@ -604,6 +648,12 @@ struct PlacementConfig {
   connectBackoffMs @6 :UInt32 = 100;
   loadBandForTest @7 :Text = "green";
   equalLimitsForTest @8 :Bool = false;
+  # Where a stateless subcall executes -- a Service Binding call, by `fetch` or by a method: "home" (the default) sends
+  # it to the Worker's home as any call of its own would go, "local" runs it on the calling node, as Cloudflare's
+  # Service Bindings do. The choice is a policy point with the caller's node as its hint, so that a mixed rule (a
+  # Worker's own preference, say) can replace it; which default is right waits on an R-line measurement
+  # (docs/s3-truth-and-durable-objects.md, section 9).
+  subcalls @9 :Text = "home";
 }
 
 struct MembershipConfig {

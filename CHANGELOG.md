@@ -2,6 +2,35 @@
 
 ## 0.5.0 (unreleased)
 
+JS RPC: a Worker's methods, and a Durable Object's, can now be called over a Binding. `env.SVC.method(args)` reaches
+another Worker of the tenant and `stub.method(args)` reaches an object, with Cloudflare's own types -- structured
+clone, `RpcTarget`, `RpcStub`, streams and functions -- and the exception a method throws reaching the caller. It is
+workerd's own mechanism throughout: the node implements `EventDispatcher.jsRpcSession()` on the channel its runtime
+already uses and on the peer session, and answers a call with the target's own entry point as a capability, which it
+proxies to the caller. A tenant's arguments are serialized in the calling isolate and decoded in the target's; the node
+reads neither, here or on the way between nodes.
+
+- **A method call is a call of the tree, like a `fetch` through the same Binding**: it is placed the same way (so the
+  target may run on another node), draws on the budget of subrequests -- the root's eight, a child's one grant --, and
+  carries the deadline; over the budget it throws `SUBREQUEST_BUDGET_EXHAUSTED` and past the deadline `LEASE_EXPIRED`,
+  as the HTTP answer of a `fetch` would say. The platform's code is the start of the error's message and is also its
+  `code` property. Calls on a capability a method returned are part of the same call and draw nothing more.
+- **A capability belongs to the call tree that made it**: an `RpcTarget`, a stub, a stream or a function that crosses a
+  Binding works wherever the caller holds it -- through this node and, when the target is elsewhere, the peer session --
+  and is released with the tree's lease (`LEASE_EXPIRED` afterwards; a disconnection when the node that held it went
+  away). One call's arguments or return value are at most 32 MiB serialized, workerd's own limit.
+- **Durable Objects**: a stub has the class's public methods as well as `fetch`. The call goes to the shard's owner with
+  the shard's epoch and its fencing, as a request does, and is an event of the object there: its CPU is topped up, its
+  lines are the event's, and an object's method call on an object starts a call tree of its own under the same 8-hop
+  limit. A class that is not a `WorkerEntrypoint`, and a plain object entry point, have `fetch` only, as on Cloudflare.
+- **Where a stateless subcall executes is now a policy point**, `placement.subcalls`: `home` (the default, unchanged)
+  places it like any call, so it goes to the Worker's home; `local` runs it on the calling node, as Cloudflare's Service
+  Bindings do. Both work for `fetch` and for method calls. Which should be the default waits on a measurement of the two
+  under load.
+- **Observation**: the state endpoint's `jsRpc` counts the sessions, the method calls, the capabilities proxied and held
+  and the failures by code, and the node writes one `[rpc]` line per method call of a Binding (the target, the entry
+  point, the call tree, how long the target's capability took).
+
 Inbound WebSocket connections for stateless Workers. A Worker that answers an upgrade with `101` and a WebSocket now gets
 its connection: the node that received the upgrade relays text and binary messages and close frames, with their code and
 reason, both ways -- also when the Worker runs on another node, through the signed peer session, which the connection

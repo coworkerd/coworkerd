@@ -166,6 +166,28 @@ The HTTP SQL interface (`POST /v1/tenants/{t}/databases/{d}/query`) answers the 
 the control plane's own `{"code","reason"}` when the database does not exist (`404 NOT_FOUND`) or no node serves it
 (`503 STORAGE_UNAVAILABLE`).
 
+## 4b. Method calls on a Binding (errors `env.SVC.method()` and `stub.method()` throw)
+
+A method call on a Service Binding or on a Durable Object stub is a call of the tree like a `fetch` through the same
+Binding, so the same things can refuse it -- but there is no response to read the code from: the call **throws**. The
+platform's code is the start of the error's `message`, and on a call made through the Binding itself it is the error's
+`code` property too (on a call made on a capability the target returned, the message carries it alone); an exception the
+target's own code threw arrives as that exception's message, with no code.
+
+| `message` | `code` | Meaning | What to do |
+| --- | --- | --- | --- |
+| whatever the method threw | absent | The target's code threw: the object or the Worker is as it was, as on Cloudflare | The caller's own business |
+| `SUBREQUEST_BUDGET_EXHAUSTED: ...` | `SUBREQUEST_BUDGET_EXHAUSTED` | The call tree's budget is used up: a method call draws on it exactly as a `fetch` through the Binding does (section 1) | Make fewer Binding calls |
+| `LEASE_EXPIRED: ...` | `LEASE_EXPIRED` | The call tree's deadline has passed -- for a capability the target returned, this is also what a call on it answers once the tree that made it is over | Make the call within the tree that opened it |
+| `CPU_LIMIT_EXCEEDED: ...`, `MEMORY_LIMIT_EXCEEDED: ...` | the same | A limit ended the method, as it would a request (section 1) | Do less per call |
+| `VERSION_UNAVAILABLE: ...`, `VERSION_PIN_MISMATCH: ...` | the same | The deployment changed during the call (section 1) | Retry |
+| `DO_HOP_LIMIT: ...`, `DO_OWNER_EXPIRED: ...`, `DO_SHARD_EPOCH_MISMATCH: ...`, `DO_RECOVERING: ...` | the same | The object could not be reached or run, as for a `fetch` to it (section 1) | As in section 1 |
+| `Network connection lost.` and the like | absent | The node that ran the target went away while the caller still held one of its capabilities | Retry; the call tree is over |
+
+A value a method sends or returns is at most 32 MiB serialized (workerd's own limit), and a value that is not
+serializable (a `Request`, a `WebSocket`, a class instance that is not an `RpcTarget`) fails the call with the message
+workerd gives it.
+
 ## 5. Outgoing requests of tenant code (errors `fetch` throws)
 
 Tenant code's `fetch()` goes out through the egress service of the node it runs on ([installing and running](install.md), section 11). When the node refuses the destination or cannot connect to it, `fetch` **throws** an `Error`

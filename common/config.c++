@@ -151,6 +151,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.connectBackoffMs = placement.getConnectBackoffMs();
   result.loadBandForTest = placement.getLoadBandForTest().cStr();
   result.equalLimitsForTest = placement.getEqualLimitsForTest();
+  result.subcalls = placement.getSubcalls().cStr();
+  KJ_REQUIRE(result.subcalls == "home" || result.subcalls == "local",
+      "placement.subcalls is \"home\" or \"local\"", result.subcalls.c_str());
   KJ_REQUIRE(result.rootLimit > 0 &&
       (result.nestedLimit > result.rootLimit ||
        (result.equalLimitsForTest && result.nestedLimit == result.rootLimit)),

@@ -315,12 +315,23 @@ function __coworkerdNamespace(entry) {
       if (!(id instanceof DurableObjectId) || __coworkerdIdNamespace.get(id) !== namespaceId)
         throw new TypeError("ID is not for this Durable Object namespace.");
       const objectId = id.toString();
-      return Object.freeze({ id, name: id.name, fetch(input, init) {
+      const stub = { id, name: id.name, fetch(input, init) {
         const request = new Request(input, init);
         const headers = new Headers(request.headers);
         headers.set(${JSON.stringify(DO_OBJECT_HEADER)}, objectId);
         return fetcher.fetch(new Request(request, { headers }));
-      } });
+      } };
+      // Any public method of the object's class, as on Cloudflare: the call goes to the node over the namespace's
+      // channel, which answers with the object's own capability, and workerd's RPC delivers it there.
+      const open = () => fetcher.rpcTarget(objectId);
+      return new Proxy(Object.freeze(stub), {
+        get(target, property) {
+          if (Object.prototype.hasOwnProperty.call(target, property)) return target[property];
+          if (typeof property !== "string" || property === "then") return undefined;
+          return __coworkerdRpcPath(open, [property]);
+        },
+        has(target, property) { return typeof property === "string" && property !== "then"; },
+      });
     },
     getByName(name, options) { return space.get(space.idFromName(name), options); },
     jurisdiction() { throw new TypeError("Durable Object jurisdictions are not supported"); },
@@ -537,11 +548,97 @@ function __coworkerdDurableClass(namespace, name) {
         throw new Error("Durable Object class " + name + " has no fetch handler");
       return withEnv(env, () => fetch.apply(this, args));
     } });
+    // The object as a capability, for a method call on its stub: the Host asks the facet for it and the node hands it
+    // to the caller, so the call is delivered to this instance by workerd's own RPC.
+    Object.defineProperty(wrapped.prototype, "__coworkerdRpcTarget", { configurable: true, get: function () {
+      const env = __coworkerdObjectEnvs.get(this);
+      return withEnv(env, () => __coworkerdRpcFacade(this, env));
+    } });
     Object.defineProperty(wrapped, "name", { value: name });
     return wrapped;
   } catch {
     return missing;
   }
+}
+`;
+
+// The JS RPC source every version's bridge carries (docs/compatibility.md, section 7). Three things live here:
+//   __coworkerdRpcFacade: the capability a method call is delivered to. It is a genuine RpcTarget of this isolate --
+//     the only kind workerd serializes as a stub, and therefore the only kind that can be a capability of its own
+//     across processes -- whose methods are the entrypoint's or the object's own public methods, each run on that
+//     instance within its env. The arguments are decoded here, in the isolate that owns the code, and nowhere else.
+//   __coworkerdService: what `env.SVC` is for a Service Binding. `fetch` is the Binding's own channel, unchanged;
+//     every other property is a method call, which opens a session to the node through the same channel (the shim's
+//     rpcTarget) and is pipelined onto the capability the node answers with, so the node never decodes it.
+//   __coworkerdRpcPath: property paths on a Binding (`env.SVC.counter.value()`), which workerd's own RPC carries as
+//     the path of one call.
+const RPC_SOURCE = `
+function __coworkerdMemberNames(instance) {
+  const names = [];
+  for (let proto = Object.getPrototypeOf(instance); proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name === "constructor" || names.includes(name)) continue;
+      names.push(name);
+    }
+  }
+  return names;
+}
+function __coworkerdRpcFacade(instance, env) {
+  class Facade extends RpcTarget {}
+  for (const name of __coworkerdMemberNames(instance)) {
+    const described = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(instance), name) ??
+      { value: instance[name] };
+    if (typeof described.get === "function") {
+      Object.defineProperty(Facade.prototype, name, { configurable: true,
+        get() { return withEnv(env, () => instance[name]); } });
+    } else if (typeof described.value === "function") {
+      Object.defineProperty(Facade.prototype, name, { configurable: true, writable: true,
+        value(...args) { return withEnv(env, () => instance[name](...args)); } });
+    }
+  }
+  return new Facade();
+}
+// A platform code at the start of an RPC error's message, as a property of the error the tenant catches
+// (docs/guide/errors.md): the message itself keeps the code, since that is all an RPC exception carries.
+function __coworkerdRpcCode(error) {
+  const reason = String(error?.message ?? error);
+  const colon = reason.indexOf(":");
+  const code = colon > 0 ? reason.slice(0, colon) : "";
+  if (/^[A-Z][A-Z_]*$/.test(code)) { try { error.code = code; } catch {} }
+  return error;
+}
+function __coworkerdRpcPath(open, path) {
+  const call = async (...args) => {
+    let target = open();
+    for (const step of path.slice(0, -1)) target = target[step];
+    try {
+      return await target[path[path.length - 1]](...args);
+    } catch (error) {
+      throw __coworkerdRpcCode(error);
+    }
+  };
+  return new Proxy(call, {
+    get(_target, name) { return typeof name === "string" && name !== "then" ? __coworkerdRpcPath(open, [...path, name]) : undefined; },
+    apply(_target, _self, args) { return call(...args); },
+  });
+}
+function __coworkerdService(fetcher) {
+  if (!fetcher) return fetcher;
+  const open = () => fetcher.rpcTarget();
+  return new Proxy(fetcher, {
+    get(target, name) {
+      if (typeof name !== "string" || name === "then") return undefined;
+      if (name === "fetch" || name === "connect") return (...args) => target[name](...args);
+      return __coworkerdRpcPath(open, [name]);
+    },
+    has(target, name) { return typeof name === "string" && name !== "then"; },
+  });
+}
+function __coworkerdServices(bindings) {
+  const out = {};
+  for (const [name, value] of Object.entries(bindings ?? {}))
+    out[name] = value !== null && typeof value === "object" && typeof value.fetch === "function" ? __coworkerdService(value) : value;
+  return out;
 }
 `;
 
@@ -763,32 +860,56 @@ async function makeWorkerCode(descriptor, env, ctx) {
     }
     const classes = Array.isArray(descriptor.durableObjectClasses) ? descriptor.durableObjectClasses : [];
     const bridge = `import { __coworkerdLog } from "./${PRELUDE_MODULE}";
-import { withEnv, DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { withEnv, DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${TRIAL_SOURCE}
+${RPC_SOURCE}
 ${classes.length ? DURABLE_SOURCE + classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\n`).join("") : ""}
-export default { fetch(request, variables, ctx) {
-  if (ctx.props.trial === true) return __coworkerdTrial(tenant, true, ctx.props.entrypoint, ctx.props.classes);
-  const { bindings, entrypoint, durableObjects } = ctx.props;
-  const env = { ...variables, ...bindings${classes.length ? ", ...__coworkerdNamespaces(durableObjects)" : ""} };
-  return withEnv(env, () => {
-    const target = tenant[entrypoint || "default"];
-    if (!target || (typeof target !== "function" && typeof target.fetch !== "function")) {
+function __coworkerdEnvOf(variables, props) {
+  const { bindings, durableObjects } = props;
+  return { ...variables, ...__coworkerdServices(bindings)${classes.length ? ", ...__coworkerdNamespaces(durableObjects)" : ""} };
+}
+export default class extends WorkerEntrypoint {
+  fetch(request) {
+    const variables = this.env, ctx = this.ctx;
+    if (ctx.props.trial === true) return __coworkerdTrial(tenant, true, ctx.props.entrypoint, ctx.props.classes);
+    const entrypoint = ctx.props.entrypoint;
+    const env = __coworkerdEnvOf(variables, ctx.props);
+    return withEnv(env, () => {
+      const target = tenant[entrypoint || "default"];
+      if (!target || (typeof target !== "function" && typeof target.fetch !== "function")) {
+        throw new Error("Worker entrypoint missing or unsupported: " + (entrypoint || "default"));
+      }
+      __coworkerdLog("[tenant-entry] " + JSON.stringify({ serverId: request.cf.serverId, processId: request.cf.processId,
+        processGeneration: request.cf.processGeneration, invocationId: request.cf.invocationId, treeId: request.cf.treeId,
+        target: ${JSON.stringify(descriptor.workerId + "@" + descriptor.versionId)}, entrypoint: entrypoint || "default",
+        callId: request.headers.get("x-placement-call-id"), observedAtUnixMs: Date.now() }));
+      if (typeof target === "function" && target.prototype instanceof WorkerEntrypoint) {
+        return new target(ctx, env).fetch(request);
+      }
+      if (target && typeof target.fetch === "function") return target.fetch(request, env, ctx);
       throw new Error("Worker entrypoint missing or unsupported: " + (entrypoint || "default"));
+    });
+  }
+  // The entrypoint as a capability, for a method call on a Service Binding: the node asks this runtime for it and
+  // hands it to the caller, so the call is delivered here by workerd's own RPC. Only a WorkerEntrypoint class has
+  // methods, as on Cloudflare.
+  get __coworkerdRpcTarget() {
+    const entrypoint = this.ctx.props.entrypoint || "default";
+    const env = __coworkerdEnvOf(this.env, this.ctx.props);
+    const target = tenant[entrypoint];
+    if (typeof target !== "function" || !(target.prototype instanceof WorkerEntrypoint)) {
+      throw new Error("Worker entrypoint has no methods (it does not extend WorkerEntrypoint): " + entrypoint);
     }
-    __coworkerdLog("[tenant-entry] " + JSON.stringify({ serverId: request.cf.serverId, processId: request.cf.processId,
-      processGeneration: request.cf.processGeneration, invocationId: request.cf.invocationId, treeId: request.cf.treeId,
-      target: ${JSON.stringify(descriptor.workerId + "@" + descriptor.versionId)}, entrypoint: entrypoint || "default",
-      callId: request.headers.get("x-placement-call-id"), observedAtUnixMs: Date.now() }));
-    if (typeof target === "function" && target.prototype instanceof WorkerEntrypoint) {
-      return new target(ctx, env).fetch(request);
-    }
-    if (target && typeof target.fetch === "function") return target.fetch(request, env, ctx);
-    throw new Error("Worker entrypoint missing or unsupported: " + (entrypoint || "default"));
-  });
-}};`;
+    return withEnv(env, () => __coworkerdRpcFacade(new target(this.ctx, env), env));
+  }
+}`;
+    // `rpc` is on by default from Cloudflare's 2024-04-03, and a Binding of ours has methods whatever the version's
+    // compatibility date says (docs/compatibility.md, section 7): a Worker that turned RPC off keeps it off.
+    const flags = [...descriptor.compatibilityFlags];
+    if (!flags.includes("no_rpc") && !flags.includes("rpc")) flags.push("rpc");
     return { compatibilityDate: descriptor.compatibilityDate,
-      compatibilityFlags: [...new Set([...descriptor.compatibilityFlags, "enable_request_signal"])],
+      compatibilityFlags: [...new Set([...flags, "enable_request_signal"])],
       mainModule: BRIDGE_MODULE, modules: { ...source, [BRIDGE_MODULE]: bridge, [PRELUDE_MODULE]: preludeSource() },
       env: variables, globalOutbound: egressOutbound(descriptor, ctx), allowExperimental: true,
       streamingTails: tenantLogTail(descriptor, ctx) };
@@ -835,6 +956,29 @@ function tenantCf(descriptor, env) {
 // from this runtime: a stateless call's Bindings, or an object's Host) and the caller -- a stateless Worker's call tree,
 // or the calling object.
 export class DurableNamespace extends WorkerEntrypoint {
+  // A method call on a stub of this namespace: the same envelope its `fetch` puts in cf, with the object the stub
+  // names, as the one method of a session to the node. The node finds the shard's owner (the epoch and the fencing as
+  // for a request) and answers with the object's own capability, which the tenant's call is then pipelined onto.
+  rpcTarget(objectId) {
+    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, treeId,
+      parentInvocationId, orderSequence, expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
+    if (typeof objectId !== "string" || !SHA256_HEX.test(objectId)) throw new Error("Invalid Durable Object call");
+    if (typeof workerId !== "string" || typeof versionId !== "string" || !SHA256_HEX.test(contentHash ?? "") ||
+        !SHA256_HEX.test(definitionHash ?? "") || !SHA256_HEX.test(namespaceId ?? "") || !CLASS_NAME.test(className ?? "")) {
+      throw new Error("Invalid Durable Object call");
+    }
+    const fromObject = caller !== undefined && caller !== null;
+    const callSequence = !fromObject && requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
+    return this.env.SERVER[JSON.stringify({
+      workerId, versionId, contentHash, definitionHash,
+      treeId: fromObject ? "" : treeId, parentInvocationId: fromObject ? "" : parentInvocationId,
+      callSequence, orderSequence: !fromObject && requiresChildSequence ? (orderSequence || callSequence) : 0,
+      expiresAtMonotonicMs: fromObject ? 0 : expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: "",
+      durableObject: { namespaceId, className, objectId, database: database ?? "",
+        callerNamespaceId: fromObject ? caller.namespaceId : "", callerObjectId: fromObject ? caller.objectId : "" },
+    })]();
+  }
+
   async fetch(request) {
     const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, treeId, parentInvocationId,
       orderSequence, expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
@@ -944,6 +1088,32 @@ export class Host extends DurableObject {
         { status: 500 });
     }
   }
+  // The object as a capability, for a method call on its stub: the facet is started exactly as a request starts it
+  // (the same loader key, the same class, a version activated since aborting the old facet), and the capability is
+  // the object's own, from the facet's isolate -- so a method call is delivered there and its arguments are decoded
+  // there. A method call is an event of the object like a request: workerd tops up its CPU and its lines are the
+  // event's.
+  async rpcTarget(envelope) {
+    const descriptor = descriptorFrom({ cf: JSON.parse(envelope), headers: new Headers() });
+    const target = descriptor.durableObject;
+    if (!target) throw new Error("Missing Durable Object target");
+    if (target.database) throw new Error("a database has no methods");
+    const key = loaderKey(descriptor) + "#" + target.className;
+    if (this.facetKey !== undefined && this.facetKey !== key) this.abortFacet("the Worker's active version changed");
+    this.facetKey = key;
+    try {
+      const facet = this.ctx.facets.get("app", () => this.start(descriptor));
+      return await facet.__coworkerdRpcTarget;
+    } catch (error) {
+      const reason = String(error?.message ?? error);
+      const code = facetCode(error);
+      if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true) {
+        this.abortFacet("the Durable Object's class failed: " + reason.slice(0, 200));
+      }
+      throw new Error(code + ": " + reason.slice(0, 300));
+    }
+  }
+
   abortFacet(reason) {
     try { this.ctx.facets.abort("app", new Error(reason)); } catch {}
   }
@@ -1030,7 +1200,17 @@ export class SqlDatabase extends DurableObject {
 }
 
 export class BoundWorker extends WorkerEntrypoint {
-  async fetch(request) {
+  // A method call on this Binding: the envelope this shim holds -- the same fields its `fetch` puts in cf -- names
+  // the one method of a session to the node over the SERVER channel, and the node answers with the target's own
+  // entrypoint (node/main.c++, RpcBindTarget). The tenant's call is pipelined onto it, so its arguments are
+  // serialized in the tenant's isolate and decoded in the target's; nothing in between reads them.
+  rpcTarget() {
+    const envelope = this.envelope();
+    if (envelope.assets === true) throw new Error("the ASSETS Binding has no methods");
+    return this.env.SERVER[JSON.stringify(envelope)]();
+  }
+
+  envelope() {
     const {
       workerId,
       versionId,
@@ -1044,6 +1224,19 @@ export class BoundWorker extends WorkerEntrypoint {
       entrypoint,
       assets,
     } = this.ctx.props;
+    this.check();
+    const callSequence = requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
+    return {
+      workerId, versionId, contentHash, definitionHash, treeId, parentInvocationId,
+      callSequence, orderSequence: requiresChildSequence ? (orderSequence || callSequence) : 0,
+      expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: entrypoint ?? "",
+      ...(assets === true ? { assets: true } : {}),
+    };
+  }
+
+  check() {
+    const { workerId, versionId, contentHash, definitionHash, treeId, parentInvocationId, orderSequence,
+      expiresAtMonotonicMs, requiresChildSequence } = this.ctx.props;
     if (
       typeof workerId !== "string" ||
       typeof versionId !== "string" ||
@@ -1061,6 +1254,12 @@ export class BoundWorker extends WorkerEntrypoint {
     ) {
       throw new Error("Invalid bound Worker capability");
     }
+  }
+
+  async fetch(request) {
+    const { workerId, versionId, contentHash, definitionHash, treeId, parentInvocationId, orderSequence,
+      expiresAtMonotonicMs, requiresChildSequence, entrypoint, assets } = this.ctx.props;
+    this.check();
     if (assets === true) {
       // The ASSETS Binding: the Server's asset layer of this version answers; no
       // child invocation, so no call sequence.
@@ -1148,65 +1347,107 @@ async function trialLoad(descriptor, env, ctx) {
   return Response.json(report);
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    if (new URL(request.url).pathname === "/__coworkerd/probe" && request.cf?.invocationId === undefined) {
-      return new Response(`${env.PROCESS_ID}:${env.PROCESS_GENERATION}`);
-    }
-    const descriptor = descriptorFrom(request);
-    if (descriptor.trial === true) return trialLoad(descriptor, env, ctx);
-    // A request to an object: its Host, on this durable process. The Host is named by the object and the epoch since which
-    // this node's copy of the object's shard is the one (the node's data epoch for it): a shard this node took over from
-    // another node starts its objects from empty, one it took back from itself keeps them.
-    if (descriptor.durableObject) {
-      if (!env.HOST) throw new Error("A Durable Object request reached a process without Durable Objects");
-      const target = descriptor.durableObject;
-      const dataEpoch = String(target.dataEpoch ?? "0");
-      return env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
-        (dataEpoch === "0" ? "" : "/" + dataEpoch))).fetch(request);
-    }
-    const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
-    const key = loaderKey(descriptor);
-    let coldStart = false;
-    // The load check before this dispatch loaded the version for this call: its cold start.
-    if (descriptor.coldLoaded === true) coldStart = true;
-    const worker = env.LOADER.get(key, async () => {
-      coldStart = true;
-      return makeWorkerCode(descriptor, env, ctx);
+// This runtime's entrypoint. A request is a `fetch` of it; a method call on a Binding or on a Durable Object stub is
+// a JS RPC session on it, whose node end reads __coworkerdRpcBind naming the call's descriptor (node/main.c++,
+// RpcDescriptorTarget) and hands the answer -- the version's entrypoint, or the object's -- to the caller.
+export default class extends WorkerEntrypoint {
+  fetch(request) { return serve(request, this.env, this.ctx); }
+  get __coworkerdRpcBind() { return rpcBind(this.env, this.ctx); }
+}
+
+// The descriptor of a method call, as a property name. Only this runtime's node sends one, over the channel its
+// SERVER Binding opens; a tenant reaches neither.
+function rpcBind(env, ctx) {
+  return new Proxy({}, {
+    getOwnPropertyDescriptor() { return { value: undefined, writable: true, enumerable: true, configurable: true }; },
+    has() { return true; },
+    get(_target, name) {
+      if (typeof name !== "string" || !name.startsWith("{")) return undefined;
+      return rpcEntrypoint(JSON.parse(name), env, ctx);
+    },
+  });
+}
+
+// The capability a method call is delivered to: the object's own, from its Host, or the version's entrypoint, from the
+// isolate the Worker Loader keeps under this version's loader key -- the same isolate its requests run in.
+async function rpcEntrypoint(value, env, ctx) {
+  const descriptor = descriptorFrom({ cf: value, headers: new Headers() });
+  const target = descriptor.durableObject;
+  if (target) {
+    if (!env.HOST) throw new Error("A Durable Object method call reached a process without Durable Objects");
+    const dataEpoch = String(target.dataEpoch ?? "0");
+    const host = env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
+      (dataEpoch === "0" ? "" : "/" + dataEpoch)));
+    return host.rpcTarget(JSON.stringify(value));
+  }
+  const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx));
+  return worker.getEntrypoint(undefined, { props: callProps(descriptor, ctx) }).__coworkerdRpcTarget;
+}
+
+async function serve(request, env, ctx) {
+  if (new URL(request.url).pathname === "/__coworkerd/probe" && request.cf?.invocationId === undefined) {
+    return new Response(`${env.PROCESS_ID}:${env.PROCESS_GENERATION}`);
+  }
+  const descriptor = descriptorFrom(request);
+  if (descriptor.trial === true) return trialLoad(descriptor, env, ctx);
+  // A request to an object: its Host, on this durable process. The Host is named by the object and the epoch since which
+  // this node's copy of the object's shard is the one (the node's data epoch for it): a shard this node took over from
+  // another node starts its objects from empty, one it took back from itself keeps them.
+  if (descriptor.durableObject) {
+    if (!env.HOST) throw new Error("A Durable Object request reached a process without Durable Objects");
+    const target = descriptor.durableObject;
+    const dataEpoch = String(target.dataEpoch ?? "0");
+    return env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
+      (dataEpoch === "0" ? "" : "/" + dataEpoch))).fetch(request);
+  }
+  const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
+  const key = loaderKey(descriptor);
+  let coldStart = false;
+  // The load check before this dispatch loaded the version for this call: its cold start.
+  if (descriptor.coldLoaded === true) coldStart = true;
+  const worker = env.LOADER.get(key, async () => {
+    coldStart = true;
+    return makeWorkerCode(descriptor, env, ctx);
+  });
+  const props = callProps(descriptor, ctx);
+  if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
+  return worker.getEntrypoint(undefined, { props }).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
+    console.log("[runtime-execution] " + JSON.stringify({
+      serverId: descriptor.serverId, processId: env.PROCESS_ID,
+      processGeneration: Number(env.PROCESS_GENERATION), invocationId: descriptor.invocationId,
+      treeId: descriptor.treeId, target: `${descriptor.workerId}@${descriptor.versionId}`,
+      coldStart, observedAtUnixMs: Date.now(),
+      ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
+    }));
+  });
+}
+
+// The props of one call of a version: its Service Bindings and its Durable Object Bindings, each a channel of this
+// runtime with the call's own envelope, and which entrypoint runs. A method call gets the same props as a request,
+// so the target's own Bindings work the same way inside it.
+function callProps(descriptor, ctx) {
+  const bindings = {};
+  for (const binding of descriptor.bindings) {
+    bindings[binding.name] = ctx.exports.BoundWorker({
+      props: {
+        workerId: binding.workerId,
+        versionId: binding.versionId,
+        contentHash: binding.contentHash,
+        definitionHash: binding.definitionHash,
+        treeId: descriptor.treeId,
+        parentInvocationId: descriptor.invocationId,
+        orderSequence: descriptor.orderSequence,
+        expiresAtMonotonicMs: descriptor.lease.expiresAtMonotonicMs,
+        requiresChildSequence: descriptor.requiresChildSequence,
+        entrypoint: binding.entrypoint,
+        ...(binding.assets === true ? { assets: true } : {}),
+      },
     });
-    const bindings = {};
-    for (const binding of descriptor.bindings) {
-      bindings[binding.name] = ctx.exports.BoundWorker({
-        props: {
-          workerId: binding.workerId,
-          versionId: binding.versionId,
-          contentHash: binding.contentHash,
-          definitionHash: binding.definitionHash,
-          treeId: descriptor.treeId,
-          parentInvocationId: descriptor.invocationId,
-          orderSequence: descriptor.orderSequence,
-          expiresAtMonotonicMs: descriptor.lease.expiresAtMonotonicMs,
-          requiresChildSequence: descriptor.requiresChildSequence,
-          entrypoint: binding.entrypoint,
-          ...(binding.assets === true ? { assets: true } : {}),
-        },
-      });
-    }
-    if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
-    // The version's Durable Object Bindings, for this call: their calls are Binding calls of its call tree.
-    const durableObjects = durableBindings(descriptor, ctx, { treeId: descriptor.treeId, parentInvocationId: descriptor.invocationId,
-      orderSequence: descriptor.orderSequence, expiresAtMonotonicMs: descriptor.lease.expiresAtMonotonicMs,
-      requiresChildSequence: descriptor.requiresChildSequence });
-    const props = descriptor.format === "v2" ? { bindings, entrypoint: descriptor.entrypoint || "default",
-      ...(durableObjects.length ? { durableObjects } : {}) } : bindings;
-    return worker.getEntrypoint(undefined, { props }).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
-      console.log("[runtime-execution] " + JSON.stringify({
-        serverId: descriptor.serverId, processId: env.PROCESS_ID,
-        processGeneration: Number(env.PROCESS_GENERATION), invocationId: descriptor.invocationId,
-        treeId: descriptor.treeId, target: `${descriptor.workerId}@${descriptor.versionId}`,
-        coldStart, observedAtUnixMs: Date.now(),
-        ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
-      }));
-    });
-  },
-};
+  }
+  // The version's Durable Object Bindings, for this call: their calls are Binding calls of its call tree.
+  const durableObjects = durableBindings(descriptor, ctx, { treeId: descriptor.treeId, parentInvocationId: descriptor.invocationId,
+    orderSequence: descriptor.orderSequence, expiresAtMonotonicMs: descriptor.lease.expiresAtMonotonicMs,
+    requiresChildSequence: descriptor.requiresChildSequence });
+  return descriptor.format === "v2" ? { bindings, entrypoint: descriptor.entrypoint || "default",
+    ...(durableObjects.length ? { durableObjects } : {}) } : bindings;
+}

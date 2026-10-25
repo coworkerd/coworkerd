@@ -221,6 +221,8 @@ struct ServerConfig {
   uint32_t rejectionAvoidMs = 100;
   uint32_t connectBackoffMs = 100;
   std::string loadBandForTest = "green";
+  // placement.subcalls: "home" (the default) or "local" (the calling node first), see the schema.
+  std::string subcalls = "home";
   bool memoryWatermarkEnabled = true;
   uint64_t memoryBudgetBytes = 0;
   bool equalLimitsForTest = false;
