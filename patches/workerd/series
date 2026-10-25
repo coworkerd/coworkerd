@@ -9,3 +9,4 @@
 0010-steady-and-worker-limits.patch
 0011-gc-pauses.patch
 0012-event-cpu-top-up.patch
+0013-durable-object-log.patch

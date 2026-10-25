@@ -98,6 +98,9 @@ struct MembershipView {
   bool identityTaken = false;
   std::string identityTakenReason;
   uint64_t ownHeartbeatChecks = 0, ownHeartbeatMissing = 0;
+  // Listings that did not hold this node's own heartbeat although it had written one within the TTL: not a listing
+  // of the members, so nobody was dropped by it (v61, requirement 5c).
+  uint64_t incompleteListings = 0;
   uint64_t oldObjectsRemoved = 0;
   // This node's suspects object (members/<nodeId>/<epoch>.suspects): writes, removals and whether its current epoch has
   // one; the other members' objects read (each when its ETag changed) and how many GETs that took.

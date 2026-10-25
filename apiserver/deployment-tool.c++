@@ -138,7 +138,7 @@ void declareNamespaces(ManifestWorker& worker, const VersionDefinition& version,
     const bool renamedHere = std::any_of(version.renamedClasses.begin(), version.renamedClasses.end(), [&](const auto& rename) {
       return rename.to == className && worker.namespaces.contains(rename.from);
     });
-    if (!renamedHere) worker.namespaces.emplace(className, ManifestNamespace{newNamespaceId(), revision, "active", 1024, "small"});
+    if (!renamedHere) worker.namespaces.emplace(className, ManifestNamespace{newNamespaceId(), revision, "active", 1024});
   }
 }
 // The version's migrations when it becomes the active one: its renames in order (a namespace moves to its new name), its

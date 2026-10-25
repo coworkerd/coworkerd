@@ -121,6 +121,79 @@ persistence comes next.
   data kept. Without the store, a request to a shard no node held failed after 10.0 s (`STORAGE_UNAVAILABLE`); with its
   owner just killed, a request failed in 23 ms, sent twice (`PEER_UNAVAILABLE`).
 
+Durable Objects keep their data when a shard moves. An object's transactions, not this machine's files, are its state:
+the durable process hands the WAL frames of each committed transaction to the node's replicator over a descriptor it
+inherited at startup (workerd's patch 0013), the replicator has `durableObjects.peers` (2) other nodes hold them before
+the object's answer goes out, merges the frames of all its objects into segments on the object store, and keeps each
+object's manifest naming what makes it up -- so a node that takes a shard over rebuilds its objects from that history,
+and never reads the previous owner's files. A write that was answered `200` is in the object after any takeover.
+
+- **The commit path costs a peer round trip, not a disk.** The peers of an object's shard are the first entries after it
+  on the member ring; they hold the records in memory and answer with the highest sequence they hold, and an object's
+  transactions are confirmed in order, so its answers come out in the order it committed them. The owner no longer waits
+  for its own disk (`synchronous=OFF`), and nothing on that path uploads anything. Measured on three nodes of one
+  machine: commit to confirmation p50 0.12 ms, p99 0.53 ms, and 2 ms for the write a client sees. A peer that cannot be
+  reached is not counted and the next node on the ring takes its place, with every record no segment covers yet; with no
+  peer at all (a single-node cluster) a write waits for this machine's disk instead, and a warning says so.
+- **Segments, manifests and snapshots.** Every `durableObjects.segmentIntervalMs` (30 s) or `durableObjects.segmentBytes`
+  (16 MiB) the records the peers hold are sealed into one segment of the node's log, `nodes/<node>/wal/<epoch>/<segment>`
+  -- one for all of the node's objects, so the store sees a node's writes, not an object's -- and then each object the
+  segment touched gets the next revision of its manifest, `do/<namespace>/objects/<object>/manifest/<rev>`, created only
+  if absent. Only once the manifests name the segment are the peers told to drop what it covers and the databases told
+  they may checkpoint those frames. An object whose log passes `durableObjects.snapshotBytes` (64 MiB), or once a day,
+  has its whole database uploaded after a checkpoint, in parts, and the segments it covers leave the manifest.
+- **Rebuilding.** The first request for an object this node does not have at the shard's data epoch waits while the
+  manifest is read, the snapshot's parts are downloaded (at most four at once), the segments are replayed in order and
+  the peers are asked for what they still hold of the previous owner's log: every peer holds a prefix of that log, so
+  the union of their answers is the longest prefix with no hole in it. A record that does not follow the last fails the
+  rebuild rather than serving the object with less than it had. Past `durableObjects.recoverTimeoutMs` (30 s) a request
+  waiting for a rebuild gets `503 DO_RECOVERING`. Measured: an owner SIGKILLed with four writers on one object, 2,694
+  writes answered `200`, another node serving the object 23.7 s later (the membership's TTL and grace) from two segments
+  and 785 records of the peer's tail, replayed in 0.6 s -- **every one of the 2,694 there, no torn transaction**; of the
+  eight writes in flight at the kill, none turned out committed in that run. A 1 GiB object was rebuilt in 19.5 s from a
+  snapshot of 50 parts and 33 segments.
+- **This machine's files are a cache.** They are bounded by `durableObjects.diskBytes` (half of the filesystem), and the
+  files of cold objects whose changes are all in a segment go first. Beside them the node keeps the machine's boot id
+  and a marker a clean exit writes: started again within the same boot, or after a clean exit, it keeps them -- a
+  durable process that restarts opens the files as they are, with each WAL cut back to the last frame its log names,
+  while an object the node serves again after the daemon itself restarted is rebuilt from its history; a machine that
+  restarted without a clean exit loses the files and all of its objects are rebuilt.
+- **Failure.** A write no peer confirms within `durableObjects.confirmTimeoutMs` (5 s) -- the peers are unreachable, or
+  what they buffer for this node (`durableObjects.peerBufferBytes`, 256 MiB) is full because the store has been out of
+  reach -- fails with `503 STORAGE_UNAVAILABLE`; the node then isolates the records nobody confirmed (they are never
+  confirmed, never put in a segment, and the peers are told to drop them) and rebuilds the object from its history
+  before serving it again. **The result of such a write is uncertain**, as is a write in flight when a node dies, so the
+  errors guide now asks for an idempotency key. While the store cannot be reached, uploads are retried with a growing
+  wait and the writes go on.
+- **The fence.** Every record carries the shard's epoch: a peer confirms only records of the epoch it knows, and a
+  manifest revision is written only when the previous one's epoch is not newer, so an old owner's writes are confirmed
+  by nobody and its segments reach no manifest.
+- **One kind of object.** There is no hot standby tier (the namespace record's `tier` field is gone): the peers buffer
+  what is not on the store yet. One object is at most `durableObjects.objectBytes` (10 GB, as on Cloudflare), judged by
+  its database file at a checkpoint; past it the object answers `413 DO_OBJECT_TOO_LARGE`. `ctx.facets.clone()` is
+  refused, because a copy of a database reaches no log.
+- **Accepted step back**: the peers do not wait for their disks (a `fdatasync` there would cost tens of milliseconds
+  instead of about one), so an owner and its peers losing power together within one segment interval lose the Durable
+  Object writes of that interval (30 s by default). Everything else -- a process that dies, a machine that restarts, a
+  node that is killed -- keeps every write that was answered.
+- **Configuration** (`durableObjects`): `peers` (2), `confirmTimeoutMs` (5000), `recoverTimeoutMs` (30000),
+  `segmentIntervalMs` (30000), `segmentBytes` (16 MiB), `snapshotBytes` (64 MiB), `snapshotIntervalMs` (a day),
+  `snapshotPartBytes` (16 MiB), `diskBytes` (half the filesystem), `peerBufferBytes` (256 MiB), `objectBytes` (10 GB),
+  `checkpointBytes` (4 MiB), `idleCheckpointMs` (10000), `uploadRetryMs` (500) and `uploadRetryMaxMs` (30000),
+  `recoverParallelism` (4). A node's object store identity now reads and lists every node's prefix (`nodes/*`, where the
+  log's segments are) and writes `do/*/objects/*`; `coworkerd secrets`, compose and the install guide follow.
+- **Observed**: the state endpoint's `durableLog` (the confirmation latency, what is not confirmed and not sealed, the
+  segments and uploads, the peers and their streams, the checkpoints, the rebuilds and their time, the buffer this node
+  holds for others, this machine's files) and `[do-log]` lines for sealing, uploads, manifests, snapshots, rebuilds, a
+  peer taking another's place and a confirmation that failed with the records it isolated; a `[do]` line says how long a
+  request waited for a rebuild.
+
+Fixed: a node no longer drops members on a listing that does not hold its own heartbeat. The first second of a stopped
+object store answered a listing of `members/` with `200` and an empty list, and two nodes dropped each other on it
+(seen in 0.5's development). A node that wrote its own heartbeat within the TTL now treats such a listing as a failed
+one -- nobody is dropped by it, the member table stays as it was, and a `[membership] incomplete-listing` line and the
+state's `incompleteListings` count it. The recovery anchor is unchanged.
+
 Log lines arrive as they are written: a Worker's `console.*` lines reach the tenant's logs while its request runs --
 each message of a WebSocket connection's as the message runs -- instead of when the request ends. The tail workerd gives
 each Worker is a streaming one, which its Worker Loader allows only when the runtime runs with workerd's `experimental`

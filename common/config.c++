@@ -18,6 +18,25 @@ namespace coworkerd {
 namespace rpc = v1::rpc;
 namespace fs = std::filesystem;
 
+void DurableLogConfig::validate() const {
+  KJ_REQUIRE(peers <= 8, "durableObjects.peers is at most 8");
+  KJ_REQUIRE(confirmTimeoutMs >= 100 && confirmTimeoutMs <= 29000,
+      "durableObjects.confirmTimeoutMs is between 100 and 29000 (workerd resets the object at 30 s)");
+  KJ_REQUIRE(recoverTimeoutMs >= 1000, "durableObjects.recoverTimeoutMs is at least 1000");
+  KJ_REQUIRE(segmentIntervalMs >= 100, "durableObjects.segmentIntervalMs is at least 100");
+  KJ_REQUIRE(segmentBytes >= (1u << 16), "durableObjects.segmentBytes is at least 65536");
+  KJ_REQUIRE(snapshotBytes >= (1u << 20), "durableObjects.snapshotBytes is at least 1048576");
+  KJ_REQUIRE(snapshotPartBytes >= (1u << 16) && snapshotPartBytes <= (256u << 20),
+      "durableObjects.snapshotPartBytes is between 65536 and 268435456");
+  KJ_REQUIRE(peerBufferBytes >= (1u << 20), "durableObjects.peerBufferBytes is at least 1048576");
+  KJ_REQUIRE(objectBytes >= (1u << 20), "durableObjects.objectBytes is at least 1048576");
+  KJ_REQUIRE(checkpointBytes >= (1u << 16), "durableObjects.checkpointBytes is at least 65536");
+  KJ_REQUIRE(recoverParallelism > 0 && recoverParallelism <= 16,
+      "durableObjects.recoverParallelism is between 1 and 16");
+  KJ_REQUIRE(uploadRetryMs > 0 && uploadRetryMaxMs >= uploadRetryMs,
+      "durableObjects.uploadRetryMaxMs is at least uploadRetryMs");
+}
+
 void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
@@ -160,7 +179,25 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       "memoryLimitMiB must be a positive number of MiB; 0 is refused (it would turn culprit attribution off; "
       "COWORKERD_MEMORY_LIMIT_MIB=0 asks for it deliberately)");
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
-  result.processPool.durableProcesses = root.getDurableObjects().getProcesses();
+  auto durable = root.getDurableObjects();
+  result.processPool.durableProcesses = durable.getProcesses();
+  result.durableLog.peers = durable.getPeers();
+  result.durableLog.confirmTimeoutMs = durable.getConfirmTimeoutMs();
+  result.durableLog.recoverTimeoutMs = durable.getRecoverTimeoutMs();
+  result.durableLog.segmentIntervalMs = durable.getSegmentIntervalMs();
+  result.durableLog.segmentBytes = durable.getSegmentBytes();
+  result.durableLog.snapshotBytes = durable.getSnapshotBytes();
+  result.durableLog.snapshotIntervalMs = durable.getSnapshotIntervalMs();
+  result.durableLog.snapshotPartBytes = durable.getSnapshotPartBytes();
+  result.durableLog.diskBytes = durable.getDiskBytes();
+  result.durableLog.diskBytesDefault = !given({"durableObjects", "diskBytes"}).has_value();
+  result.durableLog.peerBufferBytes = durable.getPeerBufferBytes();
+  result.durableLog.objectBytes = durable.getObjectBytes();
+  result.durableLog.checkpointBytes = durable.getCheckpointBytes();
+  result.durableLog.idleCheckpointMs = durable.getIdleCheckpointMs();
+  result.durableLog.uploadRetryMs = durable.getUploadRetryMs();
+  result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();
+  result.durableLog.recoverParallelism = durable.getRecoverParallelism();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
   result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();
   result.processPool.heatIdleMs = result.idleMs;

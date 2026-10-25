@@ -291,14 +291,17 @@ secrets() {
   # another node's prefixes, cluster/, tenants/ or the code.
   node_actions() {
     local b=$bucket id=$1 action out="" prefix
-    for prefix in cluster/format cluster/tenants tenants definitions packages modules bundles members do; do
+    # nodes/*: a node reads and lists every node's Durable Object log, because it rebuilds an object from the
+    # segments of whoever owned its shard before (nodes/<id>/wal/...); writing stays its own prefix.
+    for prefix in cluster/format cluster/tenants tenants definitions packages modules bundles members do nodes; do
       out+="\"Read:$b/$prefix/*\","
     done
-    for prefix in members cluster/tenants tenants do; do out+="\"List:$b/$prefix/*\","; done
+    for prefix in members cluster/tenants tenants do nodes; do out+="\"List:$b/$prefix/*\","; done
     for prefix in "members/$id" "nodes/$id"; do
       for action in Read Write List; do out+="\"$action:$b/$prefix/*\","; done
     done
     out+="\"Write:$b/do/*/shards/*\","
+    out+="\"Write:$b/do/*/objects/*\","
     printf '%s' "${out%,}"
   }
   local id

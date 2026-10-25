@@ -115,6 +115,13 @@ public:
   };
   kj::Promise<Released> releaseAll(double deadlineMonotonicMs);
 
+  // What this node knows of a shard's current epoch -- from what it holds, its cache or the hint it last read, never
+  // a read of its own; 0 when it knows nothing. The records it takes as another node's peer are judged by it: an
+  // owner whose epoch is older than this has been fenced (node/durable-log.h).
+  uint64_t knownShardEpoch(const std::string& namespaceId, uint32_t shard) const;
+  // Called for every shard this node stops holding (released, lost or dropped), so its objects' data is left alone.
+  void onShardGone(std::function<void(const std::string& namespaceId, uint32_t shard, const std::string& reason)> callback);
+
   // Whether this node may hold shards ("" when it may): processes, the store's create-if-absent, the membership.
   std::string unavailable() const;
   size_t heldCount() const { return held.size(); }
@@ -187,6 +194,7 @@ private:
   };
   std::map<std::pair<std::string, uint64_t>, Probe> probes;
   std::map<std::string, uint64_t> takeovers, refusals, forwards;
+  std::function<void(const std::string&, uint32_t, const std::string&)> shardGone;
   uint64_t acquireAttempts = 0, acquireConflicts = 0, acquireFailures = 0, acquiredAfterReadBack = 0;
   uint64_t releases = 0, releaseFailures = 0, dropped = 0, drops = 0;
   uint64_t hintReads = 0, hintMisses = 0, hintsWritten = 0, hintsRepaired = 0, hintFailures = 0;

@@ -178,7 +178,7 @@ A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `
 
 ## 11. Durable Object shards
 
-0.5, in development. A Durable Object namespace has a fixed number of shards -- 1024, set when the control plane makes the namespace and fixed for its life -- and an object falls into the shard its id's first 8 bytes, read as a big-endian number, give modulo the shards: every node computes the same. A shard has one owner in the cluster at a time, the node that runs its objects in its durable process with their SQLite databases on its disk. **The data stays on that disk in this release**: when another node takes a shard over, the shard's objects start again from empty there (a node that takes its own shard back keeps them); persistence to the object store comes next.
+0.5, in development. A Durable Object namespace has a fixed number of shards -- 1024, set when the control plane makes the namespace and fixed for its life -- and an object falls into the shard its id's first 8 bytes, read as a big-endian number, give modulo the shards: every node computes the same. A shard has one owner in the cluster at a time, the node that runs its objects in its durable process with their SQLite databases on its disk. Those databases are a cache: the object's data is the log of its transactions, which its owner has peers confirm and puts on the object store, so a node that takes a shard over rebuilds its objects from there (section 12).
 
 - **Epochs.** Owning a shard is having created its latest epoch, `do/<namespace>/shards/<shard>/epochs/<n>` (`n` 20 digits wide), created only if absent: a node lists the shard's epochs and creates the largest plus one, and holds the shard once its create succeeded; another writer's create of the same epoch got there first, and the node reads who did. An epoch names the node, its membership epoch, when it was taken, why (`first`, `timeout`, `released`, `restart`) and the epoch before, and the writer's process instance with a random value of the write: a create whose answer was lost is decided by reading the epoch back (section 1, the client) -- its own bytes mean the node holds the shard. A create waits up to `storage.createTimeoutMs` (30 s) for its answer, a read `storage.readTimeoutMs` (5 s). Then the node writes the hint `do/<namespace>/shards/<shard>/owner` -- the epoch, the node and its membership epoch --, which only says which epoch is the latest: a reader reads that epoch, and lists the shard's epochs when the hint is missing, names an epoch that does not exist, or names an owner that turns out not to hold the shard; a node that listed the epochs writes the hint again. A shard is taken when a request to one of its objects first comes, not when its namespace is made.
 - **Who takes a shard, and when**, each node deciding on its own member table (section 3):
@@ -192,3 +192,81 @@ A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `
 - **The store and the nodes.** On a store where a node measured create-if-absent not to hold under concurrency (`conditionalPutAtomic: false`, section 1) the node takes no shard and answers every request to an object `503 DO_UNSUPPORTED_STORE`. While the store cannot be reached a node keeps serving the shards it holds until its membership expires; a request whose shard's owner it does not know fails with `503 STORAGE_UNAVAILABLE` once the store's timeouts ran out. A node with `durableObjects.processes` `0` starts no durable process, takes no shard and is no default owner -- its heartbeat says so -- and sends its Workers' requests to objects to their owners.
 
 The state endpoint's `durableShards` shows the shards a node holds by namespace, its takeovers by reason, its releases, its refusals by code, its forwarding and its owner cache; each take, release and refusal is a `[do-shard]` line, and each request to an object a `[do]` line with its shard and epoch, on the node that ran it and on the node that sent it.
+
+## 12. Durable Object durability
+
+0.5, in development. An object's data does not stay on the node that owns its shard. Every transaction the object
+commits is a few WAL frames; the durable process hands them to the node's replicator, which has K peers hold them
+before the object's answer goes out, merges the frames of all its objects into segments on the object store, and keeps
+each object's manifest naming what makes it up. A node that takes a shard over rebuilds its objects from that history
+and never reads the previous owner's files.
+
+- **The commit path.** The durable process ships the frames of each committed transaction over a descriptor it
+  inherited at startup (workerd's patch 0013; nothing is opened by path). The node writes the record -- the node's
+  epoch and the shard's, the object, which of its databases, the transaction number, the frames as the database wrote
+  them, and a CRC32C over all of it -- to its own append log and sends it to the peers of the object's shard: the first
+  `durableObjects.peers` (2) nodes after the shard on the member ring, which hold it in memory and answer with the
+  highest sequence they hold. The answer to the write goes out when they have it: no disk and no upload are on that
+  path, so it costs a peer round trip. The object's own transactions are confirmed in order, so its answers come out in
+  the order it committed them. A peer that cannot be reached is not counted, and the next node on the ring takes its
+  place and is given every record no segment covers yet; with no peer left the write waits for this machine's own disk
+  instead (a warning says so) -- slower, and still correct. The owner never waits for its own disk otherwise
+  (`synchronous=OFF`): this machine's files are a cache.
+- **Segments and manifests.** Every `durableObjects.segmentIntervalMs` (30 s) or `durableObjects.segmentBytes` (16 MiB)
+  the replicator seals the records its peers hold, in sequence order up to the first one still waiting for them, into
+  one segment -- a header, the records, and a SHA-256 of all of it, with an index by object -- and creates it as
+  `nodes/<node>/wal/<node epoch>/<segment>`. A segment holds every object of the node, so the number of writes to the
+  store follows the node, not the objects. Then each object the segment touched gets the next revision of its manifest,
+  `do/<namespace>/objects/<object>/manifest/<rev>`, created only if absent and carrying the writer's identity so a lost
+  answer is decided by reading it back: the manifest names the object's latest snapshot and, after it, the segments to
+  replay in order. Only once every manifest is written are the peers told to drop what the segment covers and the
+  databases told they may checkpoint those frames -- a segment no manifest names would be a segment nobody replays.
+  Readers do not keep a `current` hint for an object: a rebuild lists the revisions and reads the largest.
+- **Snapshots.** When an object's log since its last snapshot passes `durableObjects.snapshotBytes` (64 MiB), or a day
+  has gone by, its owner uploads each of its databases after a checkpoint -- the file then holds every transaction of
+  the generations before it -- in parts of `durableObjects.snapshotPartBytes` (16 MiB) under
+  `do/<namespace>/objects/<object>/snapshot/<sequence>/`, writes the index last, and then the manifest that names it.
+  The segments the snapshot covers leave the manifest; the objects themselves are kept (reclaiming them comes later).
+- **Rebuilding an object.** The first request for an object whose files this node does not have at the shard's data
+  epoch -- a shard taken over, a machine that restarted unclean, an object whose write was not confirmed -- waits for
+  its rebuild: the manifest's revisions are listed and the largest read, the snapshot's parts downloaded (at most
+  `durableObjects.recoverParallelism` (4) at once) and checked against their digests, the segments replayed in order,
+  and then the peers of the shard are asked for what they still hold of the previous owner's log. Every peer holds a
+  prefix of its owner's log, so the union of their answers is the longest prefix and has no hole in it; the records are
+  ordered by the shard's epoch and the owner's sequence, applied once each, and the frames of each are checked as
+  SQLite's own recovery checks them. A record that does not follow the last fails the rebuild rather than serving the
+  object with less than it had. The facet tree index beside the databases is written from the records, which carry each
+  facet's name and parent. A request waits at most `durableObjects.recoverTimeoutMs` (30 s) and is then answered `503
+  DO_RECOVERING`.
+- **This machine's files.** They are a cache of the history, bounded by `durableObjects.diskBytes` (half of the
+  filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
+  are all in a segment, go when that is full, and the object is rebuilt when it is asked for again. Beside them the
+  node keeps the boot of the machine it ran on and a marker a clean exit writes: started again within the same boot, or
+  after a clean exit, it reuses the files and cuts each database's WAL back to the last frame its log names -- a
+  process that committed a transaction and died before its frames arrived leaves frames nobody was told about, and
+  nothing may read them. A machine that restarted without a clean exit (`synchronous=OFF` leaves no promise about what
+  the kernel wrote) loses them all, and every object is rebuilt from its history.
+- **The fence.** Every record carries the shard's epoch. A peer confirms only records of the epoch it knows the shard
+  at, so an owner that lost its shard is confirmed by nobody, and a manifest revision is written only when the
+  previous one's shard epoch is not newer: the old owner's segments reach no manifest and its writes reach no reader.
+  A node that finds a newer epoch in an object's manifest gives the object up.
+- **When the store cannot be reached.** Uploads are retried with a growing wait, the peers keep holding the records,
+  and the writes go on. A peer holds at most `durableObjects.peerBufferBytes` (256 MiB) for the owners it is a peer of
+  and refuses records past it; an owner whose records nobody confirms within `durableObjects.confirmTimeoutMs` (5 s)
+  fails that write with `STORAGE_UNAVAILABLE`, isolates the records it could not get confirmed -- they are never
+  confirmed, never put in a segment, and the peers are told to drop them -- and rebuilds the object from its history
+  before serving it again. Reads of objects whose writes did not fail are answered as usual.
+- **Accepted step back.** The peers hold the frames in memory and do not wait for their disks (a `fdatasync` on the
+  confirmation path costs tens of milliseconds instead of about a millisecond), so **an owner and its K peers losing
+  power together within one segment interval lose the Durable Object writes of the last `durableObjects.segmentIntervalMs`
+  (30 s)**. Everything else -- a process that dies, a machine that restarts, a node that is killed -- keeps every write
+  that was answered.
+- **One kind of object.** There is no hot standby tier: the peers buffer what is not on the store yet, and an object is
+  rebuilt from the store. One object is at most `durableObjects.objectBytes` (10 GB, as on Cloudflare), judged by its
+  database file at a checkpoint; past it the object answers `413 DO_OBJECT_TOO_LARGE`.
+
+The state endpoint's `durableLog` shows the confirmation latency (mean, p50, p99), the bytes not confirmed and not
+sealed, the segments and the last upload, the peers and the streams to them, the checkpoints, the rebuilds and their
+time, the buffer this node holds for others, and this machine's files; `[do-log]` lines record the sealing, the
+uploads, the manifests, the snapshots, the rebuilds, a peer taking another's place, and a confirmation that failed with
+the records it isolated. A `[do]` line says how long a request waited for a rebuild (`recoveredMs`).

@@ -120,6 +120,8 @@ bool workerdInherits(std::string_view name) {
 // closes before workerd runs.
 constexpr int EVENT_FD = 3, LISTEN_FD = 4, LIFECYCLE_FD = 5, BAND_FD = 6;
 constexpr int LAUNCHER_STATUS_FD = 7, LAUNCHER_PROGRAM_FD = 8;
+// A durable process's end of the Durable Object log channel (the launcher leaves it alone: it touches only 7 and 8).
+constexpr int DURABLE_LOG_FD = 9;
 // The unique key of the durable processes' Host namespace, the same on every node: an object's Host id is
 // HOST.idFromName(<namespace id>/<object id>) under it, and its databases are in <stack>/do/<key>/.
 constexpr const char* DURABLE_HOST_KEY = "coworkerd-do-host-v1";
@@ -1127,6 +1129,10 @@ public:
   Suspects& suspects;
   int bandFd = -1;  // the Server's own copy of the band's shared memory, at 10 or above
   uint64_t quarantineDispatches = 0, trialDispatches = 0, durableDispatches = 0;
+  // The Durable Object log channel of each durable generation (node/durable-log.h).
+  std::function<int(const std::string&)> durableChannelOpen;
+  std::function<void(const std::string&)> durableChannelClose;
+  DurableLogConfig durableLog;
   std::shared_ptr<TenantCpu> cpuUsage = std::make_shared<TenantCpu>();
   std::vector<Slot> slots;
   std::deque<std::string> kills;
@@ -2011,6 +2017,15 @@ public:
     if (bandFd >= 0) {
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, bandFd, BAND_FD) == 0);
     }
+    // The Durable Object log channel: the node keeps its own end and reads the frames the process ships.
+    int durableLogFd = -1;
+    auto closeDurableLog = kj::defer([&durableLogFd] { if (durableLogFd >= 0) ::close(durableLogFd); });
+    if (p->durable && durableChannelOpen) {
+      durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation)));
+      if (durableLogFd >= 0) {
+        KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, durableLogFd, DURABLE_LOG_FD) == 0);
+      }
+    }
     // The workerd file this generation runs, opened by the Server itself: the generation's identity is
     // this descriptor's (no /proc/<pid>/exe, whose path differs in the launcher's mount namespace), and the
     // launcher binds exactly this file. Hashed through the descriptor, off the event loop, once per file.
@@ -2067,6 +2082,13 @@ public:
     childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
     childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));
+    // The Durable Object log (workerd's patch coworkerd-wal-shipper.h): where to ship the frames, how long a commit
+    // waits for the node's answer, and when to checkpoint.
+    if (durableLogFd >= 0) {
+      childEnvironment.push_back("COWORKERD_DO_WAL_FD=" + std::to_string(DURABLE_LOG_FD));
+      childEnvironment.push_back("COWORKERD_DO_CONFIRM_TIMEOUT_MS=" + std::to_string(durableLog.confirmTimeoutMs));
+      childEnvironment.push_back("COWORKERD_DO_CHECKPOINT_BYTES=" + std::to_string(durableLog.checkpointBytes));
+    }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.
     childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));
@@ -2489,6 +2511,7 @@ public:
     auto reason = p->lastReason.empty() ? p->exitStatus : p->lastReason;
     event(*p, "exit", reason);
     p->pid = 0; p->state = "exited"; p->lastReason = reason;
+    if (p->durable && durableChannelClose) durableChannelClose(p->id + "-" + std::to_string(p->generation));
     p->exitedAt = mono(); p->exitedAtUnixMs = wall();
     p->exited->fulfill();
     if (rotation && rotation->old == p) {
@@ -3058,6 +3081,12 @@ uint32_t ProcessPool::resetDurable(const std::string& reason) {
     s.restartAt = 0;
   }
   return killed;
+}
+void ProcessPool::setDurableChannel(std::function<int(const std::string&)> open,
+    std::function<void(const std::string&)> close, const DurableLogConfig& settings) {
+  impl->durableChannelOpen = std::move(open);
+  impl->durableChannelClose = std::move(close);
+  impl->durableLog = settings;
 }
 void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
   impl->retiring = std::move(callback);

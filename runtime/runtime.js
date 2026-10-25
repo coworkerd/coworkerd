@@ -681,10 +681,14 @@ function durableBindings(descriptor, ctx, caller) {
     } }) : null }));
 }
 
-// The code of a facet's failure (the node's codes): a limit ended it -- workerd's own error, not one the class threw
-// (`remote`) --, or anything else.
+// The code of a facet's failure (the node's codes): the storage layer could not make a write durable, a limit ended
+// it -- workerd's own error, not one the class threw (`remote`) --, or anything else. A write whose frames the node
+// did not confirm fails with STORAGE_UNAVAILABLE, and the object is rebuilt from its replicated history before it
+// serves anything again (docs/guide/errors.md).
 function facetCode(error) {
   const reason = String(error?.message ?? error);
+  if (reason.includes("STORAGE_UNAVAILABLE")) return "STORAGE_UNAVAILABLE";
+  if (reason.includes("DO_OBJECT_TOO_LARGE")) return "DO_OBJECT_TOO_LARGE";
   if (error?.remote === true) return "EXECUTION_FAILED";
   return reason.includes("CPU_LIMIT_EXCEEDED") ? "CPU_LIMIT_EXCEEDED"
     : reason.includes("MEMORY_LIMIT_EXCEEDED") ? "MEMORY_LIMIT_EXCEEDED" : "EXECUTION_FAILED";
@@ -721,8 +725,10 @@ export class Host extends DurableObject {
       if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true) {
         this.abortFacet("the Durable Object's class failed: " + reason.slice(0, 200));
         return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
-          code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" : "Durable Object reset",
-          code, reason: reason.slice(0, 300) }, { status: 503 });
+          code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
+          code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
+          code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" : "Durable Object reset",
+          code, reason: reason.slice(0, 300) }, { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : 503 });
       }
       // The class threw: the object stays, as on Cloudflare -- the same instance takes the next request -- and the
       // caller gets the exception's message.

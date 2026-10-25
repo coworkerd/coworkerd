@@ -106,6 +106,7 @@ add_executable(coworkerd
   node/suspects.c++
   node/membership.c++
   node/durable-shards.c++
+  node/durable-log.c++
   node/bundle-cache.c++
   node/desired-state.c++
   node/desired-state-store.c++

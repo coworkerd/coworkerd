@@ -4,6 +4,7 @@
 #include "log-sink.h"
 #include "support.h"
 #include "membership.h"
+#include "durable-log.h"
 #include "durable-shards.h"
 #include "object-state.h"
 #include "deployment.h"
@@ -3323,6 +3324,38 @@ private:
   double expiresAtMonotonicMs;
 };
 
+// One peer's end of this node's Durable Object log, over the signed peer session: the calls of a stream of their own,
+// so that the records never queue behind an object's requests. The connection is held for the stream's life.
+class DurableLogSinkClient final: public coworkerd::DurableLog::PeerSink {
+public:
+  DurableLogSinkClient(kj::Rc<PeerConnection> connection, rpc::DurableLogSink::Client sink)
+      : connection(kj::mv(connection)), sink(kj::mv(sink)) {}
+
+  kj::Promise<Accepted> append(std::string records, bool partial) override {
+    auto request = sink.appendRequest();
+    request.setRecords(kj::arrayPtr(reinterpret_cast<const kj::byte*>(records.data()), records.size()));
+    request.setPartial(partial);
+    return request.send().then([](capnp::Response<rpc::DurableLogSink::AppendResults> response) {
+      return Accepted{response.getAccepted(), std::string(response.getRefused().cStr())};
+    });
+  }
+  kj::Promise<void> trim(uint64_t upTo) override {
+    auto request = sink.trimRequest();
+    request.setUpTo(upTo);
+    return request.send().ignoreResult();
+  }
+  kj::Promise<void> drop(std::vector<uint64_t> sequences) override {
+    auto request = sink.dropRequest();
+    auto list = request.initSequences(sequences.size());
+    for (size_t i = 0; i < sequences.size(); i++) list.set(i, sequences[i]);
+    return request.send().ignoreResult();
+  }
+
+private:
+  kj::Rc<PeerConnection> connection;
+  rpc::DurableLogSink::Client sink;
+};
+
 class PeerForwarder final {
 public:
   PeerForwarder(
@@ -3375,6 +3408,70 @@ public:
       return rejectedDispatcher(factory, headerTable, *result.failure, deadline);
     });
     return rpc::EventDispatcher::Client(std::move(promise));
+  }
+
+  // A Durable Object log stream to one peer: the member's current epoch is addressed, and the stream stays on that
+  // connection (a new one is opened when the session is replaced).
+  kj::Promise<kj::Own<coworkerd::DurableLog::PeerSink>> openDurableLog(std::string targetServerId, uint64_t nodeEpoch,
+      std::string instance, uint64_t firstSeq) {
+    const auto& config = server.placementConfig();
+    auto peer = server.member(targetServerId);
+    KJ_REQUIRE(peer != nullptr, "the peer is not in the member table", targetServerId.c_str());
+    const auto identity = peer->address + "#" + peer->epoch;
+    const auto address = peer->address;
+    const auto epoch = peer->epoch;
+    auto connection = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
+    auto request = connection->client().openDurableLogRequest();
+    auto session = request.initSession();
+    session.setNodeId(config.serverId.c_str());
+    session.setNodeEpoch(nodeEpoch);
+    session.setInstance(instance.c_str());
+    session.setDestinationEpoch(epoch.c_str());
+    session.setFirstSeq(firstSeq);
+    auto response = co_await request.send();
+    kj::Own<coworkerd::DurableLog::PeerSink> sink =
+        kj::heap<DurableLogSinkClient>(connection.addRef(), response.getSink());
+    co_return kj::mv(sink);
+  }
+
+  // What a node holds of a previous owner's log for one shard.
+  kj::Promise<coworkerd::DurableTailAnswer> fetchDurableTail(std::string targetServerId,
+      coworkerd::DurableTailAsk ask) {
+    const auto& config = server.placementConfig();
+    auto peer = server.member(targetServerId);
+    KJ_REQUIRE(peer != nullptr, "the peer is not in the member table", targetServerId.c_str());
+    const auto identity = peer->address + "#" + peer->epoch;
+    const auto address = peer->address;
+    const auto epoch = peer->epoch;
+    auto connection = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
+    auto request = connection->client().fetchDurableTailRequest();
+    auto parameters = request.initRequest();
+    parameters.setNamespaceId(ask.namespaceId.c_str());
+    parameters.setShard(ask.shard);
+    parameters.setShardEpoch(ask.shardEpoch);
+    parameters.setOwnerNodeId(ask.ownerNodeId.c_str());
+    parameters.setOwnerNodeEpoch(ask.ownerNodeEpoch);
+    parameters.setAfterSeq(ask.afterSeq);
+    parameters.setDestinationEpoch(epoch.c_str());
+    auto response = co_await request.send();
+    auto result = response.getResult();
+    coworkerd::DurableTailAnswer answer;
+    answer.firstSeq = result.getFirstSeq();
+    answer.lastSeq = result.getLastSeq();
+    answer.droppedTo = result.getDroppedTo();
+    answer.count = result.getCount();
+    answer.more = result.getMore();
+    answer.refusal = result.getRefused().cStr();
+    if (answer.refusal.empty()) {
+      auto records = result.getRecords();
+      std::string error;
+      for (const auto& encoded : coworkerd::splitRecords(
+               std::string_view(reinterpret_cast<const char*>(records.begin()), records.size()), &error)) {
+        auto record = coworkerd::decodeLogRecord(encoded);
+        if (record) answer.records.push_back(std::move(*record));
+      }
+    }
+    co_return answer;
   }
 
   kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation) {
@@ -3895,19 +3992,96 @@ private:
 
 class DurableDispatch;
 
+// The records another node's replicator sends here: this node holds them until that node says a segment covers them
+// (node/durable-log.h). The buffer outlives the stream -- an owner that died leaves its tail here for whoever takes
+// its shards over.
+class DurableLogSinkServer final: public rpc::DurableLogSink::Server {
+public:
+  DurableLogSinkServer(coworkerd::DurableLog& log, uint64_t streamId): log(log), streamId(streamId) {}
+
+  kj::Promise<void> append(AppendContext context) override {
+    auto records = context.getParams().getRecords();
+    auto result = log.appendIncoming(streamId,
+        std::string_view(reinterpret_cast<const char*>(records.begin()), records.size()),
+        context.getParams().getPartial());
+    context.getResults().setAccepted(result.accepted);
+    if (!result.refusal.empty()) context.getResults().setRefused(result.refusal.c_str());
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> trim(TrimContext context) override {
+    log.trimIncoming(streamId, context.getParams().getUpTo());
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> drop(DropContext context) override {
+    std::vector<uint64_t> sequences;
+    for (auto sequence : context.getParams().getSequences()) sequences.push_back(sequence);
+    log.dropIncoming(streamId, sequences);
+    return kj::READY_NOW;
+  }
+
+private:
+  coworkerd::DurableLog& log;
+  uint64_t streamId;
+};
+
 class PeerBootstrap final: public rpc::PeerServer::Server {
 public:
   PeerBootstrap(
       ServerCore& server,
       PeerForwarder& peerForwarder,
       DurableDispatch& durable,
+      coworkerd::DurableLog& durableLog,
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable)
       : server(server),
         peerForwarder(peerForwarder),
         durable(durable),
+        durableLog(durableLog),
         factory(factory),
         headerTable(headerTable) {}
+
+  // A log stream another node opens here, and the tail this node holds of a previous owner's log for one shard.
+  kj::Promise<void> openDurableLog(OpenDurableLogContext context) override {
+    auto session = context.getParams().getSession();
+    uint64_t streamId = 0;
+    auto refusal = durableLog.openIncoming(session.getNodeId().cStr(), session.getNodeEpoch(),
+        session.getInstance().cStr(), session.getDestinationEpoch().cStr(), session.getFirstSeq(), streamId);
+    KJ_REQUIRE(refusal.empty(), "this node does not take that Durable Object log stream", refusal.c_str());
+    context.getResults().setSink(kj::heap<DurableLogSinkServer>(durableLog, streamId));
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> fetchDurableTail(FetchDurableTailContext context) override {
+    auto parameters = context.getParams().getRequest();
+    const auto destination = std::string(parameters.getDestinationEpoch().cStr());
+    auto result = context.getResults().initResult();
+    if (!destination.empty() && !server.holdsEpoch(destination)) {
+      result.setRefused("this node does not hold the epoch the request is for");
+      return kj::READY_NOW;
+    }
+    coworkerd::DurableTailAsk ask;
+    ask.namespaceId = parameters.getNamespaceId().cStr();
+    ask.shard = parameters.getShard();
+    ask.shardEpoch = parameters.getShardEpoch();
+    ask.ownerNodeId = parameters.getOwnerNodeId().cStr();
+    ask.ownerNodeEpoch = parameters.getOwnerNodeEpoch();
+    ask.afterSeq = parameters.getAfterSeq();
+    auto answer = durableLog.tailFor(ask);
+    if (!answer.refusal.empty()) {
+      result.setRefused(answer.refusal.c_str());
+      return kj::READY_NOW;
+    }
+    std::vector<std::string> encoded;
+    for (const auto& record : answer.records) encoded.push_back(coworkerd::encodeLogRecord(record));
+    const auto bytes = coworkerd::frameRecords(encoded);
+    result.setRecords(kj::arrayPtr(reinterpret_cast<const kj::byte*>(bytes.data()), bytes.size()));
+    result.setFirstSeq(answer.firstSeq);
+    result.setLastSeq(answer.lastSeq);
+    result.setDroppedTo(answer.droppedTo);
+    result.setCount(answer.count);
+    result.setMore(answer.more);
+    return kj::READY_NOW;
+  }
 
   // A request to a Durable Object whose shard this node is expected to own (DurableDispatch::receive).
   kj::Promise<void> openObjectInvocation(OpenObjectInvocationContext context) override;
@@ -4068,6 +4242,7 @@ private:
   ServerCore& server;
   PeerForwarder& peerForwarder;
   DurableDispatch& durable;
+  coworkerd::DurableLog& durableLog;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headerTable;
 };
@@ -4224,6 +4399,7 @@ public:
       ServerCore& server,
       PeerForwarder& peerForwarder,
       DurableDispatch& durable,
+      coworkerd::DurableLog& durableLog,
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable,
       kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial,
@@ -4231,7 +4407,7 @@ public:
       ControlPlaneAddresses& controlPlane)
       : server(server), headerTable(headerTable),
         rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
-            server, peerForwarder, durable, factory, headerTable))), trial(kj::mv(trial)), logs(logs), state(kj::mv(state)),
+            server, peerForwarder, durable, durableLog, factory, headerTable))), trial(kj::mv(trial)), logs(logs), state(kj::mv(state)),
         peerAuth(peerAuth), controlPlane(controlPlane) {}
 
   // Besides the Cap'n Proto CONNECT, the peer listener (the address a member
@@ -4619,8 +4795,9 @@ class DurableDispatch final {
 public:
   static constexpr double DURABLE_WAIT_MS = 5000;
   DurableDispatch(ServerCore& server, PeerForwarder& peerForwarder, coworkerd::DurableShards& shards,
-      capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable)
-      : server(server), peerForwarder(peerForwarder), shards(shards), factory(factory), headerTable(headerTable) {}
+      coworkerd::DurableLog& durableLog, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable)
+      : server(server), peerForwarder(peerForwarder), shards(shards), durableLog(durableLog), factory(factory),
+        headerTable(headerTable) {}
 
   struct Request {
     std::string workerId;
@@ -4734,6 +4911,8 @@ private:
   struct Line {
     std::string workerId, versionId, caller, route, node;
     uint32_t attempt = 1;
+    // How long the object's rebuild from its replicated history took, when this request waited for one.
+    double recovered = 0;
   };
   struct Ran {
     std::optional<InvocationRejection> refusal;
@@ -4772,6 +4951,16 @@ private:
     // The object's process restarting or being replaced: its requests wait for the next generation.
     const auto waitUntil = std::min(deadline, started + DURABLE_WAIT_MS);
     while (!server.durableReady(target.key()) && monotonicTimeMs() < waitUntil) co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
+    // This machine's files for the object are brought up to date with its replicated history first: a shard taken
+    // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
+    // (node/durable-log.h). The object's data is its log, not this machine's files.
+    auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId, target.dataEpoch,
+        target.shardEpoch, target.shard});
+    if (!ready.ready) {
+      line.recovered = ready.elapsedMs;
+      co_return refused(server.refusal(ready.code, ready.reason, ready.status));
+    }
+    if (ready.rebuilt) line.recovered = ready.elapsedMs;
     if (auto refusal = server.admission(version->workerId, version->definitionHash, false, deadline, false, false, &target))
       co_return refused(*refusal);
     auto slot = server.reserve(false);
@@ -4826,7 +5015,8 @@ private:
               << jsonEscape(target.className) << "\",\"namespaceId\":\"" << target.namespaceId.substr(0, 12) << "\",\"objectId\":\""
               << target.objectId.substr(0, 12) << "\",\"shard\":" << target.shard << ",\"shardEpoch\":\"" << target.shardEpoch
               << "\",\"hops\":" << target.hops << ",\"caller\":\"" << line.caller << "\",\"route\":\"" << line.route << "\",\"node\":\""
-              << jsonEscape(line.node) << "\",\"attempt\":" << line.attempt << ",\"invocationId\":\""
+              << jsonEscape(line.node) << "\",\"attempt\":" << line.attempt << ",\"recoveredMs\":" << line.recovered
+              << ",\"invocationId\":\""
               << (process ? jsonEscape(process->invocationId) : std::string())
               << "\",\"processId\":\"" << (process ? process->processId : std::string()) << "\",\"processGeneration\":"
               << (process ? process->generation : 0) << ",\"status\":" << status
@@ -4836,6 +5026,7 @@ private:
   ServerCore& server;
   PeerForwarder& peerForwarder;
   coworkerd::DurableShards& shards;
+  coworkerd::DurableLog& durableLog;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headerTable;
 };
@@ -6209,8 +6400,9 @@ class DrainController final: private kj::TaskSet::ErrorHandler {
 public:
   // `drainConnections` closes the ingress's idle connections and resolves once none is open.
   DrainController(ServerCore& server, coworkerd::ProcessPool& runtime, coworkerd::Membership& membership,
-      coworkerd::DurableShards& shards, kj::Timer& timer, uint32_t announceDelayMs, std::function<kj::Promise<void>()> drainConnections)
-      : server(server), runtime(runtime), membership(membership), shards(shards), timer(timer),
+      coworkerd::DurableShards& shards, coworkerd::DurableLog& durableLog, kj::Timer& timer, uint32_t announceDelayMs,
+      std::function<kj::Promise<void>()> drainConnections)
+      : server(server), runtime(runtime), membership(membership), shards(shards), durableLog(durableLog), timer(timer),
         timeoutMs(server.drainTimeoutMs()), announceDelayMs(announceDelayMs), drainConnections(std::move(drainConnections)) {
     server.onDrainRequested([this](std::string trigger) { begin(std::move(trigger)); });
   }
@@ -6317,6 +6509,9 @@ private:
       const auto waitedMs = monotonicTimeMs() - startedAt;
       auto closed = co_await runtime.closeDurable();
       const auto closedMs = monotonicTimeMs() - startedAt;
+      // The records the peers hold go into a segment before the shards are let go, so the next owner finds the
+      // whole history on the object store, and the files stay usable for this node's next start.
+      co_await durableLog.stop(std::max(deadline, monotonicTimeMs()) + 10000);
       // The markers are written even when the requests ran to the deadline: each is bounded by the store's timeouts.
       auto released = co_await shards.releaseAll(std::max(deadline, monotonicTimeMs()) + 10000);
       std::ostringstream record;
@@ -6422,6 +6617,7 @@ private:
   coworkerd::ProcessPool& runtime;
   coworkerd::Membership& membership;
   coworkerd::DurableShards& shards;
+  coworkerd::DurableLog& durableLog;
   kj::Timer& timer;
   const uint32_t timeoutMs, announceDelayMs;
   std::function<kj::Promise<void>()> drainConnections;
@@ -6468,6 +6664,19 @@ kj::Promise<void> watchShardOwnership(ServerCore& server, coworkerd::ProcessPool
               << "\",\"event\":\"facets-closed\",\"shards\":" << held << ",\"webSockets\":" << told << ",\"inFlight\":" << inFlight
               << ",\"inFlightLeft\":" << left << ",\"processesReset\":" << killed << ",\"elapsedMs\":" << monotonicTimeMs() - started
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+  }
+}
+
+// The records of this node's Durable Object log carry its membership epoch, so the log follows a re-registration.
+kj::Promise<void> watchDurableEpoch(coworkerd::DurableLog& durableLog, coworkerd::Membership& membership,
+    kj::Timer& timer) {
+  std::string epoch = membership.view().epoch;
+  while (true) {
+    co_await timer.afterDelay(200 * kj::MILLISECONDS);
+    const auto& current = membership.view().epoch;
+    if (current == epoch) continue;
+    epoch = current;
+    durableLog.setNodeEpoch(std::strtoull(epoch.c_str(), nullptr, 10));
   }
 }
 
@@ -6908,8 +7117,44 @@ int run(Launch launch) {
       membership->view().backend == "objectStore", server.placementConfig().membership.ttlSeconds,
       server.placementConfig().membership.livenessGraceMs}, server.placementConfig().desiredState.objectStore,
       io.provider->getNetwork(), timer, membership->view(), [&server]() { return server.draining(); });
-  DurableDispatch durable(server, peerForwarder, shards, httpOverCapnpFactory, *headerTable);
+  // The objects' data: every commit's frames go to this node's replicator, which has K peers confirm them, puts them
+  // on the object store as segments, and rebuilds an object from that history when this node takes its shard over
+  // (node/durable-log.h).
+  coworkerd::DurableLog durableLog({server.placementConfig().serverId, membership->view().instance, launch.stackDirectory,
+      coworkerd::DURABLE_HOST_UNIQUE_KEY, server.placementConfig().durableLog,
+      membership->view().backend == "objectStore" && runtime.durableProcesses() > 0},
+      server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
+      membership->view(),
+      {[&peerForwarder, &membership](std::string nodeId, uint64_t firstSeq) {
+         return peerForwarder.openDurableLog(std::move(nodeId),
+             std::strtoull(membership->view().epoch.c_str(), nullptr, 10), membership->view().instance, firstSeq);
+       },
+       [&peerForwarder](std::string nodeId, coworkerd::DurableTailAsk ask) {
+         return peerForwarder.fetchDurableTail(std::move(nodeId), std::move(ask));
+       },
+       [&shards](const std::string& namespaceId, uint32_t shard) { return shards.knownShardEpoch(namespaceId, shard); },
+       [&runtime, &server, &timer](std::string reason) -> kj::Promise<void> {
+         // workerd has no way to close one object: the durable processes are restarted, which closes every object of
+         // this node, and the files are only then replaced (v60 does the same when this node's membership expires).
+         const auto killed = runtime.resetDurable(reason);
+         const auto until = monotonicTimeMs() + 5000;
+         while (runtime.durableInFlight() > 0 && monotonicTimeMs() < until) {
+           co_await timer.afterDelay(10 * kj::MILLISECONDS);
+         }
+         std::cout << "[do-log] {\"event\":\"objects-closed\",\"nodeId\":\""
+                   << jsonEscape(server.placementConfig().serverId) << "\",\"processesReset\":" << killed
+                   << ",\"reason\":\"" << jsonEscape(reason) << "\"}" << std::endl;
+         co_return;
+       }});
+  runtime.setDurableChannel([&durableLog](const std::string& processId) { return durableLog.openChannel(processId); },
+      [&durableLog](const std::string& processId) { durableLog.closeChannel(processId); },
+      server.placementConfig().durableLog);
+  shards.onShardGone([&durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
+    durableLog.shardGone(namespaceId, shard, reason);
+  });
+  DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable);
   server.addStateSection("durableShards", [&shards]() { return shards.json(); });
+  server.addStateSection("durableLog", [&durableLog]() { return durableLog.json(); });
   // The control plane's addresses as it announces them (ControlPlaneAddresses), beside the members' and this node's own.
   ControlPlaneAddresses controlPlane;
   coworkerd::EgressService egress(egressConfig, server.placementConfig().serverId, io.provider->getNetwork(), timer, *headerTable,
@@ -6955,7 +7200,7 @@ int run(Launch launch) {
   BindingRpcService bindingRpc(
       server, peerForwarder, durable, httpOverCapnpFactory, *headerTable);
   PeerRpcService peerRpc(
-      server, peerForwarder, durable, httpOverCapnpFactory, *headerTable,
+      server, peerForwarder, durable, durableLog, httpOverCapnpFactory, *headerTable,
       [&trials](kj::HttpMethod method, kj::AsyncInputStream& body, kj::HttpService::Response& response) {
         return trials.serve(method, body, response);
       },
@@ -6991,7 +7236,8 @@ int run(Launch launch) {
     const auto self = proc ? fs::read_symlink("/proc/self/exe") : fs::absolute(executableArgument);
     server.setServerBinary(self.string(), sha256Hex(readFile(proc ? fs::path("/proc/self/exe") : self)));
   }
-  DrainController drain(server, runtime, *membership, shards, timer, server.placementConfig().drainAnnounceDelayMsForTest,
+  DrainController drain(server, runtime, *membership, shards, durableLog, timer,
+      server.placementConfig().drainAnnounceDelayMsForTest,
       [&httpServer]() { return httpServer.drain(); });
   // Another process holds this node's id: it writes the node's usage objects from now on, this one none (not even the
   // drain's last flush), then this one drains and exits.
@@ -6999,6 +7245,10 @@ int run(Launch launch) {
     tenantUsage.stop("another process holds this node's id");
     drain.identityTaken(std::move(reason));
   });
+
+  // This machine's Durable Object files are judged and this node's own log read before anything is served.
+  durableLog.setNodeEpoch(std::strtoull(membership->view().epoch.c_str(), nullptr, 10));
+  durableLog.start().wait(waitScope);
 
   std::cout << "[server] ready http=" << launch.listenAddress
             << " binding-rpc=" << bindingSocketAddress
@@ -7022,6 +7272,8 @@ int run(Launch launch) {
       .exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer))
+      .exclusiveJoin(durableLog.run())
+      .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())
           .then([]() -> kj::Promise<void> { return kj::NEVER_DONE; }))

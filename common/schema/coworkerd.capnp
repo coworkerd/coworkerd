@@ -30,6 +30,63 @@ interface PeerServer @0xab4d6df924ec776f {
   # the shard at the epoch the sender expects (or, with epoch 0, once it took the shard), refused before anything ran.
   openObjectInvocation @1 (invocation :ObjectInvocation)
       -> (result :InvocationOpenResult);
+  # The Durable Object log of the node that calls: its replicator opens one stream per peer and sends it the records of
+  # every shard this node is a peer of, and this node buffers them until a segment on the object store covers them.
+  openDurableLog @2 (session :DurableLogSession) -> (sink :DurableLogSink);
+  # What this node still holds of a previous owner's log for one shard: a new owner asks for it after it has replayed
+  # the object store, so that the writes the previous owner answered but did not get into a segment are not lost.
+  fetchDurableTail @3 (request :DurableTailRequest) -> (result :DurableTailResult);
+}
+
+struct DurableLogSession {
+  # The owner that opens the stream: its node id, its membership epoch and the process that runs it.
+  nodeId @0 :Text;
+  nodeEpoch @1 :UInt64;
+  instance @2 :Text;
+  # The receiver's membership epoch the sender addresses (a stream to another epoch is refused).
+  destinationEpoch @3 :Text;
+  # The first node sequence this stream carries.
+  firstSeq @4 :UInt64;
+}
+
+interface DurableLogSink {
+  # One or more records of the owner's log, in sequence order, each prefixed with its length (UInt32, little endian).
+  # The answer is the highest sequence this node now holds of the stream, which is what lets the owner open its output
+  # gate; `refused` names the reason when the records were not taken (the buffer is full, or the shard's epoch is not
+  # the one this node knows: the owner has been fenced). `partial` carries a piece of what the next calls complete --
+  # one transaction's frames can be larger than a message may be -- and holds the bytes until the call that is not
+  # partial; nothing of a record is held until it is whole.
+  append @0 (records :Data, partial :Bool) -> (accepted :UInt64, refused :Text);
+  # Every record up to and including `upTo` is in a segment on the object store: this node drops them.
+  trim @1 (upTo :UInt64) -> ();
+  # Records the owner isolated: they were never confirmed and will never be in a segment, so they must not reach a
+  # rebuild of their object.
+  drop @2 (sequences :List(UInt64)) -> ();
+}
+
+struct DurableTailRequest {
+  namespaceId @0 :Text;
+  shard @1 :UInt32;
+  # The asking node's own epoch of the shard: a tail is given out only to the shard's current owner.
+  shardEpoch @2 :UInt64;
+  # Whose log, and from which sequence on (what the object store already covers); epoch 0: any epoch of that node.
+  ownerNodeId @3 :Text;
+  ownerNodeEpoch @4 :UInt64;
+  afterSeq @5 :UInt64;
+  destinationEpoch @6 :Text;
+}
+
+struct DurableTailResult {
+  # The records, each prefixed with its length (UInt32, little endian), in sequence order and without a gap.
+  records @0 :Data;
+  firstSeq @1 :UInt64;
+  lastSeq @2 :UInt64;
+  # The sequence up to which this node has dropped what it held (trimmed or isolated), and how many records it holds
+  # beyond `lastSeq` that it could not give out in one answer.
+  droppedTo @3 :UInt64;
+  count @4 :UInt32;
+  more @5 :Bool;
+  refused @6 :Text;
 }
 
 struct InvocationOpenResult {
@@ -206,6 +263,42 @@ struct ServerConfig {
     # The durable processes d0, d1, ...: each object runs in one of them, chosen by the object's id. They are not replaced
     # with age; they rotate when the workerd file changes, by hand and at rotation.residentBytes, each draining first.
     processes @0 :UInt32 = 1;
+    # An object's write is answered once K peers hold its frames: the first `peers` nodes after the object's shard on the
+    # member ring, or one fewer than the live members when there are not that many. 0 keeps every write on this node
+    # alone (its log is written and flushed to this machine's disk before the answer, which costs tens of milliseconds).
+    peers @1 :UInt32 = 2;
+    # How long a commit waits for its peers before the write fails with STORAGE_UNAVAILABLE. Below workerd's own 30 s
+    # output gate timeout, so the caller gets a code it can act on rather than a reset object.
+    confirmTimeoutMs @2 :UInt32 = 5000;
+    # How long a request for an object being rebuilt waits before 503 DO_RECOVERING.
+    recoverTimeoutMs @3 :UInt32 = 30000;
+    # A segment of the node's log is sealed and uploaded every segmentIntervalMs or once it holds segmentBytes.
+    segmentIntervalMs @4 :UInt32 = 30000;
+    segmentBytes @5 :UInt64 = 16777216;
+    # An object's whole database is uploaded as a new snapshot once its log since the last one passes snapshotBytes, or
+    # once snapshotIntervalMs has gone by. A snapshot is uploaded in parts of snapshotPartBytes.
+    snapshotBytes @6 :UInt64 = 67108864;
+    snapshotIntervalMs @7 :UInt32 = 86400000;
+    snapshotPartBytes @8 :UInt64 = 16777216;
+    # This machine's Durable Object files are a cache: the files of cold objects whose changes are all in a segment are
+    # removed once they take more than diskBytes. 0: half of the filesystem the stack is on, measured at startup.
+    diskBytes @9 :UInt64 = 0;
+    # What one node buffers for the owners it is a peer of. Past it the owners' writes are refused, so their callers get
+    # STORAGE_UNAVAILABLE rather than an unbounded buffer here.
+    peerBufferBytes @10 :UInt64 = 268435456;
+    # The largest one object may become, by its database file at a checkpoint; past it the object answers 413
+    # DO_OBJECT_TOO_LARGE (10 GB, as on Cloudflare).
+    objectBytes @11 :UInt64 = 10737418240;
+    # The WAL size at which a durable process checkpoints an object, and how long an object must be idle for the node to
+    # ask for one.
+    checkpointBytes @12 :UInt64 = 4194304;
+    idleCheckpointMs @13 :UInt32 = 10000;
+    # A failed upload of a segment or snapshot part is tried again after uploadRetryMs, doubling to uploadRetryMaxMs.
+    uploadRetryMs @14 :UInt32 = 500;
+    uploadRetryMaxMs @15 :UInt32 = 30000;
+    # How many parts of a snapshot or segments a rebuild downloads at once (R5: more than four 16 MiB reads at once met
+    # errors on a volume server of SeaweedFS 3.97).
+    recoverParallelism @16 :UInt32 = 4;
   }
 
   struct IngressConfig {

@@ -97,13 +97,12 @@ struct ManifestSecret {
 // A Durable Object namespace of a Worker, by its class's name: the id the control plane made when a version first
 // declared the class (32 random bytes, hexadecimal; a rename moves it to the new name), the manifest revision that made
 // it, its status ("active", or "deleting" once a version deleted the class: no Binding to it, no new request), and the
-// shards and reliability tier it was made with (fixed for its life).
+// shards it was made with (fixed for its life). There is one kind of object, so no tier is recorded.
 struct ManifestNamespace {
   std::string id;
   uint64_t createdRevision = 0;
   std::string status = "active";
   uint32_t shards = 1024;
-  std::string tier = "small";
   bool operator==(const ManifestNamespace&) const = default;
 };
 struct ManifestWorker {

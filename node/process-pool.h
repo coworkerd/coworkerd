@@ -103,6 +103,12 @@ public:
   // The drain's close of the durable processes alone (as closeAll() closes every process), before the node lets its
   // shards go: no durable generation starts from then on. Resolves with the record once they exited.
   kj::Promise<std::string> closeDurable();
+  // The Durable Object log channel (node/durable-log.h): a durable process inherits one end of a socket under
+  // descriptor 9 and ships its objects' WAL frames over it. `open` gives the descriptor the child is to inherit
+  // (-1: this node ships nothing), `close` is called when a generation is gone, and the settings the processes read
+  // come from the same block.
+  void setDurableChannel(std::function<int(const std::string&)> open, std::function<void(const std::string&)> close,
+      const DurableLogConfig& settings);
   // Usage: the CPU nanoseconds of each tenant's executions since the last call (from the `completed` rows),
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();

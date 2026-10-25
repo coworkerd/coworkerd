@@ -210,7 +210,7 @@ std::string tenantManifestJson(const TenantManifest& manifest) {
 
 std::string manifestNamespaceJson(const ManifestNamespace& entry) {
   return "{\"id\":" + quote(entry.id) + ",\"createdRevision\":" + std::to_string(entry.createdRevision) + ",\"status\":" +
-      quote(entry.status) + ",\"shards\":" + std::to_string(entry.shards) + ",\"tier\":" + quote(entry.tier) + "}";
+      quote(entry.status) + ",\"shards\":" + std::to_string(entry.shards) + "}";
 }
 
 TenantManifest decodeTenantManifest(const std::string& bytes) {
@@ -286,10 +286,9 @@ TenantManifest decodeTenantManifest(const std::string& bytes) {
           item.createdRevision = number(record, "createdRevision");
           item.status = string(record, "status");
           item.shards = static_cast<uint32_t>(number(record, "shards"));
-          item.tier = string(record, "tier");
           KJ_REQUIRE(hexDigest(item.id), "a namespace id is 64 hexadecimal digits");
           KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting");
-          KJ_REQUIRE(item.shards > 0 && !item.tier.empty(), "a namespace has shards and a tier");
+          KJ_REQUIRE(item.shards > 0, "a namespace has shards");
           worker.namespaces.emplace(className, std::move(item));
         }
       }

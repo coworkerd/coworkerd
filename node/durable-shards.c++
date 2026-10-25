@@ -632,8 +632,24 @@ void DurableShards::forwarded(bool designated, const std::string& outcome) {
 
 void DurableShards::countRefusal(const std::string& code) { ++refusals[code]; }
 
+uint64_t DurableShards::knownShardEpoch(const std::string& namespaceId, uint32_t shard) const {
+  const Key key{namespaceId, shard};
+  auto own = held.find(key);
+  if (own != held.end()) return own->second.epoch;
+  auto known = cache.find(key);
+  if (known != cache.end()) return known->second.record.epoch;
+  return 0;
+}
+
+void DurableShards::onShardGone(std::function<void(const std::string&, uint32_t, const std::string&)> callback) {
+  shardGone = std::move(callback);
+}
+
 uint32_t DurableShards::dropAll(const std::string& reason) {
   const auto count = static_cast<uint32_t>(held.size());
+  if (shardGone) {
+    for (const auto& [key, entry] : held) shardGone(key.first, key.second, reason);
+  }
   std::ostringstream shards;
   size_t index = 0;
   for (const auto& [key, entry] : held)
@@ -694,6 +710,7 @@ kj::Promise<DurableShards::Released> DurableShards::releaseAll(double deadlineMo
     }
     // Not this node's any more either way: the marker, or its membership leaving, lets another node take it.
     self.held.erase(key);
+    if (self.shardGone) self.shardGone(key.first, key.second, "released");
     std::ostringstream fields;
     fields << std::setprecision(6) << "\"epoch\":\"" << entry.epoch << "\",\"markerWritten\":" << (ok ? "true" : "false")
            << ",\"elapsedMs\":" << monotonicMs(self.timer) - began << (ok ? "" : ",\"error\":" + quote(error));
@@ -702,7 +719,10 @@ kj::Promise<DurableShards::Released> DurableShards::releaseAll(double deadlineMo
   };
   for (size_t at = 0; at < items.size(); at += RELEASE_PARALLELISM) {
     if (store == std::nullopt || monotonicMs(timer) >= deadlineMonotonicMs) {
-      for (size_t i = at; i < items.size(); ++i) held.erase(items[i].first);
+      for (size_t i = at; i < items.size(); ++i) {
+        held.erase(items[i].first);
+        if (shardGone) shardGone(items[i].first.first, items[i].first.second, "released-deadline");
+      }
       result.failed += static_cast<uint32_t>(items.size() - at);
       break;
     }

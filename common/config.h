@@ -173,6 +173,29 @@ struct PeerAuthConfig {
   uint32_t windowMs = 30000;
 };
 
+// What a node does with its Durable Objects' data (durableObjects in the configuration file; node/durable-log.h).
+// Every value is a setting, and the defaults are the design's
+// (docs/s3-truth-and-durable-objects.md, section 9).
+struct DurableLogConfig {
+  uint32_t peers = 2;
+  uint32_t confirmTimeoutMs = 5000;
+  uint32_t recoverTimeoutMs = 30000;
+  uint32_t segmentIntervalMs = 30000;
+  uint64_t segmentBytes = 16u << 20;
+  uint64_t snapshotBytes = 64u << 20;
+  uint32_t snapshotIntervalMs = 86400000;
+  uint64_t snapshotPartBytes = 16u << 20;
+  uint64_t diskBytes = 0;  // 0: half of the stack's filesystem, measured at startup
+  bool diskBytesDefault = true;
+  uint64_t peerBufferBytes = 256u << 20;
+  uint64_t objectBytes = 10ull << 30;
+  uint64_t checkpointBytes = 4u << 20;
+  uint32_t idleCheckpointMs = 10000;
+  uint32_t uploadRetryMs = 500, uploadRetryMaxMs = 30000;
+  uint32_t recoverParallelism = 4;
+  void validate() const;
+};
+
 struct ServerConfig {
   // The node's id: `nodeId` in the configuration file, the segment of its objects members/<nodeId>/ and
   // nodes/<nodeId>/. The C++ name is `serverId` (the code calls the node's id this throughout).
@@ -209,6 +232,8 @@ struct ServerConfig {
   bool loadCheck = true;
   // ingress.webSocketsPerTenant: the open WebSocket connections the ingress holds for one tenant; 0, no limit.
   uint32_t webSocketsPerTenant = 1000;
+  // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
+  DurableLogConfig durableLog;
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;

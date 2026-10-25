@@ -65,7 +65,7 @@ The services: `secrets` and `init` run at every start and exit, `storage` is the
 | Credential | Used by |
 | --- | --- |
 | The object store identity `deploy` | The control plane and `tool`: it reads, writes and lists the whole bucket, as the store's administrator (`init` creates the bucket with it) |
-| An object store identity `node-<nodeId>` for every node | That node: it reads what a node reads and writes only its own `members/<nodeId>/` and `nodes/<nodeId>/` (section 4, "Object storage identities") |
+| An object store identity `node-<nodeId>` for every node | That node: it reads what a node reads -- every node's `nodes/` prefix among it, where the Durable Object log's segments are -- and writes only its own `members/<nodeId>/` and `nodes/<nodeId>/` and the objects' own prefixes (section 4, "Object storage identities") |
 | The **secrets key** `secrets-key.json` | The control plane seals secrets' values with it before they are stored, and every node opens them with it |
 | The **cluster key** | The nodes sign their peer connections with it (section 12) |
 | The **management token** (unless `COWORKERD_MANAGEMENT_TOKEN` is set) | The control plane, the operations tool and operators calling a node's management endpoints (section 8); nodes sign their own sessions with the cluster key |
@@ -311,7 +311,7 @@ It is part of a workerd upgrade too: workerd reads only the table's call numbers
 | Identity | Actions | For |
 | --- | --- | --- |
 | `deploy` | Create the bucket (the self-check's first request), and read, write and list it -- compose gives it SeaweedFS's `Admin`, `Read`, `Write` and `List` | The control plane and the operations tool |
-| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/` and `do/`; list `members/`, `cluster/tenants/`, `tenants/` and `do/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` (the Durable Object shards' epochs, release markers and owner hints: any node may take a shard over) | That node |
+| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/`, `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/`, `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` (the Durable Object shards' epochs, release markers and owner hints: any node may take a shard over) and `do/*/objects/*` (an object's manifests and snapshots, written by whichever node owns its shard). Reading and listing every node's `nodes/` prefix is what lets a node rebuild an object from the segments of the node that owned its shard before (`nodes/<id>/wal/`) | That node |
 
 Every prefix ends with `/`, so that `node-1`'s policy does not cover `node-10`; a node's identity cannot read the credentials index `cluster/credentials/`, and cannot write another node's objects, `cluster/`, `tenants/` or the code.
 In SeaweedFS (4.29 or newer) these are the actions of the identity's entry in its identities (`s3.json`, or the filer's, which `s3.configure` writes); for the bucket `coworkerd` and the node `node-1`:
@@ -320,9 +320,11 @@ In SeaweedFS (4.29 or newer) these are the actions of the identity's entry in it
 {"name": "node-node-1", "credentials": [{"accessKey": "...", "secretKey": "..."}],
  "actions": ["Read:coworkerd/cluster/format/*", "Read:coworkerd/cluster/tenants/*", "Read:coworkerd/tenants/*", "Read:coworkerd/definitions/*",
    "Read:coworkerd/packages/*", "Read:coworkerd/modules/*", "Read:coworkerd/bundles/*", "Read:coworkerd/members/*",
-   "Read:coworkerd/do/*", "List:coworkerd/members/*", "List:coworkerd/cluster/tenants/*", "List:coworkerd/tenants/*",
-   "List:coworkerd/do/*", "Read:coworkerd/members/node-1/*", "Write:coworkerd/members/node-1/*", "List:coworkerd/members/node-1/*",
-   "Read:coworkerd/nodes/node-1/*", "Write:coworkerd/nodes/node-1/*", "List:coworkerd/nodes/node-1/*", "Write:coworkerd/do/*/shards/*"]}
+   "Read:coworkerd/do/*", "Read:coworkerd/nodes/*", "List:coworkerd/members/*", "List:coworkerd/cluster/tenants/*",
+   "List:coworkerd/tenants/*", "List:coworkerd/do/*", "List:coworkerd/nodes/*", "Read:coworkerd/members/node-1/*",
+   "Write:coworkerd/members/node-1/*", "List:coworkerd/members/node-1/*", "Read:coworkerd/nodes/node-1/*",
+   "Write:coworkerd/nodes/node-1/*", "List:coworkerd/nodes/node-1/*", "Write:coworkerd/do/*/shards/*",
+   "Write:coworkerd/do/*/objects/*"]}
 ```
 
 A running SeaweedFS takes a new identity at once with `weed shell`'s `s3.configure -user=... -access_key=... -secret_key=... -actions=... -apply` (what compose's `secrets` hands its store for every node), kept in its filer, and withdraws one the same way with `-delete`; it reads `s3.json` again only when it starts, and an identity read from it stays in force until then -- so compose keeps only the deploy identity there.
@@ -523,7 +525,7 @@ these ports either (section 11).
 | --- | --- | --- |
 | `GET /__coworkerd/ready` | Readiness (503 while draining, and while an ordinary process slot is not ready -- the quarantine shards, where trial loads and suspect tenants run, do not count, and `state` shows them under `readiness`; load balancers take the node out on it) | Not needed |
 | `GET /__coworkerd/probe` | Liveness (200 as long as the process is there) | Not needed |
-| `GET /__coworkerd/state` | State: `nodeId`, members (`membership`), the object store (`storage`: its create-if-absent measurement, the clock check and `appliedTenantsRevision`, the tenant index revision it serves), tenants (`tenants`), per-tenant usage (`usage`), processes (including the quarantine shards and the per-tenant suspects), deployment, version (`version`), effective configuration (`configuration`), the Durable Object shards it holds, its takeovers, releases and refusals and its owner cache (`durableShards`), counters; on both the ingress and the peer port | Needed |
+| `GET /__coworkerd/state` | State: `nodeId`, members (`membership`), the object store (`storage`: its create-if-absent measurement, the clock check and `appliedTenantsRevision`, the tenant index revision it serves), tenants (`tenants`), per-tenant usage (`usage`), processes (including the quarantine shards and the per-tenant suspects), deployment, version (`version`), effective configuration (`configuration`), the Durable Object shards it holds, its takeovers, releases and refusals and its owner cache (`durableShards`), the objects' log -- the confirmation latency, what is not confirmed and not sealed, the segments and uploads, the peers, the rebuilds and this machine's files (`durableLog`) --, counters; on both the ingress and the peer port | Needed |
 | `GET /__coworkerd/logs?worker=<tenant>/<worker>` | A Worker's recent log lines on this node, what `/v1`'s logs gather (on both the ingress and the peer port) | Needed |
 | `POST /__coworkerd/control-plane` | A control plane announces its addresses (on the peer port) | Needed |
 | `GET /__coworkerd/deployment`, `/placement?workers=`, `/process-placement?workers=` | The deployment view, placement | Needed |

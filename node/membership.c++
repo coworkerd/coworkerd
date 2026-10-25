@@ -676,6 +676,25 @@ private:
               (record ? record->instance : std::string("unreadable")) + ")");
       }
     }
+    // A listing that does not hold this node's own live heartbeat is not a listing of the members (v60's core
+    // regression: the first second of a stopped store answered 200 with an empty list, and two nodes dropped each
+    // other on it). Nothing is judged by it: the member table stays as it was and the listing counts as a failure,
+    // so the recovery anchor works exactly as before.
+    if (epoch && !state.identityTaken && !state.selfExpired && lastHeartbeatOk != kj::origin<kj::TimePoint>() &&
+        timer.now() - lastHeartbeatOk <= config.ttlSeconds * kj::SECONDS) {
+      auto own = nodes.find(serverId);
+      const bool mine = own != nodes.end() && own->second.epochs.contains(epoch) &&
+          own->second.epochs.at(epoch).heartbeat;
+      if (!mine) {
+        ++state.incompleteListings;
+        std::cout << "[membership] {\"event\":\"incomplete-listing\",\"nodeId\":" << quote(serverId)
+                  << ",\"epoch\":" << epoch << ",\"keys\":" << listing.objects.size() << ",\"nodes\":" << nodes.size()
+                  << ",\"observedAtUnixMs\":" << nowUnixMs()
+                  << ",\"reason\":\"the listing does not hold this node's own heartbeat, which it wrote within the TTL\"}"
+                  << std::endl;
+        KJ_FAIL_REQUIRE("the listing of the members does not hold this node's own heartbeat");
+      }
+    }
     auto current = liveMembers(nodes, config.ttlSeconds, config.livenessGraceMs);
     state.keptMembers = 0;
     if (state.recoveredUntilUnixMs && sample.dateUnixMs && sample.dateUnixMs < state.recoveredUntilUnixMs) {
@@ -866,6 +885,7 @@ std::string MembershipView::json() const {
            << ",\"startupCollisionWaitMs\":" << startupCollisionWaitMs
            << ",\"identityTaken\":" << (identityTaken ? "true" : "false") << ",\"identityTakenReason\":" << quote(identityTakenReason)
            << ",\"ownHeartbeatChecks\":" << ownHeartbeatChecks << ",\"ownHeartbeatMissing\":" << ownHeartbeatMissing
+           << ",\"incompleteListings\":" << incompleteListings
            << ",\"oldObjectsRemoved\":" << oldObjectsRemoved << ",\"suspectsObject\":" << (suspectsObject ? "true" : "false")
            << ",\"suspectsWritten\":" << suspectsWritten << ",\"suspectsRemoved\":" << suspectsRemoved
            << ",\"suspectsWriteFailures\":" << suspectsWriteFailures << ",\"suspectsReads\":" << suspectsReads
