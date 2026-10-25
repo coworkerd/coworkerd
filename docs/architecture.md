@@ -71,10 +71,10 @@ Tenant code has no network of its own: its outgoing `fetch()` goes to the node's
 ## 9. Boundaries
 
 - **One region.** A cluster lives in one region or an equivalent low-latency network; there is no routing or failover across regions.
-- **Stateless Workers only, in this release.** Coworkerd schedules stateless calls and refuses stateful bindings at conversion. State with ownership -- Durable Objects -- is being built for 0.5 on the object store: ownership per shard, taken with create-if-absent epochs and fenced; writes confirmed by peer nodes and shipped to the bucket. Until then a platform reaches stateful services of its own as external services.
+- **Stateless Workers only, in this release.** Coworkerd schedules stateless calls and refuses stateful bindings other than Durable Objects at conversion. State with ownership -- Durable Objects -- is being built for 0.5 on the object store: ownership per shard, taken with create-if-absent epochs and fenced; writes confirmed by peer nodes and shipped to the bucket. In development now is its first part, on one node: Durable Object Bindings and classes are accepted, and the node that receives a call to an object runs it in a durable process of its own, with the object's SQLite database on its disk -- without ownership, calls across nodes or the object store, so on a cluster of several nodes each node would keep its own copy of an object ([compatibility](compatibility.md), section 7). Until 0.5 a platform reaches stateful services of its own as external services.
 - **Isolates share processes.** Several tenants run in one workerd process, as on Cloudflare's platform, and an isolate is not as strong a boundary as a process; the per-isolate limits, the quarantine processes, process rotation and the sandbox are what this design adds to it.
 - **Trust between nodes.** Nodes trust each other through a shared signing key, when one is configured; there is no mTLS, and a node joins with an object storage identity issued for it (compose's `secrets add-node`), not through a join procedure of its own.
-- **Not done.** Accounts, billing and user interfaces; stateful bindings (Durable Objects in 0.5); scheduled triggers, JS RPC, Tail Workers and email handlers; routing across regions.
+- **Not done.** Accounts, billing and user interfaces; stateful bindings (Durable Objects in 0.5, in development on one node); scheduled triggers, JS RPC, Tail Workers and email handlers; routing across regions.
 
 ## 10. Public references
 

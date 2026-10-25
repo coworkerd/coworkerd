@@ -143,6 +143,51 @@ void validateRunWorkerFirstRules(const std::vector<std::string>& rules) {
 }
 }  // namespace
 
+namespace {
+// A Durable Object class's name: a JavaScript identifier, never one of the bridge's own (__coworkerd_...).
+bool durableClassName(const std::string& name) {
+  return environmentName(name) && !name.starts_with("__coworkerd");
+}
+// The Durable Object Bindings and classes of a v2 version: Binding names share env with variables, secrets and the other
+// Bindings (`names`), each Binding names a declared class, a class is declared or deleted (once), and a rename names a
+// class that is no longer declared and one that is.
+void validateDurableObjects(const VersionDefinition& version, std::set<std::string>& names) {
+  KJ_REQUIRE(version.durableObjects.size() <= MAX_DURABLE_OBJECT_CLASSES, "a version has more than 64 Durable Object Bindings");
+  KJ_REQUIRE(version.declaredClasses.size() + version.deletedClasses.size() + version.renamedClasses.size() <= MAX_DURABLE_OBJECT_CLASSES,
+      "a version names more than 64 Durable Object classes");
+  std::set<std::string> declared, deleted;
+  for (const auto& name : version.declaredClasses) {
+    KJ_REQUIRE(durableClassName(name), "invalid Durable Object class name", name.c_str());
+    KJ_REQUIRE(declared.insert(name).second, "a Durable Object class is declared twice", name.c_str());
+  }
+  for (const auto& name : version.deletedClasses) {
+    KJ_REQUIRE(durableClassName(name), "invalid Durable Object class name", name.c_str());
+    KJ_REQUIRE(!declared.contains(name), "a Durable Object class is both declared and deleted", name.c_str());
+    KJ_REQUIRE(deleted.insert(name).second, "a Durable Object class is deleted twice", name.c_str());
+  }
+  for (const auto& rename : version.renamedClasses) {
+    KJ_REQUIRE(durableClassName(rename.from) && durableClassName(rename.to) && rename.from != rename.to,
+        "invalid Durable Object class rename", rename.from.c_str(), rename.to.c_str());
+    KJ_REQUIRE(!declared.contains(rename.from), "a renamed Durable Object class is still declared", rename.from.c_str());
+  }
+  for (const auto& binding : version.durableObjects) {
+    KJ_REQUIRE(environmentName(binding.binding), "invalid Durable Object Binding name", binding.binding.c_str());
+    KJ_REQUIRE(names.insert(binding.binding).second, "duplicate Durable Object Binding or a collision with a variable, secret or Binding",
+        binding.binding.c_str());
+    KJ_REQUIRE(declared.contains(binding.className), "a Durable Object Binding names a class the version does not declare",
+        binding.binding.c_str(), binding.className.c_str());
+  }
+}
+// The Durable Object part of a definition's encoding and JSON, in a fixed order: Bindings by name, declared and deleted
+// classes sorted, renames in their order.
+std::vector<DurableObjectBindingDefinition> sortedDurableBindings(const VersionDefinition& version) {
+  auto bindings = version.durableObjects;
+  std::sort(bindings.begin(), bindings.end(), [](const auto& a, const auto& b) { return a.binding < b.binding; });
+  return bindings;
+}
+std::vector<std::string> sortedNames(std::vector<std::string> names) { std::sort(names.begin(), names.end()); return names; }
+}  // namespace
+
 void validateDefinition(const VersionDefinition& version) {
   // A Worker's full name; its Bindings stay within its tenant (cross-tenant Bindings are not in this version).
   KJ_REQUIRE(workerFullName(version.workerId), "invalid workerId (<tenant>/<worker>)");
@@ -222,7 +267,9 @@ void validateDefinition(const VersionDefinition& version) {
       KJ_REQUIRE(environmentName(name), "invalid secret name", name.c_str());
       KJ_REQUIRE(names.insert(name).second, "duplicate secret or secret/variable/Binding collision", name.c_str());
     }
+    validateDurableObjects(version, names);
   } else {
+    KJ_REQUIRE(!version.hasDurableObjects(), "Durable Objects require format v2");
     KJ_REQUIRE(version.compatibilityFlags.empty() && version.variables.empty() && version.secrets.empty() &&
         std::all_of(version.bindings.begin(), version.bindings.end(), [](const auto& b) { return b.entrypoint.empty(); }),
         "v2 configuration requires format v2");
@@ -271,6 +318,19 @@ std::string definitionEncoding(const VersionDefinition& version) {
     auto secrets = version.secrets; std::sort(secrets.begin(), secrets.end());
     stringField(out, "secrets"); uint32(out, secrets.size());
     for (const auto& name : secrets) stringField(out, name);
+  }
+  // Durable Objects, appended only when the version has any: definitions without them keep their bytes and hashes.
+  if (version.hasDurableObjects()) {
+    stringField(out, "durableObjects");
+    const auto bindings = sortedDurableBindings(version);
+    uint32(out, bindings.size());
+    for (const auto& binding : bindings) { stringField(out, binding.binding); stringField(out, binding.className); }
+    for (const auto& list : {sortedNames(version.declaredClasses), sortedNames(version.deletedClasses)}) {
+      uint32(out, list.size());
+      for (const auto& name : list) stringField(out, name);
+    }
+    uint32(out, version.renamedClasses.size());
+    for (const auto& rename : version.renamedClasses) { stringField(out, rename.from); stringField(out, rename.to); }
   }
   return out;
 }
@@ -327,7 +387,27 @@ std::string definitionJson(const VersionDefinition& version) {
     for (size_t i = 0; i < secrets.size(); ++i) { if (i) out += ','; out += quote(secrets[i]); }
     out += ']';
   }
+  if (version.hasDurableObjects()) out += ",\"durableObjects\":" + durableObjectsJson(version) + ",\"classes\":" + durableClassesJson(version);
   return out + '}';
+}
+
+std::string durableObjectsJson(const VersionDefinition& version) {
+  std::string out = "[";
+  for (const auto& binding : sortedDurableBindings(version))
+    out += std::string(out.size() > 1 ? "," : "") + "{\"binding\":" + quote(binding.binding) + ",\"className\":" + quote(binding.className) + '}';
+  return out + ']';
+}
+std::string durableClassesJson(const VersionDefinition& version) {
+  auto list = [](const std::vector<std::string>& names) {
+    std::string out = "[";
+    for (const auto& name : names) out += std::string(out.size() > 1 ? "," : "") + quote(name);
+    return out + ']';
+  };
+  std::string out = "{\"declared\":" + list(sortedNames(version.declaredClasses)) + ",\"deleted\":" +
+      list(sortedNames(version.deletedClasses)) + ",\"renamed\":[";
+  for (size_t i = 0; i < version.renamedClasses.size(); ++i)
+    out += std::string(i ? "," : "") + "{\"from\":" + quote(version.renamedClasses[i].from) + ",\"to\":" + quote(version.renamedClasses[i].to) + '}';
+  return out + "]}";
 }
 
 std::string versionStatusJson(const VersionDefinition& version, const std::string& extra) {
@@ -371,6 +451,35 @@ std::string deploymentBinderKey(const std::string& target, const std::string& bi
 std::string deploymentSecretKey(const std::string& workerId, const std::string& name) {
   return tenantOf(workerId) + "/secrets/" + workerNameOf(workerId) + '/' + name;
 }
+std::string deploymentNamespacesKey(const std::string& workerId) {
+  return tenantOf(workerId) + "/namespaces/" + workerNameOf(workerId);
+}
+
+std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces) {
+  std::string out = "{";
+  for (const auto& [name, entry] : namespaces)
+    out += std::string(out.size() > 1 ? "," : "") + quote(name) + ":{\"id\":" + quote(entry.id) + ",\"status\":" + quote(entry.status) + '}';
+  return out + '}';
+}
+std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes) {
+  capnp::MallocMessageBuilder message;
+  auto json = message.initRoot<capnp::JsonValue>();
+  capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), json);
+  KJ_REQUIRE(json.isObject(), "a Worker's namespaces are an object");
+  std::map<std::string, DurableObjectNamespace> namespaces;
+  for (auto entry : json.getObject()) {
+    const std::string name = entry.getName().cStr();
+    KJ_REQUIRE(durableClassName(name), "invalid Durable Object class name", name.c_str());
+    auto value = entry.getValue();
+    DurableObjectNamespace item;
+    item.id = json::text(value, "id");
+    item.status = json::text(value, "status");
+    KJ_REQUIRE(hashValid(item.id), "a namespace id is 64 lowercase hexadecimal characters", name.c_str());
+    KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting", name.c_str());
+    namespaces.emplace(name, std::move(item));
+  }
+  return namespaces;
+}
 
 std::string secretRecordJson(const std::string& value, uint64_t setAtUnixMs) {
   return "{\"value\":" + quote(value) + ",\"setAtUnixMs\":" + std::to_string(setAtUnixMs) + '}';
@@ -409,6 +518,18 @@ std::string routeValueJson(const RouteDefinition& route) {
       ",\"tenant\":" + quote(tenantOf(route.workerId)) + ",\"worker\":" + quote(workerNameOf(route.workerId)) + '}';
 }
 
+namespace {
+void readDurableObjects(VersionDefinition& version, capnp::List<rpc::DurableObjectBinding>::Reader bindings,
+    kj::Maybe<rpc::DurableObjectClasses::Reader> classes) {
+  for (auto binding : bindings) version.durableObjects.push_back({binding.getBinding().cStr(), binding.getClassName().cStr()});
+  KJ_IF_SOME(value, classes) {
+    for (auto name : value.getDeclared()) version.declaredClasses.emplace_back(name.cStr());
+    for (auto name : value.getDeleted()) version.deletedClasses.emplace_back(name.cStr());
+    for (auto rename : value.getRenamed()) version.renamedClasses.push_back({rename.getFrom().cStr(), rename.getTo().cStr()});
+  }
+}
+}  // namespace
+
 std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::string& bytes) {
   capnp::MallocMessageBuilder message;
   auto value = message.initRoot<rpc::DeploymentDefinition>();
@@ -433,6 +554,7 @@ std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::s
     for (auto rule : assets.getRunWorkerFirstRules()) version->assetsRunWorkerFirstRules.emplace_back(rule.cStr());
   }
   for (auto name : value.getSecrets()) version->secrets.emplace_back(name.cStr());
+  readDurableObjects(*version, value.getDurableObjects(), value.hasClasses() ? kj::Maybe(value.getClasses()) : kj::none);
   return version;
 }
 
@@ -481,6 +603,7 @@ DeploymentInput readDeploymentManifest(const std::filesystem::path& manifestPath
         for (auto rule : version.getAssets().getRunWorkerFirstRules()) value->assetsRunWorkerFirstRules.emplace_back(rule.cStr());
       }
       for (auto name : version.getSecrets()) value->secrets.emplace_back(name.cStr());
+      readDurableObjects(*value, version.getDurableObjects(), version.hasClasses() ? kj::Maybe(version.getClasses()) : kj::none);
       // A version's own package file inside the package: a relative path below the manifest's directory, never an
       // absolute one or one that leaves it through "..".
       if (const std::filesystem::path given = version.getPackagePath().cStr(); !given.empty()) {
@@ -834,7 +957,7 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
       }
       continue;
     }
-    // Every other key is below its tenant: <tenant>/{definitions,active,secrets,binders}/...
+    // Every other key is below its tenant: <tenant>/{definitions,active,secrets,namespaces,binders}/...
     const auto tenantEnd = key.find('/');
     const auto tenant = tenantEnd == std::string::npos ? std::string() : key.substr(0, tenantEnd);
     const auto local = tenantEnd == std::string::npos ? std::string() : key.substr(tenantEnd + 1);
@@ -862,6 +985,23 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
       }
       if (names.empty()) secretMap.erase(worker);
       if (usableBefore != usableAfter && workerMap.contains(worker)) { observe(worker); retract(worker); touched.insert(worker); }
+      continue;
+    }
+    if (local.starts_with("namespaces/")) {
+      // <tenant>/namespaces/<worker>: the Worker's Durable Object namespaces. They change no definition, pin or validity:
+      // a request to an object reads them when it is dispatched.
+      const auto name = local.substr(11);
+      if (!deploymentSafeName(name)) { unknown(); continue; }
+      const auto worker = workerFullId(tenant, name);
+      namespaceMap.erase(worker);
+      if (!change.value) { unknownKeys.erase(key); continue; }
+      try {
+        auto decoded = decodeNamespacesState(*change.value);
+        if (!decoded.empty()) namespaceMap.emplace(worker, std::move(decoded));
+        unknownKeys.erase(key);
+      } catch (const kj::Exception&) {
+        unknown();
+      }
       continue;
     }
     if (local.starts_with("definitions/")) {
@@ -1293,6 +1433,17 @@ std::string DeploymentState::statusFields(size_t limit) const {
     out << ']';
   }
   return out.str();
+}
+
+const std::map<std::string, DurableObjectNamespace>* DeploymentState::namespaces(const std::string& workerId) const {
+  auto found = namespaceMap.find(workerId);
+  return found == namespaceMap.end() ? nullptr : &found->second;
+}
+const DurableObjectNamespace* DeploymentState::durableNamespace(const std::string& workerId, const std::string& className) const {
+  const auto* all = namespaces(workerId);
+  if (!all) return nullptr;
+  auto found = all->find(className);
+  return found == all->end() ? nullptr : &found->second;
 }
 
 const SecretValue* DeploymentState::secret(const std::string& workerId, const std::string& name) const {

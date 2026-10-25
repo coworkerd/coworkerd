@@ -21,6 +21,7 @@ namespace fs = std::filesystem;
 void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
+  KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
   // One spare port beyond the slots: a rotation's next generation listens there while the
   // previous one drains on its own port.
   KJ_REQUIRE(basePort > 0 && uint64_t(basePort) + count + quarantineProcesses + 1 <= 65536, "invalid process port range");
@@ -159,6 +160,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       "memoryLimitMiB must be a positive number of MiB; 0 is refused (it would turn culprit attribution off; "
       "COWORKERD_MEMORY_LIMIT_MIB=0 asks for it deliberately)");
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
+  result.processPool.durableProcesses = root.getDurableObjects().getProcesses();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
   result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();
   result.processPool.heatIdleMs = result.idleMs;

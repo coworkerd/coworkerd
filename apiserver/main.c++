@@ -1172,6 +1172,8 @@ private:
           }
         }
       } catch (const kj::Exception&) {}
+    } else if (reason.starts_with("durableObjectNamespaces: ")) {
+      status = 422; code = "QUOTA_EXCEEDED";
     } else if (has("run the trial load")) {
       status = 503; code = "TRIAL_UNAVAILABLE";
     } else if (has("deployment label conflict")) {

@@ -102,6 +102,7 @@ std::vector<std::string> readHostnames(Json::Reader value) {
 }  // namespace
 
 std::string newWriterInstance() { return randomHex(16); }
+std::string newNamespaceId() { return randomHex(32); }
 WriterIdentity newWriter(const std::string& instance) { return {instance, randomHex(8), realClockUnixMs()}; }
 std::string writerJson(const WriterIdentity& writer) {
   return "{\"instance\":" + quote(writer.instance) + ",\"writtenAtUnixMs\":" + std::to_string(writer.writtenAtUnixMs) +
@@ -193,9 +194,23 @@ std::string tenantManifestJson(const TenantManifest& manifest) {
       out += (s++ ? "," : "") + quote(secret) + ":{\"nonce\":" + quote(sealed.nonce) + ",\"ciphertext\":" +
           quote(sealed.ciphertext) + ",\"setAtUnixMs\":" + std::to_string(sealed.setAtUnixMs) + "}";
     }
-    out += "}}";
+    out += '}';
+    // Durable Object namespaces only where a Worker has some: a manifest without them keeps its shape.
+    if (!worker.namespaces.empty()) {
+      out += ",\"namespaces\":{";
+      size_t n = 0;
+      for (const auto& [className, entry] : worker.namespaces)
+        out += (n++ ? "," : "") + quote(className) + ":" + manifestNamespaceJson(entry);
+      out += '}';
+    }
+    out += '}';
   }
   return out + "}}";
+}
+
+std::string manifestNamespaceJson(const ManifestNamespace& entry) {
+  return "{\"id\":" + quote(entry.id) + ",\"createdRevision\":" + std::to_string(entry.createdRevision) + ",\"status\":" +
+      quote(entry.status) + ",\"shards\":" + std::to_string(entry.shards) + ",\"tier\":" + quote(entry.tier) + "}";
 }
 
 TenantManifest decodeTenantManifest(const std::string& bytes) {
@@ -258,6 +273,24 @@ TenantManifest decodeTenantManifest(const std::string& bytes) {
             try { sealed.setAtUnixMs = number(record, "setAtUnixMs"); } catch (const kj::Exception&) {}
           }
           worker.secrets.emplace(secretName, std::move(sealed));
+        }
+      }
+      if (auto namespaces = field(value, "namespaces"); !namespaces.isNull()) {
+        KJ_REQUIRE(namespaces.isObject(), "namespaces is an object");
+        for (auto entry : namespaces.getObject()) {
+          const std::string className = entry.getName().cStr();
+          KJ_REQUIRE(environmentName(className), "invalid Durable Object class name");
+          auto record = entry.getValue();
+          ManifestNamespace item;
+          item.id = string(record, "id");
+          item.createdRevision = number(record, "createdRevision");
+          item.status = string(record, "status");
+          item.shards = static_cast<uint32_t>(number(record, "shards"));
+          item.tier = string(record, "tier");
+          KJ_REQUIRE(hexDigest(item.id), "a namespace id is 64 hexadecimal digits");
+          KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting");
+          KJ_REQUIRE(item.shards > 0 && !item.tier.empty(), "a namespace has shards and a tier");
+          worker.namespaces.emplace(className, std::move(item));
         }
       }
       manifest.workers.emplace(name, std::move(worker));
@@ -419,6 +452,11 @@ std::map<std::string, std::string> tenantStateKeys(const TenantManifest& manifes
       // A value that does not open has no "value": the deployment state counts it unusable, names only.
       keys.emplace(deploymentSecretKey(id, secret), value ? secretRecordJson(*value, sealed.setAtUnixMs)
           : "{\"setAtUnixMs\":" + std::to_string(sealed.setAtUnixMs) + "}");
+    }
+    if (!worker.namespaces.empty()) {
+      std::map<std::string, DurableObjectNamespace> namespaces;
+      for (const auto& [className, entry] : worker.namespaces) namespaces.emplace(className, DurableObjectNamespace{entry.id, entry.status});
+      keys.emplace(deploymentNamespacesKey(id), namespacesStateJson(namespaces));
     }
   }
   return keys;

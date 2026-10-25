@@ -37,9 +37,11 @@ public:
   };
   // False when no drainer is installed: the caller keeps its direct file.
   static bool open(Pipes& pipes);
-  // Called once the child holds the write ends. Never blocks the caller.
-  static void attach(Pipes& pipes, uint32_t slot, const std::string& processId, bool quarantine,
+  // Called once the child holds the write ends. Never blocks the caller. `processClass`: 0 ordinary, 1 quarantine,
+  // 2 durable (className()).
+  static void attach(Pipes& pipes, uint32_t slot, const std::string& processId, uint32_t processClass,
       uint64_t generation, int64_t pid);
+  static const char* className(uint32_t processClass);
   static std::string processJson(uint32_t slot);
   static std::string stateJson();
   // One Worker's kept lines, as the drainer answers them (JSON): those after the cursor `after` (oldest

@@ -27,6 +27,9 @@ struct ProcessPoolConfig {
   uint32_t cpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
+  // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
+  // not replaced with age or with requests; a rotation of one drains it before its next generation starts.
+  uint32_t durableProcesses = 1;
   uint32_t idleEvictMs = 300000;
   uint32_t idleDestroyIntervalMs = 10;
   uint32_t heatIdleMs = 30000;

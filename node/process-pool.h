@@ -86,6 +86,14 @@ public:
   std::shared_ptr<ProcessCall> select(const std::string& worker);
   // A trial load's process: a quarantine process, the tenant's shard.
   std::shared_ptr<ProcessCall> selectTrial(const std::string& worker);
+  // Durable Objects: the durable process of an object (by its key, <namespace id>/<object id>: the same one while the
+  // durable slots are), whether it takes a call now, and a call on it.
+  uint32_t durableProcesses() const;
+  // A version executed on a durable process within the placement idle period (the yellow band's test for a cold one).
+  bool durableHot(const std::string& hash) const;
+  std::string durableProcessFor(const std::string& objectKey) const;
+  bool durableAvailable(const std::string& objectKey);
+  std::shared_ptr<ProcessCall> selectDurable(const std::string& objectKey);
   // Usage: the CPU nanoseconds of each tenant's executions since the last call (from the `completed` rows),
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();

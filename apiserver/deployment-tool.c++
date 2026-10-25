@@ -123,6 +123,62 @@ void requireNoCollateral(const DeploymentState& before, const DeploymentState& a
   }
 }
 
+// ---- Durable Object namespaces (common/tenant-manifest.h, ManifestNamespace) ----
+// A class's namespace, made when an uploaded version first declares the class -- unless a rename in that version will
+// give it the namespace of the class it was called before, which happens when the version is activated. A class whose
+// namespace is being deleted is never declared again.
+void declareNamespaces(ManifestWorker& worker, const VersionDefinition& version, uint64_t revision) {
+  for (const auto& className : version.declaredClasses) {
+    if (auto found = worker.namespaces.find(className); found != worker.namespaces.end()) {
+      if (found->second.status != "active")
+        refuse("Durable Object class " + className + " of Worker " + version.workerId + " is being deleted (deleted_classes); version " +
+            version.versionId + " cannot declare or bind it again");
+      continue;
+    }
+    const bool renamedHere = std::any_of(version.renamedClasses.begin(), version.renamedClasses.end(), [&](const auto& rename) {
+      return rename.to == className && worker.namespaces.contains(rename.from);
+    });
+    if (!renamedHere) worker.namespaces.emplace(className, ManifestNamespace{newNamespaceId(), revision, "active", 1024, "small"});
+  }
+}
+// The version's migrations when it becomes the active one: its renames in order (a namespace moves to its new name), its
+// deletions (the namespace is marked deleting: its data stays until a later release cleans it), a namespace for every
+// declared class that has none yet, and every Binding's class with an active namespace.
+void activateNamespaces(ManifestWorker& worker, const VersionDefinition& version, uint64_t revision) {
+  for (const auto& rename : version.renamedClasses) {
+    auto from = worker.namespaces.find(rename.from);
+    if (from == worker.namespaces.end() || worker.namespaces.contains(rename.to)) continue;
+    if (from->second.status != "active")
+      refuse("Durable Object class " + rename.from + " of Worker " + version.workerId + " is being deleted; it cannot be renamed to " + rename.to);
+    auto entry = from->second;
+    worker.namespaces.erase(from);
+    worker.namespaces.emplace(rename.to, std::move(entry));
+  }
+  for (const auto& className : version.deletedClasses)
+    if (auto found = worker.namespaces.find(className); found != worker.namespaces.end()) found->second.status = "deleting";
+  declareNamespaces(worker, version, revision);
+  for (const auto& binding : version.durableObjects) {
+    auto found = worker.namespaces.find(binding.className);
+    if (found == worker.namespaces.end() || found->second.status != "active")
+      refuse("Durable Object Binding " + binding.binding + " of " + version.key() + " names class " + binding.className +
+          ", whose namespace " + (found == worker.namespaces.end() ? std::string("does not exist") : "is being deleted"));
+  }
+}
+// The tenant's quota of namespaces (durableObjectNamespaces), over all its Workers, deleting ones included: a change that
+// adds namespaces beyond it is refused.
+void requireNamespaceQuota(const TenantManifest& base, const TenantManifest& next) {
+  auto count = [](const TenantManifest& manifest) {
+    size_t total = 0;
+    for (const auto& [name, worker] : manifest.workers) total += worker.namespaces.size();
+    return total;
+  };
+  const auto quota = next.record ? next.record->quotas.durableObjectNamespaces : TenantQuotas{}.durableObjectNamespaces;
+  const auto after = count(next);
+  if (after > count(base) && after > quota)
+    refuse("durableObjectNamespaces: tenant " + next.tenant + " would have " + std::to_string(after) +
+        " Durable Object namespaces, its quota is " + std::to_string(quota));
+}
+
 // The change, made on `next` (a copy of the tenant's current manifest), and validated with the evaluation the nodes
 // use: the state after the change against the state before it -- the tenant's own keys and every tenant's routes.
 Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state, const DeploymentInput& desired,
@@ -154,7 +210,8 @@ Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state,
       worker.versions.emplace(version->versionId, ManifestVersion{version->definitionHash, base.revision + 1});
       result.published.push_back(version);
     }
-    if (options.publishOnly) return result;
+    for (const auto& version : result.published) declareNamespaces(next.workers[workerNameOf(version->workerId)], *version, base.revision + 1);
+    if (options.publishOnly) { requireNamespaceQuota(base, next); return result; }
     std::map<std::string, std::vector<ManifestRoute>> routes;
     std::map<std::string, std::set<std::string>> claimed;
     std::set<std::string> keys;
@@ -189,11 +246,14 @@ Plan plan(Operation operation, TenantManifest& next, const ManifestStore& state,
       // The Worker's own limits stay with its pointer whatever version it names.
       const WorkerLimits limits = worker.active ? worker.active->limits : WorkerLimits{};
       worker.active = ManifestPointer{pin.versionId, pin.definitionHash, limits};
+      if (auto version = desired.versions.find(id + "@" + pin.versionId); version != desired.versions.end())
+        activateNamespaces(worker, *version->second, base.revision + 1);
       auto list = routes[id];
       std::sort(list.begin(), list.end());
       worker.routes = std::move(list);
       result.workers.push_back(id);
     }
+    requireNamespaceQuota(base, next);
     // A route keeps its owner unless the owner is part of this change and no longer lists it, or is removed by it. An
     // unreadable value has no owner and may be repaired. Routes are every tenant's: another tenant's is never taken.
     for (const auto& [id, list] : routes) {
@@ -929,6 +989,8 @@ kj::Promise<std::string> controlWorkers(ManifestStore& state, std::string tenant
               ",\"mainModule\":" + quote(definition->mainModule) + ",\"assets\":" + (definition->assets ? "true" : "false") + ",\"secrets\":[";
           for (size_t i = 0; i < definition->secrets.size(); ++i) item += (i ? "," : "") + quote(definition->secrets[i]);
           item += ']';
+          if (definition->hasDurableObjects())
+            item += ",\"durableObjects\":" + durableObjectsJson(*definition) + ",\"classes\":" + durableClassesJson(*definition);
         } else {
           auto failure = state.definitionFailures().find(version.definitionHash);
           item += ",\"definitionHash\":" + quote(version.definitionHash) + ",\"problem\":" +
@@ -950,7 +1012,11 @@ kj::Promise<std::string> controlWorkers(ManifestStore& state, std::string tenant
               quote(route->second.value.pathPrefix) + ",\"effective\":" + (route->second.effective ? "true" : "false") + '}';
         }
       }
-      return out + "],\"secrets\":[" + secretEntries(state, tenant, workerNameOf(id), entry, false) + "]}";
+      out += "],\"secrets\":[" + secretEntries(state, tenant, workerNameOf(id), entry, false) + "],\"namespaces\":{";
+      size_t namespaces = 0;
+      for (const auto& [className, space] : entry.namespaces)
+        out += std::string(namespaces++ ? "," : "") + quote(className) + ":" + manifestNamespaceJson(space);
+      return out + "}}";
     };
     if (only) {
       printed << describe(*only);

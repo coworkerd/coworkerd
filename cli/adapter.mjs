@@ -21,7 +21,8 @@ export function canonical(value) {
 }
 const supported = new Set(["$schema", "name", "main", "compatibility_date", "compatibility_flags", "vars", "services",
   "build", "base_dir", "rules", "no_bundle", "find_additional_modules", "preserve_file_names", "minify", "tsconfig",
-  "jsx_factory", "jsx_fragment", "alias", "define", "keep_names", "upload_source_maps", "send_metrics", "assets"]);
+  "jsx_factory", "jsx_fragment", "alias", "define", "keep_names", "upload_source_maps", "send_metrics", "assets",
+  "durable_objects", "migrations"]);
 // Static assets: the directory, Cloudflare's not-found handling, the ASSETS binding (the Worker's own asset layer) and
 // run_worker_first (true, or Cloudflare's path rules); html_handling only at its default.
 const assetKeys = new Set(["directory", "html_handling", "not_found_handling", "binding", "run_worker_first"]);
@@ -73,6 +74,16 @@ export function unsupportedKeys(raw) {
     for (const key of Object.keys(binding)) if (!["binding", "service", "entrypoint"].includes(key)) found.push(`services[${index}].${key}`);
   }
   for (const key of Object.keys(raw.build ?? {})) if (!["command", "cwd", "watch_dir"].includes(key)) found.push(`build.${key}`);
+  // Durable Objects: a namespace Binding names a class of this Worker; migrations declare, delete and rename classes.
+  for (const key of Object.keys(raw.durable_objects ?? {})) if (key !== "bindings") found.push(`durable_objects.${key}`);
+  for (const [index, binding] of (raw.durable_objects?.bindings ?? []).entries()) {
+    for (const key of Object.keys(binding ?? {})) if (!["name", "class_name", "script_name"].includes(key)) found.push(`durable_objects.bindings[${index}].${key}`);
+  }
+  for (const [index, migration] of (Array.isArray(raw.migrations) ? raw.migrations : []).entries()) {
+    for (const key of Object.keys(migration ?? {}))
+      if (!["tag", "new_classes", "new_sqlite_classes", "deleted_classes", "renamed_classes", "transferred_classes"].includes(key))
+        found.push(`migrations[${index}].${key}`);
+  }
   for (const [key, value] of Object.entries(raw.assets ?? {})) {
     if (!assetKeys.has(key) || (key === "html_handling" && value !== undefined && value !== assetDefaults.html_handling)) found.push(`assets.${key}`);
   }
@@ -85,6 +96,8 @@ export function classify(raw, { redirected = false } = {}) {
   const rejected = [], ignored = [];
   for (const key of unsupportedKeys(raw)) {
     const service = /^services\[(\d+)\]\.(.+)$/.exec(key), build = /^build\.(.+)$/.exec(key), asset = /^assets\.(.+)$/.exec(key);
+    // Durable Object keys outside the supported shape are refused whatever their value.
+    if (key.startsWith("durable_objects.") || key.startsWith("migrations[")) { rejected.push(key); continue; }
     const topLevel = !service && !build && !asset;
     const value = service ? raw.services[Number(service[1])][service[2]] : build ? raw.build[build[1]] : asset ? raw.assets[asset[1]] : raw[key];
     const reason = topLevel && Object.hasOwn(platform, key) ? ["platform", platform[key]]
@@ -205,6 +218,63 @@ async function collectAssets(directory, limits) {
   if (total > limits.maxTotalBytes) throw new Error(`Static assets together are larger than allowed: ${total} > ${limits.maxTotalBytes} bytes`);
   return assets.sort((a, b) => Buffer.compare(Buffer.from(a.entry.path), Buffer.from(b.entry.path)));
 }
+// The version's Durable Objects: wrangler's durable_objects.bindings (each a name and one of this Worker's classes; a
+// script_name of another Worker is refused) and the classes its migrations leave, applied in order -- new_classes and
+// new_sqlite_classes both declare a class (every class runs on SQLite), deleted_classes delete one, renamed_classes
+// rename one (kept in their order: the control plane moves a class's namespace to its new name); transferred_classes
+// (a class of another Worker) is refused. Each Binding's class is one the migrations leave declared.
+export function durableObjectsOf(config, names) {
+  const bindings = [];
+  for (const [index, binding] of (config.durable_objects?.bindings ?? []).entries()) {
+    const where = `durable_objects.bindings[${index}]`;
+    if (typeof binding?.name !== "string" || !environmentName.test(binding.name)) throw new Error(`Unsupported ${where}.name: a JavaScript identifier`);
+    if (typeof binding.class_name !== "string" || !environmentName.test(binding.class_name))
+      throw new Error(`Unsupported ${where}.class_name: a JavaScript identifier`);
+    if (binding.script_name !== undefined && !names.includes(binding.script_name))
+      throw new Error(`Unsupported Wrangler configuration: ${where}.script_name names Worker ${binding.script_name}: ` +
+        "a Durable Object class of another Worker is not supported (only this Worker's own classes)");
+    bindings.push({ binding: binding.name, className: binding.class_name });
+  }
+  const declared = [], deleted = [], renamed = [];
+  const className = (name, where) => {
+    if (typeof name !== "string" || !environmentName.test(name) || name.startsWith("__coworkerd")) throw new Error(`Unsupported ${where}: ${JSON.stringify(name)}`);
+    return name;
+  };
+  for (const [index, migration] of (Array.isArray(config.migrations) ? config.migrations : []).entries()) {
+    const where = `migrations[${index}]`;
+    if (typeof migration?.tag !== "string" || !migration.tag) throw new Error(`Unsupported ${where}: a migration needs its tag`);
+    if ((migration.transferred_classes ?? []).length)
+      throw new Error(`Unsupported Wrangler configuration: ${where}.transferred_classes: a Durable Object class of another Worker is not supported`);
+    for (const name of [...(migration.new_classes ?? []), ...(migration.new_sqlite_classes ?? [])]) {
+      className(name, `${where} new class`);
+      if (declared.includes(name)) throw new Error(`Unsupported ${where}: class ${name} is declared twice`);
+      declared.push(name);
+      const at = deleted.indexOf(name);
+      if (at >= 0) deleted.splice(at, 1);
+    }
+    for (const rename of migration.renamed_classes ?? []) {
+      const from = className(rename?.from, `${where}.renamed_classes from`), to = className(rename?.to, `${where}.renamed_classes to`);
+      const at = declared.indexOf(from);
+      if (at < 0) throw new Error(`Unsupported ${where}: renamed class ${from} is not declared`);
+      if (declared.includes(to)) throw new Error(`Unsupported ${where}: class ${to} is already declared`);
+      declared[at] = to;
+      renamed.push({ from, to });
+    }
+    for (const name of migration.deleted_classes ?? []) {
+      className(name, `${where}.deleted_classes`);
+      const at = declared.indexOf(name);
+      if (at < 0) throw new Error(`Unsupported ${where}: deleted class ${name} is not declared`);
+      declared.splice(at, 1);
+      if (!deleted.includes(name)) deleted.push(name);
+    }
+  }
+  for (const binding of bindings)
+    if (!declared.includes(binding.className))
+      throw new Error(`Unsupported durable_objects binding ${binding.binding}: class ${binding.className} is not declared by the migrations ` +
+        "(new_classes or new_sqlite_classes)");
+  if (!bindings.length && !declared.length && !deleted.length && !renamed.length) return null;
+  return { durableObjects: bindings, classes: { declared, deleted, renamed } };
+}
 export async function adapt({ config: userConfigPath, output, workerId, versionId = "v1", pathPrefix, secrets: secretArguments = [],
   onIgnored = () => {} }) {
   const projectDir = dirname(resolve(userConfigPath));
@@ -241,10 +311,13 @@ export async function adapt({ config: userConfigPath, output, workerId, versionI
   if (badExample.length) throw new Error(`Unsupported secret names in ${SECRETS_EXAMPLE}: ${badExample.join(", ")}`);
   const secretNames = [...new Set([...exampleNames, ...secretArguments])].sort();
   if (secretNames.length > 64) throw new Error(`More than 64 secrets: ${secretNames.length}`);
+  const durable = durableObjectsOf(config, [...new Set([id, config.name].filter(Boolean))]);
   const taken = new Set([...Object.keys(config.vars ?? {}), ...(config.services ?? []).map(s => s.binding),
     ...(assetsBinding !== undefined ? [assetsBinding] : [])]);
   const clashing = secretNames.filter(name => taken.has(name));
   if (clashing.length) throw new Error(`Secret names collide with vars or bindings: ${clashing.join(", ")}`);
+  const durableClashing = (durable?.durableObjects ?? []).map(b => b.binding).filter(name => taken.has(name) || secretNames.includes(name));
+  if (durableClashing.length) throw new Error(`Durable Object binding names collide with vars, secrets or bindings: ${durableClashing.join(", ")}`);
   const temporary = await mkdtemp(join(tmpdir(), "coworkerd-wrangler-"));
   try {
     const outdir = join(temporary, "output");
@@ -291,6 +364,7 @@ export async function adapt({ config: userConfigPath, output, workerId, versionI
     const version = { versionId, format: "v2", compatibilityDate: config.compatibility_date,
       compatibilityFlags: config.compatibility_flags ?? [], mainModule, contentHash: sha256(manifestBytes), variables,
       ...(secretNames.length ? { secrets: secretNames } : {}),
+      ...(durable ? durable : {}),
       bindings: [...(config.services ?? []).map(s => ({ name: s.binding, workerId: s.service, entrypoint: s.entrypoint ?? "default" })),
         ...(assetsBinding !== undefined ? [{ name: assetsBinding, assets: true }] : [])],
       ...(assetsConfig ? { assets: { notFoundHandling, ...(runWorkerFirst === true ? { runWorkerFirst: true } : {}),

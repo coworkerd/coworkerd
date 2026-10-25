@@ -51,6 +51,8 @@ struct TenantQuotas {
   uint64_t logBufferBytes = 1048576;
   uint64_t maxWorkerCpuMs = 30000;
   uint64_t maxWorkerMemoryMiB = 512;
+  // Durable Object namespaces over all the tenant's Workers, the deleting ones included (their data is still there).
+  uint64_t durableObjectNamespaces = 16;
   bool operator==(const TenantQuotas&) const = default;
 };
 std::string tenantQuotasJson(const TenantQuotas& quotas);

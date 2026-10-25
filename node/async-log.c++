@@ -72,7 +72,7 @@ static_assert(DROP_NAMES.size() == DROP_REASONS);
 // Per process slot. The drainer's reader thread accepts and drops lines, its
 // writer thread writes them; the server only reads these counters.
 struct alignas(64) OutputSlot {
-  std::atomic<uint64_t> generation{0}, pid{0}, quarantine{0}, attachedAtUnixMs{0}, openStreams{0};
+  std::atomic<uint64_t> generation{0}, pid{0}, processClass{0}, attachedAtUnixMs{0}, openStreams{0};
   std::atomic<uint64_t> acceptedLines{0}, acceptedBytes{0}, writtenLines{0}, writtenBytes{0};
   std::atomic<uint64_t> backlogLines{0}, backlogBytes{0}, highWaterBytes{0};
   std::atomic<uint64_t> droppedLines{0}, droppedBytes{0};
@@ -94,7 +94,7 @@ struct OutputShared {
   std::array<OutputSlot, OUTPUT_SLOTS> slots;
 };
 struct AttachMessage {
-  uint32_t magic, slot, quarantine, reserved;
+  uint32_t magic, slot, processClass, reserved;
   uint64_t generation;
   int64_t pid;
   char processId[16];
@@ -572,7 +572,7 @@ private:
     auto& slot = shared.slots[record.slot];
     slot.generation.store(record.generation, std::memory_order_relaxed);
     slot.pid.store(record.pid, std::memory_order_relaxed);
-    slot.quarantine.store(record.quarantine, std::memory_order_relaxed);
+    slot.processClass.store(record.processClass, std::memory_order_relaxed);
     slot.attachedAtUnixMs.store(wallClock(), std::memory_order_relaxed);
     slot.openStreams.fetch_add(2, std::memory_order_relaxed);
     if (record.slot > shared.highestSlot.load(std::memory_order_relaxed))
@@ -585,7 +585,7 @@ private:
     {
       std::lock_guard lock(mutex);
       names[record.slot] = std::string(record.processId, strnlen(record.processId, sizeof record.processId));
-      quarantine[record.slot] = record.quarantine != 0;
+      classes[record.slot] = record.processClass;
       ++events;
     }
     wake.notify_one();
@@ -934,15 +934,15 @@ private:
       if (dropped == reported[i] || slot.backlogLines.load(std::memory_order_acquire)) continue;
       if (!ensureSink(false)) return;
       std::string name;
-      bool isQuarantine;
+      uint32_t processClass;
       {
         std::lock_guard lock(mutex);
         name = names[i];
-        isQuarantine = quarantine[i];
+        processClass = classes[i];
       }
       std::ostringstream line;
       line << "[log-dropped] {\"source\":\"workerd\",\"processId\":\"" << jsonText(name)
-           << "\",\"processClass\":\"" << (isQuarantine ? "quarantine" : "ordinary")
+           << "\",\"processClass\":\"" << WorkerdOutput::className(processClass)
            << "\",\"generation\":" << slot.lastDropGeneration.load() << ",\"pid\":" << slot.lastDropPid.load()
            << ",\"count\":" << dropped - reported[i] << ",\"total\":" << dropped << ",\"reasons\":{";
       for (size_t r = 0; r < DROP_REASONS; ++r)
@@ -978,7 +978,7 @@ private:
   uint64_t events = 0;
   bool readerDone = false;
   std::array<std::string, OUTPUT_SLOTS> names;
-  std::array<bool, OUTPUT_SLOTS> quarantine{};
+  std::array<uint32_t, OUTPUT_SLOTS> classes{};
   // Writer thread only.
   int sink = -1;
   uint64_t failingSinceMs = 0;
@@ -1081,14 +1081,14 @@ public:
     fcntl(err[1], F_SETPIPE_SZ, OUTPUT_PIPE_BYTES);
 #endif
   }
-  void attach(Pipes& pipes, uint32_t slot, const std::string& processId, bool quarantine,
+  void attach(Pipes& pipes, uint32_t slot, const std::string& processId, uint32_t processClass,
       uint64_t generation, int64_t pid) {
     closeDescriptor(pipes.stdoutWrite);
     closeDescriptor(pipes.stderrWrite);
     AttachMessage record{};
     record.magic = OUTPUT_MAGIC;
     record.slot = slot;
-    record.quarantine = quarantine;
+    record.processClass = processClass;
     record.generation = generation;
     record.pid = pid;
     std::memcpy(record.processId, processId.data(), std::min(processId.size(), sizeof record.processId - 1));
@@ -1237,9 +1237,12 @@ bool WorkerdOutput::open(Pipes& pipes) {
   active->open(pipes);
   return true;
 }
-void WorkerdOutput::attach(Pipes& pipes, uint32_t slot, const std::string& processId, bool quarantine,
+const char* WorkerdOutput::className(uint32_t processClass) {
+  return processClass == 2 ? "durable" : processClass == 1 ? "quarantine" : "ordinary";
+}
+void WorkerdOutput::attach(Pipes& pipes, uint32_t slot, const std::string& processId, uint32_t processClass,
     uint64_t generation, int64_t pid) {
-  if (active) active->attach(pipes, slot, processId, quarantine, generation, pid);
+  if (active) active->attach(pipes, slot, processId, processClass, generation, pid);
 }
 std::string WorkerdOutput::processJson(uint32_t slot) { return active ? active->processJson(slot) : "null"; }
 std::string WorkerdOutput::stateJson() { return active ? active->json() : "null"; }

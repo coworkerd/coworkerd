@@ -4,7 +4,7 @@ const config :Workerd.Config = (
   services = [
     (name = "runtime", worker = (
       compatibilityDate = "2026-08-27",
-      compatibilityFlags = ["enable_request_signal"],
+      compatibilityFlags = ["enable_request_signal", "experimental"],
       modules = [(name = "runtime.js", esModule = embed "runtime.js")],
       bindings = [
         (name = "LOADER", workerLoader = (id = "coworkerd-v1")),

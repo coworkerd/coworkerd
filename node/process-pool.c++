@@ -120,6 +120,9 @@ bool workerdInherits(std::string_view name) {
 // closes before workerd runs.
 constexpr int EVENT_FD = 3, LISTEN_FD = 4, LIFECYCLE_FD = 5, BAND_FD = 6;
 constexpr int LAUNCHER_STATUS_FD = 7, LAUNCHER_PROGRAM_FD = 8;
+// The unique key of the durable processes' Host namespace, the same on every node: an object's Host id is
+// HOST.idFromName(<namespace id>/<object id>) under it, and its databases are in <stack>/do/<key>/.
+constexpr const char* DURABLE_HOST_KEY = "coworkerd-do-host-v1";
 // The launcher's interface version (launcher/PROTOCOL.md) and its exit status for a failed launch.
 constexpr int LAUNCHER_PROTOCOL = 2, LAUNCH_FAILED_STATUS = 125;
 // A process the system call filter ended leaves this signal (the enforce mode).
@@ -740,7 +743,7 @@ using TenantCpu = std::map<std::string, uint64_t>;
 
 struct ProcessGeneration {
   std::string id;
-  bool quarantine = false;
+  bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
   uint64_t generation;
   // Its egress token: in its configuration only; the egress service attributes a request to it by this.
@@ -783,6 +786,9 @@ struct ProcessGeneration {
   std::string eventTail;
   std::vector<LimitEvent> unappliedEvents;
   std::array<std::set<std::string>, 2> terminatedCalls;  // CPU, memory: pid, invocation, Worker, version
+  // A durable process's limit rows name the request that started the object's context (workerd keeps one per object),
+  // not the request that hit the limit: by pid, Worker and version, when each was last read.
+  std::array<std::map<std::string, double>, 2> terminatedWorkers;
   uint64_t eventReadCalls = 0, eventBytes = 0, eventRows = 0, rejectedRows = 0, incompleteTailBytes = 0;
   double nextEventSync = 0;
   // The evidence rows: the latest CPU culprit (withdrawn by a later terminated row of the same
@@ -813,6 +819,8 @@ struct ProcessGeneration {
   // The process-wide WebAssembly memory cap this generation was started with.
   uint32_t wasmMemoryCapMiB = 0;
   int statusFd = -1;
+  // The launcher's end of the status socket closed (its execve, or its exit): everything it wrote has been read.
+  bool statusEnded = false;
   std::string launchRecords, launchRecord, launchFailure, observedSandbox = "null";
   std::string syscallMode = "off";
 #ifdef __linux__
@@ -829,8 +837,14 @@ struct ProcessGeneration {
   ~ProcessGeneration() {
     closeEvents();
     if (eventDigest) EVP_MD_CTX_free(eventDigest);
-    if (statusFd >= 0) ::close(statusFd);
+    closeStatus();
     closeNotify();
+  }
+  // The status socket's observer goes before its descriptor: its destructor removes the descriptor from the event port.
+  void closeStatus() {
+    statusObserver = nullptr;
+    if (statusFd >= 0) ::close(statusFd);
+    statusFd = -1;
   }
   // The supervisor's thread ends; its listener closes with it.
   void closeNotify() {
@@ -843,7 +857,7 @@ struct ProcessGeneration {
   // reports an observe-mode filter carries the notification listener with it, so this reads the
   // status socket with recvmsg and keeps the descriptor that arrives.
   void readLaunch() {
-    while (statusFd >= 0) {
+    while (statusFd >= 0 && !statusEnded) {
       char buffer[4096];
       alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int))];
       struct iovec part = {buffer, sizeof buffer};
@@ -872,7 +886,8 @@ struct ProcessGeneration {
         if (launchRecords.size() < 65536) launchRecords.append(buffer, size_t(n));
         continue;
       }
-      if (n == 0) { ::close(statusFd); statusFd = -1; }
+      // The end: the descriptor stays open until its observer is gone (closeStatus).
+      if (n == 0) statusEnded = true;
       break;  // EAGAIN: nothing more yet
     }
     std::istringstream lines(launchRecords);
@@ -921,6 +936,13 @@ struct ProcessGeneration {
     pullEvents();
     return pid > 0 && terminatedCalls[cause].count(callKey(pid, invocation, worker, version)) > 0;
   }
+  // A durable process: a limit row of the Worker's version read since `since` (a request to one of its objects).
+  bool terminatedSince(size_t cause, const std::string& worker, const std::string& version, double since) {
+    pullEvents();
+    if (pid <= 0) return false;
+    auto found = terminatedWorkers[cause].find(callKey(pid, "", worker, version));
+    return found != terminatedWorkers[cause].end() && found->second >= since;
+  }
   std::string channelJson() const {
     std::ostringstream out;
     out << "{\"open\":" << (eventFd >= 0 ? "true" : "false") << ",\"final\":" << (eventsFinal ? "true" : "false")
@@ -946,9 +968,12 @@ struct ProcessGeneration {
         capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), report);
         if (report.getPid() != static_cast<uint32_t>(spawnPid)) continue;
         const std::string event = report.getEvent().cStr();
-        if (event == "terminated" || event == "memory-terminated")
+        if (event == "terminated" || event == "memory-terminated") {
           terminatedCalls[event == "terminated" ? 0 : 1].insert(callKey(report.getPid(), report.getInvocationId().cStr(),
               report.getWorkerId().cStr(), report.getVersionId().cStr()));
+          if (durable) terminatedWorkers[event == "terminated" ? 0 : 1][callKey(report.getPid(), "", report.getWorkerId().cStr(),
+              report.getVersionId().cStr())] = mono();
+        }
         if (event == "completed" && !openContexts.empty() &&
             openContexts.erase(std::string(report.getInvocationId().cStr()))) ++contextsCompleted;
         // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
@@ -1021,14 +1046,25 @@ kj::Promise<void> ProcessCall::onExit() {
 }
 // A failed call is classified against this generation's events: a matching
 // row whose pid is the generation's current pid (none once the exit was observed).
-bool ProcessCall::cpuLimitExceeded() const { return process->terminated(0, invocationId, workerId, versionId); }
-bool ProcessCall::memoryLimitExceeded() const { return process->terminated(1, invocationId, workerId, versionId); }
+bool ProcessCall::cpuLimitExceeded() const {
+  if (process->durable) return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
+  return process->terminated(0, invocationId, workerId, versionId);
+}
+bool ProcessCall::memoryLimitExceeded() const {
+  if (process->durable) return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
+  return process->terminated(1, invocationId, workerId, versionId);
+}
+
+// A slot's or a generation's class, as the state endpoint and the [process] lines name it, and its code for the output
+// drainer (WorkerdOutput::className).
+template <typename T> const char* processClass(const T& p) { return p.durable ? "durable" : p.quarantine ? "quarantine" : "ordinary"; }
+template <typename T> uint32_t processClassCode(const T& p) { return p.durable ? 2 : p.quarantine ? 1 : 0; }
 
 class ProcessPool::Impl final: public kj::TaskSet::ErrorHandler {
 public:
   struct Slot {
     std::string id;
-    bool quarantine = false;
+    bool quarantine = false, durable = false;
     uint64_t generation = 0, restarts = 0, exits = 0, rotations = 0;
     uint32_t failures = 0;
     double restartAt = 0;
@@ -1090,7 +1126,7 @@ public:
   const kj::HttpHeaderTable& headers;
   Suspects& suspects;
   int bandFd = -1;  // the Server's own copy of the band's shared memory, at 10 or above
-  uint64_t quarantineDispatches = 0, trialDispatches = 0;
+  uint64_t quarantineDispatches = 0, trialDispatches = 0, durableDispatches = 0;
   std::shared_ptr<TenantCpu> cpuUsage = std::make_shared<TenantCpu>();
   std::vector<Slot> slots;
   std::deque<std::string> kills;
@@ -1233,6 +1269,11 @@ public:
       KJ_REQUIRE(*count && end && !*end && parsed <= 256, "invalid quarantine process override");
       this->config.quarantineProcesses = static_cast<uint32_t>(parsed);
     }
+    if (auto* count = std::getenv("COWORKERD_DURABLE_PROCESSES")) {
+      char* end = nullptr; auto parsed = std::strtoull(count, &end, 10);
+      KJ_REQUIRE(*count && end && !*end && parsed <= 64, "invalid durable process override");
+      this->config.durableProcesses = static_cast<uint32_t>(parsed);
+    }
     for (const auto& setting : {std::pair{"COWORKERD_IDLE_EVICT_MS", &this->config.idleEvictMs},
                                std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &this->config.idleDestroyIntervalMs},
                                std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &this->config.rotationDrainTimeoutMs},
@@ -1278,14 +1319,27 @@ public:
     std::filesystem::create_directories(this->directory + "/processes");
     std::filesystem::create_directories(runDirectory);
     std::filesystem::permissions(runDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    // The durable processes' objects: one SQLite database per object (and its facets), below the Host namespace's
+    // unique key -- in the stack, so that a stack's objects go with it.
+    if (this->config.durableProcesses) {
+      std::filesystem::create_directories(durableDirectory());
+      std::filesystem::permissions(durableDirectory(), std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    }
     for (uint32_t i = 0; i < config.count; ++i) slots.push_back({"p" + std::to_string(i)});
     for (uint32_t i = 0; i < this->config.quarantineProcesses; ++i) slots.push_back({"q" + std::to_string(i), true});
+    for (uint32_t i = 0; i < this->config.durableProcesses; ++i) {
+      Slot slot;
+      slot.id = "d" + std::to_string(i);
+      slot.durable = true;
+      slots.push_back(std::move(slot));
+    }
     // Sockets a previous Server in this stack left behind (generation numbers start again at 1): removed only
     // when nothing listens on them. A socket a process still accepts connections on belongs to a Server that
     // runs in this stack, and this one does not start.
     for (const auto& entry : std::filesystem::directory_iterator(runDirectory)) {
       const auto name = entry.path().filename().string();
-      if (!name.ends_with(".sock") || !(name.starts_with("p") || name.starts_with("q")) || name.find('-') == std::string::npos) continue;
+      if (!name.ends_with(".sock") || !(name.starts_with("p") || name.starts_with("q") || name.starts_with("d")) ||
+          name.find('-') == std::string::npos) continue;
       const auto path = entry.path().string();
       sockaddr_un address{};
       address.sun_family = AF_UNIX;
@@ -1349,6 +1403,16 @@ public:
     if (workerLimits.maxMemoryMiB) cap = std::max(cap, workerLimits.maxMemoryMiB());
     return cap;
   }
+  // Where the durable processes keep their objects (workerd's localDisk storage): <stack>/do.
+  std::string durableDirectory() const { return directory + "/do"; }
+  // The durable slot of an object: the first of d0, d1, ... in its key's rendezvous order -- the same while the slots
+  // are, whether or not that process is ready now.
+  std::string durableSlotFor(const std::string& objectKey) const {
+    std::vector<std::string> ids;
+    for (const auto& s : slots) if (s.durable) ids.push_back(s.id);
+    auto order = rendezvousOrder(objectKey, ids);
+    return order.empty() ? std::string() : order.front();
+  }
   // Every generation of a slot not yet released: current, incoming, retiring.
   template <typename Function> static void eachGeneration(const Slot& s, Function&& function) {
     if (s.current) function(s.current);
@@ -1357,7 +1421,7 @@ public:
   }
   void event(const ProcessGeneration& p, const char* event, const std::string& reason = "") {
     std::cout << "[process] {\"event\":\"" << event << "\",\"processId\":\"" << p.id
-        << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary")
+        << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid
         << ",\"observedAtUnixMs\":" << wall() << ",\"observedAtMonotonicMs\":" << std::setprecision(17)
         << mono() << ",\"reason\":\"" << escape(reason) << "\"}" << std::endl;
@@ -1485,7 +1549,7 @@ public:
   // The launcher's command line for a process (PROTOCOL.md): the sandbox's layers and binds, the system call
   // allowlist and the digest of the workerd this launch runs, then workerd's own command line.
   std::vector<std::string> launcherCommand(bool check, const std::vector<std::string>& program,
-      const std::string& programSha256 = {}) const {
+      const std::string& programSha256 = {}, bool durable = false) const {
     std::vector<std::string> args = {sandbox.launcherPath, "--status-fd", std::to_string(LAUNCHER_STATUS_FD), "--program-fd",
         std::to_string(LAUNCHER_PROGRAM_FD), "--parent-pid", std::to_string(getpid()), "--root", sandbox.root,
         "--user", "--net", "--ipc", "--uts", "--drop-caps", "--no-new-privs", "--non-dumpable"};
@@ -1510,6 +1574,8 @@ public:
     // startup table -- which the launcher reads before it builds that namespace -- its file has to be in it.
     if (sandbox.syscalls.steady.active) bind("--bind", sandbox.syscalls.steady.path);
     bind("--bind-rw", runDirectory);
+    // A durable process writes its objects' databases.
+    if (durable) bind("--bind-rw", durableDirectory());
     if (!check && !sandbox.bindForTest.empty()) bind("--bind", sandbox.bindForTest);
     if (check) args.push_back("--check");
     args.push_back("--");
@@ -1789,7 +1855,7 @@ public:
         : "launch failed: " + recordField(record, "step") + ": " + recordField(record, "error") + ": " + recordField(record, "errnoText");
     s.lastExitCategory = "launch-failed";
     std::ostringstream out;
-    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary") << "\",\"generation\":"
+    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p) << "\",\"generation\":"
         << p.generation << ",\"pid\":" << p.spawnPid << ",\"observedAtUnixMs\":" << wall() << ",\"exit\":\"" << escape(p.exitStatus)
         << "\",\"reason\":\"" << escape(p.lastReason) << "\",\"failures\":" << s.launchFailures << ",\"record\":" << jsonOrNull(record) << "}";
     s.lastLaunchFailure = out.str();
@@ -1808,7 +1874,7 @@ public:
     s.lastExitCategory = "syscall-denied";
     s.lastReason = p.lastReason;
     std::ostringstream out;
-    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary") << "\",\"generation\":"
+    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p) << "\",\"generation\":"
         << p.generation << ",\"pid\":" << p.spawnPid << ",\"observedAtUnixMs\":" << wall() << ",\"exit\":\"" << escape(p.exitStatus)
         << "\",\"reason\":\"" << escape(p.lastReason) << "\",\"mode\":\"" << escape(p.syscallMode)
         << "\",\"steadyMode\":\"" << escape(sandbox.syscalls.steady.active ? sandbox.syscalls.steady.mode : std::string("off"))
@@ -1850,7 +1916,7 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
-    p->id = s.id; p->quarantine = s.quarantine; p->generation = ++s.generation; p->rotation = rotation;
+    p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
     p->socketName = p->id + "-" + std::to_string(p->generation) + ".sock";
     p->socketPath = runDirectory + "/" + p->socketName;
@@ -1893,16 +1959,24 @@ public:
       for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
       configFile << "],\n";
     }
+    // A durable process's runtime also has the Host class's namespace (runtime.js: each object is a Host running its
+    // Worker's class as a facet), stored on the local disk below <stack>/do, and the Host Binding. The runtime runs with
+    // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
+    // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
     configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
-        "compatibilityFlags = [\"enable_request_signal\"], modules = [(name = \"runtime.js\", esModule = embed \""
+        "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
         << p->id << ".runtime.js\")], bindings = [\n"
         "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
         "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
         << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
-            p->egressToken + "\"),\n") <<
+            p->egressToken + "\"),\n")
+        << (p->durable ? "(name = \"HOST\", durableObjectNamespace = \"Host\"),\n" : "") <<
         "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
         << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
-        << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
+        << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\""
+        << (p->durable ? std::string(",\ndurableObjectNamespaces = [(className = \"Host\", uniqueKey = \"") + DURABLE_HOST_KEY +
+            "\", enableSql = true)],\ndurableObjectStorage = (localDisk = \"do-disk\")" : std::string()) << ")),\n"
+        << (p->durable ? "(name = \"do-disk\", disk = (path = \"" + escape(durableDirectory()) + "\", writable = true)),\n" : "") <<
         "(name = \"server\", external = (address = \"" << escape(bindingAddress)
         << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
         "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
@@ -2019,7 +2093,7 @@ public:
     std::string file = executable;
 #ifdef __linux__
     if (p->launched) {
-      args = launcherCommand(false, args, programDigest(p->spawnBinary));
+      args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable);
       file = launcherExecutable();
       ++sandbox.launches;
     }
@@ -2032,7 +2106,7 @@ public:
     KJ_REQUIRE(error == 0, "cannot spawn workerd", error);
     p->spawnPid = p->pid;
     p->nextEventSync = mono() + LIMIT_EVENT_SYNC_MS;
-    if (piped) WorkerdOutput::attach(output, index, p->id, p->quarantine, p->generation, p->pid);
+    if (piped) WorkerdOutput::attach(output, index, p->id, processClassCode(*p), p->generation, p->pid);
     if (rotation) {
       s.incoming = p;
     } else {
@@ -2054,12 +2128,12 @@ public:
   // execv does). Picks up the observe mode's notification listener and starts supervising it.
   kj::Promise<void> watchLaunch(std::shared_ptr<ProcessGeneration> p) {
     p->statusObserver = kj::heap<kj::UnixEventPort::FdObserver>(eventPort, p->statusFd, kj::UnixEventPort::FdObserver::OBSERVE_READ);
-    while (p->statusFd >= 0) {
+    while (p->statusFd >= 0 && !p->statusEnded) {
       co_await p->statusObserver->whenBecomesReadable();
       // Reading the record also takes the observe mode's notification listener and starts supervising it.
       p->readLaunch();
     }
-    p->statusObserver = nullptr;
+    p->closeStatus();
   }
   // What the generation's supervisor thread saw since the last tick: counted, and reported by the event
   // loop, so the lines and the state endpoint are written where every other record of this Server is.
@@ -2106,7 +2180,7 @@ public:
     if (entry.lastReportedAt != 0 && now - entry.lastReportedAt < SYSCALL_REPORT_INTERVAL_MS) return;
     entry.lastReportedAt = now;
     ++s.reported;
-    std::cout << "[syscall-observed] {\"processId\":\"" << p.id << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary")
+    std::cout << "[syscall-observed] {\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.spawnPid << ",\"tid\":" << tid << ",\"call\":" << number
         << ",\"name\":\"" << escape(s.name(number)) << "\",\"thread\":\"" << escape(thread) << "\",\"count\":" << entry.count
         << ",\"countThisProcess\":" << p.syscallNotifications << ",\"mode\":\"" << escape(s.mode) << "\",\"allowlistSha256\":\""
@@ -2294,7 +2368,7 @@ public:
     slot.lastExitCategory = "memory-oom";
     p.lastReason = kernelOom ? "kernel memory OOM" : "V8 memory OOM";
     std::ostringstream out;
-    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary")
+    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"observedAtUnixMs\":" << wall()
         << ",\"reason\":\"" << p.lastReason << "\",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
         << "\",\"culprit\":" << offender << "}";
@@ -2331,7 +2405,7 @@ public:
   void killProcess(ProcessGeneration& p, const std::string& reason, double duration) {
     if (p.pid == 0 || p.state == "killed") return;
     std::ostringstream out; out << std::setprecision(17) << "{\"processId\":\"" << p.id
-        << "\",\"processClass\":\"" << (p.quarantine ? "quarantine" : "ordinary")
+        << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"reason\":\"" << escape(reason)
         << "\",\"stuckDurationMs\":" << duration << ",\"observedAtUnixMs\":" << wall() << ",\"inFlight\":[";
     size_t i = 0;
@@ -2508,7 +2582,8 @@ public:
     }
     for (size_t i = 0; i < slots.size(); ++i) {
       const auto& p = slots[i].current;
-      if (!p || p->pid == 0 || p->readyAt == 0) continue;
+      // A durable process is never replaced for its age or its requests: its objects would all start again.
+      if (!p || p->pid == 0 || p->readyAt == 0 || slots[i].durable) continue;
       if (config.rotationMaxAgeMs && now - p->readyAt >= double(config.rotationMaxAgeMs)) enqueueAutomatic(i, "age");
       else if (config.rotationMaxRequests && p->dispatched >= config.rotationMaxRequests) enqueueAutomatic(i, "requests");
     }
@@ -2585,6 +2660,14 @@ public:
     std::cout << "[process-rotation] {\"event\":\"start\",\"rotationId\":" << r.id << ",\"processId\":\"" << s.id
         << "\",\"reason\":\"" << r.reason << "\",\"oldGeneration\":" << s.current->generation
         << ",\"observedAtUnixMs\":" << r.startedAtUnixMs << "}" << std::endl;
+    // A durable process's next generation starts only once the previous one has exited: an object runs in one process at
+    // a time, so its requests in flight finish and its facets close before any other process opens its database. Requests
+    // to its objects wait meanwhile (the node's Durable Object dispatch).
+    if (s.durable) {
+      r.phase = "draining";
+      switchOver(now);
+      return;
+    }
     try {
       spawn(s, request.slot, true);
       r.next = s.incoming;
@@ -2599,8 +2682,10 @@ public:
     auto old = s.current, next = s.incoming;
     r.switchedAt = now; r.switchedAtUnixMs = wall();
     s.current = next; s.incoming = nullptr;
-    writePidFiles(*next, r.slot);
-    event(*next, "switch", r.reason);
+    if (next) {
+      writePidFiles(*next, r.slot);
+      event(*next, "switch", r.reason);
+    }
     r.phase = "draining";
     if (old && old->pid > 0) {
       old->pullEvents();
@@ -2665,6 +2750,7 @@ public:
       if (!r.old || r.old->pid == 0) {
         if (r.drainOutcome == "none") r.drainOutcome = "exited";
         r.drainedAt = now; r.drainedAtUnixMs = wall();
+        if (slots[r.slot].durable) { r.phase = "closing"; advance(now); return; }
         finish(now, "completed");
         return;
       }
@@ -2688,8 +2774,36 @@ public:
         return;
       }
     }
+    if (r.phase == "starting-next") {
+      // A durable slot's next generation, started after the previous one exited.
+      if (!r.next || r.next->pid == 0) {
+        finish(now, "failed", "the next generation exited before it was ready: " + (r.next ? r.next->lastReason : std::string()));
+        return;
+      }
+      if (r.next->state != "ready") return;
+      auto& s = slots[r.slot];
+      s.current = r.next; s.incoming = nullptr;
+      writePidFiles(*r.next, r.slot);
+      event(*r.next, "switch", r.reason);
+      r.phase = "switched";
+      finish(now, "completed");
+      return;
+    }
     if (r.phase == "closing") {
-      if (r.old->pid == 0) { finish(now, "completed"); return; }
+      if (r.old->pid == 0) {
+        if (slots[r.slot].durable) {
+          try {
+            spawn(slots[r.slot], r.slot, true);
+            r.next = slots[r.slot].incoming;
+            r.phase = "starting-next";
+          } catch (const kj::Exception& error) {
+            finish(now, "failed", std::string("cannot start the next generation: ") + error.getDescription().cStr());
+          }
+          return;
+        }
+        finish(now, "completed");
+        return;
+      }
       if (r.terminatedAt == 0) {
         // The Server holds connections to it; workerd's drain waits for them, so close them first.
         if (r.old->probePending) return;
@@ -2712,7 +2826,7 @@ public:
     out << std::setprecision(17);
     auto since = [](double later, double earlier) { return later > 0 && earlier > 0 ? later - earlier : 0.0; };
     out << "{\"rotationId\":" << r.id << ",\"processId\":\"" << s.id << "\",\"processClass\":\""
-        << (s.quarantine ? "quarantine" : "ordinary") << "\",\"reason\":\"" << r.reason << "\",\"requestIds\":[";
+        << processClass(s) << "\",\"reason\":\"" << r.reason << "\",\"requestIds\":[";
     for (size_t i = 0; i < r.requestIds.size(); ++i) out << (i ? "," : "") << r.requestIds[i];
     out << "],\"phase\":\"" << r.phase << "\",\"outcome\":\"" << r.outcome << "\",\"failure\":\"" << escape(r.failure)
         << "\",\"oldGeneration\":" << (r.old ? r.old->generation : 0) << ",\"oldPid\":" << (r.old ? r.old->spawnPid : 0)
@@ -2753,7 +2867,7 @@ public:
     auto& s = slots[r.slot];
     r.outcome = outcome; r.failure = failure;
     r.finishedAt = now; r.finishedAtUnixMs = wall();
-    if (r.phase == "starting") {
+    if (r.phase == "starting" || r.phase == "starting-next") {
       // The next generation never took over (it exited, or never started).
       if (r.next && r.next->pid > 0) {
         r.next->plannedExit = true;
@@ -2870,7 +2984,9 @@ kj::Promise<void> ProcessPool::run() {
       // A rotation's next generation takes over the slot instead of a restart; a closing
       // pool (the Server's exit) starts nothing; with the allowlist on, a workerd file this Server has
       // not hashed yet waits for its digest rather than being launched against a list.
-      if ((!s.current || s.current->pid == 0) && !s.incoming && mono() >= s.restartAt && !impl->closingAll
+      // A durable slot being rotated starts its next generation itself, once the previous one has exited.
+      const bool rotating = impl->rotation && impl->rotation->slot == i && s.durable;
+      if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
           && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
       for (const auto& p : s.retiring) impl->maybeProbe(p);
@@ -2885,8 +3001,34 @@ bool ProcessPool::quarantined(const std::string& worker) const {
 bool ProcessPool::available(const std::string& worker) {
   impl->refresh();
   const auto quarantine = quarantined(worker);
-  for (const auto& s : impl->slots) if (s.quarantine == quarantine && s.current && impl->admitted(*s.current)) return true;
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && impl->admitted(*s.current)) return true;
   return false;
+}
+uint32_t ProcessPool::durableProcesses() const { return impl->config.durableProcesses; }
+bool ProcessPool::durableHot(const std::string& hash) const {
+  for (const auto& s : impl->slots) if (s.durable && s.current && s.current->pid > 0) {
+    auto found = s.current->heat.find(hash);
+    if (found != s.current->heat.end() && mono() - found->second <= impl->config.heatIdleMs) return true;
+  }
+  return false;
+}
+std::string ProcessPool::durableProcessFor(const std::string& objectKey) const { return impl->durableSlotFor(objectKey); }
+bool ProcessPool::durableAvailable(const std::string& objectKey) {
+  impl->refresh();
+  const auto id = impl->durableSlotFor(objectKey);
+  for (const auto& s : impl->slots) if (s.durable && s.id == id && s.current && impl->admitted(*s.current)) return true;
+  return false;
+}
+std::shared_ptr<ProcessCall> ProcessPool::selectDurable(const std::string& objectKey) {
+  impl->refresh();
+  const auto id = impl->durableSlotFor(objectKey);
+  for (const auto& s : impl->slots) {
+    if (s.durable && s.id == id && s.current && impl->admitted(*s.current)) {
+      ++impl->durableDispatches;
+      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current));
+    }
+  }
+  return {};
 }
 void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
   impl->retiring = std::move(callback);
@@ -2909,7 +3051,7 @@ std::optional<std::pair<std::string, uint64_t>> ProcessPool::egressSource(const 
 
 bool ProcessPool::ready() const {
   return std::all_of(impl->slots.begin(), impl->slots.end(), [](const auto& s) {
-    return s.quarantine || (s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected);
+    return s.quarantine || s.durable || (s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected);
   });
 }
 std::string ProcessPool::quarantineReadinessJson() const {
@@ -2929,7 +3071,7 @@ void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = 
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId) const { return impl->limitsOf(workerId); }
 bool ProcessPool::hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const {
   const auto quarantine = quarantined(worker);
-  for (const auto& s : impl->slots) if (s.quarantine == quarantine && s.current && s.current->pid > 0) {
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) {
     auto found = s.current->heat.find(hash);
     if (found != s.current->heat.end() && mono() - found->second <= idleMs) return true;
   }
@@ -2945,7 +3087,7 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   impl->refresh();
   const auto quarantine = quarantined(worker);
   std::vector<std::string> ids;
-  for (const auto& s : impl->slots) if (s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
   for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
     if (s.id == id && s.current && impl->admitted(*s.current)) {
       if (quarantine) ++impl->quarantineDispatches;
@@ -3015,7 +3157,9 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat[hash] = mono();
   ++p->dispatched;
-  if (p->contextsVisible) p->openContexts[call->invocationId] = {call->workerId, call->versionId};
+  // An object's requests share its context in workerd, whose completed row comes when the object leaves memory: a durable
+  // process is drained once its requests in flight are done (a WebSocket connection is told to go away).
+  if (p->contextsVisible && !p->durable) p->openContexts[call->invocationId] = {call->workerId, call->versionId};
   // From this send onward, a lost connection or a dead child is never retried.
   call->dispatched = true;
   auto result = p->runtime->open(descriptor);
@@ -3032,6 +3176,7 @@ std::string ProcessPool::json(uint32_t idleMs) const {
       << ",\"idleEvictMs\":" << impl->config.idleEvictMs
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
+      << ",\"durableProcesses\":" << impl->config.durableProcesses
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
@@ -3046,7 +3191,7 @@ std::string ProcessPool::json(uint32_t idleMs) const {
     const auto slotIndex = i;
     if (i++) out << ',';
     auto p = s.current;
-    out << "{\"processId\":\"" << s.id << "\",\"processClass\":\"" << (s.quarantine ? "quarantine" : "ordinary")
+    out << "{\"processId\":\"" << s.id << "\",\"processClass\":\"" << processClass(s)
         << "\",\"generation\":" << (p ? p->generation : s.generation) << ",\"pid\":" << (p ? p->pid : 0)
         << ",\"residentBytes\":" << MemoryWatermark::residentBytes(p ? p->pid : 0)
         << ",\"state\":\"" << (p ? p->state : "starting") << "\",\"restartCount\":" << s.restarts << ",\"exitCount\":" << s.exits
@@ -3118,6 +3263,7 @@ std::string ProcessPool::json(uint32_t idleMs) const {
   out << "],\"sandbox\":" << impl->sandboxStateJson() << ",\"recentLaunchFailures\":[";
   for (size_t j = 0; j < impl->recentLaunchFailures.size(); ++j) { if (j) out << ','; out << impl->recentLaunchFailures[j]; }
   out << "],\"quarantineDispatches\":" << impl->quarantineDispatches << ",\"trialDispatches\":" << impl->trialDispatches
+      << ",\"durableDispatches\":" << impl->durableDispatches
       << ",\"suspects\":" << impl->suspects.json()
       << ",\"output\":" << WorkerdOutput::stateJson() << ",\"rotation\":" << impl->rotationStateJson(16)
       << ",\"shuttingDown\":" << (impl->shuttingDown ? "true" : "false") << ",\"closing\":" << (impl->closingAll ? "true" : "false")
@@ -3129,7 +3275,7 @@ std::string ProcessPool::placementJson(const std::vector<std::string>& workers) 
   for (size_t i = 0; i < workers.size(); ++i) {
     if (i) out << ',';
     std::vector<std::string> ids;
-    for (const auto& s : impl->slots) if (s.quarantine == quarantined(workers[i]) && s.current && s.current->pid > 0) ids.push_back(s.id);
+    for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantined(workers[i]) && s.current && s.current->pid > 0) ids.push_back(s.id);
     auto order = rendezvousOrder(placementKey(workers[i], quarantined(workers[i])), ids);
     out << "{\"workerId\":\"" << escape(workers[i]) << "\",\"home\":\"" << (order.empty() ? "" : order.front()) << "\",\"candidates\":[";
     for (size_t j = 0; j < order.size(); ++j) { if (j) out << ','; out << '"' << order[j] << '"'; }
@@ -3286,7 +3432,7 @@ kj::Promise<std::string> ProcessPool::closeAll() {
       << ",\"durationMs\":" << mono() - started << ",\"generations\":[";
   for (size_t i = 0; i < closing.size(); ++i) {
     const auto& c = closing[i];
-    out << (i ? "," : "") << "{\"processId\":\"" << c.p->id << "\",\"processClass\":\"" << (c.p->quarantine ? "quarantine" : "ordinary")
+    out << (i ? "," : "") << "{\"processId\":\"" << c.p->id << "\",\"processClass\":\"" << processClass(*c.p)
         << "\",\"generation\":" << c.p->generation << ",\"pid\":" << c.p->spawnPid
         << ",\"terminatedAtUnixMs\":" << c.terminatedAtUnixMs << ",\"exitedAtUnixMs\":" << c.p->exitedAtUnixMs
         << ",\"terminateToExitMs\":" << (c.terminatedAt > 0 && c.p->exitedAt > 0 ? c.p->exitedAt - c.terminatedAt : 0.0)

@@ -94,14 +94,30 @@ struct ManifestSecret {
   uint64_t setAtUnixMs = 0;
   bool operator==(const ManifestSecret&) const = default;
 };
+// A Durable Object namespace of a Worker, by its class's name: the id the control plane made when a version first
+// declared the class (32 random bytes, hexadecimal; a rename moves it to the new name), the manifest revision that made
+// it, its status ("active", or "deleting" once a version deleted the class: no Binding to it, no new request), and the
+// shards and reliability tier it was made with (fixed for its life).
+struct ManifestNamespace {
+  std::string id;
+  uint64_t createdRevision = 0;
+  std::string status = "active";
+  uint32_t shards = 1024;
+  std::string tier = "small";
+  bool operator==(const ManifestNamespace&) const = default;
+};
 struct ManifestWorker {
   std::optional<ManifestPointer> active;
   std::map<std::string, ManifestVersion> versions;   // versionId -> definition
   std::vector<ManifestRoute> routes;                 // sorted, each once
   std::map<std::string, ManifestSecret> secrets;     // name -> sealed value
+  std::map<std::string, ManifestNamespace> namespaces;  // class -> namespace
   bool operator==(const ManifestWorker&) const = default;
-  bool empty() const { return !active && versions.empty() && routes.empty() && secrets.empty(); }
+  bool empty() const { return !active && versions.empty() && routes.empty() && secrets.empty() && namespaces.empty(); }
 };
+std::string manifestNamespaceJson(const ManifestNamespace& entry);
+// A new namespace's id: 32 random bytes, hexadecimal.
+std::string newNamespaceId();
 struct TenantManifest {
   std::string tenant;
   uint64_t revision = 0, generation = 0, writtenAtUnixMs = 0;
@@ -159,7 +175,7 @@ using SecretOpener = std::function<std::optional<std::string>(const std::string&
     const std::string& name, const ManifestSecret& sealed)>;
 // The keys one tenant contributes, as DeploymentState reads them: <t>/active/<w>,
 // <t>/definitions/<w>/<v> (a version whose definition is not in `definitions` has no key: unknown, as a definition key
-// that is missing), <t>/secrets/<w>/<name>. Routes are every tenant's at once (routeStateKeys).
+// that is missing), <t>/secrets/<w>/<name>, <t>/namespaces/<w> (its Durable Object namespaces' ids and statuses). Routes are every tenant's at once (routeStateKeys).
 std::map<std::string, std::string> tenantStateKeys(const TenantManifest& manifest, const DefinitionBytes& definitions,
     const SecretOpener& open);
 // routes/<host><pathPrefix> -> its value, over every tenant. A slot two tenants name goes to the first of them by name

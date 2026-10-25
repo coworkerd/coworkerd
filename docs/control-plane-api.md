@@ -32,7 +32,7 @@ Every request carries `Authorization: Bearer <credential>`. Answers are JSON, ap
 | `POST /v1/tenants/{t}/credentials`, `GET /v1/tenants/{t}/credentials` | Administrator | Issue, list the tenant's credentials |
 | `DELETE /v1/tenants/{t}/credentials/{keyId}` | The tenant or the administrator | Revoke a credential |
 | `GET /v1/tenants/{t}/usage` | The tenant or the administrator | The tenant's hourly usage |
-| `GET /v1/tenants/{t}/workers`, `GET .../workers/{w}` | The tenant or the administrator | The Workers: versions, active version, validity, limits, routes, secret names |
+| `GET /v1/tenants/{t}/workers`, `GET .../workers/{w}` | The tenant or the administrator | The Workers: versions, active version, validity, limits, routes, secret names, Durable Object namespaces |
 | `PATCH /v1/tenants/{t}/workers/{w}` | The tenant or the administrator | The Worker's CPU and memory limits, within the tenant's maxima |
 | `DELETE /v1/tenants/{t}/workers/{w}` | The tenant or the administrator | Remove the Worker: its active version and routes go, its versions stay |
 | `PUT .../workers/{w}/versions/{v}` | The tenant or the administrator | Upload a package and trial-load it; `?activate=true` also makes it active |
@@ -70,6 +70,7 @@ The control plane writes the desired state -- the tenant index, the tenants' man
 | `secrets`, `hostnames` | 1,000, 100 | By the control plane when a new secret is set or the hostnames change |
 | `logLinesPerSecond`, `logBufferBytes` | 100, 1 MiB | By every node, for the tenant's log lines |
 | `maxWorkerCpuMs`, `maxWorkerMemoryMiB` | 30,000, 512 | By the control plane when a Worker's limits or the tenant's default limits are set |
+| `durableObjectNamespaces` | 16 | By the control plane when an upload declares a Durable Object class that has no namespace yet (0.5, in development): every namespace of the tenant counts, those of deleted classes included |
 
 A change over a quota is refused with `422 QUOTA_EXCEEDED` and the quota's name at the start of the reason (`defaultLimits:` for default limits above the maxima), and nothing is written; a package larger than `packageBytes` or `control.maxUploadBytes` -- one of exactly that size is accepted -- is `413 PACKAGE_TOO_LARGE` instead unless the tenant's `packageBytes` is below `control.maxUploadBytes` -- so at the defaults, both 160 MiB, it is 413. The control plane checks these quotas when it admits a change; the log quotas refuse nothing: every node enforces them on the tenant's lines, dropping lines over the rate and the oldest lines over the buffer -- except that a node keeps the tenant's previous values when the buffer quota is larger than its own `logs.totalBufferBytes`. `workers` counts every Worker the tenant's manifest names, a removed one whose versions remain included, and a secret set for a Worker the tenant does not have yet makes one, so it is checked against `workers` too; lowering a maximum leaves Workers' own limits above it as they are, and is refused below the tenant's default limits.
 

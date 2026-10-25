@@ -341,6 +341,16 @@ struct ChildAllocation {
   std::string entrypoint;
 };
 
+// A request to a Durable Object (docs/compatibility.md, section 7): the object's namespace, id and class, and how many
+// Durable Object calls led to it (0 from a stateless Worker; a call from an object adds one to that object's).
+struct DurableTarget {
+  std::string namespaceId, objectId, className;
+  uint16_t hops = 0;
+  std::string key() const { return namespaceId + "/" + objectId; }
+};
+// More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
+constexpr uint16_t MAX_DURABLE_HOPS = 8;
+
 struct LeaseExpiry {
   double expiresAtMonotonicMs;
   std::string invocationId;
@@ -392,8 +402,13 @@ struct AdmissionSlot {
   ServerCore* server = nullptr;
   bool root = false;
   std::string ingressNodeId;
+  // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
+  // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
+  bool durable = false;
+  std::function<void(uint status, const std::string& code)> outcome;
+  void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
-  ~AdmissionSlot() { finish(); }
+  ~AdmissionSlot() { finish(); report(0, ""); }
   void finish() { if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
 };
 
@@ -884,6 +899,60 @@ public:
     leaseExpiries.push({lease->second.expiresAtMonotonicMs, invocationId});
   }
 
+  // ---- A Worker's log lines: 256 KB an event ----
+  // workerd caps a request's trace at 256 KB, but gives a streaming tail every line (runtime.js, TenantLog); the node
+  // keeps the cap, per event: a request, or a message of a WebSocket connection toward the Worker (nextLogEvent, from
+  // the connection's relay). An object's events are the object's: workerd records an object's lines under its latest
+  // request, whichever of its requests or connections wrote them, so a request to an object (startObjectLogEvent) and a
+  // message on any of its connections start the object's next event. The lines of an event past it are cut, one
+  // warning line in their place (SourceService::log). A line that names no invocation counts against its post's own
+  // budget.
+  static constexpr uint64_t LOG_EVENT_BYTES = 256 * 1024;
+  struct LogBudget { uint64_t bytes = 0; bool warned = false; double lastAt = 0; };
+  // The budget an invocation's lines count against: its object's, or its own.
+  std::string logEventKey(const std::string& invocationId) const {
+    auto object = logObjects.find(invocationId);
+    return object == logObjects.end() ? invocationId : object->second.first;
+  }
+  void startObjectLogEvent(const std::string& invocationId, const std::string& objectKey) {
+    pruneLogEvents();
+    const auto now = monotonicTimeMs();
+    logObjects[invocationId] = {"object:" + objectKey, now};
+    logEvents["object:" + objectKey] = {0, false, now};
+  }
+  void nextLogEvent(const std::string& invocationId) {
+    if (auto found = logEvents.find(logEventKey(invocationId)); found != logEvents.end()) found->second = {0, false, monotonicTimeMs()};
+  }
+  // Events quiet for ten minutes are over: their invocations ended long ago, or lines no longer come.
+  void pruneLogEvents() {
+    if (logEvents.size() < 65536 && logObjects.size() < 65536) return;
+    const auto now = monotonicTimeMs();
+    std::erase_if(logEvents, [&](const auto& item) { return now - item.second.lastAt > 600000; });
+    std::erase_if(logObjects, [&](const auto& item) { return now - item.second.second > 600000; });
+  }
+  // Whether a line of `bytes` fits in its event's budget; `warn` is set for the first line of an event that does not.
+  bool chargeLogLine(const std::string& invocationId, uint64_t bytes, LogBudget& own, bool& warn) {
+    LogBudget* budget = &own;
+    if (!invocationId.empty()) {
+      pruneLogEvents();
+      const auto now = monotonicTimeMs();
+      if (auto object = logObjects.find(invocationId); object != logObjects.end()) object->second.second = now;
+      budget = &logEvents[logEventKey(invocationId)];
+      budget->lastAt = now;
+    }
+    warn = false;
+    if (budget->bytes + bytes <= LOG_EVENT_BYTES) {
+      budget->bytes += bytes;
+      return true;
+    }
+    if (!budget->warned) {
+      budget->warned = warn = true;
+      ++logEventsOverBudget;
+    }
+    return false;
+  }
+  uint64_t logEventsOverBudgetCount() const { return logEventsOverBudget; }
+
   // ---- The Server's exit ----
   // Once draining: new roots at the ingress and every invocation arriving from another
   // Server are refused before execution (SERVER_DRAINING, retryable elsewhere); what is in
@@ -1044,7 +1113,7 @@ public:
   }
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
-      bool record = true, bool forwardedRoot = false) {
+      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr) {
     auto started = monotonicTimeMs();
     auto timing = kj::defer([&] { phaseTiming("admission", started); });
     auto rejected = [&](std::string code, std::string reason, uint status = 503) {
@@ -1060,9 +1129,14 @@ public:
       return rejected("OVERLOADED", "concurrency limit reached");
     const auto band = memory.effectiveBand();
     if ((!root || forwardedRoot) && (band == "red" ||
-        (band == "yellow" && !hot(hash))))
+        (band == "yellow" && !(durable ? runtime.durableHot(hash) : hot(hash)))))
       return rejected("LOAD_BAND_REJECTED", band == "red" ?
           (forwardedRoot ? "red band rejects forwarded roots" : "red band rejects nested invocations") : "yellow band rejects cold version");
+    if (durable) {
+      if (!runtime.durableAvailable(durable->key()))
+        return rejected("DO_UNAVAILABLE", "the durable process of this object (" + runtime.durableProcessFor(durable->key()) + ") is not ready");
+      return std::nullopt;
+    }
     if (!runtime.available(worker)) return rejected(runtime.quarantined(worker) ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
         runtime.quarantined(worker) ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch");
     return std::nullopt;
@@ -1399,6 +1473,84 @@ public:
         check.coldLoaded);
   }
 
+  // ---- Durable Objects ----
+  bool durableReady(const std::string& objectKey) { return runtime.durableAvailable(objectKey); }
+  std::string durableProcessFor(const std::string& objectKey) const { return runtime.durableProcessFor(objectKey); }
+  // How many Durable Object calls led to an object's requests: the most of those in flight, else its latest one's. A call
+  // the object makes counts one more (DO_HOP_LIMIT beyond MAX_DURABLE_HOPS): the node's own count, whatever the tenant's
+  // code sends.
+  struct ObjectActivity { std::multiset<uint16_t> inFlight; uint16_t latest = 0; double lastAt = 0; };
+  uint16_t objectHops(const std::string& objectKey) const {
+    auto found = objects.find(objectKey);
+    if (found == objects.end()) return 0;
+    return found->second.inFlight.empty() ? found->second.latest : *found->second.inFlight.rbegin();
+  }
+  void objectBegin(const std::string& objectKey, uint16_t hops) {
+    auto& entry = objects[objectKey];
+    entry.inFlight.insert(hops); entry.latest = hops; entry.lastAt = monotonicTimeMs();
+    // Bounded: objects without requests in flight are forgotten after ten minutes, or sooner beyond 65536 entries.
+    if (objects.size() > 65536 || monotonicTimeMs() - lastObjectPrune > 60000) {
+      lastObjectPrune = monotonicTimeMs();
+      const double keep = objects.size() > 65536 ? 60000 : 600000;
+      std::erase_if(objects, [&](const auto& item) { return item.second.inFlight.empty() && lastObjectPrune - item.second.lastAt > keep; });
+    }
+  }
+  void objectEnd(const std::string& objectKey, uint16_t hops) {
+    auto found = objects.find(objectKey);
+    if (found == objects.end()) return;
+    if (auto at = found->second.inFlight.find(hops); at != found->second.inFlight.end()) found->second.inFlight.erase(at);
+    found->second.lastAt = monotonicTimeMs();
+  }
+  // The version a request to an object runs: its Worker's active one, whose definition declares the class, with the
+  // class's namespace active and the one the request names. Null with a code and a reason.
+  std::shared_ptr<const VersionDefinition> durableVersion(const std::string& workerId, const DurableTarget& target,
+      std::string& code, std::string& reason) const {
+    const auto* worker = desiredState.state().worker(workerId);
+    if (!worker || !worker->valid || !worker->version) {
+      code = "WORKER_INVALID";
+      reason = "Worker " + workerId + " has no valid active version" + (worker && !worker->reason.empty() ? ": " + worker->reason : std::string());
+      return nullptr;
+    }
+    const auto* space = desiredState.state().durableNamespace(workerId, target.className);
+    if (!worker->version->declares(target.className) || !space || space->id != target.namespaceId || space->status != "active") {
+      code = "DO_NAMESPACE_UNAVAILABLE";
+      reason = "Durable Object class " + target.className + " of Worker " + workerId + ": " +
+          (!worker->version->declares(target.className) ? "the active version " + worker->version->versionId + " does not declare it"
+              : !space ? std::string("it has no namespace")
+              : space->id != target.namespaceId ? std::string("the request names another namespace")
+              : std::string("its namespace is being deleted"));
+      return nullptr;
+    }
+    return worker->version;
+  }
+  // A request to an object, on the object's durable process: from a stateless Worker a child of its call tree
+  // (`allocation`, charged to its budget as a Binding call is), from an object the root of a new call tree.
+  OpenEvent openDurable(std::shared_ptr<const VersionDefinition> version, const DurableTarget& target,
+      std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot) {
+    auto process = runtime.selectDurable(target.key());
+    if (!process) throw ProcessUnavailable{false};
+    const auto nowMonotonicMs = monotonicTimeMs();
+    expireLeases(nowMonotonicMs);
+    const auto sequence = nextSequence++;
+    auto id = invocationId(sequence);
+    // The request is the object's next event for its log lines.
+    startObjectLogEvent(id, target.key());
+    if (allocation) {
+      if (slot) slot->timing = allocation->timing;
+      addLease(id, {allocation->treeId, allocation->grant, allocation->grant, allocation->depth, allocation->expiresAtMonotonicMs,
+          allocation->pins, allocation->ingressServerId});
+      return execute(std::move(version), sequence, std::move(id), allocation->treeId, "durable", allocation->parentInvocationId,
+          allocation->callSequence, allocation->orderSequence, allocation->grant, allocation->remainingAfter, allocation->depth,
+          allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target);
+    }
+    auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
+    const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
+    auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
+    addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
+    return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
+        leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target);
+  }
+
   ChildAllocation allocateChild(
       std::string treeId,
       std::string parentInvocationId,
@@ -1646,7 +1798,7 @@ private:
       uint16_t depth,
       double expiresAtMonotonicMs,
       SharedVersionPins pins, std::shared_ptr<AdmissionSlot> slot, std::shared_ptr<coworkerd::ProcessCall> process,
-      std::string ingressServerId = {}, bool coldLoaded = false) {
+      std::string ingressServerId = {}, bool coldLoaded = false, const DurableTarget* durable = nullptr) {
 
     auto timing = slot ? slot->timing : nullptr;
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }
@@ -1660,7 +1812,7 @@ private:
         orderSequence,
         depth,
         expiresAtMonotonicMs,
-        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded);
+        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable);
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
@@ -2033,7 +2185,8 @@ private:
       double expiresAtMonotonicMs,
       const SharedVersionPins& pins, const coworkerd::ProcessCall& process,
       const std::string& ingressServerId, const std::string& entrypoint, bool trial = false,
-      bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false) const {
+      bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
+      const DurableTarget* durable = nullptr) const {
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
     descriptor.setServerId(serverConfig.serverId.c_str());
@@ -2086,10 +2239,44 @@ private:
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
-      // A trial load gets no Binding: nothing it may run could call one. The load check is one.
+      // A trial load gets no Binding: nothing it may run could call one. The load check is one. Its bridge checks the
+      // Durable Object classes the version declares among the exports.
       descriptor.setTrial(true);
       descriptor.setLoadCheck(loadCheck);
       if (!sourceInvocationId.empty()) descriptor.setSourceInvocationId(sourceInvocationId.c_str());
+      descriptor.initBindings(0);
+      if (!version.declaredClasses.empty()) {
+        auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
+        for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
+      }
+      capnp::JsonCodec json;
+      return json.encode(descriptor.asReader());
+    }
+    // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
+    // isolate first), and its Durable Object namespace Bindings, with this node's view of each class's namespace: a
+    // namespace that cannot be used has no id (its Binding refuses every call).
+    if (!version.declaredClasses.empty()) {
+      auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
+      for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
+    }
+    if (!version.durableObjects.empty()) {
+      auto namespaces = descriptor.initDurableObjects(version.durableObjects.size());
+      for (size_t i = 0; i < version.durableObjects.size(); ++i) {
+        const auto& binding = version.durableObjects[i];
+        namespaces[i].setName(binding.binding.c_str());
+        namespaces[i].setClassName(binding.className.c_str());
+        const auto* space = desiredState.state().durableNamespace(version.workerId, binding.className);
+        namespaces[i].setNamespaceId(space && space->status == "active" ? space->id.c_str() : "");
+      }
+    }
+    if (durable) {
+      // A request to an object: its Host runs the Worker's class with the version's variables, secrets and Durable Object
+      // Bindings; Service Bindings are not given to a class in this release.
+      auto target = descriptor.initDurableObject();
+      target.setNamespaceId(durable->namespaceId.c_str());
+      target.setObjectId(durable->objectId.c_str());
+      target.setClassName(durable->className.c_str());
+      target.setHops(durable->hops);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       return json.encode(descriptor.asReader());
@@ -2163,6 +2350,9 @@ private:
   kj::Timer& timer;
   // The load check: when a version last loaded on a process (process:generation:hash#entrypoint).
   std::map<std::string, double> loadConfirmed;
+  // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
+  std::map<std::string, ObjectActivity> objects;
+  double lastObjectPrune = 0;
   uint64_t nextLoadCheckSequence = 1, loadChecks = 0, loadCheckColdLoads = 0, loadFailureReroutes = 0, lateBackendFailures = 0;
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
   uint32_t inFlightRoots = 0;
@@ -2209,6 +2399,11 @@ private:
   uint64_t expiredLeases = 0;
   uint64_t expiredLeaseRejections = 0;
   uint64_t renewedLeases = 0;
+  // The current log event of each invocation or object (nextLogEvent, chargeLogLine), and the object of each request to
+  // an object, with when its lines last came.
+  std::map<std::string, LogBudget> logEvents;
+  std::map<std::string, std::pair<std::string, double>> logObjects;
+  uint64_t logEventsOverBudget = 0;
   uint64_t leaseReaperRuns = 0;
   uint64_t sourceFetches = 0;
   uint64_t nextSequence = 1;
@@ -2723,21 +2918,25 @@ public:
     pathMark(timing, "workerd-headers");
     auto body = inner.send(status, statusText, headers, expectedBodySize);
     started = true;
+    sentStatus = status;
     return body;
   }
 
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
     auto socket = inner.acceptWebSocket(headers);
     started = true;
+    sentStatus = 101;
     return socket;
   }
 
   bool hasStarted() const { return started; }
+  uint status() const { return sentStatus; }
 
 private:
   Response& inner;
   SharedPathTiming timing;
   bool started = false;
+  uint sentStatus = 0;
 };
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call) {
@@ -2794,13 +2993,17 @@ public:
     identity.handshakeMs = monotonicTimeMs() - startedAt;
     const auto invocation = process->invocationId;
     WebSocketRelay::Hooks hooks;
-    hooks.message = [&server, invocation]() { server.renewLease(invocation); };
+    hooks.message = [&server, invocation]() {
+      server.renewLease(invocation);
+      server.nextLogEvent(invocation);
+    };
     hooks.limitCode = [process]() -> std::string {
       if (process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
       if (process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
       return {};
     };
     hooks.ended = [&server, invocation]() { server.releaseLease(invocation); };
+    slot->report(101, "");
     auto pipe = kj::newWebSocketPipe();
     relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::EXECUTION, std::move(identity),
         kj::mv(ingress), kj::mv(pipe.ends[1]), std::move(hooks));
@@ -2836,7 +3039,8 @@ public:
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& requestHeaders,
       kj::AsyncInputStream& body, Response& response) override {
     auto finish = kj::defer([slot = slot] { slot->finish(); });
-    if (slot->root && slot->server != nullptr && method == kj::HttpMethod::GET && requestHeaders.isWebSocket())
+    // An ingress root's upgrade, or one to a Durable Object, may become a WebSocket connection relayed here.
+    if ((slot->root || slot->durable) && slot->server != nullptr && method == kj::HttpMethod::GET && requestHeaders.isWebSocket())
       co_return co_await webSocketRequest(method, url, requestHeaders, body, response);
     auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing);
     auto started = monotonicTimeMs();
@@ -2849,9 +3053,10 @@ public:
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
       if (slot->timing && slot->timing->kind == "binding") slot->timing->emit();
+      slot->report(tracked->status(), limitCode());
       co_return;
     } catch (const kj::Exception& error) {
-      if (tracked->hasStarted()) throw;
+      if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
     }
     co_await refuse(*tracked, failure);
@@ -2885,10 +3090,17 @@ private:
   }
   // A failure before the response started: the code the call's limits or its process say.
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure) {
+    const auto code = limitCode();
+    slot->report(503, code.empty() ? "RESULT_UNCERTAIN" : code);
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, 503, "Service Unavailable",
-        rejectionJson(slot->process && slot->process->memoryLimitExceeded() ? "MEMORY_LIMIT_EXCEEDED" :
-            slot->process && slot->process->cpuLimitExceeded() ? "CPU_LIMIT_EXCEEDED" : "RESULT_UNCERTAIN", failure, 0));
+        rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
     co_await rejection->respond(tracked);
+  }
+  // The limit that ended the call, if one did ("" otherwise).
+  std::string limitCode() const {
+    if (slot->process && slot->process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
+    if (slot->process && slot->process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
+    return {};
   }
   kj::Own<kj::HttpService> inner;
   std::shared_ptr<AdmissionSlot> slot;
@@ -4273,6 +4485,93 @@ private:
   kj::Own<AssetFirstHttpService> service;
 };
 
+// A request to a Durable Object (docs/compatibility.md, section 7): from a stateless Worker's namespace Binding, or from
+// an object's. In this release the owner of every object is this node: the request runs on the object's durable process
+// (ProcessPool::selectDurable: d0, ... by the object's id), whose runtime gives it to the object's Host -- the active
+// version of the Worker, its class declared and its namespace active. A durable process being replaced or restarted is
+// waited for, at most DURABLE_WAIT_MS within the request's lease. One [do] line per request, with its outcome.
+class DurableDispatch final {
+public:
+  static constexpr double DURABLE_WAIT_MS = 5000;
+  DurableDispatch(ServerCore& server, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable)
+      : server(server), factory(factory), headerTable(headerTable) {}
+
+  struct Request {
+    std::string workerId;
+    DurableTarget target;
+    // A stateless Worker's call: its child allocation in the caller's call tree. None: an object's call.
+    std::optional<ChildAllocation> allocation;
+    SharedPathTiming timing;
+  };
+  kj::Promise<BindingDispatch::Dispatched> dispatch(Request request) {
+    const auto started = monotonicTimeMs();
+    const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
+    const auto target = request.target;
+    const auto workerId = request.workerId;
+    const std::string caller = request.allocation ? "worker" : "object";
+    auto refused = [&](InvocationRejection refusal, const std::string& versionId = {}) {
+      server.observeLocalRefusal(refusal, "durableObject");
+      log(workerId, versionId, target, caller, nullptr, refusal.status, refusal.code, started);
+      return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, refusal, deadline)};
+    };
+    if (target.hops > MAX_DURABLE_HOPS)
+      co_return refused(server.refusal("DO_HOP_LIMIT", "more than " + std::to_string(MAX_DURABLE_HOPS) +
+          " Durable Object calls in a row (an object calling an object, ...)", 508));
+    std::string code, reason;
+    auto version = server.durableVersion(workerId, target, code, reason);
+    if (!version) co_return refused(server.refusal(code, reason, code == "WORKER_INVALID" ? 503 : 409));
+    if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(workerId)); !unavailable.empty())
+      co_return refused(server.refusal("TENANT_UNAVAILABLE", unavailable, 503), version->versionId);
+    // The object's process restarting or being replaced: its requests wait for the next generation.
+    const auto waitUntil = std::min(deadline, started + DURABLE_WAIT_MS);
+    while (!server.durableReady(target.key()) && monotonicTimeMs() < waitUntil) co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
+    if (auto refusal = server.admission(version->workerId, version->definitionHash, false, deadline, false, false, &target))
+      co_return refused(*refusal, version->versionId);
+    auto slot = server.reserve(false);
+    slot->durable = true;
+    slot->timing = request.timing;
+    auto unavailable = co_await server.ensureCode(*version, deadline);
+    if (!unavailable.empty()) {
+      server.rejectVersionUnavailable(unavailable);
+      co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409), version->versionId);
+    }
+    if (auto missing = server.secretRefusal(*version, false)) co_return refused(*missing, version->versionId);
+    try {
+      auto opened = server.openDurable(version, target, std::move(request.allocation), slot);
+      // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
+      server.objectBegin(target.key(), target.hops);
+      slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops]() {
+        previous();
+        server.objectEnd(key, hops);
+      };
+      slot->outcome = [this, workerId, versionId = version->versionId, target, caller, process = slot->process, started](
+          uint status, const std::string& code) { log(workerId, versionId, target, caller, process.get(), status, code, started); };
+      co_return BindingDispatch::Dispatched{std::move(opened.dispatcher), std::move(opened.ready)};
+    } catch (const ProcessUnavailable&) {
+      co_return refused(server.refusal("DO_UNAVAILABLE", "the durable process of this object (" +
+          server.durableProcessFor(target.key()) + ") is not ready", 503), version->versionId);
+    }
+  }
+
+private:
+  // [do]: the object's class and the first 12 hexadecimal digits of its namespace and id, how many calls led to it, its
+  // process, and the outcome -- the response's status, the code of a refusal or of the limit that ended it.
+  void log(const std::string& workerId, const std::string& versionId, const DurableTarget& target, const std::string& caller,
+      const coworkerd::ProcessCall* process, uint status, const std::string& code, double started) {
+    std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
+              << jsonEscape(workerId) << "\",\"versionId\":\"" << jsonEscape(versionId) << "\",\"className\":\"" << jsonEscape(target.className)
+              << "\",\"namespaceId\":\"" << target.namespaceId.substr(0, 12) << "\",\"objectId\":\"" << target.objectId.substr(0, 12)
+              << "\",\"hops\":" << target.hops << ",\"caller\":\"" << caller << "\",\"invocationId\":\""
+              << (process ? jsonEscape(process->invocationId) : std::string()) << "\",\"processId\":\"" << (process ? process->processId : std::string())
+              << "\",\"processGeneration\":" << (process ? process->generation : 0) << ",\"status\":" << status
+              << ",\"code\":" << (code.empty() ? std::string("null") : "\"" + jsonEscape(code) + "\"") << ",\"elapsedMs\":"
+              << monotonicTimeMs() - started << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+  }
+  ServerCore& server;
+  capnp::HttpOverCapnpFactory& factory;
+  const kj::HttpHeaderTable& headerTable;
+};
+
 class BindingBootstrap final: public rpc::WorkerdBootstrap::Server {
 public:
   BindingBootstrap(
@@ -4284,7 +4583,8 @@ public:
         factory(factory),
         headerTable(headerTable),
         assets(server, headerTable),
-        dispatcher(server, peerForwarder, factory, headerTable) {}
+        dispatcher(server, peerForwarder, factory, headerTable),
+        durable(server, factory, headerTable) {}
 
   kj::Promise<void> startEvent(StartEventContext context) override {
     auto timing = pathTiming("binding");
@@ -4310,6 +4610,58 @@ public:
     // An ASSETS Binding call names the calling version itself and allocates no child.
     const bool assetsCall = descriptor.getAssets();
     server.observeSequenceMapSize(descriptor.getSequenceMapSize());
+    if (descriptor.hasDurableObject()) {
+      // A call to a Durable Object of the calling Worker (runtime.js, DurableNamespace): from a stateless Worker a Binding
+      // call of its call tree, from an object (callerObjectId) a call of that object's.
+      auto call = descriptor.getDurableObject();
+      DurableDispatch::Request request;
+      request.workerId = workerId;
+      request.timing = timing;
+      request.target = {call.getNamespaceId().cStr(), call.getObjectId().cStr(), call.getClassName().cStr(), 0};
+      const std::string callerNamespace = call.getCallerNamespaceId().cStr(), callerObject = call.getCallerObjectId().cStr();
+      KJ_REQUIRE(coworkerd::workerFullName(workerId) && safeName(versionId) && validSha256(contentHash) && validSha256(definitionHash),
+          "invalid Durable Object call: the calling version");
+      KJ_REQUIRE(validSha256(request.target.namespaceId) && validSha256(request.target.objectId) &&
+          coworkerd::environmentName(request.target.className), "invalid Durable Object call: namespace, object id or class");
+      KJ_REQUIRE(!assetsCall && entrypoint.empty(), "a Durable Object call names no entrypoint");
+      try {
+        if (callerObject.empty()) {
+          KJ_REQUIRE(callerNamespace.empty(), "invalid Durable Object call: a caller namespace without an object");
+          KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
+              expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's call tree");
+          auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence, expiresAtMonotonicMs);
+          expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
+          allocation.timing = timing;
+          if (!server.perCallForTest() && !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
+            auto reason = "Durable Object call: the calling version disagrees with its lease's version pins";
+            server.rejectPinMismatch(reason);
+            server.observeLocalRefusal(server.refusal("VERSION_PIN_MISMATCH", reason, 409), "durableObject");
+            context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, 409, "Conflict",
+                "VERSION_PIN_MISMATCH", reason, expiresAtMonotonicMs));
+            co_return;
+          }
+          request.allocation = std::move(allocation);
+        } else {
+          KJ_REQUIRE(validSha256(callerNamespace) && validSha256(callerObject), "invalid Durable Object call: the calling object");
+          request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
+        }
+      } catch (const kj::Exception& error) {
+        std::string reason = error.getDescription().cStr();
+        const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
+        const bool expired = reason.find("lease expired before execution") != std::string::npos;
+        if (!budget && !expired) throw;
+        auto detail = server.lastRejectionReason();
+        if (detail.empty()) detail = reason;
+        const char* code = budget ? "SUBREQUEST_BUDGET_EXHAUSTED" : "LEASE_EXPIRED";
+        server.observeLocalRefusal(server.refusal(code, detail, budget ? 429 : 410), "durableObject");
+        context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, budget ? 429 : 410,
+            budget ? "Too Many Requests" : "Gone", code, std::move(detail), expiresAtMonotonicMs));
+        co_return;
+      }
+      auto dispatched = co_await durable.dispatch(std::move(request));
+      context.initResults().setDispatcher(std::move(dispatched.dispatcher));
+      co_return co_await std::move(dispatched.ready);
+    }
     KJ_REQUIRE(coworkerd::workerFullName(workerId), "invalid bound workerId");
     KJ_REQUIRE(safeName(versionId), "invalid bound versionId");
     KJ_REQUIRE(validSha256(contentHash), "invalid bound contentHash");
@@ -4431,6 +4783,7 @@ private:
   const kj::HttpHeaderTable& headerTable;
   AssetLayer assets;
   BindingDispatch dispatcher;
+  DurableDispatch durable;
 };
 
 class BindingRpcService final: public kj::HttpService {
@@ -4494,15 +4847,19 @@ public:
 
   std::string logJson() const {
     return "{\"posts\":" + std::to_string(logPosts) + ",\"lines\":" + std::to_string(logLines) + ",\"cutLines\":" +
-        std::to_string(logCutLines) + ",\"refusedPosts\":" + std::to_string(logRefusedPosts) + "}";
+        std::to_string(logCutLines) + ",\"refusedPosts\":" + std::to_string(logRefusedPosts) + ",\"eventsOverBudget\":" +
+        std::to_string(server.logEventsOverBudgetCount()) + "}";
   }
 
 private:
   // A Worker's console lines, from the runtime of one of this node's processes (runtime/runtime.js, TenantLog: the
-  // tail channel workerd gives each Worker it loads, bound to that Worker's identity by the runtime; only the
-  // runtimes reach this socket). They are kept as that Worker's lines (WorkerdOutput::appendTenantLines); what a line
-  // says never decides whose it is. Lines beyond what one append carries are cut and counted.
+  // streaming tail workerd gives each Worker it loads, bound to that Worker's identity by the runtime; only the
+  // runtimes reach this socket), as they are written, with the invocation they belong to. They are kept as that
+  // Worker's lines (WorkerdOutput::appendTenantLines); what a line says never decides whose it is. An event's lines past
+  // 256 KB (ServerCore::chargeLogLine) and lines beyond what one append carries are cut and counted.
   static constexpr size_t MAX_LOG_POST_BYTES = 16 * 1024 * 1024, MAX_LOG_APPEND_BYTES = 2 * 1024 * 1024;
+  static constexpr const char* LOG_EVENT_EXCEEDED = "Log size limit exceeded: more than 256 KB of lines in one event (a request, "
+      "a request to a Durable Object, or a message of a WebSocket connection); the event's later lines are not kept";
   kj::Promise<void> log(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
     const auto processId = queryParameter(url, "processId", true, "/v1/log");
     auto text = co_await body.readAllText(MAX_LOG_POST_BYTES);
@@ -4510,24 +4867,38 @@ private:
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
     const auto workerId = coworkerd::json::text(json, "workerId"), versionId = coworkerd::json::text(json, "versionId");
-    if (!coworkerd::workerFullName(workerId) || !safeName(versionId) || versionId.size() > 255) {
+    const auto invocationField = coworkerd::json::field(json, "invocationId");
+    const std::string invocationId = invocationField.isString() ? invocationField.getString().cStr() : "";
+    if (!coworkerd::workerFullName(workerId) || !safeName(versionId) || versionId.size() > 255 ||
+        !(invocationId.empty() || (safeName(invocationId) && invocationId.size() <= 255))) {
       ++logRefusedPosts;
-      KJ_FAIL_REQUIRE("a log post names an invalid Worker or version");
+      KJ_FAIL_REQUIRE("a log post names an invalid Worker, version or invocation");
     }
     auto entries = coworkerd::json::field(json, "lines");
-    KJ_REQUIRE(entries.isArray(), "a log post holds {workerId, versionId, lines}");
+    KJ_REQUIRE(entries.isArray(), "a log post holds {workerId, versionId, invocationId, lines}");
     std::string lines;
     uint64_t kept = 0, cut = 0;
+    ServerCore::LogBudget own;
+    auto append = [&](const std::string& name, std::string_view text) {
+      auto line = "{\"workerId\":\"" + workerId + "\",\"versionId\":\"" + versionId + "\",\"level\":\"" + name + "\",\"message\":\"" +
+          jsonEscape(std::string(text)) + "\"}\n";
+      if (lines.size() + line.size() > MAX_LOG_APPEND_BYTES) { ++cut; return; }
+      lines += line;
+      ++kept;
+    };
     for (auto entry : entries.getArray()) {
       auto level = coworkerd::json::field(entry, "level"), text = coworkerd::json::field(entry, "message");
       if (!level.isString() || !text.isString()) { ++cut; continue; }
       const std::string name(level.getString().cStr());
       if (name != "debug" && name != "info" && name != "log" && name != "warn" && name != "error") { ++cut; continue; }
-      auto line = "{\"workerId\":\"" + workerId + "\",\"versionId\":\"" + versionId + "\",\"level\":\"" + name + "\",\"message\":\"" +
-          jsonEscape(std::string(text.getString().begin(), text.getString().size())) + "\"}\n";
-      if (lines.size() + line.size() > MAX_LOG_APPEND_BYTES) { ++cut; continue; }
-      lines += line;
-      ++kept;
+      const std::string_view value(text.getString().begin(), text.getString().size());
+      bool warn = false;
+      if (!server.chargeLogLine(invocationId, value.size(), own, warn)) {
+        ++cut;
+        if (warn) append("warn", LOG_EVENT_EXCEEDED);
+        continue;
+      }
+      append(name, value);
     }
     ++logPosts;
     logLines += kept;
@@ -5097,6 +5468,16 @@ private:
             else if (request.routed) verdict = {"ENTRYPOINT_MISSING", "", "there is no default export, and the Worker has routes"};
             else if (!named.empty()) verdict.message = "no default export; named entrypoints serve fetch: " + names;
             else verdict = {"ENTRYPOINT_MISSING", "", "there is no default export and no other entrypoint that serves fetch"};
+            // Every Durable Object class the version declares is an exported class that extends DurableObject or has fetch.
+            if (auto classes = field(json, "durableObjectClasses"); verdict.category.empty() && classes.isArray()) {
+              for (auto entry : classes.getArray()) {
+                auto usable = field(entry, "usable"), name = field(entry, "name"), why = field(entry, "reason");
+                if (usable.isBoolean() && usable.getBoolean()) continue;
+                verdict = {"ENTRYPOINT_MISSING", "", "the Durable Object class " + std::string(name.isString() ? name.getString().cStr() : "?") +
+                    " " + (why.isString() ? why.getString().cStr() : "cannot be used")};
+                break;
+              }
+            }
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
             verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
@@ -5948,6 +6329,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
       << ",\"ingress\":{\"webSocketsPerTenant\":" << c.webSocketsPerTenant << "}"
+      << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
       << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
       << "},\"logs\":{\"tenantBufferBytes\":" << c.logs.tenantBufferBytes << ",\"totalBufferBytes\":" << c.logs.totalBufferBytes

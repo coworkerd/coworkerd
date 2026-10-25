@@ -27,8 +27,66 @@ keeps for its life. Outgoing WebSockets (a Worker's `fetch()` upgrade, through t
   client whose ingress lost the node its connection ran on sees an abnormal closure (`1006`).
 - **Usage and logs**: a connection counts as one request; its CPU is metered while its messages run (workerd reports a
   lasting request's CPU at most once a second), not only when it closes; the lines its handlers write reach the tenant's
-  logs only when it closes, as a call's do when it ends -- a known limitation.
+  logs as each message runs (log lines below).
 - **Configuration**: `ingress.webSocketsPerTenant` (1000; `0`: no limit).
+
+Durable Objects, in development: their first part, on one node. A wrangler project's `durable_objects` and `migrations`
+convert, versions carry their Bindings and classes, and the node that receives a call to an object runs it, with the
+object's SQLite database on its disk. Not a release yet: ownership, calls across nodes and persistence to the object
+store come next, and until then each node of a cluster of several would keep its own copy of an object.
+
+- **Conversion and versions**: `durable_objects.bindings` (`name`, `class_name`; a `script_name` only when it names the
+  Worker itself) and `migrations` in their order -- `new_sqlite_classes` and `new_classes` both declare a SQLite class,
+  `renamed_classes`, `deleted_classes`; a class of another Worker and `transferred_classes` are refused. A version
+  definition gains `durableObjects` and `classes`; the control plane checks that each Binding's class is declared and its
+  name taken by nothing else in `env`, and the trial load that each declared class is exported, extending
+  `DurableObject` or with `fetch` (`LOAD_FAILED`, `ENTRYPOINT_MISSING`, naming the class).
+- **Namespaces**: the control plane makes a class's namespace id (32 random bytes) at the first upload that declares the
+  class and keeps it for that name in later versions; `renamed_classes` moves it to the new name and `deleted_classes`
+  marks it `deleting`, after which no version declares or binds the class again (its data is kept). `GET
+  .../workers/{w}` lists the namespaces, and a tenant has at most `durableObjectNamespaces` of them (16; `422
+  QUOTA_EXCEEDED`).
+- **The durable process group**: `d0`, ... (`durableObjects.processes`, 1 by default), of class `durable`, never replaced
+  for age or requests -- only when the workerd file changes, by hand, or at the resident threshold, and then one at a
+  time: the old generation drains and its objects' requests in flight complete, and new requests wait up to 5 s for the
+  next generation (`503 DO_UNAVAILABLE` beyond). Its runtime adds the `Host` class, a SQLite-backed Durable Object
+  namespace stored in the node's `<stack>/do/` directory, which the launcher binds writable into the sandbox.
+- **Objects**: a namespace Binding has `idFromName` (the SHA-256 of the namespace id, `name` and the name),
+  `newUniqueId`, `idFromString`, `get` and `getByName`, and a stub's `fetch` -- WebSocket upgrades included -- reaches the
+  node, which runs the request on the object's durable process: the object's `Host` runs the Worker's class as a facet,
+  from the version's isolate under the same loader key as its stateless calls, with a SQLite database of its own
+  (`ctx.storage.sql`, the key-value methods, transactions). A class's `env` holds the version's variables and secrets and
+  the Worker's Durable Object Bindings; there are no RPC methods, alarms or hibernation, and no Service Bindings in a
+  class. After a version is activated, an object's next request runs the new class on the same data.
+- **Failures and limits**: each request to an object and each message of a connection to it runs with the request's
+  CPU limit, the memory limit is the version's isolate's. An exception the class throws leaves the object as it is --
+  the same instance takes the next request -- and the caller's `fetch()` answers `500 EXECUTION_FAILED` with its
+  message; a request over a limit aborts the object -- `503` with `CPU_LIMIT_EXCEEDED` or `MEMORY_LIMIT_EXCEEDED` -- and
+  the next request constructs it again with its data (the limit restarts every object of the version on that node). A
+  stateless Worker's call to an object is a Binding call of its tree; an object's calls to objects start trees of their
+  own, at most 8 in a row (`508 DO_HOP_LIMIT`). Each request writes a `[do]` line (the class, the first 12 digits of the
+  namespace and object ids, the process, the outcome) and counts in usage as a request.
+- **Measured** on one node of a Mac: an object's first request 57 ms (the version's isolate loaded in the durable process,
+  the class constructed), then 2 ms (the median of 19), and 11 ms with its data after `d0` was killed and started again;
+  10,000 messages to one object on one connection in 5.4 s, 5.0 s of CPU together and none ended; the request after a
+  CPU overrun 7 ms, the object constructed again with its data, and after an exception 2 ms, on the same instance; eight
+  calls in a row between objects 72 ms, a ninth refused; a manual rotation of `d0` let a request in flight on an object
+  finish (the drain took 1.7 s) and started the next generation 33 ms after the old one exited, while a request that
+  came meanwhile waited 1.8 s for it; an object's 21 message lines were in the tenant's logs 8 ms after the last, its
+  connections open.
+
+Log lines arrive as they are written: a Worker's `console.*` lines reach the tenant's logs while its request runs --
+each message of a WebSocket connection's as the message runs -- instead of when the request ends. The tail workerd gives
+each Worker is a streaming one, which its Worker Loader allows only when the runtime runs with workerd's `experimental`
+compatibility flag; tenants' own flags still come from the non-experimental list, so what their code can do does not
+change. workerd's cap of 256 KB a request does not apply to a streaming tail, so the node keeps it per event -- a
+request, or a message of a connection; an object's events are its requests and its connections' messages together --
+and puts one warning line in place of an event's lines past it (`tenantLogPosts.eventsOverBudget` in the state).
+
+Fixed: with the launcher, every workerd generation's start logged `[process-pool] task failed: epoll_ctl(... EPOLL_CTL_DEL
+...): Bad file descriptor` (since 0.3.0): the launcher's status socket was closed before its observer left the event
+loop. The observer goes first now: on Linux with the launcher, 0.4.1's node logged the line at each of six generation
+starts, this one at none of eight.
 
 ## 0.4.1
 

@@ -3,6 +3,7 @@
 #include <kj/async-io.h>
 #include <kj/compat/http.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <map>
@@ -34,6 +35,19 @@ struct BindingDefinition {
 
 struct EnvironmentVariable { std::string name, type, value; };
 
+// A Durable Object namespace Binding (v2): its name in env and one of the version's own classes (a class of another
+// Worker is not supported).
+struct DurableObjectBindingDefinition {
+  std::string binding, className;
+  bool operator==(const DurableObjectBindingDefinition&) const = default;
+};
+struct DurableObjectRename {
+  std::string from, to;
+  bool operator==(const DurableObjectRename&) const = default;
+};
+// At most this many classes a version names (declared, deleted and renamed together) and Bindings it has.
+inline constexpr size_t MAX_DURABLE_OBJECT_CLASSES = 64;
+
 struct VersionDefinition {
   // The Worker's full name, <tenant>/<worker>: part of the definition's identity, so the same code of two
   // tenants has two definitions. Bindings name full names of the same tenant.
@@ -58,6 +72,12 @@ struct VersionDefinition {
   // Names of the secrets the version reads from env (v2). The definition holds
   // names only; values live under secrets/<workerId>/<name>.
   std::vector<std::string> secrets;
+  // Durable Objects (v2): the namespace Bindings, and the classes the version's migrations leave -- declared (every one a
+  // SQLite class), deleted, and the renames in the order the migrations made them. The control plane gives each class a
+  // namespace, kept by its name from version to version (a rename moves it), in the tenant's manifest.
+  std::vector<DurableObjectBindingDefinition> durableObjects;
+  std::vector<std::string> declaredClasses, deletedClasses;
+  std::vector<DurableObjectRename> renamedClasses;
   // Input location only; excluded from immutable identity and authority state.
   std::filesystem::path packagePath;
   std::string key() const { return workerId + "@" + versionId; }
@@ -67,6 +87,12 @@ struct VersionDefinition {
   const BindingDefinition* assetsBinding() const {
     for (const auto& binding : bindings) if (binding.assets) return &binding;
     return nullptr;
+  }
+  bool hasDurableObjects() const {
+    return !durableObjects.empty() || !declaredClasses.empty() || !deletedClasses.empty() || !renamedClasses.empty();
+  }
+  bool declares(const std::string& className) const {
+    return std::find(declaredClasses.begin(), declaredClasses.end(), className) != declaredClasses.end();
   }
 };
 
@@ -105,6 +131,10 @@ std::string definitionJson(const VersionDefinition& version);
 // when not empty.
 std::string versionStatusJson(const VersionDefinition& version, const std::string& extra = {});
 std::string routesJson(const std::vector<RouteDefinition>& routes);
+// A version's Durable Object Bindings ([{"binding","className"}], by name) and classes ({"declared","deleted","renamed"}),
+// as its definition holds them.
+std::string durableObjectsJson(const VersionDefinition& version);
+std::string durableClassesJson(const VersionDefinition& version);
 // A request's host as routes and tenants' hostnames are compared with it: lower case, without a final dot.
 std::string requestHost(const std::string& host);
 // A tenant's route under the default host * as the control plane writes it: /<tenant> becomes /<tenant>/, so that
@@ -134,12 +164,23 @@ std::string deploymentActiveKey(const std::string& workerId);
 std::string deploymentDefinitionKey(const std::string& workerId, const std::string& versionId);
 std::string deploymentBinderKey(const std::string& target, const std::string& binder);
 std::string deploymentSecretKey(const std::string& workerId, const std::string& name);
+// <tenant>/namespaces/<worker>: the Worker's Durable Object namespaces, {"<class>":{"id","status"},...}.
+std::string deploymentNamespacesKey(const std::string& workerId);
 // "<tenant>/": the prefix of a tenant's keys.
 std::string deploymentTenantPrefix(const std::string& tenant);
 // The active pointer {versionId, definitionHash[, limits]}: a Worker's own limits travel with it.
 std::string activePointerJson(const std::string& versionId, const std::string& definitionHash, const WorkerLimits& limits = {});
 std::string routeValueJson(const RouteDefinition& route);
 std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::string& bytes);
+
+// A Durable Object namespace as the nodes use it: its id (32 random bytes, hexadecimal, made by the control plane) and
+// status ("active", or "deleting": no new request and no Binding to it).
+struct DurableObjectNamespace {
+  std::string id, status = "active";
+  bool operator==(const DurableObjectNamespace&) const = default;
+};
+std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces);
+std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes);
 
 // One secret value as stored: {"value":<string>,"setAtUnixMs":<ms>}. A value is
 // UTF-8 text without NUL, at most MAX_SECRET_BYTES. Reasons never carry the value.
@@ -272,6 +313,9 @@ public:
   std::string secretsStatusField(const VersionDefinition& version) const;
   // Every secret key's record by Worker and name, usable or not.
   const std::map<std::string, std::map<std::string, SecretValue>>& secrets() const { return secretMap; }
+  // A Worker's Durable Object namespaces by class (the <tenant>/namespaces/<worker> key: the tenant manifest's), or null.
+  const std::map<std::string, DurableObjectNamespace>* namespaces(const std::string& workerId) const;
+  const DurableObjectNamespace* durableNamespace(const std::string& workerId, const std::string& className) const;
 
 private:
   uint64_t revisionValue = 0;
@@ -287,6 +331,7 @@ private:
   std::set<std::string> invalidWorkers, invalidRoutes, invalidDefinitions;
   std::set<std::string> unknownKeys, binderKeys;
   std::map<std::string, std::map<std::string, SecretValue>> secretMap;  // workerId -> name -> record
+  std::map<std::string, std::map<std::string, DurableObjectNamespace>> namespaceMap;  // workerId -> class -> namespace
   size_t secretKeys = 0, unusableSecrets = 0;
   bool requireSecretValues = true;
   size_t validWorkers = 0, effectiveRoutes = 0;

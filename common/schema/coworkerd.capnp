@@ -164,6 +164,14 @@ struct ServerConfig {
   gc @41 :GcConfig;
   # The ingress's inbound WebSocket connections (docs/compatibility.md, section 7).
   ingress @42 :IngressConfig;
+  # Durable Objects (docs/compatibility.md, section 7): the workerd processes that run them on this node.
+  durableObjects @43 :DurableObjectsConfig;
+
+  struct DurableObjectsConfig {
+    # The durable processes d0, d1, ...: each object runs in one of them, chosen by the object's id. They are not replaced
+    # with age; they rotate when the workerd file changes, by hand and at rotation.residentBytes, each draining first.
+    processes @0 :UInt32 = 1;
+  }
 
   struct IngressConfig {
     # The open WebSocket connections this node's ingress holds for one tenant: an upgrade beyond them is refused before
@@ -535,6 +543,26 @@ struct VersionPin {
   definitionHash @3 :Text;
 }
 
+# A version's Durable Object namespace Binding (wrangler's durable_objects.bindings): its name in env and one of the
+# version's own classes.
+struct DurableObjectBinding {
+  binding @0 :Text;
+  className @1 :Text;
+}
+
+# The Durable Object classes a version's migrations leave, applied in order: those declared (every class is a SQLite
+# class), those deleted, and every rename from one class to another.
+struct DurableObjectClasses {
+  declared @0 :List(Text);
+  deleted @1 :List(Text);
+  renamed @2 :List(Rename);
+
+  struct Rename {
+    from @0 :Text;
+    to @1 :Text;
+  }
+}
+
 struct DeploymentDefinition {
   workerId @0 :Text;
   versionId @1 :Text;
@@ -550,6 +578,9 @@ struct DeploymentDefinition {
   # Names of the secrets the version reads from env (v2 only); their values are
   # set separately under secrets/<workerId>/<name> and never part of a definition.
   secrets @11 :List(Text);
+  # The version's Durable Object Bindings and classes (v2 only).
+  durableObjects @12 :List(DurableObjectBinding);
+  classes @13 :DurableObjectClasses;
 }
 
 # The value of a secret's deployment key secrets/<workerId>/<name>: the secret string and when it
@@ -624,6 +655,8 @@ struct Manifest {
     packagePath @9 :Text;
     assets @10 :DeploymentAssets;
     secrets @11 :List(Text);
+    durableObjects @12 :List(DurableObjectBinding);
+    classes @13 :DurableObjectClasses;
   }
 
   struct Binding {
@@ -676,6 +709,14 @@ struct InvocationDescriptor {
   # and memory limits take them from there. The ceiling against the tenant's maximum is the control plane's.
   cpuLimitMs @26 :UInt32;
   memoryLimitMiB @27 :UInt32;
+  # The version's Durable Object namespace Bindings: each one's name, class and namespace id (empty while the namespace
+  # cannot be used: none for the class, or being deleted).
+  durableObjects @28 :List(DurableObjectNamespace);
+  # A request to an object, which the runtime of a durable process hands to the object's Host: the object's namespace,
+  # id and class, and how many Durable Object calls led to it (0 from a stateless Worker).
+  durableObject @29 :DurableObjectTarget;
+  # A trial load (and a load check): the Durable Object classes the version declares, checked among its exports.
+  durableObjectClasses @30 :List(Text);
 
   struct Binding {
     name @0 :Text;
@@ -690,6 +731,19 @@ struct InvocationDescriptor {
   struct Secret {
     name @0 :Text;
     value @1 :Text;
+  }
+
+  struct DurableObjectNamespace {
+    name @0 :Text;
+    className @1 :Text;
+    namespaceId @2 :Text;
+  }
+
+  struct DurableObjectTarget {
+    namespaceId @0 :Text;
+    objectId @1 :Text;
+    className @2 :Text;
+    hops @3 :UInt16;
   }
 }
 
@@ -713,4 +767,15 @@ struct BindingDescriptor {
   entrypoint @10 :Text;
   # A call of the ASSETS Binding: answered by the asset layer of this version.
   assets @11 :Bool;
+  # A call to a Durable Object of this Worker: its namespace, class and object id; from an object, that object's
+  # namespace and id (a stateless Worker's call names its call tree instead).
+  durableObject @12 :DurableObjectCall;
+
+  struct DurableObjectCall {
+    namespaceId @0 :Text;
+    className @1 :Text;
+    objectId @2 :Text;
+    callerNamespaceId @3 :Text;
+    callerObjectId @4 :Text;
+  }
 }
