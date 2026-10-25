@@ -26,6 +26,9 @@ struct Member {
   // objectStore: its heartbeat's LastModified and how far it was behind the Date of the listing that last saw it.
   uint64_t heartbeatUnixMs = 0;
   int64_t heartbeatAgeMs = 0;
+  // objectStore: its durable processes (durableObjects.processes, from its heartbeat): a member with none is no Durable
+  // Object shard's default owner.
+  uint32_t durableProcesses = 1;
 };
 
 // All access takes place on the Server's KJ event loop. Request handling only
@@ -69,6 +72,11 @@ struct MembershipView {
   uint32_t heartbeatIntervalMs = 0, listIntervalMs = 0, livenessGraceMs = 0, clockSkewToleranceMs = 0, createSettleMs = 0;
   uint64_t heartbeatsWritten = 0, heartbeatFailures = 0, lists = 0, listFailures = 0, addressReads = 0;
   uint64_t lastHeartbeatAtUnixMs = 0, lastListAtUnixMs = 0, lastListMembers = 0, ignoredKeys = 0;
+  // The Date of the store's answer to the last listing that applied (the store's clock): what the member table knows is
+  // as of then.
+  uint64_t lastListDateUnixMs = 0;
+  // This node's durable processes, as its heartbeat announces them.
+  uint32_t durableProcesses = 1;
   // Past the TTL without a heartbeat written, by this node's monotonic clock: the others drop it, and it places on
   // itself only when no other member takes a call (the calls addressed to an epoch it held are still served), until it
   // registers a new epoch.
@@ -128,6 +136,8 @@ public:
   // listing cycle, and at the start this node's own of its earlier epochs before they are removed. (nullptr: none.)
   using SuspectsCallback = std::function<void(const std::string& nodeId, const std::string& epoch, const std::string& bytes)>;
   virtual void onSuspects(SuspectsCallback callback) {}
+  // objectStore: the durable processes this node runs, announced in its heartbeats (set before start()).
+  virtual void setDurableProcesses(uint32_t count) {}
 };
 
 kj::Own<Membership> newMembership(

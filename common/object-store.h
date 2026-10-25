@@ -95,7 +95,7 @@ struct CreateResult {
 // Credentials are never included in diagnostics. This client deliberately uses
 // only path addressing and signed, single-chunk payloads, without an AWS SDK.
 // Keys: content by hash under bundles/, definitions/, modules/ and packages/ (lower-case hexadecimal paths), and
-// the cluster's state under members/, cluster/, tenants/ and nodes/ (and check/, `coworkerd check`'s probes): '/'-separated segments of letters,
+// the cluster's state under members/, cluster/, tenants/, nodes/ and do/ (and check/, `coworkerd check`'s probes): '/'-separated segments of letters,
 // digits, '.', '_' and '-', none of them "." or "..". Only the S3 backend keeps state: create, list and remove
 // refuse the directory backend.
 class ObjectStore {

@@ -239,7 +239,7 @@ std::string memberRecordJson(const MemberRecord& record) {
   return "{\"nodeId\":" + quote(record.nodeId) + ",\"epoch\":" + quote(std::to_string(record.epoch)) +
       ",\"address\":" + quote(record.address) + ",\"startedAtUnixMs\":" + std::to_string(record.startedAtUnixMs) +
       ",\"state\":" + quote(record.state) + ",\"writtenAtUnixMs\":" + std::to_string(record.writtenAtUnixMs) +
-      ",\"instance\":" + quote(record.instance) + "}";
+      ",\"instance\":" + quote(record.instance) + ",\"durableProcesses\":" + std::to_string(record.durableProcesses) + "}";
 }
 
 std::optional<MemberRecord> parseMemberRecord(const std::string& bytes, std::string* error) {
@@ -265,6 +265,10 @@ std::optional<MemberRecord> parseMemberRecord(const std::string& bytes, std::str
         std::pair{"writtenAtUnixMs", &record.writtenAtUnixMs}}) {
       auto value = json::field(reader, name);
       if (value.isNumber() && value.getNumber() > 0) *target = static_cast<uint64_t>(value.getNumber());
+    }
+    if (auto durable = json::field(reader, "durableProcesses"); durable.isNumber()) {
+      KJ_REQUIRE(durable.getNumber() >= 0 && durable.getNumber() <= 64, "invalid member durableProcesses");
+      record.durableProcesses = static_cast<uint32_t>(durable.getNumber());
     }
     return record;
   } catch (const kj::Exception& exception) {

@@ -382,6 +382,7 @@ const limit = (value) =>
   value === undefined || (Number.isInteger(value) && value >= 0 && value <= 4294967295);
 
 const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const DECIMAL = /^[0-9]{1,20}$/;
 // The descriptor's Durable Object fields, when present: the version's namespace Bindings, a request's object, the
 // declared classes.
 function durableFieldsValid(value) {
@@ -389,7 +390,9 @@ function durableFieldsValid(value) {
   if (bindings !== undefined && !(Array.isArray(bindings) && bindings.every(b => b !== null && typeof b === "object" &&
       typeof b.name === "string" && CLASS_NAME.test(b.className ?? "") && (b.namespaceId === "" || SHA256_HEX.test(b.namespaceId ?? ""))))) return false;
   if (target !== undefined && !(target !== null && typeof target === "object" && SHA256_HEX.test(target.namespaceId ?? "") &&
-      SHA256_HEX.test(target.objectId ?? "") && CLASS_NAME.test(target.className ?? "") && Number.isInteger(target.hops ?? 0))) return false;
+      SHA256_HEX.test(target.objectId ?? "") && CLASS_NAME.test(target.className ?? "") && Number.isInteger(target.hops ?? 0) &&
+      Number.isInteger(target.shard ?? 0) && DECIMAL.test(String(target.shardEpoch ?? "0")) &&
+      DECIMAL.test(String(target.dataEpoch ?? "0")))) return false;
   if (classes !== undefined && !(Array.isArray(classes) && classes.every(name => typeof name === "string" && CLASS_NAME.test(name)))) return false;
   return true;
 }
@@ -688,7 +691,7 @@ function facetCode(error) {
 }
 
 // A Durable Object (docs/compatibility.md, section 7) on a durable process. Each object is a Host -- this runtime's own
-// SQLite-backed class, its id HOST.idFromName(<namespace id>/<object id>) -- that runs the Worker's class as its facet
+// SQLite-backed class, its id HOST.idFromName(<namespace id>/<object id>/<data epoch>) -- that runs the Worker's class as its facet
 // "app", with the facet's own SQLite. The class comes from the Worker Loader's isolate of the version, under the same
 // loader key as the version's stateless calls, so the tenant's code runs in that dynamic isolate with its limits: CPU
 // topped up at every event, memory per isolate. The Host remembers the key its facet started with: a request of another
@@ -865,11 +868,15 @@ export default {
     }
     const descriptor = descriptorFrom(request);
     if (descriptor.trial === true) return trialLoad(descriptor, env, ctx);
-    // A request to an object: its Host, on this durable process.
+    // A request to an object: its Host, on this durable process. The Host is named by the object and the epoch since which
+    // this node's copy of the object's shard is the one (the node's data epoch for it): a shard this node took over from
+    // another node starts its objects from empty, one it took back from itself keeps them.
     if (descriptor.durableObject) {
       if (!env.HOST) throw new Error("A Durable Object request reached a process without Durable Objects");
       const target = descriptor.durableObject;
-      return env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId)).fetch(request);
+      const dataEpoch = String(target.dataEpoch ?? "0");
+      return env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
+        (dataEpoch === "0" ? "" : "/" + dataEpoch))).fetch(request);
     }
     const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
     const key = loaderKey(descriptor);

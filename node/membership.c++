@@ -133,6 +133,8 @@ public:
 
   void onSuspects(SuspectsCallback callback) override { suspectsCallback = std::move(callback); }
 
+  void setDurableProcesses(uint32_t count) override { state.durableProcesses = count; }
+
   kj::Promise<void> writeSuspects(std::string bytes) override {
     KJ_REQUIRE(epoch && !stopping && !state.identityTaken && !state.selfExpired, "no live epoch to write the suspects object for",
         serverId.c_str());
@@ -316,12 +318,13 @@ private:
     record.epoch = epoch;
     record.startedAtUnixMs = startedAtUnixMs;
     record.writtenAtUnixMs = nowUnixMs();
+    record.durableProcesses = state.durableProcesses;
     return record;
   }
 
   Member selfMember() const {
     return {serverId, config.advertisedAddress, std::to_string(epoch), startedAtUnixMs, state.draining ? "draining" : "active",
-        state.lastHeartbeatAtUnixMs, 0};
+        state.lastHeartbeatAtUnixMs, 0, state.durableProcesses};
   }
 
   kj::Promise<std::pair<ObjectListing, ClockSample>> timedList(std::string prefix) {
@@ -649,6 +652,7 @@ private:
     lastListOk = listedAt;
     ++state.lists;
     state.lastListAtUnixMs = nowUnixMs();
+    state.lastListDateUnixMs = sample.dateUnixMs;
     state.storeClient = store.stats().json();
     state.watchConnected = true;
     if (realClockUnixMs() - state.clockCheckedAtUnixMs >= CLOCK_RECHECK_MS) noteClock(sample, false);
@@ -697,7 +701,7 @@ private:
       auto record = co_await addressOf(live.id, live.epoch);
       if (!record) continue;
       next[live.id] = {live.id, record->address, std::to_string(live.epoch), record->startedAtUnixMs,
-          live.draining ? "draining" : "active", live.heartbeatUnixMs, live.ageMs};
+          live.draining ? "draining" : "active", live.heartbeatUnixMs, live.ageMs, record->durableProcesses};
     }
     std::erase_if(addresses, [&](const auto& entry) { return !seen.contains(entry.first); });
     // The suspects objects ride this listing: a live member's is read only when its ETag changed since the last read.
@@ -810,20 +814,26 @@ private:
   }
 
   // Whether the store's create-if-absent holds under concurrency (4 writers, 5 rounds, under members/<id>/probe/):
-  // reported in the log and the state endpoint; a store where it does not hold is warned of, not refused.
+  // reported in the log and the state endpoint; a store where it does not hold is warned of, not refused. A measurement
+  // the store failed is tried again every 5 s until one completes (Durable Objects wait for its answer).
   kj::Promise<void> measure() {
-    try {
-      auto measurement = co_await measureConditionalPut(store, memberProbePrefix(serverId), 4, 5);
-      state.conditionalPutAtomic = measurement.atomic() ? "true" : "false";
-      state.conditionalPutProbe = measurement.json();
-      std::cout << "[membership] {\"event\":\"conditional-put\",\"nodeId\":" << quote(serverId) << ",\"measurement\":"
-                << state.conditionalPutProbe
-                << (measurement.atomic() ? "" : ",\"warning\":\"the object store's create-if-absent did not hold under "
-                    "concurrency: the membership does not rely on it (registrations are read back), but a control plane "
-                    "with more than one instance and Durable Objects would\"") << "}" << std::endl;
-    } catch (const kj::Exception& error) {
-      state.conditionalPutAtomic = std::string("failed: ") + error.getDescription().cStr();
-      failed("conditional put measurement", error);
+    while (!stopping) {
+      try {
+        auto measurement = co_await measureConditionalPut(store, memberProbePrefix(serverId), 4, 5);
+        state.conditionalPutAtomic = measurement.atomic() ? "true" : "false";
+        state.conditionalPutProbe = measurement.json();
+        std::cout << "[membership] {\"event\":\"conditional-put\",\"nodeId\":" << quote(serverId) << ",\"measurement\":"
+                  << state.conditionalPutProbe
+                  << (measurement.atomic() ? "" : ",\"warning\":\"the object store's create-if-absent did not hold under "
+                      "concurrency: the membership does not rely on it (registrations are read back), but a control plane "
+                      "with more than one instance and Durable Objects would: this node takes no Durable Object shard\"")
+                  << "}" << std::endl;
+        co_return;
+      } catch (const kj::Exception& error) {
+        state.conditionalPutAtomic = std::string("failed: ") + error.getDescription().cStr();
+        failed("conditional put measurement", error);
+      }
+      co_await timer.afterDelay(5 * kj::SECONDS);
     }
   }
 };
@@ -842,7 +852,8 @@ std::string MembershipView::json() const {
            << ",\"livenessGraceMs\":" << livenessGraceMs << ",\"createSettleMs\":" << createSettleMs
            << ",\"heartbeatsWritten\":" << heartbeatsWritten << ",\"heartbeatFailures\":" << heartbeatFailures
            << ",\"lastHeartbeatAtUnixMs\":" << lastHeartbeatAtUnixMs << ",\"lists\":" << lists << ",\"listFailures\":" << listFailures
-           << ",\"lastListAtUnixMs\":" << lastListAtUnixMs << ",\"lastListMembers\":" << lastListMembers
+           << ",\"lastListAtUnixMs\":" << lastListAtUnixMs << ",\"lastListDateUnixMs\":" << lastListDateUnixMs
+           << ",\"lastListMembers\":" << lastListMembers << ",\"durableProcesses\":" << durableProcesses
            << ",\"addressReads\":" << addressReads << ",\"ignoredKeys\":" << ignoredKeys
            << ",\"selfExpired\":" << (selfExpired ? "true" : "false") << ",\"selfExpiries\":" << selfExpiries
            << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"recoveries\":" << recoveries
@@ -873,7 +884,7 @@ std::string MembershipView::json() const {
       auto value = memberJson(member);
       value.pop_back();
       output << (index++ ? "," : "") << value << ",\"heartbeatUnixMs\":" << member.heartbeatUnixMs
-             << ",\"heartbeatAgeMs\":" << member.heartbeatAgeMs << "}";
+             << ",\"heartbeatAgeMs\":" << member.heartbeatAgeMs << ",\"durableProcesses\":" << member.durableProcesses << "}";
     }
     output << "]}";
     return output.str();

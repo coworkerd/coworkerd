@@ -136,9 +136,12 @@ IdentityUse identityUse(const ListedNode& node, uint64_t dateUnixMs, uint32_t tt
 
 // A heartbeat's value (and, without address and state, a registration's). `instance` names the process that wrote
 // it: a random value of each Membership, never reused, so that a process can tell its own objects from another's.
+// `durableProcesses`: how many durable processes the node runs (durableObjects.processes); a node with none takes no
+// Durable Object shard and is no shard's default owner. A record without the field counts as one.
 struct MemberRecord {
   std::string nodeId, address, state = "active", instance;
   uint64_t epoch = 0, startedAtUnixMs = 0, writtenAtUnixMs = 0;
+  uint32_t durableProcesses = 1;
 };
 std::string memberRecordJson(const MemberRecord& record);
 // The record in `bytes`, or none when they are not one (the reason in `error`).

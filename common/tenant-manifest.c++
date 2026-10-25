@@ -455,7 +455,8 @@ std::map<std::string, std::string> tenantStateKeys(const TenantManifest& manifes
     }
     if (!worker.namespaces.empty()) {
       std::map<std::string, DurableObjectNamespace> namespaces;
-      for (const auto& [className, entry] : worker.namespaces) namespaces.emplace(className, DurableObjectNamespace{entry.id, entry.status});
+      for (const auto& [className, entry] : worker.namespaces)
+        namespaces.emplace(className, DurableObjectNamespace{entry.id, entry.status, entry.shards});
       keys.emplace(deploymentNamespacesKey(id), namespacesStateJson(namespaces));
     }
   }

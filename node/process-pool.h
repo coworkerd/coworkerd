@@ -94,6 +94,15 @@ public:
   std::string durableProcessFor(const std::string& objectKey) const;
   bool durableAvailable(const std::string& objectKey);
   std::shared_ptr<ProcessCall> selectDurable(const std::string& objectKey);
+  // The calls in flight on the durable processes (every live generation).
+  uint32_t durableInFlight();
+  // The node no longer owns the objects its durable processes run (its membership expired): each live durable generation
+  // is killed -- what it runs ends with it, the facets of every object among it -- and a new one starts at once, empty.
+  // Not a failure of the process: no backoff, no culprit. Returns how many generations were killed.
+  uint32_t resetDurable(const std::string& reason);
+  // The drain's close of the durable processes alone (as closeAll() closes every process), before the node lets its
+  // shards go: no durable generation starts from then on. Resolves with the record once they exited.
+  kj::Promise<std::string> closeDurable();
   // Usage: the CPU nanoseconds of each tenant's executions since the last call (from the `completed` rows),
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();

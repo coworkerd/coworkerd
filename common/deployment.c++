@@ -458,7 +458,8 @@ std::string deploymentNamespacesKey(const std::string& workerId) {
 std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces) {
   std::string out = "{";
   for (const auto& [name, entry] : namespaces)
-    out += std::string(out.size() > 1 ? "," : "") + quote(name) + ":{\"id\":" + quote(entry.id) + ",\"status\":" + quote(entry.status) + '}';
+    out += std::string(out.size() > 1 ? "," : "") + quote(name) + ":{\"id\":" + quote(entry.id) + ",\"status\":" + quote(entry.status) +
+        ",\"shards\":" + std::to_string(entry.shards) + '}';
   return out + '}';
 }
 std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes) {
@@ -474,6 +475,11 @@ std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::s
     DurableObjectNamespace item;
     item.id = json::text(value, "id");
     item.status = json::text(value, "status");
+    if (auto shards = json::field(value, "shards"); shards.isNumber()) {
+      KJ_REQUIRE(shards.getNumber() >= 1 && shards.getNumber() <= 1048576 && shards.getNumber() == std::floor(shards.getNumber()),
+          "a namespace has 1 to 1048576 shards", name.c_str());
+      item.shards = static_cast<uint32_t>(shards.getNumber());
+    }
     KJ_REQUIRE(hashValid(item.id), "a namespace id is 64 lowercase hexadecimal characters", name.c_str());
     KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting", name.c_str());
     namespaces.emplace(name, std::move(item));

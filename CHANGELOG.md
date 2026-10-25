@@ -31,9 +31,9 @@ keeps for its life. Outgoing WebSockets (a Worker's `fetch()` upgrade, through t
 - **Configuration**: `ingress.webSocketsPerTenant` (1000; `0`: no limit).
 
 Durable Objects, in development: their first part, on one node. A wrangler project's `durable_objects` and `migrations`
-convert, versions carry their Bindings and classes, and the node that receives a call to an object runs it, with the
-object's SQLite database on its disk. Not a release yet: ownership, calls across nodes and persistence to the object
-store come next, and until then each node of a cluster of several would keep its own copy of an object.
+convert, versions carry their Bindings and classes, and the node that runs an object keeps the object's SQLite database
+on its disk. Not a release yet: one owner per shard across the cluster follows (below), persistence to the object store
+comes next.
 
 - **Conversion and versions**: `durable_objects.bindings` (`name`, `class_name`; a `script_name` only when it names the
   Worker itself) and `migrations` in their order -- `new_sqlite_classes` and `new_classes` both declare a SQLite class,
@@ -74,6 +74,52 @@ store come next, and until then each node of a cluster of several would keep its
   finish (the drain took 1.7 s) and started the next generation 33 ms after the old one exited, while a request that
   came meanwhile waited 1.8 s for it; an object's 21 message lines were in the tenant's logs 8 ms after the last, its
   connections open.
+
+Durable Objects across the cluster: one owner per shard. A namespace's objects fall into its shards (1024, an object's by
+the first 8 bytes of its id), and each shard has one owner at a time -- the node that created the shard's latest epoch,
+`do/<namespace>/shards/<shard>/epochs/<n>`, an object of the store created only if absent -- which runs the shard's
+objects; the other nodes send it their requests through the peer session, WebSocket upgrades included. The objects' data
+still stays on the owner's disk: **when another node takes a shard over, its objects start again from empty there**;
+persistence comes next.
+
+- **Taking a shard**, when a request to one of its objects first comes: a shard without an epoch goes to its default
+  owner -- the first, in the rendezvous order of `<namespace>/<shard>`, of the members that run durable processes and
+  are not draining --, to which the other nodes send the request; only when it refuses or cannot be reached does another
+  node take it, after 200 to 500 ms and a fresh read. A shard whose owner's membership expired -- a TTL plus the grace
+  after its last heartbeat, by the store's clock -- or that its owner released is taken over by the default owner among
+  the others, the others waiting their rank times 1 s; a node started again under its id takes its own shards back at
+  once, with their data. A create whose answer was lost is read back: the writer's instance and a random value in its
+  bytes say whose it is. The owner hint `do/<namespace>/shards/<shard>/owner` names the latest epoch; a missing or wrong
+  hint costs a listing of the shard's epochs and is written again.
+- **The check**: a request names the shard's epoch its node expects, and the owner refuses any other, `409
+  DO_SHARD_EPOCH_MISMATCH`; the caller's node then reads the shard again and sends the request once more. A refusal or a
+  connection not made is retried that once; an answer lost after the request was sent is `RESULT_UNCERTAIN`. A node
+  caches the owners it found until a request is refused, the owner's membership expires, the shard turns out released, or
+  60 s pass without a request confirming it.
+- **Expiry and drain**: a node whose own membership expires gives its shards up at once -- `503 DO_OWNER_EXPIRED`, its
+  objects' WebSocket connections closed with `1001`, its durable processes started again empty -- before any other node
+  may take them over, and keeps serving stateless calls; back with a new membership epoch it does not take back what
+  others took. A draining node answers `503 DO_OWNER_DRAINING`, closes its objects' connections with `1001`, lets their
+  requests in flight finish, closes its durable processes and writes a release marker beside each shard's epoch: the next
+  owner takes the shard at once, while the rest of the drain goes on, and the drain record counts the shards.
+- **Stores and nodes**: a node takes no shard on a store whose create-if-absent does not hold under concurrency (`503
+  DO_UNSUPPORTED_STORE`); without the store it serves the shards it holds until its membership expires, and a request
+  whose owner it cannot find fails with `503 STORAGE_UNAVAILABLE`. A node with `durableObjects.processes` `0` runs no
+  durable process, takes no shard and is no default owner; its heartbeat announces its durable processes. A node's object
+  store identity may now read and list `do/` and write `do/*/shards/*` (compose's `secrets` step).
+- **Observed**: the state endpoint's `durableShards` (the shards held by namespace, takeovers by reason, releases,
+  refusals by code, the forwarding, the owner cache), a `[do-shard]` line for each take, release and refusal, and each
+  `[do]` line names the object's shard and epoch, on the node that ran it and on the node that sent it.
+- **Measured** on three nodes of a Mac, with a TTL of 15 s and a grace of 10 s: an object's first request through a node
+  other than its shard's default owner 79 ms, the shard taken on the way, then 2 ms whether the node that received a
+  request ran it or sent it on (the medians); 60 requests at once through the three nodes counted 2 to 61 on the one
+  object. With its owner killed, a shard was taken over 26.0 s after the owner's last heartbeat by the store's clock,
+  25.4 s after the kill, the requests meanwhile refused each within 36 ms; cut from the store, an owner gave its shard up
+  14.9 s after the cut, and the shard was taken over 26.6 s after its last heartbeat. A drain released its shard 1.24 s
+  after it began, once the request in flight had finished, and the next owner took the shard 33 ms after the release and
+  served it 60 ms after. A node started again under its id took its shard back 15 ms after it was ready, the object's
+  data kept. Without the store, a request to a shard no node held failed after 10.0 s (`STORAGE_UNAVAILABLE`); with its
+  owner just killed, a request failed in 23 ms, sent twice (`PEER_UNAVAILABLE`).
 
 Log lines arrive as they are written: a Worker's `console.*` lines reach the tenant's logs while its request runs --
 each message of a WebSocket connection's as the message runs -- instead of when the request ends. The tail workerd gives

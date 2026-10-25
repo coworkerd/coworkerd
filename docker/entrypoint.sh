@@ -284,18 +284,21 @@ secrets() {
   # The object store's identities. deploy writes everything; each node's identity has SeaweedFS's prefix actions
   # (Action:bucket/prefix*, the prefix ending in '/' so that node-1's never covers node-10's): it reads what a node reads --
   # the cluster's marker, the tenant index and the manifests (and lists them when a hint is missing), the definitions
-  # and the code, the members (and lists them: liveness, the suspects) -- and reads, writes and lists only its own
-  # members/<id>/ and nodes/<id>/ (heartbeats, epochs, the drain marker, its suspects; its usage). It never reads the
-  # credentials index or writes another node's prefixes, cluster/, tenants/ or the code.
+  # and the code, the members (and lists them: liveness, the suspects), the Durable Object shards (and lists their
+  # epochs) -- and reads, writes and lists only its own members/<id>/ and nodes/<id>/ (heartbeats, epochs, the drain
+  # marker, its suspects; its usage); it also writes the shards' epochs, release markers and owner hints
+  # (do/<namespace>/shards/<shard>/...): any node may take a shard over. It never reads the credentials index or writes
+  # another node's prefixes, cluster/, tenants/ or the code.
   node_actions() {
     local b=$bucket id=$1 action out="" prefix
-    for prefix in cluster/format cluster/tenants tenants definitions packages modules bundles members; do
+    for prefix in cluster/format cluster/tenants tenants definitions packages modules bundles members do; do
       out+="\"Read:$b/$prefix/*\","
     done
-    for prefix in members cluster/tenants tenants; do out+="\"List:$b/$prefix/*\","; done
+    for prefix in members cluster/tenants tenants do; do out+="\"List:$b/$prefix/*\","; done
     for prefix in "members/$id" "nodes/$id"; do
       for action in Read Write List; do out+="\"$action:$b/$prefix/*\","; done
     done
+    out+="\"Write:$b/do/*/shards/*\","
     printf '%s' "${out%,}"
   }
   local id

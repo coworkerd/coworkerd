@@ -105,6 +105,7 @@ add_executable(coworkerd
   node/memory-watermark.c++
   node/suspects.c++
   node/membership.c++
+  node/durable-shards.c++
   node/bundle-cache.c++
   node/desired-state.c++
   node/desired-state-store.c++

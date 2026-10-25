@@ -1245,6 +1245,8 @@ public:
   // Server exit: no rotation starts once shutting down; nothing is started,
   // restarted or rotated once closing.
   bool shuttingDown = false, closingAll = false;
+  // The durable processes were closed for the node's exit (closeDurable()): none starts again.
+  bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
 
   Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
@@ -2608,10 +2610,13 @@ public:
   }
   // A rotation still in progress when the pool closes: its generations stay
   // tracked (the next one joins `retiring`) and are closed with all the others.
-  void abortRotation(double now) {
+  // The close of every generation of the slots `which` picks: the Server's connections first, then SIGTERM, then SIGKILL
+  // after the termination grace (closeAll(), closeDurable()); resolves with the record once all exited.
+  kj::Promise<std::string> closeGenerations(std::function<bool(const Slot&)> which);
+  void abortRotation(double now, const std::string& why = "the Server is shutting down") {
     auto& r = *rotation;
     auto& s = slots[r.slot];
-    r.outcome = "aborted"; r.failure = "the Server is shutting down";
+    r.outcome = "aborted"; r.failure = why;
     r.finishedAt = now; r.finishedAtUnixMs = wall();
     if (s.incoming) {
       s.incoming->retiring = true;
@@ -2987,7 +2992,7 @@ kj::Promise<void> ProcessPool::run() {
       // A durable slot being rotated starts its next generation itself, once the previous one has exited.
       const bool rotating = impl->rotation && impl->rotation->slot == i && s.durable;
       if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
-          && impl->launchReady(s)) impl->spawn(s, i);
+          && !(s.durable && impl->durableClosed) && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
       for (const auto& p : s.retiring) impl->maybeProbe(p);
     }
@@ -3029,6 +3034,30 @@ std::shared_ptr<ProcessCall> ProcessPool::selectDurable(const std::string& objec
     }
   }
   return {};
+}
+uint32_t ProcessPool::durableInFlight() {
+  impl->refresh();
+  uint32_t calls = 0;
+  for (const auto& s : impl->slots) if (s.durable) Impl::eachGeneration(s, [&](const auto& p) { if (p->pid > 0) calls += p->inFlight; });
+  return calls;
+}
+uint32_t ProcessPool::resetDurable(const std::string& reason) {
+  impl->refresh();
+  if (impl->closingAll || impl->durableClosed) return 0;
+  if (impl->rotation && impl->slots[impl->rotation->slot].durable) impl->abortRotation(mono(), reason);
+  uint32_t killed = 0;
+  for (auto& s : impl->slots) {
+    if (!s.durable) continue;
+    Impl::eachGeneration(s, [&](const auto& p) {
+      if (p->pid == 0 || p->state == "killed") return;
+      // Planned: the slot is not charged a failure, and its next generation starts as soon as this one is reaped.
+      p->closing = true; p->plannedExit = true;
+      impl->killProcess(*p, reason, 0);
+      ++killed;
+    });
+    s.restartAt = 0;
+  }
+  return killed;
 }
 void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
   impl->retiring = std::move(callback);
@@ -3381,9 +3410,21 @@ ProcessPool::Killed ProcessPool::killBusy(double since, uint32_t periodMs, const
 kj::Promise<std::string> ProcessPool::closeAll() {
   impl->refresh();
   impl->shuttingDown = impl->closingAll = true;
+  if (impl->rotation) impl->abortRotation(mono());
+  return impl->closeGenerations([](const Impl::Slot&) { return true; });
+}
+
+kj::Promise<std::string> ProcessPool::closeDurable() {
+  impl->refresh();
+  impl->durableClosed = true;
+  if (impl->rotation && impl->slots[impl->rotation->slot].durable) impl->abortRotation(mono());
+  return impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
+}
+
+kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(const Slot&)> which) {
+  auto* impl = this;
   const auto started = mono();
   const auto startedAtUnixMs = wall();
-  if (impl->rotation) impl->abortRotation(started);
   struct Closing {
     std::shared_ptr<ProcessGeneration> p;
     double terminatedAt = 0;
@@ -3391,12 +3432,15 @@ kj::Promise<std::string> ProcessPool::closeAll() {
     bool sigkill = false, signalled = false;
   };
   std::vector<Closing> closing;
-  for (auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
-    if (p->pid == 0) return;
-    p->closing = true; p->plannedExit = true;
-    if (p->state != "killed") p->state = "closing";
-    closing.push_back({p});
-  });
+  for (auto& s : impl->slots) {
+    if (!which(s)) continue;
+    Impl::eachGeneration(s, [&](const auto& p) {
+      if (p->pid == 0) return;
+      p->closing = true; p->plannedExit = true;
+      if (p->state != "killed") p->state = "closing";
+      closing.push_back({p});
+    });
+  }
   // The rotation's close of each generation, all at once: the Server's connections first (workerd's
   // drain waits for them, and an in-flight probe finishes first), then SIGTERM, then SIGKILL
   // after the termination grace.

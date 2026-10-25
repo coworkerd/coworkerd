@@ -173,10 +173,12 @@ std::string activePointerJson(const std::string& versionId, const std::string& d
 std::string routeValueJson(const RouteDefinition& route);
 std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::string& bytes);
 
-// A Durable Object namespace as the nodes use it: its id (32 random bytes, hexadecimal, made by the control plane) and
-// status ("active", or "deleting": no new request and no Binding to it).
+// A Durable Object namespace as the nodes use it: its id (32 random bytes, hexadecimal, made by the control plane),
+// status ("active", or "deleting": no new request and no Binding to it) and how many shards its objects fall into
+// (fixed when it was made; an object's shard is the first 8 bytes of its id, big-endian, modulo this number).
 struct DurableObjectNamespace {
   std::string id, status = "active";
+  uint32_t shards = 1024;
   bool operator==(const DurableObjectNamespace&) const = default;
 };
 std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces);

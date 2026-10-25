@@ -26,6 +26,10 @@ interface WorkerdBootstrap @0x878048cda334ade3 {
 interface PeerServer @0xab4d6df924ec776f {
   openInvocation @0 (invocation :RemoteInvocation)
       -> (result :InvocationOpenResult);
+  # A request to a Durable Object, sent to the node that owns the object's shard: accepted only when the receiver holds
+  # the shard at the epoch the sender expects (or, with epoch 0, once it took the shard), refused before anything ran.
+  openObjectInvocation @1 (invocation :ObjectInvocation)
+      -> (result :InvocationOpenResult);
 }
 
 struct InvocationOpenResult {
@@ -67,6 +71,37 @@ struct RemoteInvocation {
   ingressRoot @16 :Bool = false;
   ingressServerId @17 :Text;
   entrypoint @18 :Text;
+}
+
+# A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
+# runs it as a request it received itself would run, on its own durable process, with the Worker's active version as it
+# sees it; it never sends it on. The caller is a stateless Worker's call tree (treeId set: the request is a Binding call
+# of that tree, with its share of the budget and the remaining time) or an object (callerObjectId set: the request
+# starts a call tree of its own on the owner).
+struct ObjectInvocation {
+  workerId @0 :Text;
+  namespaceId @1 :Text;
+  className @2 :Text;
+  objectId @3 :Text;
+  # The object's shard, and the shard's epoch the sender expects the receiver to hold; 0: the sender found no live owner
+  # and asks the receiver -- the shard's default owner as the sender sees the members -- to take the shard.
+  shard @4 :UInt32;
+  shardEpoch @5 :UInt64;
+  # How many Durable Object calls led to this request (x-coworkerd-do-hops; beyond 8, DO_HOP_LIMIT).
+  hops @6 :UInt16;
+  # The receiver's membership epoch the sender addresses.
+  destinationEpoch @7 :Text;
+  originServerId @8 :Text;
+  treeId @9 :Text;
+  parentInvocationId @10 :Text;
+  subrequestGrant @11 :UInt16;
+  depth @12 :UInt16;
+  remainingMs @13 :Float64;
+  callSequence @14 :UInt64;
+  orderSequence @15 :UInt64;
+  ingressServerId @16 :Text;
+  callerNamespaceId @17 :Text;
+  callerObjectId @18 :Text;
 }
 
 struct ServerConfig {
@@ -744,6 +779,12 @@ struct InvocationDescriptor {
     objectId @1 :Text;
     className @2 :Text;
     hops @3 :UInt16;
+    # The object's shard, the shard's epoch this node holds it at, and the epoch since which this node's copy of the
+    # shard's objects is the one: the object's Host is named by it, so that a shard this node takes over from another
+    # node starts its objects from empty while one it takes back from itself keeps them.
+    shard @4 :UInt32;
+    shardEpoch @5 :UInt64;
+    dataEpoch @6 :UInt64;
   }
 }
 
