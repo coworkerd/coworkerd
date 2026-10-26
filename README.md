@@ -16,20 +16,14 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
   on the node that executes it);
 - **a declarative control plane** -- the `/v1` API of `coworkerd-apiserver` (tenants, credentials, quotas, versions,
   routes, secrets, logs, usage), and `cowctl`, a thin command line that deploys wrangler projects;
-- **one bucket as the cluster's only state** -- membership, the desired state, suspects, usage and code all live in an
-  S3-compatible object store; the control plane keeps nothing of its own, and a node only its Workers' recent log lines
-  and the usage counts it has not written yet (a minute's worth while the store takes them), so a stateless node and a
-  bucket make a cluster.
+- **Durable Objects and D1** -- SQLite classes with shard ownership, peer confirmation, uploaded history and recovery, plus hibernation, alarms and method calls;
+- **one bucket for desired state and durable history** -- membership, code, tenant manifests, ownership, log segments and snapshots. A confirmed tail can remain on the owner and its peers before upload; nodes also keep recovered files, logs and recent usage locally.
 
-Accounts, billing and user interfaces are left to the platform on top. Stateful services are not: Durable Objects are
-being built for 0.5 (ownership per shard with fencing, writes confirmed by peer nodes and shipped to the object store),
-and this release runs stateless Workers only. The components and their boundaries are described in [docs/components.md](docs/components.md).
+Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: 0.4.1
+## Status: 0.5.0
 
-0.4.1 is the current release, for Linux `amd64` and `arm64`: a full garbage collection is no longer taken for a CPU
-overrun, and processes are no longer replaced every hour. 0.4.0 moved the cluster's whole state from etcd to the object
-store, and etcd is gone; it does not upgrade a 0.3.x cluster in place (0.3.0 was the first release, 0.3.1 its fixes).
+0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
 launcher `coworkerd-launcher`, the patched `workerd`, `cowctl`) and a container image, with compose files for one or
 three nodes, to which more nodes can be added while they run. [CHANGELOG.md](CHANGELOG.md) lists what it contains.
@@ -38,10 +32,7 @@ The `/v1` API changes only by adding fields and endpoints until 1.0.
 Boundaries to know about:
 
 - **One region.** A cluster lives in one region or an equivalent low-latency network; no routing or failover across regions.
-- **Stateless Workers only, in this release.** Stateful bindings (Durable Objects come in 0.5) and several Cloudflare
-  features (scheduled triggers, Tail Workers and others) are refused when a project is converted; a Service Binding
-  reaches the other Worker's `fetch()` and, in 0.5, its `WorkerEntrypoint` methods (JS RPC), and only within the
-  tenant; the full list is in [docs/guide/compat.md](docs/guide/compat.md).
+- **Compatibility has a defined scope.** HTTP, inbound WebSockets, Service Binding fetch / RPC, SQLite Durable Objects and basic D1 are supported. KV, R2, Queues, scheduled triggers and Tail Workers are refused; [compatibility scope](docs/guide/compat.md) lists the boundary.
 - **The sandbox needs host support.** The launcher needs unprivileged user namespaces; under Docker's default seccomp
   and AppArmor profiles it cannot set up its environment, so the default compose cluster runs without the sandbox and
   says so in its logs ([docs/guide/install.md](docs/guide/install.md), sections 3 and 4). The system call allowlist
@@ -49,13 +40,13 @@ Boundaries to know about:
 - **Trust between nodes uses a shared cluster key.** The CONNECT that opens each peer connection is signed with it when
   `peerAuth.keyFile` names it (compose always does; without it peer connections are neither signed nor checked, and the
   node warns); the calls inside a connection are not signed one by one, and it is plain TCP; every node
-  has an object storage identity of its own that can write only that node's objects (a policy of the object store, which
+  has an object storage identity of its own that can write its membership and usage plus shared Durable Object prefixes (a policy of the object store, which
   compose's `secrets` step writes), and secret values are sealed with
   the cluster's secrets key before they are stored. There is no mTLS and no node join procedure beyond issuing a node
   its identity.
 - **The object store must hold its promises.** For more than one writer of the desired state at a time, create-if-absent
-  has to hold under concurrency: SeaweedFS 4.29 or newer (the compose files pin 4.48); `coworkerd check storage`
-  measures it.
+  has to hold under concurrency: the compose files pin SeaweedFS 4.48, whose concurrent create-if-absent behavior was verified; `coworkerd check storage`
+  measures it. Durable Object ownership also requires atomic create-if-absent on a single-node cluster; otherwise requests fail with `DO_UNSUPPORTED_STORE`.
 - **The upstream runtime** is workerd `v1.20261012.1` with the patch series in [patches/workerd/](patches/workerd/);
   the patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd), and
   [patches/README.md](patches/README.md) describes how it follows upstream.
@@ -66,9 +57,9 @@ With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a c
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.4.1-linux-arm64.tar.gz
-docker load -i coworkerd-0.4.1-linux-arm64-image.tar.gz
-cd coworkerd-0.4.1-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.5.0-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.0-linux-arm64-image.tar.gz
+cd coworkerd-0.5.0-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 
@@ -79,8 +70,7 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 
 - **The daemons**: `scripts/build.sh` builds `coworkerd` and `coworkerd-apiserver` for the host with CMake and Ninja
   (it fetches Cap'n Proto and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff)); OpenSSL is required.
-- **workerd**: the branch `coworkerd-v1.20261012.1` of the fork [coworkerd/workerd](https://github.com/coworkerd/workerd),
-  or upstream `v1.20261012.1` checked out into `workerd/` with the series applied by
+- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261012.1`), checked out into `workerd/` with the series applied by
   `python3 scripts/workerd-patches.py apply`; [patches/README.md](patches/README.md) explains the series and how it
   is maintained.
 - **A release**: `scripts/release.sh <version>` builds the Linux binaries in a toolchain container
@@ -121,3 +111,5 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 
 Coworkerd is licensed under the [Apache License 2.0](LICENSE). It builds on Cloudflare's workerd, also Apache-2.0;
 [NOTICE](NOTICE) has the attribution.
+
+For stateful applications, see [Durable Objects](docs/guide/durable-objects.md), [databases](docs/guide/databases.md) and the [durable-counter example](examples/durable-counter).

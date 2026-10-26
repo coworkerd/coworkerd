@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0
+
+0.5 adds stateful Workers: SQLite Durable Objects and D1 databases alongside stateless Workers, with inbound WebSockets, hibernation, alarms and JS RPC. Shard ownership lives in conditional object-store epochs. Committed transaction frames are confirmed by reachable peers (or flushed locally with no peer), uploaded as node log segments with per-object manifests and snapshots, and replayed after takeover. Confirming peers buffer in memory: simultaneous loss of an owner and all confirming peers can lose the unuploaded tail, which can exceed the normal 30 s segment interval during an outage.
+
+0.4.x installations upgrade in place while retaining their bucket, node identities and volumes. The object layout adds DO history and ownership objects; finish upgrading every component and node's storage policy before using the new features. `/v1` keeps its existing fields and adds namespace / database endpoints, quotas and inspection fields. New errors include `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_UNSUPPORTED_STORE`, `DO_RECOVERING`, `DO_NAMESPACE_UNAVAILABLE`, `DO_HOP_LIMIT`, `DO_OBJECT_TOO_LARGE` and `WEBSOCKET_LIMIT`; durable calls can also return `STORAGE_UNAVAILABLE` and `QUOTA_EXCEEDED`. Clients should follow the [error guide](docs/guide/errors.md) before retrying a write.
+
+- **Durable Objects:** migrations declare SQLite classes; namespace IDs stay stable across versions and renames. Fetch and public method calls route to the shard owner. Durable processes have an object-tree resident target, no age / request-count rotation, per-event CPU and logs, and facet-aware replication and recovery. Object and tenant byte limits are enforced at durable confirmation using checkpoint-size estimates.
+- **D1:** tenant-scoped databases use a platform SQL Worker, with bindings, the basic JavaScript API, HTTP SQL and `cowctl d1 create/list/delete/execute`. A known binding defect affects Workers without a declared DO class (see the [database guide](docs/guide/databases.md)); statements in `batch` are ordered but are not one transaction; Sessions, replicas, import/export and point-in-time restore are absent.
+- **WebSockets and alarms:** ingress relays frames across processes and peers; hibernation retains connections across idle object eviction. Process / node exit closes them. Alarm times are replicated database state, while object-store hints discover due objects after takeover; retries and discovery delays remain possible.
+- **JS RPC:** Service Bindings to `WorkerEntrypoint` classes and Durable Object stubs expose methods through workerd's capability protocol. Nodes validate envelopes and proxy capabilities without decoding arguments; capabilities expire with the call tree's lease. `placement.subcalls` chooses the normal home policy or caller-first stateless placement.
+- **Operations and documentation:** configurable durable process count (including zero on forwarding-only nodes), peer buffers, confirmation / recovery / upload / snapshot / disk limits, quotas and diagnostic state. New [Durable Object](docs/guide/durable-objects.md) and [database](docs/guide/databases.md) guides and the `durable-counter` example accompany the updated architecture and installation guides.
+
+The changes of 0.5.0 in detail, in the order they were made (latest first):
 
 JS RPC: a Worker's methods, and a Durable Object's, can now be called over a Binding. `env.SVC.method(args)` reaches
 another Worker of the tenant and `stub.method(args)` reaches an object, with Cloudflare's own types -- structured

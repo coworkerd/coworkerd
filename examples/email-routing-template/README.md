@@ -11,15 +11,15 @@ as it is (pinned at commit `dfdf1409`, MIT License, see `LICENSE`; the template'
 The email handler (`email()`) is never called on Coworkerd; `observability` is a Cloudflare platform setting, ignored with a notice at conversion. No `npm install` is needed:
 it has no runtime dependencies, and the wrangler that comes with `coworkerd` can build it.
 
-Its asset paths start at `/`, so it takes a hostname of its own as its route (`*.localhost` resolves to 127.0.0.1 locally): the administrator registers the hostname
+Its asset paths start at `/`, so it takes a hostname of its own as its route (the curl examples explicitly resolve it to 127.0.0.1): the administrator registers the hostname
 to the tenant first. With a tenant and its credential as the quickstart's section 2 makes them (the tenant `acme`, the admin credential in `~/.cowctl/admin`, the tenant's in `~/.cowctl/token`):
 
 ```bash
 COWCTL_TOKEN=$(cat ~/.cowctl/admin) cowctl tenant update acme --hostname email-routing.localhost   # the list replaces acme's: name every hostname it keeps
 cowctl init --tenant acme --route email-routing.localhost/
 cowctl deploy
-curl http://email-routing.localhost:18080/                   # the settings page: support@company.example
-curl -I http://email-routing.localhost:18080/index.html      # static assets answered directly by the node (ETag and so on)
+curl --resolve email-routing.localhost:18080:127.0.0.1 http://email-routing.localhost:18080/                   # the settings page: support@company.example
+curl --resolve email-routing.localhost:18080:127.0.0.1 -I http://email-routing.localhost:18080/index.html      # static assets answered directly by the node (ETag and so on)
 ```
 
 A new version: change `ROUTE_ADDRESS` in `wrangler.jsonc` to another address and `cowctl deploy` again; the address on the page changes with it; `cowctl rollback v1` goes back to the original.

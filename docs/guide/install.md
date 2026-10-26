@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.4.1.
+> For release 0.5.0.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -8,18 +8,18 @@
 
 Coworkerd is a Workers infrastructure layer for platforms, based on Cloudflare `workerd`: one cluster runs all the Workers of one platform, the platform is the only administrator,
 the platform's users are **tenants**, and Workers belong to tenants (full name `tenant/Worker`). Each **node** is one `coworkerd` process (the node daemon) and the
-`workerd` processes it manages. The cluster's whole state -- the members, the desired state, the suspects, the usage and the Workers' code -- is in one bucket of an S3-compatible object store;
-nodes and the control plane keep none of their own, so a node started with the bucket's address and its credentials is a node of that cluster. A request enters through any node's ingress
+`workerd` processes it manages. Membership, desired state, suspects, usage, code and uploaded durable history are in one bucket of an S3-compatible object store; the latest confirmed object tail may still be on nodes;
+nodes keep recovered SQLite files and an append log, while the control plane mirrors desired state. The bucket address, marker and credentials identify the cluster a node joins. A request enters through any node's ingress
 and runs on that node or another one according to the placement rules. The **control plane** `coworkerd-apiserver` and its operations tool, with the same identity, are the only writers of the desired state (tenants, credentials, deployments), and `cowctl` talks only to the control plane;
-nodes only read the desired state and only write their own membership, suspects and usage, each with an object storage identity of its own (section 4, "Object storage identities").
+nodes read desired state and write their own membership, suspects, usage and WAL segments, plus shared Durable Object ownership and history, each with an object storage identity of its own (section 4, "Object storage identities").
 
 Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three files each, plus one checksum file:
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.4.1-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.4.1-linux-<arch>/` (the next table) |
-| `coworkerd-0.4.1-linux-<arch>-image.tar.gz` | The image `coworkerd:0.4.1`, for `docker load` |
-| `coworkerd-0.4.1-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.5.0-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.0-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.0-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.0`, for `docker load` |
+| `coworkerd-0.5.0-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -39,17 +39,16 @@ The package:
 A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64` (`uname -m` is `x86_64`).
 
 Requirements: **Docker Engine 28 or newer** (compose's internal network uses `gateway_mode_ipv4: isolated`, which only exists from 28.0; 27.x rejects it) and the Docker Compose plugin (Docker Desktop on the Mac includes it; the compose file uses volume `subpath` and the healthcheck's
-`start_interval`, so take a current Compose: this page was run with Compose 5.1). The image is about 78 MB to download and about 350 MB once loaded; a cluster that has just started takes about 180 MiB of memory with one node
-(the node about 60, the object store about 115, the control plane about 7) and about 360 MiB with three nodes (measured on a Mac with Apple silicon).
+`start_interval`; use a Compose version that supports both). Budget memory for the ordinary and quarantine slots, the durable processes and their resident isolates, plus the control plane and object store; the durable process count and resident-object target are configured below.
 
 ## 2. Option one: compose, one node (one command)
 
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.4.1-linux-amd64.tar.gz
-docker load -i coworkerd-0.4.1-linux-amd64-image.tar.gz
-cd coworkerd-0.4.1-linux-amd64/docker
+tar -xzf coworkerd-0.5.0-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.0-linux-amd64-image.tar.gz
+cd coworkerd-0.5.0-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -58,7 +57,7 @@ docker compose up -d --wait
 ```
 
 The services: `secrets` and `init` run at every start and exit, `storage` is the object store (SeaweedFS 4.48), `node-1` the node and `apiserver` the control plane (the API `cowctl` connects to);
-`node-2` and `node-3` are in the profile `cluster` (section 3), and `tool`, the operations tool, in the profile `tools`, run on demand. There is nothing else: the cluster's whole state is in the store's bucket `coworkerd`.
+`node-2` and `node-3` are in the profile `cluster` (section 3), and `tool`, the operations tool, in the profile `tools`, run on demand. The store's bucket `coworkerd` holds desired state and uploaded durable history. Node volumes also hold SQLite files and the local append log; retain them because they may contain the latest confirmed tail.
 
 **What `secrets` generates.** On the first start the `secrets` container (no network, exits once it is done) generates every credential of the cluster into the data volume named `secrets`, and on every later start only what is missing:
 
@@ -94,13 +93,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.4.1 version` |
+| Show the version | `docker run --rm coworkerd:0.5.0 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.4.1` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.0` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -111,8 +110,7 @@ To change ports, tokens or the project directory, copy `.env.example` to `.env` 
 | `COWORKERD_PROJECT` | `coworkerd` | The compose project name (to tell several clusters on one machine apart) |
 
 **The store's other interfaces.** Only SeaweedFS's S3 gateway listens on the store container's network; its master, volume and filer servers listen on the container's loopback, and the gateway's own gRPC interface takes only client certificates of a certificate authority that has signed none and whose key is not kept; the gateway's own certificate, whose key the volume holds under `storage/`, comes from another authority, so it opens nothing either.
-The filer also serves an identity service without authentication, which the loopback keeps closed: do not publish the filer's ports. `weed shell`'s `s3.configure` prints every identity with its secret, and SeaweedFS writes an unknown access key into its warnings in full,
-so treat `docker compose logs storage` as a credential.
+The filer also serves an identity service without authentication, which the loopback keeps closed: do not publish the filer's ports. The initialization scripts discard `weed shell`'s `s3.configure` output. Treat identity-management output and `docker compose logs storage` as potentially containing credentials; redact them before sharing.
 
 ### Adding a node
 
@@ -123,7 +121,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.4.1}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.0}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -162,7 +160,7 @@ Measured on a three-node cluster: `node-4` was ready about 4 seconds after `add-
 Pass both files to every later compose command for this cluster (or write `COMPOSE_FILE=docker-compose.yml:docker-compose.node-4.yml` into `.env`), for example to stop and delete it:
 `docker compose -f docker-compose.yml -f docker-compose.node-4.yml --profile cluster down -v`.
 
-Adding the id to `COWORKERD_NODE_IDS` of the `secrets` service and running `up` again goes the same way. Restarting the store (`docker compose restart storage`) applies every hotload file again, at the cost of about half a minute in which every request to the store fails: the nodes keep serving what they have, and the control plane answers reads from its copy -- except the usage, and a first read of Workers whose definitions it has not fetched, which answer `503 STORAGE_UNAVAILABLE` too -- and refuses every change with `503 STORAGE_UNAVAILABLE` (make it again once the store answers).
+Adding the id to `COWORKERD_NODE_IDS` of the `secrets` service and running `up` again goes the same way. Restarting the store (`docker compose restart storage`) applies every hotload file again, with a period of storage unavailability: the nodes keep serving what they have, and the control plane answers reads from its copy -- except the usage, and a first read of Workers whose definitions it has not fetched, which answer `503 STORAGE_UNAVAILABLE` too -- and changes can answer `503 STORAGE_UNAVAILABLE`. A failed answer can follow a committed write; inspect the resulting state before retrying a mutation.
 Do not edit `s3.json` or the hotload files by hand: `secrets` writes them again from the volume's identities at every start, a hotload file for every `nodes/<id>/` directory.
 
 **Removing a node** for good: stop it, then `docker compose run --rm secrets remove-node node-4` removes its directory `nodes/node-4/` and its `storage/hotload/node-4.weed`, and writes `storage/hotload/node-4.remove.weed`, which the store's container applies within about 2 seconds with `s3.configure`'s deletion: the identity leaves the store's filer, and requests signed with it are refused from then on, without a restart of the store.
@@ -178,12 +176,12 @@ docker compose --profile cluster down -v      # stops all three nodes and delete
 ```
 
 The three nodes find each other in the object store: each registers an epoch below `members/<nodeId>/` (`nodeId` being `node-1..3`), writes its heartbeat there every 5 seconds and lists `members/` every 10 seconds,
-and they connect to each other by their alias on the internal network (`node-N-peer:8934`). One deployment takes effect on all three nodes within about 5 seconds: each node reads the desired state that often, and `cowctl deploy` waits until all three report it.
+and they connect to each other by their alias on the internal network (`node-N-peer:8934`). One deployment takes effect on all three nodes within about 5 seconds: each node reads the desired state that often, and `cowctl deploy` waits up to 15 seconds for non-draining nodes to report the new revision, then warns and returns successfully if some remain behind; `--no-wait` skips that wait.
 A node that stops is dropped by the others at their next listing, one that crashed about half a minute after its last heartbeat; a fourth node joins as "Adding a node" in section 2 describes.
 
 **The sandbox under compose**: the nodes' `sandbox.mode` defaults to `auto` -- each workerd starts through `coworkerd-launcher` in a least-privilege environment (see "Sandbox" in section 4),
 and when the conditions are not met workerd starts directly with a warning. Docker's default seccomp profile does not let a process without `CAP_SYS_ADMIN` create namespaces, so **in a cluster started with the commands above the sandbox is off**:
-each node's log has a line `[sandbox] {"event":"warning",...}`, the state endpoint's `processes.sandbox.active` is `false`, and everything else works as usual.
+each node's log has a line `[sandbox] {"event":"warning",...}`, the state endpoint's `processes.sandbox.active` is `false`; the node is running without launcher isolation.
 To turn it on, first meet the host prerequisites of section 4, then add the package's `docker-compose.sandbox.yml` (it only lifts the default seccomp and AppArmor profiles for `node-1`, `node-2` and `node-3` -- a node added as in section 2 needs the same settings in its own file --, adds
 `no-new-privileges`, adds no capability, and sets `sandbox.mode` to `launcher`: a node that cannot set up the environment refuses to start instead of running without the sandbox):
 
@@ -198,7 +196,7 @@ For running the nodes and the control plane directly on Linux hosts, with your o
 
 **Preparation**
 
-- S3-compatible object storage and a bucket. With SeaweedFS, **4.29 or newer** (the compose files pin 4.48): in 3.97 and earlier, concurrent creates of one key can all succeed, which more than one writer of the desired state at a time cannot work with (the nodes' membership reads its registrations back and does not rely on it: a node only warns), and
+- S3-compatible object storage and a bucket. The compose files pin **SeaweedFS 4.48**, whose concurrent create-if-absent behavior was verified. In the tested 3.97 version, concurrent creates of one key can all succeed, which more than one writer of the desired state at a time cannot work with (the nodes' membership reads its registrations back and does not rely on it: a node only warns), and
   `coworkerd check storage` reports `conditionalPutAtomic: false` and still exits 0. What the cluster needs from a store: create-if-absent (`If-None-Match: *`) -- one that also holds under concurrency when more than one writer of the desired state uses the bucket --, a read after a write that returns the write,
   listings that name each object's `LastModified` and ETag with the answer's `Date`, and overwrites; reads are signed as standard presigned URLs (the host only, an unsigned payload) and writes in the `Authorization` header, so the store must take both. Keep versioning off on the bucket, and **create the bucket first**, then deploy.
 - One identity of the store for the control plane (`deploy`: it creates the bucket -- the self-check's first request -- and reads, writes and lists it; compose gives it SeaweedFS's `Admin`, `Read`, `Write` and `List`) and one for each node, held to the policy in "Object storage identities" below.
@@ -219,13 +217,13 @@ The launcher has to create user namespaces as an ordinary user and mount inside 
 `[coworkerd-launcher] {"event":"failed",...,"step":...}` saying which step failed):
 
 ```bash
-sysctl kernel.apparmor_restrict_unprivileged_userns     # no such key (Ubuntu 22.04 and others) or 0: not restricted by this
+sysctl kernel.apparmor_restrict_unprivileged_userns     # no such key or 0: not restricted by this
 cat /proc/sys/user/max_user_namespaces                  # greater than 0
 cat /proc/sys/kernel/yama/ptrace_scope                  # 1 or greater; when 0: echo 'kernel.yama.ptrace_scope = 1' | sudo tee /etc/sysctl.d/60-coworkerd-ptrace.conf && sudo sysctl --system
 sudo -u coworkerd /opt/coworkerd/bin/coworkerd-launcher --user --net --ipc --uts --root /tmp --drop-caps --no-new-privs --check && echo ok
 ```
 
-**Ubuntu 23.10 and later (including 24.04)** default to `kernel.apparmor_restrict_unprivileged_userns=1` (the AppArmor profile below has not been run; lifting the restriction for the whole machine let the launcher's check pass on an Ubuntu 24.04 machine, with compose's `docker-compose.sandbox.yml`): a user namespace created by a process without an AppArmor permission has no capabilities in it,
+**AppArmor restrictions:** the tested Ubuntu 24.04 machine had `kernel.apparmor_restrict_unprivileged_userns=1` (the AppArmor profile below has not been run; lifting the restriction for the whole machine let the launcher's check pass on an Ubuntu 24.04 machine, with compose's `docker-compose.sandbox.yml`): a user namespace created by a process without an AppArmor permission has no capabilities in it,
 and the check above fails (the `[coworkerd-launcher]` line it prints says where it stopped). Pick one:
 
 - Permit only the launcher (recommended): `/etc/apparmor.d/coworkerd-launcher`
@@ -238,7 +236,7 @@ and the check above fails (the `[coworkerd-launcher]` line it prints says where 
   }
   ```
 
-  then `sudo apparmor_parser -r /etc/apparmor.d/coworkerd-launcher` (loaded automatically after a reboot);
+  then `sudo apparmor_parser -r /etc/apparmor.d/coworkerd-launcher`; verify the profile is loaded again after a reboot;
 - or lift the restriction for the whole machine: `echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/60-coworkerd-userns.conf && sudo sysctl --system`.
 
 At startup the node prints a line `[sandbox] {...}`: `active` being `true` means it is in effect; the state endpoint's `processes.sandbox` says the same, and each process's `sandbox.observed.layers` are the layers the node
@@ -280,7 +278,7 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8930/__coworkerd/state \
 | `denied`, `recentDenials[]` | The number of processes the filter killed in enforce mode, and the latest records |
 | `interrupted`, `errors` | How often the thread was already interrupted by a signal while a notification was being produced; how often the supervision itself failed (should be 0) |
 
-**What to do about an observation**: each record is a log line `[syscall-observed] {...}` (rate-limited to one line per call number per 10 seconds; the counts are not affected) with the call (`call`, `name`), its total `count`, and this observation's `processId`, `processClass` (`ordinary` or `quarantine`), `generation`, `pid`, `tid`, `thread`, `countThisProcess`, `mode`, `allowlistSha256` and `observedAtUnixMs`.
+**What to do about an observation**: each record is a log line `[syscall-observed] {...}` (rate-limited to one line per call number per 10 seconds; the counts are not affected) with the call (`call`, `name`), its total `count`, and this observation's `processId`, `processClass` (`ordinary`, `quarantine` or `durable`), `generation`, `pid`, `tid`, `thread`, `countThisProcess`, `mode`, `allowlistSha256` and `observedAtUnixMs`.
 Steps:
 
 1. Tell from `name`/`call` and `thread` who made it (thread names tell V8's worker threads, our watchdog thread and the main thread apart);
@@ -294,9 +292,9 @@ Steps:
 -- exactly the check that prevents "a new binary with the old allowlist". So, to upgrade workerd:
 
 1. first put in place an allowlist that **covers both the old and the new bytes** (`--workerd` of the generator `scripts/syscall-allowlist.py` can be given several times, for example
-   `--workerd old/workerd --workerd new/workerd`; the one in the release package covers only the package's own binary);
+   `--workerd old/workerd --workerd new/workerd`; inspect the package allowlist's `# workerd-sha256` lines rather than assuming it covers the old binary);
 2. then replace the workerd file -- the server then rotates slot by slot as usual ("the binary changed, so rotate"), and the new generation's launcher reads an allowlist that already covers it;
-3. once done, replace the allowlist with the one that covers only the new bytes (the one in the release package); the launcher uses it from the next start of a process on, and the state endpoint shows it after the server's next restart.
+3. once done, replace the allowlist with the one that covers only the new bytes (generate it with only the new binary); the launcher uses it from the next start of a process on, and the state endpoint shows it after the server's next restart.
 
 Two details: the **launcher reads** the allowlist **at every start**, so step 1 takes effect for every later start as soon as the file is in place; the server reads it only **once, at startup**, for reporting and for checking the pair, so
 `allowlist.workerdSha256s` in the state endpoint changes only after the server restarts. An upgrade of the whole package (the node and workerd together) does not need this order: stop and replace everything as in section 9.
@@ -306,7 +304,7 @@ The launcher installs the startup table, which has to contain the calls used onl
 `processes.sandbox.syscalls.steady` reports the mode and the table's hash, each process's `sandbox.syscalls.steadyMode` its mode and `sandbox.observed.layers.steadySyscalls` whether the second filter is on. Switch it in the same order as the startup table: `observe` first, `enforce` after zero records.
 It is part of a workerd upgrade too: workerd reads only the table's call numbers, without a digest check, and the node checks it against the binary only at its own start, so replace it in the same order as the startup table.
 
-**Object storage identities**: only the deploy identity -- the control plane's and the operations tool's -- can write the desired state, and each node writes only below its own name; the store's own policies enforce this, not a convention.
+**Object storage identities**: only the deploy identity -- the control plane's and the operations tool's -- can write the desired state, and each node writes its own `members/<nodeId>/` and `nodes/<nodeId>/` prefixes plus shared `do/*/shards/*` and `do/*/objects/*`; the store's own policies enforce this, not a convention.
 
 | Identity | Actions | For |
 | --- | --- | --- |
@@ -314,7 +312,7 @@ It is part of a workerd upgrade too: workerd reads only the table's call numbers
 | `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/`, `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/`, `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` (the Durable Object shards' epochs, release markers and owner hints: any node may take a shard over) and `do/*/objects/*` (an object's manifests and snapshots, written by whichever node owns its shard). Reading and listing every node's `nodes/` prefix is what lets a node rebuild an object from the segments of the node that owned its shard before (`nodes/<id>/wal/`) | That node |
 
 Every prefix ends with `/`, so that `node-1`'s policy does not cover `node-10`; a node's identity cannot read the credentials index `cluster/credentials/`, and cannot write another node's objects, `cluster/`, `tenants/` or the code.
-In SeaweedFS (4.29 or newer) these are the actions of the identity's entry in its identities (`s3.json`, or the filer's, which `s3.configure` writes); for the bucket `coworkerd` and the node `node-1`:
+In the pinned SeaweedFS 4.48 these are the actions of the identity's entry in its identities (`s3.json`, or the filer's, which `s3.configure` writes); for the bucket `coworkerd` and the node `node-1`:
 
 ```json
 {"name": "node-node-1", "credentials": [{"accessKey": "...", "secretKey": "..."}],
@@ -408,7 +406,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | Field | Default | Description |
 | --- | --- | --- |
 | `nodeId` | required | This node's name in the cluster (letters, digits, `-_.`, at most 255 characters, not `.` or `..`); also the segment of its objects `members/<nodeId>/` and `nodes/<nodeId>/`, which no other node's identity writes (the control plane's deploy identity, which may write the whole bucket, also removes expired usage objects there) |
-| `storage.endpoint` | required | The object storage's S3 endpoint (`http://`); the cluster's whole state is there |
+| `storage.endpoint` | required | The object storage's S3 endpoint (`http://`); desired state, code and uploaded durable history are there |
 | `storage.bucket` / `storage.region` | `coworkerd` / `us-east-1` | The bucket and the region |
 | `storage.credentialsFile` | none: the environment variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | The node's own identity `{"accessKey","secretKey"}` (the control plane: the deploy identity) |
 | `storage.connectTimeoutMs` / `storage.readTimeoutMs` / `storage.createTimeoutMs` | `2000` / `5000` / `30000` | Each request's connection; its answer, and every read or write after the one before; a create-if-absent's answer. A GET, HEAD, listing or DELETE that fails before its whole answer arrives is sent once more on a new connection; a create whose answer is lost is decided by reading the key back, and sent once more when the key is absent |
@@ -437,7 +435,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `sandbox.syscalls.allowlistPath` | `coworkerd-syscalls-startup.txt` in the directory of `coworkerd` | The allowlist file (shipped in the release package, generated by the build for this workerd). The environment variable `COWORKERD_SANDBOX_ALLOWLIST` overrides it |
 | `loadCheck` | `true` | Check that a Worker loads before its first dispatch, and refuse explicitly when it does not (`LOAD_FAILED`) |
 | `logs.tenantBufferBytes` / `logs.linesPerSecond` | `1048576` / `100` | How much log each tenant keeps on this node and how many lines per second are recorded; `logBufferBytes` and `logLinesPerSecond` of the tenant's quota take precedence |
-| `usage.flushIntervalMs` / `usage.retentionHours` / `usage.sampleIntervalMs` | `60000` / `744` / `1000` | Per-tenant usage: how often the hours whose counts changed are written to the object store (a stopped node loses at most that much, unless it cannot read its hour's object when it starts again), how long the hourly objects are kept (by their node, and by the control plane for every node; `0`: never deleted), the sampling interval of isolate time |
+| `usage.flushIntervalMs` / `usage.retentionHours` / `usage.sampleIntervalMs` | `60000` / `744` / `1000` | Per-tenant usage: how often the hours whose counts changed are written to the object store (the interval is a scheduling delay, not a hard bound on lost usage; a startup read failure defers that hour's writes until its existing counts can be read), how long the hourly objects are kept (by their node, and by the control plane for every node; `0`: never deleted), the sampling interval of isolate time |
 | `egress.mode` | `on` | Outgoing requests of tenant code (section 11): `on` goes through this node's egress service; `off` refuses every outgoing request at the policy point (`EGRESS_DENIED: egress-off`). The environment variable `COWORKERD_EGRESS_MODE` overrides it |
 | `egress.defaultPolicy` / `egress.publicPorts` | `public` / `[80, 443]` | What a tenant may reach of the public addresses its own `allow` rules do not name: `public`, these ports of them; `deny`, none. The environment variable `COWORKERD_EGRESS_DEFAULT_POLICY` overrides it |
 | `egress.tenants[]` | none | Each tenant's rules: `tenant` (the tenant name), `allow`, `deny`, `allowInternal` (internal destinations the administrator allows), `concurrency`, `requestsPerSecond` (section 11) |
@@ -449,7 +447,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `membership.clockSkewToleranceMs` / `membership.createSettleMs` | `2000` / `1000` | How far this machine's clock may be from the store's `Date` (more refuses the start, and is only warned of while running); how long a new epoch's registration settles before it is read back |
 | `membership.backend` / `desiredState.backend` | `objectStore` with the `storage` block | Where the members and the desired state are kept: a node started with `--config` requires `objectStore` for both, and `file` is only the command line's test form (a 0.3 `etcd` backend is refused, section 9) |
 | `desiredState.pollIntervalMs` | `5000` | How often the node reads the tenant index's hint, and what changed (50 to 3600000) |
-| `placement.subcalls` | `home` | Where a stateless subcall -- a Service Binding call, by `fetch` or by a method -- executes: `home` places it like any call, so it goes to the Worker's home node; `local` runs it on the node whose Worker made it, as Cloudflare's Service Bindings do. Both work for `fetch` and for method calls; which one should be the default waits on a measurement of the two under load |
+| `placement.subcalls` | `home` | Stateless Service Binding fetch / method placement: `home` uses the normal warm/home policy; `local` tries the caller's node first and falls back to that policy. Object calls follow their shard owner |
 | `placement.*`, `membership.*`, `desiredState.*` | see the schema | Detailed parameters of placement, membership and the desired state; `storage` is the shorthand of `desiredState.objectStore` (they cannot both be given) and puts the desired state and the membership on the object store, which a node requires. Entries in `placements` use `nodeId`, and Workers their full name `tenant/Worker` |
 | `control.*` | see "The control plane" in section 4 | Used only by `coworkerd-apiserver` (`listenAddress`, `adminCredential`, `pathRouting`, `maxUploadBytes`, `serverTimeoutMs`, `pollIntervalMs`, `temporaryDirectory`), but every daemon validates the section: a malformed `control` section stops a node too |
 
@@ -477,6 +475,30 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ## 6. Tenants and deployments
 
+### Durable Objects and local storage
+
+`durableObjects.processes` defaults to `1` (`d0`), accepts `0`–`64`, and is independent of `processPool.count`. At `0` a node still receives and forwards object / database calls but acquires no shards. Its membership advertises that count. The durable settings below belong in the JSON configuration (`COWORKERD_CONFIG` uses that file directly).
+
+| `durableObjects` key | Default | Meaning |
+| --- | --- | --- |
+| `processes` | `1` | Number of durable workerd slots, not per tenant |
+| `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
+| `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
+| `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
+| `segmentIntervalMs` / `segmentBytes` | `30000` / `16777216` | Seal the node's log every 30 s or 16 MiB; minima 100 ms and 64 KiB |
+| `snapshotBytes` / `snapshotIntervalMs` | `67108864` / `86400000` | Snapshot after 64 MiB of history or one day |
+| `snapshotPartBytes` | `16777216` | 16 MiB parts; range 64 KiB–256 MiB |
+| `diskBytes` | `0` | `0` chooses half the capacity of the stack's filesystem at startup; not half its free space |
+| `peerBufferBytes` | `268435456` | 256 MiB total memory for other owners' tails; refusal beyond it |
+| `objectBytes` | `10737418240` | 10 GiB per object including its facet databases, based on reported checkpoint / open / close sizes |
+| `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
+| `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
+| `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
+| `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
+| `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
+
+The stack directory holds `cache/` for verified code and assets, `do/` for recovered object databases and facet indexes, and `do/log/` for the local append log and recovery metadata, alongside `processes/`, `run/` and `logs/`. Object databases live under `do/coworkerd-do-host-v1/` with hashed Host ids, `.sqlite` / facet files, not paths named by the application's object name. Use a persistent writable volume and leave headroom for SQLite WAL, logs and snapshots; `diskBytes` bounds evictable recovered files, not all disk use. Do not remove a single-node cache or append log while it can contain the only confirmed tail. Files are reused only when boot / clean-exit markers and confirmed positions permit it; an unclean machine reboot rebuilds from uploaded history and surviving peers. On macOS the boot identifier is unavailable, so an unclean process exit also drops local durable files. A known 0.5.0 defect can lose acknowledged writes even after abrupt same-disk process restart on Linux; this release does not pass that recovery check. See [cluster state](../cluster-state.md), section 12.
+
 **Tenants** are the platform's users: the administrator (the platform) creates a tenant with the admin credential, registers hostnames for it, sets its quota, and then issues it a tenant credential; the tenant deploys its own Workers with its own credential.
 `cowctl tenant create|list|get|update|delete` and `cowctl credential create|list|revoke` are the administrator's subcommands (see sections 2 and 11 of the [quickstart](quickstart.md));
 the API is `/v1/tenants/...` (the control plane, compose's `apiserver` service, local port `18090`), and each request carries `Authorization: Bearer <credential>`.
@@ -489,9 +511,11 @@ the API is `/v1/tenants/...` (the control plane, compose's `apiserver` service, 
 | `logLinesPerSecond`, `logBufferBytes` | 100, 1 MiB | On each node, per tenant (lines over the limit are counted in `[dropped]`; requests are not affected) |
 | `maxWorkerCpuMs`, `maxWorkerMemoryMiB` | 30000, 512 | In the control plane when Worker-level limits are set (the limits themselves: see the end of section 5) |
 
+`durableObjectNamespaces` defaults to 16, counting class namespaces, databases and retained deleting namespaces. `durableObjectBytes` defaults to 10 GiB (10,737,418,240 bytes), enforced at durable confirmation using lagging node summaries; it can overshoot. Deleting namespaces / databases stop counting bytes, but 0.5 retains their history and names. Over the object cap a write gets `413 DO_OBJECT_TOO_LARGE`; over the tenant byte estimate it gets `422 QUOTA_EXCEEDED`. Reads continue; a refused transaction can remain locally visible until reopen repairs it. [Durable Objects](durable-objects.md) and [databases](databases.md) give the usage model.
+
 Over a quota gives `422 QUOTA_EXCEEDED`, with a `reason` that starts with the quota's name (`defaultLimits` when a tenant's default limits exceed its ceilings; [error codes](errors.md)). A package may be as large as the smaller of `packageBytes` and the control plane's `control.maxUploadBytes`: a larger one gets `422 QUOTA_EXCEEDED` while `packageBytes` is the smaller, otherwise -- as with the defaults, both 160 MiB -- `413 PACKAGE_TOO_LARGE`. **Hostnames**: a hostname belongs to one tenant only (`cowctl tenant update T --hostname H` sets the tenant's whole list: repeat `--hostname` for every one it keeps);
 a tenant's routes may use only the hostnames registered to it, or paths starting with `/<tenant>/` under the cluster's default host `*` (not the latter when `control.pathRouting` is `false`), otherwise `403 HOSTNAME_NOT_OWNED`. A request whose hostname is registered to a tenant is matched against that tenant's routes only, and a path prefix matches whole path segments (`/acme` does not take `/acme-corp/...`).
-**Deleting a tenant** (`cowctl tenant delete T`, which asks for confirmation, or without a terminal needs `--yes`): it is first marked `deleting` -- every node stops serving it within a few seconds, and requests get `503 TENANT_UNAVAILABLE` --, then its objects in object storage are cleaned up, its credentials removed, and finally the tenant itself with its routes, active pointers and secrets. A step that cannot finish -- an object the store does not remove, for example -- leaves the tenant `deleting` with `503 DELETION_INCOMPLETE`, and `cowctl tenant delete T` again goes on from there until nothing of it remains;
+**Deleting a tenant** (`cowctl tenant delete T`, which asks for confirmation, or without a terminal needs `--yes`): it is first marked `deleting` -- every node stops serving it within a few seconds, and requests get `503 TENANT_UNAVAILABLE` --, then eligible code / asset objects are cleaned up, credentials removed, and finally the tenant record with its routes, active pointers and secrets. Young code objects remain deferred by the cleanup grace, and Durable Object / D1 history is retained in this release. A step that cannot finish -- an object the store does not remove, for example -- leaves the tenant `deleting` with `503 DELETION_INCOMPLETE`, and `cowctl tenant delete T` again resumes that deletion workflow;
 [control plane API](../control-plane-api.md), section 6, describes each step and what a failure answers.
 
 **Deploying with `cowctl`**: in the directory of a wrangler project, `cowctl init --tenant T` and `cowctl deploy`, then `logs`, `versions`, `rollback`, `secret put` and `usage` --
@@ -517,7 +541,7 @@ compose has two networks: `backend` (internal, without a gateway: object storage
 
 On bare metal: the ingress is for users and the front load balancer; the control plane only for the platform's own systems and `cowctl`; the peer port only between the nodes and from the control plane and the operations tool; object storage not exposed.
 Each of these channels has credentials: peer connections are signed with the cluster key (section 12),
-object storage requests are signed and each node has an identity of its own that writes only its own objects ("Object storage identities" in section 4); the management endpoints use the management token, the control plane the admin and tenant credentials. Network isolation still has to be done -- apart from the credentials, tenant code itself cannot reach
+object storage requests are signed and each node has an identity of its own that writes its own membership / usage and shared Durable Object prefixes ("Object storage identities" in section 4); the management endpoints use the management token, the control plane the admin and tenant credentials. Network isolation still has to be done -- apart from the credentials, tenant code itself cannot reach
 these ports either (section 11).
 
 ## 8. Management endpoints and the token
@@ -547,8 +571,7 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
 - **One node exits**: `SIGTERM` (`docker compose stop`, `systemctl stop`) or `coworkerd-apiserver tool drain --server http://<ingress> --wait`
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
   writes out the current hour's usage, removes its heartbeat and drain marker, then exits. A second SIGTERM exits immediately. compose allows 45 seconds (`stop_grace_period`).
-- **Upgrading nodes**: one at a time: load the new image, `docker compose up -d node-1` (recreates that one), wait until it is ready, then the next. As long as the membership table always holds at least two nodes and the clients' front load balancer takes a node out when its readiness turns 503,
-  calls fail zero times: a request that still reaches the leaving node gets `503 SERVER_DRAINING`, to be sent to another node, and its port refuses connections once it has exited.
+- **Upgrading nodes**: one at a time: load the new image, `docker compose up -d node-1` (recreates that one), wait until it is ready, then the next. Keep at least two nodes in the membership table and have the clients' front load balancer take a node out when its readiness turns 503. Clients must still handle refusals and connection failures: a request that still reaches the leaving node gets `503 SERVER_DRAINING`, to be sent to another node, and its port refuses connections once it has exited.
 - **Replacing workerd**: replace the file `workerdPath` points to; the node notices within a second and rotates process by process, with in-flight requests completing in the old process;
   `coworkerd-apiserver tool rotate --server ... --all` rotates by hand as well.
 - **Replacing workerd** (only workerd, not the whole package): first put in an allowlist covering both the old and the new bytes, then replace the binary, finally switch to the allowlist covering only the new bytes -- the order and the reasons are in "System call allowlist" in section 4.
@@ -557,11 +580,15 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
 
+**Upgrading 0.4.x to 0.5.0 is in place.** Keep the bucket, cluster marker, secrets and peer keys, node ids and persistent volumes. The object layout adds `do/` and node WAL / usage objects without rewriting the 0.4 desired-state layout. Back up the bucket and configuration as for any upgrade, load the new image, update the compose / entry point files from the new package, and rerun `docker compose run --rm secrets` so each node's storage policy can read `do/` and `nodes/` and write the shared DO shard / object prefixes. On bare metal, update those policies yourself (section 4).
+
+Upgrade the control plane and then nodes one at a time, waiting for each readiness check before continuing; retain the old volumes. Keep stateless traffic during this sequence, with ordinary retry handling for a node that drains or is unavailable. Finish upgrading all nodes and writers before deploying DO / D1 definitions or adding the new configuration keys: a 0.4 daemon does not understand the new runtime / ownership protocol or those keys. `/v1` keeps its fields and adds new fields and endpoints; clients must also handle the new errors in [errors](errors.md).
+
 **Upgrading from 0.3.x** is not an upgrade in place: 0.3.x kept the cluster's state in etcd, 0.4 keeps all of it in the object store and reads nothing of 0.3's, and nothing is migrated. Build the cluster anew:
 deploy tenants, credentials, Workers and secrets again through `/v1` (`cowctl`) on a new 0.4 cluster. Under compose that means a new project or `down -v` first -- the `secrets` volume as well:
 a 0.4 node needs an identity of the store of its own, and a 0.3 `secrets` volume holds in each node's directory the one read identity 0.3 gave every node, which a 0.4 `secrets` step would keep. On bare metal, give every node its own identity and the secrets key, and remove `etcdEndpoint` and `etcdCredentialsFile`
 from every configuration: a 0.4 daemon refuses a configuration that names them, or an `etcd` backend, with `0.4 has no etcd: ... (the members, the desired state, the suspects and the usage are on the object store: the storage block)`.
-The store must be SeaweedFS 4.29 or newer (or another store with the properties in section 4); on the 0.3.x compose files' SeaweedFS 3.97 create-if-absent does not hold under concurrency: a 0.4 node starts there with a warning, and only one writer of the desired state may run at a time.
+Use the pinned SeaweedFS 4.48 or another store verified to have the properties in section 4; on the 0.3.x compose files' SeaweedFS 3.97 create-if-absent does not hold under concurrency: a 0.4 node starts there with a warning, and only one writer of the desired state may run at a time.
 
 ## 10. Troubleshooting
 
@@ -571,7 +598,7 @@ The store must be SeaweedFS 4.29 or newer (or another store with the properties 
 | The control plane refuses to start with `set control.adminCredential or COWORKERD_ADMIN_CREDENTIAL` | No admin credential: compose's `secrets` step generates it; on bare metal see "The control plane" in section 4 |
 | `cowctl` reports `UNAUTHORIZED` / `FORBIDDEN` | The credential is wrong, revoked or expired / its scope is not enough (a tenant credential acts only on its own tenant; `tenant` (except reading its own record), `credential create` and `credential list`, `node` and `usage --all` need the admin credential), see [error codes](errors.md) |
 | A node or the control plane refuses to start: `the bucket ... holds no cluster/format/1` | The bucket is not a cluster's yet, or it is the wrong bucket: compose's `init` writes the marker; on bare metal `coworkerd-apiserver tool init` ("A new cluster's bucket" in section 4) |
-| `init`'s contract line or `check storage` reports `"conditionalPutAtomic":false` | The store's create-if-absent does not hold under concurrency: SeaweedFS before 4.29. Use 4.29 or newer; on such a store run one control plane only |
+| `init`'s contract line or `check storage` reports `"conditionalPutAtomic":false` | The store's create-if-absent does not hold under concurrency (observed on SeaweedFS 3.97). Use a verified store, such as the pinned 4.48. Until then run one desired-state writer only; Durable Objects are unavailable |
 | A node refuses to start: `membership refuses to start: clock skew` | This machine's clock is more than `membership.clockSkewToleranceMs` (2 s) from the store's `Date`; the reason says by how much and which store. Install NTP |
 | A node refuses to start: `membership nodeId conflict` | Another process holds this `nodeId`: its heartbeat was written again while this one waited. Stop one of them; a node that finds its id taken while it runs exits with 3 |
 | A node refuses to start: `no management token: ...` | Set `COWORKERD_MANAGEMENT_TOKEN` (or `management.token`); compose's `secrets` step generates one. Only a development node may run without, with `management.allowWithoutToken: true` (section 8) |
@@ -591,14 +618,14 @@ The store must be SeaweedFS 4.29 or newer (or another store with the properties 
 | `fetch` throws `EGRESS_DENIED: <rule>` / `EGRESS_FAILED: <category>` | The outgoing request was refused by policy or could not connect, see section 11 and section 4 of the [error codes](errors.md); the node log's `[egress]` lines have the destination and the reason |
 | The log has `[peer-auth] {...,"event":"refused",...}` and cross-node calls get `PEER_UNAVAILABLE` | The peer connection is unsigned or its signature is not accepted: `reason` `unknown-key` (the two key files differ; a rotation is not finished), `expired` (the two clocks differ by more than 30 seconds: install NTP), `missing` (the other side has no cluster key configured), `bad-signature` (the same key id with another secret: the two files differ in a secret), `wrong-target`, `malformed`, `replayed` or `replay-cache-full`. See section 12 |
 | The object store answers `403 AccessDenied` to a node | The node's identity is not allowed what it did -- its policy ("Object storage identities" in section 4); a node writing another node's objects is refused by design |
-| `cowctl` or `/v1` answers `503 STORAGE_UNAVAILABLE` | The control plane cannot reach the object store: a write is refused with this answer and nothing is written (send it again once the store answers); reads are answered from its mirror and the members from its last listing, except the usage, which is read from the store, and a first read of Workers whose definitions it has not fetched yet; the nodes keep serving |
+| `cowctl` or `/v1` answers `503 STORAGE_UNAVAILABLE` | The control plane cannot reach the object store: a write can fail before or after committing its manifest revision (inspect state before repeating a non-idempotent operation); reads are answered from its mirror and the members from its last listing, except the usage, which is read from the store, and a first read of Workers whose definitions it has not fetched yet; the nodes keep serving |
 
 ## 11. Egress: tenant code reaching the network
 
 Tenant code's `fetch()` does not connect to the network from workerd itself -- with the sandbox active the workerd processes have no network interfaces ("Sandbox" in section 4), and without it they reach the network only through this egress configuration -- but goes to **the egress service of the node it runs on**
 (`<stack directory>/run/egress.sock`): the node checks the destination against the policy, resolves names itself, opens the connection itself (it also does the TLS of HTTPS, verified against the system's root certificates),
 counts the bytes, and hands the answer back. When refused or unable to connect, `fetch` throws `EGRESS_DENIED: <rule>` or `EGRESS_FAILED: <category>` (section 4 of the [error codes](errors.md)).
-Request and response headers are forwarded as they are (the node adds no identifying headers for the tenant); redirects are followed by `fetch` and each hop is checked again; HTTP, HTTPS and WebSocket are supported.
+The egress service strips connection headers and `x-coworkerd-egress*`, sets `Host` to the destination, and regenerates WebSocket handshake headers (preserving the subprotocol); it adds no tenant-identifying header; redirects are followed by `fetch` and each hop is checked again; HTTP, HTTPS and WebSocket are supported.
 
 **Refusals no rule can open**: loopback, link-local, the clouds' metadata addresses (169.254.169.254 and others), `0.0.0.0`, reserved and multicast addresses, and **the cluster's own addresses** --
 all of this node's interface addresses, the advertised address of every node in the membership table, the object storage endpoint, the addresses every control plane announces to the nodes, and those listed in `egress.clusterAddresses` (load balancers and others the node cannot see itself),
@@ -660,4 +687,4 @@ To generate a key: `openssl rand -hex 32`. compose's `secrets` distributes the n
 **The secrets key** cannot be replaced on a running cluster: a value sealed with one key does not open with another, and a node that cannot open a value treats the secret as missing, so the Workers that declare it are not served until the value is set again.
 Keep `secrets-key.json` with the other credentials of the cluster; under compose it is in the `secrets` volume.
 
-**Object storage**: requests are always signed; the deploy identity is only for the control plane and the operations tool, and each node has an identity of its own that writes only its own objects (compose's directory layout does exactly that; writing another node's objects with a node's identity gets 403).
+**Object storage**: requests are always signed; the deploy identity is only for the control plane and the operations tool, and each node has an identity of its own that writes its own membership / usage and shared Durable Object prefixes (compose's directory layout does exactly that; writing another node's objects with a node's identity gets 403).

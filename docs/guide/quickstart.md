@@ -1,6 +1,6 @@
 # Coworkerd quickstart
 
-> For release 0.4.1.
+> For release 0.5.0.
 > From a wrangler project to the first request: start the cluster -> the administrator creates a tenant and a credential -> `cowctl init --tenant` -> `cowctl deploy` -> `curl` ->
 > `cowctl logs` -> a new version -> `cowctl rollback` -> `cowctl secret put` -> `cowctl usage`.
 > Installation details, bare-metal deployment and configuration are in [installing and running](install.md); which wrangler features work is in the [compatibility scope](compat.md); errors are in [error codes](errors.md).
@@ -13,22 +13,21 @@ a Worker's full name is `tenant/Worker`, so two tenants can each have a Worker c
 - **Docker Engine 28 or newer** and the Docker Compose plugin (Docker Desktop on the Mac has both; on Linux take a Compose that supports volume `subpath` and the healthcheck's `start_interval`, which the compose file uses; this page was run with Docker 29.2 and Compose 5.1);
 - **Node.js 22.5 or newer** (`node --version`): the wrangler that `cowctl deploy` runs requires Node.js 22, and `cowctl`'s adapter uses `path.matchesGlob`, which Node.js has since 22.5;
 - `curl`;
-- your architecture's two files from the release and the checksums: `coworkerd-0.4.1-linux-<arch>.tar.gz`, `coworkerd-0.4.1-linux-<arch>-image.tar.gz`,
+- your architecture's two files from the release and the checksums: `coworkerd-0.5.0-linux-<arch>.tar.gz`, `coworkerd-0.5.0-linux-<arch>-image.tar.gz`,
   `SHA256SUMS`. A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64`.
 
 ## 1. Start the cluster (well under a minute)
 
 ```bash
 shasum -a 256 -c --ignore-missing SHA256SUMS        # on Linux: sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.4.1-linux-arm64.tar.gz
-docker load -i coworkerd-0.4.1-linux-arm64-image.tar.gz
-cd coworkerd-0.4.1-linux-arm64
+tar -xzf coworkerd-0.5.0-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.0-linux-arm64-image.tar.gz
+cd coworkerd-0.5.0-linux-arm64
 export COWORKERD_PACKAGE="$PWD" PATH="$PWD/bin:$PATH"
-(cd docker && docker compose --profile cluster up -d --wait)
+(cd docker && docker compose up -d --wait)
 ```
 
-This starts three nodes (compose services `node-1`, `node-2`, `node-3`, with their ingresses on local ports `18080`, `18081`, `18082`), the object store that holds the cluster's whole state, and the **control plane**
-(service `apiserver`, the API `cowctl` connects to, local port `18090`). For a single node, leave out `--profile cluster`. `bin/cowctl` is the command line `cowctl` (`cowctl --help` lists all subcommands).
+This starts one node (`node-1`, ingress `18080`), the object store and the control plane (`apiserver`, API `18090`). It is the single-node form used throughout this page. For three nodes, add `--profile cluster` to `up`; the other ingresses are `18081` and `18082`. `bin/cowctl` is the CLI (`cowctl --help` lists its commands). A single node flushes durable writes locally when there are no peers; keep its data volume across restarts.
 
 ## 2. Administrator: create a tenant and its credential
 
@@ -63,9 +62,9 @@ uploads it as the new version `v1`, and **first trial-loads it in a node's quara
 ```text
 deployed acme/hello-world v1 (active)
   package: 3 files, 4608 bytes; built in 2.2 s, deployed in 2.2 s
-  trial load: node-3 (its quarantine process), 17 ms
+  trial load: node-1 (its quarantine process), 17 ms
   route */acme/hello-world  ->  http://127.0.0.1:18080/acme/hello-world
-  served by 3 nodes (tenant index revision 3) in 1.9 s
+  served by 1 node (tenant index revision 3) in 1.9 s
 ```
 
 The nodes read the cluster's desired state from the object store every 5 seconds, so a deployment reaches them within about 5 seconds; until then a node answers with what it had before --
@@ -77,8 +76,7 @@ $ curl http://127.0.0.1:18080/acme/hello-world
 Hello from Coworkerd!
 ```
 
-All three ingresses work: a request can enter at any node and normally runs on this Worker's home node (computed from `tenant/Worker`); a node that ran the version within the last 30 s may serve it itself. By default the route is
-`/<tenant>/<Worker name>` under the cluster's default host; a tenant's own hostnames are registered to it by the administrator, then used with `cowctl deploy --route <hostname>/` (see section 9).
+With more nodes, any ingress can receive a request. The normal stateless warm/home placement policy selects its execution node. By default the route is `/<tenant>/<Worker name>` under the cluster's default host; the administrator can register tenant hostnames for `cowctl deploy --route <hostname>/` (section 10).
 
 ## 4. Logs
 
@@ -88,12 +86,12 @@ cowctl logs --follow          # keeps printing; Ctrl-C ends it
 ```
 
 ```text
-2026-10-24 06:44:11.514 node-3 log   v1 GET /acme/hello-world
+2026-10-24 06:44:11.514 node-1 log   v1 GET /acme/hello-world
 ```
 
 Each line is one `console.log`/`info`/`debug`/`warn`/`error` in the Worker: the time, the node that ran it, the level, the version, the content. The control plane fetches this Worker's logs from each node and
 merges them by time. `--since 10m` (or `2h`, or an ISO time) shows only the recent ones; `--json` prints one JSON object per line. Log quotas are per **tenant** and per node: each node keeps the latest 1 MiB in memory for each tenant,
-and each tenant may record at most 100 lines per second on each node (the administrator can adjust both per tenant); lines over the per-second rate are not recorded and a `[dropped]` line counts them, the buffer keeps the newest 1 MiB, and a line over 4 KB is cut;
+and each tenant may record at most 100 lines per second on each node (the administrator can adjust both per tenant); lines over the per-second rate are not recorded and a `[dropped]` line counts them, the buffer keeps the newest 1 MiB, and a line over 4 KiB is cut;
 all tenants' lines on a node together are kept up to 64 MiB, past which the oldest line of any tenant goes first (none of this affects the requests themselves).
 
 ## 5. A new version, and a rollback
@@ -118,7 +116,7 @@ acme/hello-world: active v2
   route */acme/hello-world  ->  http://127.0.0.1:18080/acme/hello-world
 ```
 
-The `package` hashes are an example from an arm64 machine: `cowctl` bundles the Worker with the tools installed for the machine it runs on, so on another architecture they differ.
+The `package` hashes identify the bundled files. The shown values are examples; changing the source or build-tool output changes the hash.
 
 ## 6. Add a secret
 
@@ -128,7 +126,7 @@ cowctl deploy --secret API_KEY
 curl http://127.0.0.1:18080/acme/hello-world/secret   # API_KEY has 15 characters
 ```
 
-A secret's value is read only from standard input (run directly in a terminal, it prompts for it without echoing) or from `--from-file`, with trailing whitespace removed; every output, log and state shows only its name, its length and when it was set.
+A secret's value is read only from standard input (run directly in a terminal, it prompts for it without echoing) or from `--from-file`, with trailing whitespace removed; the secret-management responses show only its name, its length and when it was set. Worker code receives the plaintext and can print it in application logs; do not log secret values.
 In the cluster it is stored sealed with the cluster's secrets key: the control plane seals it, and opens it only to check that it opens, each time it evaluates or lists the tenant's Workers (a deployment, a rollback, `versions`, `secret list`); the nodes open it to hand it to the Worker.
 A version has to **declare** which secrets it reads: wrangler's convention is to list them in the project's `.dev.vars.example` (only the names are taken; `.dev.vars` and `.env` are never read),
 or `deploy --secret NAME`. A version that declares a secret without a value is refused at deployment, with a hint to `secret put` first (with `--no-activate` the upload is accepted, and its activation is refused, naming the secret, until the value is set). `cowctl secret list` lists only names, lengths and when each was set;
@@ -162,25 +160,56 @@ cowctl versions --tenant beta                          # acme's credential: FORB
 The two tenants each have a `hello-world` with the same name, without affecting each other: routes, versions, secrets, logs and usage are each their own. A tenant credential acts only on its own tenant;
 touching another tenant gets `403 FORBIDDEN`.
 
-## 9. Your own project
+## 9. A Durable Object counter and a database
+
+The example stores a counter through the `Counter` object's SQLite-backed key-value API. Its `/rpc` endpoint makes one method call on the same object and one D1 query (`SELECT 42 AS answer`). From the tenant setup above:
+
+```bash
+cp -R "$COWORKERD_PACKAGE/examples/durable-counter" ~/durable-counter
+cd ~/durable-counter
+cowctl init --tenant acme
+cowctl d1 create counterdb
+cowctl deploy
+curl -X POST http://127.0.0.1:18080/acme/durable-counter
+curl http://127.0.0.1:18080/acme/durable-counter
+curl --fail --retry 10 --retry-delay 1 --retry-all-errors http://127.0.0.1:18080/acme/durable-counter/rpc
+cowctl do list
+cowctl do inspect Counter
+```
+
+The first two calls return `{"count":1}` on a fresh cluster; the method / D1 call returns `{"count":1,"database":42}`. Migrations declare the class namespace; the separately created database is selected by `database_name`. POST increments once for every request: avoid repeating an uncertain write blindly.
+
+Kill the single node, then start it again using the same volume:
+
+```bash
+(cd "$COWORKERD_PACKAGE/docker" && docker compose kill -s SIGKILL node-1)
+(cd "$COWORKERD_PACKAGE/docker" && docker compose up -d --wait node-1)
+curl http://127.0.0.1:18080/acme/durable-counter
+curl --fail --retry 10 --retry-delay 1 --retry-all-errors http://127.0.0.1:18080/acme/durable-counter/rpc
+cd ~/hello-world
+```
+
+The recovery assertion is that both answers still contain `count: 1`. **Known 0.5.0 failure:** this check currently fails: an acknowledged count of 1 was read as 0 after abrupt restart on the same disk. Keep this check when evaluating a fix; a status-200 answer containing 0 is data loss, not successful recovery. The read-only RPC / SQL request retries transient startup failures; node readiness covers ordinary processes, so a durable slot can still be starting or briefly paused. These commands exercise process / node restart on the same disk; a single node losing its disk before upload can lose data. In a larger cluster, a new shard owner rebuilds from snapshots, log segments and surviving peers. Simultaneous loss of the owner and all confirming peers can lose the unuploaded tail. See the [Durable Object guide](durable-objects.md) for classes, IDs, fetch, methods, WebSocket hibernation, alarms, quotas and takeover; the [database guide](databases.md) covers SQL.
+
+## 10. Your own project
 
 In the directory of a wrangler project, `cowctl init --tenant <tenant>`, then `cowctl deploy`:
 
 - if the project has its own wrangler installed (`npm install` was run), it builds with that; otherwise with the wrangler 4.136.1 `cowctl` brings along. For a project with dependencies, run `npm install` first;
 - a project that needs its own build first (Vite, React Router and the like): run `npm run build` first;
-- unsupported configuration (KV, Durable Objects, D1 and others) is listed in full at conversion and refused; platform-type settings (`observability` and others) are ignored with a notice, see the [compatibility scope](compat.md);
+- unsupported configuration (KV, R2, Queues and others) is listed in full at conversion and refused; platform-type settings (`observability` and others) are ignored with a notice, see the [compatibility scope](compat.md);
 - routes: `/<tenant>/<Worker name>` by default. A **static assets site** has its asset paths starting at `/` and needs a whole host: the administrator first registers the hostname to the tenant
   (`cowctl tenant update acme --hostname site.acme.localhost`, which sets the tenant's whole list: name every hostname it keeps; a hostname belongs to one tenant only), then `cowctl deploy --route site.acme.localhost/`
   (then `curl -H 'Host: site.acme.localhost' http://127.0.0.1:18080/`). An unregistered hostname is refused at deployment with `deploy refused: hostname ... is not one of tenant acme's hostnames`, and a path under the default host that does not start with `/<tenant>/` with `deploy refused: the routes of tenant acme under the default host are */acme/...: route */... is outside them` (the API's code is `HOSTNAME_NOT_OWNED` for both);
 - quotas: the number of Workers, versions per Worker, bundle size, the number and total size of static assets, the number of secrets, the number of hostnames and the log volume are all tenant quotas (set by the administrator, shown by `cowctl tenant get`);
   over one, the deployment, the secret or -- for the number of hostnames -- the administrator's tenant update is refused with a reason that names the quota (`deploy refused: tenant acme's quota: ...`, the API's code `QUOTA_EXCEEDED`), except the two log quotas, over which lines are dropped (section 4).
-  The conversion itself refuses more than 20000 static assets, 100 MiB of them, or one over 25 MiB, and a package of 160 MiB or more -- both the default quota and the control plane's upload limit -- gets `PACKAGE_TOO_LARGE`.
+  The conversion itself refuses more than 20000 static assets, 100 MiB of them, or one over 25 MiB, and a package larger than 160 MiB -- both the default quota and the control plane's upload limit -- gets `PACKAGE_TOO_LARGE`.
 
 `examples/` also has two official templates as they are: `email-routing-template` (static assets and the `ASSETS` Binding) and `x402-proxy-template` (secrets).
 Each serves at `/` of a host of its own: register a hostname to the tenant as above, then in the template's directory `cowctl init --tenant acme --route <hostname>/` and `cowctl deploy`; `x402-proxy-template` also needs `npm ci` first and its secret, `cowctl secret put JWT_SECRET` after `init`;
 each example's own `README.md` gives these commands for it.
 
-## 10. Cleaning up
+## 11. Cleaning up
 
 ```bash
 cowctl status                                                       # the control plane, the desired state's revisions, the nodes
@@ -189,16 +218,14 @@ cowctl status                                                       # the contro
 
 ```text
 $ cowctl status
-control plane http://127.0.0.1:18090: coworkerd-apiserver 0.4.1 (source 9d8a0003edd8), tenants revision 9, credentials revision 3; tenant acme
-node-1  active  coworkerd 0.4.1
-node-2  active  coworkerd 0.4.1
-node-3  active  coworkerd 0.4.1
+control plane http://127.0.0.1:18090: coworkerd-apiserver 0.5.0 (source e664d47e0f98), tenants revision 11, credentials revision 3; tenant acme
+node-1  active  coworkerd 0.5.0
 ```
 
 `cowctl status` names the control plane -- its `source` is the commit its binaries were built from, an example above --, the revisions of the tenant index and the credentials index it holds (each change of the desired state is a new revision in the object store), and the nodes;
 with the admin credential it also shows each node's processes and the revision of the deployment state the node serves. To stop without deleting: `down` without `-v`; at the next `up`, the tenants, credentials, deployments and secrets are all still there.
 
-## 11. Commands
+## 12. Commands
 
 | Command | Purpose |
 | --- | --- |
@@ -220,7 +247,7 @@ with the admin credential it also shows each node's processes and the revision o
 `--tenant T` names the tenant (default from `cowctl.json`), `--worker NAME` the Worker (default from `cowctl.json`, then `name` in the wrangler configuration);
 `COWCTL_CONTROL_PLANE` overrides the control plane's address. On failure it prints one sentence plus the reason the control plane gave (cleaned: no secret values or absolute paths) and exits with 1; a usage error exits with 2, an interrupted command with 130.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Remedy |
 | --- | --- |
@@ -231,7 +258,7 @@ with the admin credential it also shows each node's processes and the revision o
 | `the project does not convert: Unsupported Wrangler configuration: ...` | The listed settings are not supported by this platform, see the [compatibility scope](compat.md) |
 | `deploy refused: version vN does not load (SYNTAX_ERROR ...)` | The new version cannot be loaded and the active version did not change; reasons and categories are in [error codes](errors.md) |
 | `deploy refused: Worker ... would be invalid after upsert: missing secret: NAME` | `cowctl secret put NAME` first |
-| `deploy refused: tenant ...'s quota` / `deploy refused: hostname ... is not one of tenant ...'s hostnames` | Over the tenant's quota, or the route's hostname does not belong to this tenant: see section 9 |
+| `deploy refused: tenant ...'s quota` / `deploy refused: hostname ... is not one of tenant ...'s hostnames` | Over the tenant's quota, or the route's hostname does not belong to this tenant: see section 10 |
 | `curl` right after `cowctl deploy --no-wait` (or after a deploy that said `not served yet by ...`) gets 404 `ROUTE_NOT_FOUND`, or the previous version | The nodes have not read the deployment yet: they do every 5 seconds. Wait a few seconds and try again |
 | `curl` gets 404 `ROUTE_NOT_FOUND` | The path is not under any route: see the routes at the end of `cowctl versions` (by default `/<tenant>/<Worker>`) |
 | `curl` gets 503 | The request was refused or did not finish: the JSON answer's `code` says why -- a limit exceeded while running, but also a refusal before anything ran (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `SERVER_DRAINING`, `PROCESS_UNAVAILABLE` and others), see [error codes](errors.md); if it ran, `cowctl logs` shows what it printed |

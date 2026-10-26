@@ -8,18 +8,17 @@
   Linux only: there `build.sh` builds it too, which takes a C compiler as well.
 - **cowctl**: `npm ci --prefix cli` installs its dependencies (Node.js 22.5 or newer: the wrangler and Miniflare it
   pins require Node.js 22, and its adapter uses `path.matchesGlob`); `node cli/bin/cowctl.mjs` runs it.
-- **workerd**: the branch `coworkerd-v1.20261012.1` of the fork [coworkerd/workerd](https://github.com/coworkerd/workerd),
-  or upstream `v1.20261012.1` checked out into `workerd/` with `python3 scripts/workerd-patches.py apply`; build
+- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261012.1`), checked out into `workerd/` with `python3 scripts/workerd-patches.py apply`; build
   `//src/workerd/server:workerd` with Bazel (`--config=release`). [patches/README.md](patches/README.md) describes the
   series and how it is maintained.
 - **Linux binaries, a release package and its image**: `scripts/release.sh <version>` builds `coworkerd`,
   `coworkerd-apiserver` and `coworkerd-launcher` in a Linux toolchain container
-  ([scripts/toolchain/](scripts/toolchain/) has its image and how to set it up), takes the workerd build of the series
-  for the architecture and its system call allowlist, and assembles the package and the image `coworkerd:<version>`;
+  ([scripts/toolchain/](scripts/toolchain/) has its image and how to set it up), takes a prebuilt workerd whose SHA is pinned in the script
+  for the architecture and its matching system call allowlist, and assembles the package and the image `coworkerd:<version>`;
   the header of the script lists the environment it reads. It builds neither workerd nor its allowlist: it takes only
-  the build of the series pinned by SHA-256 for the architecture, with the allowlist directory generated for it, and
+  the binary pinned by SHA-256 for the architecture, with the allowlist directory generated for it, and
   only the version `cli/package.json` names, and it needs the toolchain container running with a configured CMake
-  tree. A release is built on a machine of each architecture.
+  tree. The current workerd pins predate patch 0014 and reject the current series build; the script also omits the database and Durable Object guides. These packaging defects must be resolved before making a 0.5.0 release. A release is built on a machine of each architecture.
 
 ## Trying a change on a local cluster
 

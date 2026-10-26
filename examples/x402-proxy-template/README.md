@@ -31,3 +31,5 @@ curl --cookie "auth_token=$TOKEN" http://x402.localhost:18080/__x402/protected  
 ```
 
 Changing the secret: `secret put JWT_SECRET` again. Isolates loaded after that use the new value; loaded ones keep the old value until they are reclaimed. `cowctl secret list` lists only names.
+
+The preserved upstream README has two stale references: use Node.js 22.5 or newer with `cowctl`, rather than its Node.js 18+ prerequisite; its `src/bots.ts` link should point to [src/bot-management/reference.ts](src/bot-management/reference.ts).
