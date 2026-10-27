@@ -3171,8 +3171,13 @@ kj::Promise<void> DurableLog::publishUsage() {
 
 kj::Promise<void> DurableLog::readUsage() {
   if (!enabled()) co_return;
+  // A membership refresh swaps its map while a store read is suspended. Keep this pass's node ids alive.
+  std::vector<std::string> nodeIds;
+  nodeIds.reserve(membership.members.size());
   for (const auto& [nodeId, member] : membership.members) {
-    if (nodeId == settings.nodeId) continue;
+    if (nodeId != settings.nodeId) nodeIds.push_back(nodeId);
+  }
+  for (const auto& nodeId : nodeIds) {
     try {
       auto answer = co_await store->get(nodeDurableUsageKey(nodeId));
       if (answer.status != 200) continue;

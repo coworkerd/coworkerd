@@ -159,10 +159,10 @@ A `d1_databases` Binding speaks D1's protocol, so its errors are D1's: statement
 | `D1_COLUMN_NOTFOUND: Column not found (c)` | `first("c")` on a row without that column | Check the statement's columns |
 | `D1_ERROR: the D1 Sessions API is not supported on this platform` | `withSession()`; `dump()` and `query()` answer the same way | Not in this release |
 
-The HTTP SQL interface (`POST /v1/tenants/{t}/databases/{d}/query`) answers the same shapes as the object does:
+The HTTP SQL interface (`POST /v1/tenants/{t}/databases/{d}/query`) sends the control plane's request through any node to the database's shard owner and answers the same shapes as the object does:
 `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a statement that failed, and
 the control plane's own `{"code","reason"}` when the database does not exist (`404 NOT_FOUND`) or no node serves it
-(`503 STORAGE_UNAVAILABLE`). Node statuses and bodies pass through, including 200 with `success:false`, 413, 422 and 503. Another member is tried only if connection establishment failed, or a node refused with `PEER_UNAVAILABLE`, `SERVER_DRAINING`, `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_OWNER_DRAINING` or `DO_SHARD_EPOCH_MISMATCH` before execution. A lost reply after connecting returns `503 RESULT_UNCERTAIN` without replay. The JavaScript binding preserves the platform error prefix.
+(`503 STORAGE_UNAVAILABLE`). Node statuses and bodies pass through, including 200 with `success:false`, 413, 422 and 503. A dispatch refusal returns its original code and body without waiting for the rejected request body to be consumed. Another member is tried only if connection establishment failed, or a node refused with `PEER_UNAVAILABLE`, `SERVER_DRAINING`, `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_OWNER_DRAINING` or `DO_SHARD_EPOCH_MISMATCH` before execution. A lost reply after connecting returns `503 RESULT_UNCERTAIN` without replay. The JavaScript binding preserves the platform error prefix.
 
 ## 4b. Method calls on a Binding (errors `env.SVC.method()` and `stub.method()` throw)
 

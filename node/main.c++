@@ -5255,10 +5255,10 @@ public:
   struct Request {
     std::string workerId;
     DurableTarget target;
-    // A stateless Worker's call: its child allocation in the caller's call tree. None: an object's call.
+    // A stateless Worker's call: its child allocation in the caller's call tree. None: an object or node's call.
     std::optional<ChildAllocation> allocation;
     SharedPathTiming timing;
-    // An object's call: the calling object.
+    // An object's call: the calling object. Both empty for a node's SQL or alarm request.
     std::string callerNamespaceId, callerObjectId;
   };
 
@@ -5271,7 +5271,8 @@ public:
     const auto started = monotonicTimeMs();
     const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
     const auto workerId = request.workerId;
-    Line line{workerId, {}, request.allocation ? "worker" : "object", "local", {}};
+    Line line{workerId, {}, request.allocation ? "worker" :
+        request.callerNamespaceId.empty() && request.callerObjectId.empty() ? "node" : "object", "local", {}};
     auto refused = [&](const InvocationRejection& refusal) {
       server.observeLocalRefusal(refusal, "durableObject");
       log(line, request.target, nullptr, refusal.status, refusal.code, started);
@@ -5332,7 +5333,8 @@ public:
   kj::Promise<Received> receive(Request request, uint32_t shard, uint64_t expectedEpoch, std::string from) {
     const auto started = monotonicTimeMs();
     const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
-    Line line{request.workerId, {}, request.allocation ? "worker" : "object", "received", from};
+    Line line{request.workerId, {}, request.allocation ? "worker" :
+        request.callerNamespaceId.empty() && request.callerObjectId.empty() ? "node" : "object", "received", from};
     auto refused = [&](const InvocationRejection& refusal) {
       server.observeRefusal(refusal, "peerDurableObject");
       log(line, request.target, nullptr, refusal.status, refusal.code, started);
@@ -5359,7 +5361,7 @@ public:
 
 private:
   // What the request's [do] line says besides the target: the caller's Worker and version, who called ("worker" or
-  // "object"), where it ran ("local": here, for a caller here; "forwarded": sent to the owner `node`; "received": sent here
+  // "object" or "node"), where it ran ("local": here, for a caller here; "forwarded": sent to the owner `node`; "received": sent here
   // by `node`).
   struct Line {
     std::string workerId, versionId, caller, route, node;
@@ -5507,10 +5509,10 @@ kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOv
   headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
   auto pipe = kj::newOneWayPipe(held->size());
   auto upload = pipe.out->write(kj::arrayPtr(held->data(), held->size()).asBytes())
-                    .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; });
+                    .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; }).eagerlyEvaluate(nullptr);
   CollectedResponse collected;
-  co_await kj::joinPromisesFailFast(kj::arr(kj::mv(upload),
-      service->request(kj::HttpMethod::POST, path, headers, *pipe.in, collected)));
+  // A refused dispatch answers without reading the body. Once the response is complete, cancel any remaining upload.
+  co_await service->request(kj::HttpMethod::POST, path, headers, *pipe.in, collected);
   co_return kj::mv(collected);
 }
 
@@ -5642,8 +5644,15 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   } else {
     request.callerNamespaceId = remote.getCallerNamespaceId().cStr();
     request.callerObjectId = remote.getCallerObjectId().cStr();
-    KJ_REQUIRE(validSha256(request.callerNamespaceId) && validSha256(request.callerObjectId),
-        "invalid remote Durable Object call: the calling object");
+    if (request.callerNamespaceId.empty() && request.callerObjectId.empty()) {
+      // The trusted peer node originates HTTP SQL and alarms without a calling object or call tree.
+      KJ_REQUIRE(request.target.hops == 0 &&
+          (!request.target.database.empty() || request.target.alarmAtUnixMs != 0),
+          "invalid remote Durable Object call: the calling node");
+    } else {
+      KJ_REQUIRE(validSha256(request.callerNamespaceId) && validSha256(request.callerObjectId),
+          "invalid remote Durable Object call: the calling object");
+    }
   }
   std::cout << "[peer-open] {\"nodeId\":\"" << server.placementConfig().serverId << "\",\"durableObject\":true,\"treeId\":\""
             << treeId << "\",\"remainingMs\":" << remainingMs << ",\"shard\":" << remote.getShard() << ",\"shardEpoch\":\""
