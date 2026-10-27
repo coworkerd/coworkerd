@@ -42,7 +42,7 @@ named within its tenant):
 
 ## 4. Use it
 
-`env.DB` is D1's API when the binding is installed. **Known 0.5.0 defect:** a Worker with D1 bindings but no declared Durable Object class gets no database bindings in its env. The example below describes the API, but fails in such a D1-only Worker. The [durable-counter example](../../examples/durable-counter) declares a DO class and exercises the binding successfully; HTTP SQL in section 5 also works without a Worker.
+`env.DB` is installed for every declared D1 binding, including Workers with no Durable Object classes. The following example needs only the `d1_databases` entry above.
 
 ```js
 export default {
@@ -66,7 +66,7 @@ and `exec()`, with D1's `meta` (`changes`, `last_row_id`, `rows_read`, `rows_wri
 D1's errors ([error codes](errors.md), section 4). What is not: a migration tool, import and export, restore to a point
 in time, read replicas, and the Sessions API -- `withSession()`, `dump()` and `query()` are refused.
 
-`batch()` is one request to the database, so its statements run one after another on the same object; it is not a transaction. The client checks only the first result for throwing; inspect later results for `success: false` even when the promise resolves. `exec()` splits its argument by lines and runs each as a statement, as D1 does, and reports the first failure after the request has executed its statements; later statements may already have run (`D1_EXEC_ERROR` names the line).
+`batch()` executes its statements in order within one transaction. Any statement failure rolls back the whole batch and rejects the promise with `D1_ERROR:`. `exec()` splits its argument by lines and runs each as a statement, stops at the first failure, and keeps earlier successful lines; `D1_EXEC_ERROR` names the failing line. It does not roll back earlier lines.
 
 ## 5. Without a Worker
 
@@ -83,8 +83,8 @@ curl -s -X POST "$CONTROL_PLANE/v1/tenants/acme/databases/books/query" \
   -d '{"sql":"SELECT title FROM books WHERE pages > ?","params":[400]}'
 ```
 
-Set `CONTROL_PLANE` to your API URL and `COWCTL_TOKEN` to your tenant credential. CLI `--param` values are strings (the SQL engine applies its conversions); the HTTP `params` array can also carry numbers, null and byte arrays. The public endpoint is `/query`; `/execute` is not routed. It accepts an object or an array of statement objects and always returns row objects (`ARRAY_OF_OBJECTS`); its `resultsFormat` query parameter has no effect. The internal SQL Worker also supports `ROWS_AND_COLUMNS`, which the JavaScript client uses for `raw()`. The answer is D1's: `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a
-statement that failed. An array of `{"sql","params"}` runs several statements and answers an array.
+Set `CONTROL_PLANE` to your API URL and `COWCTL_TOKEN` to your tenant credential. CLI `--param` values are strings (the SQL engine applies its conversions); the HTTP `params` array can also carry numbers, null and byte arrays. The public endpoint is `/query`; `/execute` is not routed. It accepts an object or an array of statement objects. `resultsFormat=ARRAY_OF_OBJECTS` (the default) returns row objects; `resultsFormat=ROWS_AND_COLUMNS` returns `{columns,rows}`, also used by the JavaScript client for `raw()`. Other format names are refused. The answer is D1's: `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a
+statement that failed. An array of `{"sql","params"}` runs one transaction and answers an array; a failing statement rolls the transaction back.
 
 ## 6. Delete one
 
@@ -98,6 +98,6 @@ be used again in this release.
 
 ## 7. Failure and consistency
 
-Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. `batch()` is not an atomic multi-statement transaction, and a failed `exec()` does not undo earlier statements. SQL errors use D1 error prefixes; the JavaScript binding can distinguish platform failures such as `STORAGE_UNAVAILABLE`, `DO_RECOVERING`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED` (see [errors](errors.md)). The public HTTP SQL route only forwards a node answer with status 200; it tries other members after a non-200 answer or transport error and otherwise returns `503 STORAGE_UNAVAILABLE`, losing the original code. This retry can repeat a statement whose result was uncertain, so HTTP SQL does not provide at-most-once writes. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. The same-disk abrupt-restart defect and unchecked local flush described in [Durable Objects](durable-objects.md), section 7, also affect the database storage path. No read replicas or Sessions API provide another consistency mode.
+Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
-Database names currently need lowercase letters / digits with a letter first to be usable by nodes (for example `books` or `counterdb`). The API and CLI also accept names with hyphens or a leading digit, but the deployment-state decoder incorrectly treats them as class names; creation succeeds and serving fails. Use the narrower form until that defect is fixed.
+Database names follow `[a-z0-9][a-z0-9-]{0,62}`: hyphens and a leading digit are supported. A malformed entry in the deployment's database or namespace table is skipped independently; `deployment.invalidNamespaceEntryCount` at the node's state endpoint counts skipped entries.

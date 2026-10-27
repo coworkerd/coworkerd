@@ -89,7 +89,7 @@ done
 ALLOWLIST_SUMMARY=$(python3 "$ROOT/scripts/syscall-allowlist-check.py" "$ALLOWLIST" "$WORKERD_SHA256") || exit 1
 log "system call allowlist: $ALLOWLIST_SUMMARY"
 
-for page in install quickstart compat errors; do
+for page in install quickstart compat errors databases durable-objects; do
   [[ -f $ROOT/docs/guide/$page.md ]] || { echo "docs/guide/$page.md is missing" >&2; exit 1; }
 done
 command -v node >/dev/null && command -v npm >/dev/null || { echo "node and npm are needed to package cowctl" >&2; exit 1; }
@@ -155,7 +155,7 @@ cp "$ROOT/docker/entrypoint.sh" "$STAGE/docker/entrypoint.sh"
 chmod 0755 "$STAGE/docker/entrypoint.sh"
 cp -R "$ROOT/docker/examples/hello" "$STAGE/docker/examples/hello"
 cp "$ROOT/docs/guide/install.md" "$STAGE/INSTALL.md"
-for page in install quickstart compat errors; do cp "$ROOT/docs/guide/$page.md" "$STAGE/docs/$page.md"; done
+for page in install quickstart compat errors databases durable-objects; do cp "$ROOT/docs/guide/$page.md" "$STAGE/docs/$page.md"; done
 # The examples: hello-world and two official Cloudflare templates as they are (MIT, LICENSE beside them).
 cp -R "$ROOT/examples" "$STAGE/examples"
 find "$STAGE/examples" \( -name node_modules -o -name .wrangler -o -name dist \) -prune -exec rm -rf {} +

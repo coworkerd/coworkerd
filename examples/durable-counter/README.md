@@ -21,4 +21,4 @@ cowctl do list
 cowctl do inspect Counter
 ```
 
-The `Counter` class namespace is created by `migrations`; the database is created separately. Redeploying the Worker keeps both. POST is not idempotent: do not repeat an uncertain request blindly. The quickstart checks killing and restarting the single node with the same volume. That recovery assertion currently fails in 0.5.0: an acknowledged count of 1 can become 0; the [Durable Object guide](../../docs/guide/durable-objects.md) explains recovery and the accepted loss of an unuploaded tail when an owner and all confirming peers fail together.
+The `Counter` class namespace is created by `migrations`; the database is created separately. Redeploying the Worker keeps both. POST is not idempotent: do not repeat an uncertain request blindly. The quickstart checks killing and restarting the single node with the same volume. Both reads must still contain `count: 1`; the [Durable Object guide](../../docs/guide/durable-objects.md) explains recovery and the accepted loss of an unuploaded tail when an owner and all confirming peers fail together.

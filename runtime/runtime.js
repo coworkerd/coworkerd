@@ -399,9 +399,10 @@ async function __coworkerdD1Send(entry, endpoint, query, params, resultsFormat) 
 }
 async function __coworkerdD1SendOrThrow(entry, endpoint, query, params, resultsFormat) {
   const results = await __coworkerdD1Send(entry, endpoint, query, params, resultsFormat);
-  const first = __coworkerdD1First(results);
-  if (!first?.success) {
-    const message = first?.error ?? "Something went wrong";
+  const list = Array.isArray(results) ? results : [results];
+  const failed = list.findIndex(one => !one?.success);
+  if (failed !== -1) {
+    const message = list[failed]?.error ?? "Something went wrong";
     throw new Error("D1_ERROR: " + message, { cause: new Error(message) });
   }
   return results;
@@ -859,15 +860,18 @@ async function makeWorkerCode(descriptor, env, ctx) {
       throw staged("decode", error);
     }
     const classes = Array.isArray(descriptor.durableObjectClasses) ? descriptor.durableObjectClasses : [];
+    // A trial load shares this isolate's loader key but has no bindings. Include the namespace helpers here;
+    // install bindings from each call's props, independently of the classes declared by this Worker.
     const bridge = `import { __coworkerdLog } from "./${PRELUDE_MODULE}";
 import { withEnv, DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${TRIAL_SOURCE}
 ${RPC_SOURCE}
-${classes.length ? DURABLE_SOURCE + classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\n`).join("") : ""}
+${DURABLE_SOURCE}
+${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\n`).join("")}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
-  return { ...variables, ...__coworkerdServices(bindings)${classes.length ? ", ...__coworkerdNamespaces(durableObjects)" : ""} };
+  return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
 }
 export default class extends WorkerEntrypoint {
   fetch(request) {
@@ -1021,6 +1025,33 @@ function durableBindings(descriptor, ctx, caller) {
 // it -- workerd's own error, not one the class threw (`remote`) --, or anything else. A write whose frames the node
 // did not confirm fails with STORAGE_UNAVAILABLE, and the object is rebuilt from its replicated history before it
 // serves anything again (docs/guide/errors.md).
+function cleanDurableReason(error, secrets = []) {
+  let text = String(error?.message ?? error).split("\n")
+    .filter((line, i) => i === 0 || !line.trimStart().startsWith("at ")).join("\n");
+  const values = secrets.flatMap(({ value }) => typeof value === "string" && value.length
+    ? [value, JSON.stringify(value).slice(1, -1)] : []).sort((a, b) => b.length - a.length);
+  for (const value of values) text = text.split(value).join("[redacted]");
+  const starts = " \t\n\"'(<[=,", ends = " \t\n\"')>],";
+  let cleaned = "";
+  for (let i = 0; i < text.length;) {
+    const boundary = i === 0 || starts.includes(text[i - 1]);
+    if (boundary && (text.startsWith("file:", i) || (text[i] === "/" && text[i + 1] !== "/"))) {
+      let end = i;
+      while (end < text.length && !ends.includes(text[end])) ++end;
+      const token = text.slice(i, end);
+      if (token.startsWith("file:") || token.indexOf("/", 1) >= 0) { cleaned += "<path>"; i = end; continue; }
+    }
+    cleaned += text[i++];
+  }
+  if (cleaned.includes("not valid JSON")) cleaned = cleaned.replace(/"[^"\n]*"/g, '"…"');
+  cleaned = cleaned.replaceAll("__coworkerd_tenant__.js", "script").replace(/[\x00-\x1f]/g, " ");
+  const bytes = new TextEncoder().encode(cleaned);
+  if (bytes.length <= 400) return cleaned;
+  let end = 397; // Leave room for the UTF-8 ellipsis within the 400-byte limit.
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) --end;
+  return new TextDecoder().decode(bytes.subarray(0, end)) + "…";
+}
+
 function facetCode(error) {
   const reason = String(error?.message ?? error);
   if (reason.includes("STORAGE_UNAVAILABLE")) return "STORAGE_UNAVAILABLE";
@@ -1068,7 +1099,7 @@ export class Host extends DurableObject {
       }
       return await facet.fetch(new Request(request, { headers, cf: tenantCf(descriptor, this.env) }));
     } catch (error) {
-      const reason = String(error?.message ?? error);
+      const reason = cleanDurableReason(error, descriptor.secrets);
       const code = facetCode(error);
       // A limit ended the class's isolate, or workerd reset the object: the facet goes, and the next request starts it
       // again -- from a new isolate when the old one was revoked, which ends every object of the version here.
@@ -1079,12 +1110,12 @@ export class Host extends DurableObject {
           code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
           code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" :
           code === "QUOTA_EXCEEDED" ? "the tenant's Durable Object storage quota is exhausted" : "Durable Object reset",
-          code, reason: reason.slice(0, 300) },
+          code, reason },
           { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : code === "QUOTA_EXCEEDED" ? 422 : 503 });
       }
       // The class threw: the object stays, as on Cloudflare -- the same instance takes the next request -- and the
       // caller gets the exception's message.
-      return Response.json({ error: "Durable Object execution failed", code: "EXECUTION_FAILED", reason: reason.slice(0, 300) },
+      return Response.json({ error: "Durable Object execution failed", code: "EXECUTION_FAILED", reason },
         { status: 500 });
     }
   }
@@ -1164,7 +1195,24 @@ export class SqlDatabase extends DurableObject {
         return { success: false, error: String(error instanceof Error ? error.message : error) };
       }
     };
-    return Response.json(Array.isArray(body) ? body.map(one) : one(body));
+    if (!Array.isArray(body)) return Response.json(one(body));
+    if (query) {
+      // batch() is atomic: let the failing statement escape transactionSync so SQLite rolls the whole batch back.
+      // Report that statement's D1 error only after the rollback has completed.
+      try {
+        return Response.json(this.ctx.storage.transactionSync(() => body.map(statement => this.runStatement(statement, resultsFormat))));
+      } catch (error) {
+        return Response.json([{ success: false, error: String(error instanceof Error ? error.message : error) }]);
+      }
+    }
+    // exec() commits each line, keeps earlier successes and stops at the first failure.
+    const answers = [];
+    for (const statement of body) {
+      const answer = one(statement);
+      answers.push(answer);
+      if (!answer.success) break;
+    }
+    return Response.json(answers);
   }
 
   runStatement(statement, resultsFormat) {

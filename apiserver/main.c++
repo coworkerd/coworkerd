@@ -523,7 +523,7 @@ private:
       }
       if (n == 6 && segments[5] == "query") {
         if (!is(kj::HttpMethod::POST)) co_return co_await methodNotAllowed(response, "POST");
-        co_return co_await sqlQuery(tenant, database, body, response);
+        co_return co_await sqlQuery(tenant, database, query, body, response);
       }
       co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
     }
@@ -838,7 +838,7 @@ private:
     co_return result;
   }
 
-  struct Fetched { bool ok = false; uint status = 0; std::string body, error; };
+  struct Fetched { bool ok = false, connected = false; uint status = 0; std::string body, error; };
   kj::Promise<Fetched> fetch(std::string url) {
     Fetched result;
     try {
@@ -880,16 +880,22 @@ public:
 
 private:
   // A POST whose answer the caller reads (the SQL statements): the status and the body, or why it did not answer.
-  kj::Promise<Fetched> ask(std::string url, std::string body, uint32_t timeoutMs) {
+  kj::Promise<Fetched> ask(std::string address, std::string path, std::string body, uint32_t timeoutMs) {
     Fetched result;
     try {
-      auto client = kj::newHttpClient(timer, headerTable, network, kj::none);
-      kj::HttpHeaders headers(headerTable);
-      headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
-      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-      if (!settings.token.empty()) headers.addPtr("Authorization", kj::str("Bearer ", settings.token.c_str()));
-      auto call = client->request(kj::HttpMethod::POST, url.c_str(), headers, body.size());
       auto work = [&]() -> kj::Promise<void> {
+        // Establish the connection before creating the request. Only a failure before this boundary proves that
+        // no SQL was sent; a lost response after it must never replay a potentially committed write.
+        auto target = co_await network.parseAddress(address.c_str());
+        auto stream = co_await target->connect();
+        result.connected = true;
+        auto client = kj::newHttpClient(headerTable, *stream);
+        kj::HttpHeaders headers(headerTable);
+        headers.setPtr(kj::HttpHeaderId::HOST, address.c_str());
+        headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
+        headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+        if (!settings.token.empty()) headers.addPtr("Authorization", kj::str("Bearer ", settings.token.c_str()));
+        auto call = client->request(kj::HttpMethod::POST, path.c_str(), headers, body.size());
         co_await call.body->write(kj::arrayPtr(body.data(), body.size()).asBytes());
         call.body = nullptr;
         auto answer = co_await call.response;
@@ -1123,8 +1129,13 @@ private:
 
   // POST /v1/tenants/{t}/databases/{d}/query: the statement goes to a node, which sends it to the shard's owner. The
   // body and the answer are D1's own (src/cloudflare/internal/d1-api.ts): {"sql","params"} or an array of them.
-  kj::Promise<void> sqlQuery(std::string tenant, std::string database, kj::AsyncInputStream& body,
+  kj::Promise<void> sqlQuery(std::string tenant, std::string database, const std::map<std::string, std::string>& query,
+      kj::AsyncInputStream& body,
       ControlResponse& response) {
+    const auto asked = query.find("resultsFormat");
+    const auto format = asked == query.end() ? std::string("ARRAY_OF_OBJECTS") : asked->second;
+    if (format != "ARRAY_OF_OBJECTS" && format != "ROWS_AND_COLUMNS")
+      co_return co_await fail(response, 400, "INVALID_REQUEST", "resultsFormat is ARRAY_OF_OBJECTS or ROWS_AND_COLUMNS");
     auto record = coworkerd::readDatabaseRecord(state, tenant, database);
     if (record.status != 200) co_return co_await send(response, record);
     auto text = co_await readBody(body, 1024 * 1024);
@@ -1133,12 +1144,31 @@ private:
       co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "no node is a live member of the cluster");
     // Any node: it sends the statement on to the owner of the database's shard.
     std::string problem;
+    std::optional<Fetched> refused;
     for (const auto& member : list) {
-      auto answer = co_await ask("http://" + member.address + "/__coworkerd/databases/" + tenant + "/" + database +
-          "/query", text, 15000);
-      if (answer.ok) co_return co_await sendJson(response, answer.status ? answer.status : 200, answer.body);
+      auto answer = co_await ask(member.address, "/__coworkerd/databases/" + tenant + "/" + database +
+          "/query?resultsFormat=" + format, text, 15000);
+      if (answer.ok) {
+        std::string code;
+        try {
+          capnp::MallocMessageBuilder message;
+          auto value = message.initRoot<capnp::JsonValue>();
+          capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.body.data(), answer.body.size()), value);
+          code = coworkerd::json::text(value.asReader(), "code");
+        } catch (const kj::Exception&) {}
+        const bool notExecuted = code == "PEER_UNAVAILABLE" || code == "SERVER_DRAINING" ||
+            code == "DO_UNAVAILABLE" || code == "DO_OWNER_EXPIRED" || code == "DO_OWNER_DRAINING" ||
+            code == "DO_SHARD_EPOCH_MISMATCH";
+        if (!notExecuted || answer.status < 400)
+          co_return co_await sendJson(response, answer.status, answer.body);
+        refused = std::move(answer);
+        continue;
+      }
+      if (answer.connected)
+        co_return co_await fail(response, 503, "RESULT_UNCERTAIN", "the SQL request was sent but its response was lost");
       problem = answer.error;
     }
+    if (refused) co_return co_await sendJson(response, refused->status, refused->body);
     co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "no node answered the statement: " + problem);
   }
 

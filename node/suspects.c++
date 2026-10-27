@@ -55,12 +55,16 @@ Suspects::Suspects(Membership* membership, std::string serverId, uint32_t baseMs
   // The members' objects, as the membership reads them (installed before it starts: its first listing adopts them).
   if (keepsObjects()) {
     membership->onSuspects([this](const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
-      adopt(nodeId, epoch, bytes);
+      return adopt(nodeId, epoch, bytes);
     });
+    membership->ownSuspects([this]() { return ownObject(); });
   }
 }
 Suspects::~Suspects() noexcept(false) {
-  if (keepsObjects()) membership->onSuspects(nullptr);
+  if (keepsObjects()) {
+    membership->onSuspects(nullptr);
+    membership->ownSuspects(nullptr);
+  }
 }
 bool Suspects::keepsObjects() const { return membership != nullptr && membership->view().backend == "objectStore"; }
 bool Suspects::contains(const std::string& tenant) const {
@@ -105,7 +109,7 @@ std::string Suspects::ownObject() const {
   }
   return out.empty() ? out : out + "}";
 }
-void Suspects::adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
+bool Suspects::adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
   // A member's object holds that member's suspicions only. A missing object never erases one: known suspicions expire on
   // their recorded deadline, even offline.
   capnp::MallocMessageBuilder message;
@@ -116,13 +120,17 @@ void Suspects::adopt(const std::string& nodeId, const std::string& epoch, const 
   } catch (const kj::Exception& error) {
     ++invalidObjects;
     lastError = "the suspects object of " + nodeId + " epoch " + epoch + " does not read: " + error.getDescription().cStr();
-    return;
+    return false;
   }
   ++adoptedObjects;
+  bool valid = true;
   for (auto entry : value.asReader().getObject()) {
     Suspect record;
-    try { record = decode(entry.getName().cStr(), entry.getValue()); } catch (const kj::Exception&) { ++invalidObjects; continue; }
-    if (record.sourceServerId != nodeId || record.expiresAtUnixMs <= wall()) continue;
+    try { record = decode(entry.getName().cStr(), entry.getValue()); } catch (const kj::Exception&) {
+      ++invalidObjects; valid = false; continue;
+    }
+    if (record.sourceServerId != nodeId) { ++invalidObjects; valid = false; continue; }
+    if (record.expiresAtUnixMs <= wall()) continue;
     auto local = entries.find(record.tenant);
     if (local != entries.end() && local->second.invocationId == record.invocationId) {
       if (record.expiresAtUnixMs > local->second.expiresAtUnixMs) { remember(record, "shared"); ++adoptions; }
@@ -133,6 +141,7 @@ void Suspects::adopt(const std::string& nodeId, const std::string& epoch, const 
       ++adoptions;
     }
   }
+  return valid;
 }
 kj::Promise<void> Suspects::maintain() {
   while (true) {

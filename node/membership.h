@@ -121,8 +121,8 @@ public:
   virtual const MembershipView& view() const = 0;
   virtual kj::Promise<void> start() = 0;
   virtual kj::Promise<void> run() = 0;
-  // Removes this epoch's objects (the other members drop it at their next listing); idempotent. Heartbeats and
-  // registration end here, so the objects never come back from this process.
+  // Removes this epoch's heartbeat and drain marker; retains live suspicions for the next epoch. Idempotent.
+  // Heartbeats and registration end here, so the removed objects never come back from this process.
   virtual kj::Promise<void> stop() = 0;
   // Marks this Server's membership draining, under its current epoch and only
   // if the epoch is still held by it. Heartbeats continue. Throws when the store did
@@ -137,8 +137,10 @@ public:
   virtual kj::Promise<void> writeSuspects(std::string bytes) { return kj::READY_NOW; }
   // objectStore: every live member's suspects object whose ETag changed since this membership last read it, once per
   // listing cycle, and at the start this node's own of its earlier epochs before they are removed. (nullptr: none.)
-  using SuspectsCallback = std::function<void(const std::string& nodeId, const std::string& epoch, const std::string& bytes)>;
+  using SuspectsCallback = std::function<bool(const std::string& nodeId, const std::string& epoch, const std::string& bytes)>;
   virtual void onSuspects(SuspectsCallback callback) {}
+  // The live suspicions owned by this node, used for an atomic handoff between epochs and graceful shutdown.
+  virtual void ownSuspects(std::function<std::string()> callback) {}
   // objectStore: the durable processes this node runs, announced in its heartbeats (set before start()).
   virtual void setDurableProcesses(uint32_t count) {}
 };

@@ -132,6 +132,7 @@ public:
   }
 
   void onSuspects(SuspectsCallback callback) override { suspectsCallback = std::move(callback); }
+  void ownSuspects(std::function<std::string()> callback) override { ownSuspectsCallback = std::move(callback); }
 
   void setDurableProcesses(uint32_t count) override { state.durableProcesses = count; }
 
@@ -213,10 +214,19 @@ public:
       try {
         co_await bounded(store.remove(memberHeartbeatKey(serverId, epoch)));
         co_await bounded(store.remove(memberDrainKey(serverId, epoch)));
-        if (state.suspectsObject) {
-          co_await bounded(store.remove(memberSuspectsKey(serverId, epoch)));
-          state.suspectsObject = false;
-          ++state.suspectsRemoved;
+        if (ownSuspectsCallback) {
+          const auto body = ownSuspectsCallback();
+          if (body.empty() && state.suspectsObject) {
+            co_await bounded(store.remove(memberSuspectsKey(serverId, epoch)));
+            state.suspectsObject = false;
+            ++state.suspectsRemoved;
+          } else if (!body.empty()) {
+            // Keep the current deadlines, including a suspicion recognized just before draining. The successor
+            // reads and writes these to its own epoch before removing this object.
+            co_await bounded(store.put(memberSuspectsKey(serverId, epoch), body));
+            state.suspectsObject = true;
+            ++state.suspectsWritten;
+          }
         }
         state.revokeStatus = "removed";
         std::cout << "[membership] removed node=" << serverId << " epoch=" << epoch << std::endl;
@@ -287,6 +297,7 @@ private:
   bool serving = false;
   std::function<void(std::string)> identityCallback;
   SuspectsCallback suspectsCallback;
+  std::function<std::string()> ownSuspectsCallback;
   // (node, epoch) -> the ETag of its suspects object as this membership last read it.
   std::map<std::pair<std::string, uint64_t>, std::string> suspectsEtags;
   // The registrations this process created (its epochs, once read back).
@@ -556,8 +567,8 @@ private:
 
   // A member's suspects object, handed to the callback (Suspects adopts what it holds) once it reads; its ETag is
   // remembered so that the next listing reads it again only when it changed.
-  kj::Promise<void> readSuspects(std::string id, uint64_t number, std::string etag) {
-    if (!suspectsCallback) co_return;
+  kj::Promise<bool> readSuspects(std::string id, uint64_t number, std::string etag) {
+    if (!suspectsCallback) co_return false;
     ++state.suspectsReads;
     ObjectResponse response;
     try {
@@ -565,15 +576,19 @@ private:
     } catch (const kj::Exception& error) {
       ++state.suspectsReadFailures;
       failed("suspects read", error);
-      co_return;
+      co_return false;
     }
     if (response.status != 200) {
       // Gone since the listing (its node removed it): the next listing tells.
       if (response.status != 404) ++state.suspectsReadFailures;
-      co_return;
+      co_return false;
+    }
+    if (!suspectsCallback(id, std::to_string(number), response.bytes)) {
+      ++state.suspectsReadFailures;
+      co_return false;
     }
     suspectsEtags[{id, number}] = etag;
-    if (suspectsCallback) suspectsCallback(id, std::to_string(number), response.bytes);
+    co_return true;
   }
 
   // The old epochs' heartbeats, markers and suspects objects of this id go once a new epoch holds it (its suspicions are
@@ -591,7 +606,10 @@ private:
         if (listed.heartbeat) { co_await bounded(store.remove(memberHeartbeatKey(serverId, number))); ++state.oldObjectsRemoved; }
         if (listed.draining) { co_await bounded(store.remove(memberDrainKey(serverId, number))); ++state.oldObjectsRemoved; }
         if (listed.suspects) {
-          co_await readSuspects(serverId, number, listed.suspectsEtag);
+          if (!ownSuspectsCallback || !co_await readSuspects(serverId, number, listed.suspectsEtag)) continue;
+          // Do not delete the only durable copy on a failed read, decode, or write. Startup may be retried, and
+          // adopting an already restored record preserves its original expiration.
+          co_await writeSuspects(ownSuspectsCallback());
           co_await bounded(store.remove(memberSuspectsKey(serverId, number)));
           ++state.oldObjectsRemoved;
         }

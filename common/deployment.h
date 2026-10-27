@@ -194,7 +194,8 @@ struct DurableObjectNamespace {
   bool operator==(const DurableObjectNamespace&) const = default;
 };
 std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces);
-std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes);
+std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes,
+    bool databases = false, size_t* invalidEntries = nullptr);
 
 // One secret value as stored: {"value":<string>,"setAtUnixMs":<ms>}. A value is
 // UTF-8 text without NUL, at most MAX_SECRET_BYTES. Reasons never carry the value.
@@ -359,6 +360,7 @@ private:
   std::set<std::string> unknownKeys, binderKeys;
   std::map<std::string, std::map<std::string, SecretValue>> secretMap;  // workerId -> name -> record
   std::map<std::string, std::map<std::string, DurableObjectNamespace>> namespaceMap;  // workerId -> class -> namespace
+  std::map<std::string, size_t> invalidNamespaceEntries;  // state key -> skipped entries (including databases)
   size_t secretKeys = 0, unusableSecrets = 0;
   bool requireSecretValues = true;
   size_t validWorkers = 0, effectiveRoutes = 0;

@@ -852,7 +852,11 @@ kj::Promise<void> DurableLog::start() {
       std::filesystem::remove_all(entry.path(), code);
       ++removed;
     }
-    std::filesystem::remove_all(logDirectory(), code);
+    // setNodeEpoch() has already opened this epoch's append log. Keep its directory entry: otherwise every
+    // acknowledged write of a fresh node goes into an unlinked inode and disappears when the process exits.
+    for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code)) {
+      if (entry.path() != logPath) std::filesystem::remove_all(entry.path(), code);
+    }
     filesDropped += removed;
     log("cache-dropped", "\"reason\":" + quote(reason) + ",\"entries\":" + std::to_string(removed));
   } else {
@@ -867,7 +871,9 @@ kj::Promise<void> DurableLog::start() {
     auto space = std::filesystem::space(settings.stackDirectory, code);
     diskLimitBytes = code ? (8ull << 30) : space.capacity / 2;
   }
+  const auto logBytes = std::filesystem::file_size(logPath, code);
   log("started", "\"trusted\":" + std::string(diskTrusted ? "true" : "false") + ",\"reason\":" + quote(reason) +
+          ",\"logPath\":" + quote(logPath.string()) + ",\"logBytes\":" + (code ? "null" : std::to_string(logBytes)) +
           ",\"objects\":" + std::to_string(objects.size()) + ",\"diskBytes\":\"" + std::to_string(diskLimitBytes) +
           "\",\"peers\":" + std::to_string(settings.config.peers));
 }
@@ -897,6 +903,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
   };
   std::map<std::string, Position> positions;
   uint64_t read = 0, kept = 0, broken = 0;
+  std::string fileNames = "[";
   for (const auto& file : files) {
     const auto epoch = decimal(file.stem().string());
     std::string bytes;
@@ -905,6 +912,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
     } catch (const kj::Exception&) {
       continue;
     }
+    fileNames += (fileNames.size() > 1 ? "," : "") + quote(file.filename().string());
     uint64_t sealedTo = 0;
     std::map<uint64_t, LogRecord> unsealed;
     for (const auto& encoded : splitRecords(bytes)) {
@@ -972,10 +980,12 @@ kj::Promise<void> DurableLog::readOwnLog() {
     facet.salt1 = position.salt1;
     facet.salt2 = position.salt2;
     facet.txn = position.txn;
+    facet.lastFrame = position.lastFrame;
     cutBackWal(position.storageId, position.facetId, position.salt1, position.salt2, position.pageSize,
         position.lastFrame);
   }
-  log("log-read", "\"files\":" + std::to_string(files.size()) + ",\"records\":" + std::to_string(read) +
+  log("log-read", "\"files\":" + std::to_string(files.size()) + ",\"fileNames\":" + fileNames +
+          "],\"records\":" + std::to_string(read) +
           ",\"unsealed\":" + std::to_string(kept) + ",\"objects\":" + std::to_string(objects.size()) +
           ",\"cutShort\":" + std::to_string(broken));
   co_return;
@@ -1403,7 +1413,19 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
-  if (object->overLimit) {
+  // The final WAL commit frame names the size after the transaction. An over-limit database may still delete
+  // data or reuse its existing pages; RESET and DROP also reduce storage. Never infer this from the SQL text.
+  const auto heldFacet = object->facets.find(record.facetId);
+  bool nonGrowing = record.kind == LogRecordKind::RESET || record.kind == LogRecordKind::DELETED;
+  if (record.kind == LogRecordKind::FRAMES && record.frames && record.pageSize &&
+      record.frameBytes.size() == uint64_t(record.frames) * (24 + uint64_t(record.pageSize)) &&
+      heldFacet != object->facets.end()) {
+    const auto* last = reinterpret_cast<const unsigned char*>(record.frameBytes.data()) +
+        uint64_t(record.frames - 1) * (24 + uint64_t(record.pageSize));
+    const auto pages = beU32(last + 4);
+    nonGrowing = pages != 0 && uint64_t(pages) * record.pageSize <= heldFacet->second.databaseBytes;
+  }
+  if (object->overLimit && !nonGrowing) {
     ++overLimitAnswers;
     if (request) answer(channel, request, ACK_TOO_LARGE);
     return;
@@ -1413,7 +1435,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   // it bounds the storage, it does not account for it.
   if (hooks.tenantQuotaBytes && !object->tenant.empty()) {
     const auto quota = hooks.tenantQuotaBytes(object->tenant);
-    if (quota && tenantBytes(object->tenant) > quota) {
+    if (quota && tenantBytes(object->tenant) > quota && !nonGrowing) {
       ++quotaRefusals;
       log("quota-exceeded", "\"tenant\":" + quote(object->tenant) + ",\"bytes\":\"" +
               std::to_string(tenantBytes(object->tenant)) + "\",\"quota\":\"" + std::to_string(quota) + "\"");
@@ -1478,7 +1500,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   const auto now = monotonicTimeMs();
   for (const auto& peer : flight.peers) {
     auto found = peers.find(peer);
-    if (found == peers.end() || found->second.broken || found->second.sink == kj::none) {
+    if (found == peers.end() || found->second.broken || found->second.connecting || found->second.sink == kj::none) {
       // One attempt a second at a peer that cannot be reached, not one per write.
       if (found == peers.end() || now - found->second.attemptedAtMs >= PEER_RETRY_MS) {
         auto& entry = peers[peer];
@@ -1490,17 +1512,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     }
     sendOne(found->second, record.nodeSeq, encoded);
   }
-  if (flight.peers.empty()) {
-    // A single node cluster: there is nobody to hold the frames, so this machine's own disk decides and the write
-    // waits for it (slow but correct, and a warning says so at startup).
-    if (logFd >= 0) {
-#ifdef __APPLE__
-      ::fsync(logFd);
-#else
-      ::fdatasync(logFd);
-#endif
-    }
-  }
+  // checkConfirmations() flushes and checks the local log when this record has no selected peers.
   checkConfirmations();
   if (recordBytes >= settings.config.segmentBytes) tasks.add(sealNow("bytes"));
 }
@@ -1547,7 +1559,7 @@ void DurableLog::sendOne(PeerStream& peer, uint64_t sequence, const std::string&
 // Sends what the stream's window allows, and again as the answers come back.
 void DurableLog::pumpPeer(PeerStream& peer) {
   while (!peer.queue.empty() && peer.inFlightBytes < APPEND_WINDOW_BYTES) {
-    if (peer.broken || peer.sink == kj::none) return;
+    if (peer.broken || peer.connecting || peer.sink == kj::none) return;
     auto item = std::move(peer.queue.front());
     peer.queue.pop_front();
     const auto size = item.bytes.size();
@@ -1596,8 +1608,8 @@ void DurableLog::pumpPeer(PeerStream& peer) {
   }
 }
 
-// Opens a stream to one peer and hands it every record no segment covers yet, so a peer that takes another's place
-// holds the same tail (requirement 2: a peer that died is replaced by the next node on the ring).
+// Reconnects the same nodeId and hands it every record no segment covers yet. A different peer is selected for
+// subsequent records only after the membership view changes.
 kj::Promise<void> DurableLog::openPeer(std::string nodeId) {
   auto& peer = peers[nodeId];
   if (peer.connecting) co_return;
@@ -1611,9 +1623,17 @@ kj::Promise<void> DurableLog::openPeer(std::string nodeId) {
     auto& entry = peers[nodeId];
     entry.nodeId = nodeId;
     entry.sink = kj::mv(sink);
-    entry.connecting = false;
     entry.firstSeq = sealedSeq + 1;
     entry.ackedSeq = 0;
+    // A disconnected peer may still hold a tail isolated while it was away. Drop those records again before
+    // sending the backlog; isolation remains relevant after the local records have been sealed and trimmed.
+    if (!isolated.empty()) {
+      // This set is scoped to nodeEpoch. isolatedReported also contains older shard epochs for manifests and
+      // must not be used to drop coincident sequence numbers from a different owner epoch's stream.
+      std::vector<uint64_t> dropped(isolated.begin(), isolated.end());
+      co_await (*KJ_ASSERT_NONNULL(entry.sink)).drop(std::move(dropped));
+    }
+    entry.connecting = false;
     log("peer-opened", "\"peer\":" + quote(nodeId) + ",\"firstSeq\":\"" + std::to_string(entry.firstSeq) + "\"");
     // Everything this node holds goes out at once: the backlog first, then the records as they come.
     for (const auto& [sequence, encoded] : records) {
@@ -1644,7 +1664,9 @@ void DurableLog::checkConfirmations() {
   std::set<std::string> blocked;
   const auto configured = peerCount();
   std::vector<uint64_t> done;
+  std::vector<std::pair<std::string, uint64_t>> failed;
   bool flushed = false;
+  bool flushOk = false;
   for (auto& [sequence, flight] : inFlight) {
     if (isolated.contains(sequence)) continue;
     if (blocked.contains(flight.objectKey)) continue;
@@ -1655,27 +1677,40 @@ void DurableLog::checkConfirmations() {
       if (found->second.sink != kj::none && !found->second.broken) ++reachable;
       if (found->second.ackedSeq >= sequence) ++held;
     }
-    // The peers of the record that can be reached decide how many must hold it: a member nothing can reach is not one
-    // of them, and with none left this machine's own disk answers for the write (the warning at startup says so).
+    // A nonempty selected peer list waits when none is reachable. Only an empty list uses the local disk.
     const auto want = std::min(configured, reachable);
     if (held < want || (reachable == 0 && !flight.peers.empty())) {
       blocked.insert(flight.objectKey);
       continue;
     }
-    if (want == 0 && logFd >= 0 && !flushed) {
+    if (want == 0 && !flushed) {
       flushed = true;
 #ifdef __APPLE__
-      ::fsync(logFd);
+      const auto result = ::fsync(logFd);
 #else
-      ::fdatasync(logFd);
+      const auto result = ::fdatasync(logFd);
 #endif
+      flushOk = result == 0;
+      if (!flushOk) log("log-flush-failed", "\"errno\":" + std::to_string(errno) +
+          ",\"reason\":\"local flush failed; these writes are not confirmed\"");
       if (configured > 0 && !noPeerWarned) {
         noPeerWarned = true;
         log("no-peer-reachable", "\"warning\":\"no peer of a shard can be reached: its writes are answered once this "
             "machine's own disk holds them, and the peers take over again as soon as one answers\"");
       }
     }
+    if (want == 0 && !flushOk) {
+      failed.emplace_back(flight.shipperKey, sequence);
+      blocked.insert(flight.objectKey);
+      continue;
+    }
     done.push_back(sequence);
+  }
+  for (const auto& [key, sequence] : failed) {
+    ++confirmFailures;
+    isolate(key, sequence, "the local log could not be flushed");
+    auto* object = objectOf(key.substr(0, key.rfind('/')));
+    if (object != nullptr) markRepair(*object, "the local log could not be flushed");
   }
   for (auto sequence : done) {
     auto found = inFlight.find(sequence);
@@ -1773,8 +1808,15 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   std::map<std::string, std::pair<uint32_t, uint32_t>> saltsOf;
   uint64_t first = 0, last = 0, bytes = 0;
   std::set<std::string> touched;
+  // Persist exclusions even when there are no confirmed records to upload, or an earlier record is still waiting.
+  // Keep the isolated records until this succeeds, so a failed manifest write is retried on the next seal.
+  for (const auto sequence : isolated) {
+    auto found = parsed.find(sequence);
+    if (found != parsed.end()) touched.insert(hostNameOf(found->second));
+  }
   for (const auto& [sequence, record] : records) {
     if (isolated.contains(sequence)) {
+      if (!first) first = sequence;
       last = sequence;
       continue;
     }
@@ -1799,10 +1841,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
     }
     if (bytes >= settings.config.segmentBytes) break;
   }
-  if (encoded.empty()) {
-    if (last > sealedSeq) sealedSeq = last;  // only isolated records: nothing to put anywhere
-    co_return;
-  }
+  if (encoded.empty() && touched.empty()) co_return;
   sealing = true;
   const auto release = kj::defer([this]() { sealing = false; });
   SegmentHeader header;
@@ -1816,19 +1855,21 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   header.sealedAtUnixMs = realClockUnixMs();
   header.reason = reason;
   for (auto& [key, entry] : index) header.objects.push_back(entry);
-  const auto body = encodeSegment(header, encoded);
-  co_await uploadSegment(header, body);
-  segmentNumber = header.segment;
-  ++segments;
-  segmentBytes += body.size();
-  lastSegmentAtMs = monotonicTimeMs();
+  const auto body = encoded.empty() ? std::string() : encodeSegment(header, encoded);
+  if (!encoded.empty()) {
+    co_await uploadSegment(header, body);
+    segmentNumber = header.segment;
+    ++segments;
+    segmentBytes += body.size();
+    lastSegmentAtMs = monotonicTimeMs();
+  }
   // Each object's manifest names the segment before anything drops the records: a manifest nobody has written yet
   // leaves the segment pointing at nothing, and a node taking the shard over would not replay it.
   uint32_t written = 0, failed = 0;
   for (const auto& objectName : touched) {
     auto* object = objectOf(objectName);
     if (object == nullptr) continue;
-    object->segments.push_back(ManifestSegment{settings.nodeId, nodeEpoch, header.segment, first, last,
+    if (!encoded.empty()) object->segments.push_back(ManifestSegment{settings.nodeId, nodeEpoch, header.segment, first, last,
         object->shardEpoch});
     const bool ok = co_await writeManifest(*object, false).catch_([this](kj::Exception&& error) {
       ++manifestFailures;
@@ -1844,7 +1885,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
           ",\"bytes\":\"" + std::to_string(body.size()) + "\",\"objects\":" + std::to_string(touched.size()) +
           ",\"manifests\":" + std::to_string(written) + ",\"manifestsFailed\":" + std::to_string(failed) +
           ",\"reason\":" + quote(reason));
-  if (failed) {
+  if (failed || !last) {
     // The records stay where they are and the next segment carries them again (a record that ends up in two
     // segments is applied once: a rebuild takes each by its shard epoch and sequence).
     co_return;
@@ -1859,7 +1900,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
     }
     parsed.erase(sequence);
     confirmed.erase(sequence);
-    isolated.erase(sequence);
+    // Keep isolated sequence numbers until nodeEpoch changes, so a reopened stream receives the drops again.
   }
   sealedSeq = last;
   LogRecord marker;

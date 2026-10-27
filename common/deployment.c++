@@ -480,15 +480,18 @@ std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespa
         ",\"shards\":" + std::to_string(entry.shards) + '}';
   return out + '}';
 }
-std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes) {
+std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes,
+    bool databases, size_t* invalidEntries) {
+  if (invalidEntries) *invalidEntries = 0;
   capnp::MallocMessageBuilder message;
   auto json = message.initRoot<capnp::JsonValue>();
   capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), json);
   KJ_REQUIRE(json.isObject(), "a Worker's namespaces are an object");
   std::map<std::string, DurableObjectNamespace> namespaces;
   for (auto entry : json.getObject()) {
+    try {
     const std::string name = entry.getName().cStr();
-    KJ_REQUIRE(durableClassName(name), "invalid Durable Object class name", name.c_str());
+    KJ_REQUIRE(databases ? apiName(name) : durableClassName(name), "invalid namespace name", name.c_str());
     auto value = entry.getValue();
     DurableObjectNamespace item;
     item.id = json::text(value, "id");
@@ -501,6 +504,9 @@ std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::s
     KJ_REQUIRE(hashValid(item.id), "a namespace id is 64 lowercase hexadecimal characters", name.c_str());
     KJ_REQUIRE(item.status == "active" || item.status == "deleting", "a namespace's status is active or deleting", name.c_str());
     namespaces.emplace(name, std::move(item));
+    } catch (const kj::Exception&) {
+      if (invalidEntries) ++*invalidEntries;
+    }
   }
   return namespaces;
 }
@@ -1017,9 +1023,11 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
       // <tenant>/databases: the tenant's databases, each a namespace of its own. Like the namespaces key, it changes
       // no definition, pin or validity -- a request to a database's object reads it when it is dispatched.
       databaseMap.erase(tenant);
+      invalidNamespaceEntries.erase(key);
       if (!change.value) { unknownKeys.erase(key); continue; }
       try {
-        auto decoded = decodeNamespacesState(*change.value);
+        auto decoded = decodeNamespacesState(*change.value, true, &invalidNamespaceEntries[key]);
+        if (!invalidNamespaceEntries[key]) invalidNamespaceEntries.erase(key);
         if (!decoded.empty()) databaseMap.emplace(tenant, std::move(decoded));
         unknownKeys.erase(key);
       } catch (const kj::Exception&) {
@@ -1034,9 +1042,11 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
       if (!deploymentSafeName(name)) { unknown(); continue; }
       const auto worker = workerFullId(tenant, name);
       namespaceMap.erase(worker);
+      invalidNamespaceEntries.erase(key);
       if (!change.value) { unknownKeys.erase(key); continue; }
       try {
-        auto decoded = decodeNamespacesState(*change.value);
+        auto decoded = decodeNamespacesState(*change.value, false, &invalidNamespaceEntries[key]);
+        if (!invalidNamespaceEntries[key]) invalidNamespaceEntries.erase(key);
         if (!decoded.empty()) namespaceMap.emplace(worker, std::move(decoded));
         unknownKeys.erase(key);
       } catch (const kj::Exception&) {
@@ -1457,7 +1467,10 @@ std::string DeploymentState::statusFields(size_t limit) const {
     if (index++) out << ',';
     out << quote(key);
   }
-  out << "],\"binderKeyCount\":" << binderKeys.size() << ",\"generationError\":" << quote(generationError)
+  size_t invalidNamespaceCount = 0;
+  for (const auto& [key, count] : invalidNamespaceEntries) invalidNamespaceCount += count;
+  out << "],\"invalidNamespaceEntryCount\":" << invalidNamespaceCount
+      << ",\"binderKeyCount\":" << binderKeys.size() << ",\"generationError\":" << quote(generationError)
       << ",\"maxClosureSize\":" << maxClosureSize()
       << ",\"validSetDigest\":\"" << validSet.hex() << "\",\"effectiveRouteDigest\":\"" << routeSet.hex() << '"';
   // Only when secret keys exist (a state without secrets keeps its fields):

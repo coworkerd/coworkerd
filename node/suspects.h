@@ -61,7 +61,7 @@ private:
   bool keepsObjects() const;
   // The live suspicions this node recognized (and restored from its earlier epochs), as its object holds them; "" for none.
   std::string ownObject() const;
-  void adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes);
+  bool adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes);
   kj::Promise<void> maintain();
   void expire();
   void remember(Suspect record, const char* event);

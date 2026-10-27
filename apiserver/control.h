@@ -42,7 +42,7 @@ struct ControlContext {
 // A tenant's Workers (or one of them): versions in upload order, the active version, validity, limits, routes,
 // secrets' names and lengths.
 kj::Promise<std::string> controlWorkers(ManifestStore& state, std::string tenant, std::optional<std::string> workerId = std::nullopt);
-// PUT a version: `manifest` holds exactly that version of that Worker. Always trial-loaded; its definition is
+// PUT a version: `manifest` holds exactly that version of that Worker. Trial-loaded when activated; its definition is
 // published only once it loads; `activate` also flips the pointer (the manifest's routes, or the Worker's current
 // ones when it lists none).
 kj::Promise<std::string> controlDeploy(ControlContext& context, std::filesystem::path manifest, std::string workerId,

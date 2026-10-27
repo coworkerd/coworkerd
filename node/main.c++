@@ -4770,7 +4770,7 @@ private:
 // One SQL statement on a tenant's database, defined with the other requests the node makes of an object (below).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body);
+    std::string database, std::string body, std::string resultsFormat);
 
 class PeerRpcService final: public kj::HttpService {
 public:
@@ -4865,6 +4865,17 @@ public:
   kj::Promise<void> sqlQuery(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
     constexpr uint64_t LIMIT = 1u << 20;
     std::string path(url.cStr());
+    std::string resultsFormat = "ARRAY_OF_OBJECTS";
+    if (auto query = path.find('?'); query != std::string::npos) {
+      const auto parameters = path.substr(query + 1);
+      path.resize(query);
+      if (parameters == "resultsFormat=ROWS_AND_COLUMNS") resultsFormat = "ROWS_AND_COLUMNS";
+      else if (parameters != "resultsFormat=ARRAY_OF_OBJECTS") {
+        co_await sendJson(response, 400, "Bad Request",
+            "{\"code\":\"INVALID_REQUEST\",\"reason\":\"resultsFormat is ARRAY_OF_OBJECTS or ROWS_AND_COLUMNS\"}");
+        co_return;
+      }
+    }
     path = path.substr(std::string("/__coworkerd/databases/").size());
     if (!path.ends_with("/query")) {
       co_await sendJson(response, 404, "Not Found",
@@ -4891,7 +4902,7 @@ public:
       co_return;
     }
     auto answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
-        std::string(text.cStr(), text.size()));
+        std::string(text.cStr(), text.size()), resultsFormat);
     co_await sendJson(response, answer.status ? answer.status : 503,
         answer.status == 200 ? "OK" : "Error",
         answer.body.empty() ? std::string("{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the database answered nothing\"}")
@@ -5508,7 +5519,6 @@ kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOv
 constexpr const char* DURABLE_ALARM_PATH = "http://coworkerd-node/__coworkerd/durable-alarm";
 // The object answers D1's own protocol, so a statement from the control plane goes to /query like one from a
 // d1_databases Binding does (src/cloudflare/internal/d1-api.ts).
-constexpr const char* DURABLE_QUERY_PATH = "http://coworkerd-node/query?resultsFormat=ARRAY_OF_OBJECTS";
 
 // Fires one object's alarm. The firing is a request to the object like any other: its Worker's active version and
 // class, admission, the CPU topped up for the event, a lease of its own, its lines kept and one [do] line. The
@@ -5566,7 +5576,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
 // plane to any node, which sends it on to the shard's owner).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body) {
+    std::string database, std::string body, std::string resultsFormat) {
   CollectedResponse refusal;
   const auto* space = server.database(tenant, database);
   if (space == nullptr || space->status != "active") {
@@ -5582,7 +5592,8 @@ kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCor
   request.target.className = coworkerd::DATABASE_CLASS_NAME;
   request.target.tenant = tenant;
   request.target.database = database;
-  co_return co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_QUERY_PATH, std::move(body));
+  const auto path = "http://coworkerd-node/query?resultsFormat=" + resultsFormat;
+  co_return co_await askObject(durable, factory, headerTable, std::move(request), path.c_str(), std::move(body));
 }
 
 // A request to an object whose shard this node is expected to own (or to take): the fields checked as an invocation

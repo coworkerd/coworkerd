@@ -4,15 +4,17 @@
 
 0.5 adds stateful Workers: SQLite Durable Objects and D1 databases alongside stateless Workers, with inbound WebSockets, hibernation, alarms and JS RPC. Shard ownership lives in conditional object-store epochs. Committed transaction frames are confirmed by reachable peers (or flushed locally with no peer), uploaded as node log segments with per-object manifests and snapshots, and replayed after takeover. Confirming peers buffer in memory: simultaneous loss of an owner and all confirming peers can lose the unuploaded tail, which can exceed the normal 30 s segment interval during an outage.
 
-0.4.x installations upgrade in place while retaining their bucket, node identities and volumes. The object layout adds DO history and ownership objects; finish upgrading every component and node's storage policy before using the new features. `/v1` keeps its existing fields and adds namespace / database endpoints, quotas and inspection fields. New errors include `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_UNSUPPORTED_STORE`, `DO_RECOVERING`, `DO_NAMESPACE_UNAVAILABLE`, `DO_HOP_LIMIT`, `DO_OBJECT_TOO_LARGE` and `WEBSOCKET_LIMIT`; durable calls can also return `STORAGE_UNAVAILABLE` and `QUOTA_EXCEEDED`. Clients should follow the [error guide](docs/guide/errors.md) before retrying a write.
+The 0.4.x upgrade procedure retains the bucket, node identities and volumes; bare-metal and in-place upgrade execution are part of release validation. The object layout adds DO history and ownership objects; finish upgrading every component and node's storage policy before using the new features. `/v1` keeps its existing fields and adds namespace / database endpoints, quotas and inspection fields. New errors include `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_UNSUPPORTED_STORE`, `DO_RECOVERING`, `DO_NAMESPACE_UNAVAILABLE`, `DO_HOP_LIMIT`, `DO_OBJECT_TOO_LARGE` and `WEBSOCKET_LIMIT`; durable calls can also return `STORAGE_UNAVAILABLE` and `QUOTA_EXCEEDED`. Clients should follow the [error guide](docs/guide/errors.md) before retrying a write.
 
-- **Durable Objects:** migrations declare SQLite classes; namespace IDs stay stable across versions and renames. Fetch and public method calls route to the shard owner. Durable processes have an object-tree resident target, no age / request-count rotation, per-event CPU and logs, and facet-aware replication and recovery. Object and tenant byte limits are enforced at durable confirmation using checkpoint-size estimates.
-- **D1:** tenant-scoped databases use a platform SQL Worker, with bindings, the basic JavaScript API, HTTP SQL and `cowctl d1 create/list/delete/execute`. A known binding defect affects Workers without a declared DO class (see the [database guide](docs/guide/databases.md)); statements in `batch` are ordered but are not one transaction; Sessions, replicas, import/export and point-in-time restore are absent.
+- **Durable Objects:** migrations declare SQLite classes; namespace IDs stay stable across versions and renames. Fetch and public method calls route to the shard owner. Durable processes have an object-tree resident target, no age / request-count rotation, per-event CPU and logs, and facet-aware replication and recovery. Object and tenant byte limits are enforced at durable confirmation using reported database sizes; transactions that do not grow their database remain permitted, including deletions.
+- **D1:** tenant-scoped databases use a platform SQL Worker, with bindings, the basic JavaScript API, HTTP SQL and `cowctl d1 create/list/delete/execute`. Bindings also work in Workers with no declared DO class. `batch` is one transaction and rejects on any statement failure; `exec` keeps earlier successful lines and stops at its first failure. Database names include hyphens and leading digits. HTTP SQL preserves node statuses and bodies, honors both result formats and does not replay uncertain requests; Sessions, replicas, import/export and point-in-time restore are absent.
 - **WebSockets and alarms:** ingress relays frames across processes and peers; hibernation retains connections across idle object eviction. Process / node exit closes them. Alarm times are replicated database state, while object-store hints discover due objects after takeover; retries and discovery delays remain possible.
 - **JS RPC:** Service Bindings to `WorkerEntrypoint` classes and Durable Object stubs expose methods through workerd's capability protocol. Nodes validate envelopes and proxy capabilities without decoding arguments; capabilities expire with the call tree's lease. `placement.subcalls` chooses the normal home policy or caller-first stateless placement.
-- **Operations and documentation:** configurable durable process count (including zero on forwarding-only nodes), peer buffers, confirmation / recovery / upload / snapshot / disk limits, quotas and diagnostic state. New [Durable Object](docs/guide/durable-objects.md) and [database](docs/guide/databases.md) guides and the `durable-counter` example accompany the updated architecture and installation guides.
+- **Operations and documentation:** configurable durable process count (including zero on forwarding-only nodes), peer buffers, confirmation / recovery / upload / snapshot / disk limits, quotas and diagnostic state. Graceful restart retains unexpired culprit suspicions until the new epoch has persisted them, without extending their expiry; failed recovery keeps the old object. New [Durable Object](docs/guide/durable-objects.md) and [database](docs/guide/databases.md) guides and the `durable-counter` example accompany the updated architecture and installation guides.
 
-The changes of 0.5.0 in detail, in the order they were made (latest first):
+Correctness fixes before release: startup preserves the current epoch's append-log file when discarding an untrusted cache, and restores its WAL frame positions on same-boot restart. Local-flush failures return `STORAGE_UNAVAILABLE` without confirmation. Isolation exclusions are published at the next seal even without new confirmed records, and sent again when a peer reconnects. Durable fetch reasons redact known secrets, paths and stack lines within 400 UTF-8 bytes; method exceptions retain RPC transport.
+
+The changes of 0.5.0 in detail, grouped by development milestone. Early-stage limitations below are historical; the release behavior is described by the completed milestones and fixes above. Measurements are the recorded development runs, not new release-wide guarantees:
 
 JS RPC: a Worker's methods, and a Durable Object's, can now be called over a Binding. `env.SVC.method(args)` reaches
 another Worker of the tenant and `stub.method(args)` reaches an object, with Cloudflare's own types -- structured
@@ -23,10 +25,11 @@ proxies to the caller. A tenant's arguments are serialized in the calling isolat
 reads neither, here or on the way between nodes.
 
 - **A method call is a call of the tree, like a `fetch` through the same Binding**: it is placed the same way (so the
-  target may run on another node), draws on the budget of subrequests -- the root's eight, a child's one grant --, and
+  target may run on another node), draws on the budget of subrequests -- eight root slots, two consumed per direct child (four calls; the fifth
+  is refused), with one granted slot per child --, and
   carries the deadline; over the budget it throws `SUBREQUEST_BUDGET_EXHAUSTED` and past the deadline `LEASE_EXPIRED`,
-  as the HTTP answer of a `fetch` would say. The platform's code is the start of the error's message and is also its
-  `code` property. Calls on a capability a method returned are part of the same call and draw nothing more.
+  as the HTTP answer of a `fetch` would say. The platform's code starts the error's message; the runtime also sets `.code` when possible. Getters and
+  returned capabilities can retain only the message prefix; an application message with the same prefix can look like a platform code. Calls on a capability a method returned are part of the same call and draw nothing more.
 - **A capability belongs to the call tree that made it**: an `RpcTarget`, a stub, a stream or a function that crosses a
   Binding works wherever the caller holds it -- through this node and, when the target is elsewhere, the peer session --
   and is released with the tree's lease (`LEASE_EXPIRED` afterwards; a disconnection when the node that held it went
@@ -34,10 +37,9 @@ reads neither, here or on the way between nodes.
 - **Durable Objects**: a stub has the class's public methods as well as `fetch`. The call goes to the shard's owner with
   the shard's epoch and its fencing, as a request does, and is an event of the object there: its CPU is topped up, its
   lines are the event's, and an object's method call on an object starts a call tree of its own under the same 8-hop
-  limit. A class that is not a `WorkerEntrypoint`, and a plain object entry point, have `fetch` only, as on Cloudflare.
+  limit. For Service Bindings, a class that is not a `WorkerEntrypoint`, and a plain object entry point, have `fetch` only.
 - **Where a stateless subcall executes is now a policy point**, `placement.subcalls`: `home` (the default, unchanged)
-  places it like any call, so it goes to the Worker's home; `local` runs it on the calling node, as Cloudflare's Service
-  Bindings do. Both work for `fetch` and for method calls. Which should be the default waits on a measurement of the two
+  places it like any call, so it goes to the Worker's home; `local` tries the calling node first, then falls back to other eligible nodes. Both work for `fetch` and for method calls. Which should be the default waits on a measurement of the two
   under load.
 - **Observation**: the state endpoint's `jsRpc` counts the sessions, the method calls, the capabilities proxied and held
   and the failures by code, and the node writes one `[rpc]` line per method call of a Binding (the target, the entry
@@ -71,10 +73,10 @@ keeps for its life. Outgoing WebSockets (a Worker's `fetch()` upgrade, through t
   logs as each message runs (log lines below).
 - **Configuration**: `ingress.webSocketsPerTenant` (1000; `0`: no limit).
 
-Durable Objects, in development: their first part, on one node. A wrangler project's `durable_objects` and `migrations`
+The first Durable Object milestone (v59), on one node: A wrangler project's `durable_objects` and `migrations`
 convert, versions carry their Bindings and classes, and the node that runs an object keeps the object's SQLite database
-on its disk. Not a release yet: one owner per shard across the cluster follows (below), persistence to the object store
-comes next.
+on its disk. At that stage, cluster ownership and object-store persistence were not yet present; the later milestones below
+added them before release.
 
 - **Conversion and versions**: `durable_objects.bindings` (`name`, `class_name`; a `script_name` only when it names the
   Worker itself) and `migrations` in their order -- `new_sqlite_classes` and `new_classes` both declare a SQLite class,
@@ -97,8 +99,8 @@ comes next.
   node, which runs the request on the object's durable process: the object's `Host` runs the Worker's class as a facet,
   from the version's isolate under the same loader key as its stateless calls, with a SQLite database of its own
   (`ctx.storage.sql`, the key-value methods, transactions). A class's `env` holds the version's variables and secrets and
-  the Worker's Durable Object Bindings; there are no RPC methods, alarms or hibernation, and no Service Bindings in a
-  class. After a version is activated, an object's next request runs the new class on the same data.
+  the Worker's Durable Object Bindings. At this first milestone RPC methods, alarms and hibernation were absent;
+  later milestones added them. Service Bindings in a class remain unsupported. After a version is activated, an object's next request runs the new class on the same data.
 - **Failures and limits**: each request to an object and each message of a connection to it runs with the request's
   CPU limit, the memory limit is the version's isolate's. An exception the class throws leaves the object as it is --
   the same instance takes the next request -- and the caller's `fetch()` answers `500 EXECUTION_FAILED` with its
@@ -116,12 +118,11 @@ comes next.
   came meanwhile waited 1.8 s for it; an object's 21 message lines were in the tenant's logs 8 ms after the last, its
   connections open.
 
-Durable Objects across the cluster: one owner per shard. A namespace's objects fall into its shards (1024, an object's by
+The cluster-ownership milestone (v60): one owner per shard. A namespace's objects fall into its shards (1024, an object's by
 the first 8 bytes of its id), and each shard has one owner at a time -- the node that created the shard's latest epoch,
 `do/<namespace>/shards/<shard>/epochs/<n>`, an object of the store created only if absent -- which runs the shard's
-objects; the other nodes send it their requests through the peer session, WebSocket upgrades included. The objects' data
-still stays on the owner's disk: **when another node takes a shard over, its objects start again from empty there**;
-persistence comes next.
+objects; the other nodes send it their requests through the peer session, WebSocket upgrades included. At that milestone the objects' data
+still stayed on the owner's disk, so takeover started empty. The persistence milestone below superseded that behavior.
 
 - **Taking a shard**, when a request to one of its objects first comes: a shard without an epoch goes to its default
   owner -- the first, in the rendezvous order of `<namespace>/<shard>`, of the members that run durable processes and
@@ -167,27 +168,29 @@ the durable process hands the WAL frames of each committed transaction to the no
 inherited at startup (workerd's patch 0013), the replicator has `durableObjects.peers` (2) other nodes hold them before
 the object's answer goes out, merges the frames of all its objects into segments on the object store, and keeps each
 object's manifest naming what makes it up -- so a node that takes a shard over rebuilds its objects from that history,
-and never reads the previous owner's files. A write that was answered `200` is in the object after any takeover.
+and never reads the previous owner's files. Recovery depends on uploaded history, trusted surviving files or a surviving confirmed peer tail; the failure
+boundaries below also apply to writes answered `200`.
 
 - **The commit path costs a peer round trip, not a disk.** The peers of an object's shard are the first entries after it
   on the member ring; they hold the records in memory and answer with the highest sequence they hold, and an object's
   transactions are confirmed in order, so its answers come out in the order it committed them. The owner no longer waits
   for its own disk (`synchronous=OFF`), and nothing on that path uploads anything. Measured on three nodes of one
   machine: commit to confirmation p50 0.12 ms, p99 0.53 ms, and 2 ms for the write a client sees. A peer that cannot be
-  reached is not counted and the next node on the ring takes its place, with every record no segment covers yet; with no
-  peer at all (a single-node cluster) a write waits for this machine's disk instead, and a warning says so.
+  reached is retried under the same node id; membership changes can select new peers for later records. A reopened
+  stream receives exclusions before the remaining unsealed records. An empty selected peer list (a single-node
+  cluster) requires a successful local disk flush; failure returns `STORAGE_UNAVAILABLE` and is logged.
 - **Segments, manifests and snapshots.** Every `durableObjects.segmentIntervalMs` (30 s) or `durableObjects.segmentBytes`
   (16 MiB) the records the peers hold are sealed into one segment of the node's log, `nodes/<node>/wal/<epoch>/<segment>`
   -- one for all of the node's objects, so the store sees a node's writes, not an object's -- and then each object the
   segment touched gets the next revision of its manifest, `do/<namespace>/objects/<object>/manifest/<rev>`, created only
   if absent. Only once the manifests name the segment are the peers told to drop what it covers and the databases told
-  they may checkpoint those frames. An object whose log passes `durableObjects.snapshotBytes` (64 MiB), or once a day,
-  has its whole database uploaded after a checkpoint, in parts, and the segments it covers leave the manifest.
+  they may checkpoint those frames. An object whose log passes `durableObjects.snapshotBytes` (64 MiB), or whose existing snapshot is a day old,
+  has its whole database uploaded after a checkpoint, in parts, and the segments it covers leave the manifest. The first snapshot needs the size threshold; time alone does not trigger it.
 - **Rebuilding.** The first request for an object this node does not have at the shard's data epoch waits while the
   manifest is read, the snapshot's parts are downloaded (at most four at once), the segments are replayed in order and
-  the peers are asked for what they still hold of the previous owner's log: every peer holds a prefix of that log, so
-  the union of their answers is the longest prefix with no hole in it. A record that does not follow the last fails the
-  rebuild rather than serving the object with less than it had. Past `durableObjects.recoverTimeoutMs` (30 s) a request
+  the peers are asked for what they still hold of the previous owner's log. Records are merged, deduplicated and
+  ordered by shard epoch and owner sequence. WAL generation, checksum and consecutive-frame checks reject frame
+  gaps; there is no separate proof that every acknowledged transaction was recovered. Past `durableObjects.recoverTimeoutMs` (30 s) a request
   waiting for a rebuild gets `503 DO_RECOVERING`. Measured: an owner SIGKILLed with four writers on one object, 2,694
   writes answered `200`, another node serving the object 23.7 s later (the membership's TTL and grace) from two segments
   and 785 records of the peer's tail, replayed in 0.6 s -- **every one of the 2,694 there, no torn transaction**; of the
@@ -197,36 +200,38 @@ and never reads the previous owner's files. A write that was answered `200` is i
   files of cold objects whose changes are all in a segment go first. Beside them the node keeps the machine's boot id
   and a marker a clean exit writes: started again within the same boot, or after a clean exit, it keeps them -- a
   durable process that restarts opens the files as they are, with each WAL cut back to the last frame its log names,
-  while an object the node serves again after the daemon itself restarted is rebuilt from its history; a machine that
-  restarted without a clean exit loses the files and all of its objects are rebuilt.
+  and confirmed positions beside the files let a daemon restart reuse them too (completed in v62, fixed before release).
+  A machine that restarted without a clean exit discards the cache and rebuilds from available history. Native macOS
+  has no readable boot id, so an unclean process exit also discards its local durable files.
 - **Failure.** A write no peer confirms within `durableObjects.confirmTimeoutMs` (5 s) -- the peers are unreachable, or
   what they buffer for this node (`durableObjects.peerBufferBytes`, 256 MiB) is full because the store has been out of
   reach -- fails with `503 STORAGE_UNAVAILABLE`; the node then isolates the records nobody confirmed (they are never
-  confirmed, never put in a segment, and the peers are told to drop them) and rebuilds the object from its history
+  confirmed, never put in a segment, and the peers are told to drop them; the next seal persists their exclusions even without
+  new confirmed records, and reconnect repeats the drops) and rebuilds the object from its history
   before serving it again. **The result of such a write is uncertain**, as is a write in flight when a node dies, so the
   errors guide now asks for an idempotency key. While the store cannot be reached, uploads are retried with a growing
   wait and the writes go on.
-- **The fence.** Every record carries the shard's epoch: a peer confirms only records of the epoch it knows, and a
-  manifest revision is written only when the previous one's epoch is not newer, so an old owner's writes are confirmed
-  by nobody and its segments reach no manifest.
+- **The fence.** Every record carries the shard's epoch. A peer rejects epochs older than the nonzero epoch it knows;
+  unknown and higher epochs pass that comparison. A manifest writer gives up when the previous revision names a
+  newer epoch. These checks depend on each participant's knowledge; they do not prove every stale writer is refused.
 - **One kind of object.** There is no hot standby tier (the namespace record's `tier` field is gone): the peers buffer
-  what is not on the store yet. One object is at most `durableObjects.objectBytes` (10 GB, as on Cloudflare), judged by
-  its database file at a checkpoint; past it the object answers `413 DO_OBJECT_TOO_LARGE`. `ctx.facets.clone()` is
+  what is not on the store yet. One object is at most `durableObjects.objectBytes` (10 GiB (10,737,418,240 bytes)), judged by
+  reported database sizes at checkpoint, open and close; past it a growing transaction answers `413 DO_OBJECT_TOO_LARGE`.
+  Transactions whose final commit page count does not grow the database remain permitted. `ctx.facets.clone()` is
   refused, because a copy of a database reaches no log.
 - **Accepted step back**: the peers do not wait for their disks (a `fdatasync` there would cost tens of milliseconds
-  instead of about one), so an owner and its peers losing power together within one segment interval lose the Durable
-  Object writes of that interval (30 s by default). Everything else -- a process that dies, a machine that restarts, a
-  node that is killed -- keeps every write that was answered.
+  instead of about one), so simultaneous loss of an owner and all confirming peers can lose the unuploaded tail. The normal segment
+  interval is 30 s; upload failures or backlogs can extend that tail. A surviving peer, uploaded history or trusted
+  local files can recover after a failure. With no peers, loss of the only disk before upload loses its tail.
 - **Configuration** (`durableObjects`): `peers` (2), `confirmTimeoutMs` (5000), `recoverTimeoutMs` (30000),
   `segmentIntervalMs` (30000), `segmentBytes` (16 MiB), `snapshotBytes` (64 MiB), `snapshotIntervalMs` (a day),
-  `snapshotPartBytes` (16 MiB), `diskBytes` (half the filesystem), `peerBufferBytes` (256 MiB), `objectBytes` (10 GB),
+  `snapshotPartBytes` (16 MiB), `diskBytes` (half the filesystem), `peerBufferBytes` (256 MiB), `objectBytes` (10 GiB),
   `checkpointBytes` (4 MiB), `idleCheckpointMs` (10000), `uploadRetryMs` (500) and `uploadRetryMaxMs` (30000),
   `recoverParallelism` (4). A node's object store identity now reads and lists every node's prefix (`nodes/*`, where the
   log's segments are) and writes `do/*/objects/*`; `coworkerd secrets`, compose and the install guide follow.
 - **Observed**: the state endpoint's `durableLog` (the confirmation latency, what is not confirmed and not sealed, the
   segments and uploads, the peers and their streams, the checkpoints, the rebuilds and their time, the buffer this node
-  holds for others, this machine's files) and `[do-log]` lines for sealing, uploads, manifests, snapshots, rebuilds, a
-  peer taking another's place and a confirmation that failed with the records it isolated; a `[do]` line says how long a
+  holds for others, this machine's files) and `[do-log]` lines for sealing, uploads, manifests, snapshots, rebuilds, peer reconnection or membership-driven selection and a confirmation that failed with the records it isolated; a `[do]` line says how long a
   request waited for a rebuild.
 
 Durable Objects a team can use: hibernatable connections, a resident limit, alarms, a database (D1), the namespace and
@@ -239,44 +244,47 @@ on Cloudflare.
   object with none of its connections sending anything may be evicted while they stay connected -- at the entry and at
   the owner the relay is unchanged, so the client notices nothing -- and the next message wakes the object with them.
   Each message is still an event of its Worker: its CPU is topped up, its lines are kept and it counts in the usage.
-- **A resident limit.** A durable process keeps at most `durableObjects.residentObjects` (4096) objects resident; past
-  it the least recently used go, a facet before its root, and an object a request is running in is left alone. An
+- **A resident limit.** A durable process targets `durableObjects.residentObjects` (4096) resident object trees; past
+  it idle trees go in least-recently-used order, facets before their root. Active trees are protected and can
+  temporarily exceed the target. An
   evicted object's hibernatable connections hibernate rather than close. The state endpoint's `durableLog.resident`
   reports, per process, how many are resident, the limit, how many were evicted and woken, and how long the wakes took.
 - **Alarms.** `ctx.storage.setAlarm`, `getAlarm` and `deleteAlarm` and the `alarm(alarmInfo)` handler. The time lives in
   the object's own database, so it is replicated and recovered with everything else; the owner node schedules the firing
   and fires it as an event of the object's Worker (the version's class, admission, the CPU topped up, a lease, a `[do]`
   line). A hint beside the shard's epochs (`do/<ns>/shards/<s>/alarms/<id>`) names each object's next alarm, so the node
-  that takes the shard over goes on firing what is left -- the object's own database decides, so an alarm that already
-  ran is not fired again, and one still due is not lost. A handler that throws is retried with Cloudflare's backoff (two
+  that takes the shard over discovers due objects. The object's own database decides whether the handler runs;
+  delivery can be delayed or repeated across failures, and a missing hint can delay it until the object opens again. A handler that throws is retried with Cloudflare's backoff (two
   seconds, doubling, a quarter of jitter, six counted tries and then up to about seventeen minutes), and
   `alarmInfo.retryCount` says which try it is; a successful handler clears the alarm in its own transaction, which its
-  peers confirm before the answer, so the semantics are Cloudflare's. A class without an `alarm()` handler has its alarm
+  peers confirm before the answer, so handlers must tolerate retries around failures. A class without an `alarm()` handler has its alarm
   dropped rather than retried for ever. Upstream workerd refuses `setAlarm()` on a facet, and a Coworkerd object runs
   the tenant's class as one; patch 0014 lets the hook report to the node instead.
 - **A database (D1's shape).** `POST /v1/tenants/{t}/databases/{d}` makes one: a Durable Object namespace of its own
   with one shard and one object, whose class is the platform's own SQL Worker in the static runtime -- run through the
-  Host as a facet, like a tenant's class, with the same replication, rebuild and 10 GB limit. A `d1_databases` Binding
+  Host as a facet, like a tenant's class, with the same replication, rebuild and 10 GiB limit. A `d1_databases` Binding
   in wrangler's configuration gives `env.DB` the D1 API over D1's own wire protocol: `prepare().bind().run()`, `all()`,
-  `first(column?)`, `raw({columnNames})`, `batch()` and `exec()`, with D1's `meta` (`changes`, `last_row_id`,
+  `first(column?)`, `raw({columnNames})`, `batch()` and `exec()`. A batch is one transaction and rejects on any statement failure; `exec` keeps earlier
+  successful lines and stops at its first failure. Results include D1's `meta` (`changes`, `last_row_id`,
   `rows_read`, `rows_written`, `changed_db`, `size_after`) and its errors (`D1_ERROR:`, `D1_EXEC_ERROR:`,
   `D1_TYPE_ERROR:`, `D1_COLUMN_NOTFOUND:`). The same protocol is the HTTP SQL interface,
-  `POST /v1/tenants/{t}/databases/{d}/query`, with the tenant's own credential. No migration tool, no import or export,
+  `POST /v1/tenants/{t}/databases/{d}/query`, with the tenant's own credential, `ARRAY_OF_OBJECTS` or `ROWS_AND_COLUMNS` results, preserved platform status codes,
+  and retries only before execution is possible. A lost reply after connecting is `RESULT_UNCERTAIN`. No migration tool, no import or export,
   no restore to a point in time, no read replicas and no Sessions API (`withSession()` is refused).
 - **`/v1`**: `GET .../workers/{w}/namespaces` and `.../namespaces/{class}` (the shards, the owner of each shard an epoch
   was taken for, the objects and the bytes, summed from the nodes and marked `approximate` with the time it was made),
   `DELETE .../namespaces/{class}` (the semantics of a version's `deleted_classes`: no new request, the data stays), and
   `POST`, `GET`, `DELETE /v1/tenants/{t}/databases[/{d}]`.
-- **`cowctl`**: `do list`, `do inspect <class>`, and `d1 create|list|execute|delete`. A created database is waited for
-  until every node serves it, as a deployment is.
-- **Quotas.** Each tenant's Durable Objects hold at most `durableObjectBytes` (10 GB by default): past it a write is
-  refused with `422 QUOTA_EXCEEDED` and reads go on. What a tenant holds is what the nodes publish of their own objects
-  (`nodes/<id>/durable-usage`, every `durableObjects.usagePublishMs`, an hour by default), so it bounds the storage
-  rather than accounting for it. A database or a class counts against `durableObjectNamespaces` (16) alike, and the
+- **`cowctl`**: `do list`, `do inspect <class>`, and `d1 create|list|execute|delete`. Creation waits up to 15 s for non-draining nodes to report the revision (warning if still behind), then
+  polls `SELECT 1` until one serving path succeeds; `--no-wait` skips both waits.
+- **Quotas.** Each tenant's Durable Objects hold at most `durableObjectBytes` (10 GiB by default): past it a growing write is
+  refused with `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database go on. What a tenant holds is what the nodes publish of their own objects
+  (`nodes/<id>/durable-usage`, every `durableObjects.usagePublishMs`, an hour by default), so enforcement uses a lagging estimate, not an exact distributed counter; failed reads and publications
+  can delay it beyond that interval. A database or a class counts against `durableObjectNamespaces` (16) alike, and the
   objects of a deleted one stop counting.
-- **An object past its own limit refuses only writes.** `413 DO_OBJECT_TOO_LARGE` is answered at the moment a write
-  would be made durable, not before the request is dispatched: everything that reads is served and the object is not
-  reset, as on Cloudflare (0.5's fourth part refused the object as a whole). A refused write is not durable -- no peer
+- **An object past its own limit refuses growing transactions.** `413 DO_OBJECT_TOO_LARGE` is answered at the moment a write
+  would be made durable, not before the request is dispatched: reads and transactions that do not grow the database remain possible and the object is not
+  reset (0.5's fourth part refused the object as a whole). A refused write is not durable -- no peer
   holds it and no manifest names it -- but on the node that refused it, it stays readable from that machine's file
   until the object is next opened, and the rebuild that follows drops it.
 - **The same boot reuses this machine's files.** The position each database is confirmed at is written beside it, so a
@@ -302,7 +310,7 @@ each message of a WebSocket connection's as the message runs -- instead of when 
 each Worker is a streaming one, which its Worker Loader allows only when the runtime runs with workerd's `experimental`
 compatibility flag; tenants' own flags still come from the non-experimental list, so what their code can do does not
 change. workerd's cap of 256 KB a request does not apply to a streaming tail, so the node keeps it per event -- a
-request, or a message of a connection; an object's events are its requests and its connections' messages together --
+request, or one message of a connection, including each separate event on an object --
 and puts one warning line in place of an event's lines past it (`tenantLogPosts.eventsOverBudget` in the state).
 
 Fixed: with the launcher, every workerd generation's start logged `[process-pool] task failed: epoll_ctl(... EPOLL_CTL_DEL
