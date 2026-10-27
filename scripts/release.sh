@@ -13,8 +13,8 @@
 #                                                  workerd), lib/ (cowctl's Node.js code with
 #                                                  the Wrangler adapter and its dependencies), runtime/,
 #                                                  docker/ (compose, entry point, Dockerfile, the hello
-#                                                  example), examples/, docs/ (install, quickstart, compat,
-#                                                  errors), INSTALL.md, VERSION, SHA256SUMS
+#                                                  example), examples/, docs/ (install, quickstart, compat, errors,
+#                                                  databases, durable-objects), INSTALL.md, VERSION, SHA256SUMS
 #   coworkerd-<version>-linux-<arch>-image.tar.gz  the image coworkerd:<version> (`docker load -i`)
 #   coworkerd-<version>-linux-<arch>.json          what was built from what, with every SHA-256
 # then (re)writes OUT/SHA256SUMS over every asset present and prints the upload command. The other

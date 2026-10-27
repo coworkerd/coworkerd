@@ -30,8 +30,8 @@ The package:
 | `lib/` | `lib/cowctl/`: `cowctl` and the wrangler adapter with their dependencies |
 | `runtime/` | `runtime.js`, the runtime bridge every workerd process loads |
 | `docker/` | The compose file `docker-compose.yml`, `docker-compose.sandbox.yml` (section 3), the entry point script `entrypoint.sh`, the `Dockerfile`, `.env.example`, and `examples/hello/`: the example project the compose `tool` service mounts by default |
-| `examples/` | `hello-world` and two official Cloudflare templates |
-| `docs/` | This document, the quickstart, the compatibility scope and the error codes |
+| `examples/` | `hello-world`, `durable-counter` (the quickstart's Durable Object counter with one D1 query, section 9 of the quickstart) and two official Cloudflare templates |
+| `docs/` | This document, the quickstart, the compatibility scope, the error codes, the databases guide and the Durable Objects guide |
 | `INSTALL.md` | A copy of this document; read it first after unpacking |
 | `VERSION` | What `coworkerd --version` prints |
 | `SHA256SUMS` | The SHA-256 of every file in the package |
