@@ -21,7 +21,7 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: 0.5.0
+## Status: 0.5.1
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
@@ -57,9 +57,9 @@ With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a c
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.5.0-linux-arm64.tar.gz
-docker load -i coworkerd-0.5.0-linux-arm64-image.tar.gz
-cd coworkerd-0.5.0-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.5.1-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.1-linux-arm64-image.tar.gz
+cd coworkerd-0.5.1-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 

@@ -1,6 +1,6 @@
 # Coworkerd compatibility scope: which features of a wrangler project work
 
-> For release 0.5.0. Compiled from [compatibility with Cloudflare Workers](https://github.com/coworkerd/coworkerd/blob/main/docs/compatibility.md).
+> For release 0.5.1. Compiled from [compatibility with Cloudflare Workers](https://github.com/coworkerd/coworkerd/blob/main/docs/compatibility.md).
 > `cowctl deploy` uses wrangler to read the configuration and build the project, then converts it into a Coworkerd code bundle; unsupported configuration keys are listed together at conversion and refused -- rule files in the asset directory after the build, compatibility dates and flags at upload --, never silently ignored.
 
 ## 1. What works

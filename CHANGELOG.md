@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - Fix Durable Object recovery after eviction and reopening: a repeated header for the same WAL keeps the replay
   position and checksum chain, including histories written by 0.5.0. New WAL generations still start at frame one;

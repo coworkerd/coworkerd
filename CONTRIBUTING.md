@@ -18,7 +18,7 @@
   the header of the script lists the environment it reads. It builds neither workerd nor its allowlist: it takes only
   the binary pinned by SHA-256 for the architecture, with the allowlist directory generated for it, and
   only the version `cli/package.json` names, and it needs the toolchain container running with a configured CMake
-  tree. The current workerd pins predate patch 0014 and reject the current series build; the script also omits the database and Durable Object guides. These packaging defects must be resolved before making a 0.5.0 release. A release is built on a machine of each architecture.
+  tree. The script checks the architecture-specific workerd pin and matching syscall profiles, and packages all six guides. A release is built on a machine of each architecture.
 
 ## Trying a change on a local cluster
 
