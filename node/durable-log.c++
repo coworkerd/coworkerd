@@ -553,25 +553,36 @@ bool DatabaseReplay::apply(const LogRecord& record, std::string* error) {
   if (record.kind == LogRecordKind::RESET || record.kind == LogRecordKind::DELETED) {
     KJ_REQUIRE(::ftruncate(fd, 0) == 0, "cannot empty a Durable Object database", path.string().c_str());
     haveHeader = false;
+    walHeader.clear();
     ++records;
     return true;
   }
   if (record.kind != LogRecordKind::FRAMES) return true;
   if (!record.header.empty()) {
+    if (record.header.size() != 32) return refuse("WAL header length");
     const auto* header = reinterpret_cast<const unsigned char*>(record.header.data());
     uint32_t m = beU32(header);
     if ((m & 0xFFFFFFFE) != 0x377f0682) return refuse("not a WAL header");
+    if (beU32(header + 4) != 3007000) return refuse("WAL header version");
+    const uint32_t size = beU32(header + 8);
+    if (size < 512 || size > 65536 || (size & (size - 1)) != 0) return refuse("WAL header page size");
     uint32_t s1 = 0, s2 = 0;
     walChecksum(m & 1, header, 24, s1, s2);
     if (s1 != beU32(header + 24) || s2 != beU32(header + 28)) return refuse("WAL header checksum");
-    magic = m;
-    pageSize = beU32(header + 8);
-    salt1 = beU32(header + 16);
-    salt2 = beU32(header + 20);
-    cksum1 = s1;
-    cksum2 = s2;
-    nextFrame = 1;
-    haveHeader = true;
+    // Reopening an object resends the existing WAL header with its next frames. The shipper's generation counter
+    // is local to that instance; the complete validated header identifies the WAL generation across reopens.
+    // A repeated header must preserve both the frame position and the checksum chain already applied.
+    if (!haveHeader || walHeader != record.header) {
+      magic = m;
+      pageSize = size;
+      salt1 = beU32(header + 16);
+      salt2 = beU32(header + 20);
+      cksum1 = s1;
+      cksum2 = s2;
+      nextFrame = 1;
+      walHeader = record.header;
+      haveHeader = true;
+    }
   }
   if (!haveHeader) return refuse("frames without their generation's header");
   if (record.pageSize != pageSize || record.salt1 != salt1 || record.salt2 != salt2)

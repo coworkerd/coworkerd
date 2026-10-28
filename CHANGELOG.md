@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix Durable Object recovery after eviction and reopening: a repeated header for the same WAL keeps the replay
+  position and checksum chain, including histories written by 0.5.0. New WAL generations still start at frame one;
+  header validation, frame continuity, salts and checksums remain enforced.
+
 ## 0.5.0
 
 0.5 adds stateful Workers: SQLite Durable Objects and D1 databases alongside stateless Workers, with inbound WebSockets, hibernation, alarms and JS RPC. Shard ownership lives in conditional object-store epochs. Committed transaction frames are confirmed by reachable peers (or flushed locally with no peer), uploaded as node log segments with per-object manifests and snapshots, and replayed after takeover. Confirming peers buffer in memory: simultaneous loss of an owner and all confirming peers can lose the unuploaded tail, which can exceed the normal 30 s segment interval during an outage.

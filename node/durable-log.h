@@ -184,6 +184,7 @@ private:
   uint64_t records = 0, framesApplied = 0;
   // The generation being applied: its header's values and the running checksum.
   bool haveHeader = false;
+  std::string walHeader;
   uint32_t magic = 0, pageSize = 0, salt1 = 0, salt2 = 0, cksum1 = 0, cksum2 = 0, nextFrame = 0;
 };
 
