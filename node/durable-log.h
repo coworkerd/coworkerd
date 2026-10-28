@@ -6,6 +6,7 @@
 #include "object-store.h"
 
 #include <kj/async-io.h>
+#include <kj/refcount.h>
 
 #include <cstdint>
 #include <deque>
@@ -266,7 +267,7 @@ public:
   // as a peer (0: it does not know); `closeObjects` closes every object of this node's durable processes, which is
   // how an object whose write was not confirmed stops being served before its files are thrown away.
   struct Hooks {
-    std::function<kj::Promise<kj::Own<PeerSink>>(std::string nodeId, uint64_t firstSeq)> openStream;
+    std::function<kj::Promise<kj::Own<PeerSink>>(std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq)> openStream;
     std::function<kj::Promise<DurableTailAnswer>(std::string nodeId, DurableTailAsk ask)> fetchTail;
     std::function<uint64_t(const std::string& namespaceId, uint32_t shard)> knownShardEpoch;
     std::function<kj::Promise<void>(std::string reason)> closeObjects;
@@ -451,8 +452,14 @@ private:
     bool partial = false;
   };
   struct PeerStream {
-    std::string nodeId;
-    kj::Maybe<kj::Own<PeerSink>> sink;
+    // Requests retain their sink until they settle, even after this session has been retired.
+    struct Sink: kj::Refcounted {
+      explicit Sink(kj::Own<PeerSink> value): value(kj::mv(value)) {}
+      kj::Own<PeerSink> value;
+    };
+    std::string nodeId, identity;
+    uint64_t session = 0, ownerEpoch = 0;
+    kj::Maybe<kj::Rc<Sink>> sink;
     bool connecting = false, broken = false;
     uint64_t firstSeq = 0, ackedSeq = 0, sentSeq = 0, appends = 0, refusals = 0;
     std::string lastRefusal;
@@ -468,6 +475,7 @@ private:
     double openedAtMs = 0, lastAppendMs = 0;
     std::string fragment;                  // the pieces of a record whose last call has not come yet
     std::map<uint64_t, std::string> held;  // nodeSeq -> the encoded record
+    std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
   };
 
   void taskFailed(kj::Exception&& error) override;
@@ -499,6 +507,11 @@ private:
   void takeRecord(Channel& channel, LogRecord&& record, uint64_t request);
   void sendOne(PeerStream& peer, uint64_t sequence, const std::string& encoded);
   void pumpPeer(PeerStream& peer);
+  std::string peerIdentity(const std::string& nodeId) const;
+  PeerStream* currentPeer(const std::string& nodeId, uint64_t session);
+  void retirePeer(PeerStream& peer);
+  void drivePeers();
+  kj::Promise<void> peerLoop();
   std::vector<std::string> peersOf(const std::string& namespaceId, uint32_t shard) const;
   uint32_t peerCount() const;
   void onPeerAck(const std::string& nodeId, uint64_t accepted);
@@ -588,6 +601,8 @@ private:
   uint64_t usagePublishes = 0, usagePublishFailures = 0, usageReads = 0;
   std::map<std::string, Channel> channels;       // processId -> channel
   std::map<std::string, PeerStream> peers;       // nodeId -> stream
+  uint64_t nextPeerSession = 0;
+  bool stopped = false;
   std::map<uint64_t, InFlight> inFlight;         // nodeSeq -> what waits for its peers
   std::map<uint64_t, PeerBuffer> incoming;       // streamId -> what this node buffers as a peer
   uint64_t nextStreamId = 0, incomingBytes = 0;

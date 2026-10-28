@@ -665,7 +665,7 @@ constexpr uint32_t MANIFEST_ATTEMPTS = 8;
 // The confirmation latencies kept for the state endpoint's percentiles.
 constexpr size_t CONFIRM_SAMPLES = 4096;
 // How often a stream to a peer that cannot be reached is tried again.
-constexpr double PEER_RETRY_MS = 1000;
+constexpr uint32_t PEER_RETRY_MS = 1000;
 
 // The object a record belongs to, as this node keeps it: the name its Host was made with.
 std::string hostNameOf(const LogRecord& record) {
@@ -752,6 +752,24 @@ std::filesystem::path DurableLog::databasePath(const std::string& storageId, uin
 
 void DurableLog::setNodeEpoch(uint64_t epoch) {
   if (epoch == nodeEpoch) return;
+  // Sequence numbers will be reused. Fail pending requests under their old identity, but keep confirmed bytes
+  // for the existing earlier-epoch uploader until its segment and manifests are durable.
+  std::set<std::string> pending;
+  for (const auto& [sequence, flight] : inFlight) pending.insert(flight.shipperKey);
+  for (const auto& key : pending) {
+    isolate(key, 0, "the node's log epoch changed before confirmation");
+    auto* object = objectOf(key.substr(0, key.rfind('/')));
+    if (object != nullptr) markRepair(*object, "the node's log epoch changed before confirmation");
+  }
+  for (const auto& [sequence, encoded] : records) {
+    if (!confirmed.contains(sequence) || isolated.contains(sequence)) continue;
+    auto record = decodeLogRecord(encoded);
+    KJ_REQUIRE(record.has_value(), "a confirmed local record cannot be decoded");
+    earlier[nodeEpoch][sequence] = std::move(*record);
+  }
+  for (auto& [id, peer] : peers) retirePeer(peer);
+  inFlight.clear();
+  confirmed.clear();
   if (logFd >= 0) {
     ::close(logFd);
     logFd = -1;
@@ -1046,6 +1064,8 @@ void DurableLog::cutBackWal(const std::string& storageId, uint32_t facetId, uint
 }
 
 kj::Promise<void> DurableLog::stop(double deadlineMonotonicMs) {
+  stopped = true;
+  for (auto& [id, peer] : peers) retirePeer(peer);
   if (!enabled()) co_return;
   try {
     if (!records.empty()) co_await sealNow("drain");
@@ -1412,6 +1432,10 @@ void DurableLog::appendToLogFile(const std::string& encoded) {
 // One record of this node's log: it goes to the peers of its object's shard, and the answer to the request that
 // carried it waits for them. Nothing here touches the disk or the object store (experiment 25, D.2).
 void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t request) {
+  if (stopped) {
+    if (request) answer(channel, request, ACK_UNAVAILABLE);
+    return;
+  }
   // The durable process names the object by its Host's name, which carries the data epoch; the history is the
   // object's, whichever copy of its files the frames came from.
   auto* object = objectOf(record.objectName);
@@ -1508,20 +1532,14 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   flight.generation = record.generation;
   flight.peers = peersOf(object->namespaceId, object->shard);
   inFlight[record.nodeSeq] = flight;
-  const auto now = monotonicTimeMs();
+  drivePeers();
   for (const auto& peer : flight.peers) {
     auto found = peers.find(peer);
-    if (found == peers.end() || found->second.broken || found->second.connecting || found->second.sink == kj::none) {
-      // One attempt a second at a peer that cannot be reached, not one per write.
-      if (found == peers.end() || now - found->second.attemptedAtMs >= PEER_RETRY_MS) {
-        auto& entry = peers[peer];
-        entry.nodeId = peer;
-        entry.attemptedAtMs = now;
-        tasks.add(openPeer(peer));
-      }
-      continue;
+    // A newly opened session takes the entire backlog. An already usable one takes only this record.
+    if (found != peers.end() && !found->second.connecting && found->second.sink != kj::none &&
+        currentPeer(peer, found->second.session) != nullptr && found->second.sentSeq < record.nodeSeq) {
+      sendOne(found->second, record.nodeSeq, encoded);
     }
-    sendOne(found->second, record.nodeSeq, encoded);
   }
   // checkConfirmations() flushes and checks the local log when this record has no selected peers.
   checkConfirmations();
@@ -1567,97 +1585,159 @@ void DurableLog::sendOne(PeerStream& peer, uint64_t sequence, const std::string&
   pumpPeer(peer);
 }
 
+// A session is tied to both ends' identities. Membership can change between a send and its continuation,
+// before the background loop observes it, so every continuation checks the live view as well as its token.
+std::string DurableLog::peerIdentity(const std::string& nodeId) const {
+  auto found = membership.members.find(nodeId);
+  return found == membership.members.end() ? std::string() : found->second.address + "#" + found->second.epoch;
+}
+
+DurableLog::PeerStream* DurableLog::currentPeer(const std::string& nodeId, uint64_t session) {
+  auto found = peers.find(nodeId);
+  if (stopped || found == peers.end()) return nullptr;
+  auto& peer = found->second;
+  return peer.session == session && peer.ownerEpoch == nodeEpoch && peer.identity == peerIdentity(nodeId)
+      ? &peer : nullptr;
+}
+
+void DurableLog::retirePeer(PeerStream& peer) {
+  peer.session = ++nextPeerSession;
+  peer.sink = kj::none;
+  peer.connecting = false;
+  peer.broken = true;
+  peer.queue.clear();
+  peer.queuedBytes = peer.inFlightBytes = 0;
+  peer.firstSeq = peer.ackedSeq = peer.sentSeq = 0;
+}
+
+// One scheduler per peer, independent of business writes. A confirmed but unsealed tail also needs replication
+// after a peer restarts. Neither isolated records nor a fully sealed prefix keep retrying an idle connection.
+void DurableLog::drivePeers() {
+  if (stopped || !nodeEpoch) return;
+  for (const auto& [sequence, flight] : inFlight) {
+    for (const auto& id : flight.peers) peers[id].nodeId = id;
+  }
+  const bool backlog = std::any_of(records.begin(), records.end(), [this](const auto& record) {
+    return !isolated.contains(record.first);
+  });
+  const auto now = monotonicTimeMs();
+  for (auto& [id, peer] : peers) {
+    const auto identity = peerIdentity(id);
+    if (peer.ownerEpoch != nodeEpoch || peer.identity != identity) {
+      retirePeer(peer);
+      peer.identity = identity;
+      peer.ownerEpoch = nodeEpoch;
+    }
+    if (!backlog || identity.empty() || peer.connecting || (!peer.broken && peer.sink != kj::none)) continue;
+    if (peer.attemptedAtMs != 0 && now - peer.attemptedAtMs < PEER_RETRY_MS) continue;
+    tasks.add(openPeer(id));
+  }
+}
+
+kj::Promise<void> DurableLog::peerLoop() {
+  while (!stopped) {
+    drivePeers();
+    co_await timer.afterDelay(100 * kj::MILLISECONDS);
+  }
+}
+
 // Sends what the stream's window allows, and again as the answers come back.
 void DurableLog::pumpPeer(PeerStream& peer) {
   while (!peer.queue.empty() && peer.inFlightBytes < APPEND_WINDOW_BYTES) {
-    if (peer.broken || peer.connecting || peer.sink == kj::none) return;
+    if (peer.broken || peer.connecting || peer.sink == kj::none ||
+        currentPeer(peer.nodeId, peer.session) == nullptr) return;
     auto item = std::move(peer.queue.front());
     peer.queue.pop_front();
     const auto size = item.bytes.size();
     peer.queuedBytes -= std::min(peer.queuedBytes, uint64_t(size));
+    if (isolated.contains(item.sequence)) continue;
     peer.inFlightBytes += size;
     ++peer.appends;
     peer.sentSeq = std::max(peer.sentSeq, item.sequence);
     const auto nodeId = peer.nodeId;
-    auto& sink = *KJ_ASSERT_NONNULL(peer.sink);
-    tasks.add(sink.append(std::move(item.bytes), item.partial)
-                  .then([this, nodeId, size](PeerSink::Accepted accepted) {
-      auto found = peers.find(nodeId);
-      if (found == peers.end()) return;
-      found->second.inFlightBytes -= std::min(found->second.inFlightBytes, uint64_t(size));
+    const auto session = peer.session;
+    auto& sink = KJ_ASSERT_NONNULL(peer.sink);
+    tasks.add(sink->value->append(std::move(item.bytes), item.partial)
+                  .then([this, nodeId, session, size](PeerSink::Accepted accepted) {
+      auto* current = currentPeer(nodeId, session);
+      if (current == nullptr) return;
+      current->inFlightBytes -= std::min(current->inFlightBytes, uint64_t(size));
       if (!accepted.refusal.empty()) {
         ++refusals;
-        ++found->second.refusals;
-        found->second.lastRefusal = accepted.refusal;
+        ++current->refusals;
+        current->lastRefusal = accepted.refusal;
         if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
         log("peer-refused", "\"peer\":" + quote(nodeId) + ",\"reason\":" + quote(accepted.refusal));
-        pumpPeer(found->second);
+        pumpPeer(*current);
         return;
       }
-      found->second.lastRefusal.clear();
-      found->second.lastAckMs = monotonicTimeMs();
-      onPeerAck(nodeId, accepted.sequence);
-      auto again = peers.find(nodeId);
-      if (again != peers.end()) pumpPeer(again->second);
-    }).catch_([this, nodeId, size](kj::Exception&& error) {
-      auto found = peers.find(nodeId);
-      if (found != peers.end()) {
-        found->second.inFlightBytes -= std::min(found->second.inFlightBytes, uint64_t(size));
-        if (!found->second.broken) {
-          found->second.broken = true;
-          found->second.sink = kj::none;
-          // What was queued for the stream goes with it: the stream that takes its place is given every record no
-          // segment covers.
-          found->second.queue.clear();
-          found->second.queuedBytes = 0;
-          ++peerSwitches;
-          log("peer-lost", "\"peer\":" + quote(nodeId) + ",\"error\":" +
-                  quote(std::string(error.getDescription().cStr())));
-        }
-      }
-    }));
+      current->lastRefusal.clear();
+      current->lastAckMs = monotonicTimeMs();
+      onPeerAck(nodeId, std::min(accepted.sequence, current->sentSeq));
+      pumpPeer(*current);
+    }).catch_([this, nodeId, session](kj::Exception&& error) {
+      auto* current = currentPeer(nodeId, session);
+      if (current == nullptr) return;
+      retirePeer(*current);
+      ++peerSwitches;
+      log("peer-lost", "\"peer\":" + quote(nodeId) + ",\"session\":\"" + std::to_string(session) +
+              "\",\"error\":" + quote(std::string(error.getDescription().cStr())));
+    }).attach(sink.addRef()));
   }
 }
 
-// Reconnects the same nodeId and hands it every record no segment covers yet. A different peer is selected for
-// subsequent records only after the membership view changes.
+// The open floor is captured before awaiting the connection. If sealing moves it meanwhile, discard this
+// attempt and reopen at the new floor; assigning a newer floor to the old request would misdescribe its backlog.
 kj::Promise<void> DurableLog::openPeer(std::string nodeId) {
-  auto& peer = peers[nodeId];
-  if (peer.connecting) co_return;
-  peer.nodeId = nodeId;
-  peer.connecting = true;
-  peer.broken = false;
-  peer.attemptedAtMs = monotonicTimeMs();
-  peer.openedAtMs = monotonicTimeMs();
+  uint64_t session;
+  const auto firstSeq = sealedSeq + 1;
+  const auto ownerEpoch = nodeEpoch;
+  {
+    auto& peer = peers[nodeId];
+    if (stopped || peer.connecting) co_return;
+    retirePeer(peer);
+    peer.nodeId = nodeId;
+    peer.ownerEpoch = ownerEpoch;
+    peer.identity = peerIdentity(nodeId);
+    peer.connecting = true;
+    peer.broken = false;
+    peer.attemptedAtMs = peer.openedAtMs = monotonicTimeMs();
+    session = peer.session;
+  }
   try {
-    auto sink = co_await hooks.openStream(nodeId, sealedSeq + 1);
-    auto& entry = peers[nodeId];
-    entry.nodeId = nodeId;
-    entry.sink = kj::mv(sink);
-    entry.firstSeq = sealedSeq + 1;
-    entry.ackedSeq = 0;
-    // A disconnected peer may still hold a tail isolated while it was away. Drop those records again before
-    // sending the backlog; isolation remains relevant after the local records have been sealed and trimmed.
-    if (!isolated.empty()) {
-      // This set is scoped to nodeEpoch. isolatedReported also contains older shard epochs for manifests and
-      // must not be used to drop coincident sequence numbers from a different owner epoch's stream.
-      std::vector<uint64_t> dropped(isolated.begin(), isolated.end());
-      co_await (*KJ_ASSERT_NONNULL(entry.sink)).drop(std::move(dropped));
+    auto sink = co_await timer.timeoutAfter(PEER_RETRY_MS * kj::MILLISECONDS,
+        hooks.openStream(nodeId, ownerEpoch, firstSeq));
+    if (currentPeer(nodeId, session) == nullptr) co_return;
+    // Isolation can advance during DROP as well. No append is dispatched until the current exclusions are held.
+    std::set<uint64_t> dropped;
+    while (dropped != isolated) {
+      dropped = isolated;
+      co_await timer.timeoutAfter(PEER_RETRY_MS * kj::MILLISECONDS,
+          sink->drop(std::vector<uint64_t>(dropped.begin(), dropped.end())));
+      if (currentPeer(nodeId, session) == nullptr) co_return;
     }
-    entry.connecting = false;
-    log("peer-opened", "\"peer\":" + quote(nodeId) + ",\"firstSeq\":\"" + std::to_string(entry.firstSeq) + "\"");
-    // Everything this node holds goes out at once: the backlog first, then the records as they come.
+    auto* entry = currentPeer(nodeId, session);
+    if (entry == nullptr) co_return;
+    if (firstSeq != sealedSeq + 1) {
+      retirePeer(*entry);
+      co_return;
+    }
+    entry->sink = kj::rc<PeerStream::Sink>(kj::mv(sink));
+    entry->firstSeq = firstSeq;
+    entry->connecting = false;
+    log("peer-opened", "\"peer\":" + quote(nodeId) + ",\"session\":\"" + std::to_string(session) +
+            "\",\"receiver\":" + quote(entry->identity) + ",\"firstSeq\":\"" + std::to_string(firstSeq) + "\"");
     for (const auto& [sequence, encoded] : records) {
-      if (isolated.contains(sequence)) continue;
-      sendOne(entry, sequence, encoded);
+      if (sequence < firstSeq || isolated.contains(sequence)) continue;
+      sendOne(*entry, sequence, encoded);
     }
   } catch (const kj::Exception& error) {
-    auto& entry = peers[nodeId];
-    entry.connecting = false;
-    entry.broken = true;
-    entry.sink = kj::none;
-    entry.lastRefusal = std::string(error.getDescription().cStr());
-    log("peer-open-failed", "\"peer\":" + quote(nodeId) + ",\"error\":" + quote(entry.lastRefusal));
+    auto* entry = currentPeer(nodeId, session);
+    if (entry == nullptr) co_return;
+    retirePeer(*entry);
+    entry->lastRefusal = std::string(error.getDescription().cStr());
+    log("peer-open-failed", "\"peer\":" + quote(nodeId) + ",\"session\":\"" + std::to_string(session) +
+            "\",\"error\":" + quote(entry->lastRefusal));
   }
 }
 
@@ -1672,6 +1752,7 @@ void DurableLog::onPeerAck(const std::string& nodeId, uint64_t accepted) {
 // A record is confirmed once K peers of its shard hold it and every earlier record of the same database is
 // confirmed: the answers of one object are released in the order its transactions were committed.
 void DurableLog::checkConfirmations() {
+  if (stopped) return;
   std::set<std::string> blocked;
   const auto configured = peerCount();
   std::vector<uint64_t> done;
@@ -1685,6 +1766,7 @@ void DurableLog::checkConfirmations() {
     for (const auto& peer : flight.peers) {
       auto found = peers.find(peer);
       if (found == peers.end()) continue;
+      if (currentPeer(peer, found->second.session) == nullptr) continue;
       if (found->second.sink != kj::none && !found->second.broken) ++reachable;
       if (found->second.ackedSeq >= sequence) ++held;
     }
@@ -1766,9 +1848,12 @@ void DurableLog::isolate(const std::string& objectKey, uint64_t fromSeq, const s
   }
   ++isolations;
   for (auto& [id, peer] : peers) {
-    if (peer.sink == kj::none) continue;
-    auto& sink = *KJ_ASSERT_NONNULL(peer.sink);
-    tasks.add(sink.drop(dropped).catch_([](kj::Exception&&) {}));
+    if (peer.sink != kj::none) {
+      auto& sink = KJ_ASSERT_NONNULL(peer.sink);
+      tasks.add(sink->value->drop(dropped).catch_([](kj::Exception&&) {}).attach(sink.addRef()));
+    }
+    // Invalidate pending ACKs and queued fragments as well. The replacement sends all exclusions before its tail.
+    retirePeer(peer);
   }
   log("isolated", "\"object\":" + quote(objectKey) + ",\"records\":" + std::to_string(dropped.size()) + ",\"from\":\"" +
           std::to_string(dropped.front()) + "\",\"reason\":" + quote(reason));
@@ -1791,6 +1876,7 @@ void DurableLog::markRepair(Object& object, const std::string& reason) {
 
 kj::Promise<void> DurableLog::run() {
   if (!enabled()) co_await kj::Promise<void>(kj::NEVER_DONE);
+  tasks.add(peerLoop());
   tasks.add(sealLoop());
   tasks.add(housekeeping());
   tasks.add(alarmLoop());
@@ -1869,6 +1955,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   const auto body = encoded.empty() ? std::string() : encodeSegment(header, encoded);
   if (!encoded.empty()) {
     co_await uploadSegment(header, body);
+    if (nodeEpoch != header.nodeEpoch) co_return;
     segmentNumber = header.segment;
     ++segments;
     segmentBytes += body.size();
@@ -1888,6 +1975,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
       log("manifest-failed", "\"error\":" + quote(lastManifestError));
       return false;
     });
+    if (nodeEpoch != header.nodeEpoch) co_return;
     if (ok) ++written;
     else ++failed;
   }
@@ -1922,8 +2010,8 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   appendToLogFile(encodeLogRecord(marker));
   for (auto& [id, peer] : peers) {
     if (peer.sink == kj::none) continue;
-    auto& sink = *KJ_ASSERT_NONNULL(peer.sink);
-    tasks.add(sink.trim(last).catch_([](kj::Exception&&) {}));
+    auto& sink = KJ_ASSERT_NONNULL(peer.sink);
+    tasks.add(sink->value->trim(last).catch_([](kj::Exception&&) {}).attach(sink.addRef()));
   }
   for (const auto& [key, frame] : lastFrameOf) {
     auto salts = saltsOf.find(key);
@@ -1947,6 +2035,23 @@ kj::Promise<void> DurableLog::uploadSegment(const SegmentHeader& header, const s
                        .catch_([](kj::Exception&& error) {
       return std::make_pair(false, std::string(error.getDescription().cStr()));
     });
+    if (outcome.second.empty() && !outcome.first) {
+      // Existence alone does not prove this upload succeeded: another attempt may have used the same number.
+      // Read errors retry the same immutable bytes; a different body must never be named by this manifest.
+      auto held = co_await store->get(key).then([&body](ObjectResponse response) {
+        return std::make_pair(response.status == 200 && response.bytes == body,
+            response.status == 200 ? std::string() : std::string("the existing segment could not be read"));
+      }).catch_([](kj::Exception&& error) {
+        return std::make_pair(false, std::string(error.getDescription().cStr()));
+      });
+      outcome.second = std::move(held.second);
+      if (outcome.second.empty() && !held.first) {
+        ++uploadFailures;
+        lastUploadError = "the existing segment has different bytes";
+        log("segment-conflict", "\"key\":" + quote(key) + ",\"expectedSha256\":" + quote(sha256Hex(body)));
+        failConflict("a different immutable Durable Object log segment already exists at " + key);
+      }
+    }
     if (outcome.second.empty()) {
       ++uploads;
       lastUploadAtMs = monotonicTimeMs();
@@ -2202,10 +2307,14 @@ kj::Promise<void> DurableLog::housekeeping() {
 // peers kept them for an epoch that is gone), so they are sealed under that epoch before anything else may need
 // them.
 kj::Promise<void> DurableLog::resealEarlier() {
-  if (earlier.empty() || !enabled() || !nodeEpoch) co_return;
+  if (earlier.empty() || !enabled() || !nodeEpoch || sealing) co_return;
+  // Normal seals and earlier-epoch seals share one writer, including numbering and manifest publication.
+  // In particular, an epoch change must not start a list/PUT while the previous epoch's seal is still uploading.
+  sealing = true;
+  const auto release = kj::defer([this]() { sealing = false; });
   auto epoch = earlier.begin()->first;
-  auto taken = std::move(earlier.begin()->second);
-  earlier.erase(earlier.begin());
+  // Retain this epoch while any upload or manifest can still fail. A new epoch may arrive during the awaits.
+  const auto taken = earlier.begin()->second;
   std::vector<std::string> encoded;
   SegmentHeader header;
   std::map<std::pair<std::string, uint32_t>, SegmentIndexEntry> index;
@@ -2222,7 +2331,10 @@ kj::Promise<void> DurableLog::resealEarlier() {
     ++entry.records;
     touched.insert(hostNameOf(record));
   }
-  if (encoded.empty()) co_return;
+  if (encoded.empty()) {
+    earlier.erase(epoch);
+    co_return;
+  }
   header.nodeId = settings.nodeId;
   header.nodeEpoch = epoch;
   header.segment = 1;
@@ -2239,19 +2351,25 @@ kj::Promise<void> DurableLog::resealEarlier() {
   log("segment-earlier", "\"epoch\":\"" + std::to_string(epoch) + "\",\"segment\":\"" +
           std::to_string(header.segment) + "\",\"records\":" + std::to_string(header.records) + ",\"objects\":" +
           std::to_string(touched.size()));
+  bool complete = true;
   for (const auto& objectName : touched) {
     auto* object = objectOf(objectName);
-    if (object == nullptr) continue;
+    if (object == nullptr) {
+      complete = false;
+      continue;
+    }
     object->segments.push_back(ManifestSegment{settings.nodeId, epoch, header.segment, header.firstSeq,
         header.lastSeq, object->shardEpoch});
-    co_await writeManifest(*object, false).catch_([](kj::Exception&&) { return false; });
+    if (!co_await writeManifest(*object, false).catch_([](kj::Exception&&) { return false; })) complete = false;
   }
+  if (complete) earlier.erase(epoch);
 }
 
 // This machine's files are a cache: when they take more than their share, the objects nothing has asked for in the
 // longest time and whose changes are all in a segment lose theirs. The object is rebuilt from its history when it
 // is asked for again.
 kj::Promise<void> DurableLog::dropColdFiles() {
+  if (!earlier.empty()) co_return;
   std::error_code code;
   uint64_t total = 0;
   std::vector<std::pair<double, std::string>> cold;
@@ -3352,7 +3470,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
         return result;
       }
     }
-    if (record->nodeSeq <= buffer.droppedTo) continue;
+    if (record->nodeSeq <= buffer.droppedTo || buffer.isolated.contains(record->nodeSeq)) continue;
     auto [entry, added] = buffer.held.insert({record->nodeSeq, encoded});
     if (added) {
       buffer.bytes += encoded.size();
@@ -3377,6 +3495,7 @@ void DurableLog::trimIncoming(uint64_t streamId, uint64_t upTo) {
     entry = buffer.held.erase(entry);
   }
   buffer.droppedTo = std::max(buffer.droppedTo, upTo);
+  buffer.isolated.erase(buffer.isolated.begin(), buffer.isolated.upper_bound(buffer.droppedTo));
 }
 
 void DurableLog::dropIncoming(uint64_t streamId, const std::vector<uint64_t>& sequences) {
@@ -3384,6 +3503,7 @@ void DurableLog::dropIncoming(uint64_t streamId, const std::vector<uint64_t>& se
   if (found == incoming.end()) return;
   auto& buffer = found->second;
   for (auto sequence : sequences) {
+    buffer.isolated.insert(sequence);
     auto entry = buffer.held.find(sequence);
     if (entry == buffer.held.end()) continue;
     incomingBytes -= std::min<uint64_t>(incomingBytes, entry->second.size());
@@ -3463,7 +3583,12 @@ std::string DurableLog::json() const {
   for (const auto& [id, peer] : peers) {
     if (!first) out << ",";
     first = false;
-    out << "{\"nodeId\":" << quote(id) << ",\"open\":" << ((peer.sink != kj::none) ? "true" : "false")
+    const bool current = !stopped && peer.ownerEpoch == nodeEpoch && peer.identity == peerIdentity(id);
+    out << "{\"nodeId\":" << quote(id) << ",\"open\":"
+        << ((current && peer.sink != kj::none && !peer.connecting && !peer.broken) ? "true" : "false")
+        << ",\"session\":\"" << peer.session << "\",\"ownerEpoch\":\"" << peer.ownerEpoch
+        << "\",\"receiver\":" << quote(peer.identity) << ",\"connecting\":" << (peer.connecting ? "true" : "false")
+        << ",\"firstSeq\":\"" << peer.firstSeq << "\""
         << ",\"ackedSeq\":\"" << peer.ackedSeq << "\",\"sentSeq\":\"" << peer.sentSeq << "\",\"appends\":"
         << peer.appends << ",\"inFlightBytes\":\"" << peer.inFlightBytes << "\",\"queuedBytes\":\""
         << peer.queuedBytes << "\",\"lastAckAgoMs\":" << (peer.lastAckMs ? uint64_t(now - peer.lastAckMs) : 0)

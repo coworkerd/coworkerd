@@ -215,6 +215,17 @@ and never reads the previous owner's files.
   path, so it costs a peer round trip. Transactions of the same database are confirmed in commit order; this is not a single order across all facets of an object.
   A peer that cannot be reached is not counted as reachable. Its stream is retried to the same node; a changed membership
   table can select a replacement for later records. A reopened stream first receives the exclusions again as `drop` messages, then the unsealed records except those marked isolated.
+  While an unconfirmed or unsealed tail remains, a background loop drives one connection attempt per peer, at most
+  once per second; it does not need another business write or reset the write's confirmation deadline. Every stream
+  has a local session token, the receiver's address and membership epoch, and the owner's log epoch. Open, append
+  and drop continuations from a retired session cannot update its replacement. An open whose sealed prefix advances
+  while connecting is discarded and retried with the current `firstSeq=sealedSeq+1`. Requests retain their old sink
+  until completion. A local epoch change fails pending writes and retains confirmed, unsealed bytes for the existing
+  earlier-epoch uploader, which releases them only after the segment and manifests succeed. DROP exclusions remain
+  in the receiver's epoch buffer, so a delayed append cannot restore a record after DROP.
+  Current and earlier-epoch seals share one writer through segment allocation, upload and manifest publication.
+  If a conditional segment create finds an existing key, the full stored bytes must match before it is treated as
+  successful; conflicting bytes fail the upload and retain the pending records.
   With an empty selected list the node calls a local disk flush instead. If the selected list is nonempty but all peers are unreachable, the write waits and can time out. A failed flush logs `log-flush-failed`, isolates the waiting records and answers `STORAGE_UNAVAILABLE` without confirming them. The owner never waits for its own disk otherwise
   (`synchronous=OFF`): this machine's files are a cache.
 - **Segments and manifests.** Every `durableObjects.segmentIntervalMs` (30 s) or `durableObjects.segmentBytes` (16 MiB)

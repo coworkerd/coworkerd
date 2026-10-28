@@ -2,6 +2,13 @@
 
 ## 0.5.1
 
+- Reconnect Durable Object replication streams while an unconfirmed or unsealed tail remains, without another
+  business write. Retries retain the original five-second confirmation window and log identity. Session tokens
+  separate receiver changes, replacement streams and local log epochs; late callbacks cannot confirm reused
+  sequence numbers or undo isolation. Reopened streams drop exclusions before sending the current unsealed prefix.
+- Serialize current and earlier-epoch log segment uploads across node epoch changes. Conditional-create collisions
+  count as a successful upload only when read-back bytes match; conflicting content keeps the tail pending and
+  cannot be published through a manifest.
 - Fix Durable Object recovery after eviction and reopening: a repeated header for the same WAL keeps the replay
   position and checksum chain, including histories written by 0.5.0. New WAL generations still start at frame one;
   header validation, frame continuity, salts and checksums remain enforced.

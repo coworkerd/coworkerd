@@ -7894,9 +7894,9 @@ int run(Launch launch) {
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
-      {[&peerForwarder, &membership](std::string nodeId, uint64_t firstSeq) {
+      {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {
          return peerForwarder.openDurableLog(std::move(nodeId),
-             std::strtoull(membership->view().epoch.c_str(), nullptr, 10), membership->view().instance, firstSeq);
+             ownerEpoch, membership->view().instance, firstSeq);
        },
        [&peerForwarder](std::string nodeId, coworkerd::DurableTailAsk ask) {
          return peerForwarder.fetchDurableTail(std::move(nodeId), std::move(ask));
