@@ -58,7 +58,9 @@ services:
     # 4.29 and later make create-if-absent hold under concurrency (the membership measures it at every start).
     image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     user: "10001:10001"
+    init: true
     restart: unless-stopped
+    stop_grace_period: 40s
     depends_on:
       secrets:
         condition: service_completed_successfully
@@ -67,24 +69,16 @@ services:
     # signatures, and its gRPC interface, which security.toml closes to everyone; the master, volume and filer servers
     # (the filer's identity service among them) listen on its loopback only, where the gateway reaches them. Every
     # node's identity comes as hotload/<id>.weed, one the secrets step withdraws (remove-node) as hotload/<id>.remove.weed:
-    # every 2 s a loop beside the store applies each such file it has not applied yet since the container started with
-    # weed shell (s3.configure, kept in the filer and in force at once) until the identity is there, or gone, so that
-    # each one can be withdrawn without a restart; its output discarded (it prints the identities).
-    entrypoint:
-      - /bin/sh
-      - -c
-      - >-
-        until [ -s /config/s3.json ] && [ -s /config/security.toml ]; do sleep 0.2; done;
-        (applied=""; while sleep 2; do for f in /config/hotload/*.weed; do [ -f "$$f" ] || continue;
-        sum=$$(cksum < "$$f"); case "$$applied" in *"|$$sum|"*) continue;; esac; id=$${f##*/}; id=$${id%.weed};
-        case "$$id" in *.remove) id=$${id%.remove}; want=no;; *) want=yes;; esac;
-        cd /tmp && timeout 60 /usr/bin/weed shell < "$$f" > /dev/null 2>&1 &&
-        if printf 's3.configure\n' | timeout 60 /usr/bin/weed shell 2>/dev/null | grep -q "\"name\": \"node-$$id\"";
-        then have=yes; else have=no; fi && [ "$$have" = "$$want" ] &&
-        applied="$$applied|$$sum|"; done; done) &
-        cd /config && exec /usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=20
-        -master.volumeSizeLimitMB=64 -s3 -s3.config=/config/s3.json
+    # every 2 s the storage entrypoint applies changed files with weed shell (s3.configure, kept in the filer and
+    # in force at once). It caches only verified success and supervises the store and reload process group. Shell
+    # output stays private (it prints credentials); init forwards signals and reaps timeout watchdogs.
+    entrypoint: [/bin/sh, /usr/local/bin/coworkerd-storage]
     volumes:
+      - type: bind
+        source: ./storage-entrypoint.sh
+        target: /usr/local/bin/coworkerd-storage
+        read_only: true
+        bind: {create_host_path: false}
       - storage-data:/data
       - {type: volume, source: secrets, target: /config, read_only: true, volume: {subpath: storage}}
     networks: [backend]

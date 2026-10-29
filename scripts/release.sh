@@ -151,8 +151,8 @@ grep -q "^coworkerd-apiserver $VERSION$" <<<"$APISERVER_VERSION_TEXT" || { echo 
 # ---- The package --------------------------------------------------------------------------------------------
 cp "$ROOT/runtime/runtime.js" "$STAGE/runtime/runtime.js"
 cp "$ROOT/docker/Dockerfile" "$ROOT/docker/docker-compose.yml" "$ROOT/docker/docker-compose.sandbox.yml" "$ROOT/docker/.env.example" "$STAGE/docker/"
-cp "$ROOT/docker/entrypoint.sh" "$STAGE/docker/entrypoint.sh"
-chmod 0755 "$STAGE/docker/entrypoint.sh"
+cp "$ROOT/docker/entrypoint.sh" "$ROOT/docker/storage-entrypoint.sh" "$STAGE/docker/"
+chmod 0755 "$STAGE/docker/entrypoint.sh" "$STAGE/docker/storage-entrypoint.sh"
 cp -R "$ROOT/docker/examples/hello" "$STAGE/docker/examples/hello"
 cp "$ROOT/docs/guide/install.md" "$STAGE/INSTALL.md"
 for page in install quickstart compat errors databases durable-objects; do cp "$ROOT/docs/guide/$page.md" "$STAGE/docs/$page.md"; done
