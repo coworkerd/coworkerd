@@ -1,6 +1,6 @@
 # Databases (D1's shape)
 
-> For release 0.5.1. A database is a Durable Object: it gets the same replication, the same rebuild
+> For release 0.5.2. A database is a Durable Object: it gets the same replication, the same rebuild
 > after its owner changes and the same limits ([compatibility scope](compat.md), [durable objects](durable-objects.md)).
 > The API is D1's, so an application written for D1 runs unchanged within the subset below.
 

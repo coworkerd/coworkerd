@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.5.1.
+> For release 0.5.2.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.5.1-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.1-linux-<arch>/` (the next table) |
-| `coworkerd-0.5.1-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.1`, for `docker load` |
-| `coworkerd-0.5.1-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.5.2-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.2-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.2-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.2`, for `docker load` |
+| `coworkerd-0.5.2-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -29,7 +29,7 @@ The package:
 | `bin/` | `coworkerd` (the node daemon; `coworkerd check` is its self-check, `coworkerd check storage` the object store's), `coworkerd-apiserver` (the control plane, and the operations tool `coworkerd-apiserver tool`), `coworkerd-launcher` (starts workerd in a least-privilege environment, see "Sandbox" in section 4), `workerd`, `cowctl` (the command line; it runs `lib/cowctl` with the machine's Node.js), and `coworkerd-syscalls-startup.txt`, `coworkerd-syscalls-steady.txt` and `coworkerd-syscalls.json` (the system call allowlist of this workerd and the record of how it was generated, see "System call allowlist" in section 4) |
 | `lib/` | `lib/cowctl/`: `cowctl` and the wrangler adapter with their dependencies |
 | `runtime/` | `runtime.js`, the runtime bridge every workerd process loads |
-| `docker/` | The compose file `docker-compose.yml`, `docker-compose.sandbox.yml` (section 3), the entry point script `entrypoint.sh`, the `Dockerfile`, `.env.example`, and `examples/hello/`: the example project the compose `tool` service mounts by default |
+| `docker/` | The compose file `docker-compose.yml`, `docker-compose.sandbox.yml` (section 3), `entrypoint.sh` for the Coworkerd services, `storage-entrypoint.sh` for storage, the `Dockerfile`, `.env.example`, and `examples/hello/`: the example project the compose `tool` service mounts by default |
 | `examples/` | `hello-world`, `durable-counter` (the quickstart's Durable Object counter with one D1 query, section 9 of the quickstart) and two official Cloudflare templates |
 | `docs/` | This document, the quickstart, the compatibility scope, the error codes, the databases guide and the Durable Objects guide |
 | `INSTALL.md` | A copy of this document; read it first after unpacking |
@@ -37,6 +37,11 @@ The package:
 | `SHA256SUMS` | The SHA-256 of every file in the package |
 
 A Mac (Apple silicon) uses `arm64`; most Linux servers use `amd64` (`uname -m` is `x86_64`).
+
+Keep `storage-entrypoint.sh` beside the Compose file from the same package. Compose mounts it read-only into
+the storage container; copying only the YAML is insufficient. Storage uses an init process to reap children and
+allows 40 seconds for a normal stop. Preserve that budget when using an external service manager. A forced
+storage termination remains a failure; a supervisor exiting does not imply that the store shut down cleanly.
 
 Requirements: **Docker Engine 28 or newer** (compose's internal network uses `gateway_mode_ipv4: isolated`, which only exists from 28.0; 27.x rejects it) and the Docker Compose plugin (Docker Desktop on the Mac includes it; the compose file uses volume `subpath` and the healthcheck's
 `start_interval`; use a Compose version that supports both). Budget memory for the ordinary and quarantine slots, the durable processes and their resident isolates, plus the control plane and object store; the durable process count and resident-object target are configured below.
@@ -46,9 +51,9 @@ Requirements: **Docker Engine 28 or newer** (compose's internal network uses `ga
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.5.1-linux-amd64.tar.gz
-docker load -i coworkerd-0.5.1-linux-amd64-image.tar.gz
-cd coworkerd-0.5.1-linux-amd64/docker
+tar -xzf coworkerd-0.5.2-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.2-linux-amd64-image.tar.gz
+cd coworkerd-0.5.2-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -93,13 +98,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.5.1 version` |
+| Show the version | `docker run --rm coworkerd:0.5.2 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.5.1` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.2` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -121,7 +126,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.5.1}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.2}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -580,9 +585,22 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
 
-**Upgrading 0.5.0 to 0.5.1 keeps the existing data layout.** Retain the bucket, keys, node identities and volumes, load the new image and replace components using the rolling procedure below. Version 0.5.1 fixes replay of a repeated WAL header after an object was evicted and reopened, including history already written by 0.5.0; no data conversion or key rotation is required.
+**Upgrading 0.5.1 to 0.5.2 keeps the existing data layout.** Update the complete package: the runtime and workerd
+carry matching RPC identity changes, and the launcher allowlist must match the new workerd bytes. Retain the
+bucket, keys, node identities and data volumes. For the bundled Compose store, plan a stateful write pause while
+replacing the Compose file and both entrypoint scripts and recreating the storage container. Wait for confirmed
+records to upload before stopping storage, allow its full 40-second stop budget, and check storage readiness before
+resuming writes. Upgrade the control plane and nodes with the new package; do not combine the new runtime with
+an old workerd or reuse an old syscall allowlist.
 
-**Upgrading 0.4.x to 0.5.1 is in place.** Keep the bucket, cluster marker, secrets and peer keys, node ids and persistent volumes. The object layout adds `do/` and node WAL / usage objects without rewriting the 0.4 desired-state layout. Back up the bucket and configuration as for any upgrade, load the new image, update the compose / entry point files from the new package, and rerun `docker compose run --rm secrets` so each node's storage policy can read `do/` and `nodes/` and write the shared DO shard / object prefixes. On bare metal, update those policies yourself (section 4).
+**Upgrading 0.5.0 to 0.5.2 also preserves the data layout.** The 0.5.1 fix for repeated WAL headers after object
+reopening is included, including replay of history written by 0.5.0. Before replacing any peer, pause DO, D1 and
+state-changing WebSocket writes and wait for confirmed history to upload. Keep that pause until all nodes use the
+new package, ownership has settled and reads have been checked. Old 0.5.0 writers do not have the later peer
+reconnection fixes, so this procedure does not promise uninterrupted stateful writes during a mixed-version roll.
+No data conversion or key rotation is required.
+
+**Upgrading 0.4.x to 0.5.2 is in place.** Keep the bucket, cluster marker, secrets and peer keys, node ids and persistent volumes. The object layout adds `do/` and node WAL / usage objects without rewriting the 0.4 desired-state layout. Back up the bucket and configuration as for any upgrade, load the new image, update the compose / entry point files from the new package, and rerun `docker compose run --rm secrets` so each node's storage policy can read `do/` and `nodes/` and write the shared DO shard / object prefixes. On bare metal, update those policies yourself (section 4).
 
 Upgrade the control plane and then nodes one at a time, waiting for each readiness check before continuing; retain the old volumes. Keep stateless traffic during this sequence, with ordinary retry handling for a node that drains or is unavailable. Finish upgrading all nodes and writers before deploying DO / D1 definitions or adding the new configuration keys: a 0.4 daemon does not understand the new runtime / ownership protocol or those keys. `/v1` keeps its fields and adds new fields and endpoints; clients must also handle the new errors in [errors](errors.md).
 

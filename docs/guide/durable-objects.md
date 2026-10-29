@@ -1,6 +1,6 @@
 # Durable Objects
 
-> For release 0.5.1. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
+> For release 0.5.2. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
 
 ## 1. Write a class
 

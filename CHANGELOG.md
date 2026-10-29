@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 (unreleased)
+
+- Bind each dynamic Worker entrypoint to the trusted invocation identity, so RPC completion clears the correct
+  process-pool record and CPU progress belongs to the correct call. Preserve real background work and RPC capabilities.
+- Reap storage hotload subprocesses, cache only successful identity updates, and preserve the store's actual exit
+  status during shutdown. Compose now includes `storage-entrypoint.sh` and a 40-second storage stop budget.
+- Package the updated workerd patch series and matching syscall profiles. Full candidate validation and the new
+  twelve-hour run remain pending; the previous 0.5.1 run is unchanged.
+
 ## 0.5.1
 
 - Reconnect Durable Object replication streams while an unconfirmed or unsealed tail remains, without another
