@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 29 Oct 2026 06:33:09 +0000
+Subject: [PATCH] Bind Coworkerd invocation identity to each dynamic entrypoint
+
+
+diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
+index 78d0be261b3535dc05704234ae8f39dd220e3bf4..36eae6a935181d77179e3ba4fdee751a20be796b 100644
+--- a/src/workerd/api/worker-loader.c++
++++ b/src/workerd/api/worker-loader.c++
+@@ -28,11 +28,13 @@ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
+     jsg::Optional<EntrypointOptions> options) {
+   Frankenvalue props;
+   kj::Maybe<ResourceLimits> limits;
++  kj::Maybe<kj::String> invocationIdentity;
+   KJ_IF_SOME(o, options) {
+     KJ_IF_SOME(p, o.props) {
+       props = Frankenvalue::fromJs(js, p.getHandle(js));
+     }
+     limits = o.limits;
++    invocationIdentity = kj::mv(o.coworkerdInvocationIdentity);
+   }
+ 
+   kj::Maybe<kj::String> entrypointName;
+@@ -44,7 +46,8 @@ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
+     }
+   }
+ 
+-  auto subreqChannel = channel->getEntrypoint(kj::mv(entrypointName), kj::mv(props), limits);
++  auto subreqChannel = channel->getEntrypoint(
++      kj::mv(entrypointName), kj::mv(props), limits, kj::mv(invocationIdentity));
+   return js.alloc<Fetcher>(IoContext::current().addObject(kj::mv(subreqChannel)));
+ }
+ 
+diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
+index 94e738c9668b878db60326ab150b84520aceb1bc..3d63f70982f17df37b2e3f37859180da004c7ff0 100644
+--- a/src/workerd/api/worker-loader.h
++++ b/src/workerd/api/worker-loader.h
+@@ -22,8 +22,11 @@ class WorkerStub: public jsg::Object {
+   struct EntrypointOptions {
+     jsg::Optional<jsg::JsRef<jsg::JsObject>> props;
+     jsg::Optional<ResourceLimits> limits;
++    // Coworkerd platform runtime only: its LOADER capability is never given to tenant code.
++    // An owned JSON identity of this entrypoint, independent of request cf and mutable props.
++    jsg::Optional<kj::String> coworkerdInvocationIdentity;
+ 
+-    JSG_STRUCT(props, limits);
++    JSG_STRUCT(props, limits, coworkerdInvocationIdentity);
+   };
+ 
+   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
+diff --git a/src/workerd/io/io-channels.c++ b/src/workerd/io/io-channels.c++
+index 1ccfccc2a5dabb63e710574786dfeb5cd4a2834d..91044886c90e5cb60e8679efb0d6e38189475199 100644
+--- a/src/workerd/io/io-channels.c++
++++ b/src/workerd/io/io-channels.c++
+@@ -274,15 +274,18 @@ kj::Rc<IoChannelFactory::RpcChannel> IoChannelFactory::makeRestoredRpcChannel(
+ }
+ 
+ kj::Rc<IoChannelFactory::SubrequestChannel> WorkerStubChannel::getEntrypoint(
+-    kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) {
++    kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
++    kj::Maybe<kj::String> invocationIdentity) {
+   KJ_IF_SOME(promise, props.resolveCaps(resolveCap)) {
+     return kj::rc<PromisedSubrequestChannel>(
+         promise.then([self = addRefToThis(), name = kj::mv(name), props = kj::mv(props),
+-                         limits = kj::mv(limits)]() mutable {
+-      return self->getEntrypointResolved(kj::mv(name), kj::mv(props), kj::mv(limits));
++                         limits = kj::mv(limits), invocationIdentity = kj::mv(invocationIdentity)]() mutable {
++      return self->getEntrypointResolved(
++          kj::mv(name), kj::mv(props), kj::mv(limits), kj::mv(invocationIdentity));
+     }));
+   } else {
+-    return getEntrypointResolved(kj::mv(name), kj::mv(props), kj::mv(limits));
++    return getEntrypointResolved(
++          kj::mv(name), kj::mv(props), kj::mv(limits), kj::mv(invocationIdentity));
+   }
+ }
+ 
+diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
+index 07b0295dc437f04d4fe2e252b294bddfa2db0a37..e726601c45ea7b0648e2eac0d9b24a5ea1d7d7ef 100644
+--- a/src/workerd/io/io-channels.h
++++ b/src/workerd/io/io-channels.h
+@@ -198,6 +198,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
+ 
+     // Address of the client as IP:port on whose behalf this request is being made.
+     kj::Maybe<kj::String> clientAddress;
++
++    // Bound by a Coworkerd platform dynamic entrypoint, never inferred from cf or props.
++    // Reporting identity only; it does not change the request or context lifetime.
++    kj::Maybe<kj::String> coworkerdInvocationIdentity;
+   };
+ 
+   // Parameters that can influence the version of a worker that is used to serve a subrequest.
+@@ -563,9 +567,11 @@ class WorkerStubChannel: public kj::Refcounted {
+   // As with IoChannelFactory::getSubrequestChannel(), the non-virtual method waits for `props` to
+   // resolve first, then calls the virtual method.
+   kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypoint(
+-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits);
++      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
++      kj::Maybe<kj::String> invocationIdentity = kj::none);
+   virtual kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
+-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) = 0;
++      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
++      kj::Maybe<kj::String> invocationIdentity) = 0;
+ 
+   // As with IoChannelFactory::getActorClass(), the non-virtual method waits for `props` to
+   // resolve first, then calls the virtual method.
+diff --git a/src/workerd/server/channel-token-test.c++ b/src/workerd/server/channel-token-test.c++
+index 255b83ed0434f54cc68a80a0bcb6a504a8af9271..fda0cdef16b7e2b010f44b9b85e7f85eca6d6f87 100644
+--- a/src/workerd/server/channel-token-test.c++
++++ b/src/workerd/server/channel-token-test.c++
+@@ -195,8 +195,12 @@ class MockActorChannel: public IoChannelFactory::ActorChannel {
+ 
+ class MockWorkerStubChannel final: public WorkerStubChannel {
+  public:
++  kj::Maybe<kj::String> boundInvocationIdentity;
++
+   kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
+-      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
++      kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
++      kj::Maybe<kj::String> invocationIdentity) override {
++    boundInvocationIdentity = kj::mv(invocationIdentity);
+     return kj::rc<MockSubrequestChannel>(
+         ServiceTriplet("outer", kj::none, kj::mv(props)), Persistent::NO);
+   }
+@@ -546,7 +550,9 @@ KJ_TEST("resolving channel props keeps promised caps alive") {
+   caps.add(newPromisedChannel<IoChannelFactory::SubrequestChannel>(kj::mv(paf.promise)).toOwn());
+ 
+   auto worker = kj::refcounted<MockWorkerStubChannel>();
+-  auto channel = worker->getEntrypoint(kj::none, propsWithCaps(kj::mv(caps)), kj::none);
++  auto identity = kj::str("{\"workerId\":\"tenant/service\",\"versionId\":\"v1\",\"invocationId\":\"async-1\"}");
++  auto channel = worker->getEntrypoint(
++      kj::none, propsWithCaps(kj::mv(caps)), kj::none, kj::mv(identity));
+   auto resolutionResult = channel->getResolved();
+   auto resolution = KJ_ASSERT_NONNULL(
+       kj::mv(resolutionResult).tryGet<kj::Promise<kj::Rc<IoChannelFactory::TokenizableChannel>>>());
+@@ -555,6 +561,8 @@ KJ_TEST("resolving channel props keeps promised caps alive") {
+       ServiceTriplet("nested", kj::none, Frankenvalue()), Persistent::NO));
+ 
+   auto resolved = resolution.wait(waitScope).downcast<MockSubrequestChannel>();
++  KJ_EXPECT(KJ_ASSERT_NONNULL(worker->boundInvocationIdentity) ==
++      "{\"workerId\":\"tenant/service\",\"versionId\":\"v1\",\"invocationId\":\"async-1\"}"_kj);
+   auto capTable = resolved->triplet.props.getCapTable();
+   KJ_ASSERT(capTable.size() == 1);
+   auto& nested = KJ_ASSERT_NONNULL(kj::tryDowncast<MockSubrequestChannel>(*capTable[0]));
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index b9e68521dcc70f570103c709667ffd0170700b76..f9085c6eb5915bac09a5d68e7bec0b50339c1d71 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -4381,9 +4381,11 @@ class Server::WorkerService final: public Service,
+     // is the moment it serves: from here on it is non-dumpable and runs under the steady-state system call
+     // filter (Coworkerd v49, coworkerd-steady.h).
+     coworkerdServing();
++    auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
++        ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
+     auto requestLimits = wrapCpuRequestLimits(
+         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+-        *cpuLimits, metadata.cfBlobJson, [this]() {
++        *cpuLimits, invocationIdentity, [this]() {
+           KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
+         }, actor != kj::none);
+     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+@@ -5745,8 +5747,10 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
+     }
+ 
+     kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
+-        kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
+-      return kj::rc<SubrequestChannelImpl>(addRefToThis(), kj::mv(name), kj::mv(props));
++        kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits,
++        kj::Maybe<kj::String> invocationIdentity) override {
++      return kj::rc<SubrequestChannelImpl>(
++          addRefToThis(), kj::mv(name), kj::mv(props), kj::mv(invocationIdentity));
+     }
+ 
+     kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
+@@ -5898,10 +5902,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
+     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
+      public:
+       SubrequestChannelImpl(
+-          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props)
++          kj::Rc<WorkerStubImpl> isolate, kj::Maybe<kj::String> entrypointName, Frankenvalue props,
++          kj::Maybe<kj::String> invocationIdentity)
+           : isolate(kj::mv(isolate)),
+             entrypointName(kj::mv(entrypointName)),
+-            props(kj::mv(props)) {}
++            props(kj::mv(props)),
++            invocationIdentity(kj::mv(invocationIdentity)) {}
+ 
+       kj::Own<WorkerInterface> startRequest(
+           IoChannelFactory::SubrequestMetadata metadata) override {
+@@ -5931,10 +5937,15 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
+       kj::Rc<WorkerStubImpl> isolate;
+       kj::Maybe<kj::String> entrypointName;
+       Frankenvalue props;  // moved away when `entrypointService` is initialized
++      const kj::Maybe<kj::String> invocationIdentity;  // owned by this entrypoint, not its isolate
+ 
+       kj::Maybe<kj::Rc<Service>> entrypointService;
+ 
+       kj::Own<WorkerInterface> startRequestImpl(IoChannelFactory::SubrequestMetadata metadata) {
++        KJ_IF_SOME(identity, invocationIdentity) {
++          // Neither a subsequent fetch cf nor props can replace the bound reporting identity.
++          metadata.coworkerdInvocationIdentity = kj::str(identity);
++        }
+         auto& service = KJ_ASSERT_NONNULL(isolate->service);
+         if (entrypointService == kj::none) {
+           entrypointService = service->getEntrypoint(entrypointName, kj::mv(props));

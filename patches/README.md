@@ -15,9 +15,14 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261012.1`), which is the tag plus one commit per patch.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
-- **Thin patches.** Changes stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it); the logic lives in
-  new files of our own, upstream files only get hooks, and upstream's command line entry is not touched. The fewer the
-  hooks, the cheaper following upstream is.
+- **Thin patches.** Changes stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with one explicit
+  exception: `0015-rpc-invocation-identity.patch` may also change `src/workerd/api/worker-loader.h`,
+  `src/workerd/api/worker-loader.c++`, `src/workerd/io/io-channels.h`, and `src/workerd/io/io-channels.c++`.
+  These hooks carry an owned invocation identity from the trusted platform loader to each dynamic entrypoint;
+  they do not change request lifetimes or accept identity from tenant headers, props, or logs. The exception is
+  bound to that patch and those exact paths. Other patches remain limited to the server directory; IoContext,
+  V8, jsg, and the general RPC protocol are outside this exception. Keep implementation in our server helpers
+  and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
   into the fork's `patches/v8/`, where upstream keeps its own.
@@ -51,5 +56,6 @@ The export is deterministic (no commit hashes, signatures or statistics): export
 same files. A new series also needs the compatibility flags the node accepts regenerated
 (`python3 scripts/compatibility-flags.py`, into `common/generated/`), new workerd builds for both architectures,
 their system call allowlists (`scripts/syscall-profile.mjs`, then `scripts/syscall-allowlist.py`) and the pinned
-hashes in `scripts/release.sh`. `check` is the source side of checking a sync: the checkout differs from the tag in
-`UPSTREAM` by exactly the series, and only under `src/workerd/server/`.
+hashes in `scripts/release.sh`. `check` is the source side of checking a sync: the complete checkout tree differs
+from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
+operations validate the series before mutating a checkout or exporting files.

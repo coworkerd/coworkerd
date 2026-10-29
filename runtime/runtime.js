@@ -1378,7 +1378,7 @@ async function trialLoad(descriptor, env, ctx) {
       processGeneration: Number(env.PROCESS_GENERATION),
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
       invocationId: descriptor.invocationId, treeId: descriptor.treeId };
-    report = await (await worker.getEntrypoint(undefined, { props }).fetch("http://coworkerd-trial/", { cf })).json();
+    report = await (await worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch("http://coworkerd-trial/", { cf })).json();
   } catch (error) {
     report = { ok: false, stage, codeStage, name: typeof error?.name === "string" ? error.name : typeof error,
       message: typeof error?.message === "string" ? error.message : String(error) };
@@ -1429,7 +1429,7 @@ async function rpcEntrypoint(value, env, ctx) {
     return host.rpcTarget(JSON.stringify(value));
   }
   const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx));
-  return worker.getEntrypoint(undefined, { props: callProps(descriptor, ctx) }).__coworkerdRpcTarget;
+  return worker.getEntrypoint(undefined, invocationOptions(descriptor, callProps(descriptor, ctx))).__coworkerdRpcTarget;
 }
 
 async function serve(request, env, ctx) {
@@ -1459,7 +1459,7 @@ async function serve(request, env, ctx) {
   });
   const props = callProps(descriptor, ctx);
   if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
-  return worker.getEntrypoint(undefined, { props }).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
+  return worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
     console.log("[runtime-execution] " + JSON.stringify({
       serverId: descriptor.serverId, processId: env.PROCESS_ID,
       processGeneration: Number(env.PROCESS_GENERATION), invocationId: descriptor.invocationId,
@@ -1468,6 +1468,15 @@ async function serve(request, env, ctx) {
       ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
     }));
   });
+}
+
+// LOADER belongs only to this platform runtime; tenant env/props contain no WorkerLoader or WorkerStub.
+// Bind the node descriptor's own invocation, including for RPC where Fetcher supplies no cf. This
+// per-entrypoint owned option is separate from tenant cf/props and is not shared by a loader key.
+function invocationOptions(descriptor, props) {
+  return { props, coworkerdInvocationIdentity: JSON.stringify({
+    workerId: descriptor.workerId, versionId: descriptor.versionId, invocationId: descriptor.invocationId,
+  }) };
 }
 
 // The props of one call of a version: its Service Bindings and its Durable Object Bindings, each a channel of this
