@@ -118,7 +118,7 @@ Object-store hints identify which objects the next shard owner should wake, but 
 
 An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination invalidates the version's isolate in that durable process: all its objects there are constructed again on their next event, recovering storage subject to the limitations in section 7. A durable slot does not move a suspect tenant into quarantine.
 
-A write past the object or tenant cap is refused at confirmation with `413 DO_OBJECT_TOO_LARGE` or `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database remain possible, including deleting rows. The size estimate can lag and a refused transaction can remain visible locally until reopen repairs it from confirmed history. No rollback should be inferred from these errors. See [error codes](errors.md).
+A write past the object or tenant cap is refused at confirmation with `413 DO_OBJECT_TOO_LARGE` or `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database remain possible, including deleting rows. The size estimate can lag. A refusal immediately marks the object for repair; the next request waits for recovery from confirmed history, so it cannot read the refused transaction. The SQL statement may already have executed locally before confirmation was refused. See [error codes](errors.md).
 
 ## 7. When ownership changes
 

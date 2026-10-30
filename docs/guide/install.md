@@ -171,6 +171,12 @@ Do not edit `s3.json` or the hotload files by hand: `secrets` writes them again 
 **Removing a node** for good: stop it, then `docker compose run --rm secrets remove-node node-4` removes its directory `nodes/node-4/` and its `storage/hotload/node-4.weed`, and writes `storage/hotload/node-4.remove.weed`, which the store's container applies within about 2 seconds with `s3.configure`'s deletion: the identity leaves the store's filer, and requests signed with it are refused from then on, without a restart of the store.
 This holds for every node, `node-1` to `node-3` included: `s3.json`, which the store reads at its start, holds only the deploy identity, and every node's identity is a `storage/hotload/<id>.weed` that the store's container puts into the filer at each of its starts and whenever one appears. Take an id that is in `COWORKERD_NODE_IDS` out of it as well (the line `remove-node` prints says `"inNodeIds":true`), or the next `up` gives that node a new identity.
 
+The bundled SeaweedFS store uses 1024 MiB volumes and automatically sets its volume count from the free space of
+Docker's data disk (`-volume.max=0 -master.volumeSizeLimitMB=1024`). It has no fixed 1.28 GB cap; available disk space,
+SeaweedFS's free-space reserve and metadata limit capacity. Reserve enough space for at least one 10 GiB object's
+history plus log segments, snapshots and the cluster's other data. Retained history can exceed the object's current
+SQLite size. For production, use your own object storage with capacity planning and the required consistency properties.
+
 ## 3. Option two: compose, three nodes
 
 ```bash

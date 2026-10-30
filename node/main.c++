@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
 #include "log-cleaning.h"
@@ -881,11 +882,11 @@ public:
     if (perCallForTest()) {
       // Control mode: each executing Server resolves its own current pointer.
       const auto* worker = desiredState.state().worker(workerId);
-      if (!worker || !worker->valid) { reason = "定义未知：Worker absent from version pins"; co_return nullptr; }
+      if (!worker || !worker->valid) { reason = coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "Worker absent from version pins"); co_return nullptr; }
       pin = coworkerd::versionPin(*worker->version);
     } else {
       auto found = pins->find(workerId);
-      if (found == pins->end()) { reason = "定义未知：Worker absent from version pins"; co_return nullptr; }
+      if (found == pins->end()) { reason = coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "Worker absent from version pins"); co_return nullptr; }
       pin = found->second;
     }
     co_return co_await desiredState.resolve(std::move(pin), deadline - monotonicTimeMs(), reason);
@@ -2031,9 +2032,9 @@ public:
 
   void rejectVersionUnavailable(std::string detail) {
     ++versionUnavailableRejections;
-    if (detail.find("定义未知") != std::string::npos) ++versionUnknownRejections;
-    else if (detail.find("定义不一致") != std::string::npos) ++versionInconsistentRejections;
-    else if (detail.find("代码不可用") != std::string::npos) ++versionCodeRejections;
+    if (detail.find(coworkerd::reasons::DEFINITION_UNKNOWN) != std::string::npos) ++versionUnknownRejections;
+    else if (detail.find(coworkerd::reasons::DEFINITION_INCONSISTENT) != std::string::npos) ++versionInconsistentRejections;
+    else if (detail.find(coworkerd::reasons::CODE_UNAVAILABLE) != std::string::npos) ++versionCodeRejections;
     lastRejection = std::move(detail);
   }
 
@@ -3804,7 +3805,7 @@ public:
     const auto& config = server.placementConfig();
     auto peer = server.member(targetServerId);
     if (peer == nullptr) {
-      auto reason = "target is not in membership table (不在成员表): node=" + targetServerId;
+      auto reason = ("target is " + coworkerd::reasons::NOT_IN_MEMBERSHIP + ": node=") + targetServerId;
       server.rejectPeerUnavailable(reason);
       co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
     }
@@ -3830,7 +3831,7 @@ public:
     // A watch update may observe re-registration while the connection opens.
     // Keep the captured epoch; the receiver knows whether this instance held it.
     if (current == nullptr || current->address != address) {
-      auto reason = "target is not in membership table (不在成员表) or its address changed before dispatch: node=" + targetServerId;
+      auto reason = ("target is " + coworkerd::reasons::NOT_IN_MEMBERSHIP + " or its address changed before dispatch: node=") + targetServerId;
       server.rejectPeerUnavailable(reason);
       co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
     }
@@ -3899,7 +3900,7 @@ public:
     const auto& config = server.placementConfig();
     auto peer = server.member(targetServerId);
     if (peer == nullptr) {
-      auto reason = "the owner of the object's shard is not in the membership table (不在成员表): node=" + targetServerId;
+      auto reason = ("the owner of the object's shard is " + coworkerd::reasons::NOT_IN_MEMBERSHIP + ": node=") + targetServerId;
       server.rejectPeerUnavailable(reason);
       co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
     }
@@ -3971,10 +3972,12 @@ public:
           result.getAccepted(), connection.addRef(), factory, headerTable, targetServerId, deadline)), std::nullopt, false};
     } catch (const kj::Exception& error) {
       markConnectionDisconnected(targetServerId, connection);
-      auto reason = "peer open result uncertain node=" + targetServerId + " detail=" + error.getDescription().cStr();
-      std::cerr << "[server] RESULT_UNCERTAIN: " << cleanReason(reason) << std::endl;
-      // Once the request has been sent, a transport failure is never proof that it did not run.
-      co_return InvocationAttempt{nullptr, server.refusal("RESULT_UNCERTAIN", reason), false};
+      auto reason = "peer unavailable before object dispatch node=" + targetServerId + " detail=" + error.getDescription().cStr();
+      // The receiver defers recovery and execution until the first event on the accepted capability. No event
+      // has been sent while this open is pending, so losing its answer is still known non-execution.
+      server.rejectPeerUnavailable(reason);
+      ++peerStates[targetServerId].peerUnavailableResponses;
+      co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
     }
   }
 
@@ -5171,6 +5174,36 @@ private:
   const kj::HttpHeaderTable& headerTable;
 };
 
+// Accept a peer open before preparing the object. Only the first event asks for recovery or opens workerd;
+// keeping the ready promise here preserves the event until its dispatcher and response are finished.
+class DeferredObjectDispatcher final: public rpc::EventDispatcher::Server {
+public:
+  explicit DeferredObjectDispatcher(kj::Function<kj::Promise<BindingDispatch::Dispatched>()> open)
+      : open(kj::mv(open)) {}
+  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+    co_await prepare();
+    co_await context.tailCall(inner.getHttpServiceRequest());
+  }
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    co_await prepare();
+    co_await context.tailCall(inner.jsRpcSessionRequest(capnp::MessageSize{4, 0}));
+  }
+private:
+  kj::Promise<void> prepare() {
+    if (preparing == kj::none) {
+      preparing = open().then([this](BindingDispatch::Dispatched dispatched) {
+        inner = kj::mv(dispatched.dispatcher);
+        ready = kj::mv(dispatched.ready).eagerlyEvaluate([](kj::Exception&&) {});
+      }).fork();
+    }
+    return KJ_ASSERT_NONNULL(preparing).addBranch();
+  }
+  kj::Function<kj::Promise<BindingDispatch::Dispatched>()> open;
+  rpc::EventDispatcher::Client inner = nullptr;
+  kj::Maybe<kj::Promise<void>> ready;
+  kj::Maybe<kj::ForkedPromise<void>> preparing;
+};
+
 // A Binding call answered by the asset layer first. For a Service Binding to a
 // Worker with assets (default entrypoint) the request goes to the Worker when
 // the asset layer routes it there: dispatch happens then, with the child
@@ -5319,7 +5352,13 @@ public:
       log(line, request.target, nullptr, failure.status, failure.code, started);
       line.attempt = attempt + 1;
       shards.refusedBy(request.target.namespaceId, request.target.shard, failure.code);
+      const auto previous = route;
       route = co_await shards.route(request.target.namespaceId, request.target.shard, true, route.nodeId, designated);
+      // Refresh ownership once, but do not spend a second peer timeout on the same unavailable owner instance.
+      // A new owner or epoch can still take the request, since no event has been sent.
+      if (failure.code == "PEER_UNAVAILABLE" && route.kind == coworkerd::ShardRoute::Kind::FORWARD &&
+          route.nodeId == previous.nodeId && route.nodeEpoch == previous.nodeEpoch && route.epoch == previous.epoch)
+        co_return refused(failure);
     }
   }
 
@@ -5354,9 +5393,15 @@ public:
     }
     request.target.shardEpoch = route.epoch;
     request.target.dataEpoch = route.dataEpoch;
-    auto ran = co_await runHere(std::move(request), std::move(version), line, started, deadline);
-    if (ran.refusal) co_return Received{*ran.refusal};
-    co_return Received{std::nullopt, kj::mv(ran.dispatched.dispatcher)};
+    auto dispatcher = kj::heap<DeferredObjectDispatcher>(
+        [this, request = std::move(request), version = std::move(version), line, started, deadline]() mutable
+            -> kj::Promise<BindingDispatch::Dispatched> {
+      auto ran = co_await runHere(std::move(request), std::move(version), line, started, deadline);
+      if (ran.refusal) co_return BindingDispatch::Dispatched{
+          rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
+      co_return kj::mv(ran.dispatched);
+    });
+    co_return Received{std::nullopt, rpc::EventDispatcher::Client(kj::mv(dispatcher))};
   }
 
 private:
@@ -5408,9 +5453,6 @@ private:
       log(line, target, nullptr, refusal.status, refusal.code, started);
       return Ran{refusal};
     };
-    // The object's process restarting or being replaced: its requests wait for the next generation.
-    const auto waitUntil = std::min(deadline, started + DURABLE_WAIT_MS);
-    while (!server.durableReady(target.key()) && monotonicTimeMs() < waitUntil) co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
@@ -5421,6 +5463,11 @@ private:
       co_return refused(server.refusal(ready.code, ready.reason, ready.status));
     }
     if (ready.rebuilt) line.recovered = ready.elapsedMs;
+    // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
+    // rebuilding as well as after an independent restart, before admission or opening the event.
+    const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
+    while (!server.durableReady(target.key()) && monotonicTimeMs() < waitUntil)
+      co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
     if (auto refusal = server.admission(version->workerId, version->definitionHash, false, deadline, false, false, &target))
       co_return refused(*refusal);
     auto slot = server.reserve(false);
@@ -5858,7 +5905,7 @@ public:
         auto version = co_await server.resolveVersion(pin, expiresAtMonotonicMs, unavailable);
         if (version != nullptr && !(version->assets && version->assetsBinding())) {
           version = nullptr;
-          unavailable = "定义不一致：the version has no ASSETS Binding";
+          unavailable = coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_INCONSISTENT, "the version has no ASSETS Binding");
         }
         if (version == nullptr) {
           server.rejectVersionUnavailable(unavailable);

@@ -254,7 +254,9 @@ and never reads the previous owner's files.
   facet's name and parent. How long a rebuild takes is the history's size: a small object is milliseconds, and a
   gibibyte takes about twenty seconds (measured: 19.5 s, with the snapshot's parts fetched four at a time, which is
   what a store of this kind is held to). A request waits at most `durableObjects.recoverTimeoutMs` (30 s) and is then answered `503
-  DO_RECOVERING`.
+  DO_RECOVERING`. A receiving peer accepts the shard and returns its dispatcher before starting this wait; the first
+  event on that dispatcher triggers recovery. Peer-open still has the two-second `peerTimeoutMs` bound. A failed open
+  before any event is sent is `PEER_UNAVAILABLE`, permitting ownership lookup again without replaying execution.
 - **This machine's files.** They are a cache of the history, bounded by `durableObjects.diskBytes` (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
   are all in a segment, go when that is full, and the object is rebuilt when it is asked for again. Beside them the
@@ -278,8 +280,8 @@ and never reads the previous owner's files.
   databases as they last reported their size (at a checkpoint, and when a database is opened or closed); past it a
   **write** is refused with `413 DO_OBJECT_TOO_LARGE` at the moment it would be made durable, and everything that
   reads is served. Transactions whose commit page count does not exceed the current database size are permitted even over the limit, so rows can be deleted. The refused transaction reaches no peer, no segment and no manifest, so it is not part of the
-  object's history; it stays readable from the refusing node's own file until the object is next opened, and the
-  rebuild that follows drops it.
+  object's history. The node immediately marks the object for repair; the next request waits for its files to be
+  rebuilt from confirmed history before serving, so the refused transaction cannot be read by that request.
 - **The tenant's storage.** What all of a tenant's objects hold is bounded by the tenant's `durableObjectBytes` quota
   (10 GiB by default): past it a growing write is refused with `422 QUOTA_EXCEEDED`, while reads and transactions that do not grow their database go on. Every node publishes what
   its own objects of each tenant hold to `nodes/<id>/durable-usage` every `durableObjects.usagePublishMs` (an hour) and

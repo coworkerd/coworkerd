@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "desired-state.h"
 #include "code-package.h"
 
@@ -70,7 +71,7 @@ public:
     return index.find(pin, reason);
   }
   kj::Promise<std::string> ensureCode(const VersionDefinition& version, double) override {
-    return sources.contains(version.definitionHash) ? std::string() : std::string("代码不可用：缺失");
+    return sources.contains(version.definitionHash) ? std::string() : std::string(coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "missing"));
   }
   kj::Promise<std::string> source(const VersionDefinition& version) override {
     return sources.at(version.definitionHash);
@@ -78,7 +79,7 @@ public:
   std::string bundlesJson() const override { return "{\"backend\":\"file\"}"; }
   kj::Promise<SharedAssetIndex> assets(const VersionDefinition& version, double, std::string& reason) override {
     auto manifest = objects.find("packages/" + version.contentHash);
-    if (manifest == objects.end()) { reason = "资源不可用：包清单缺失"; return SharedAssetIndex(); }
+    if (manifest == objects.end()) { reason = coworkerd::reasons::detail(coworkerd::reasons::ASSETS_UNAVAILABLE, "package manifest missing"); return SharedAssetIndex(); }
     auto& cached = assetIndexes[version.contentHash];
     if (!cached) {
       auto index = std::make_shared<AssetIndex>();
@@ -92,7 +93,7 @@ public:
   kj::Promise<AssetRead> assetBytes(const CodeAsset& asset, double) override {
     auto found = objects.find("modules/" + asset.sha256);
     if (found == objects.end() || deploymentSha256(found->second) != asset.sha256) {
-      return AssetRead{{}, "资源不可用：缺失或哈希不符"};
+      return AssetRead{{}, coworkerd::reasons::detail(coworkerd::reasons::ASSETS_UNAVAILABLE, "missing or hash mismatch")};
     }
     return AssetRead{found->second, {}};
   }

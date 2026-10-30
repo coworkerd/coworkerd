@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "desired-state.h"
 #include "coworkerd.capnp.h"
 #include "object-state.h"
@@ -92,7 +93,7 @@ public:
   kj::Promise<std::shared_ptr<const VersionDefinition>> resolve(
       VersionPin pin, double remainingMs, std::string& reason) override {
     auto known = index.find(pin, reason);
-    if (known || reason == "定义不一致") co_return known;
+    if (known || reason == coworkerd::reasons::DEFINITION_INCONSISTENT) co_return known;
     auto found = definitionFlights.find(pin.definitionHash);
     if (found == definitionFlights.end()) {
       auto hash = pin.definitionHash;
@@ -106,7 +107,7 @@ public:
     }
     auto result = co_await found->second->addBranch().exclusiveJoin(
         timer.afterDelay(static_cast<int64_t>(std::max(0.0, remainingMs) * 1000) * kj::MICROSECONDS)
-            .then([] { return DefinitionResult{nullptr, "定义未知（拉取超时）"}; }));
+            .then([] { return DefinitionResult{nullptr, coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "fetch timed out")}; }));
     if (!result.version) { reason = result.reason; co_return nullptr; }
     // Concurrent applies or different callers may have learned the hash while
     // the GET was in progress. Recheck identity before execution.
@@ -135,7 +136,7 @@ public:
     if (read.package) co_return read.package->assets;
     ++assetCounters.manifestFailures;
     const auto detail = unprefixed(read.reason);
-    reason = "资源不可用：" + (detail.starts_with("包清单") ? detail : "包清单" + detail);
+    reason = (coworkerd::reasons::ASSETS_UNAVAILABLE + ": ") + (detail.starts_with("package manifest") ? detail : "package manifest: " + detail);
     co_return nullptr;
   }
   kj::Promise<AssetRead> assetBytes(const CodeAsset& asset, double remainingMs) override {
@@ -143,7 +144,7 @@ public:
     auto read = co_await modules->read(asset.sha256, remainingMs);
     if (!read.reason.empty()) {
       ++assetCounters.fetchFailures;
-      co_return AssetRead{{}, "资源不可用：" + unprefixed(read.reason)};
+      co_return AssetRead{{}, (coworkerd::reasons::ASSETS_UNAVAILABLE + ": ") + unprefixed(read.reason)};
     }
     co_return AssetRead{std::move(read.bytes), {}};
   }
@@ -287,7 +288,7 @@ private:
     // Each caller keeps its own deadline; the read itself has the object store's.
     auto delay = static_cast<int64_t>(std::max(0.0, std::min(remainingMs, 86400000.0)) * 1000);
     return flight->second->addBranch().exclusiveJoin(timer.afterDelay(delay * kj::MICROSECONDS).then([] {
-      return ManifestRead{nullptr, "代码不可用：拉取超时（调用截止时间）"};
+      return ManifestRead{nullptr, coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "fetch timed out (call deadline)")};
     }));
   }
   kj::Promise<ManifestRead> readManifest(std::string packageHash) {
@@ -299,7 +300,7 @@ private:
       KJ_REQUIRE(packageJson(contents) == manifest, "package is not canonical");
       co_return ManifestRead{rememberPackage(packageHash, std::move(contents)), {}};
     } catch (const kj::Exception&) {
-      co_return ManifestRead{nullptr, "代码不可用：包清单校验失败"};
+      co_return ManifestRead{nullptr, coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package manifest validation failed")};
     }
   }
   void dropUnservedPackages() {
@@ -312,7 +313,7 @@ private:
   }
   AssetLimits limits = AssetLimits::fromEnvironment();
   static std::string unprefixed(const std::string& reason) {
-    const std::string prefix = "代码不可用：";
+    const std::string prefix = (coworkerd::reasons::CODE_UNAVAILABLE + ": ");
     return reason.starts_with(prefix) ? reason.substr(prefix.size()) : reason;
   }
   SharedPackage rememberPackage(const std::string& packageHash, PackageContents contents) {
@@ -362,21 +363,21 @@ private:
       else {
         auto response = co_await storage.get("definitions/" + hash);
         if (response.status != 200) {
-          result.reason = response.status == 404 ? "定义未知（对象不存在）" : "定义未知（拉取失败）";
+          result.reason = response.status == 404 ? coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "object not found") : coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "fetch failed");
         }
         bytes = std::move(response.bytes);
       }
       if (result.reason.empty()) {
         auto version = decodeDeploymentDefinition(bytes);
         if (version->definitionHash != hash || deploymentSha256(definitionEncoding(*version)) != hash) {
-          result.reason = "定义未知（内容哈希不符）";
+          result.reason = coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "content hash mismatch");
         } else {
           index.remember(version);
           ++outOfBandDefinitions;
           result.version = std::move(version);
         }
       }
-    } catch (const kj::Exception&) { result.reason = "定义未知（拉取失败或校验失败）"; }
+    } catch (const kj::Exception&) { result.reason = coworkerd::reasons::detail(coworkerd::reasons::DEFINITION_UNKNOWN, "fetch failed or validation failed"); }
     if (!result.version) ++definitionFetchFailures;
     co_return result;
   }

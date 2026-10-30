@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "bundle-cache.h"
 #include "json.h"
 
@@ -64,15 +65,15 @@ void BundleCache::makeRoom(uint64_t size) {
 std::string BundleCache::fail(const std::string& category, const std::string& reason) {
   ++failures[category];
   lastError = reason;
-  return "代码不可用：" + reason;
+  return (coworkerd::reasons::CODE_UNAVAILABLE + ": ") + reason;
 }
 kj::Promise<std::string> BundleCache::fetch(std::string hash) {
   const auto temporary = path(hash).string() + ".tmp";
   try {
     auto result = co_await storage.get(prefix + hash);
-    if (result.status == 404) co_return fail("notFound", "对象不存在");
-    if (result.status != 200) co_return fail("fetchFailed", "拉取失败 HTTP " + std::to_string(result.status));
-    if (result.bytes.size() > settings.maxBytes) co_return fail("overLimit", "超过缓存上限");
+    if (result.status == 404) co_return fail("notFound", "object not found");
+    if (result.status != 200) co_return fail("fetchFailed", "fetch failed HTTP " + std::to_string(result.status));
+    if (result.bytes.size() > settings.maxBytes) co_return fail("overLimit", "cache size limit exceeded");
     // Staging and commit are synchronous on the event loop: at most one disk
     // staging object exists, even when network downloads overlap.
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -82,7 +83,7 @@ kj::Promise<std::string> BundleCache::fetch(std::string hash) {
     auto staged = readFile(temporary);
     if (objectSha256(staged) != hash) {
       std::filesystem::remove(temporary);
-      co_return fail("hashMismatch", "内容哈希不符");
+      co_return fail("hashMismatch", "content hash mismatch");
     }
     makeRoom(staged.size());
     std::filesystem::rename(temporary, path(hash));
@@ -93,10 +94,10 @@ kj::Promise<std::string> BundleCache::fetch(std::string hash) {
   } catch (const kj::Exception& error) {
     std::filesystem::remove(temporary);
     const bool timedOut = error.getType() == kj::Exception::Type::OVERLOADED;
-    co_return fail(timedOut ? "fetchTimeout" : "fetchFailed", timedOut ? "拉取超时" : "拉取失败");
+    co_return fail(timedOut ? "fetchTimeout" : "fetchFailed", timedOut ? "fetch timed out" : "fetch failed");
   } catch (const std::exception&) {
     std::filesystem::remove(temporary);
-    co_return fail("fetchFailed", "拉取失败（缓存 IO）");
+    co_return fail("fetchFailed", "fetch failed (cache I/O)");
   }
 }
 
@@ -123,7 +124,7 @@ kj::Promise<std::string> BundleCache::ensure(std::string hash, double remainingM
   auto branch = found->second->addBranch();
   auto delay = static_cast<int64_t>(std::max(0.0, std::min(remainingMs, 86400000.0)) * 1000);
   return branch.exclusiveJoin(timer.afterDelay(delay * kj::MICROSECONDS).then([this] {
-    return fail("waitTimeout", "拉取超时（调用截止时间）");
+    return fail("waitTimeout", "fetch timed out (call deadline)");
   }));
 }
 
@@ -139,7 +140,7 @@ kj::Promise<BundleCache::Read> BundleCache::read(std::string hash, double remain
   if (valid) co_return Read{std::move(content), {}};
   // Never serve bytes that failed verification; the next read fetches again.
   invalidate(hash);
-  co_return Read{{}, fail("diskInvalidated", "缓存内容哈希不符")};
+  co_return Read{{}, fail("diskInvalidated", "cached content hash mismatch")};
 }
 
 kj::Promise<std::string> BundleCache::source(std::string hash) {

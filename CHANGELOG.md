@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- Accept a Durable Object peer open before rebuilding its history; wait on the first event and retain the two-second
+  bound for an unavailable peer, so a request forwarded during a takeover is no longer answered `RESULT_UNCERTAIN`.
+- Deployment and code refusal reasons are English constants (`definition unknown`, `definition inconsistent`,
+  `code unavailable: ...`, `assets unavailable: ...`, `not in the membership table`, `another deployment intervened`);
+  the earlier Chinese wording is gone.
+- Mark size- and quota-refused objects for immediate repair, so the next read or write waits for confirmed history
+  and cannot see the refused transaction.
+- Size the bundled Compose store from available disk space with 1024 MiB volumes, removing its fixed 20 × 64 MB limit.
+
 ## 0.5.2
 
 - Bind each dynamic Worker entrypoint to the trusted invocation identity, so RPC completion clears the correct

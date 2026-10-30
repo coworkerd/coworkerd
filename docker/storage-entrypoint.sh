@@ -77,8 +77,8 @@ state=$(mktemp -d /tmp/coworkerd-storage.XXXXXX) || exit 1
 mkdir "$state/applied" || exit 1
 printf '%s\n' s3.configure > "$state/query"
 cd /config || exit 1
-/usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=20 \
-  -master.volumeSizeLimitMB=64 -s3 -s3.config=/config/s3.json &
+/usr/bin/weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3.ip.bind=0.0.0.0 -dir=/data -volume.max=0 \
+  -master.volumeSizeLimitMB=1024 -s3 -s3.config=/config/s3.json &
 server=$!
 setsid /bin/sh "$0" reload "$state" &
 loader=$!

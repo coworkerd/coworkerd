@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "manifests.h"
 #include "support.h"
 
@@ -369,8 +370,8 @@ kj::Promise<ManifestStore::Written> ManifestStore::writeTenant(std::string name,
     ++stats.conflicts;
     result.conflictWaitsMs.push_back(waited);
     if (attempt >= maxAttempts)
-      refuseWrite("期间有其他部署 (another writer created revision " + std::to_string(next.revision) + " of tenant " + name +
-          "'s manifest first; " + std::to_string(attempt) + " attempts); nothing written");
+      refuseWrite((coworkerd::reasons::ANOTHER_DEPLOYMENT + ": another writer created revision ") + std::to_string(next.revision) + " of tenant " + name +
+          "'s manifest first; " + std::to_string(attempt) + " attempts; nothing written");
     ++stats.retries;
     co_await pause(attempt);
     co_await reloadTenant(name);
@@ -428,8 +429,8 @@ kj::Promise<void> ManifestStore::revert(const std::string& name, const TenantMan
   next.writer = newWriter(instance);
   next.writtenAtUnixMs = next.writer.writtenAtUnixMs;
   auto created = co_await store.create(revisionKey(tenantManifestPrefix(name), next.revision), tenantManifestJson(next));
-  if (!created.created) refuseWrite("期间有其他部署 (another writer created revision " + std::to_string(next.revision) + " of tenant " +
-      name + "'s manifest while its refused write went back)");
+  if (!created.created) refuseWrite((coworkerd::reasons::ANOTHER_DEPLOYMENT + ": another writer created revision ") + std::to_string(next.revision) + " of tenant " +
+      name + "'s manifest while its refused write went back");
   ++stats.writes;
   ++stats.reverted;
   indexRefusals.erase(name);
@@ -588,7 +589,7 @@ kj::Promise<ManifestStore::WrittenCredentials> ManifestStore::writeCredentials(
     }
     ++stats.credentialConflicts;
     if (attempt >= maxAttempts)
-      refuseWrite("another write changed the credentials (" + std::to_string(attempt) + " attempts); nothing written");
+      refuseWrite("another write changed the credentials (" + std::to_string(attempt) + " attempts; nothing written");
     co_await pause(attempt);
     auto latest = co_await readLatestRevision(store, CREDENTIAL_INDEX_PREFIX, indexHintKey(CREDENTIAL_INDEX_PREFIX), 0, true);
     if (latest.revision > credentialIndex.revision) credentialIndex = decodeCredentialIndex(latest.bytes);

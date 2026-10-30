@@ -1,3 +1,4 @@
+#include "reasons.h"
 #include "deployment.h"
 #include "coworkerd.capnp.h"
 #include "code-package.h"
@@ -1580,9 +1581,9 @@ std::shared_ptr<const VersionDefinition> DefinitionIndex::find(const VersionPin&
   auto found = hashes.find(value.definitionHash);
   if (found != hashes.end()) {
     if (versionPin(*found->second) == value) return found->second;
-    reason = "定义不一致";
+    reason = coworkerd::reasons::DEFINITION_INCONSISTENT;
   } else {
-    reason = labels.contains(value.workerId + "@" + value.versionId) ? "定义不一致" : "定义未知";
+    reason = labels.contains(value.workerId + "@" + value.versionId) ? coworkerd::reasons::DEFINITION_INCONSISTENT : coworkerd::reasons::DEFINITION_UNKNOWN;
   }
   return nullptr;
 }

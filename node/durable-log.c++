@@ -1463,6 +1463,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   if (object->overLimit && !nonGrowing) {
     ++overLimitAnswers;
     if (request) answer(channel, request, ACK_TOO_LARGE);
+    markRepair(*object, "a growing write exceeded the object size limit");
     return;
   }
   // The tenant's durableObjectBytes quota: only the write is refused, and only while the tenant is over it. What the
@@ -1475,6 +1476,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
       log("quota-exceeded", "\"tenant\":" + quote(object->tenant) + ",\"bytes\":\"" +
               std::to_string(tenantBytes(object->tenant)) + "\",\"quota\":\"" + std::to_string(quota) + "\"");
       if (request) answer(channel, request, ACK_QUOTA);
+      markRepair(*object, "a growing write exceeded the tenant storage quota");
       return;
     }
   }
