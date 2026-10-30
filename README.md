@@ -21,11 +21,12 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: preparing 0.5.2
+## Status: 0.5.2
 
-The main branch is preparing a 0.5.2 candidate with storage process cleanup and RPC completion identity fixes.
-Its package validation and twelve-hour run are pending. The published 0.5.1 remains a prerelease; these source
-fixes do not replace its assets or change the result of its earlier test run.
+0.5.2 is the current release, for Linux `amd64` and `arm64`, and the first stable release of the 0.5 series:
+SQLite Durable Objects, D1's basic API, inbound WebSockets, hibernation, alarms and JS RPC, validated by the
+full regression, the stateful fault scenarios and a 12-hour three-node run on one host (0.5.0 and 0.5.1 stay
+pre-releases, superseded). Multi-host bare-metal validation and sandbox enforcement remain separate work.
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the

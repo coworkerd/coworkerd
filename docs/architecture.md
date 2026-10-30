@@ -4,7 +4,7 @@ This page is the map of Coworkerd for anyone who wants to know how it works befo
 
 ## 1. One cluster, one platform
 
-A Coworkerd cluster runs all the Workers of one platform. The platform is the cluster's only administrator; its users are **tenants**, every Worker belongs to one tenant and is named `tenant/Worker`, and a tenant's credential acts only on its own tenant. Worker code follows the Cloudflare Workers programming model and runs in workerd, Cloudflare's open-source runtime, with a series of thirteen patches, all under `src/workerd/server/`.
+A Coworkerd cluster runs all the Workers of one platform. The platform is the cluster's only administrator; its users are **tenants**, every Worker belongs to one tenant and is named `tenant/Worker`, and a tenant's credential acts only on its own tenant. Worker code follows the Cloudflare Workers programming model and runs in workerd, Cloudflare's open-source runtime, with a series of fourteen patches: thirteen under `src/workerd/server/`, and one -- the invocation identity of dynamic entry points -- that also hooks four files of `api/` and `io/` ([patches/README.md](../patches/README.md)).
 
 Coworkerd adds tenant isolation and resource limits, quotas and metering, placement across nodes, and a declarative API. In 0.5, stateless Workers run alongside SQLite Durable Objects and D1 databases. Objects have one owner per shard; transaction frames are confirmed by peers (or flushed locally with no peer), uploaded as log segments, and replayed when ownership changes. Accounts, billing and user interfaces belong to the platform on top.
 
