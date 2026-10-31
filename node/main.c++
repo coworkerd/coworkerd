@@ -1,4 +1,5 @@
 #include "reasons.h"
+#include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
 #include "log-cleaning.h"
@@ -93,10 +94,12 @@ using coworkerd::monotonicTimeMs;
 using coworkerd::readFile;
 using coworkerd::redactSecrets;
 using coworkerd::runLogClock;
+using coworkerd::rpcFailureCode;
 using coworkerd::safeName;
 using coworkerd::secretRedactions;
 using coworkerd::sendUnauthorized;
 using coworkerd::sha256Hex;
+using coworkerd::tagRpcError;
 using coworkerd::trialClean;
 using coworkerd::versionJson;
 using coworkerd::versionText;
@@ -607,6 +610,53 @@ void copyCallParams(rpc::JsRpcTarget::CallParams::Reader from, rpc::JsRpcTarget:
   if (from.hasCallerSpanContext()) to.getCallerSpanContext().set(from.getCallerSpanContext());
 }
 
+// A membrane redirect must copy capabilities through that same membrane in both directions. Observe the
+// actual method result, retaining promise pipelining, without decoding its serialized JavaScript arguments.
+class ObservedRpcCall final: public capnp::Capability::Server {
+public:
+  ObservedRpcCall(capnp::Capability::Client target, kj::Own<capnp::MembranePolicy> policy,
+      std::function<void(const std::string&)> failed, bool reverse)
+      : target(kj::mv(target)), policy(kj::mv(policy)), failed(std::move(failed)), reverse(reverse) {}
+
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
+    return {forward(interfaceId, methodId, kj::mv(context)), false, true};
+  }
+
+private:
+  kj::Promise<void> forward(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
+    auto params = context.getParams();
+    auto call = params.getAs<rpc::JsRpcTarget::CallParams>();
+    const bool binding = call.which() == rpc::JsRpcTarget::CallParams::METHOD_NAME &&
+        call.getMethodName() == JS_RPC_BIND_METHOD;
+    try {
+      auto request = target.typelessRequest(interfaceId, methodId, params.targetSize(), {});
+      auto orphanage = capnp::Orphanage::getForMessageContaining(
+          static_cast<capnp::AnyPointer::Builder&>(request));
+      request.adopt(reverse ? capnp::copyOutOfMembrane(params, orphanage, policy->addRef())
+                            : capnp::copyIntoMembrane(params, orphanage, policy->addRef()));
+      context.releaseParams();
+      auto sent = request.send();
+      context.setPipeline(reverse ? capnp::reverseMembranePipeline(sent.noop(), policy->addRef())
+                                  : capnp::membranePipeline(sent.noop(), policy->addRef()));
+      auto response = co_await sent;
+      auto results = context.getResultsOrphanage(response.targetSize());
+      context.adoptResults(reverse ? capnp::copyIntoMembrane(response, results, policy->addRef())
+                                   : capnp::copyOutOfMembrane(response, results, policy->addRef()));
+    } catch (const kj::Exception& error) {
+      const auto code = rpcFailureCode(error);
+      // bind() observes binding failures, and the lease's revocation promise already counts its expiry.
+      if (!binding && code != "LEASE_EXPIRED") failed(code);
+      throw;
+    }
+  }
+  capnp::Capability::Client target;
+  kj::Own<capnp::MembranePolicy> policy;
+  std::function<void(const std::string&)> failed;
+  bool reverse;
+};
+
 // Everything a capability the node handed out may be used for, for as long as the call tree's lease lasts: the
 // membrane wraps every capability that crosses it, in both directions, so a stub or a stream the target returned is
 // revoked with the lease it was made under (docs/guide/errors.md). A call that crosses it is one method call of the
@@ -615,18 +665,23 @@ class LeaseMembrane final: public capnp::MembranePolicy, public kj::Refcounted {
 public:
   LeaseMembrane(kj::Promise<void> revoked, std::function<void()> counted,
       rpc::JsRpcSession::Client session, kj::Promise<void> opened,
-      kj::Own<kj::PromiseFulfiller<void>> done, std::function<void()> released)
+      kj::Own<kj::PromiseFulfiller<void>> done, std::function<void()> released,
+      std::function<void(const std::string&)> failed)
       : revoked(revoked.fork()), counted(std::move(counted)), session(kj::mv(session)),
         opened(kj::mv(opened).eagerlyEvaluate([](kj::Exception&&) {})), done(kj::mv(done)),
-        released(std::move(released)) {}
+        released(std::move(released)), failed(std::move(failed)) {}
 
   kj::Maybe<capnp::Capability::Client> inboundCall(
-      uint64_t interfaceId, uint16_t methodId, capnp::Capability::Client) override {
+      uint64_t interfaceId, uint16_t methodId, capnp::Capability::Client target) override {
     if (interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0 && counted) counted();
+    if (interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0)
+      return capnp::Capability::Client(kj::heap<ObservedRpcCall>(kj::mv(target), addRef(), failed, false));
     return kj::none;
   }
   kj::Maybe<capnp::Capability::Client> outboundCall(
-      uint64_t, uint16_t, capnp::Capability::Client) override {
+      uint64_t interfaceId, uint16_t methodId, capnp::Capability::Client target) override {
+    if (interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0)
+      return capnp::Capability::Client(kj::heap<ObservedRpcCall>(kj::mv(target), addRef(), failed, true));
     return kj::none;
   }
   kj::Own<capnp::MembranePolicy> addRef() override { return kj::addRef(*this); }
@@ -644,6 +699,7 @@ private:
   kj::Promise<void> opened;
   kj::Own<kj::PromiseFulfiller<void>> done;
   std::function<void()> released;
+  std::function<void(const std::string&)> failed;
 };
 
 // The top-level target of a session on the node that executes the call: the runtime's own target takes our
@@ -1054,8 +1110,9 @@ public:
         .then([]() -> kj::Promise<void> {
       // A failure, not a disconnection: the caller is told why, and `jsg.` is what carries the message through
       // workerd rather than the "Network connection lost." a broken connection gives (docs/guide/errors.md).
-      return KJ_EXCEPTION(FAILED,
-          "jsg.Error: LEASE_EXPIRED: the call tree's lease expired, so the capabilities of its method calls are gone");
+      return tagRpcError(KJ_EXCEPTION(FAILED,
+          "jsg.Error: LEASE_EXPIRED: the call tree's lease expired, so the capabilities of its method calls are gone"),
+          "LEASE_EXPIRED");
     });
   }
   void observeRpcSession(bool durableObject) {
@@ -2841,13 +2898,14 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext) override {
     // `jsg.` is what workerd passes on to the caller rather than hiding behind "internal error"
     // (src/workerd/jsg/exception.c++, tunneledErrorType): our code is then the start of the message the tenant
-    // catches, and the Binding's shim makes it the error's `code` too (runtime/runtime.js).
+    // catches; the exception detail makes it the error's `code` in workerd's JS conversion.
     // The description is built here and set as it is: KJ's macros label every argument that is not a string literal
     // with the expression it came from (`code.c_str() = ...`), and the label would stand between the `jsg.` prefix
     // and the code -- workerd passes a message on only when the description starts with `jsg.` (v62 met the same
     // thing on the Durable Object log's refusals).
     const auto message = "jsg.Error: " + code + ": " + body;
-    kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(message.c_str())));
+    kj::throwFatalException(tagRpcError(kj::Exception(kj::Exception::Type::FAILED,
+        __FILE__, __LINE__, kj::heapString(message.c_str())), code.c_str()));
   }
 
 private:
@@ -6054,13 +6112,14 @@ public:
     // The lease: a capability the target returned is the caller's for as long as the call tree lives, and no longer.
     // The lease running out is a failure of this call tree's capabilities, counted once under its own code.
     auto revoked = server.whenLeaseExpires(deadline).catch_([&server = server](kj::Exception&& error) -> kj::Promise<void> {
-      server.observeRpcFailure("LEASE_EXPIRED");
+      server.observeRpcFailure(rpcFailureCode(error));
       return kj::Promise<void>(kj::mv(error));
     });
     co_return capnp::membrane(capnp::Capability::Client(started.getTopLevel()),
         kj::refcounted<LeaseMembrane>(kj::mv(revoked), [&server = server, durableCall]() {
           server.observeRpcCall(durableCall);
-        }, started.getSession(), kj::mv(out.ready), kj::mv(done), [&server = server]() { server.observeRpcReleased(); }));
+        }, started.getSession(), kj::mv(out.ready), kj::mv(done), [&server = server]() { server.observeRpcReleased(); },
+        [&server = server](const std::string& code) { server.observeRpcFailure(code); }));
   }
 
 
@@ -6102,17 +6161,8 @@ kj::Promise<void> RpcBindTarget::bind(uint64_t interfaceId, uint16_t methodId,
     context.releaseParams();
     co_return co_await context.tailCall(kj::mv(request));
   } catch (const kj::Exception& error) {
-    // Our codes are the start of an RPC error's message (docs/guide/errors.md): the first word of one is what this
-    // failure is counted as, anything else as EXECUTION_FAILED. workerd's own tag for a message it passes on
-    // (`jsg.Error: `) and the `remote.` a hop adds stand in front of it and are skipped first.
-    std::string reason = error.getDescription().cStr();
-    for (const auto& tag : {"remote.", "jsg.Error: ", "jsg.TypeError: ", "jsg.RangeError: "}) {
-      while (reason.starts_with(tag)) reason.erase(0, std::strlen(tag));
-    }
-    const auto colon = reason.find(':');
-    std::string code = colon == std::string::npos ? std::string() : reason.substr(0, colon);
-    const bool ours = !code.empty() && code.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ_") == std::string::npos;
-    bootstrap.observeRpcFailure(ours ? code : "EXECUTION_FAILED");
+    // Only the platform detail identifies a platform refusal. Application messages are opaque.
+    bootstrap.observeRpcFailure(rpcFailureCode(error));
     throw;
   }
 }

@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 31 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Preserve RPC platform codes and exit when the node parent is gone
+
+diff --git a/src/workerd/jsg/BUILD.bazel b/src/workerd/jsg/BUILD.bazel
+index 9c6f4461356e0d9a3e0c04b35fc4ba43c46028f9..0ee4dc499552095bcefd19d0ab9eaa61dfb6beb1 100644
+--- a/src/workerd/jsg/BUILD.bazel
++++ b/src/workerd/jsg/BUILD.bazel
+@@ -93,6 +93,7 @@ wd_cc_library(
+         "ser.c++",
+         "setup.c++",
+         "util.c++",
++        "coworkerd-rpc-code.c++",
+         "v8-platform-wrapper.c++",
+         "wrappable.c++",
+     ],
+@@ -110,6 +111,7 @@ wd_cc_library(
+         "snapshot.h",
+         "unwrap-args.h",
+         "util.h",
++        "coworkerd-rpc-code.h",
+         "v8-platform-wrapper.h",
+         "web-idl.h",
+         "wrappable.h",
+diff --git a/src/workerd/jsg/coworkerd-rpc-code.c++ b/src/workerd/jsg/coworkerd-rpc-code.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..44e832b18d53934706ca234df0f0446894dcc0cf
+--- /dev/null
++++ b/src/workerd/jsg/coworkerd-rpc-code.c++
+@@ -0,0 +1,14 @@
++#include "coworkerd-rpc-code.h"
++#include "jsg.h"
++
++namespace workerd::jsg {
++void coworkerdSetRpcErrorCode(v8::Isolate* isolate, v8::Local<v8::Value> value,
++    const kj::Exception& exception) {
++  if (!value->IsObject()) return;
++  KJ_IF_SOME(code, exception.getDetail(COWORKERD_CODE_DETAIL_ID)) {
++    auto text = kj::heapString(code.asChars());
++    check(value.As<v8::Object>()->Set(isolate->GetCurrentContext(),
++        v8StrIntern(isolate, "code"_kj), v8Str(isolate, text)));
++  }
++}
++}  // namespace workerd::jsg
+diff --git a/src/workerd/jsg/coworkerd-rpc-code.h b/src/workerd/jsg/coworkerd-rpc-code.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b82413c9bae32a96f505bdda2a7c5dec1cfb3d02
+--- /dev/null
++++ b/src/workerd/jsg/coworkerd-rpc-code.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <kj/exception.h>
++#include <kj/string.h>
++
++namespace workerd::jsg {
++// Assigned by the v76 RPC error-detail contract. Keep in sync with the node's
++// common/rpc-error.h. The value is a platform code's bytes, without a trailing NUL.
++inline constexpr kj::Exception::DetailTypeId COWORKERD_CODE_DETAIL_ID = 0xc6f4a09d8b3e2175ull;
++
++inline kj::Exception tagCoworkerdRpcError(kj::Exception error, kj::StringPtr code) {
++  error.setDetail(COWORKERD_CODE_DETAIL_ID, kj::heapArray(code.asBytes()));
++  return error;
++}
++}  // namespace workerd::jsg
+diff --git a/src/workerd/jsg/util.c++ b/src/workerd/jsg/util.c++
+index 7cc0095e393facfe1babb6dfab2d76f11115e23d..7a953aef84f21a37cf83ada68f2b37e0193eb93d 100644
+--- a/src/workerd/jsg/util.c++
++++ b/src/workerd/jsg/util.c++
+@@ -371,6 +371,9 @@ v8::Local<v8::Value> exceptionToJs(
+   // TODO(cleanup): decodeTunneledException is currently only used here, consider
+   // inlining it back into this function.
+   auto tunneledException = decodeTunneledException(isolate, exception, options);
++  // Coworkerd: the platform's detail survives RPC, including getters and returned capabilities.
++  void coworkerdSetRpcErrorCode(v8::Isolate*, v8::Local<v8::Value>, const kj::Exception&);
++  coworkerdSetRpcErrorCode(isolate, tunneledException.handle, exception);
+ 
+   if (tunneledException.isInternal) {
+     // Don't log exceptions that have been explicitly marked with worker_do_not_log or are
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index 6e8fac98dd1b250cec0466d1f3700c621ca9a35f..6687bfaade639082d45dfd7823a17cbef79cee49 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -348,6 +348,7 @@ wd_cc_library(
+         "coworkerd-idle-eviction.h",
+         "coworkerd-steady.h",
+         "coworkerd-wal-shipper.h",
++        "coworkerd-parent-death.h",
+     ],
+     deps = [
+         ":coworkerd-memory-limit",
+diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+index 2c3f2c4b157047adf106f82d9c05e552fa3e4b9b..4acbfcfdca7d6c686b33a800252a06e5cd1a7372 100644
+--- a/src/workerd/server/coworkerd-cpu-limit.h
++++ b/src/workerd/server/coworkerd-cpu-limit.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <workerd/jsg/coworkerd-rpc-code.h>
+ #include "coworkerd-gc.h"
+ #include "coworkerd-idle-eviction.h"
+ #include <workerd/server/coworkerd-memory-limit.h>
+@@ -187,8 +189,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
+   kj::Exception exception() {
+     return exceeded->load() == IsolateLimitCause::MEMORY
+-        ? KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED")
+-        : KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
++        ? jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED"),
++              "MEMORY_LIMIT_EXCEEDED")
++        : jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
++              "CPU_LIMIT_EXCEEDED");
+   }
+   void requireNotExceeded() {
+     if (exceeded->load() != IsolateLimitCause::NONE) kj::throwFatalException(exception());
+diff --git a/src/workerd/server/coworkerd-parent-death.h b/src/workerd/server/coworkerd-parent-death.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..232c93f11a914d77d7183e66ada892947437bb16
+--- /dev/null
++++ b/src/workerd/server/coworkerd-parent-death.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include <kj/async-io.h>
++#include <kj/debug.h>
++#include <cerrno>
++#include <cstdlib>
++#include <cstdio>
++#include <unistd.h>
++
++namespace workerd::server {
++class CoworkerdParentWatch {
++ public:
++  explicit CoworkerdParentWatch(kj::Own<kj::AsyncInputStream> input): input(kj::mv(input)) {
++    task = watch().eagerlyEvaluate([](kj::Exception&&) { parentGone("error"); });
++  }
++ private:
++  kj::Own<kj::AsyncInputStream> input;
++  kj::Promise<void> task = nullptr;
++  char bytes[64];
++  [[noreturn]] static void parentGone(const char* reason) {
++    char row[192];
++    int n = snprintf(row, sizeof(row),
++        "[coworkerd-lifecycle] {\"event\":\"parent-gone\",\"pid\":%d,\"reason\":\"%s\"}\n",
++        getpid(), reason);
++    ssize_t written;
++    do { written = write(STDERR_FILENO, row, n); } while (written < 0 && errno == EINTR);
++    _exit(0);
++  }
++  kj::Promise<void> watch() {
++    while (co_await input->tryRead(bytes, 1, sizeof(bytes)) != 0) {}
++    parentGone("eof");
++  }
++};
++
++inline void followCoworkerdParent(kj::LowLevelAsyncIoProvider& provider) {
++  const char* text = std::getenv("COWORKERD_PARENT_FD");
++  if (text == nullptr) return;
++  char* end;
++  long fd = std::strtol(text, &end, 10);
++  KJ_REQUIRE(*text && !*end && fd > STDERR_FILENO && fd <= 1000000,
++      "COWORKERD_PARENT_FD must be an inherited descriptor");
++  // Process lifetime; retaining the promise keeps the asynchronous read registered on the main loop.
++  static auto* watch = new CoworkerdParentWatch(provider.wrapSocketFd(
++      static_cast<kj::LowLevelAsyncIoProvider::Fd>(fd),
++      kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP));
++  (void)watch;
++}
++}  // namespace workerd::server
+diff --git a/src/workerd/server/coworkerd-wal-shipper.c++ b/src/workerd/server/coworkerd-wal-shipper.c++
+index c024f42fdd19a9e51ff0ba6410918bc9dac140ad..3cd4c764fe86327707e9b8b82272d0c4f4a54996 100644
+--- a/src/workerd/server/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/coworkerd-wal-shipper.c++
+@@ -1,5 +1,6 @@
+ // Coworkerd: see coworkerd-wal-shipper.h.
+ #include "coworkerd-wal-shipper.h"
++#include "coworkerd-parent-death.h"
+ 
+ #include <workerd/jsg/exception.h>
+ 
+@@ -409,6 +410,7 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+ 
+ void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
+   logProvider = &provider;
++  followCoworkerdParent(provider);
+ }
+ 
+ bool durableLogEnabled() {

@@ -51,8 +51,10 @@ private:
 // and the runtime RPC); 5, shared memory for its lifecycle snapshot; 6, the memory band's shared
 // memory (when the watermark is on). The runtime calls back over <stack>/run/binding.sock and
 // source.sock, which `bindingAddress` and `sourceAddress` name. With the sandbox the launcher
-// also gets 7 (its status socket) and 8 (the workerd file); it closes both before workerd runs. In the
-// observe mode of the system call allowlist the launcher sends the filter's notification listener
+// also gets 7 (its status socket) and 8 (the workerd file); it closes both before workerd runs. For
+// parent liveness, workerd inherits only the read end at 10; only this node keeps the
+// close-on-exec write end, so every process class exits on EOF after node death.
+// In the observe mode of the system call allowlist the launcher sends the filter's notification listener
 // back over 7, and this Server is the supervisor that answers the notifications.
 class ProcessPool final {
 public:

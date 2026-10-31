@@ -168,12 +168,14 @@ the control plane's own `{"code","reason"}` when the database does not exist (`4
 
 A method call on a Service Binding or on a Durable Object stub is a call of the tree like a `fetch` through the same
 Binding, so the same things can refuse it -- but there is no response to read the code from: the call **throws**. The
-platform's code is the start of the error's `message`, and on a call made through the Binding itself it is the error's
-`code` property too (on a call made on a capability the target returned, the message carries it alone); an exception the target's own code threw arrives with its message. The Binding shim derives `.code` from any leading `UPPER_CASE:` prefix, including an application exception, so that property alone does not prove a platform failure.
+platform's code is the start of the error's `message` and its `code` property. The runtime sets `.code` from a
+platform exception marker, consistently for Binding calls, getters and calls on capabilities the target returned.
+An exception the target's own code threw arrives with its message; a leading `UPPER_CASE:` in that message does
+not cause the runtime to add `.code`.
 
 | `message` | `code` | Meaning | What to do |
 | --- | --- | --- | --- |
-| whatever the method threw | absent unless the message starts with an uppercase code prefix | The target's code threw: the instance remains available; a Binding call may add `.code` based on the message prefix | The caller's own business |
+| whatever the method threw | absent unless the application supplied it | The target's code threw: the instance remains available; an uppercase message prefix alone does not add `.code` | The caller's own business |
 | `SUBREQUEST_BUDGET_EXHAUSTED: ...` | `SUBREQUEST_BUDGET_EXHAUSTED` | The call tree's budget is used up: a method call draws on it exactly as a `fetch` through the Binding does (section 1) | Make fewer Binding calls |
 | `LEASE_EXPIRED: ...` | `LEASE_EXPIRED` | The call tree's deadline has passed -- for a capability the target returned, this is also what a call on it answers once the tree that made it is over | Make the call within the tree that opened it |
 | `CPU_LIMIT_EXCEEDED: ...`, `MEMORY_LIMIT_EXCEEDED: ...` | the same | A limit ended the method, as it would a request (section 1) | Do less per call |
@@ -217,4 +219,4 @@ not counted against the tenant's log quota; refusals for concurrency and rate ar
 
 `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED` at a durable write's output gate mean the caller did not receive successful durable confirmation. The SQLite transaction may already have changed the local file. A size- or quota-refused transaction reaches no peer or uploaded history: the node immediately marks the object for repair, and the next request waits for recovery from confirmed history before serving, so it cannot read the refused transaction. These errors do not mean the SQL statement never executed locally. After confirmation timeout the node isolates its local records and asks peers to drop them before rebuilding. Peer-drop delivery is best effort and repeated on reconnect; exclusion metadata is published at the next seal even without new confirmed records. If publication fails, an unreachable peer can retain a tail that recovery may still see. A successful response also remains subject to the accepted loss of the unuploaded tail when the owner and all confirming peers fail together, as described in [Durable Objects](durable-objects.md), section 7. A failed flush on the no-peer path is logged and returns `STORAGE_UNAVAILABLE` without confirmation. Use application operation IDs and inspect state when retrying non-idempotent writes.
 
-Alarms can run again after failures, and an absent discovery hint can delay them until the object is reopened. WebSocket clients reconnect after a process / node exit. Neither a timeout nor a broken RPC capability proves that a method did not run; after dispatch it is uncertain. RPC platform codes survive in the exception's message, with `.code` added when possible; getters and returned capabilities can expose only the message prefix.
+Alarms can run again after failures, and an absent discovery hint can delay them until the object is reopened. WebSocket clients reconnect after a process / node exit. Neither a timeout nor a broken RPC capability proves that a method did not run; after dispatch it is uncertain. RPC platform codes survive in both the exception's message and `.code`, including getters and returned capabilities.

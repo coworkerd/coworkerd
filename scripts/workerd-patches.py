@@ -16,6 +16,11 @@ IDENTITY_PATHS = frozenset({
     "src/workerd/api/worker-loader.h", "src/workerd/api/worker-loader.c++",
     "src/workerd/io/io-channels.h", "src/workerd/io/io-channels.c++",
 })
+RPC_CODE_PATCH = "0016-rpc-code-parent-death.patch"
+RPC_CODE_PATHS = frozenset({
+    "src/workerd/jsg/util.c++", "src/workerd/jsg/BUILD.bazel",
+    "src/workerd/jsg/coworkerd-rpc-code.h", "src/workerd/jsg/coworkerd-rpc-code.c++",
+})
 
 def git(checkout, *args, env=None, input=None):
     return subprocess.check_output(["git", "-c", "core.autocrlf=false", "-c", "diff.noprefix=false", "-c", "core.quotePath=true",
@@ -27,11 +32,13 @@ def allowed_path(name, path):
     canonical = path and not path.startswith("/") and "\\" not in path and all(
         part not in ("", ".", "..") for part in path.split("/"))
     return canonical and (path.startswith("src/workerd/server/") or
-                          name == IDENTITY_PATCH and path in IDENTITY_PATHS)
+                          name == IDENTITY_PATCH and path in IDENTITY_PATHS or
+                          name == RPC_CODE_PATCH and path in RPC_CODE_PATHS)
 
 def validate_patch(checkout, name, data):
     """Validate Git's parsed paths and literal headers before any checkout mutation."""
     headers, current, in_hunk = set(), None, False
+    rpc_conversion_hunks = 0
     for line in data.splitlines():
         if line.startswith(b"diff --git "):
             match = re.fullmatch(rb"diff --git a/([^\s]+) b/([^\s]+)", line)
@@ -42,6 +49,8 @@ def validate_patch(checkout, name, data):
             current, in_hunk = new, False
         elif line.startswith(b"@@"):
             in_hunk = True
+            if name == RPC_CODE_PATCH and current == "src/workerd/jsg/util.c++":
+                rpc_conversion_hunks += 1
         elif not in_hunk:
             if line.startswith((b"rename from ", b"rename to ", b"copy from ", b"copy to ")):
                 raise AssertionError("patch scope: rename/copy headers are not allowed")
@@ -60,6 +69,8 @@ def validate_patch(checkout, name, data):
         assert allowed_path(name, path), "patch scope: " + name + ": " + path
         parsed.add(path)
     assert headers and headers == parsed, "patch scope: literal and Git paths differ"
+    if name == RPC_CODE_PATCH:
+        assert rpc_conversion_hunks == 1, "RPC conversion requires exactly one upstream hook"
     return sorted(parsed)
 
 def settings(directory):
@@ -124,7 +135,7 @@ def operate(action, checkout, directory, output=None):
             actual = git(checkout, "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-renames", base, env=environment)
             assert actual == expected, "complete checkout difference does not match patch sequence byte for byte"
             paths = git(checkout, "diff", "--cached", "--name-only", base, env=environment).decode().splitlines()
-            assert paths and all(allowed_path(IDENTITY_PATCH if IDENTITY_PATCH in series else "", p) for p in paths), paths
+            assert paths and all(any(allowed_path(name, p) for name in series) for p in paths), paths
             assert actual_tree == expected_tree, "complete Git trees differ"
         return {"passed": True, "upstream": upstream, "diffSha256": hashlib.sha256(actual).hexdigest(),
                 "expectedTree": expected_tree, "actualTree": actual_tree, "modifiedFiles": paths, "patchScopes": scopes}

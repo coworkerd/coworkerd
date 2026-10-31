@@ -599,24 +599,11 @@ function __coworkerdRpcFacade(instance, env) {
   }
   return new Facade();
 }
-// A platform code at the start of an RPC error's message, as a property of the error the tenant catches
-// (docs/guide/errors.md): the message itself keeps the code, since that is all an RPC exception carries.
-function __coworkerdRpcCode(error) {
-  const reason = String(error?.message ?? error);
-  const colon = reason.indexOf(":");
-  const code = colon > 0 ? reason.slice(0, colon) : "";
-  if (/^[A-Z][A-Z_]*$/.test(code)) { try { error.code = code; } catch {} }
-  return error;
-}
 function __coworkerdRpcPath(open, path) {
   const call = async (...args) => {
     let target = open();
     for (const step of path.slice(0, -1)) target = target[step];
-    try {
-      return await target[path[path.length - 1]](...args);
-    } catch (error) {
-      throw __coworkerdRpcCode(error);
-    }
+    return await target[path[path.length - 1]](...args);
   };
   return new Proxy(call, {
     get(_target, name) { return typeof name === "string" && name !== "then" ? __coworkerdRpcPath(open, [...path, name]) : undefined; },

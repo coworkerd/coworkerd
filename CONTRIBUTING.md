@@ -50,7 +50,7 @@ come in a later version.
 - A change to workerd is a commit on the fork's branch and the same change exported to `patches/workerd/` (`python3
   scripts/workerd-patches.py export`, which takes one commit per patch named in `patches/workerd/series`, so a new
   patch is named there first; it works on the checkout `workerd/`, or the one `--checkout` names, which must be clean
-  and hold `UPSTREAM`'s tag at its commit) in this repository; patches stay in `src/workerd/server/` (with the one documented exception in
+  and hold `UPSTREAM`'s tag at its commit) in this repository; patches stay in `src/workerd/server/` (with the two documented exceptions in
   [patches/README.md](patches/README.md)), with the logic in our own files and only hooks in upstream files.
 - The `/v1` API changes only by adding fields and endpoints until 1.0; changing or removing something in it needs a
   discussion first.

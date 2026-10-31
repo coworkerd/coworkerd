@@ -122,6 +122,8 @@ constexpr int EVENT_FD = 3, LISTEN_FD = 4, LIFECYCLE_FD = 5, BAND_FD = 6;
 constexpr int LAUNCHER_STATUS_FD = 7, LAUNCHER_PROGRAM_FD = 8;
 // A durable process's end of the Durable Object log channel (the launcher leaves it alone: it touches only 7 and 8).
 constexpr int DURABLE_LOG_FD = 9;
+// The node alone holds the write end; EOF on this read end ends workerd after node death.
+constexpr int PARENT_FD = 10;
 // The unique key of the durable processes' Host namespace, the same on every node: an object's Host id is
 // HOST.idFromName(<namespace id>/<object id>) under it, and its databases are in <stack>/do/<key>/.
 constexpr const char* DURABLE_HOST_KEY = "coworkerd-do-host-v1";
@@ -134,28 +136,37 @@ constexpr int SYSCALL_DENIED_SIGNAL = SIGSYS;
 constexpr double SYSCALL_REPORT_INTERVAL_MS = 10000;
 // The distinct call numbers one generation reports; beyond it the counters go on but no new entry is kept.
 constexpr size_t SYSCALL_OBSERVED_CAP = 64;
-// A descriptor at 10 or above, close-on-exec: the numbers a child inherits (3-6) never collide
+// A descriptor above PARENT_FD, close-on-exec: the numbers a child inherits (3-10) never collide
 // with one a spawn action still has to read.
 int raised(int fd) {
-  if (fd < 0 || fd >= 10) return fd;
-  int moved = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+  if (fd < 0 || fd > PARENT_FD) return fd;
+  int moved = fcntl(fd, F_DUPFD_CLOEXEC, PARENT_FD + 1);
   ::close(fd);
   KJ_REQUIRE(moved >= 0, "cannot move a descriptor");
   return moved;
 }
 void closeOnExec(int fd) { fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC); }
-// The limit event pipe: workerd holds the write end, the Server reads the other without blocking.
+// A close-on-exec pipe for limit events.
 std::pair<int, int> eventPipe() {
   int fds[2];
 #ifdef __linux__
-  KJ_REQUIRE(pipe2(fds, O_CLOEXEC) == 0, "cannot create a limit event pipe");
+  KJ_REQUIRE(pipe2(fds, O_CLOEXEC) == 0, "cannot create an inherited channel pipe");
   // Room for bursts while the Server's event loop is busy (best effort; the default is 64 KiB).
   fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);
 #else
-  KJ_REQUIRE(pipe(fds) == 0, "cannot create a limit event pipe");
+  KJ_REQUIRE(pipe(fds) == 0, "cannot create an inherited channel pipe");
   closeOnExec(fds[0]); closeOnExec(fds[1]);
 #endif
   fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+  return {raised(fds[0]), raised(fds[1])};
+}
+// The workerd I/O provider wraps sockets, so its one-way parent pipe uses a UNIX socket pair.
+std::pair<int, int> parentPipe() {
+  int fds[2];
+  KJ_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "cannot create the parent pipe");
+  closeOnExec(fds[0]); closeOnExec(fds[1]);
+  KJ_REQUIRE(shutdown(fds[1], SHUT_RD) == 0 && shutdown(fds[0], SHUT_WR) == 0,
+      "cannot make the parent pipe one-way");
   return {raised(fds[0]), raised(fds[1])};
 }
 // Anonymous shared memory: a memfd on Linux, an unlinked POSIX shared memory object elsewhere.
@@ -753,6 +764,8 @@ struct ProcessGeneration {
   // Its listening socket in the run directory: <slot>-<generation>.sock.
   std::string socketName, socketPath;
   pid_t pid = 0;
+  // Only this node holds this generation's parent-liveness write end.
+  int parentWrite = -1;
   std::string state = "starting", lastReason;
   // Rotation: spawned as a slot's next generation; switched away from (takes no new calls);
   // closing (connections closed, SIGTERM sent); and whether the exit was the rotation's own doing.
@@ -837,6 +850,7 @@ struct ProcessGeneration {
   kj::Own<kj::PromiseFulfiller<void>> exited;
   kj::Maybe<kj::ForkedPromise<void>> exitSignal;
   ~ProcessGeneration() {
+    if (parentWrite >= 0) ::close(parentWrite);
     closeEvents();
     if (eventDigest) EVP_MD_CTX_free(eventDigest);
     closeStatus();
@@ -2011,10 +2025,15 @@ public:
       KJ_REQUIRE(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600) == 0);
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) == 0);
     }
-    // The sources are all at 10 or above, so no earlier action overwrites a later one's source.
+    auto parent = parentPipe();
+    const int parentRead = parent.first;
+    p->parentWrite = parent.second;
+    auto closeParentRead = kj::defer([parentRead] { ::close(parentRead); });
+    // Sources are above fd 10, so no earlier action overwrites a later one's source.
     KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, eventWrite, EVENT_FD) == 0);
     KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, listener, LISTEN_FD) == 0);
     KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, lifecycle, LIFECYCLE_FD) == 0);
+    KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, parentRead, PARENT_FD) == 0);
     if (bandFd >= 0) {
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, bandFd, BAND_FD) == 0);
     }
@@ -2080,6 +2099,7 @@ public:
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));
+    childEnvironment.push_back("COWORKERD_PARENT_FD=" + std::to_string(PARENT_FD));
     childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
     childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));

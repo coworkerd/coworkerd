@@ -2,6 +2,9 @@
 
 ## 0.5.3 (unreleased)
 
+- Set RPC platform errors' `.code` from an exception marker, including getters and returned capabilities;
+  uppercase prefixes in application error messages no longer cause the runtime to add `.code`.
+- End workerd when its node dies on macOS as well as Linux, using an inherited parent-liveness pipe.
 - Accept a Durable Object peer open before rebuilding its history; wait on the first event and retain the two-second
   bound for an unavailable peer, so a request forwarded during a takeover is no longer answered `RESULT_UNCERTAIN`.
 - Deployment and code refusal reasons are English constants (`definition unknown`, `definition inconsistent`,

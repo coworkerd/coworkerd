@@ -21,7 +21,13 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   These hooks carry an owned invocation identity from the trusted platform loader to each dynamic entrypoint;
   they do not change request lifetimes or accept identity from tenant headers, props, or logs. The exception is
   bound to that patch and those exact paths. Other patches remain limited to the server directory; IoContext,
-  V8, jsg, and the general RPC protocol are outside this exception. Keep implementation in our server helpers
+  V8 and the general RPC protocol are outside this exception. A second explicit exception,
+  `0016-rpc-code-parent-death.patch`, changes `src/workerd/jsg/util.c++` at one conversion hook and
+  `src/workerd/jsg/BUILD.bazel` to build our `coworkerd-rpc-code.h` and `coworkerd-rpc-code.c++` helpers there.
+  The hook sets a platform error's `.code` from exception detail ID `0xc6f4a09d8b3e2175`, shared with the
+  node's `common/rpc-error.h`; it never infers a code from an application message. That patch also watches
+  the inherited parent pipe through the existing channel startup I/O provider in our server helpers.
+  Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
