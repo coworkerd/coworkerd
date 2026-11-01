@@ -12,7 +12,9 @@
   the earlier Chinese wording is gone.
 - Mark size- and quota-refused objects for immediate repair, so the next read or write waits for confirmed history
   and cannot see the refused transaction.
-- Size the bundled Compose store from available disk space with 1024 MiB volumes, removing its fixed 20 × 64 MB limit.
+- Size the bundled Compose store from available disk space with 1024 MiB volumes, removing its fixed 20 × 64 MB limit,
+  which the 0.5.2 validation load filled after about 22 h 44 min (run b23, 2026-11-01: heartbeat writes then failed and
+  every node fenced its Durable Objects until the store was expanded; no acknowledged write was lost).
 
 ## 0.5.2
 
