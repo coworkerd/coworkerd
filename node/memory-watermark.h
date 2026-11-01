@@ -12,6 +12,8 @@ namespace coworkerd {
 // The Server owns the signal. Children only load the published atomic word.
 class MemoryWatermark final {
 public:
+  // Called at main entry, before configuration, large allocations, or drainer forks.
+  static void initializeDaemonThp();
   MemoryWatermark(bool enabled, uint64_t configuredBudget);
   ~MemoryWatermark();
   kj::Promise<void> run(kj::Timer& timer);
@@ -24,13 +26,15 @@ public:
   // rssBytes: Current resident pages, read afresh from smaps_rollup or task_info.
   // pssBytes: Current proportional resident bytes from Linux smaps_rollup; otherwise null.
   // anonBytes: Current Linux Anonymous bytes; otherwise null.
+  // anonHugeBytes: Current Linux smaps_rollup AnonHugePages in bytes; null when unavailable.
   // swapBytes: Current Linux Swap bytes; otherwise null.
-  // malloc.arena: Current glibc non-mmap heap space; the entire malloc object is null elsewhere.
+  // malloc.arena: Current glibc non-mmap heap space; allocator metrics are null elsewhere.
   // malloc.uordblks: Current arena in-use bytes, separate from mmap allocations.
   // malloc.fordblks: Current arena free bytes; release depends on allocator geometry and trim.
   // malloc.hblkhd: Current live mmap allocation bytes; freed large allocations can return directly.
   // malloc.keepcost: Current releasable top chunk, not all free pages.
   // malloc.trims: Explicit calls since boot, limited to once a minute after a minute without DO appends.
+  // malloc.policy.thpDisabled: Startup PR_SET_THP_DISABLE succeeded/failed; null on non-Linux.
   // malloc.policy.configured: Whether all three startup mallopt settings succeeded.
   // malloc.policy.trimThresholdBytes: Startup-fixed 128 KiB trim threshold.
   // malloc.policy.mmapThresholdBytes: Startup-fixed 128 KiB mmap threshold (disables dynamic growth).

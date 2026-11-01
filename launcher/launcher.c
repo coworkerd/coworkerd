@@ -550,6 +550,10 @@ int main(int argc, char **argv) {
   // getuid, are not calls workerd makes and so are not in the allowlist.
   report_uid = options.user_ns ? (unsigned)options.uid : (unsigned)geteuid();
   report_gid = options.user_ns ? (unsigned)options.gid : (unsigned)getegid();
+  // PR_SET_THP_DISABLE survives fork/exec; restore the host default for workerd's runtime heap.
+  // This round changes only daemon THP policy, including when no sandbox layers are requested.
+  if (prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) != 0)
+    dprintf(STDERR_FILENO, "[coworkerd-launcher] {\"event\":\"thp-reset\",\"result\":-1,\"errno\":%d}\n", errno);
   install_filter();
   if (options.check) {
     report("check");

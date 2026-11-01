@@ -2,6 +2,8 @@
 
 ## 0.5.3 (unreleased)
 
+- Disable transparent huge pages for the Linux daemon, preserve workerd's host default, and report `anonHugeBytes` and `malloc.policy.thpDisabled` under `memory.daemon`.
+
 - Report daemon resident/allocator memory and retained containers under `memory.daemon`; reap expired request-log and counter windows while idle, bound glibc's temporary-buffer retention, and return free pages after a minute without Durable Object appends.
 
 - Set RPC platform errors' `.code` from an exception marker, including getters and returned capabilities;

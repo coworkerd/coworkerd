@@ -11,6 +11,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <optional>
+#include <cerrno>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -31,6 +35,10 @@ constexpr double DAEMON_IDLE_TRIM_MS = 60000;
 uint64_t daemonTrims = 0;  // Explicit malloc_trim calls since this daemon started; no history retained.
 double daemonLastAppendMs = nowMs(), daemonLastTrimMs = daemonLastAppendMs;
 bool daemonAllocatorConfigured = false;
+#endif
+std::optional<int> daemonThpDisableResult;  // Startup prctl return value; unavailable on non-Linux.
+#ifdef __linux__
+int daemonThpDisableErrno = 0;
 #endif
 constexpr std::array<const char*, 3> BANDS = {"green", "yellow", "red"};
 uint32_t number(const std::string& value) {
@@ -125,8 +133,22 @@ public:
   }
 };
 
+void MemoryWatermark::initializeDaemonThp() {
+#ifdef __linux__
+  // Disable THP before daemon allocations and forks; workerd's launcher restores the host default.
+  daemonThpDisableResult = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  daemonThpDisableErrno = *daemonThpDisableResult == 0 ? 0 : errno;
+#endif
+}
+
 MemoryWatermark::MemoryWatermark(bool enabled, uint64_t budget)
     : impl(std::make_unique<Impl>(enabled, budget)) {
+#ifdef __linux__
+  if (daemonThpDisableResult) {
+    std::cout << "[memory-policy] {\"thpDisableResult\":" << *daemonThpDisableResult
+        << ",\"errno\":" << daemonThpDisableErrno << "}" << std::endl;
+  }
+#endif
 #ifdef __GLIBC__
   // Prevent large temporary segment/state buffers from raising glibc's adaptive mmap/trim thresholds indefinitely.
   // This configures only this node; exec'ed workerd processes initialize their own allocator.
@@ -211,7 +233,7 @@ std::string MemoryWatermark::daemonJson(const std::string& containers) {
   // hblkhd is live mmap space, and keepcost is the top-most releasable block (not all free space).
   const auto allocated = mallinfo2();
 #endif
-  std::optional<uint64_t> rss, pss, anon, swap, startTicks;
+  std::optional<uint64_t> rss, pss, anon, anonHuge, swap, startTicks;
 #ifdef __linux__
   // Kernel-resident/private accounting, read afresh; no history retained. A failed/missing reading stays null.
   std::ifstream smaps("/proc/self/smaps_rollup");
@@ -223,6 +245,7 @@ std::string MemoryWatermark::daemonJson(const std::string& containers) {
     if (key == "Rss:") rss = kib * 1024;
     else if (key == "Pss:") pss = kib * 1024;
     else if (key == "Anonymous:") anon = kib * 1024;
+    else if (key == "AnonHugePages:") anonHuge = kib * 1024;  // Kernel huge-page bytes, sampled afresh.
     else if (key == "Swap:") swap = kib * 1024;
   }
   std::ifstream stat("/proc/self/stat");
@@ -242,20 +265,23 @@ std::string MemoryWatermark::daemonJson(const std::string& containers) {
     rss = info.resident_size;
 #endif
   const auto value = [](const auto& n) { return n ? std::to_string(*n) : std::string("null"); };
+  const char* thpDisabled = !daemonThpDisableResult ? "null" : *daemonThpDisableResult == 0 ? "true" : "false";
   std::ostringstream out;
   out << "{\"pid\":" << getpid() << ",\"startTicks\":" << value(startTicks)
       << ",\"rssBytes\":" << value(rss) << ",\"pssBytes\":" << value(pss)
-      << ",\"anonBytes\":" << value(anon) << ",\"swapBytes\":" << value(swap) << ",\"malloc\":";
+      << ",\"anonBytes\":" << value(anon) << ",\"anonHugeBytes\":" << value(anonHuge) << ",\"swapBytes\":" << value(swap) << ",\"malloc\":";
 #ifdef __GLIBC__
   out << "{\"arena\":" << allocated.arena << ",\"uordblks\":" << allocated.uordblks
       << ",\"fordblks\":" << allocated.fordblks << ",\"hblkhd\":" << allocated.hblkhd
       << ",\"keepcost\":" << allocated.keepcost << ",\"trims\":" << daemonTrims
-      << ",\"policy\":{\"configured\":" << (daemonAllocatorConfigured ? "true" : "false")
+      << ",\"policy\":{\"thpDisabled\":" << thpDisabled
+      << ",\"configured\":" << (daemonAllocatorConfigured ? "true" : "false")
       << ",\"trimThresholdBytes\":" << DAEMON_TRIM_BYTES  // Startup-fixed trim threshold.
       << ",\"mmapThresholdBytes\":" << DAEMON_TRIM_BYTES  // Large temporary buffers are returned via munmap.
       << ",\"topPadBytes\":0,\"idleTrimAfterMs\":60000}}";  // No top padding; at most one idle trim per minute.
 #else
-  out << "null";
+  out << "{\"arena\":null,\"uordblks\":null,\"fordblks\":null,\"hblkhd\":null,\"keepcost\":null,\"trims\":null,\"policy\":{\"thpDisabled\":"
+      << thpDisabled << "}}";
 #endif
   out << ",\"containers\":" << containers << '}';
   return out.str();

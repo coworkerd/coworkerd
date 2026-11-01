@@ -8393,6 +8393,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  coworkerd::MemoryWatermark::initializeDaemonThp();
   std::unique_ptr<coworkerd::AsyncLog> logging;
   std::unique_ptr<coworkerd::WorkerdOutput> workerdOutput;
   try {

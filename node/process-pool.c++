@@ -1198,6 +1198,8 @@ public:
   struct Sandbox {
     std::string mode, reason = "not set up";
     bool active = false;
+    bool thpResetViaLauncher = false;  // Actual path of the latest successful spawn; false before the first one.
+    bool thpInheritanceWarned = false;
     std::string launcherPath, launcherSha256, launcherVersion, root, checkRecord = "null";
     int launcherFd = -1;
     BinarySignature launcherSignature, diskSignature;
@@ -1459,6 +1461,7 @@ public:
     const auto& b = sandbox;
     std::ostringstream out;
     out << std::setprecision(17) << "{\"mode\":\"" << b.mode << "\",\"active\":" << (b.active ? "true" : "false")
+        << ",\"thpResetViaLauncher\":" << (b.thpResetViaLauncher ? "true" : "false")
         << ",\"reason\":\"" << escape(b.reason) << "\",\"launcher\":{\"path\":\"" << escape(b.launcherPath) << "\",\"sha256\":\"" << b.launcherSha256
         << "\",\"version\":\"" << escape(b.launcherVersion) << "\",\"protocol\":" << LAUNCHER_PROTOCOL << ",\"diskSha256\":\""
         << diskLauncherSha256() << "\",\"changedOnDisk\":" << (b.changedOnDisk ? "true" : "false") << "},\"pendingRestart\":";
@@ -2138,11 +2141,28 @@ public:
     // launcher itself executed through the descriptor this Server pinned at startup.
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     std::string file = executable;
+    bool thpResetViaLauncher = false;
 #ifdef __linux__
     if (p->launched) {
       args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable);
       file = launcherExecutable();
       ++sandbox.launches;
+      thpResetViaLauncher = true;
+    } else {
+      // The daemon disables THP, which survives exec. Use only the launcher's reset step when
+      // sandbox layers are off or unavailable, so workerd still inherits the host's THP default.
+      if (access(sandbox.launcherPath.c_str(), X_OK) == 0) {
+        std::vector<std::string> unsandboxed = {sandbox.launcherPath, "--"};
+        unsandboxed.insert(unsandboxed.end(), args.begin(), args.end());
+        args = std::move(unsandboxed);
+        file = sandbox.launcherPath;
+        thpResetViaLauncher = true;
+      } else if (!sandbox.thpInheritanceWarned) {
+        const int error = errno;
+        sandbox.thpInheritanceWarned = true;
+        std::cout << "[sandbox] {\"event\":\"warning\",\"warning\":\"workerd inherits the daemon's THP disable flag because the launcher is unavailable\",\"launcherPath\":\""
+            << escape(sandbox.launcherPath) << "\",\"reason\":\"" << escape(strerror(error)) << "\"}" << std::endl;
+      }
     }
 #endif
     std::vector<char*> argv;
@@ -2151,6 +2171,7 @@ public:
     auto error = posix_spawn(&p->pid, file.c_str(), &actions, &attr, argv.data(), childEnv.data());
     if (error != 0) ::unlink(p->socketPath.c_str());
     KJ_REQUIRE(error == 0, "cannot spawn workerd", error);
+    sandbox.thpResetViaLauncher = thpResetViaLauncher;
     p->spawnPid = p->pid;
     p->nextEventSync = mono() + LIMIT_EVENT_SYNC_MS;
     if (piped) WorkerdOutput::attach(output, index, p->id, processClassCode(*p), p->generation, p->pid);
