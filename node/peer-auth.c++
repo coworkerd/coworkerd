@@ -1,4 +1,5 @@
 // The peer listener's authentication: see peer-auth.h.
+#include "memory-observation.h"
 #include "peer-auth.h"
 #include "support.h"
 
@@ -288,6 +289,14 @@ std::string PeerAuth::json() const {
       << std::count_if(retirements.begin(), retirements.end(), [](const auto& entry) { return entry.second.at != 0; })
       << ",\"retiredSessions\":" << retiredSessions << ",\"nonces\":" << nonces.size() << "}";
   return out.str();
+}
+
+
+std::string PeerAuth::memoryJson() const {
+  MemoryContainers out;
+  out.count("nonces", nonces.size());  // Expired verification nonces erased on verify (windowMs).
+  out.count("retirements", retirements.size());  // Retired key promises erased by run() after their deadline.
+  return out.json();
 }
 
 }  // namespace coworkerd

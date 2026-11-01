@@ -1,4 +1,5 @@
 #include "usage.h"
+#include "memory-observation.h"
 #include "json.h"
 #include "support.h"
 
@@ -241,6 +242,17 @@ std::string TenantUsage::json() const {
   }
   out << "}}";
   return out.str();
+}
+
+
+std::string TenantUsage::memoryJson() const {
+  MemoryContainers out;
+  out.count("hours", hours.size());  // Old hours erased after all tenant rows are clean; current and previous retained.
+  uint64_t rows = 0;
+  for (const auto& [hour, tenants] : hours) rows += tenants.size();
+  out.count("tenants", rows);  // Hour/tenant rows share hours' flush cleanup; dirty hours survive write failures.
+  out.count("lastKept", lastKept.size());  // One latest drainer count per tenant; cleared on drainer epoch change.
+  return out.json();
 }
 
 }  // namespace coworkerd

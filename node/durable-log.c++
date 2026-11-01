@@ -1,5 +1,7 @@
 #include "durable-log.h"
 
+#include "memory-observation.h"
+#include "memory-watermark.h"
 #include "json.h"
 #include "object-state.h"
 #include "support.h"
@@ -1493,6 +1495,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     facet.facetName = record.facetName;
   }
   facet.open = true;
+  MemoryWatermark::noteDaemonAppend();
   record.nodeSeq = ++nextSeq;
   record.nodeEpoch = nodeEpoch;
   record.shard = object->shard;
@@ -3399,6 +3402,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     return result;
   }
   auto& buffer = found->second;
+  if (!bytes.empty()) MemoryWatermark::noteDaemonAppend();
   if (partial) {
     // A piece of a record the next calls complete: held, counted, and taken only when the record is whole.
     if (incomingBytes + bytes.size() > settings.config.peerBufferBytes ||
@@ -3730,6 +3734,72 @@ std::string DurableLog::json() const {
       << settings.config.recoverParallelism << ",\"residentObjects\":" << settings.config.residentObjects
       << ",\"usagePublishMs\":" << settings.config.usagePublishMs << "}}";
   return out.str();
+}
+
+
+std::string DurableLog::memoryJson() const {
+  MemoryContainers out;
+  out.count("records", records.size(), recordBytes);  // Erased after successful seal and manifests; unsealed backlog.
+  uint64_t parsedBytes = 0, earlierEntries = 0, earlierBytes = 0;
+  const auto payload = [](const LogRecord& r) { return r.header.size() + r.frameBytes.size() +
+      r.objectName.size() + r.storageId.size() + r.facetName.size(); };
+  for (const auto& [seq, r] : parsed) parsedBytes += payload(r);
+  out.count("parsed", parsed.size(), parsedBytes);  // Same seal floor as records; decoded payload only.
+  out.count("confirmed", confirmed.size());  // Erased at the successfully published seal floor.
+  out.count("isolated", isolated.size());  // Retained until nodeEpoch changes, for repeated peer DROP.
+  out.count("isolatedReported", isolatedReported.size(), isolatedReported.capacity() * sizeof(isolatedReported[0]));
+  // isolatedReported retains exclusions for manifests for this node epoch; capacity is included above.
+  uint64_t pendingBytes = 0;
+  for (const auto& [seq, r] : inFlight) pendingBytes += r.bytes;
+  out.count("inFlight", inFlight.size(), pendingBytes);  // Removed on confirmation or isolation/timeout.
+  out.count("incoming", incoming.size(), incomingBytes);  // Streams retire with owner identity; peerBufferBytes caps payload.
+  uint64_t held = 0, heldBytes = 0, dropped = 0, fragmentBytes = 0;
+  std::ostringstream streams; streams << '['; bool first = true;
+  for (const auto& [id, b] : incoming) {
+    uint64_t bytes = 0;
+    for (const auto& [seq, encoded] : b.held) bytes += encoded.size();
+    held += b.held.size(); heldBytes += bytes; dropped += b.isolated.size(); fragmentBytes += b.fragment.size();
+    if (!first) streams << ','; first = false;
+    streams << "{\"streamId\":" << id << ",\"held\":{\"entries\":" << b.held.size()
+        << ",\"bytes\":" << bytes << "},\"isolated\":{\"entries\":" << b.isolated.size()
+        << "},\"fragmentBytes\":" << b.fragment.size() << '}';
+  }
+  streams << ']';
+  out.count("incomingHeld", held, heldBytes);  // Erased on owner's TRIM/DROP; included in incomingBytes.
+  out.count("incomingIsolated", dropped);  // DROP exclusions live with the stream; do not count toward held bytes.
+  out.count("incomingFragments", incoming.size(), fragmentBytes);  // Cleared when the last fragment arrives or stream retires.
+  out.count("objects", objects.size());  // Known object metadata retained for this daemon lifetime; disk cache eviction does not erase it.
+  uint64_t facets = 0, objectSegments = 0, snapshotFacets = 0, objectAlarms = 0;
+  for (const auto& [name, o] : objects) {
+    facets += o.facets.size(); objectSegments += o.segments.size();
+    snapshotFacets += o.snapshotFacets.size(); objectAlarms += o.alarms.size();
+  }
+  out.count("objectFacets", facets);  // Per known object's databases; removed with the object/facet.
+  out.count("objectSegments", objectSegments);  // Pending segment references, cleared when manifest is written.
+  out.count("snapshotFacets", snapshotFacets);  // Latest snapshot's facets, replaced by the next snapshot.
+  out.count("objectAlarms", objectAlarms);  // Per facet's latest reported alarm; removed with facet/object.
+  out.count("alarms", alarms.size());  // Removed when cleared/fired or ownership is lost; one per scheduled facet.
+  out.count("residency", residency.size());  // One latest report per durable process channel.
+  uint64_t inboxBytes = 0, queued = 0, queuedBytes = 0;
+  for (const auto& [id, c] : channels) inboxBytes += c.inbox.size();
+  for (const auto& [id, peer] : peers) { queued += peer.queue.size(); queuedBytes += peer.queuedBytes; }
+  out.count("channels", channels.size(), inboxBytes);  // One per durable process; closed with the generation.
+  out.count("peers", peers.size());  // Streams are reconciled to current peer identities; node-id metadata is retained.
+  out.count("peerQueue", queued, queuedBytes);  // Drained by append window; discarded on peer retirement.
+  out.count("rebuilding", rebuilding.size());  // Settled promise released by next openObject(), never its continuation.
+  out.count("settledRebuilds", settledRebuilds.size());  // Same next-open cleanup as rebuilding.
+  uint64_t tenants = 0;
+  for (const auto& [node, values] : publishedBytes) tenants += values.size();
+  out.count("publishedBytes", publishedBytes.size());  // One latest usage table per node seen; refreshed at usageReadMs, without a fixed node-id cap.
+  out.count("publishedTenants", tenants);  // Latest tenant entries of publishedBytes (values are stored disk usage).
+  for (const auto& [epoch, values] : earlier) for (const auto& [seq, r] : values) {
+    ++earlierEntries; earlierBytes += payload(r);
+  }
+  out.count("earlier", earlier.size());  // Startup-only epoch backlog, removed after resealEarlier().
+  out.count("earlierRecords", earlierEntries, earlierBytes);  // Same reseal lifecycle, decoded payload bytes.
+  out.count("confirmSamples", confirmSamples.size(), confirmSamples.capacity() * sizeof(double));  // Capped at 4096.
+  auto result = out.json(); result.pop_back();
+  return result + ",\"incomingStreams\":" + streams.str() + '}';
 }
 
 }  // namespace coworkerd

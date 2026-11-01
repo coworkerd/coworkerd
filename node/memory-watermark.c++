@@ -10,8 +10,13 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <optional>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #ifdef __APPLE__
 #include <libproc.h>
+#include <mach/mach.h>
 #endif
 
 namespace coworkerd {
@@ -20,6 +25,13 @@ double nowMs() {
   return std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#ifdef __GLIBC__
+constexpr int DAEMON_TRIM_BYTES = 128 * 1024;
+constexpr double DAEMON_IDLE_TRIM_MS = 60000;
+uint64_t daemonTrims = 0;  // Explicit malloc_trim calls since this daemon started; no history retained.
+double daemonLastAppendMs = nowMs(), daemonLastTrimMs = daemonLastAppendMs;
+bool daemonAllocatorConfigured = false;
+#endif
 constexpr std::array<const char*, 3> BANDS = {"green", "yellow", "red"};
 uint32_t number(const std::string& value) {
   for (uint32_t i = 0; i < BANDS.size(); ++i) if (value == BANDS[i]) return i;
@@ -114,13 +126,38 @@ public:
 };
 
 MemoryWatermark::MemoryWatermark(bool enabled, uint64_t budget)
-    : impl(std::make_unique<Impl>(enabled, budget)) {}
+    : impl(std::make_unique<Impl>(enabled, budget)) {
+#ifdef __GLIBC__
+  // Prevent large temporary segment/state buffers from raising glibc's adaptive mmap/trim thresholds indefinitely.
+  // This configures only this node; exec'ed workerd processes initialize their own allocator.
+  const bool trim = mallopt(M_TRIM_THRESHOLD, DAEMON_TRIM_BYTES) != 0;
+  const bool pad = mallopt(M_TOP_PAD, 0) != 0;
+  const bool mmap = mallopt(M_MMAP_THRESHOLD, DAEMON_TRIM_BYTES) != 0;
+  daemonAllocatorConfigured = trim && pad && mmap;
+  daemonLastAppendMs = daemonLastTrimMs = nowMs();
+#endif
+}
 MemoryWatermark::~MemoryWatermark() = default;
 kj::Promise<void> MemoryWatermark::run(kj::Timer& timer) {
   while (true) {
     co_await timer.afterDelay(100 * kj::MILLISECONDS);
     if (impl->enabled) impl->sample();
+#ifdef __GLIBC__
+    const auto now = nowMs();
+    // No more than once a minute, and only after a full minute with neither own nor peer DO appends.
+    // malloc_trim releases free pages only; it never removes a log record or changes an acknowledgement.
+    if (now - daemonLastAppendMs >= DAEMON_IDLE_TRIM_MS && now - daemonLastTrimMs >= DAEMON_IDLE_TRIM_MS) {
+      daemonLastTrimMs = now;
+      malloc_trim(0);
+      ++daemonTrims;
+    }
+#endif
   }
+}
+void MemoryWatermark::noteDaemonAppend() {
+#ifdef __GLIBC__
+  daemonLastAppendMs = nowMs();
+#endif
 }
 void MemoryWatermark::setTestBand(const std::string& value) { impl->testBand = number(value); impl->publish(); }
 std::string MemoryWatermark::effectiveBand() const { return BANDS[impl->effective()]; }
@@ -167,4 +204,61 @@ std::pair<uint64_t, std::string> MemoryWatermark::nodeMemory(uint64_t configured
   bytes = pages > 0 && page > 0 ? uint64_t(pages) * uint64_t(page) : 0;
   return {bytes, "physical memory"};
 }
+
+std::string MemoryWatermark::daemonJson(const std::string& containers) {
+#ifdef __GLIBC__
+  // Sample before formatting: arena is non-mmap space; uordblks/fordblks are its in-use/free bytes,
+  // hblkhd is live mmap space, and keepcost is the top-most releasable block (not all free space).
+  const auto allocated = mallinfo2();
+#endif
+  std::optional<uint64_t> rss, pss, anon, swap, startTicks;
+#ifdef __linux__
+  // Kernel-resident/private accounting, read afresh; no history retained. A failed/missing reading stays null.
+  std::ifstream smaps("/proc/self/smaps_rollup");
+  std::string line;
+  while (std::getline(smaps, line)) {
+    std::istringstream in(line);
+    std::string key, unit; uint64_t kib;
+    if (!(in >> key >> kib >> unit) || unit != "kB") continue;
+    if (key == "Rss:") rss = kib * 1024;
+    else if (key == "Pss:") pss = kib * 1024;
+    else if (key == "Anonymous:") anon = kib * 1024;
+    else if (key == "Swap:") swap = kib * 1024;
+  }
+  std::ifstream stat("/proc/self/stat");
+  if (std::getline(stat, line)) {
+    // comm can contain spaces and ')'; field 22 follows the final ')'.
+    const auto end = line.rfind(')');
+    if (end != std::string::npos) {
+      std::istringstream fields(line.substr(end + 1)); std::string field;
+      for (unsigned number = 3; number <= 22 && fields >> field; ++number)
+        if (number == 22) startTicks = std::stoull(field);
+    }
+  }
+#elif defined(__APPLE__)
+  // task_info is this process's RSS; PSS/Anonymous/Swap and Linux start ticks have no equivalent here.
+  mach_task_basic_info_data_t info{}; mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+    rss = info.resident_size;
+#endif
+  const auto value = [](const auto& n) { return n ? std::to_string(*n) : std::string("null"); };
+  std::ostringstream out;
+  out << "{\"pid\":" << getpid() << ",\"startTicks\":" << value(startTicks)
+      << ",\"rssBytes\":" << value(rss) << ",\"pssBytes\":" << value(pss)
+      << ",\"anonBytes\":" << value(anon) << ",\"swapBytes\":" << value(swap) << ",\"malloc\":";
+#ifdef __GLIBC__
+  out << "{\"arena\":" << allocated.arena << ",\"uordblks\":" << allocated.uordblks
+      << ",\"fordblks\":" << allocated.fordblks << ",\"hblkhd\":" << allocated.hblkhd
+      << ",\"keepcost\":" << allocated.keepcost << ",\"trims\":" << daemonTrims
+      << ",\"policy\":{\"configured\":" << (daemonAllocatorConfigured ? "true" : "false")
+      << ",\"trimThresholdBytes\":" << DAEMON_TRIM_BYTES  // Startup-fixed trim threshold.
+      << ",\"mmapThresholdBytes\":" << DAEMON_TRIM_BYTES  // Large temporary buffers are returned via munmap.
+      << ",\"topPadBytes\":0,\"idleTrimAfterMs\":60000}}";  // No top padding; at most one idle trim per minute.
+#else
+  out << "null";
+#endif
+  out << ",\"containers\":" << containers << '}';
+  return out.str();
+}
+
 }  // namespace coworkerd

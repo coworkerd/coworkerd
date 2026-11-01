@@ -55,6 +55,7 @@ public:
   // Re-reads the key file when it changes; retires removed keys.
   kj::Promise<void> run();
   std::string json() const;
+  std::string memoryJson() const;
 
 private:
   struct Key {

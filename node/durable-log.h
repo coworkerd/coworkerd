@@ -362,6 +362,7 @@ public:
 
   // The state endpoint's "durableLog" section.
   std::string json() const;
+  std::string memoryJson() const;
   bool enabled() const { return settings.objectStore && store.has_value(); }
 
 private:

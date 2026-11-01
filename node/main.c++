@@ -15,6 +15,7 @@
 #include "process-pool.h"
 #include "async-log.h"
 #include "memory-watermark.h"
+#include "memory-observation.h"
 #include "egress.h"
 #include "json.h"
 #include "peer-auth.h"
@@ -1200,10 +1201,16 @@ public:
   }
   // Events quiet for ten minutes are over: their invocations ended long ago, or lines no longer come.
   void pruneLogEvents() {
-    if (logEvents.size() < 65536 && logObjects.size() < 65536) return;
     const auto now = monotonicTimeMs();
+    // The lease reaper also calls this while idle. A size threshold left small expired tables alive forever;
+    // scanning at most once a second also avoids walking a full table on every request near the old threshold.
+    if (now - lastLogPrune < 1000) return;
+    lastLogPrune = now;
     std::erase_if(logEvents, [&](const auto& item) { return now - item.second.lastAt > 600000; });
-    std::erase_if(logObjects, [&](const auto& item) { return now - item.second.second > 600000; });
+    // A quiet held connection still needs its invocation-to-object attribution when its next message arrives.
+    std::erase_if(logObjects, [&](const auto& item) {
+      return now - item.second.second > 600000 && !leases.contains(item.first);
+    });
   }
   // Whether a line of `bytes` fits in its event's budget; `warn` is set for the first line of an event that does not.
   bool chargeLogLine(const std::string& invocationId, uint64_t bytes, LogBudget& own, bool& warn) {
@@ -2218,6 +2225,8 @@ public:
 
   void reapExpiredLeases() {
     expireLeases(monotonicTimeMs());
+    pruneLogEvents();
+    pruneCounterEvents(monotonicTimeMs());
     std::erase_if(lastExecution, [&](const auto& entry) { return monotonicTimeMs() - entry.second > serverConfig.idleMs; });
     if (leaseReaperRuns % 50 == 0) {
       const auto stale = 2 * loadCheckFreshMs();
@@ -2280,7 +2289,7 @@ public:
            << ",\"tenants\":" << tenantsJson()
            << ",\"usage\":" << usageJson()
            << ",\"processes\":" << runtime.json(serverConfig.idleMs)
-           << ",\"memory\":" << memory.json()
+           << ",\"memory\":" << memoryStateJson()
            << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
@@ -2408,9 +2417,42 @@ public:
   // Sections the state endpoint appends after the ones above, each from its own part of the node (egress,
   // peerAuth, storage).
   void addStateSection(std::string name, std::function<std::string()> section) {
-    stateSections.emplace_back(std::move(name), std::move(section));
+    if (name == "memory.daemon") daemonMemory = std::move(section);
+    else stateSections.emplace_back(std::move(name), std::move(section));
   }
   std::vector<std::pair<std::string, std::function<std::string()>>> stateSections;
+  std::function<std::string()> daemonMemory;
+  std::string memoryStateJson() const {
+    auto result = memory.json();
+    if (daemonMemory) { result.pop_back(); result += ",\"daemon\":" + daemonMemory() + '}'; }
+    return result;
+  }
+
+  std::string retainedMemoryJson() const {
+    coworkerd::MemoryContainers out;
+    uint64_t logObjectBytes = 0, logEventBytes = 0, counterEventBytes = 0;
+    for (const auto& [key, value] : logObjects) logObjectBytes += key.size() + value.first.size();
+    for (const auto& [key, value] : logEvents) logEventBytes += key.size();
+    for (const auto& [when, key] : counterEvents) counterEventBytes += key.size();
+    out.count("logObjects", logObjects.size(), logObjectBytes);  // Expire after ten quiet minutes, except live invocation leases.
+    out.count("logEvents", logEvents.size(), logEventBytes);  // The same ten-minute quiet expiry; checked each second.
+    out.count("counterEvents", counterEvents.size(), counterEventBytes);  // Only the last 60 seconds; reaped even when idle.
+    out.count("executions", executions.size());  // Latest MAX_EXECUTION_RECORDS (1024) executions.
+    out.count("debits", debits.size());  // Latest MAX_EXECUTION_RECORDS (1024) debits.
+    out.count("decisionTimes", decisionTimes.size());  // Latest MAX_EXECUTION_RECORDS (1024) placement timings.
+    out.count("recentTrials", recentTrials.size());  // Latest 32 trial records.
+    out.count("leases", leases.size());  // Held connections, or unheld invocations until their lease deadline.
+    out.count("leaseExpiries", leaseExpiries.size());  // Deadline queue, including stale renewals until their deadline.
+    out.count("nextArrivalOrder", nextArrivalOrder.size());  // Naive-order mode only; retained for the daemon lifetime.
+    out.count("loadConfirmed", loadConfirmed.size());  // Old process/version confirmations reaped every 50 reaper runs.
+    out.count("objects", objects.size());  // Recent object activity; objectBegin prunes quiet, inactive entries after ten minutes.
+    out.count("lastExecution", lastExecution.size());  // Process/version execution times expire after idleMs.
+    out.count("counterTotals", counterTotals.size());  // One lifetime total per category/target/code, not per invocation.
+    out.count("coldStarts", coldStarts.size());  // Lifetime totals per process/version identity.
+    out.count("databaseVersions", databaseVersions.size());  // One synthetic database version per seen tenant.
+    out.count("assetStats", assetStats.size());  // Lifetime counters per seen Worker identity.
+    return out.json();
+  }
 
   std::string lastRejectionReason() const {
     return lastRejection;
@@ -2716,9 +2758,12 @@ private:
   std::map<std::string, uint64_t> coldStarts, counterTotals;
   std::map<std::string, std::map<std::string, uint64_t>> decisionsByKind;
   std::deque<std::pair<double, std::string>> counterEvents;
+  void pruneCounterEvents(double now) {
+    while (!counterEvents.empty() && counterEvents.front().first <= now - 60000) counterEvents.pop_front();
+  }
   void observeCounter(const std::string& category, const std::string& target, const std::string& code) {
     const auto now = monotonicTimeMs();
-    while (!counterEvents.empty() && counterEvents.front().first <= now - 60000) counterEvents.pop_front();
+    pruneCounterEvents(now);
     auto key = category + "|" + target + "|" + code;
     ++counterTotals[key]; counterEvents.emplace_back(now, std::move(key));
   }
@@ -2752,6 +2797,7 @@ private:
   // an object, with when its lines last came.
   std::map<std::string, LogBudget> logEvents;
   std::map<std::string, std::pair<std::string, double>> logObjects;
+  double lastLogPrune = 0;
   uint64_t logEventsOverBudget = 0;
   uint64_t leaseReaperRuns = 0;
   uint64_t sourceFetches = 0;
@@ -8058,6 +8104,16 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
+  server.addStateSection("memory.daemon", [&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server]() {
+    // members is the current membership view, replaced/expired by the backend's watch/listing.
+    const auto& view = membership->view();
+    std::string containers = "{\"durableLog\":" + durableLog.memoryJson() +
+        ",\"membership\":{\"members\":{\"entries\":" + std::to_string(view.members.size()) + "}}" +
+        ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson() +
+        ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
+        ",\"serverCore\":" + server.retainedMemoryJson() + '}';
+    return coworkerd::MemoryWatermark::daemonJson(containers);
+  });
   // The object store as this node uses it: the membership's measurements, and the tenant index's revision it has applied
   // (what a deployment waits for: cowctl, /v1/nodes).
   if (membership->view().backend == "objectStore" || server.placementConfig().desiredState.backend == "objectStore") {

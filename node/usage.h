@@ -48,6 +48,7 @@ public:
   // No more writes from this process (another process holds the node's id and writes its objects).
   void stop(std::string reason);
   std::string json() const;
+  std::string memoryJson() const;
 
 private:
   struct Counts {

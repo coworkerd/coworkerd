@@ -296,6 +296,8 @@ and never reads the previous owner's files.
   connected while it is evicted and is woken by the next message. The state endpoint reports the resident count per
   process, the limit, the evictions, the wakes and how long they took.
 
+On glibc the daemon fixes the mmap/trim thresholds at 128 KiB with no top padding and trims free pages at most once a minute after one minute without own or peer log appends. `memory.daemon.containers` reports retained entries and available payload byte counts: unsealed records are pruned after seal/manifest publication, peer buffers after owner trim/drop, histories at their fixed caps, and usage/auth state at flush/expiry; request-log links without a live invocation lease expire after ten quiet minutes and counter windows after sixty seconds even when idle, while epoch exclusions and known-object/tenant metadata follow their documented lifecycle rather than a fixed entry cap.
+
 The state endpoint's `durableLog` shows the confirmation latency (mean, p50, p99), the bytes not confirmed and not
 sealed, the segments and the last upload, the peers and the streams to them, the checkpoints, the rebuilds and their
 time, the buffer this node holds for others, and this machine's files; `[do-log]` lines record the sealing, the

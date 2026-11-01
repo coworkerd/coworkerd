@@ -1,4 +1,5 @@
 #include "process-pool.h"
+#include "memory-observation.h"
 #include "tenancy.h"
 #include "support.h"
 #include "async-log.h"
@@ -3550,6 +3551,39 @@ ProcessPool::Killed ProcessPool::killAll(const std::string& reason) {
     impl->killProcess(*p, reason, 0);
   });
   return killed;
+}
+
+
+std::string ProcessPool::memoryJson() const {
+  MemoryContainers out;
+  const auto strings = [&](const char* name, const auto& values) {
+    uint64_t bytes = 0; for (const auto& s : values) bytes += s.size();
+    out.count(name, values.size(), bytes);
+  };
+  strings("kills", impl->kills);  // Latest 32 CPU kill records.
+  strings("memoryCrashes", impl->memoryCrashes);  // Latest 32 memory crash records.
+  strings("recentGcPauses", impl->recentGcPauses);  // Latest 32 long-GC records.
+  strings("channelExits", impl->channelExits);  // Latest 32 exited limit channel records.
+  strings("recentLaunchFailures", impl->recentLaunchFailures);  // Latest 32 failed launches.
+  strings("recentDenials", impl->sandbox.syscalls.recentDenials);  // Latest 32 syscall denials.
+  out.count("unattributedOomKills", impl->unattributedOomKills.size());  // Expire after OOM_ATTRIBUTION_MS at supervision.
+  out.count("rotationQueue", impl->rotationQueue.size());  // Pending requests, removed when rotation starts/cancels.
+  uint64_t historyBytes = 0;
+  for (const auto& [id, r] : impl->rotationHistory) historyBytes += r.size();
+  out.count("rotationHistory", impl->rotationHistory.size(), historyBytes);  // Latest 256 completed rotations.
+  out.count("rotationRequests", impl->rotationRequests.size());  // Request status table capped at 4096.
+  uint64_t dispatched = 0, dispatchBytes = 0, delays = 0, calls = 0, contexts = 0, generations = 0;
+  for (const auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
+    ++generations; calls += p->calls.size(); contexts += p->openContexts.size();
+    dispatched += p->recentDispatched.size(); delays += p->probeDelays.size();
+    for (const auto& r : p->recentDispatched) dispatchBytes += r.workerId.size() + r.versionId.size() + r.invocationId.size();
+  });
+  out.count("generations", generations);  // Current/starting/retiring generations; retired ones reaped after exit.
+  out.count("recentDispatched", dispatched, dispatchBytes);  // At most 4096 identities per live generation.
+  out.count("probeDelays", delays, delays * sizeof(double));  // At most 1024 probe samples per live generation.
+  out.count("calls", calls);  // In-flight calls only; removed on completion/exit.
+  out.count("openContexts", contexts);  // Completed/background contexts; removed by completion event/exit.
+  return out.json();
 }
 
 }  // namespace coworkerd

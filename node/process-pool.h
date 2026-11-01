@@ -58,6 +58,7 @@ private:
 // back over 7, and this Server is the supervisor that answers the notifications.
 class ProcessPool final {
 public:
+  std::string memoryJson() const;
   ProcessPool(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,

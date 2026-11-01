@@ -1,5 +1,6 @@
 #include "async-log.h"
 
+#include "memory-observation.h"
 #include <kj/debug.h>
 
 #include <algorithm>
@@ -91,6 +92,7 @@ struct OutputShared {
   std::atomic<uint64_t> sinkRotations{0}, sinkBytes{0}, sinkRotationFailures{0};
   std::atomic<uint64_t> tenantWorkers{0}, tenantKeptLines{0}, tenantDroppedLines{0}, tenantTruncatedLines{0};
   std::atomic<uint64_t> tenantEvictedLines{0}, tenantBufferBytes{0}, queries{0}, queryFailures{0};
+  std::atomic<uint64_t> tenantEntries{0}, tenantOrder{0};
   std::array<OutputSlot, OUTPUT_SLOTS> slots;
 };
 struct AttachMessage {
@@ -425,6 +427,8 @@ private:
       });
     }
     shared.tenantBufferBytes.store(total, std::memory_order_relaxed);
+    shared.tenantEntries.store(live, std::memory_order_relaxed);
+    shared.tenantOrder.store(order.size(), std::memory_order_relaxed);
   }
   void evictFront(Log& log) {
     const auto& front = log.entries.front();
@@ -1170,6 +1174,14 @@ public:
     return out.str();
   }
 
+  std::string memoryJson() const {
+    MemoryContainers out;
+    out.count("tenants", shared->tenantWorkers.load());  // Tenant metadata lives for this drainer's lifetime.
+    out.count("entries", shared->tenantEntries.load(), shared->tenantBufferBytes.load());  // Byte quotas evict oldest.
+    out.count("order", shared->tenantOrder.load());  // Compacted above 2 * live entries + 4096.
+    return out.json();
+  }
+
   // A log query: a socket pair; the other end to the drainer with a query record (as an attach sends its pipes),
   // then the request on this end and the answer read to its end, both without blocking (an append's lines may not
   // fit an empty socket buffer, and the drainer reads them only once it holds its end).
@@ -1245,6 +1257,7 @@ void WorkerdOutput::attach(Pipes& pipes, uint32_t slot, const std::string& proce
   if (active) active->attach(pipes, slot, processId, processClass, generation, pid);
 }
 std::string WorkerdOutput::processJson(uint32_t slot) { return active ? active->processJson(slot) : "null"; }
+std::string WorkerdOutput::memoryJson() { return active ? active->memoryJson() : "null"; }
 std::string WorkerdOutput::stateJson() { return active ? active->json() : "null"; }
 kj::Promise<std::string> WorkerdOutput::workerLogs(kj::LowLevelAsyncIoProvider& provider, const std::string& workerId,
     uint64_t after, uint64_t sinceUnixMs, uint32_t limit) {

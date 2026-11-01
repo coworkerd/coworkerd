@@ -44,6 +44,8 @@ public:
   static const char* className(uint32_t processClass);
   static std::string processJson(uint32_t slot);
   static std::string stateJson();
+  // Tenant buffers live in the drainer process; these shared counters do not belong to the daemon's malloc heap.
+  static std::string memoryJson();
   // One Worker's kept lines, as the drainer answers them (JSON): those after the cursor `after` (oldest
   // first) or else the newest `limit` from `sinceUnixMs` on. On the event loop; never blocks it.
   static kj::Promise<std::string> workerLogs(kj::LowLevelAsyncIoProvider& provider, const std::string& workerId,
