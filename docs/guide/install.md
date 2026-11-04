@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.5.2.
+> For release 0.5.3.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.5.2-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.2-linux-<arch>/` (the next table) |
-| `coworkerd-0.5.2-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.2`, for `docker load` |
-| `coworkerd-0.5.2-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.5.3-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.3-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.3-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.3`, for `docker load` |
+| `coworkerd-0.5.3-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -51,9 +51,9 @@ Requirements: **Docker Engine 28 or newer** (compose's internal network uses `ga
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.5.2-linux-amd64.tar.gz
-docker load -i coworkerd-0.5.2-linux-amd64-image.tar.gz
-cd coworkerd-0.5.2-linux-amd64/docker
+tar -xzf coworkerd-0.5.3-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.3-linux-amd64-image.tar.gz
+cd coworkerd-0.5.3-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -98,13 +98,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.5.2 version` |
+| Show the version | `docker run --rm coworkerd:0.5.3 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.5.2` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.3` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -126,7 +126,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.5.2}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.3}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -591,6 +591,20 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   `processes.sandbox.pendingRestart` says the new one is used only after a restart; so replace it together with the node, then restart the node. When the prerequisites are met through an AppArmor profile (section 4),
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
+
+**Upgrading 0.5.2 to 0.5.3 keeps the existing data layout.** Update the complete package: the patch series gained
+`0016`, so the runtime, workerd and the launcher's system call allowlist belong together, and a 0.5.3 node must not run a
+0.5.2 workerd or its tables. Retain the bucket, keys, node identities and data volumes. The bundled store's entrypoint
+sizes its volumes differently (`-volume.max=0 -master.volumeSizeLimitMB=1024`, section 2), so recreate the storage
+container with the new Compose file and entrypoint on the existing data volume: the volumes 0.5.2 wrote stay readable and
+new ones use the new size (the 0.5.2 validation store, restarted this way after it had filled up, served its objects
+again within 27 seconds). Plan the same stateful write pause as for 0.5.2: wait for confirmed records to upload, stop
+storage within its 40-second budget, start the new one and check its readiness before resuming writes; then upgrade
+the control plane and the nodes one at a time with stateless traffic. Two defaults change: `placement.subcalls` is
+now `local` (set `home` explicitly to keep the previous placement; the state endpoint's
+`configuration.placement.subcalls` shows the effective value), and the Linux daemon runs with transparent huge pages
+disabled for itself (`memory.daemon` reports it; nothing to configure). No data conversion or key rotation is
+required. The 0.5.0 and 0.5.1 procedures below apply unchanged when upgrading those versions to 0.5.3.
 
 **Upgrading 0.5.1 to 0.5.2 keeps the existing data layout.** Update the complete package: the runtime and workerd
 carry matching RPC identity changes, and the launcher allowlist must match the new workerd bytes. Retain the

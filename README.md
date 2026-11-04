@@ -21,12 +21,14 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: 0.5.2
+## Status: preparing 0.5.3
 
-0.5.2 is the current release, for Linux `amd64` and `arm64`, and the first stable release of the 0.5 series:
-SQLite Durable Objects, D1's basic API, inbound WebSockets, hibernation, alarms and JS RPC, validated by the
-full regression, the stateful fault scenarios and a 12-hour three-node run on one host (0.5.0 and 0.5.1 stay
-pre-releases, superseded). Multi-host bare-metal validation and sandbox enforcement remain separate work.
+The main branch is preparing a 0.5.3 candidate, the maintenance release of the stable 0.5 series: the bundled Compose
+store is sized from the disk instead of a fixed 1.25 GiB, a takeover accepts a peer's open before rebuilding the
+object and refused writes are repaired at once, the daemon's memory is observable and bounded, stateless sub-calls
+run on the caller's node by default, and RPC platform errors carry a `.code` ([CHANGELOG.md](CHANGELOG.md)). Its
+package validation and twelve-hour run are pending. The published 0.5.2 remains the current stable release; these
+source changes do not replace its assets or change the result of its earlier test run.
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
@@ -62,9 +64,9 @@ With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a c
 Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.5.2-linux-arm64.tar.gz
-docker load -i coworkerd-0.5.2-linux-arm64-image.tar.gz
-cd coworkerd-0.5.2-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.5.3-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.3-linux-arm64-image.tar.gz
+cd coworkerd-0.5.3-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 

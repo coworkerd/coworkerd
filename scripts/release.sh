@@ -59,13 +59,13 @@ CONTAINER=${COWORKERD_BUILD_CONTAINER:-coworkerd-capacity-linux}
 TREE=${COWORKERD_BUILD_TREE:-/work/coworkerd-build}
 JOBS=${COWORKERD_BUILD_JOBS:-6}
 
-# The workerd builds of the current patch series (upstream v1.20261012.1 + patches/workerd 0001-0008, 0010-0015), by
+# The workerd builds of the current patch series (upstream v1.20261012.1 + patches/workerd 0001-0008, 0010-0016), by
 # architecture, each pinned by its SHA-256: built from the fork's branch (patches/README.md) on a Linux machine of that
 # architecture, and put at the default path below or named by COWORKERD_RELEASE_WORKERD. A new series needs its own
 # builds here.
 case $ARCH in
-  arm64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-arm64/workerd"; WORKERD_SHA256=e288221adfd1902c9e1f3bf13b27a12f0d7b936ef49fe485e3c495f4c17fc77c ;;
-  amd64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-amd64/workerd"; WORKERD_SHA256=4296800401b8cd2284d7475f86452f3d8689f9a56f4beec977a9edb861ef11df ;;
+  arm64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-arm64/workerd"; WORKERD_SHA256=37099103b2795ec6779e4c03130ca36198499301fbd51f0ce2089dc40d1b6f29 ;;
+  amd64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-amd64/workerd"; WORKERD_SHA256=5fe82e700c767a935c09e923c62dd2eb88c4d451fcf042b805149928ded3274e ;;
 esac
 WORKERD=${COWORKERD_RELEASE_WORKERD:-$WORKERD_DEFAULT}
 SERIES_DIR="$ROOT/patches/workerd"
