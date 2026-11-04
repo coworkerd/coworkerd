@@ -2,6 +2,8 @@
 
 ## 0.5.3 (unreleased)
 
+- Keep the memory-band descriptor copy above inherited descriptor numbers: when daemon fd 10 was free, workerd could receive the parent-liveness socket instead of the band and fail with `invalid inherited shared memory` (introduced during unreleased 0.5.3 development). Check every inherited descriptor source before spawn.
+
 - Default `placement.subcalls` to `local` for caller-first stateless Service Binding calls; select `home` for memory-first deployments or large caller fan-out. Report `subcalls` in `configuration.placement`.
 
 - Disable transparent huge pages for the Linux daemon, preserve workerd's host default, and report `anonHugeBytes` and `malloc.policy.thpDisabled` under `memory.daemon`.

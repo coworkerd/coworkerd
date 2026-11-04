@@ -146,6 +146,10 @@ int raised(int fd) {
   KJ_REQUIRE(moved >= 0, "cannot move a descriptor");
   return moved;
 }
+void inherit(posix_spawn_file_actions_t& actions, int source, int target) {
+  KJ_REQUIRE(source > PARENT_FD, "a spawn source must be above the inherited descriptor numbers", source, target);
+  KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, source, target) == 0);
+}
 void closeOnExec(int fd) { fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC); }
 // A close-on-exec pipe for limit events.
 std::pair<int, int> eventPipe() {
@@ -1142,7 +1146,7 @@ public:
   kj::UnixEventPort& eventPort;
   const kj::HttpHeaderTable& headers;
   Suspects& suspects;
-  int bandFd = -1;  // the Server's own copy of the band's shared memory, at 10 or above
+  int bandFd = -1;  // the Server's own copy of the band's shared memory, above PARENT_FD
   uint64_t quarantineDispatches = 0, trialDispatches = 0, durableDispatches = 0;
   // The Durable Object log channel of each durable generation (node/durable-log.h).
   std::function<int(const std::string&)> durableChannelOpen;
@@ -1381,7 +1385,7 @@ public:
       std::filesystem::remove(entry.path());
     }
     if (this->config.memoryBandFd >= 0) {
-      bandFd = fcntl(this->config.memoryBandFd, F_DUPFD_CLOEXEC, 10);
+      bandFd = fcntl(this->config.memoryBandFd, F_DUPFD_CLOEXEC, PARENT_FD + 1);
       KJ_REQUIRE(bandFd >= 0, "cannot keep the memory band descriptor");
     }
     setUpSandbox();
@@ -1623,8 +1627,8 @@ public:
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     auto cleanupActions = kj::defer([&] { posix_spawn_file_actions_destroy(&actions); });
-    posix_spawn_file_actions_adddup2(&actions, statusWrite, LAUNCHER_STATUS_FD);
-    posix_spawn_file_actions_adddup2(&actions, program, LAUNCHER_PROGRAM_FD);
+    inherit(actions, statusWrite, LAUNCHER_STATUS_FD);
+    inherit(actions, program, LAUNCHER_PROGRAM_FD);
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     auto cleanupAttr = kj::defer([&] { posix_spawnattr_destroy(&attr); });
@@ -2023,8 +2027,10 @@ public:
     WorkerdOutput::Pipes output;
     const bool piped = WorkerdOutput::open(output);
     if (piped) {
-      KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, output.stdoutWrite, STDOUT_FILENO) == 0);
-      KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, output.stderrWrite, STDERR_FILENO) == 0);
+      output.stdoutWrite = raised(output.stdoutWrite);
+      output.stderrWrite = raised(output.stderrWrite);
+      inherit(actions, output.stdoutWrite, STDOUT_FILENO);
+      inherit(actions, output.stderrWrite, STDERR_FILENO);
     } else {
       KJ_REQUIRE(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600) == 0);
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) == 0);
@@ -2033,13 +2039,13 @@ public:
     const int parentRead = parent.first;
     p->parentWrite = parent.second;
     auto closeParentRead = kj::defer([parentRead] { ::close(parentRead); });
-    // Sources are above fd 10, so no earlier action overwrites a later one's source.
-    KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, eventWrite, EVENT_FD) == 0);
-    KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, listener, LISTEN_FD) == 0);
-    KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, lifecycle, LIFECYCLE_FD) == 0);
-    KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, parentRead, PARENT_FD) == 0);
+    // Sources are above PARENT_FD, checked by inherit, so no earlier action overwrites a later one's source.
+    inherit(actions, eventWrite, EVENT_FD);
+    inherit(actions, listener, LISTEN_FD);
+    inherit(actions, lifecycle, LIFECYCLE_FD);
+    inherit(actions, parentRead, PARENT_FD);
     if (bandFd >= 0) {
-      KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, bandFd, BAND_FD) == 0);
+      inherit(actions, bandFd, BAND_FD);
     }
     // The Durable Object log channel: the node keeps its own end and reads the frames the process ships.
     int durableLogFd = -1;
@@ -2047,7 +2053,7 @@ public:
     if (p->durable && durableChannelOpen) {
       durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation)));
       if (durableLogFd >= 0) {
-        KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, durableLogFd, DURABLE_LOG_FD) == 0);
+        inherit(actions, durableLogFd, DURABLE_LOG_FD);
       }
     }
     // The workerd file this generation runs, opened by the Server itself: the generation's identity is
@@ -2080,8 +2086,8 @@ public:
       fcntl(p->statusFd, F_SETFL, fcntl(p->statusFd, F_GETFL) | O_NONBLOCK);
       p->launched = true;
       if (sandbox.syscalls.active) p->syscallMode = sandbox.syscalls.mode;
-      KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, statusWrite, LAUNCHER_STATUS_FD) == 0);
-      KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, program, LAUNCHER_PROGRAM_FD) == 0);
+      inherit(actions, statusWrite, LAUNCHER_STATUS_FD);
+      inherit(actions, program, LAUNCHER_PROGRAM_FD);
     }
 #endif
     posix_spawnattr_t attr; KJ_REQUIRE(posix_spawnattr_init(&attr) == 0);
