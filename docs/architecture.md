@@ -50,7 +50,7 @@ Coworkerd adds tenant isolation and resource limits, quotas and metering, placem
 
 ## 4. Placement
 
-Stateless placement is decided per call. An operator's static entry in `placements` can pin Binding calls; ingress requests for that Worker then execute where they arrive. Otherwise a Worker's home is a locality preference. `placement.subcalls: "home"` (the default) uses the ordinary warm/home policy for stateless Service Binding calls; `"local"` tries the caller's node first and falls back to that policy if it refuses. Both `fetch` and method calls follow this policy. Durable Object calls instead follow their shard's owner. [Cluster state](cluster-state.md), sections 7 and 11, describes both paths.
+Stateless placement is decided per call. An operator's static entry in `placements` can pin Binding calls; ingress requests for that Worker then execute where they arrive. Otherwise a Worker's home is a locality preference. `placement.subcalls: "local"` (the default) tries the caller's node first for stateless Service Binding calls and falls back to the ordinary warm/home policy if it refuses. Select `"home"` to use that policy directly in memory-first deployments or when callers fan out across many nodes. Both `fetch` and method calls follow this policy. Durable Object calls instead follow their shard's owner. [Cluster state](cluster-state.md), sections 7 and 11, describes both paths.
 
 ## 5. Isolation
 

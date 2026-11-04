@@ -135,6 +135,8 @@ When object storage is down, the deployment state a node has and its cached vers
 
 **The decision**, for an ingress request and a Binding call alike, on the node X that received it or runs the caller:
 
+Stateless Service Binding subcalls first try the caller's node by default (`placement.subcalls: "local"`), falling back to the order below on refusal; `"home"` disables this first step. Static `placements` entries are unaffected.
+
 1. If the version ran on X within `placement.idleMs` (30 s) and X would admit it, X goes first -- except that, when X is not the home, the home goes first anyway with probability `placement.homeProbability` (0.05), so that copies spread by load drift back once traffic falls.
 2. Otherwise the order is the home, then X, then the others by rank. Executing on X after the home refused keeps the call local: the overflow stays where it arrived, at no extra hop, and the Worker is warm there for the next request.
 3. Candidates that refused or could not be reached recently move behind the others for a short avoidance period, at most `placement.avoidMaxMs` (2 s), without being removed.

@@ -7830,6 +7830,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
+      << ",\"subcalls\":" << q(c.subcalls)
       << ",\"idleMs\":" << c.idleMs << ",\"homeProbability\":" << shortestNumber(c.homeProbability) << ",\"avoidMaxMs\":" << c.avoidMaxMs
       << ",\"rejectionAvoidMs\":" << c.rejectionAvoidMs << ",\"connectBackoffMs\":" << c.connectBackoffMs
       << ",\"initialPlacementHops\":" << unsigned(c.initialPlacementHops) << ",\"peerTimeoutMs\":" << c.peerTimeoutMs

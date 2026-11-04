@@ -648,12 +648,10 @@ struct PlacementConfig {
   connectBackoffMs @6 :UInt32 = 100;
   loadBandForTest @7 :Text = "green";
   equalLimitsForTest @8 :Bool = false;
-  # Where a stateless subcall executes -- a Service Binding call, by `fetch` or by a method: "home" (the default) sends
-  # it to the Worker's home as any call of its own would go, "local" runs it on the calling node, as Cloudflare's
-  # Service Bindings do. The choice is a policy point with the caller's node as its hint, so that a mixed rule (a
-  # Worker's own preference, say) can replace it; which default is right waits on an R-line measurement
-  # (docs/s3-truth-and-durable-objects.md, section 9).
-  subcalls @9 :Text = "home";
+  # Stateless Service Binding fetch and method calls try the caller's node first, then the ordinary warm/home policy.
+  # R9 (lab results/r9/PROTOCOL.md, section 0) found lower local p99 at both tenant counts and all three RTTs, at the
+  # cost of additional svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.
+  subcalls @9 :Text = "local";
 }
 
 struct MembershipConfig {
