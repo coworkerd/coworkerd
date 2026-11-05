@@ -65,3 +65,45 @@ their system call allowlists (`scripts/syscall-profile.mjs`, then `scripts/sysca
 hashes in `scripts/release.sh`. `check` is the source side of checking a sync: the complete checkout tree differs
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
+
+## Rust server port (v1.20261031.1)
+
+The `port-0.5.4` series targets `v1.20261031.1` and is exported from
+`coworkerd-v1.20261031.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
+0010, 0011, 0015 and 0017, in that order. Deferred patches remain outside `series`.
+
+### 0005: startup identity
+
+The synchronous loading request supplies an owned startup identity through the existing
+`loadIsolate` / `load_isolate` argument. 0017 expands that slot into a creation record,
+including the startup identity, without adding another loading method or argument.
+
+### 0015: invocation identity
+
+The API/io hooks listed above bind the invocation identity to each entrypoint. The exact Rust
+exceptions are `src/workerd/server/server/bridge.rs` and `src/workerd/server/server/loader.rs`:
+Rust owns the string and copies it into request metadata through one C++ setter before starting
+the request. The factory prefers this identity to the fetch `cf` blob; actor classes are unchanged.
+
+### 0017: explicit creation record
+
+Only the platform runtime holds the WorkerLoader capability. Its optional third `get()` argument
+is `{ coworkerdWorker: { workerId, versionId, generation?, cpuLimitMs?, memoryLimitMiB? } }`.
+The API validates the two nonempty strings and nonnegative integer options before loading;
+limits fit uint32. It derives `tenant` from the text before the first slash in `workerId`, or
+the empty string without a slash. Generation is reserved and remains zero. Missing limits or
+zero select the process environment values. `load()` has no creation-record option.
+
+One flat cxx `CoworkerdLoadIdentity` carries `startup_identity`, `present`, `tenant`, `worker_id`,
+`version_id`, `generation`, `cpu_limit_ms` and `memory_limit_mib`. Rust only transports it;
+configuration workers receive an empty record. The factory fills `CoworkerdWorkerIdentity` with
+the six creation fields. Record presence enables tenant CPU/memory accounting and selects the
+tenant GC behavior; its limit fields configure the enforcer and `workerId` selects the shared
+GC budget. Without a record the platform/static heap policy applies. Loader names remain opaque
+to these hooks and event fields remain unchanged.
+
+The exact API/io exceptions are `src/workerd/api/worker-loader.h`,
+`src/workerd/api/worker-loader.c++` and `src/workerd/io/io-channels.h`. The exact Rust exceptions
+are `src/workerd/server/server/bridge.rs`, `src/workerd/server/server/loader.rs` and
+`src/workerd/server/server/worker.rs`; other Rust files remain excluded. Runtime callers must
+supply this record when their integration is ported.

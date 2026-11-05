@@ -7,3 +7,5 @@
 0005-memory-limit.patch
 0010-steady-and-worker-limits.patch
 0011-gc-pauses.patch
+0015-rpc-invocation-identity.patch
+0017-creation-identity.patch

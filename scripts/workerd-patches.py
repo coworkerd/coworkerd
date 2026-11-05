@@ -25,6 +25,11 @@ STARTUP_IDENTITY_PATCH = "0005-memory-limit.patch"
 STARTUP_IDENTITY_PATHS = frozenset({
     "src/workerd/api/worker-loader.c++", "src/workerd/io/io-channels.h",
 })
+CREATION_IDENTITY_PATCH = "0017-creation-identity.patch"
+CREATION_IDENTITY_PATHS = frozenset({
+    "src/workerd/api/worker-loader.h", "src/workerd/api/worker-loader.c++",
+    "src/workerd/io/io-channels.h",
+})
 
 def git(checkout, *args, env=None, input=None):
     return subprocess.check_output(["git", "-c", "core.autocrlf=false", "-c", "diff.noprefix=false", "-c", "core.quotePath=true",
@@ -36,6 +41,15 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    IDENTITY_PATCH: frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/loader.rs",
+    }),
+    CREATION_IDENTITY_PATCH: frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/loader.rs",
+        "src/workerd/server/server/worker.rs",
+    }),
     STARTUP_IDENTITY_PATCH: frozenset({
         "src/workerd/server/server/bridge.rs",
         "src/workerd/server/server/loader.rs",
@@ -56,6 +70,7 @@ def allowed_path(name, path):
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
+                          name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
                           name == RPC_CODE_PATCH and path in RPC_CODE_PATHS)
 
 def validate_patch(checkout, name, data):

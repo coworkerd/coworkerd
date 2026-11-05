@@ -1,0 +1,640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 6 Nov 2026 02:20:26 +0800
+Subject: [PATCH] Carry explicit Coworkerd creation identity through the worker
+ loader
+
+Coworkerd 0.5.4 port: creation identity record (r13 rule 2)
+
+The platform-only optional get() argument preserves existing two-argument calls and load(). Presence enables tenant accounting, explicit limits override process defaults, and workerId selects GC budgets. Generation remains reserved at zero.
+
+diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
+index 74d87726012b2a80350b2231585edc2d1362fd4b..2b388329f7500aefd4f83c96223e1cdf8158c14d 100644
+--- a/src/workerd/api/worker-loader.c++
++++ b/src/workerd/api/worker-loader.c++
+@@ -8,6 +8,8 @@
+ 
+ #include <capnp/message.h>
+ #include <kj/vector.h>
++#include <cmath>
++#include <limits>
+ 
+ namespace workerd::api {
+ 
+@@ -77,8 +79,40 @@ jsg::Ref<DurableObjectClass> WorkerStub::getDurableObjectClass(jsg::Lock& js,
+ }
+ 
+ jsg::Ref<WorkerStub> WorkerLoader::get(
+-    jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode) {
++    jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode,
++    jsg::Optional<GetOptions> options) {
+   auto& ioctx = IoContext::current();
++  CoworkerdLoadIdentity identity{.startupIdentity = server::captureMemoryStartupIdentity()};
++  KJ_IF_SOME(o, options) {
++    KJ_IF_SOME(record, o.coworkerdWorker) {
++      JSG_REQUIRE(record.workerId.value.size() > 0 && record.versionId.value.size() > 0,
++          TypeError, "coworkerdWorker.workerId and versionId must be nonempty strings");
++      auto number = [](const jsg::Optional<jsg::NonCoercible<double>>& input,
++                        kj::StringPtr field) {
++        double value = input.map([](const auto& v) { return v.value; }).orDefault(0);
++        JSG_REQUIRE(std::isfinite(value) && value >= 0 && std::trunc(value) == value,
++            TypeError, "coworkerdWorker.", field, " must be a nonnegative integer");
++        return value;
++      };
++      auto limit = [&](const auto& input, kj::StringPtr field) {
++        auto value = number(input, field);
++        JSG_REQUIRE(value <= std::numeric_limits<uint32_t>::max(), TypeError,
++            "coworkerdWorker.", field, " exceeds uint32");
++        return static_cast<uint32_t>(value);
++      };
++      // Generation is reserved for lifecycle handoff; no generation is assigned here.
++      number(record.generation, "generation");
++      identity.cpuLimitMs = limit(record.cpuLimitMs, "cpuLimitMs");
++      identity.memoryLimitMiB = limit(record.memoryLimitMiB, "memoryLimitMiB");
++      identity.present = true;
++      identity.workerId = kj::mv(record.workerId.value);
++      identity.versionId = kj::mv(record.versionId.value);
++      identity.tenant = kj::str("");
++      KJ_IF_SOME(slash, identity.workerId.findFirst('/')) {
++        identity.tenant = kj::str(identity.workerId.slice(0, slash));
++      }
++    }
++  }
+ 
+   // It's important that we use a *weak* reentry callback because this callback will held by the
+   // WorkerStub and any entrypoint stubs in vends until they are GC'd. We don't want to create
+@@ -97,7 +131,7 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
+   });
+ 
+   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name),
+-      kj::mv(reenterAndGetCode), server::captureMemoryStartupIdentity());
++      kj::mv(reenterAndGetCode), kj::mv(identity));
+ 
+   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+ }
+@@ -121,7 +155,7 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
+   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
+       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
+     return source.clone(kj::atomicAddRef(*ownContentWrapper));
+-  }, kj::str(""));
++  }, CoworkerdLoadIdentity{});
+ 
+   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+ }
+diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
+index 3d63f70982f17df37b2e3f37859180da004c7ff0..e4a7ca000b36a7860bd10f756df7a15c8935abf4 100644
+--- a/src/workerd/api/worker-loader.h
++++ b/src/workerd/api/worker-loader.h
+@@ -138,8 +138,24 @@ class WorkerLoader: public jsg::Object {
+     });
+   };
+ 
+-  jsg::Ref<WorkerStub> get(
+-      jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode);
++  // Only the platform runtime holds the loader capability that supplies this record.
++  struct CoworkerdWorker {
++    jsg::NonCoercible<kj::String> workerId;
++    jsg::NonCoercible<kj::String> versionId;
++    jsg::Optional<jsg::NonCoercible<double>> generation;
++    jsg::Optional<jsg::NonCoercible<double>> cpuLimitMs;
++    jsg::Optional<jsg::NonCoercible<double>> memoryLimitMiB;
++
++    JSG_STRUCT(workerId, versionId, generation, cpuLimitMs, memoryLimitMiB);
++  };
++
++  struct GetOptions {
++    jsg::Optional<CoworkerdWorker> coworkerdWorker;
++    JSG_STRUCT(coworkerdWorker);
++  };
++
++  jsg::Ref<WorkerStub> get(jsg::Lock& js, kj::Maybe<kj::String> name,
++      jsg::Function<jsg::Promise<WorkerCode>()> getCode, jsg::Optional<GetOptions> options);
+ 
+   // Shortcut for `get(null, () => code)`.
+   jsg::Ref<WorkerStub> load(jsg::Lock& js, WorkerCode code);
+@@ -170,6 +186,7 @@ class WorkerLoader: public jsg::Object {
+ 
+ #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
+   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
+-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
++      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoader::CoworkerdWorker, \
++      api::WorkerLoader::GetOptions, workerd::ResourceLimits
+ 
+ }  // namespace workerd::api
+diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
+index 7d1987f00a82ef8dfb92a6da8c87b0b6ec90da76..47863f33799ce670aeb6e9ef05eff87b546029e3 100644
+--- a/src/workerd/io/io-channels.h
++++ b/src/workerd/io/io-channels.h
+@@ -36,6 +36,19 @@ inline kj::String captureMemoryStartupIdentity() {
+ }
+ }  // namespace server
+ 
++// Owned load-time input from the platform's WorkerLoader capability. The factory copies this
++// into the single cxx CoworkerdLoadIdentity value before asynchronous source retrieval.
++struct CoworkerdLoadIdentity {
++  kj::String startupIdentity;
++  bool present = false;
++  kj::String tenant;
++  kj::String workerId;
++  kj::String versionId;
++  uint64_t generation = 0;
++  uint32_t cpuLimitMs = 0;
++  uint32_t memoryLimitMiB = 0;
++};
++
+ class WorkerInterface;
+ 
+ // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
+@@ -495,7 +508,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
+   virtual kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
+       kj::Maybe<kj::String> name,
+       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
+-      kj::String startupIdentity) {
++      CoworkerdLoadIdentity identity) {
+     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
+   }
+ 
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index ea1fb3fcae08997b4d8501a73061cc95fb4b35bc..365369bfafcf2b17eff78f1efe9d4e0236323a67 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -106,25 +106,6 @@ uint32_t cpuLimitFromEnvironment() {
+   }
+   return static_cast<uint32_t>(value);
+ }
+-CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName) {
+-  // The loader key's last segment, written by the node's runtime bridge only: `limits=<cpuMs>:<memoryMiB>`.
+-  // Anything else -- another segment, a number that does not fit, a name of any other shape -- names no limit.
+-  const auto text = isolateName.asArray();
+-  size_t at = text.size();
+-  while (at > 0 && text[at - 1] != '#') --at;
+-  const kj::StringPtr marker = "limits="_kj;
+-  if (at == 0 || text.size() - at <= marker.size()) return {};
+-  for (size_t i = 0; i < marker.size(); ++i) if (text[at + i] != marker[i]) return {};
+-  uint64_t values[2] = {0, 0};
+-  size_t field = 0;
+-  for (size_t p = at + marker.size(); p < text.size(); ++p) {
+-    if (text[p] == ':' && field == 0) { ++field; continue; }
+-    if (text[p] < '0' || text[p] > '9') return {};
+-    values[field] = values[field] * 10 + static_cast<uint64_t>(text[p] - '0');
+-    if (values[field] > std::numeric_limits<uint32_t>::max()) return {};
+-  }
+-  return {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1])};
+-}
+ int coworkerdPid() {
+   static const int pid = getpid();
+   return pid;
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 10003e7818ffa0eb6183e7bc849b49b3753e1cf8..d81e4d1e938ae950894d4a3b173b056784269c59 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -26,24 +26,19 @@
+ #endif
+ 
+ namespace workerd::server {
+-// Creation identity is distinct from per-request origin. The factory slot is empty
+-// until the trusted loader transports this record across the existing bridge.
++// Explicit creation identity supplied by the platform loader, distinct from request origin.
+ struct CoworkerdWorkerIdentity {
+   kj::String tenant;
+-  kj::String version;
++  kj::String workerId;
++  kj::String versionId;
+   uint64_t generation = 0;
++  uint32_t cpuLimitMs = 0;
++  uint32_t memoryLimitMiB = 0;
+ };
+-uint32_t cpuLimitFromEnvironment();
+-// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
+-// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
+-// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
+-// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
+-// fixed when it is created, and a Worker's limits are part of the key it is loaded under, so a Worker whose
+-// limits change is loaded as another isolate rather than kept at the old ones.
+-struct CoworkerdNamedLimits {
++struct CoworkerdAppliedLimits {
+   uint32_t cpuMs = 0, memoryMiB = 0;
+ };
+-CoworkerdNamedLimits coworkerdNamedLimits(kj::StringPtr isolateName);
++uint32_t cpuLimitFromEnvironment();
+ kj::String escapeCpuJsonString(kj::StringPtr text);
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
+ kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
+@@ -110,22 +105,21 @@ class LimitWatchdog {
+ // CPU accounting stays on the isolate thread; only termination and event writes cross threads.
+ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
+-      kj::StringPtr startupIdentity = "")
+-      : fallback(kj::mv(fallback)), name(kj::str(name)), named(coworkerdNamedLimits(name)),
+-        cpuNs(uint64_t(named.cpuMs ? named.cpuMs : cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
+-        dynamic(dynamic),
+-        startupIdentity(kj::str(startupIdentity)) {
+-    if (dynamic) {
+-      auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
++  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
++      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "")
++      : fallback(kj::mv(fallback)), name(kj::str(name)),
++        cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)) {
++    KJ_IF_SOME(record, identity) {
++      cpuNs = uint64_t(record.cpuLimitMs ? record.cpuLimitMs : cpuLimitFromEnvironment()) * 1000000;
++      auto limit = record.memoryLimitMiB ? record.memoryLimitMiB : memoryLimitFromEnvironment();
+       if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
+     }
+     // The isolate's GC callbacks account for excluded CPU and long pauses.
+     if (gcSettings().observes()) {
+-      gc = std::make_shared<IsolateGc>(name, dynamic, cpuNs);
++      gc = std::make_shared<IsolateGc>(name, identity, cpuNs);
+     }
+     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
+-    recordPlatformFacts(name, dynamic);
++    recordPlatformFacts(name, tenantWorker);
+     auto paf = kj::newPromiseAndFulfiller<void>();
+     failure = paf.promise.fork();
+     fulfiller = kj::mv(paf.fulfiller);
+@@ -138,7 +132,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     if (memory) {
+       params.constraints.ConfigureDefaultsFromHeapSize(0, memory->limitBytes);
+       params.array_buffer_allocator_shared = memory;
+-    } else if (!dynamic && gcSettings().staticHeapBytes) {
++    } else if (!tenantWorker && gcSettings().staticHeapBytes) {
+       // The runtime: a heap sized for its working set rather than from the machine, so its collections stay small
+       // (its young generation follows from the maximum).
+       params.constraints.ConfigureDefaultsFromHeapSize(0, gcSettings().staticHeapBytes);
+@@ -175,7 +169,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     isolate = value;
+     if (memory) memory->customize(value);
+     if (gc) gc->install(value);
+-    if (!dynamic && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
++    if (!tenantWorker && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
+   }
+   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
+   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
+@@ -184,11 +178,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   // keeps reporting who was executing.
+   bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
+   // The limits in force here, whichever named them: what the state endpoint shows as applied.
+-  CoworkerdNamedLimits applied() const {
++  CoworkerdAppliedLimits applied() const {
+     return {static_cast<uint32_t>(cpuNs / 1000000), memory ? static_cast<uint32_t>(memory->limitBytes >> 20) : 0};
+   }
+-  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
+-  bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
++  // A tenant Worker's request contexts report their end on the event pipe, limits or not.
++  bool reportsCompletion() const { return tenantWorker && cpuEventsDescriptor() >= 0; }
+   kj::Maybe<EventOutcome> outcome() {
+     if (exceeded->load() == IsolateLimitCause::NONE) return kj::none;
+     return exceeded->load() == IsolateLimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
+@@ -247,16 +241,16 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     }
+     writeLimitEvent(row);
+   }
+-  // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
++  // The end of a tenant Worker's request context (after its waitUntil work), whether or not it
+   // ever ran JavaScript; without limits only the event pipe gets the row. `used` is what the limit charged, and
+   // `gcExcluded` the GC CPU it did not: the request's CPU is their sum.
+   void completed(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+-    if (dynamic) record("completed", identity, used, gcExcluded);
++    if (tenantWorker) record("completed", identity, used, gcExcluded);
+   }
+   // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
+   // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
+   void progress(kj::StringPtr identity, uint64_t used, uint64_t gcExcluded) {
+-    if (dynamic) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
++    if (tenantWorker) writeLimitEvent(report("cpu-progress", identity, used, gcExcluded));
+   }
+   // Written while a termination has not taken effect; a later terminated row for the same
+   // invocation withdraws it.
+@@ -407,9 +401,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  private:
+   kj::Own<IsolateLimitEnforcer> fallback;
+   kj::String name;
+-  CoworkerdNamedLimits named;
+   uint64_t cpuNs;
+-  bool dynamic;
++  const bool tenantWorker;
+   kj::String startupIdentity;
+   v8::Isolate* isolate = nullptr;
+   uint64_t startupUsed = 0;
+diff --git a/src/workerd/server/factory/coworkerd-gc.c++ b/src/workerd/server/factory/coworkerd-gc.c++
+index cff4228706231b24ba5ac77394ac522f2d5fb3d5..e761b206971849ad0fcc1e1cfd95547c7691d691 100644
+--- a/src/workerd/server/factory/coworkerd-gc.c++
++++ b/src/workerd/server/factory/coworkerd-gc.c++
+@@ -67,18 +67,6 @@ const char* typeName(v8::GCType type) {
+   return "scavenge";
+ }
+ 
+-// The Worker an isolate belongs to: its name before the version. A dynamic isolate is named
+-// "<namespace>:<workerId>@<versionId>#<content>#<definition>[#limits=...]" (the node's runtime bridge); any other
+-// name is its own Worker.
+-std::string workerKey(kj::StringPtr name) {
+-  std::string text(name.cStr());
+-  auto hash = text.find('#');
+-  if (hash != std::string::npos) text.resize(hash);
+-  auto at = text.rfind('@');
+-  if (at != std::string::npos) text.resize(at);
+-  return text;
+-}
+-
+ // What a static isolate (the runtime) holds once a mark-compact is done: its working set.
+ struct StaticHeap {
+   uint64_t majors = 0, liveAfterMajorBytes = 0, peakLiveAfterMajorBytes = 0, heapLimitBytes = 0;
+@@ -179,12 +167,12 @@ class GcBudget {
+ namespace {
+ // Every Worker's budget in this process, kept while an isolate of the Worker holds it and until it is full again (from
+ // then on it is the same as a new one), so that a new isolate of the Worker goes on with the old one's.
+-std::shared_ptr<GcBudget> budgetFor(kj::StringPtr isolateName) {
++std::shared_ptr<GcBudget> budgetFor(kj::StringPtr workerId) {
+   static kj::MutexGuarded<std::map<std::string, std::shared_ptr<GcBudget>>> budgets;
+   auto now = monotonicNs();
+   auto lock = budgets.lockExclusive();
+   std::erase_if(*lock, [now](auto& entry) { return entry.second.use_count() == 1 && entry.second->full(now); });
+-  auto key = workerKey(isolateName);
++  auto key = std::string(workerId.begin(), workerId.size());
+   auto found = lock->find(key);
+   if (found != lock->end()) return found->second;
+   auto made = std::make_shared<GcBudget>(now);
+@@ -193,9 +181,12 @@ std::shared_ptr<GcBudget> budgetFor(kj::StringPtr isolateName) {
+ }
+ }  // namespace
+ 
+-IsolateGc::IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs)
+-    : name(kj::str(name)), dynamic(dynamic), cpuLimitNs(cpuLimitNs) {
+-  if (dynamic && cpuLimitNs && gcSettings().excludes()) budget = budgetFor(name);
++IsolateGc::IsolateGc(kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
++    uint64_t cpuLimitNs)
++    : name(kj::str(name)), tenantWorker(identity != kj::none), cpuLimitNs(cpuLimitNs) {
++  KJ_IF_SOME(record, identity) {
++    if (cpuLimitNs && gcSettings().excludes()) budget = budgetFor(record.workerId);
++  }
+ }
+ IsolateGc::~IsolateGc() noexcept(false) {}
+ 
+@@ -204,7 +195,7 @@ void IsolateGc::install(v8::Isolate* value) {
+   clock = kj::heap<ThreadCpuClock>();
+   value->AddGCPrologueCallback(&IsolateGc::prologue, this, v8::kGCTypeAll);
+   value->AddGCEpilogueCallback(&IsolateGc::epilogue, this, v8::kGCTypeAll);
+-  if (dynamic && gcSettings().idleCollectMs) oldUsed = oldAfterMajor = oldGenerationBytes();
++  if (tenantWorker && gcSettings().idleCollectMs) oldUsed = oldAfterMajor = oldGenerationBytes();
+ }
+ 
+ void IsolateGc::prologue(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* data) {
+@@ -244,12 +235,12 @@ void IsolateGc::ended(v8::GCType) {
+   const bool major = (type & MAJOR) != 0;
+   if (major) ++majors;
+   const auto& settings = gcSettings();
+-  if (dynamic && settings.idleCollectMs) {
++  if (tenantWorker && settings.idleCollectMs) {
+     oldUsed = oldGenerationBytes();
+     if (major) oldAfterMajor = oldUsed;
+   }
+   uint64_t live = 0, limit = 0;
+-  if (!dynamic && major) {
++  if (!tenantWorker && major) {
+     v8::HeapStatistics stats;
+     isolate->GetHeapStatistics(&stats);
+     live = stats.used_heap_size();
+@@ -278,7 +269,7 @@ void IsolateGc::ended(v8::GCType) {
+       p.firstMajorLongestNs = pause;
+       p.firstMajorLongestIsolate = name.cStr();
+     }
+-    if (!dynamic && major) {
++    if (!tenantWorker && major) {
+       auto& heap = p.statics[name.cStr()];
+       ++heap.majors;
+       heap.liveAfterMajorBytes = live;
+@@ -316,7 +307,7 @@ size_t IsolateGc::oldGenerationBytes() const {
+ 
+ void IsolateGc::measureOld() {
+   // At most every few milliseconds: a request's entries come in bursts, and the collections measure it anyway.
+-  if (!dynamic || !isolate || !gcSettings().idleCollectMs) return;
++  if (!tenantWorker || !isolate || !gcSettings().idleCollectMs) return;
+   auto now = monotonicNs();
+   if (now - lastMeasured < 5000000) return;
+   lastMeasured = now;
+diff --git a/src/workerd/server/factory/coworkerd-gc.h b/src/workerd/server/factory/coworkerd-gc.h
+index d6cd2afb63cd3080fde1ae67dff33b674d67cd0c..7ad4a2a8bbbcc35daf778f7b56f67aee6ab18a2a 100644
+--- a/src/workerd/server/factory/coworkerd-gc.h
++++ b/src/workerd/server/factory/coworkerd-gc.h
+@@ -38,6 +38,8 @@ class Worker;
+ 
+ namespace workerd::server {
+ 
++struct CoworkerdWorkerIdentity;
++
+ struct GcSettings {
+   uint64_t budgetNs = 0, refillNsPerSecond = 0;
+   uint64_t longPauseNs = 0;
+@@ -80,7 +82,8 @@ enum class IdleCollection { COLLECTED, BUSY, GONE };
+ // callbacks are never removed: they end with the isolate.
+ class IsolateGc {
+  public:
+-  IsolateGc(kj::StringPtr name, bool dynamic, uint64_t cpuLimitNs);
++  IsolateGc(kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
++      uint64_t cpuLimitNs);
+   ~IsolateGc() noexcept(false);
+   IsolateGc(const IsolateGc&) = delete;
+ 
+@@ -118,7 +121,7 @@ class IsolateGc {
+   void measureOld();
+ 
+   kj::StringPtr getName() const { return name; }
+-  bool isDynamic() const { return dynamic; }
++  bool isTenantWorker() const { return tenantWorker; }
+ 
+  private:
+   static void prologue(v8::Isolate* isolate, v8::GCType type, v8::GCCallbackFlags flags, void* data);
+@@ -128,9 +131,9 @@ class IsolateGc {
+   size_t oldGenerationBytes() const;
+ 
+   const kj::String name;
+-  const bool dynamic;
++  const bool tenantWorker;
+   const uint64_t cpuLimitNs;
+-  std::shared_ptr<GcBudget> budget;  // dynamic isolates while the exclusion is on
++  std::shared_ptr<GcBudget> budget;  // tenant isolates while the exclusion is on
+   v8::Isolate* isolate = nullptr;
+   kj::Maybe<kj::Own<ThreadCpuClock>> clock;
+ 
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 98c45245b509749d6eb9ae6c873e0b20135e5ab8..380348373aebb55827efb93f17d1b5233e958c60 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -900,11 +900,14 @@ class RustIoChannelFactory final: public IoChannelFactory {
+   kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
+       kj::Maybe<kj::String> name,
+       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
+-      kj::String startupIdentity) override {
++      workerd::CoworkerdLoadIdentity identity) override {
+     auto nameStr = name.map([](kj::String& n) { return toRust(n); });
+     return kj::refcounted<WorkerStubChannelHandle>(channels->load_isolate(
+         loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource)),
+-        toRustString(startupIdentity)));
++        CoworkerdLoadIdentity{toRustString(identity.startupIdentity), identity.present,
++            toRustString(identity.tenant), toRustString(identity.workerId),
++            toRustString(identity.versionId), identity.generation,
++            identity.cpuLimitMs, identity.memoryLimitMiB}));
+   }
+ 
+   kj::Network& getWorkerdDebugPortNetwork() override {
+@@ -1539,8 +1542,12 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
+   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
+   impl->isDynamic = dynamicSource != kj::none;
+-  // The creation-identity slot is not inferred from a name, source shape, or request metadata.
+-  impl->coworkerdIdentity = kj::none;
++  if (spec.load_identity.present) {
++    const auto& identity = spec.load_identity;
++    impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
++      kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
++      identity.cpu_limit_ms, identity.memory_limit_mib};
++  }
+   ErrorReporter errorReporter;
+   auto& options = *factory.options;
+   bool experimental = options.experimental;
+@@ -1619,8 +1626,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic,
+-        kj::str(spec.startup_identity));
++        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
++        kj::str(spec.load_identity.startup_identity));
+     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index a5531e8fd32e0d21c048690ae83db9d224f8a808..ad640ee73accdc5ade4b29aec299d183e266830e 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -105,11 +105,22 @@ pub mod ffi {
+         env_actor_classes: u32,
+     }
+ 
++    /// Owned load-time input. Rust transports it without interpreting its identity or limits.
++    #[derive(Default)]
++    struct CoworkerdLoadIdentity {
++        startup_identity: String,
++        present: bool,
++        tenant: String,
++        worker_id: String,
++        version_id: String,
++        generation: u64,
++        cpu_limit_ms: u32,
++        memory_limit_mib: u32,
++    }
++
+     struct WorkerSpec {
+         name: String,
+-        /// Opaque creation identity captured synchronously by the loading request. Owned across
+-        /// asynchronous source retrieval and compilation; interpreted only by the factory.
+-        startup_identity: String,
++        load_identity: CoworkerdLoadIdentity,
+         /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
+         inbound_listeners: Vec<InboundListener>,
+         /// The `env` object: an encoded `Globals` message (compiled-bindings.capnp), in words.
+@@ -822,7 +833,7 @@ pub mod ffi {
+             loader_channel: u32,
+             name: KjMaybe<&str>,
+             source: KjOwn<DynamicSource>,
+-            startup_identity: String,
++            load_identity: CoworkerdLoadIdentity,
+         ) -> Result<Box<WorkerStub>>;
+         /// Whether this worker has the workerd debug port binding.
+         fn has_debug_port(self: &ChannelFactory) -> bool;
+diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
+index d3ee83ab3043803b174d15a9e240f494fc84fbed..3c07edd8edec414452cf9c1d5543f087de02478f 100644
+--- a/src/workerd/server/server/loader.rs
++++ b/src/workerd/server/server/loader.rs
+@@ -67,7 +67,7 @@ impl WorkerLoaderNamespace {
+         self: &Rc<Self>,
+         name: Option<&str>,
+         source: KjOwn<DynamicSource>,
+-        startup_identity: String,
++        load_identity: ffi::CoworkerdLoadIdentity,
+     ) -> Result<Rc<WorkerStub>> {
+         let server = self
+             .server
+@@ -92,7 +92,7 @@ impl WorkerLoaderNamespace {
+                     Weak::clone(&self.server),
+                     format!("{}:{name}", self.name),
+                     source,
+-                    startup_identity,
++                    load_identity,
+                     Some(on_abort),
+                 );
+                 self.isolates
+@@ -105,7 +105,7 @@ impl WorkerLoaderNamespace {
+                 Weak::clone(&self.server),
+                 format!("{}:dynamic:{:032x}", self.name, rand::random::<u128>()),
+                 source,
+-                startup_identity,
++                load_identity,
+                 None,
+             ),
+         };
+@@ -148,7 +148,7 @@ impl WorkerStub {
+         server: Weak<Server>,
+         isolate_name: String,
+         source: KjOwn<DynamicSource>,
+-        startup_identity: String,
++        load_identity: ffi::CoworkerdLoadIdentity,
+         on_abort: Option<Box<dyn Fn()>>,
+     ) -> Rc<Self> {
+         let fired = Cell::new(false);
+@@ -164,7 +164,7 @@ impl WorkerStub {
+             factory,
+             isolate_name,
+             source,
+-            startup_identity,
++            load_identity,
+             server,
+             abort_isolate,
+         )
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index e9bff10653d89b195fb1eefdc45d3a1f8cd434ab..7f16cd7034f857bf44304b6dcfd9b20a847baa63 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -177,7 +177,7 @@ impl WorkerService {
+ 
+         let spec = ffi::WorkerSpec {
+             name: name.to_owned(),
+-            startup_identity: String::new(),
++            load_identity: ffi::CoworkerdLoadIdentity::default(),
+             inbound_listeners,
+             globals: std::mem::take(&mut bindings.globals),
+             access_blob_header: access_blob_header.into(),
+@@ -269,13 +269,13 @@ impl WorkerService {
+         factory: Rc<Factory>,
+         name: String,
+         source: KjOwn<DynamicSource>,
+-        startup_identity: String,
++        load_identity: ffi::CoworkerdLoadIdentity,
+         server: Weak<Server>,
+         abort_isolate: Box<dyn Fn()>,
+     ) -> Result<Rc<Self>> {
+         let spec = ffi::WorkerSpec {
+             name,
+-            startup_identity,
++            load_identity,
+             inbound_listeners: Vec::new(),
+             globals: Vec::new(),
+             access_blob_header: KjMaybe::None,
+@@ -1089,7 +1089,7 @@ impl ChannelFactory {
+         loader_channel: u32,
+         name: KjMaybe<&str>,
+         source: KjOwn<DynamicSource>,
+-        startup_identity: String,
++        load_identity: ffi::CoworkerdLoadIdentity,
+     ) -> Result<Box<WorkerStub>> {
+         let loader = self
+             .0
+@@ -1099,7 +1099,7 @@ impl ChannelFactory {
+         Ok(Box::new(WorkerStub(loader.load(
+             name.into(),
+             source,
+-            startup_identity,
++            load_identity,
+         )?)))
+     }
+ 
