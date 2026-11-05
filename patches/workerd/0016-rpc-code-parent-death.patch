@@ -1,13 +1,16 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Sat, 31 Oct 2026 00:00:00 +0000
-Subject: [PATCH] Preserve RPC platform codes and exit when the node parent is gone
+Date: Thu, 5 Nov 2026 22:12:13 +0800
+Subject: [PATCH] Preserve RPC platform codes and exit when the node parent is
+ gone
+
+Ported from the 0.5.3 series 0016
 
 diff --git a/src/workerd/jsg/BUILD.bazel b/src/workerd/jsg/BUILD.bazel
-index 9c6f4461356e0d9a3e0c04b35fc4ba43c46028f9..0ee4dc499552095bcefd19d0ab9eaa61dfb6beb1 100644
+index f1b400a690ca6de07ff9fad61fe0c7970a919d7a..cbec9833fa8c06223bcca51dc2fee9aa3adc774e 100644
 --- a/src/workerd/jsg/BUILD.bazel
 +++ b/src/workerd/jsg/BUILD.bazel
-@@ -93,6 +93,7 @@ wd_cc_library(
+@@ -104,6 +104,7 @@ wd_cc_library(
          "ser.c++",
          "setup.c++",
          "util.c++",
@@ -15,7 +18,7 @@ index 9c6f4461356e0d9a3e0c04b35fc4ba43c46028f9..0ee4dc499552095bcefd19d0ab9eaa61
          "v8-platform-wrapper.c++",
          "wrappable.c++",
      ],
-@@ -110,6 +111,7 @@ wd_cc_library(
+@@ -121,6 +122,7 @@ wd_cc_library(
          "snapshot.h",
          "unwrap-args.h",
          "util.h",
@@ -65,10 +68,10 @@ index 0000000000000000000000000000000000000000..b82413c9bae32a96f505bdda2a7c5dec
 +}
 +}  // namespace workerd::jsg
 diff --git a/src/workerd/jsg/util.c++ b/src/workerd/jsg/util.c++
-index 7cc0095e393facfe1babb6dfab2d76f11115e23d..7a953aef84f21a37cf83ada68f2b37e0193eb93d 100644
+index 5833dba68e81a764945372a0c370672c44b22743..f957caf58c5d9bc421b75a8953491dc269eeb6b1 100644
 --- a/src/workerd/jsg/util.c++
 +++ b/src/workerd/jsg/util.c++
-@@ -371,6 +371,9 @@ v8::Local<v8::Value> exceptionToJs(
+@@ -396,6 +396,9 @@ v8::Local<v8::Value> exceptionToJs(
    // TODO(cleanup): decodeTunneledException is currently only used here, consider
    // inlining it back into this function.
    auto tunneledException = decodeTunneledException(isolate, exception, options);
@@ -78,47 +81,75 @@ index 7cc0095e393facfe1babb6dfab2d76f11115e23d..7a953aef84f21a37cf83ada68f2b37e0
  
    if (tunneledException.isInternal) {
      // Don't log exceptions that have been explicitly marked with worker_do_not_log or are
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 6e8fac98dd1b250cec0466d1f3700c621ca9a35f..6687bfaade639082d45dfd7823a17cbef79cee49 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -348,6 +348,7 @@ wd_cc_library(
-         "coworkerd-idle-eviction.h",
-         "coworkerd-steady.h",
-         "coworkerd-wal-shipper.h",
-+        "coworkerd-parent-death.h",
-     ],
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index ed07fa559101008a6aa6eef827ea71fa8a9b8c6b..6ff00fbd4c10ceb8072f091e72766fbc5e4d555c 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -85,7 +85,7 @@ wd_cc_library(
+ # V8 on the Rust-owned event loop and builds the worker factory the Rust server runs.
+ wd_cc_library(
+     name = "bootstrap",
+-    srcs = ["bootstrap.c++"],
++    srcs = ["bootstrap.c++", "coworkerd-parent-death.h"],
+     linkstatic = CC_LIBRARY_LINKSTATIC,
      deps = [
-         ":coworkerd-memory-limit",
-diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
-index 2c3f2c4b157047adf106f82d9c05e552fa3e4b9b..4acbfcfdca7d6c686b33a800252a06e5cd1a7372 100644
---- a/src/workerd/server/coworkerd-cpu-limit.h
-+++ b/src/workerd/server/coworkerd-cpu-limit.h
-@@ -1,4 +1,6 @@
+         ":bootstrap-hdrs",
+diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
+index 75a5e8356f9cc27625fdaf900dc8ddd76371295f..1788c2e6babb3465115133d2022d2d3b0443a320 100644
+--- a/src/workerd/server/factory/bootstrap.c++
++++ b/src/workerd/server/factory/bootstrap.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "bootstrap.h"
++#include "coworkerd-parent-death.h"
+ #include "coworkerd-channels.h"
+ 
+ #include "worker-factory.h"
+@@ -146,8 +147,10 @@ class Bootstrap {
+       kj::Maybe<const BenchOptions&> bench)
+       : timer(loop.getTimer()),
+         monotonicClock(kj::systemPreciseMonotonicClock()),
++        parentProvider(loop.getTimer()),
+         provider(loop.getTimer()) {
+     initializeCoworkerdChannels();
++    followCoworkerdParent(parentProvider);
+     KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
+ #ifdef WORKERD_USE_PERFETTO
+       perfettoSession = PerfettoSession(kj::str(path),
+@@ -217,6 +220,7 @@ class Bootstrap {
+   kj::Timer& timer;
+   // The loop's monotonic clock, consistent with `timer`.
+   const kj::MonotonicClock& monotonicClock;
++  kj_rs_io::TokioLowLevelAsyncIoProvider parentProvider;
+   // The tokio-backed kj::Network over the Runtime's loop, for the factory.
+   kj_rs_io::TokioAsyncIoProvider provider;
+ 
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 831b2c19c43adaa6de9807af0a8173cde9b4b321..35eed676153cd3a0b9a22de688a31abf9dbb5fff 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -1,4 +1,5 @@
  #pragma once
-+
 +#include <workerd/jsg/coworkerd-rpc-code.h>
- #include "coworkerd-gc.h"
- #include "coworkerd-idle-eviction.h"
- #include <workerd/server/coworkerd-memory-limit.h>
-@@ -187,8 +189,10 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #include "coworkerd-channels.h"
+ 
+ #include <workerd/io/actor-cache.h>
+@@ -113,7 +114,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
    }
    kj::Exception exception() {
-     return exceeded->load() == IsolateLimitCause::MEMORY
--        ? KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED")
--        : KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
-+        ? jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED"),
-+              "MEMORY_LIMIT_EXCEEDED")
-+        : jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
-+              "CPU_LIMIT_EXCEEDED");
+-    return KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
++    return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
++        "CPU_LIMIT_EXCEEDED");
    }
    void requireNotExceeded() {
-     if (exceeded->load() != IsolateLimitCause::NONE) kj::throwFatalException(exception());
-diff --git a/src/workerd/server/coworkerd-parent-death.h b/src/workerd/server/coworkerd-parent-death.h
+     if (exceeded.load()) kj::throwFatalException(exception());
+diff --git a/src/workerd/server/factory/coworkerd-parent-death.h b/src/workerd/server/factory/coworkerd-parent-death.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..232c93f11a914d77d7183e66ada892947437bb16
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-parent-death.h
++++ b/src/workerd/server/factory/coworkerd-parent-death.h
 @@ -0,0 +1,48 @@
 +#pragma once
 +
@@ -168,22 +199,3 @@ index 0000000000000000000000000000000000000000..232c93f11a914d77d7183e66ada89294
 +  (void)watch;
 +}
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-wal-shipper.c++ b/src/workerd/server/coworkerd-wal-shipper.c++
-index c024f42fdd19a9e51ff0ba6410918bc9dac140ad..3cd4c764fe86327707e9b8b82272d0c4f4a54996 100644
---- a/src/workerd/server/coworkerd-wal-shipper.c++
-+++ b/src/workerd/server/coworkerd-wal-shipper.c++
-@@ -1,5 +1,6 @@
- // Coworkerd: see coworkerd-wal-shipper.h.
- #include "coworkerd-wal-shipper.h"
-+#include "coworkerd-parent-death.h"
- 
- #include <workerd/jsg/exception.h>
- 
-@@ -409,6 +410,7 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
- 
- void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
-   logProvider = &provider;
-+  followCoworkerdParent(provider);
- }
- 
- bool durableLogEnabled() {

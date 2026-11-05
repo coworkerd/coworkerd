@@ -27,11 +27,23 @@ def git(checkout, *args, env=None, input=None):
         "-c", "diff.suppressBlankEmpty=false", "-c", "format.subjectPrefix=PATCH", "-c", "format.useAutoBase=false",
         "-C", str(checkout), *args], env=env, input=input)
 
+# C++ implementation hooks may live in the legacy server package or its factory.
+# Rust server/CLI changes require a patch-specific exact path, even though they
+# live below the server package. Stage 1 currently introduces no Rust hooks.
+SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
+RUST_PATHS = {}  # patch filename -> frozenset of exact existing Rust paths
+
+
 def allowed_path(name, path):
     # Do not normalize a suspicious spelling into an authorized path.
     canonical = path and not path.startswith("/") and "\\" not in path and all(
         part not in ("", ".", "..") for part in path.split("/"))
-    return canonical and (path.startswith("src/workerd/server/") or
+    server_path = (path.startswith(SERVER_CPP_ROOTS) or
+                   path.startswith("src/workerd/server/") and
+                   "/" not in path[len("src/workerd/server/"):])
+    rust_path = (path.startswith(("src/workerd/server/server/", "src/workerd/server/cli/")) and
+                 path in RUST_PATHS.get(name, frozenset()))
+    return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == RPC_CODE_PATCH and path in RPC_CODE_PATHS)
 

@@ -1,15 +1,6 @@
-0001-native-binding.patch
 0002-cpu-limit.patch
-0003-idle-eviction.patch
-0004-memory-watermark.patch
-0005-memory-limit.patch
 0006-limit-channel.patch
 0007-resident-watchdog.patch
 0008-fd-channels.patch
-0010-steady-and-worker-limits.patch
-0011-gc-pauses.patch
 0012-event-cpu-top-up.patch
-0013-durable-object-log.patch
-0014-durable-object-hibernation-alarms.patch
-0015-rpc-invocation-identity.patch
 0016-rpc-code-parent-death.patch

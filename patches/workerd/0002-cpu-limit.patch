@@ -1,31 +1,28 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Mon, 12 Oct 2026 16:39:29 +0800
+Date: Thu, 5 Nov 2026 22:12:12 +0800
 Subject: [PATCH] Enforce dynamic Worker CPU budgets through isolated hooks
 
-Move v27 CPU monitoring, request accounting, isolate revocation and out-of-loop culprit reporting into Coworkerd files. Read validated COWORKERD_CPU_LIMIT_MS and COWORKERD_CPU_STATE without changing the Rust CLI. Preserve upstream null-limit defaults through delegation. Required by Coworkerd v27-v29 and the v28 quarantine pool. Upstream status: Coworkerd-specific; not submitted.
+Ported from the 0.5.3 series 0002
 
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 93f513daafb9c68fc0c9bd8f895ded02d5c6e76b..ec5e7838da18ee821ef4a379fe8c171adece0b07 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -335,9 +335,11 @@ wd_cc_library(
-     name = "server",
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 5e7e52b96ef5aa798579b5d74ec8c85958b5d3e6..10e11b7cb9bd0790c20144a1c7f0ee92349479d9 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -28,6 +28,8 @@ wd_cc_library(
+     name = "worker-factory",
      srcs = [
-         "server.c++",
+         "worker-factory.c++",
 +        "coworkerd-cpu-limit.c++",
-     ],
-     hdrs = [
-         "server.h",
 +        "coworkerd-cpu-limit.h",
-     ],
-     deps = [
-         ":actor-id-impl",
-diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 new file mode 100644
 index 0000000000000000000000000000000000000000..722916b9324d7ac99f0560217a52db2e4c6ef312
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 @@ -0,0 +1,161 @@
 +#include "coworkerd-cpu-limit.h"
 +#include <workerd/util/autogate.h>
@@ -188,12 +185,12 @@ index 0000000000000000000000000000000000000000..722916b9324d7ac99f0560217a52db2e
 +  return kj::heap<CpuWorkerInterface>(kj::mv(entry), kj::addRef(limits));
 +}
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..212cee64053cc97311ffa5bac21d0abfbfba729e
+index 0000000000000000000000000000000000000000..4c7583caad06a0477ed353c9bba8712a7bed842c
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-cpu-limit.h
-@@ -0,0 +1,220 @@
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -0,0 +1,227 @@
 +#pragma once
 +
 +#include <workerd/io/actor-cache.h>
@@ -214,6 +211,13 @@ index 0000000000000000000000000000000000000000..212cee64053cc97311ffa5bac21d0abf
 +#endif
 +
 +namespace workerd::server {
++// Creation identity is distinct from per-request origin. The factory slot is empty
++// until the trusted loader transports this record across the existing bridge.
++struct CoworkerdWorkerIdentity {
++  kj::String tenant;
++  kj::String version;
++  uint64_t generation = 0;
++};
 +uint32_t cpuLimitFromEnvironment();
 +kj::String cpuStateFromEnvironment();
 +kj::String escapeCpuJsonString(kj::StringPtr text);
@@ -414,135 +418,68 @@ index 0000000000000000000000000000000000000000..212cee64053cc97311ffa5bac21d0abf
 +kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
 +    CpuIsolateLimitEnforcer& limits);
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index 5de0fdd946c62c214eaa6e6236e06b3c201a5b7e..eb5613e499259b3ef98d59cab8a8ff48b4c1f404 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -6,6 +6,7 @@
+diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
+index c94183b650ff5fa72b3e05f81a2cffef5a659e27..dbe00b6d98d36a053115490baff253759a3893f2 100644
+--- a/src/workerd/server/factory/worker-factory-impl.h
++++ b/src/workerd/server/factory/worker-factory-impl.h
+@@ -7,6 +7,7 @@
+ // The private state behind worker-factory.h, shared by the factory's source files.
  
- #include "alarm-scheduler.h"
- #include "container-client.h"
+ #include "worker-factory.h"
 +#include "coworkerd-cpu-limit.h"
- #include "pyodide.h"
- #include "workerd-api.h"
  
-@@ -3537,6 +3538,7 @@ class Server::WorkerService final: public Service,
-       kj::Maybe<kj::String> containerEgressInterceptorImageParam,
-       ActorStorageIsLocalDisk actorStorageIsLocalDisk,
-       bool isDynamic,
-+      kj::Own<CpuIsolateLimitEnforcer> cpuLimits,
-       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
-       kj::Maybe<kj::String> accessBlobHeaderNameParam = kj::none)
-       : channelTokenHandler(channelTokenHandler),
-@@ -3556,6 +3558,7 @@ class Server::WorkerService final: public Service,
-         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
-         actorStorageIsLocalDisk(actorStorageIsLocalDisk),
-         isDynamic(isDynamic),
-+        cpuLimits(kj::mv(cpuLimits)),
-         abortIsolateCallback(kj::mv(abortIsolateCallback)),
-         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
+ #include <workerd/io/actor-sqlite.h>
+ #include <workerd/io/io-thread-context.h>
+@@ -191,6 +192,8 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
+   kj::Vector<kj::Rc<IoChannelFactory::RpcChannel>> rpcChannels;
+   kj::Maybe<kj::String> accessBlobHeader;
+   bool isDynamic = false;
++  kj::Maybe<CoworkerdWorkerIdentity> coworkerdIdentity;
++  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
  
-@@ -4128,9 +4131,14 @@ class Server::WorkerService final: public Service,
-       }
-     }
- 
--    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
--        kj::mv(props), kj::mv(actor),
-+    auto requestLimits = wrapCpuRequestLimits(
-         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
-+        *cpuLimits, metadata.cfBlobJson, [this]() {
-+          KJ_IF_SOME(cb, abortIsolateCallback) { cb(); }
-+        });
-+    auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-+        kj::mv(props), kj::mv(actor),
-+        kj::mv(requestLimits),
-         {},  // ioContextDependency
-         addRefToThis(), kj::mv(observer), waitUntilTasks,
-         true,                  // tunnelExceptions
-@@ -4140,6 +4148,7 @@ class Server::WorkerService final: public Service,
-         kj::mv(triggerContext), IsDynamicDispatch::NO, kj::mv(accessInfo),
-         kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
-         kj::mv(metadata.clientAddress));
-+    return wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits);
+   kj::Maybe<kj::Own<const Worker>> worker;
+   // Held from compilation until `worker_set_ctx_exports()` fills the object in; none for a worker
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 7ccb5a7676ea634e5489ea3572c8aa0cf01e85a8..62ae991c5d7fcb8d9b6476b9365004740a44bb5e 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -1134,12 +1134,17 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
    }
  
-  private:
-@@ -4395,6 +4404,7 @@ class Server::WorkerService final: public Service,
-   // `hasLocalDiskActorStorage()` when validating Workflow bindingService storage.
-   ActorStorageIsLocalDisk actorStorageIsLocalDisk;
-   bool isDynamic;
-+  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
-   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
-   kj::Maybe<kj::String> accessBlobHeaderName;
-   kj::Maybe<kj::uint> accessBindingServiceChannel;
-@@ -5924,10 +5934,13 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
-     const WorkerDef& def,
-     capnp::List<config::Extension>::Reader extensions,
-     Worker::Isolate::InspectorPolicy inspectorPolicy,
--    kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
-+    kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
-+    kj::Own<CpuIsolateLimitEnforcer>& cpuLimits) {
-   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
-   auto observer = kj::atomicRefcounted<IsolateObserver>();
--  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
-+  cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
-+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic);
-+  auto limitEnforcer = kj::addRef(*cpuLimits);
-   auto isolateGroup = jsg::newIsolateGroup();
- 
-   kj::Array<Worker::Api::InboundListener> listeners;
-@@ -5986,9 +5999,10 @@ kj::Maybe<kj::Own<jsg::SnapshotArtifact>> Server::makeSnapshot(
- 
-   auto snapshotArtifact = kj::atomicRefcounted<jsg::SnapshotArtifact>();
-   auto zygoteName = kj::str(name, "-snapshot");
-+  kj::Own<CpuIsolateLimitEnforcer> zygoteLimits;
-   auto zygoteIsolate = makeWorkerIsolate(zygoteName, name, def, extensions,
-       Worker::Isolate::InspectorPolicy::DISALLOW,
--      jsg::SnapshotConfig(jsg::MutableSnapshot{.artifact = kj::mv(snapshotArtifact)}));
-+      jsg::SnapshotConfig(jsg::MutableSnapshot{.artifact = kj::mv(snapshotArtifact)}), zygoteLimits);
- 
-   auto zygoteWorkerFs = newWorkerFileSystem(kj::heap<FsMap>(), getBundleDirectory(def.source));
-   auto zygoteArtifactBundler = workerd::api::pyodide::ArtifactBundler::makeDisabledBundler();
-@@ -6100,8 +6114,9 @@ kj::Promise<kj::Rc<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
-     // For workerd, if the inspector is enabled, it is always fully trusted.
-     inspectorPolicy = Worker::Isolate::InspectorPolicy::ALLOW_FULLY_TRUSTED;
-   }
--  auto isolate =
--      makeWorkerIsolate(name, name, def, extensions, inspectorPolicy, kj::mv(snapshotConfig));
-+  kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
-+  auto isolate = makeWorkerIsolate(
-+      name, name, def, extensions, inspectorPolicy, kj::mv(snapshotConfig), cpuLimits);
- 
-   // If we are using the inspector, we need to register the Worker::Isolate
-   // with the inspector service.
-@@ -6473,7 +6488,7 @@ kj::Promise<kj::Rc<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
-           kj::mv(errorReporter.workflowClasses), kj::mv(linkCallback),
-           KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
-           kj::mv(dockerPath), kj::mv(containerEgressInterceptorImage), actorStorageIsLocalDisk,
--          isDynamic, kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
-+          isDynamic, kj::mv(cpuLimits), kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
-   result->initActorNamespaces(localActorConfigs, actorNamespacesByUniqueKey, network);
-   co_return result;
+   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+-  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
++  auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
++      *worker.cpuLimits, metadata.cfBlobJson, [channel = ioChannelFactory.addRef()]() mutable {
++        channel->abortIsolate("CPU limit exceeded");
++      });
++  auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
++      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+       kj::mv(metadata.clientAddress));
++  return wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits);
  }
-diff --git a/src/workerd/server/server.h b/src/workerd/server/server.h
-index ce3f82fa4516764752dc5518e8ba54185c2842ab..117290574581b9587727810c52d1ffc99d294bc7 100644
---- a/src/workerd/server/server.h
-+++ b/src/workerd/server/server.h
-@@ -28,6 +28,7 @@ class V8System;
- namespace workerd::server {
  
- using api::pyodide::PythonConfig;
-+class CpuIsolateLimitEnforcer;
- 
- // Implements the single-tenant Workers Runtime server / CLI.
- //
-@@ -366,7 +367,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
-       const WorkerDef& def,
-       capnp::List<config::Extension>::Reader extensions,
-       Worker::Isolate::InspectorPolicy inspectorPolicy,
--      kj::Maybe<jsg::SnapshotConfig> snapshotConfig);
-+      kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
-+      kj::Own<CpuIsolateLimitEnforcer>& cpuLimits);
- 
-   // Creates a throwaway zygote Worker in PREPARE_SNAPSHOT mode and returns the filled snapshot
-   // artifact, or kj::none when the zygote failed to start.
+ }  // namespace
+@@ -1521,6 +1526,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
+   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
+   impl->isDynamic = dynamicSource != kj::none;
++  // The creation-identity slot is not inferred from a name, source shape, or request metadata.
++  impl->coworkerdIdentity = kj::none;
+   ErrorReporter errorReporter;
+   auto& options = *factory.options;
+   bool experimental = options.experimental;
+@@ -1598,7 +1605,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   // The isolate of the Worker, or of the zygote that snapshots its startup.
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
++        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic);
++    auto limitEnforcer = kj::addRef(*impl->cpuLimits);
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+         .protocol = kj::str(listener.protocol),
