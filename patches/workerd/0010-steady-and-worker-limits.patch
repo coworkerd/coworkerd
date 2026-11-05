@@ -1,60 +1,29 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Sun, 18 Oct 2026 12:00:00 +0800
+Date: Fri, 6 Nov 2026 00:15:58 +0800
 Subject: [PATCH] Narrow a serving process and take its limits from each Worker
 
-Coworkerd v49, the workerd side of the process sandbox (docs/process-isolation.md sections 27-29) and of the
-per-Worker limits of v47. Depends on the CPU limit patch (v29) and the memory limit patch (v33). Fixed
-upstream v1.20261012.1. Upstream status: Coworkerd-specific; not submitted.
+Ported from the 0.5.3 series 0010
 
-Two things only the process itself can do, both at its first request -- the node's readiness probe, before it
-has answered anything -- in coworkerd-steady.{h,c++}, with one call from Server::WorkerService::startRequest:
+Install the existing serving-time seccomp policy and non-dumpable setting at the first request. Preserve per-Worker CPU and memory limits from the final loader-key segment.
 
-  * the steady-state system call filter. The launcher (v44, v45) has to execve workerd, so its own table must
-    hold execve and everything else only the startup needs, and a seccomp filter can only ever be narrowed,
-    never replaced: the narrower table of the same build (coworkerd-syscalls-steady.txt, 40 of the startup
-    table's 62 calls on x86_64) can only go on from in here. COWORKERD_SECCOMP_STEADY_MODE picks off, observe
-    or enforce, as for the startup table, and COWORKERD_SECCOMP_STEADY_FILE is the file, which the node binds
-    into the process's mount namespace. The layout is the launcher's, so both tables are the same program
-    shape. In observe mode the process answers its own notifications -- by then it has no channel to the node
-    that could carry a notification listener -- from a thread that exists before the filter does and makes
-    only calls the table holds (ioctl, write; the kernel's receive blocks, so it needs no poll, which a
-    serving process no longer has), which is why production runs enforce, with no thread at all. Either way
-    one [coworkerd-seccomp] row says what was installed;
-  * PR_SET_DUMPABLE 0, which the launcher sets before the execve and the kernel then undoes for a readable,
-    same-owner binary (v44's ruling: the state endpoint reported the truth, and this is the fix).
-
-The limits of a dynamic Worker are now that Worker's own where it names them (v47 stores them per Worker; the
-node's runtime bridge puts them in the loader key, so an isolate is created under its Worker's limits and a
-change of them loads another isolate): the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` is read
-in coworkerd-cpu-limit, and a limit it does not name stays the process's (COWORKERD_CPU_LIMIT_MS,
-COWORKERD_MEMORY_LIMIT_MIB), which is the behaviour before this patch. Every limit event row already carries
-the limit it was measured against, so the node reads them per Worker. The memory execution identity (v33)
-now follows the isolate's own memory limit as well as the process's, so an isolate limited on its own keeps
-reporting who was executing when it died.
-
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 7904457966da8ec2f2a44e9cde327da041df08c3..b3b317313830458c627718efbe082ca93f31d7e5 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -337,11 +337,13 @@ wd_cc_library(
-         "server.c++",
-         "coworkerd-cpu-limit.c++",
-         "coworkerd-idle-eviction.c++",
-+        "coworkerd-steady.c++",
-     ],
-     hdrs = [
-         "server.h",
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index aa35890bc98e447c6feb21a5ac54c0e5b624bebb..f14f992e920b95a85abff31b13d6ca4af2ffe249 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -32,6 +32,8 @@ wd_cc_library(
          "coworkerd-cpu-limit.h",
-         "coworkerd-idle-eviction.h",
+         "coworkerd-memory-limit.c++",
+         "coworkerd-memory-limit.h",
++        "coworkerd-steady.c++",
 +        "coworkerd-steady.h",
-     ],
-     deps = [
-         ":coworkerd-memory-limit",
-diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
-index 3171ec4aa37f18a6e3a6ad2c0b2b70b97a8b7c57..b34935b0ccb041ab9551ae4aa217250d7d0204d1 100644
---- a/src/workerd/server/coworkerd-cpu-limit.c++
-+++ b/src/workerd/server/coworkerd-cpu-limit.c++
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index baa944fea54230816cb77c192f9a8c4b81471603..ecba5faf0e24ca24540d964cae44bc8b0092c3b4 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 @@ -106,6 +106,25 @@ uint32_t cpuLimitFromEnvironment() {
    }
    return static_cast<uint32_t>(value);
@@ -78,34 +47,16 @@ index 3171ec4aa37f18a6e3a6ad2c0b2b70b97a8b7c57..b34935b0ccb041ab9551ae4aa217250d
 +  }
 +  return {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1])};
 +}
- void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
-   auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
-       ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
-@@ -213,7 +232,7 @@ class RequestLimits final: public LimitEnforcer {
-     kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
-       if (limits->publish()) abortIsolate();
-       limits->requireNotExceeded();
--      if (memoryLimitFromEnvironment()) return kj::heap<IdentityScope>(lock, *this);
-+      if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
-       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
-     }
-     void topUpActor() override {}
-@@ -249,7 +268,7 @@ class RequestLimits final: public LimitEnforcer {
- kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
-     CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
-     kj::Function<void()> abortIsolate) {
--  if (!limits.isEnabled() && !memoryLimitFromEnvironment() && !limits.reportsCompletion()) return fallback;
-+  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
-   return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
- }
- kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
-diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
-index 45429a4b417fecb6a42cbfdecc8310ae862541e7..430257403180e532290f84b942728e034a01274f 100644
---- a/src/workerd/server/coworkerd-cpu-limit.h
-+++ b/src/workerd/server/coworkerd-cpu-limit.h
-@@ -23,6 +23,16 @@
- 
- namespace workerd::server {
+ int coworkerdPid() {
+   static const int pid = getpid();
+   return pid;
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 37ab83e5910ecfeac23baca44f241d4116c6b47b..f3602112d929d1be35d44b1117429d95524eced7 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -33,6 +33,16 @@ struct CoworkerdWorkerIdentity {
+   uint64_t generation = 0;
+ };
  uint32_t cpuLimitFromEnvironment();
 +// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
 +// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
@@ -120,30 +71,27 @@ index 45429a4b417fecb6a42cbfdecc8310ae862541e7..430257403180e532290f84b942728e03
  kj::String escapeCpuJsonString(kj::StringPtr text);
  void recordPlatformFacts(kj::StringPtr name, bool dynamic);
  kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
-@@ -92,12 +102,12 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+@@ -101,12 +111,12 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   public:
    CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
-       IdleWorkerRef idleWorker = nullptr, kj::StringPtr startupIdentity = "")
+       kj::StringPtr startupIdentity = "")
 -      : fallback(kj::mv(fallback)), name(kj::str(name)),
 -        cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
 +      : fallback(kj::mv(fallback)), name(kj::str(name)), named(coworkerdNamedLimits(name)),
 +        cpuNs(uint64_t(named.cpuMs ? named.cpuMs : cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
-         dynamic(dynamic), idleWorker(kj::mv(idleWorker)),
+         dynamic(dynamic),
          startupIdentity(kj::str(startupIdentity)) {
      if (dynamic) {
 -      auto limit = memoryLimitFromEnvironment();
 +      auto limit = named.memoryMiB ? named.memoryMiB : memoryLimitFromEnvironment();
        if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
      }
-     if (isEnabled()) watchdog = &LimitWatchdog::start();
-@@ -148,6 +158,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-     if (memory) memory->customize(value);
-   }
-   bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-+  // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
-+  // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
-+  // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
-+  // keeps reporting who was executing.
+     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
+@@ -161,7 +171,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
+   // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
+   // keeps reporting who was executing.
+-  bool memoryIdentityWanted() const { return memoryLimitFromEnvironment() != 0; }
 +  bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
 +  // The limits in force here, whichever named them: what the state endpoint shows as applied.
 +  CoworkerdNamedLimits applied() const {
@@ -151,20 +99,20 @@ index 45429a4b417fecb6a42cbfdecc8310ae862541e7..430257403180e532290f84b942728e03
 +  }
    // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
    bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
-   const IdleWorkerRef& activity() const { return idleWorker; }
-@@ -365,6 +384,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::Maybe<EventOutcome> outcome() {
+@@ -392,6 +406,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   private:
    kj::Own<IsolateLimitEnforcer> fallback;
    kj::String name;
 +  CoworkerdNamedLimits named;
    uint64_t cpuNs;
    bool dynamic;
-   IdleWorkerRef idleWorker;
-diff --git a/src/workerd/server/coworkerd-steady.c++ b/src/workerd/server/coworkerd-steady.c++
+   kj::String startupIdentity;
+diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
 new file mode 100644
 index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc61d97109
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-steady.c++
++++ b/src/workerd/server/factory/coworkerd-steady.c++
 @@ -0,0 +1,281 @@
 +#include "coworkerd-steady.h"
 +
@@ -447,11 +395,11 @@ index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc
 +}
 +
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-steady.h b/src/workerd/server/coworkerd-steady.h
+diff --git a/src/workerd/server/factory/coworkerd-steady.h b/src/workerd/server/factory/coworkerd-steady.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..b9bcb7d8629e65dec163f9e7449c6f47b4753a90
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-steady.h
++++ b/src/workerd/server/factory/coworkerd-steady.h
 @@ -0,0 +1,9 @@
 +#pragma once
 +
@@ -462,26 +410,20 @@ index 0000000000000000000000000000000000000000..b9bcb7d8629e65dec163f9e7449c6f47
 +// happens without that environment, and nothing happens outside Linux.
 +void coworkerdServing();
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index 40193b637bac835fb1e098641e2e9c6f752f605a..2b94d22e581c697d95ca0384b1079eb5b4e11fcf 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -7,6 +7,7 @@
- #include "alarm-scheduler.h"
- #include "container-client.h"
- #include "coworkerd-cpu-limit.h"
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 263699ea2270289c59d5db761f433dfd8f24ca51..3ef00a6ccf291854ea649c69c96aeaf97258ca39 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -1,3 +1,4 @@
 +#include "coworkerd-steady.h"
- #include "pyodide.h"
- #include "workerd-api.h"
- 
-@@ -4131,6 +4132,10 @@ class Server::WorkerService final: public Service,
-       }
-     }
- 
-+    // The first request of this process -- the node's readiness probe, before it has answered anything --
-+    // is the moment it serves: from here on it is non-dumpable and runs under the steady-state system call
-+    // filter (Coworkerd v49, coworkerd-steady.h).
-+    coworkerdServing();
-     auto requestLimits = wrapCpuRequestLimits(
-         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
-         *cpuLimits, metadata.cfBlobJson, [this]() {
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // Licensed under the Apache 2.0 license found in the LICENSE file or at:
+ //     https://opensource.org/licenses/Apache-2.0
+@@ -1158,6 +1159,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+     ::rust::Box<ChannelFactory> channels,
+     kj::Own<RequestMetadata> metadata,
+     ::rust::Box<WorkerInterfaceList> tails) {
++  coworkerdServing();
+   TRACE_EVENT("workerd", "worker_start_request()");
+   auto& impl = worker.getImpl();
+   auto entrypointName = toKj(entrypoint);

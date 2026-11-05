@@ -1,57 +1,126 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Wed, 14 Oct 2026 03:04:28 +0800
+Date: Fri, 6 Nov 2026 00:15:58 +0800
 Subject: [PATCH] Bound dynamic Worker memory and report fatal OOM identity
 
-Coworkerd v33, depends on v27 resource invalidation and v28 quarantine. Fixed upstream v1.20261012.1. Configure public isolate parameters and callbacks in our server limit enforcer; upstream retains only library dependency hooks.
+Ported from the 0.5.3 series 0005
 
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index e88397023dff009db2a90699071785525d4734fc..7904457966da8ec2f2a44e9cde327da041df08c3 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -344,6 +344,7 @@ wd_cc_library(
-         "coworkerd-idle-eviction.h",
-     ],
-     deps = [
-+        ":coworkerd-memory-limit",
-         ":actor-id-impl",
-         ":alarm-scheduler",
-         ":channel-token",
-@@ -445,6 +446,7 @@ wd_cc_library(
-         "v8-platform-impl.h",
-     ],
-     deps = [
-+        ":coworkerd-memory-limit",
-         "//src/workerd/io",
-         "//src/workerd/jsg",
-         "@capnp-cpp//src/kj",
-@@ -556,3 +558,10 @@ kj_test(
-         "@capnp-cpp//src/kj:kj-async-io",
-     ],
- )
+Capture the loading request identity synchronously and transfer one owned string through the existing loader and WorkerSpec calls. Restore memory allocation limits, execution attribution, and watchdog notification in the C++ factory. Rust only forwards the value.
+
+diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
+index de9157cfa9fb354952ddaffa50a6a009ed858497..ac419e2d9c56fe6ae89af02ce5b31b5537a643b1 100644
+--- a/src/workerd/api/worker-loader.c++
++++ b/src/workerd/api/worker-loader.c++
+@@ -93,8 +93,8 @@ jsg::Ref<WorkerStub> WorkerLoader::get(
+     }));
+   });
+ 
+-  auto isolateChannel =
+-      ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name), kj::mv(reenterAndGetCode));
++  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name),
++      kj::mv(reenterAndGetCode), server::captureMemoryStartupIdentity());
+ 
+   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+ }
+@@ -118,7 +118,7 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
+   auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
+       [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
+     return source.clone(kj::atomicAddRef(*ownContentWrapper));
+-  });
++  }, kj::str(""));
+ 
+   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+ }
+diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
+index 43450c07266c7fde3d2a0b56645eb608689a99cb..eee2cee959f74c0be7a9478280ee785ca2204583 100644
+--- a/src/workerd/io/io-channels.h
++++ b/src/workerd/io/io-channels.h
+@@ -24,6 +24,18 @@ class Network;
+ 
+ namespace workerd {
+ 
++namespace server {
++// Request entry installs a borrowed identity only for its synchronous JS scope. The loader copies
++// it before asynchronous source retrieval; the inline accessor shares one TLS slot across users.
++inline kj::StringPtr& memoryStartupIdentitySlot() {
++  static thread_local kj::StringPtr identity;
++  return identity;
++}
++inline kj::String captureMemoryStartupIdentity() {
++  return kj::str(memoryStartupIdentitySlot());
++}
++}  // namespace server
 +
-+wd_cc_library(
-+    name = "coworkerd-memory-limit",
-+    srcs = ["coworkerd-memory-limit.c++"],
-+    hdrs = ["coworkerd-memory-limit.h"],
-+    deps = ["@workerd-v8//:v8", "@capnp-cpp//src/kj"],
-+)
-diff --git a/src/workerd/server/coworkerd-cpu-limit.c++ b/src/workerd/server/coworkerd-cpu-limit.c++
-index 722916b9324d7ac99f0560217a52db2e4c6ef312..04670f4fed6209799ef956fefcb6aea038f041df 100644
---- a/src/workerd/server/coworkerd-cpu-limit.c++
-+++ b/src/workerd/server/coworkerd-cpu-limit.c++
-@@ -5,6 +5,26 @@
+ class WorkerInterface;
+ 
+ // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
+@@ -478,7 +490,8 @@ class IoChannelFactory: public virtual kj::Refcounted {
+   // Use a dynamic Worker loader binding to obtain an Worker by name. If name is null, or if the named Worker doesn't already exist, the callback will be called to fetch the source code from which the Worker should be created.
+   virtual kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
+       kj::Maybe<kj::String> name,
+-      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) {
++      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
++      kj::String startupIdentity) {
+     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
+   }
+ 
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 6ff00fbd4c10ceb8072f091e72766fbc5e4d555c..aa35890bc98e447c6feb21a5ac54c0e5b624bebb 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -30,6 +30,8 @@ wd_cc_library(
+         "worker-factory.c++",
+         "coworkerd-cpu-limit.c++",
+         "coworkerd-cpu-limit.h",
++        "coworkerd-memory-limit.c++",
++        "coworkerd-memory-limit.h",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index e4881cb11011a143d78ae4c9e74de09ea511ba47..baa944fea54230816cb77c192f9a8c4b81471603 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -1,7 +1,7 @@
+ #include "coworkerd-cpu-limit.h"
+ #include <workerd/util/autogate.h>
+-#include <cstdlib>
+ #include <csignal>
++#include <cstdlib>
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -9,16 +9,20 @@
  #include <v8-isolate.h>
  
  namespace workerd::server {
 +namespace {
-+thread_local kj::StringPtr startupExecutionIdentity;
++void wakeLimitWatchdog() { LimitWatchdog::start().wake(); }
 +}
-+MemoryStartupIdentityScope::MemoryStartupIdentityScope(kj::StringPtr identity)
-+    : previous(startupExecutionIdentity) { startupExecutionIdentity = identity; }
-+MemoryStartupIdentityScope::~MemoryStartupIdentityScope() { startupExecutionIdentity = previous; }
-+kj::String captureMemoryStartupIdentity() { return kj::str(startupExecutionIdentity); }
 +
+ LimitWatchdog& LimitWatchdog::start() {
+   // Destroyed at exit, which stops and joins the thread.
+   static LimitWatchdog watchdog;
+   return watchdog;
+ }
+ LimitWatchdog::LimitWatchdog(): thread([this]() { run(); }) {
+-
++  setLimitStateObserver(&wakeLimitWatchdog);
+ }
+ LimitWatchdog::~LimitWatchdog() noexcept(false) {
+-
++  setLimitStateObserver(nullptr);
+   state.lockExclusive()->stopping = true;
+ }
+ void LimitWatchdog::add(Entry& entry, kj::Maybe<kj::TimePoint> due) {
+@@ -74,7 +78,22 @@ void LimitWatchdog::run() {
+     }
+   }
+ }
++MemoryStartupIdentityScope::MemoryStartupIdentityScope(kj::StringPtr identity)
++    : previous(memoryStartupIdentitySlot()) { memoryStartupIdentitySlot() = identity; }
++MemoryStartupIdentityScope::~MemoryStartupIdentityScope() { memoryStartupIdentitySlot() = previous; }
+ 
 +kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey() {
 +  static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
 +  return key.addRef();
@@ -67,10 +136,13 @@ index 722916b9324d7ac99f0560217a52db2e4c6ef312..04670f4fed6209799ef956fefcb6aea0
  uint32_t cpuLimitFromEnvironment() {
    const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
    if (text == nullptr) return 0;
-@@ -117,7 +137,21 @@ class RequestLimits final: public LimitEnforcer {
-     ~RequestLimits() noexcept(false) {
-       if (cpuUsed) limits->record("completed", identity, cpuUsed);
-     }
+@@ -255,15 +274,37 @@ class RequestLimits final: public LimitEnforcer {
+         kj::String identity, kj::Function<void()> abortIsolate)
+         : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
+           abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
++    // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
++    // ends with the actor: its row has the CPU of all its events.
+     ~RequestLimits() noexcept(false) { limits->completed(identity, toppedUp + cpuUsed); }
 -    kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
 +    struct IdentityScope {
 +      jsg::AsyncContextFrame::StorageScope frame;
@@ -86,11 +158,26 @@ index 722916b9324d7ac99f0560217a52db2e4c6ef312..04670f4fed6209799ef956fefcb6aea0
 +    kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
 +      if (limits->publish()) abortIsolate();
 +      limits->requireNotExceeded();
-+      if (memoryLimitFromEnvironment()) return kj::heap<IdentityScope>(lock, *this);
++      if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
        return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
      }
-     void topUpActor() override {}
-@@ -132,7 +166,10 @@ class RequestLimits final: public LimitEnforcer {
++    // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
++    // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
++    // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
++    // thus limited one by one, as requests are, instead of together; what each charged stays in the completed row, and
++    // while the request lasts its total so far goes on the event pipe at most once per PROGRESS_INTERVAL, so that the
++    // node meters a long connection as it runs.
+     void topUpActor() override {
+       toppedUp += cpuUsed;
+       cpuUsed = 0;
+-      auto now = LimitWatchdog::now();
+-      if (toppedUp > reported && now - lastProgress >= 1 * kj::SECONDS) {
++      const auto now = LimitWatchdog::now();
++      if (toppedUp > reported && now - lastProgress >= PROGRESS_INTERVAL) {
+         lastProgress = now;
+         reported = toppedUp;
+         limits->progress(identity, toppedUp);
+@@ -280,7 +321,10 @@ class RequestLimits final: public LimitEnforcer {
      kj::Maybe<EventOutcome> getLimitsExceeded() override { return limits->outcome(); }
      kj::Promise<void> onLimitsExceeded() override { return limits->onExceeded(); }
      void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
@@ -102,33 +189,50 @@ index 722916b9324d7ac99f0560217a52db2e4c6ef312..04670f4fed6209799ef956fefcb6aea0
      void reportMetrics(RequestObserver&) override {}
      kj::Duration consumeTimeElapsedForPeriodicLogging() override { return 0 * kj::SECONDS; }
      size_t getSqliteMemoryUsage() const override { return 0; }
-@@ -150,7 +187,7 @@ class RequestLimits final: public LimitEnforcer {
+@@ -289,8 +333,12 @@ class RequestLimits final: public LimitEnforcer {
+     kj::Own<CpuIsolateLimitEnforcer> limits;
+     kj::Function<void()> abortIsolate;
+     kj::String identity;
+-    uint64_t cpuUsed = 0, toppedUp = 0, reported = 0;
++    // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.
++    uint64_t cpuUsed = 0, toppedUp = 0;
++    // The last progress row: when, and the CPU it reported.
++    static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
+     kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
++    uint64_t reported = 0;
+   };
+ 
+ 
+@@ -299,7 +347,7 @@ class RequestLimits final: public LimitEnforcer {
  kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
      CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
      kj::Function<void()> abortIsolate) {
--  if (!limits.isEnabled()) return fallback;
-+  if (!limits.isEnabled() && !memoryLimitFromEnvironment()) return fallback;
+-  if (!limits.isEnabled() && !limits.reportsCompletion()) return fallback;
++  if (!limits.isEnabled() && !limits.memoryIdentityWanted() && !limits.reportsCompletion()) return fallback;
    return kj::heap<RequestLimits>(kj::mv(fallback), limits, limits.identity(metadata), kj::mv(abortIsolate));
  }
  kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
-diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
-index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8ce27ba14 100644
---- a/src/workerd/server/coworkerd-cpu-limit.h
-+++ b/src/workerd/server/coworkerd-cpu-limit.h
-@@ -1,9 +1,11 @@
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 35eed676153cd3a0b9a22de688a31abf9dbb5fff..37ab83e5910ecfeac23baca44f241d4116c6b47b 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -1,10 +1,14 @@
  #pragma once
- #include "coworkerd-idle-eviction.h"
-+#include <workerd/server/coworkerd-memory-limit.h>
++
+ #include <workerd/jsg/coworkerd-rpc-code.h>
+ #include "coworkerd-channels.h"
++#include "coworkerd-memory-limit.h"
  
  #include <workerd/io/actor-cache.h>
++#include <workerd/io/io-channels.h>
  #include <workerd/io/limit-enforcer.h>
  #include <workerd/io/worker-interface.h>
 +#include <workerd/jsg/async-context.h>
  #include <capnp/compat/json.h>
  #include <capnp/message.h>
  #include <kj/function.h>
-@@ -23,28 +25,63 @@ uint32_t cpuLimitFromEnvironment();
- kj::String cpuStateFromEnvironment();
+@@ -31,7 +35,22 @@ struct CoworkerdWorkerIdentity {
+ uint32_t cpuLimitFromEnvironment();
  kj::String escapeCpuJsonString(kj::StringPtr text);
  void recordPlatformFacts(kj::StringPtr name, bool dynamic);
 +kj::Arc<jsg::AsyncContextFrame::StorageKey> memoryExecutionKey();
@@ -140,23 +244,37 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
 + private:
 +  kj::StringPtr previous;
 +};
-+kj::String captureMemoryStartupIdentity();
  
- // CPU accounting stays on the isolate thread; only termination and file writes cross threads.
++// The process's one limit watchdog thread, started by the first enabled limit enforcer. A JS
++// entry registers for as long as it runs. The thread sleeps toward the earliest time a registered
++// entry needs a check: when its CPU deadline can first arrive (thread CPU time never advances
++// faster than the monotonic clock), when a termination grace period ends, or when a limit state
++// leaves NONE elsewhere and wakes it. Registering and unregistering make no system call unless
++// the new entry needs a check before the thread's planned wake-up.
+ class LimitWatchdog {
+  public:
+   class Entry {
+@@ -77,27 +96,53 @@ class LimitWatchdog {
+   void run();
+ };
+ 
+-// CPU accounting stays on the isolate thread; only termination and file writes cross threads.
++// CPU accounting stays on the isolate thread; only termination and event writes cross threads.
  class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   public:
-   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
--      IdleWorkerRef idleWorker = nullptr)
-+      IdleWorkerRef idleWorker = nullptr, kj::StringPtr startupIdentity = "")
+-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic)
++  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
++      kj::StringPtr startupIdentity = "")
        : fallback(kj::mv(fallback)), name(kj::str(name)),
          cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
--        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)) {
-+        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)),
+-        dynamic(dynamic) {
++        dynamic(dynamic),
 +        startupIdentity(kj::str(startupIdentity)) {
 +    if (dynamic) {
 +      auto limit = memoryLimitFromEnvironment();
-+      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, state);
++      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
 +    }
+     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
      recordPlatformFacts(name, dynamic);
      auto paf = kj::newPromiseAndFulfiller<void>();
      failure = paf.promise.fork();
@@ -198,7 +316,7 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
    void completedRequest(kj::StringPtr id) const override { fallback->completedRequest(id); }
    bool exitJs(jsg::Lock& lock) const override { return fallback->exitJs(lock); }
    void reportMetrics(IsolateObserver& observer) const override { fallback->reportMetrics(observer); }
-@@ -54,21 +91,27 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+@@ -107,22 +152,35 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
    bool hasExcessivelyExceededHeapLimit() const override { return fallback->hasExcessivelyExceededHeapLimit(); }
    const TrackedWasmInstanceList& getTrackedWasmInstances() const override { return fallback->getTrackedWasmInstances(); }
    void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
@@ -209,17 +327,26 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
 +    if (memory) memory->customize(value);
 +  }
 +  bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-   const IdleWorkerRef& activity() const { return idleWorker; }
++  // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
++  // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
++  // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
++  // keeps reporting who was executing.
++  bool memoryIdentityWanted() const { return memoryLimitFromEnvironment() != 0; }
++  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
+   bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }
    kj::Maybe<EventOutcome> outcome() {
 -    return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
 +    if (exceeded->load() == IsolateLimitCause::NONE) return kj::none;
 +    return exceeded->load() == IsolateLimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
    }
    kj::Exception exception() {
--    return KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
+-    return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
+-        "CPU_LIMIT_EXCEEDED");
 +    return exceeded->load() == IsolateLimitCause::MEMORY
-+        ? KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED")
-+        : KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED");
++        ? jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: MEMORY_LIMIT_EXCEEDED"),
++              "MEMORY_LIMIT_EXCEEDED")
++        : jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, "jsg.Error: CPU_LIMIT_EXCEEDED"),
++              "CPU_LIMIT_EXCEEDED");
    }
    void requireNotExceeded() {
 -    if (exceeded.load()) kj::throwFatalException(exception());
@@ -232,19 +359,62 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
      published = true;
      fulfiller->reject(exception());
      return true;
-@@ -96,7 +139,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+@@ -150,26 +208,32 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
    kj::String report(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
      return kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":", escapeCpuJsonString(name),
          ',', identity, "\"cpuUsedNs\":", used, ",\"cpuLimitMs\":", cpuNs / 1000000,
--        ",\"pid\":", getpid(), "}\n");
-+        ",\"pid\":", getpid(), memory ? memory->metrics() : kj::str(""), "}\n");
+-        ",\"pid\":", coworkerdPid(), "}\n");
++        ",\"pid\":", coworkerdPid(), memory ? memory->metrics() : kj::str(""),
++        "}\n");
    }
    void record(kj::StringPtr event, kj::StringPtr identity, uint64_t used) {
      auto row = report(event, identity, used);
-@@ -156,24 +199,35 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-     kj::MutexGuarded<bool> stopped{false};
-     kj::Maybe<kj::Thread> watchdog;
-     bool reported = false;
+     if (isEnabled()) {
++      // All workerd processes append to one log: emit the prefix and JSON in one syscall.
+       auto log = kj::str("[cpu-limit] ", row);
+       ssize_t written;
+       do { written = write(STDERR_FILENO, log.cStr(), log.size()); } while (written < 0 && errno == EINTR);
+     }
+     writeLimitEvent(row);
+   }
++  // The end of a dynamic Worker's request context (after its waitUntil work), whether or not it
++  // ever ran JavaScript; without limits only the event pipe gets the row. `used` is what the limit charged, and
+   void completed(kj::StringPtr identity, uint64_t used) {
+     if (dynamic) record("completed", identity, used);
+   }
++  // A request's CPU so far while it lasts -- a WebSocket's events top it up, and its context ends only with the
++  // connection --, in the completed row's terms: on the event pipe only, where the node meters it, never in the log.
+   void progress(kj::StringPtr identity, uint64_t used) {
+     if (dynamic) writeLimitEvent(report("cpu-progress", identity, used));
+   }
+-  void culprit(kj::StringPtr identity, uint64_t used) {
+-    writeLimitEvent(report("culprit", identity, used));
+-  }
++  // Written while a termination has not taken effect; a later terminated row for the same
++  // invocation withdraws it.
++  void culprit(kj::StringPtr identity, uint64_t used) { writeLimitEvent(report("culprit", identity, used)); }
+ 
+   struct CpuClock {
+ #if __APPLE__
+@@ -194,7 +258,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #endif
+   };
+ 
++
++  // One JS entry, registered with the watchdog while it runs. Its watch state is touched only by
++  // the watchdog thread with the registry locked, and read here after unregistering.
+   struct Scope final: public LimitWatchdog::Entry {
++    // Below the remaining budget, the watchdog rechecks at this interval rather than sooner.
+     static constexpr uint64_t MIN_RECHECK_NS = 100000;
+     CpuIsolateLimitEnforcer& owner;
+     uint64_t& used;
+@@ -204,60 +272,120 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     uint64_t started = clock.now();
+     bool terminated = false;
+     bool finished = false;
+-    bool reported = false;
+     kj::TimePoint graceEnd = kj::origin<kj::TimePoint>();
++    bool reported = false;
 +    kj::String oomReport;
 +    MemoryExecution previousMemory;
  
@@ -255,45 +425,73 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
 +        oomReport = owner.report("memory-culprit", this->identity, 0);
 +        previousMemory = owner.memory->enter(oomReport);
 +      }
-       watchdog.emplace([this]() {
-         auto lock = stopped.lockExclusive();
-         while (!*lock) {
-           auto consumed = clock.now() - started + this->used;
--          if (consumed >= this->owner.cpuNs) {
--            this->owner.exceeded.store(true);
-+          if ((this->owner.cpuNs && consumed >= this->owner.cpuNs) ||
-+              this->owner.exceeded->load() != IsolateLimitCause::NONE) {
-+            if (this->owner.cpuNs && consumed >= this->owner.cpuNs) {
-+              auto expected = IsolateLimitCause::NONE;
-+              this->owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
-+            }
-             this->owner.isolate->TerminateExecution();
-             // 100 ms exceeds observed interrupt jitter, and leaves ample time before 3 s kill.
-             lock.wait([](bool stopped) { return stopped; }, 100 * kj::MILLISECONDS);
--            if (!*lock) {
--              this->owner.culprit(this->identity, clock.now() - started + this->used);
-+            auto finalConsumed = clock.now() - started + this->used;
-+            if (!*lock && this->owner.cpuNs && finalConsumed >= this->owner.cpuNs) {
-+              this->owner.culprit(this->identity, finalConsumed);
-               reported = true;
-             }
--            break;
-+            if (*lock || !this->owner.cpuNs || reported) break;
-           }
-           lock.wait([](bool stopped) { return stopped; }, 1 * kj::MILLISECONDS);
++      // Last: from here on the watchdog thread may call watch().
+       owner.watchdog->add(*this, firstCheck());
+     }
+     kj::Maybe<kj::TimePoint> firstCheck() const {
+       auto now = LimitWatchdog::now();
+-      if (owner.exceeded.load()) return now;
++      if (owner.exceeded->load() != IsolateLimitCause::NONE) return now;
++      if (!owner.cpuNs) return kj::none;
+       return now + static_cast<int64_t>(used < owner.cpuNs ? owner.cpuNs - used : 0) * kj::NANOSECONDS;
+     }
++    // One check of this entry: terminate once the CPU budget is spent or the limit state left
++    // NONE; when the grace period ends, report the culprit if the termination has not taken effect.
+     kj::Maybe<kj::TimePoint> watch(kj::TimePoint now) override {
+       if (finished) return kj::none;
+       if (terminated) {
+         if (now < graceEnd) return graceEnd;
+-        auto consumed = clock.now() - started + used;
+-        if (consumed >= owner.cpuNs) {
+-          owner.culprit(identity, consumed);
++        auto finalCpu = clock.now();
++        auto finalConsumed = finalCpu - started + used;
++        if (owner.cpuNs && finalConsumed >= owner.cpuNs) {
++          owner.culprit(identity, finalConsumed);
+           reported = true;
++        }
++        if (!owner.cpuNs || reported) {
+           finished = true;
+           return kj::none;
          }
-@@ -183,22 +237,57 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-       { auto lock = stopped.lockExclusive(); *lock = true; }
-       watchdog = kj::none;
-       used += clock.now() - started;
--      if (used >= owner.cpuNs) owner.exceeded.store(true);
+         terminated = false;
+         return now + 1 * kj::MILLISECONDS;
+       }
+-      auto consumed = clock.now() - started + used;
+-      if (consumed >= owner.cpuNs || owner.exceeded.load()) {
+-        owner.exceeded.store(true);
++      auto cpuNow = clock.now();
++      auto consumed = cpuNow - started + used;
++      if ((owner.cpuNs && consumed >= owner.cpuNs) ||
++          owner.exceeded->load() != IsolateLimitCause::NONE) {
++        if (owner.cpuNs && consumed >= owner.cpuNs) {
++          auto expected = IsolateLimitCause::NONE;
++          owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
++        }
+         owner.isolate->TerminateExecution();
+         terminated = true;
++        // 100 ms exceeds observed interrupt jitter, and leaves ample time before 3 s kill.
+         graceEnd = now + 100 * kj::MILLISECONDS;
+         return graceEnd;
+       }
++      if (!owner.cpuNs) return kj::none;
+       return now + static_cast<int64_t>(kj::max(owner.cpuNs - consumed, MIN_RECHECK_NS)) * kj::NANOSECONDS;
+     }
+     ~Scope() noexcept(false) {
+-      owner.watchdog->remove(*this, [this]() { used += clock.now() - started; });
+-      if (used >= owner.cpuNs && !owner.exceeded.exchange(true)) owner.watchdog->wake();
+-      if (owner.exceeded.load()) owner.record("terminated", identity, used);
++      owner.watchdog->remove(*this, [this]() {
++        auto cpuNow = clock.now();
++        used += cpuNow - started;
++      });
 +      if (owner.cpuNs && used >= owner.cpuNs) {
 +        auto expected = IsolateLimitCause::NONE;
-+        owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU);
++        if (owner.exceeded->compare_exchange_strong(expected, IsolateLimitCause::CPU)) {
++          owner.watchdog->wake();
++        }
 +      }
 +      if (owner.memory) owner.memory->leave(previousMemory);
-       if (reported && owner.state.size()) unlink(owner.state.cStr());
--      if (owner.exceeded.load()) owner.record("terminated", identity, used);
 +      if (owner.exceeded->load() != IsolateLimitCause::NONE) {
 +        owner.record(owner.exceeded->load() == IsolateLimitCause::MEMORY ? "memory-terminated" : "terminated", identity, used);
 +      }
@@ -346,25 +544,26 @@ index 7f04ed7280ee306f4626d38c4f1726d1ccbe04e2..c139a363a45e4ebe01071f206a0ab5d8
        else result = static_cast<int64_t>(self.startupUsed) * kj::NANOSECONDS;
      });
    }
-@@ -208,9 +297,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+@@ -266,10 +394,12 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::String name;
    uint64_t cpuNs;
-   kj::String state;
-   IdleWorkerRef idleWorker;
+   bool dynamic;
 +  kj::String startupIdentity;
    v8::Isolate* isolate = nullptr;
    uint64_t startupUsed = 0;
+   LimitWatchdog* watchdog = nullptr;
 -  std::atomic<bool> exceeded{false};
 +  IsolateLimitState exceeded = std::make_shared<std::atomic<IsolateLimitCause>>(IsolateLimitCause::NONE);
 +  std::shared_ptr<IsolateMemoryLimit> memory;
    bool published = false;
    kj::ForkedPromise<void> failure = nullptr;
    kj::Own<kj::PromiseFulfiller<void>> fulfiller;
-diff --git a/src/workerd/server/coworkerd-memory-limit.c++ b/src/workerd/server/coworkerd-memory-limit.c++
+diff --git a/src/workerd/server/factory/coworkerd-memory-limit.c++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff5824be28ba
+index 0000000000000000000000000000000000000000..5cffbbaa11a5f04bca8a15d1423ba92994eda843
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-memory-limit.c++
-@@ -0,0 +1,177 @@
++++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
+@@ -0,0 +1,159 @@
 +#include "coworkerd-memory-limit.h"
 +
 +#include <kj/debug.h>
@@ -380,30 +579,20 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +namespace workerd::server {
 +namespace {
 +thread_local MemoryExecution executingMemory;
-+char oomPath[4096] = {}, oomTemporaryPath[4112] = {}, unknownOomReport[256] = {};
-+int oomSignalFd = -1;
++char unknownOomReport[256] = {};
 +std::atomic<bool> oomReportReady{false};
++std::atomic<void (*)()> limitStateObserver{nullptr};
++
++void raiseLimitState(const IsolateLimitState& state) {
++  auto expected = IsolateLimitCause::NONE;
++  if (state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY)) {
++    if (auto observer = limitStateObserver.load()) observer();
++  }
++}
 +
 +void raisePeak(std::atomic<size_t>& peak, size_t value) {
 +  auto old = peak.load();
 +  while (old < value && !peak.compare_exchange_weak(old, value)) {}
-+}
-+
-+// The fatal path performs only file syscalls on data prepared before entering JS.
-+void writeOomReport(kj::StringPtr report) {
-+  if (!oomReportReady.load(std::memory_order_acquire)) return;
-+  auto fd = open(oomTemporaryPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-+  if (fd < 0) return;
-+  size_t offset = 0;
-+  while (offset < report.size()) {
-+    auto n = write(fd, report.cStr() + offset, report.size() - offset);
-+    if (n < 0 && errno == EINTR) continue;
-+    if (n <= 0) break;
-+    offset += n;
-+  }
-+  auto closed = close(fd);
-+  if (offset == report.size() && closed == 0) rename(oomTemporaryPath, oomPath);
-+  else unlink(oomTemporaryPath);
 +}
 +
 +}  // namespace
@@ -420,18 +609,14 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +  }
 +  return value;
 +}
++void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
 +
-+IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath)
++IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state)
 +    : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
-+  if (!reportPath.size()) return;
-+  KJ_REQUIRE(reportPath.size() + 8 <= sizeof(oomPath), "OOM report path too long");
++  // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
++  if (cpuEventsDescriptor() < 0) return;
 +  if (!oomReportReady.load(std::memory_order_acquire)) {
-+    snprintf(oomPath, sizeof(oomPath), "%s.memory", reportPath.cStr());
-+    snprintf(oomTemporaryPath, sizeof(oomTemporaryPath), "%s.tmp", oomPath);
-+    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", getpid());
-+    char signalPath[4112];
-+    snprintf(signalPath, sizeof(signalPath), "%s.memory-oom", reportPath.cStr());
-+    oomSignalFd = open(signalPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++    snprintf(unknownOomReport, sizeof(unknownOomReport), "{\"event\":\"memory-oom-undetermined\",\"pid\":%d}\n", coworkerdPid());
 +    oomReportReady.store(true, std::memory_order_release);
 +  }
 +}
@@ -443,8 +628,7 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +    auto base = heapBytes.load() + otherBytes.load();
 +    if (bytes > limitBytes || base > limitBytes - bytes || used > limitBytes - bytes - base) {
 +      raisePeak(deniedBytes, bytes);
-+      auto expected = IsolateLimitCause::NONE;
-+      state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
++      raiseLimitState(state);
 +      return false;
 +    }
 +    if (ownedBytes.compare_exchange_weak(used, used + bytes)) {
@@ -491,8 +675,7 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +  if (total >= limitBytes) terminate();
 +}
 +void IsolateMemoryLimit::terminate() {
-+  auto expected = IsolateLimitCause::NONE;
-+  state->compare_exchange_strong(expected, IsolateLimitCause::MEMORY);
++  raiseLimitState(state);
 +  isolate->TerminateExecution();
 +}
 +size_t IsolateMemoryLimit::nearHeap(void* data, size_t current, size_t initial) {
@@ -515,7 +698,7 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +  auto length = snprintf(row, sizeof(row),
 +      "[memory-limit-sample] {\"event\":\"%s\",\"pid\":%d,\"memoryLimitMiB\":%zu,\"heapUsedBytes\":%zu,"
 +      "\"externalOwnedBytes\":%zu,\"arrayBufferBytes\":%zu,\"peakUsedBytes\":%zu,"
-+      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, getpid(), limitBytes >> 20,
++      "\"headroomBytes\":%zu,\"nearHeapCalls\":%zu}\n", event, coworkerdPid(), limitBytes >> 20,
 +      heapBytes.load(), ownedBytes.load(), bufferBytes.load(), peakUsedBytes.load(),
 +      grantedHeadroomBytes.load(), nearCalls.load());
 +  if (length > 0 && static_cast<size_t>(length) < sizeof(row)) {
@@ -524,14 +707,12 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +  }
 +}
 +void IsolateMemoryLimit::oom(const char*, const v8::OOMDetails&) {
-+  // A preopened descriptor distinguishes OOM even if the detailed atomic report fails.
-+  if (oomSignalFd >= 0) {
-+    auto report = kj::StringPtr(unknownOomReport);
-+    ssize_t written;
-+    do { written = write(oomSignalFd, report.cStr(), report.size()); } while (written < 0 && errno == EINTR);
-+  }
-+  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeOomReport(executingMemory.report);
-+  else writeOomReport(unknownOomReport);
++  // Only writes of rows prepared before entering JS, on the descriptor inherited at startup: first
++  // the bare OOM row, which tells an OOM apart even if nothing else is known, then the identity of
++  // the execution that hit it.
++  if (!oomReportReady.load(std::memory_order_acquire)) return;
++  writeLimitEvent(unknownOomReport);
++  if (executingMemory.owner != nullptr && executingMemory.report.size()) writeLimitEvent(executingMemory.report);
 +  // V8 invokes the original process-wide jsg OOM callback after this returns.
 +}
 +kj::String IsolateMemoryLimit::metrics() const {
@@ -542,14 +723,15 @@ index 0000000000000000000000000000000000000000..c235a5fec3649c9effd9430cea39ff58
 +      ",\"nearHeapCalls\":", nearCalls.load());
 +}
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-memory-limit.h b/src/workerd/server/coworkerd-memory-limit.h
+diff --git a/src/workerd/server/factory/coworkerd-memory-limit.h b/src/workerd/server/factory/coworkerd-memory-limit.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..5e7cc9b616061bf9253849f7696634c8d874f2e4
+index 0000000000000000000000000000000000000000..4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-memory-limit.h
-@@ -0,0 +1,55 @@
++++ b/src/workerd/server/factory/coworkerd-memory-limit.h
+@@ -0,0 +1,59 @@
 +#pragma once
 +
++#include "coworkerd-channels.h"
 +#include <kj/memory.h>
 +#include <kj/string.h>
 +#include <v8-array-buffer.h>
@@ -562,6 +744,9 @@ index 0000000000000000000000000000000000000000..5e7cc9b616061bf9253849f7696634c8
 +enum class IsolateLimitCause { NONE, CPU, MEMORY };
 +using IsolateLimitState = std::shared_ptr<std::atomic<IsolateLimitCause>>;
 +uint32_t memoryLimitFromEnvironment();
++// Called after a memory limit moves a limit state from NONE, so that the limit watchdog
++// terminates the isolate without waiting for a CPU deadline. Set by the watchdog; may be null.
++void setLimitStateObserver(void (*observer)());
 +
 +struct MemoryExecution {
 +  class IsolateMemoryLimit* owner = nullptr;
@@ -572,7 +757,7 @@ index 0000000000000000000000000000000000000000..5e7cc9b616061bf9253849f7696634c8
 +class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::enable_shared_from_this<IsolateMemoryLimit> {
 + public:
 +  static constexpr size_t HEADROOM = 8ull << 20;
-+  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, kj::StringPtr reportPath);
++  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state);
 +  ~IsolateMemoryLimit() noexcept override;
 +  void* Allocate(size_t length) override;
 +  void* AllocateUninitialized(size_t length) override;
@@ -603,48 +788,170 @@ index 0000000000000000000000000000000000000000..5e7cc9b616061bf9253849f7696634c8
 +};
 +
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index d7dc8fbc1c2497ad8808a6ba2c7c971cf0e0246c..40193b637bac835fb1e098641e2e9c6f752f605a 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -5325,6 +5325,7 @@ struct Server::WorkerDef {
-   // themselves from the loader's isolate map.
-   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
-   IdleWorkerRef idleWorker;
-+  kj::StringPtr startupIdentity;
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 62ae991c5d7fcb8d9b6476b9365004740a44bb5e..263699ea2270289c59d5db761f433dfd8f24ca51 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -896,10 +896,12 @@ class RustIoChannelFactory final: public IoChannelFactory {
  
-   // HTTP header name from which to extract the per-request Cloudflare Access JSON blob.
-   // Set from Worker.accessBlobHeader in the config; kj::none for most workers.
-@@ -5454,6 +5455,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-         : onAborted(kj::mv(onAborted)),
-           idleWorker(registerIdleWorker(idleReaper(server.timer), isolateName,
-               [this]() { onAbortIsolate(); }, this->onAborted != kj::none)),
-+          startupIdentity(captureMemoryStartupIdentity()),
-           startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
-               .catch_([this](kj::Exception&& error) -> kj::Promise<void> {
-                 idleWorkerFailed(idleWorker);
-@@ -5507,6 +5509,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-     // unnamed dynamic isolates.
-     kj::Maybe<kj::Function<void()>> onAborted;
-     IdleWorkerRef idleWorker;
-+    kj::String startupIdentity;
+   kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
+       kj::Maybe<kj::String> name,
+-      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override {
++      kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
++      kj::String startupIdentity) override {
+     auto nameStr = name.map([](kj::String& n) { return toRust(n); });
+     return kj::refcounted<WorkerStubChannelHandle>(channels->load_isolate(
+-        loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource))));
++        loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource)),
++        toRustString(startupIdentity)));
+   }
  
-     kj::Maybe<kj::Rc<WorkerService>> service;  // null if still starting up
-     kj::ForkedPromise<void> startupTask;       // resolves when `service` is non-null
-@@ -5613,6 +5616,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-         // pointer is safe.
-         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
-         .idleWorker = idleWorker,
-+        .startupIdentity = startupIdentity,
-         // clang-format on
-       };
+   kj::Network& getWorkerdDebugPortNetwork() override {
+@@ -1606,7 +1608,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic);
++        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->isDynamic,
++        kj::str(spec.startup_identity));
+     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 40f2e7630c4c6a0555b7169bcf3f9a97ff68e11e..cfb2311fd1a22f976646f2fefe7b4e0e637a96ce 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -71,6 +71,8 @@ using ActorIdHandle = Worker::Actor::Id;
+ // The source of a dynamic worker, as `IoChannelFactory::loadIsolate()` receives it: the function
+ // that fetches it. `factory_new_worker()` fetches the source and compiles the worker from it; the
+ // capabilities in its `env` become the worker's own channel tables (`CompiledWorker::Impl`).
++// The loading request's creation identity travels separately in WorkerSpec, captured before this
++// callback runs and owned until the factory copies it into the isolate's limit enforcer.
+ using DynamicSource = kj::Function<kj::Promise<DynamicWorkerSource>()>;
+ // One request's metadata.
+ using RequestMetadata = IoChannelFactory::SubrequestMetadata;
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index db8f21a60ae4196408e7bf563d0bd3bcdc40c1a6..d4f8faddbd1e0460b2c20a4f4f98bfadcec7007d 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -107,6 +107,9 @@ pub mod ffi {
  
-@@ -5959,7 +5963,7 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
-   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
-   auto observer = idleIsolateObserver(name, def.isDynamic, def.idleWorker);
-   cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
--      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker);
-+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker, def.startupIdentity);
-   auto limitEnforcer = kj::addRef(*cpuLimits);
-   auto isolateGroup = jsg::newIsolateGroup();
+     struct WorkerSpec {
+         name: String,
++        /// Opaque creation identity captured synchronously by the loading request. Owned across
++        /// asynchronous source retrieval and compilation; interpreted only by the factory.
++        startup_identity: String,
+         /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
+         inbound_listeners: Vec<InboundListener>,
+         /// The `env` object: an encoded `Globals` message (compiled-bindings.capnp), in words.
+@@ -814,6 +817,7 @@ pub mod ffi {
+             loader_channel: u32,
+             name: KjMaybe<&str>,
+             source: KjOwn<DynamicSource>,
++            startup_identity: String,
+         ) -> Result<Box<WorkerStub>>;
+         /// Whether this worker has the workerd debug port binding.
+         fn has_debug_port(self: &ChannelFactory) -> bool;
+diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
+index 0fa3f3310c732b37fbfecbad78bab70bbcf6360b..e76daa25c4cf18ec50fe119e2c40795f0b74e285 100644
+--- a/src/workerd/server/server/loader.rs
++++ b/src/workerd/server/server/loader.rs
+@@ -67,6 +67,7 @@ impl WorkerLoaderNamespace {
+         self: &Rc<Self>,
+         name: Option<&str>,
+         source: KjOwn<DynamicSource>,
++        startup_identity: String,
+     ) -> Result<Rc<WorkerStub>> {
+         let server = self
+             .server
+@@ -91,6 +92,7 @@ impl WorkerLoaderNamespace {
+                     Weak::clone(&self.server),
+                     format!("{}:{name}", self.name),
+                     source,
++                    startup_identity,
+                     Some(on_abort),
+                 );
+                 self.isolates
+@@ -103,6 +105,7 @@ impl WorkerLoaderNamespace {
+                 Weak::clone(&self.server),
+                 format!("{}:dynamic:{:032x}", self.name, rand::random::<u128>()),
+                 source,
++                startup_identity,
+                 None,
+             ),
+         };
+@@ -145,6 +148,7 @@ impl WorkerStub {
+         server: Weak<Server>,
+         isolate_name: String,
+         source: KjOwn<DynamicSource>,
++        startup_identity: String,
+         on_abort: Option<Box<dyn Fn()>>,
+     ) -> Rc<Self> {
+         let fired = Cell::new(false);
+@@ -156,10 +160,16 @@ impl WorkerStub {
+                 on_abort();
+             }
+         });
+-        let startup =
+-            WorkerService::new_dynamic(factory, isolate_name, source, server, abort_isolate)
+-                .boxed_local()
+-                .shared();
++        let startup = WorkerService::new_dynamic(
++            factory,
++            isolate_name,
++            source,
++            startup_identity,
++            server,
++            abort_isolate,
++        )
++        .boxed_local()
++        .shared();
+         Rc::new(Self {
+             startup,
+             unlinked: Cell::new(false),
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index 73bbf9745908f7fdb99727f5df6ea1dbff38153a..e9bff10653d89b195fb1eefdc45d3a1f8cd434ab 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -177,6 +177,7 @@ impl WorkerService {
  
+         let spec = ffi::WorkerSpec {
+             name: name.to_owned(),
++            startup_identity: String::new(),
+             inbound_listeners,
+             globals: std::mem::take(&mut bindings.globals),
+             access_blob_header: access_blob_header.into(),
+@@ -268,11 +269,13 @@ impl WorkerService {
+         factory: Rc<Factory>,
+         name: String,
+         source: KjOwn<DynamicSource>,
++        startup_identity: String,
+         server: Weak<Server>,
+         abort_isolate: Box<dyn Fn()>,
+     ) -> Result<Rc<Self>> {
+         let spec = ffi::WorkerSpec {
+             name,
++            startup_identity,
+             inbound_listeners: Vec::new(),
+             globals: Vec::new(),
+             access_blob_header: KjMaybe::None,
+@@ -1086,13 +1089,18 @@ impl ChannelFactory {
+         loader_channel: u32,
+         name: KjMaybe<&str>,
+         source: KjOwn<DynamicSource>,
++        startup_identity: String,
+     ) -> Result<Box<WorkerStub>> {
+         let loader = self
+             .0
+             .worker_loaders
+             .get(loader_channel as usize)
+             .ok_or_else(|| kj::failed!("invalid worker loader channel number"))?;
+-        Ok(Box::new(WorkerStub(loader.load(name.into(), source)?)))
++        Ok(Box::new(WorkerStub(loader.load(
++            name.into(),
++            source,
++            startup_identity,
++        )?)))
+     }
+ 
+     pub(crate) fn has_debug_port(&self) -> bool {

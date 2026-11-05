@@ -4,3 +4,6 @@
 0008-fd-channels.patch
 0012-event-cpu-top-up.patch
 0016-rpc-code-parent-death.patch
+0005-memory-limit.patch
+0010-steady-and-worker-limits.patch
+0011-gc-pauses.patch
