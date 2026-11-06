@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.5.3 (unreleased)
+## 0.5.3 (2026-11-06)
+
+- Validation (run b25 on the released amd64 assets, 2026-11-05/06): all 188 run items of the 209-row regression list, the twelve stateful fault scenarios and the 720-minute three-node single-host run passed; the run issued 2,159,999 stateless requests, read back all 42,429 acknowledged Durable Object writes, recorded no kernel OOM kill and no unplanned process exit, and its five good-tenant failures are all attributed to first-offense large allocations by the designed bad tenants. Daemon and durable-process RSS still grew during the window without an attributed cause (recorded, not a gate).
 
 - Keep the memory-band descriptor copy above inherited descriptor numbers: when daemon fd 10 was free, workerd could receive the parent-liveness socket instead of the band and fail with `invalid inherited shared memory` (introduced during unreleased 0.5.3 development). Check every inherited descriptor source before spawn.
 

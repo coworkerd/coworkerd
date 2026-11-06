@@ -21,14 +21,14 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: preparing 0.5.3
+## Status: 0.5.3 released
 
-The main branch is preparing a 0.5.3 candidate, the maintenance release of the stable 0.5 series: the bundled Compose
+[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) (2026-11-06) is the current stable release, the maintenance release of the stable 0.5 series: the bundled Compose
 store is sized from the disk instead of a fixed 1.25 GiB, a takeover accepts a peer's open before rebuilding the
 object and refused writes are repaired at once, the daemon's memory is observable and bounded, stateless sub-calls
 run on the caller's node by default, and RPC platform errors carry a `.code` ([CHANGELOG.md](CHANGELOG.md)). Its
-package validation and twelve-hour run are pending. The published 0.5.2 remains the current stable release; these
-source changes do not replace its assets or change the result of its earlier test run.
+package validation, the twelve stateful scenarios and the 720-minute run passed on the released amd64 assets
+(run b25). The 0.5.2 assets remain published and unchanged.
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
