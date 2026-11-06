@@ -70,7 +70,14 @@ operations validate the series before mutating a checkout or exporting files.
 
 The `port-0.5.4` series targets `v1.20261031.1` and is exported from
 `coworkerd-v1.20261031.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015 and 0017, in that order. Deferred patches remain outside `series`.
+0010, 0011, 0015, 0017 and 0001, in that order. Deferred patches remain outside `series`.
+
+### 0001: native external transport
+
+Ported to the Rust server: upstream `rpc_client_start_request` supplies the
+`startEvent` metadata. This patch adds only the schema variant, configuration
+branch and Capnp transport's `start_request`. Its exact Rust exception is
+`src/workerd/server/server/services/mod.rs`.
 
 ### 0005: startup identity
 

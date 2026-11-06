@@ -9,3 +9,4 @@
 0011-gc-pauses.patch
 0015-rpc-invocation-identity.patch
 0017-creation-identity.patch
+0001-native-binding.patch

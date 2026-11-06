@@ -1140,7 +1140,7 @@ export class Host extends DurableObject {
     // A database: this runtime's own SQL Worker class, taken from the SQL_CLASS Binding (a Durable Object class
     // Binding without a namespace of its own, which is what a facet's class may be). No tenant code is loaded.
     if (target.database) return { class: env.SQL_CLASS, id: target.objectId };
-    const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx));
+    const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx), { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
     const durableObjects = durableBindings(descriptor, ctx, { caller: { namespaceId: target.namespaceId, objectId: target.objectId } });
     return { class: worker.getDurableObjectClass(DURABLE_EXPORT_PREFIX + target.className, { props: { durableObjects } }),
       id: target.objectId };
@@ -1355,7 +1355,7 @@ async function trialLoad(descriptor, env, ctx) {
   const worker = env.LOADER.get(loaderKey(descriptor), async () => {
     coldLoad = true;
     try { return await makeWorkerCode(descriptor, env, ctx); } catch (error) { stage = "code"; codeStage = stageOf(error); throw error; }
-  });
+  }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
   let report;
   try {
     const props = descriptor.format === "v2" ? { trial: true, entrypoint: descriptor.entrypoint || "default",
@@ -1415,7 +1415,7 @@ async function rpcEntrypoint(value, env, ctx) {
       (dataEpoch === "0" ? "" : "/" + dataEpoch)));
     return host.rpcTarget(JSON.stringify(value));
   }
-  const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx));
+  const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx), { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
   return worker.getEntrypoint(undefined, invocationOptions(descriptor, callProps(descriptor, ctx))).__coworkerdRpcTarget;
 }
 
@@ -1443,7 +1443,7 @@ async function serve(request, env, ctx) {
   const worker = env.LOADER.get(key, async () => {
     coldStart = true;
     return makeWorkerCode(descriptor, env, ctx);
-  });
+  }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
   const props = callProps(descriptor, ctx);
   if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
   return worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
