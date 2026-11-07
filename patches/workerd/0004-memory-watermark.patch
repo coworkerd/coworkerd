@@ -1,45 +1,85 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Tue, 13 Oct 2026 19:00:35 +0800
+Date: Sat, 7 Nov 2026 18:30:45 +0800
 Subject: [PATCH] Reap least recently used idle Workers from the Server memory
  band
 
-Coworkerd v32; reads a shared atomic band published by the Server. Keeps v30 activity semantics and destruction pacing. Only our server source changes.
+Ported from the 0.5.3 series 0004
 
-diff --git a/src/workerd/server/coworkerd-idle-eviction.c++ b/src/workerd/server/coworkerd-idle-eviction.c++
-index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38690ff5a6 100644
---- a/src/workerd/server/coworkerd-idle-eviction.c++
-+++ b/src/workerd/server/coworkerd-idle-eviction.c++
-@@ -6,6 +6,9 @@
+diff --git a/src/workerd/server/factory/coworkerd-channels.h b/src/workerd/server/factory/coworkerd-channels.h
+index cc05539b33d7ae641c3f5aa261c794b4bfb5a6b0..1cbc706a6325768a739bd59efc95309ae7d826c1 100644
+--- a/src/workerd/server/factory/coworkerd-channels.h
++++ b/src/workerd/server/factory/coworkerd-channels.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <kj/string.h>
++#include <cstdint>
+ namespace workerd::server {
+ int coworkerdPid();
+ int cpuEventsDescriptor();
+@@ -7,4 +8,5 @@ void writeLimitEvent(kj::StringPtr row);
+ void initializeCoworkerdChannels();
+ // Borrow the mapping initialized before the Rust server starts; never reopen fd5.
+ void* coworkerdLifecycleMapping();
++const uint32_t* coworkerdMemoryBandMapping();
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index 347cee9e451bf85c9e1fec9973582cfaf5995944..83465d36f54eeb03c70132b0b749248e18165a94 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -181,11 +181,16 @@ void* coworkerdLifecycleMapping() {
+   return lifecycle.base;
+ }
+ 
++const uint32_t* coworkerdMemoryBandMapping() {
++  static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
++  return static_cast<const uint32_t*>(band.base);
++}
++
+ void initializeCoworkerdChannels() {
+   coworkerdPid();
+   cpuEventsDescriptor();
+   coworkerdLifecycleMapping();
+-  static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
++  coworkerdMemoryBandMapping();
+ }
+ 
+ void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 8ba8c839b6e579a037e316725dfd21ee5827eb93..cabe7cb1c3ca939180d454fc49da100c43c58606 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -4,10 +4,10 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+-#include <unistd.h>
  #include <list>
  #include <limits>
  #include <string>
-+#include <fcntl.h>
-+#include <sys/mman.h>
-+#include <sys/stat.h>
++#include <unistd.h>
  
  namespace workerd::server {
  namespace {
-@@ -65,12 +68,29 @@ class IdleReaper {
+@@ -81,6 +81,9 @@ LifecycleChannel& lifecycleChannel() {
+   return channel;
+ }
+ 
++// Borrow the fd6 mapping established before the Rust server starts.
++const uint32_t* inheritedBand() { return coworkerdMemoryBandMapping(); }
++
+ }  // namespace
+ 
+ struct IdleWorker {
+@@ -104,12 +107,18 @@ class IdleReaper {
        : timer(timer), threshold(setting("COWORKERD_IDLE_EVICT_MS", 0)),
          interval(setting("COWORKERD_IDLE_DESTROY_INTERVAL_MS", 10)) {
      KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
-+    const char* channel = std::getenv("COWORKERD_MEMORY_BAND_FILE");
-+    if (channel && *channel) {
-+      int fd = open(channel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-+      KJ_REQUIRE(fd >= 0, "cannot open published memory band");
-+      auto closeFd = kj::defer([&] { close(fd); });
-+      struct stat info;
-+      KJ_REQUIRE(fstat(fd, &info) == 0 && info.st_size == 4096, "invalid memory band channel");
-+      auto mapping = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, 0);
-+      KJ_REQUIRE(mapping != MAP_FAILED, "cannot map published memory band");
-+      publishedBand = static_cast<const uint32_t*>(mapping);
-+    }
++    publishedBand = inheritedBand();
      publish();
 -    if (threshold) task = loop().eagerlyEvaluate(nullptr);
 +    if (threshold || publishedBand) task = loop().eagerlyEvaluate(nullptr);
    }
-+  ~IdleReaper() { if (publishedBand) munmap(const_cast<uint32_t*>(publishedBand), 4096); }
    kj::Timer& timer;
    uint32_t threshold, interval;
    uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
@@ -51,7 +91,7 @@ index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38
    double lastDestroy = 0;
    std::list<std::weak_ptr<IdleWorker>> workers;
    kj::Promise<void> task = nullptr;
-@@ -82,6 +102,7 @@ class IdleReaper {
+@@ -121,6 +130,7 @@ class IdleReaper {
          ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
          ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
          ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
@@ -59,17 +99,17 @@ index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38
          ",\"idleDestroyIntervalMs\":", interval, "}"));
    }
    void publish() {
-@@ -99,7 +120,8 @@ class IdleReaper {
+@@ -138,7 +148,8 @@ class IdleReaper {
      }
-     auto row = kj::str("{\"pid\":", getpid(), ",\"residentIsolates\":", created - destroyed,
+     auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"residentIsolates\":", created - destroyed,
          ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
 -        ",\"idleEvictions\":", evicted, ",\"loadFailureRemovals\":", failed,
 +        ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
 +        ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
          ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
          ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
-     auto path = kj::str(state, ".lifecycle"), temporary = kj::str(path, ".tmp");
-@@ -113,23 +135,35 @@ class IdleReaper {
+     if (!channel.publish(row) && !overflowReported) {
+@@ -151,23 +162,40 @@ class IdleReaper {
    kj::Promise<void> loop() {
      while (true) {
        co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
@@ -80,7 +120,12 @@ index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38
 +        bandReadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
 +            std::chrono::steady_clock::now() - start).count();
 +        ++bandReads;
-+        if (monotonicMs() - lastPublish >= 1000) { publish(); lastPublish = monotonicMs(); }
++      }
++      // At most once a second for the band.
++      if (monotonicMs() - lastPublish >= 1000 &&
++          publishedBand) {
++        publish();
++        lastPublish = monotonicMs();
 +      }
 +      auto minimum = effectiveThreshold();
 +      if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
@@ -114,7 +159,7 @@ index 065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe..838ada98683d657fdc9ba53244996e38
        }
      }
    }
-@@ -154,6 +188,7 @@ void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason) {
+@@ -191,6 +219,7 @@ void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason) {
    worker->removed = true; worker->reason = kj::str(reason);
    if (auto owner = worker->owner.lock()) {
      if (reason == "idle") ++owner->evicted;

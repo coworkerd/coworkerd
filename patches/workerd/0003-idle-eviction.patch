@@ -1,78 +1,75 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
-Date: Tue, 13 Oct 2026 01:35:44 +0800
+Date: Sat, 7 Nov 2026 18:30:45 +0800
 Subject: [PATCH] Reclaim idle dynamic Workers and remove failed loads
 
-Coworkerd v30; depends on the v29 CPU hooks and native Binding patch. Upstream v1.20261012.1 exposes lifetime and teardown hooks; no files outside server are changed.
+Ported from the 0.5.3 series 0003
 
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index ec5e7838da18ee821ef4a379fe8c171adece0b07..e88397023dff009db2a90699071785525d4734fc 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -336,10 +336,12 @@ wd_cc_library(
-     srcs = [
-         "server.c++",
-         "coworkerd-cpu-limit.c++",
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 3c2984c66e718862040babb2797230f7bdcadd71..5834dbf37eaacad945a61aded13be084f0e08adc 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -36,6 +36,8 @@ wd_cc_library(
+         "coworkerd-steady.h",
+         "coworkerd-gc.c++",
+         "coworkerd-gc.h",
 +        "coworkerd-idle-eviction.c++",
-     ],
-     hdrs = [
-         "server.h",
-         "coworkerd-cpu-limit.h",
 +        "coworkerd-idle-eviction.h",
-     ],
-     deps = [
-         ":actor-id-impl",
-diff --git a/src/workerd/server/coworkerd-cpu-limit.h b/src/workerd/server/coworkerd-cpu-limit.h
-index 212cee64053cc97311ffa5bac21d0abfbfba729e..7f04ed7280ee306f4626d38c4f1726d1ccbe04e2 100644
---- a/src/workerd/server/coworkerd-cpu-limit.h
-+++ b/src/workerd/server/coworkerd-cpu-limit.h
-@@ -1,4 +1,5 @@
- #pragma once
-+#include "coworkerd-idle-eviction.h"
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+diff --git a/src/workerd/server/factory/coworkerd-channels.h b/src/workerd/server/factory/coworkerd-channels.h
+index 7fc2b592dae9c658b4083588f73f7d90cf38576b..cc05539b33d7ae641c3f5aa261c794b4bfb5a6b0 100644
+--- a/src/workerd/server/factory/coworkerd-channels.h
++++ b/src/workerd/server/factory/coworkerd-channels.h
+@@ -5,4 +5,6 @@ int coworkerdPid();
+ int cpuEventsDescriptor();
+ void writeLimitEvent(kj::StringPtr row);
+ void initializeCoworkerdChannels();
++// Borrow the mapping initialized before the Rust server starts; never reopen fd5.
++void* coworkerdLifecycleMapping();
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index 365369bfafcf2b17eff78f1efe9d4e0236323a67..347cee9e451bf85c9e1fec9973582cfaf5995944 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -171,15 +171,20 @@ class InheritedMapping {
+ };
+ }  // namespace
  
- #include <workerd/io/actor-cache.h>
- #include <workerd/io/limit-enforcer.h>
-@@ -26,10 +27,11 @@ void recordPlatformFacts(kj::StringPtr name, bool dynamic);
- // CPU accounting stays on the isolate thread; only termination and file writes cross threads.
- class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-  public:
--  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic)
-+  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name, bool dynamic,
-+      IdleWorkerRef idleWorker = nullptr)
-       : fallback(kj::mv(fallback)), name(kj::str(name)),
-         cpuNs(uint64_t(cpuLimitFromEnvironment()) * (dynamic ? 1000000 : 0)),
--        state(cpuStateFromEnvironment()) {
-+        state(cpuStateFromEnvironment()), idleWorker(kj::mv(idleWorker)) {
-     recordPlatformFacts(name, dynamic);
-     auto paf = kj::newPromiseAndFulfiller<void>();
-     failure = paf.promise.fork();
-@@ -54,6 +56,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
-   void customizeIsolate(v8::Isolate* value) override { isolate = value; }
-   bool isEnabled() const { return cpuNs != 0; }
-+  const IdleWorkerRef& activity() const { return idleWorker; }
-   kj::Maybe<EventOutcome> outcome() {
-     return exceeded.load() ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_CPU) : kj::none;
+-void initializeCoworkerdChannels() {
+-  coworkerdPid();
+-  cpuEventsDescriptor();
++void* coworkerdLifecycleMapping() {
+   static InheritedMapping lifecycle("COWORKERD_LIFECYCLE_FD",
+       64 + 2 * (16 + size_t(8 << 20)), PROT_READ | PROT_WRITE);
+   if (lifecycle.base) {
+     auto* header = static_cast<const uint32_t*>(lifecycle.base);
+     KJ_REQUIRE(header[2] == 0x434c5743 && header[3] == (8 << 20), "invalid lifecycle channel");
    }
-@@ -204,6 +207,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   kj::String name;
-   uint64_t cpuNs;
-   kj::String state;
-+  IdleWorkerRef idleWorker;
-   v8::Isolate* isolate = nullptr;
-   uint64_t startupUsed = 0;
-   std::atomic<bool> exceeded{false};
-diff --git a/src/workerd/server/coworkerd-idle-eviction.c++ b/src/workerd/server/coworkerd-idle-eviction.c++
++  return lifecycle.base;
++}
++
++void initializeCoworkerdChannels() {
++  coworkerdPid();
++  cpuEventsDescriptor();
++  coworkerdLifecycleMapping();
+   static InheritedMapping band("COWORKERD_MEMORY_BAND_FD", 4096, PROT_READ, true);
+ }
+ 
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b32fc8abe
+index 0000000000000000000000000000000000000000..8ba8c839b6e579a037e316725dfd21ee5827eb93
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-idle-eviction.c++
-@@ -0,0 +1,251 @@
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -0,0 +1,305 @@
 +#include "coworkerd-idle-eviction.h"
 +#include "coworkerd-cpu-limit.h"
 +#include <algorithm>
 +#include <chrono>
 +#include <cstdlib>
++#include <cstring>
++#include <unistd.h>
 +#include <list>
 +#include <limits>
 +#include <string>
@@ -104,14 +101,51 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  auto line = kj::str("[coworkerd-lifecycle] ", row, '\n');
 +  ssize_t n;
 +  do { n = write(STDERR_FILENO, line.cStr(), line.size()); } while (n < 0 && errno == EINTR);
-+  const char* state = std::getenv("COWORKERD_CPU_STATE");
-+  if (state && *state) {
-+    auto path = kj::str(state, ".lifecycle.events");
-+    if (auto* f = fopen(path.cStr(), "a")) {
-+      fwrite(row.cStr(), 1, row.size(), f); fputc('\n', f); fclose(f);
-+    }
-+  }
 +}
++// The lifecycle snapshot channel: shared memory from the Server (COWORKERD_LIFECYCLE_FD) holding
++// the latest snapshot this process published. Layout, shared with the Server:
++//   [0, 8)    publications completed; the latest snapshot is in buffer (publications % 2)
++//   [8, 12)   magic 0x434c5743 ("CWLC")
++//   [12, 16)  capacity of each buffer's data in bytes
++//   buffer i at 64 + i * (16 + capacity): sequence (8; odd while being written), length (4),
++//             4 unused, data
++// One writer, this process; a reader copies the published buffer and keeps the copy only if its
++// sequence did not change meanwhile. A writer killed mid-write leaves the published buffer intact.
++class LifecycleChannel {
++ public:
++  static constexpr uint32_t MAGIC = 0x434c5743;
++  LifecycleChannel(): base(static_cast<char*>(coworkerdLifecycleMapping())) {
++    if (base) capacity = *reinterpret_cast<uint32_t*>(base + 12);
++  }
++  explicit operator bool() const { return base != nullptr; }
++  // False when the snapshot does not fit; the previous one stays published.
++  bool publish(kj::StringPtr row) {
++    auto lock = mutex.lockExclusive();
++    if (row.size() > capacity) return false;
++    auto* published = reinterpret_cast<uint64_t*>(base);
++    auto next = __atomic_load_n(published, __ATOMIC_RELAXED) + 1;
++    auto* buffer = base + 64 + (next % 2) * (16 + uint64_t(capacity));
++    auto* sequence = reinterpret_cast<uint64_t*>(buffer);
++    auto start = __atomic_load_n(sequence, __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, start + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    memcpy(buffer + 16, row.begin(), row.size());
++    __atomic_store_n(reinterpret_cast<uint32_t*>(buffer + 8), uint32_t(row.size()), __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, start + 2, __ATOMIC_RELEASE);
++    __atomic_store_n(published, next, __ATOMIC_RELEASE);
++    return true;
++  }
++ private:
++  kj::MutexGuarded<bool> mutex;
++  char* base = nullptr;
++  uint32_t capacity = 0;
++};
++// The inherited descriptors are mapped once per process and closed.
++LifecycleChannel& lifecycleChannel() {
++  static LifecycleChannel channel;
++  return channel;
++}
++
 +}  // namespace
 +
 +struct IdleWorker {
@@ -148,15 +182,15 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
 +    emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
 +        escapeCpuJsonString(worker.name), ",\"instance\":", worker.id,
-+        ",\"pid\":", getpid(), ",\"monotonicMs\":", monotonicMs(),
++        ",\"pid\":", coworkerdPid(), ",\"monotonicMs\":", monotonicMs(),
 +        ",\"active\":", worker.active, ",\"lastEndMs\":", worker.lastEnd,
 +        ",\"reason\":", escapeCpuJsonString(worker.reason), ",\"elapsedMs\":", elapsed,
 +        ",\"cpuUsedNs\":", cpu, ",\"idleEvictMs\":", threshold,
 +        ",\"idleDestroyIntervalMs\":", interval, "}"));
 +  }
 +  void publish() {
-+    const char* state = std::getenv("COWORKERD_CPU_STATE");
-+    if (!state || !*state) return;
++    auto& channel = lifecycleChannel();
++    if (!channel) return;
 +    kj::Vector<kj::String> entries;
 +    for (auto it = workers.begin(); it != workers.end();) {
 +      if (auto worker = it->lock()) {
@@ -167,18 +201,17 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +        it = workers.erase(it);
 +      }
 +    }
-+    auto row = kj::str("{\"pid\":", getpid(), ",\"residentIsolates\":", created - destroyed,
++    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"residentIsolates\":", created - destroyed,
 +        ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
 +        ",\"idleEvictions\":", evicted, ",\"loadFailureRemovals\":", failed,
 +        ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
 +        ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
-+    auto path = kj::str(state, ".lifecycle"), temporary = kj::str(path, ".tmp");
-+    if (auto* f = fopen(temporary.cStr(), "w")) {
-+      auto written = fwrite(row.cStr(), 1, row.size(), f);
-+      if (fclose(f) == 0 && written == row.size()) rename(temporary.cStr(), path.cStr());
-+      else unlink(temporary.cStr());
++    if (!channel.publish(row) && !overflowReported) {
++      overflowReported = true;
++      emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
 +    }
 +  }
++  bool overflowReported = false;
 + private:
 +  kj::Promise<void> loop() {
 +    while (true) {
@@ -206,10 +239,7 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +};
 +
 +std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer) {
-+  static std::weak_ptr<IdleReaper> current;
-+  auto reaper = current.lock();
-+  if (!reaper) { reaper = std::make_shared<IdleReaper>(timer); current = reaper; }
-+  return reaper;
++  return std::make_shared<IdleReaper>(timer);
 +}
 +IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
 +    kj::StringPtr name, kj::Function<void()> remove, bool eligible) {
@@ -218,7 +248,9 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  worker->eligible = eligible;
 +  return worker;
 +}
-+void idleWorkerReady(const IdleWorkerRef& worker) { worker->ready = true; worker->lastEnd = monotonicMs(); }
++void idleWorkerReady(const IdleWorkerRef& worker) {
++  if (worker) { worker->ready = true; worker->lastEnd = monotonicMs(); }
++}
 +void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason) {
 +  if (!worker || worker->removed) return;
 +  worker->removed = true; worker->reason = kj::str(reason);
@@ -229,6 +261,7 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  }
 +}
 +void idleWorkerFailed(const IdleWorkerRef& worker) {
++  if (!worker || worker->ready || worker->removed) return;
 +  if (auto owner = worker->owner.lock()) owner->event(*worker, "load-failed",
 +      monotonicMs() - worker->loadStart, cpuNs() - worker->loadCpu);
 +  KJ_IF_SOME(cb, worker->remove) {
@@ -246,15 +279,29 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +};
 +class IdleObserver final: public IsolateObserver {
 + public:
-+  IdleObserver(kj::StringPtr name, bool dynamic, IdleWorkerRef worker)
-+      : name(kj::str(name)), dynamic(dynamic), worker(kj::mv(worker)) {}
++  IdleObserver(kj::StringPtr name, bool dynamic, IdleWorkerRef worker,
++      kj::Own<IsolateObserver> inner)
++      : name(kj::str(name)), dynamic(dynamic), worker(kj::mv(worker)), inner(kj::mv(inner)) {}
++  kj::Maybe<AsyncTraceConfig> getAsyncTraceConfig() const override {
++    return inner->getAsyncTraceConfig();
++  }
++  void addAsyncTraceSinks(AsyncTraceSinks& sinks, kj::StringPtr name,
++      kj::Maybe<kj::StringPtr> actorId) const override {
++    inner->addAsyncTraceSinks(sinks, name, actorId);
++  }
 +  void created() override {
++    inner->created();
 +    if (!worker) return;
 +    worker->created = true;
 +    if (auto owner = worker->owner.lock()) { ++owner->created; owner->event(*worker, "created"); owner->publish(); }
 +  }
-+  void teardownStarted() override { if (worker) worker->teardownStart = monotonicMs(); }
++  void teardownStarted() override {
++    inner->teardownStarted();
++    if (worker) worker->teardownStart = monotonicMs();
++  }
++  void teardownLockAcquired() override { inner->teardownLockAcquired(); }
 +  void teardownFinished() override {
++    inner->teardownFinished();
 +    auto elapsed = worker ? monotonicMs() - worker->teardownStart : 0;
 +    if (worker) {
 +      worker->destroyed = true;
@@ -273,6 +320,7 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  kj::String name;
 +  bool dynamic;
 +  IdleWorkerRef worker;
++  kj::Own<IsolateObserver> inner;
 +};
 +class IdleInterface final: public WorkerInterface {
 + public:
@@ -311,19 +359,20 @@ index 0000000000000000000000000000000000000000..065f8ea6fc65c92aa6ecc7fa5063a68b
 +  if (!worker) return {};
 +  return kj::heap<Activity>(worker);
 +}
-+kj::Own<IsolateObserver> idleIsolateObserver(kj::StringPtr name, bool dynamic, IdleWorkerRef worker) {
-+  return kj::atomicRefcounted<IdleObserver>(name, dynamic, kj::mv(worker));
++kj::Own<IsolateObserver> idleIsolateObserver(kj::StringPtr name, bool dynamic, IdleWorkerRef worker,
++    kj::Own<IsolateObserver> inner) {
++  return kj::atomicRefcounted<IdleObserver>(name, dynamic, kj::mv(worker), kj::mv(inner));
 +}
 +kj::Own<WorkerInterface> wrapIdleWorkerInterface(kj::Own<WorkerInterface> inner, const IdleWorkerRef& worker) {
 +  if (!worker) return inner;
 +  return kj::heap<IdleInterface>(kj::mv(inner), worker);
 +}
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-idle-eviction.h b/src/workerd/server/coworkerd-idle-eviction.h
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.h b/src/workerd/server/factory/coworkerd-idle-eviction.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0c5c3967f777d0c248d1491d21ca33f97793dbff
+index 0000000000000000000000000000000000000000..ffd993267a7fb6883f7776e0c0af1fbeacbe8c30
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-idle-eviction.h
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.h
 @@ -0,0 +1,27 @@
 +#pragma once
 +
@@ -348,151 +397,210 @@ index 0000000000000000000000000000000000000000..0c5c3967f777d0c248d1491d21ca33f9
 +void detachIdleWorker(const IdleWorkerRef& worker);
 +kj::Own<void> idleActivity(const IdleWorkerRef& worker);
 +kj::Own<IsolateObserver> idleIsolateObserver(kj::StringPtr name,
-+    bool dynamic, IdleWorkerRef worker);
++    bool dynamic, IdleWorkerRef worker, kj::Own<IsolateObserver> inner);
 +kj::Own<WorkerInterface> wrapIdleWorkerInterface(
 +    kj::Own<WorkerInterface> inner, const IdleWorkerRef& worker);
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index eb5613e499259b3ef98d59cab8a8ff48b4c1f404..d7dc8fbc1c2497ad8808a6ba2c7c971cf0e0246c 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -4139,7 +4139,7 @@ class Server::WorkerService final: public Service,
-     auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-         kj::mv(props), kj::mv(actor),
-         kj::mv(requestLimits),
--        {},  // ioContextDependency
-+        idleActivity(cpuLimits->activity()),  // ioContextDependency
-         addRefToThis(), kj::mv(observer), waitUntilTasks,
-         true,                  // tunnelExceptions
-         kj::mv(workerTracer),  // workerTracer
-@@ -4148,7 +4148,7 @@ class Server::WorkerService final: public Service,
-         kj::mv(triggerContext), IsDynamicDispatch::NO, kj::mv(accessInfo),
-         kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
-         kj::mv(metadata.clientAddress));
--    return wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits);
-+    return wrapIdleWorkerInterface(wrapCpuWorkerInterface(kj::mv(entry), *cpuLimits), cpuLimits->activity());
-   }
+diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
+index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a2449f0fd90 100644
+--- a/src/workerd/server/factory/worker-factory-impl.h
++++ b/src/workerd/server/factory/worker-factory-impl.h
+@@ -8,6 +8,7 @@
  
-  private:
-@@ -5324,6 +5324,7 @@ struct Server::WorkerDef {
-   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
-   // themselves from the loader's isolate map.
-   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
-+  IdleWorkerRef idleWorker;
+ #include "worker-factory.h"
+ #include "coworkerd-cpu-limit.h"
++#include "coworkerd-idle-eviction.h"
  
-   // HTTP header name from which to extract the per-request Cloudflare Access JSON blob.
-   // Set from Worker.accessBlobHeader in the config; kj::none for most workers.
-@@ -5334,10 +5335,12 @@ struct Server::WorkerDef {
- };
- 
- class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
-+  class WorkerStubImpl;
+ #include <workerd/io/actor-sqlite.h>
+ #include <workerd/io/io-thread-context.h>
+@@ -129,6 +130,7 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
+   // Background work no request owns: container cleanup, trace delivery, and the Rust server's
+   // tasks (factory_spawn). Declared last, so that it is destroyed first: a task may hold anything
+   // else here.
++  std::shared_ptr<IdleReaper> idleReaper;
+   kj::TaskSet tasks;
+   // How many tasks factory_spawn has added; factory_settle_tasks waits for it to stop growing.
+   uint64_t spawnCount = 0;
+@@ -171,6 +173,7 @@ class WorkerTimerChannel final: public TimerChannel {
+ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
   public:
-   WorkerLoaderNamespace(Server& server, kj::String namespaceName)
-       : server(server),
-         namespaceName(kj::mv(namespaceName)),
-+        reaper(idleReaper(server.timer)),
-         startupTasks(*this) {}
+   Impl(const WorkerFactory& factory, kj::String name);
++  ~Impl() noexcept(false);
  
-   void unlink() {
-@@ -5362,8 +5365,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-         kj::Function<void()> onAborted = [this, mapKey = kj::str(n)]() { removeIsolate(mapKey); };
+   const WorkerFactory& factory;
+   kj::String name;
+@@ -193,6 +196,10 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
+   kj::Maybe<kj::String> accessBlobHeader;
+   bool isDynamic = false;
+   kj::Maybe<CoworkerdWorkerIdentity> coworkerdIdentity;
++  IdleWorkerRef idleWorker;
++  bool idleReady = false;
++  // LinkedChannels owns loopback references; worker_unlink releases this copy first.
++  kj::Maybe<::rust::Box<ChannelFactory>> idleChannels;
+   kj::Own<CpuIsolateLimitEnforcer> cpuLimits;
  
-         return {.key = kj::mv(n),
--          .value = kj::rc<WorkerStubImpl>(
--              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource))};
-+          .value = keepStarting(kj::rc<WorkerStubImpl>(
-+              server, kj::mv(isolateName), kj::mv(onAborted), kj::mv(fetchSource)))};
-       })
-           .addRef()
-           .toOwn();
-@@ -5387,6 +5390,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-     }
+   kj::Maybe<kj::Own<const Worker>> worker;
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 380348373aebb55827efb93f17d1b5233e958c60..0b8ebd9552ce552ad2a87ade4564b75d7597d530 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -89,6 +89,7 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
+       channelTokenHandler(factory,
+           this->config.hasCluster() ? kj::Maybe<kj::StringPtr>(this->config.getCluster().getKey())
+                                     : kj::none),
++      idleReaper(server::idleReaper(timer)),
+       tasks(*this) {
+   // The config's logging settings go on top of the caller's.
+   auto& logging = this->options->loggingOptions;
+@@ -894,6 +895,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
+         .attach(kj::addRef(*this));
+   }
+   void abortIsolate(kj::StringPtr reason) noexcept override {
++    idleWorkerRemoved(worker->idleWorker, "cpu");
+     channels->abort_isolate(toRustString(reason));
    }
  
-+  kj::Rc<WorkerStubImpl> keepStarting(kj::Rc<WorkerStubImpl> stub) {
-+    startupTasks.add(stub->whenStartupDone().then(
-+        [keep = stub.addRef()]() {}, [](kj::Exception&&) {}));
-+    return stub;
+@@ -1149,12 +1151,14 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+         channel->abortIsolate("CPU limit exceeded");
+       });
+   auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
++      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits),
++      idleActivity(worker.idleWorker),
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+       kj::mv(metadata.clientAddress));
+-  return wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits);
++  return wrapIdleWorkerInterface(
++      wrapCpuWorkerInterface(kj::mv(entry), *worker.cpuLimits), worker.idleWorker);
+ }
+ 
+ }  // namespace
+@@ -1358,6 +1362,22 @@ CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
+       timerChannel(factory.getImpl().timer, factory.getImpl().monotonicClock),
+       waitUntilTasks(*this) {}
+ 
++CompiledWorker::Impl::~Impl() noexcept(false) {
++  idleChannels = kj::none;
++  if (idleWorker && !idleReady) {
++    // A failed startup destroys its compiled isolate before reporting load-failed,
++    // as the 0.5.3 startup promise did when unwinding its failed service.
++    KJ_IF_SOME(w, worker) {
++      w->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock&) {
++        ctxExportsHandle = kj::none;
++      });
++    }
++    worker = kj::none;
++    idleWorkerFailed(idleWorker);
 +  }
++  detachIdleWorker(idleWorker);
++}
 +
-   void removeIsolate(kj::StringPtr name) {
-     // This is called by abortIsolate()
-     isolates.erase(name);
-@@ -5395,8 +5404,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-  private:
-   Server& server;
-   kj::String namespaceName;
-+  std::shared_ptr<IdleReaper> reaper;
+ void CompiledWorker::Impl::taskFailed(kj::Exception&& exception) {
+   KJ_LOG(ERROR, exception);
+ }
+@@ -1543,6 +1563,10 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
+   impl->isDynamic = dynamicSource != kj::none;
+   if (spec.load_identity.present) {
++    impl->idleWorker = registerIdleWorker(factory.idleReaper, impl->name,
++        [target = impl.get()]() {
++      KJ_IF_SOME(channels, target->idleChannels) channels->abort_isolate("idle");
++    }, spec.load_identity.present);
+     const auto& identity = spec.load_identity;
+     impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
+       kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
+@@ -1645,7 +1669,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+         workerSource.variant.is<WorkerSource::ScriptSource>() && !usingNewModuleRegistry
+         ? Worker::ConsoleMode::INSPECTOR_ONLY
+         : options.loggingOptions.consoleMode;
+-    return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), newIsolateObserver(options),
++    return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api),
++        idleIsolateObserver(isolateName, impl->isDynamic, impl->idleWorker,
++            newIsolateObserver(options)),
+         isolateName, kj::mv(limitEnforcer), policy, kj::mv(isolateLoggingOptions));
+   };
  
--  class WorkerStubImpl;
-   kj::HashMap<kj::String, kj::Rc<WorkerStubImpl>> isolates;
+@@ -1794,8 +1820,16 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
+   });
+ }
  
-   // Holds tasks that keep unnamed WorkerStubImpl instances alive while their
-@@ -5443,7 +5452,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-         kj::Maybe<kj::Function<void()>> onAborted,
-         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource)
-         : onAborted(kj::mv(onAborted)),
--          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource)).fork()),
-+          idleWorker(registerIdleWorker(idleReaper(server.timer), isolateName,
-+              [this]() { onAbortIsolate(); }, this->onAborted != kj::none)),
-+          startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource))
-+              .catch_([this](kj::Exception&& error) -> kj::Promise<void> {
-+                idleWorkerFailed(idleWorker);
-+                return kj::mv(error);
-+              }).fork()),
-           cleanupTaskSet(server.tasks) {}
++void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels) {
++  auto& impl = worker.getImpl();
++  impl.idleChannels = kj::mv(channels);
++  impl.idleReady = true;
++  idleWorkerReady(impl.idleWorker);
++}
++
+ void worker_unlink(const CompiledWorker& worker) {
+   auto& impl = worker.getImpl();
++  impl.idleChannels = kj::none;
+   impl.waitUntilTasks.clear();
+   impl.subrequestChannels.clear();
+   impl.actorClassChannels.clear();
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 26437373dac337a20476e8896ad0efbe1f487379..0bb1cc59064335f71e51dd8d3a9405b808de929f 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -207,6 +207,7 @@ class CompiledWorker final {
  
-     // Returns a branch of the startup task promise. Used by the namespace to
-@@ -5453,6 +5468,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
+ WorkerInfo worker_info(const CompiledWorker& worker);
+ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
++void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels);
+ void worker_unlink(const CompiledWorker& worker);
+ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+     kj::Maybe<::rust::Str> entrypoint,
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index ad640ee73accdc5ade4b29aec299d183e266830e..62a4def8850992ceba019d277354039a569a5db5 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -378,6 +378,8 @@ pub mod ffi {
+         /// Compiles `ctx.exports` from an encoded `Globals` message. Called once, after the
+         /// server has numbered the worker's loopback channels.
+         fn worker_set_ctx_exports(worker: &CompiledWorker, globals: &[u64]) -> Result<()>;
++        /// Gives the C++ idle reaper the linked worker's existing abort path.
++        fn worker_idle_ready(worker: &CompiledWorker, channels: Box<ChannelFactory>) -> Result<()>;
+         /// Cancels the worker's requests still in flight (background work past the response: a
+         /// `waitUntil()`, a tail worker's event), each of which holds the worker and its I/O
+         /// channels; and drops a dynamic worker's env channel tables and tails, which may refer
+diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
+index 3c07edd8edec414452cf9c1d5543f087de02478f..2c9103c7e79a2cf93959571ae53273af0e82c88d 100644
+--- a/src/workerd/server/server/loader.rs
++++ b/src/workerd/server/server/loader.rs
+@@ -116,9 +116,21 @@ impl WorkerLoaderNamespace {
+         // an aborted named stub has left the map. A stub dropped before its service exists would
+         // leave that service never unlinked.
+         let keep = Rc::clone(&stub);
++        let namespace = Rc::downgrade(self);
++        let name = name.map(str::to_owned);
+         factory.spawn_detached(async move {
+-            // A startup failure reaches the callers that await the stub.
+-            let _ = keep.startup().await;
++            // Callers retain the failed result, but a later named load may try fresh source.
++            if keep.startup().await.is_err()
++                && let (Some(namespace), Some(name)) = (namespace.upgrade(), name)
++            {
++                let mut isolates = namespace.isolates.borrow_mut();
++                if isolates
++                    .get(&name)
++                    .is_some_and(|current| Rc::ptr_eq(current, &keep))
++                {
++                    isolates.remove(&name);
++                }
++            }
+         });
+         Ok(stub)
      }
- 
-     ~WorkerStubImpl() {
-+      detachIdleWorker(idleWorker);
-       // Defer unlink and destruction of `WorkerService` to the next turn of the event loop. This
-       // is needed because worker stubs are typically destroyed while some other isolate is
-       // current, and so we cannot enter the dynamic worker's isolate to tear it down. It's even
-@@ -5490,6 +5506,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-     // Callback to remove the worker stub from the isolates map. None for
-     // unnamed dynamic isolates.
-     kj::Maybe<kj::Function<void()>> onAborted;
-+    IdleWorkerRef idleWorker;
- 
-     kj::Maybe<kj::Rc<WorkerService>> service;  // null if still starting up
-     kj::ForkedPromise<void> startupTask;       // resolves when `service` is non-null
-@@ -5498,6 +5515,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-     bool unlinked = false;
- 
-     void onAbortIsolate() {
-+      idleWorkerRemoved(idleWorker, "cpu");
-       KJ_IF_SOME(cb, onAborted) {
-         auto callback = kj::mv(cb);
-         onAborted = kj::none;
-@@ -5594,6 +5612,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
-         // pointer is safe.
-         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
-+        .idleWorker = idleWorker,
-         // clang-format on
-       };
- 
-@@ -5607,6 +5626,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
-       errorReporter.throwIfErrors();
- 
-       this->service = kj::mv(service);
-+      idleWorkerReady(idleWorker);
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index 7f16cd7034f857bf44304b6dcfd9b20a847baa63..21c6c62e6aa19949fb1e18b4575da02e27b85a85 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -358,6 +358,7 @@ impl WorkerService {
+             },
+             None,
+         )?;
++        ffi::worker_idle_ready(&this.worker, Box::new(ChannelFactory(this.channels()?)))?;
+         Ok(this)
      }
- 
-     class SubrequestChannelImpl final: public IoChannelFactory::SubrequestChannel {
-@@ -5937,9 +5957,9 @@ kj::Own<Worker::Isolate> Server::makeWorkerIsolate(kj::StringPtr name,
-     kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
-     kj::Own<CpuIsolateLimitEnforcer>& cpuLimits) {
-   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
--  auto observer = kj::atomicRefcounted<IsolateObserver>();
-+  auto observer = idleIsolateObserver(name, def.isDynamic, def.idleWorker);
-   cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
--      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic);
-+      kj::refcounted<NullIsolateLimitEnforcer>(), name, def.isDynamic, def.idleWorker);
-   auto limitEnforcer = kj::addRef(*cpuLimits);
-   auto isolateGroup = jsg::newIsolateGroup();
- 
+ }

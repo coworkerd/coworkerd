@@ -10,3 +10,6 @@
 0015-rpc-invocation-identity.patch
 0017-creation-identity.patch
 0001-native-binding.patch
+0003-idle-eviction.patch
+0004-memory-watermark.patch
+0018-idle-collector-lifecycle-gc.patch

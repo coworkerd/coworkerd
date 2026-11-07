@@ -70,7 +70,33 @@ operations validate the series before mutating a checkout or exporting files.
 
 The `port-0.5.4` series targets `v1.20261031.1` and is exported from
 `coworkerd-v1.20261031.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015, 0017 and 0001, in that order. Deferred patches remain outside `series`.
+0010, 0011, 0015, 0017, 0001, 0003, 0004 and 0018, in that order.
+Deferred patches remain outside `series`.
+
+### 0003 / 0004: dynamic Worker lifecycle
+
+The C++ factory owns the idle reaper and each compiled worker owns its lifecycle handle.
+Creation-record presence selects eligible workers; isolate names remain opaque and unchanged.
+The single `worker_idle_ready` bridge receives the existing linked ChannelFactory after a
+successful link. Idle and watermark eviction use its existing abort path, and `worker_unlink`
+releases it before Rust drops its linked channels. Failed named startups are removed from the
+namespace map only if it still holds that stub. These are the three exact Rust exceptions:
+`server/server/worker.rs`, `server/server/loader.rs` and `server/server/bridge.rs` below
+`src/workerd/`. 0004 has no Rust changes.
+
+The publisher borrows the fd5 mapping established by 0008, preserving the released double-buffer
+protocol and JSON fields. Lifecycle rows remain on stderr. 0004 borrows fd6, selects the original,
+5000 ms or 1000 ms idle threshold, and evicts in LRU order with the existing destruction pacing.
+
+### 0011 / 0018: GC accounting and idle collection
+
+0011 contains GC callbacks, per-Worker CPU budget accounting and gc-pause rows. Its deferred idle
+collector and lifecycle snapshot hunks are split into `0018-idle-collector-lifecycle-gc.patch`.
+0018 attaches the collector after ready, holds the Worker through an asynchronous collection,
+and detaches it when the compiled worker is destroyed. Activity and event-loop stalls postpone
+collection; actor top-ups count activity and exclude actor isolates from idle collection.
+`processGcJson()` supplies the original process-level `gc` object in fd5. Per-isolate actor and
+collection counters remain in lifecycle events. No new Rust bridge or state is introduced.
 
 ### 0001: native external transport
 
