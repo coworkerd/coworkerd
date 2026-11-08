@@ -1842,6 +1842,11 @@ public:
         b.syscalls.steady.active = false;
         b.syscalls.steady.reason = error.what();
       }
+      if (b.syscalls.mode == "observe" && b.syscalls.steady.mode == "observe") {
+        b.syscalls.steady.active = false;
+        b.syscalls.steady.reason = "the startup table's observe mode holds the process's only seccomp notification listener; "
+            "the steady-state observe filter cannot be installed (EBUSY); set the startup table to enforce for steady observe";
+      }
       b.checkRecord = runCheck(raisedProgram);
       b.launcherVersion = recordField(b.checkRecord, "version");
       b.active = true;
@@ -2014,6 +2019,7 @@ public:
         // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).
         << (egressAddress.empty() ? std::string() : "(name = \"egress\", external = (address = \"" + escape(egressAddress) +
             "\", http = (style = proxy))),\n") <<
+        "(name = \"internet\", network = (allow = [], deny = [])),\n"
         "(name = \"none\", network = (allow = [], deny = []))],\n"
         // No address: the listening socket is the descriptor given with --socket-fd.
         "sockets = [(name = \"rpc\", service = \"runtime\", http = (capnpConnectHost = \"coworkerd-runtime\"))]);\n";

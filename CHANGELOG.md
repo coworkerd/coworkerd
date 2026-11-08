@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4 (unreleased)
+
+- Define an explicit `internet` network service without TLS options in generated workerd configurations, so the Rust server does not load system trust roots; tenant egress continues through the node proxy.
+- Reject simultaneous startup and steady-state `observe` filters before launch: the startup filter owns the sole seccomp notification listener (`EBUSY`); `auto` warns and disables the steady filter, and `launcher` refuses to start.
+
 ## 0.5.3 (unreleased)
 
 - Keep the memory-band descriptor copy above inherited descriptor numbers: when daemon fd 10 was free, workerd could receive the parent-liveness socket instead of the band and fail with `invalid inherited shared memory` (introduced during unreleased 0.5.3 development). Check every inherited descriptor source before spawn.
