@@ -7,6 +7,8 @@ Ported from the 0.5.3 series 0010
 
 Install the existing serving-time seccomp policy and non-dumpable setting at the first request. Preserve per-Worker CPU and memory limits from the final loader-key segment.
 
+Size the steady filter for each architecture and require its exact emitted length.
+
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
 index 303eb0aa1d92813a5456f96abf5ea2b3eec7587c..63e1001767d5bc2b871356a3e914842ccc3f58d7 100644
 --- a/src/workerd/server/factory/BUILD.bazel
@@ -110,10 +112,10 @@ index 37ab83e5910ecfeac23baca44f241d4116c6b47b..f3602112d929d1be35d44b1117429d95
    kj::String startupIdentity;
 diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc61d97109
+index 0000000000000000000000000000000000000000..c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-steady.c++
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,295 @@
 +#include "coworkerd-steady.h"
 +
 +#include <atomic>
@@ -125,6 +127,8 @@ index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc
 +#include <mutex>
 +#include <unistd.h>
 +#if __linux__
++#include <kj/debug.h>
++
 +#include <fcntl.h>
 +#include <linux/audit.h>
 +#include <linux/filter.h>
@@ -198,6 +202,16 @@ index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc
 +  if (digits && count < MAX_CALLS) numbers[count++] = value;
 +  close(fd);
 +  return count;
++}
++
++size_t programLength(size_t count) {
++#if defined(__x86_64__)
++  return count + 9;
++#elif defined(__aarch64__)
++  return count + 6;
++#else
++#error "the steady-state system call filter needs this architecture's audit arch"
++#endif
 +}
 +
 +// The launcher's filter layout (launcher/launcher.c, spike 21 PROTOCOL 4.4), so that both tables are
@@ -326,9 +340,11 @@ index 0000000000000000000000000000000000000000..7118f562d2bdbf80f7f28ed99d9278bc
 +    failure = ENOENT;
 +  }
 +  if (count > 0) {
-+    std::vector<struct sock_filter> program(count + 8);
-+    instructions = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
++    std::vector<struct sock_filter> program(programLength(count));
++    const auto at = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
 +        program.data());
++    KJ_REQUIRE(at == program.size(), count, at, program.size());
++    instructions = at;
 +    struct sock_fprog filter = {static_cast<unsigned short>(instructions), program.data()};
 +    // no_new_privs is seccomp(2)'s precondition for an unprivileged process. The launcher set it and it
 +    // survives the execve; setting it again keeps this independent of how the process was started.

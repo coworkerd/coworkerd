@@ -2,6 +2,8 @@
 
 ## 0.5.4 (unreleased)
 
+- Fix the amd64 steady-state seccomp filter buffer overflow by allocating its exact architecture-specific instruction count and checking the emitted length (0.5.3 amd64 在开 steady enforce / observe 时潜伏).
+
 - Port shipped facet alarms and namespace resident-object limits to the Rust server, preserving hibernating WebSockets, wake accounting and the node's refusal-code protocol. This completes the stage 3 Durable Object port.
 - Port Durable Object WAL shipping to the Rust server's actor tree and C++ factory, preserving the node protocol, confirmation gate, reset/delete notifications and shipped `cloneFacet()` rejection.
 - Define an explicit `internet` network service without TLS options in generated workerd configurations, so the Rust server does not load system trust roots; tenant egress continues through the node proxy.
