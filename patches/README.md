@@ -70,8 +70,34 @@ operations validate the series before mutating a checkout or exporting files.
 
 The `port-0.5.4` series targets `v1.20261108.1` and is exported from
 `coworkerd-v1.20261108.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015, 0017, 0001, 0003, 0004 and 0018, in that order.
-Deferred patches remain outside `series`.
+0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018 and 0013, in that order.
+0013 is the sixteenth patch; 0014 remains deferred outside `series`.
+
+### 0013: Durable Object WAL shipping
+
+The factory uses 0013's original WAL hook, frame validation, commit boundaries and node
+protocol. `ActorStorageSpec` carries the shipped flag, the root's `idFromName` name,
+the facet name and its parent id. The root name follows the existing parent chain;
+an unnamed root falls back to its storage key. Only durable storage with a directory
+can be shipped, and cluster replication with the node's log is a configuration error.
+C++ remains the first reader and validator of the inherited log descriptor through
+the fallible `factory_durable_log_enabled` bridge.
+
+The exact Rust exceptions are `src/workerd/server/server/actor.rs` and
+`src/workerd/server/server/bridge.rs`: Rust owns the root metadata, fills the storage
+spec and rejects shipped `cloneFacet()` before any abort or same-name early return.
+The namespace handle supplies the shipped root name when deleting unopened facets.
+C++ deletes descendants first, sends DELETE, then removes the database files.
+After a reset, the existing Rust callback closes descendants, WAL mode is restored,
+the shipper sends RESET, and descendant storage deletion sends the child DELETEs.
+The existing cluster committer branch remains unchanged.
+
+Bootstrap registers the same Tokio provider used by the parent-liveness channel.
+The replicator wraps fd 9 once on first use and is shut down before that provider is
+destroyed. Its empty static owner does not use the provider at process exit.
+These hooks depend on actor/storage metadata and factory lifetime, not on Worker
+loading shape. Facet alarms, residency policy and the 0014 refusal-code extensions
+remain deferred.
 
 ### 0003 / 0004: dynamic Worker lifecycle
 
@@ -146,8 +172,9 @@ supply this record when their integration is ported.
 | Upstream tag | Commit | V8 | Series |
 | --- | --- | --- | --- |
 | `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
-| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | Same 15 patches replayed in series order |
+| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches plus the 0013 WAL port (16 total) |
 
 The November 8 replay keeps the upstream handoff metadata accessors alongside the
-Coworkerd invocation-identity setter. The Rust path exceptions and creation-record
-contract are unchanged. Upstream cluster features remain inactive.
+Coworkerd invocation-identity setter. The creation-record contract is unchanged;
+0013 adds only its two exact Rust path exceptions described above. Upstream cluster
+features remain inactive.

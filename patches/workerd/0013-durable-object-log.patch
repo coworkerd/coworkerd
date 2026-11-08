@@ -1,88 +1,66 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Sun, 25 Oct 2026 22:34:41 +0800
-Subject: [PATCH] Ship a Durable Object's committed WAL frames to the node and
- hold its answers until they are confirmed
+From: maslow <wangfugen@126.com>
+Date: Sun, 8 Nov 2026 19:29:13 +0800
+Subject: [PATCH] Port Durable Object WAL shipping to the Rust actor factory
 
-Coworkerd v61, depends on v39's inherited descriptors (0008). A Durable Object's data no longer
-stays on the node that owns its shard. The localDisk actor storage factory gives every database it
-opens a shipper: the database is kept in WAL mode with SQLite's own checkpointing off
-(sqlite3_wal_autocheckpoint(0), SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) and synchronous=OFF, because this
-machine's files are a cache and the write is durable once the node's peers hold its frames.
-ActorSqlite's commit callback becomes the shipper's: it reads the frames committed since the last
-one from the <database>-wal file, checks each as SQLite's own recovery does (the generation's salt,
-a page number, the chained checksum) and takes only those up to the last commit frame, so a
-transaction is handed on whole or not at all; sqlite3_wal_hook only records SQLite's exact frame
-count, which says whether the WAL holds a frame the shipper has not read. The frames go to the
-node's replicator over the descriptor COWORKERD_DO_WAL_FD, inherited at startup like the Server's
-other channels (nothing is opened by path), and the promise the callback returns -- which the output
-gate waits on, so every answer of the object waits with it -- resolves when the node confirms them.
-The shipper has its own deadline, COWORKERD_DO_CONFIRM_TIMEOUT_MS (5000, below workerd's 30 s output
-gate timeout): past it the node is told which request it gave up on, and the write fails with a
-jsg.Error naming STORAGE_UNAVAILABLE, so the caller gets a code rather than a reset object. A
-checkpoint (TRUNCATE) is made only by the shipper, when the WAL has grown past
-COWORKERD_DO_CHECKPOINT_BYTES (4 MiB) or the node says the object is idle, and only once every frame
-read has been handed on, the connection is idle and the WAL holds nothing unread. afterReset()
-(deleteAll) applies the settings again and tells the node to start the object from empty;
-deleteFacetImpl() tells it a facet's files are gone, and cloneFacet() is refused for a shipped
-namespace, because a copy of a database behind SQLite's back reaches no log. Opening a database that
-already has a WAL reports where it starts, and the node breaks the object when that is past what it
-confirmed: frames nobody confirmed must not be read. Without the descriptor nothing of this runs.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 3d372f798b831f16d4285678080e44d02c990b93..6e8fac98dd1b250cec0466d1f3700c621ca9a35f 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -339,6 +339,7 @@ wd_cc_library(
-         "coworkerd-gc.c++",
-         "coworkerd-idle-eviction.c++",
-         "coworkerd-steady.c++",
-+        "coworkerd-wal-shipper.c++",
-     ],
-     hdrs = [
-         "server.h",
-@@ -346,9 +347,11 @@ wd_cc_library(
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index a5cbcf20b64de6a07a0462403449d22d7180ddff..27ead7ad05c3ce86c9476b81bb717914c2e304e5 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -38,15 +38,17 @@ wd_cc_library(
          "coworkerd-gc.h",
+         "coworkerd-idle-eviction.c++",
          "coworkerd-idle-eviction.h",
-         "coworkerd-steady.h",
-+        "coworkerd-wal-shipper.h",
++        "coworkerd-wal-shipper.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+         "worker-factory-rpc.c++",
      ],
+-    hdrs = ["coworkerd-channels.h"],
++    hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
+     linkstatic = CC_LIBRARY_LINKSTATIC,
      deps = [
-         ":coworkerd-memory-limit",
+         ":worker-factory-hdrs",
 +        "@sqlite3",
-         ":actor-id-impl",
-         ":alarm-scheduler",
-         ":channel-token",
-diff --git a/src/workerd/server/cli-main.c++ b/src/workerd/server/cli-main.c++
-index d9687a2180e32ea955ac9bb720df848a83e851e4..c237099987de7291644d6a78361b049df90395a8 100644
---- a/src/workerd/server/cli-main.c++
-+++ b/src/workerd/server/cli-main.c++
-@@ -4,6 +4,7 @@
+         "//src/rust/worker:bridge",
+         "//src/workerd/api:memory-cache",
+         "//src/workerd/api:pyodide",
+diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
+index 0b61718cc33f8ed6f525a4519fd32676d92d78c6..f96e2ac9de03d05eedec664e7feafee5ece2a7fa 100644
+--- a/src/workerd/server/factory/bootstrap.c++
++++ b/src/workerd/server/factory/bootstrap.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
  
- #include "cli-main.h"
- 
+ #include "bootstrap.h"
 +#include "coworkerd-wal-shipper.h"
- #include "server.h"
+ #include "coworkerd-parent-death.h"
+ #include "coworkerd-channels.h"
  
- #include <workerd/io/compatibility-date.capnp.h>
-@@ -187,6 +188,9 @@ class CliMain {
-   }
- 
-   void applyServeOptions(const ServeOptions& options) {
-+    // Coworkerd: the descriptor the node passed for its Durable Object log is wrapped with this process's own
-+    // I/O provider; nothing is opened by path after startup (patches/workerd 0008).
-+    setDurableLogProvider(*io.lowLevelProvider);
-     for (auto& o: options.socket_addr_overrides) {
-       server->overrideSocket(kj::str(o.name), kj::str(o.value));
+@@ -152,6 +153,7 @@ class Bootstrap {
+         provider(loop.getTimer()) {
+     initializeCoworkerdChannels();
+     followCoworkerdParent(parentProvider);
++    setDurableLogProvider(parentProvider);
+     KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
+ #ifdef WORKERD_USE_PERFETTO
+       perfettoSession = PerfettoSession(kj::str(path),
+@@ -190,6 +192,7 @@ class Bootstrap {
+   // Ends the --async-trace file. The factory is destroyed first, ending every context, so the exit
+   // line follows their ends.
+   ~Bootstrap() noexcept(false) {
++    shutdownDurableLog();
+     KJ_IF_SOME(writer, asyncTraceWriter) {
+       writer->finish();
      }
-diff --git a/src/workerd/server/coworkerd-wal-shipper.c++ b/src/workerd/server/coworkerd-wal-shipper.c++
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..432c403d8dbd4640541e69c945fff8da222fdcdf
+index 0000000000000000000000000000000000000000..16636beeae1471f4cdd95812c05fa8a9a2798539
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-wal-shipper.c++
-@@ -0,0 +1,760 @@
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -0,0 +1,782 @@
 +// Coworkerd: see coworkerd-wal-shipper.h.
 +#include "coworkerd-wal-shipper.h"
 +
@@ -253,9 +231,22 @@ index 0000000000000000000000000000000000000000..432c403d8dbd4640541e69c945fff8da
 +class Replicator final: private kj::TaskSet::ErrorHandler {
 + public:
 +  static Replicator& get() {
-+    // Deliberately leaked: the channel lives as long as the process.
-+    static Replicator* instance = new Replicator();
++    auto& instance = holder();
++    if (instance.get() == nullptr) instance = kj::heap<Replicator>();
 +    return *instance;
++  }
++
++  Replicator(): tasks(*this) {}
++
++  ~Replicator() noexcept(false) {
++    // Cancel I/O while the stream, buffers and provider are all still alive.
++    tasks.clear();
++    writeChain = nullptr;
++    stream = kj::none;
++  }
++
++  static void shutdown() {
++    holder() = nullptr;
 +  }
 +
 +  bool enabled() {
@@ -325,7 +316,11 @@ index 0000000000000000000000000000000000000000..432c403d8dbd4640541e69c945fff8da
 +  kj::Vector<kj::byte> inbox;
 +  kj::byte readBuffer[65536];
 +
-+  Replicator(): tasks(*this) {}
++  static kj::Own<Replicator>& holder() {
++    // Bootstrap empties this owner before destroying the provider. Static teardown is inert.
++    static kj::Own<Replicator> instance;
++    return instance;
++  }
 +
 +  void taskFailed(kj::Exception&& exception) override {
 +    fail(kj::mv(exception));
@@ -478,6 +473,11 @@ index 0000000000000000000000000000000000000000..432c403d8dbd4640541e69c945fff8da
 +
 +void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
 +  logProvider = &provider;
++}
++
++void shutdownDurableLog() {
++  Replicator::shutdown();
++  logProvider = nullptr;
 +}
 +
 +bool durableLogEnabled() {
@@ -843,12 +843,12 @@ index 0000000000000000000000000000000000000000..432c403d8dbd4640541e69c945fff8da
 +}
 +
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/coworkerd-wal-shipper.h b/src/workerd/server/coworkerd-wal-shipper.h
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.h b/src/workerd/server/factory/coworkerd-wal-shipper.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..003258ef7a7187a6f2d38bb10187edfa434a5928
+index 0000000000000000000000000000000000000000..b19f85a4c1cfed6ad0dbbc94556d1e7979277e5a
 --- /dev/null
-+++ b/src/workerd/server/coworkerd-wal-shipper.h
-@@ -0,0 +1,132 @@
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.h
+@@ -0,0 +1,135 @@
 +// Coworkerd: a Durable Object's data does not stay on the node that owns it. Every database the localDisk actor
 +// storage factory opens gets a shipper: it reads the WAL frames of each committed transaction and hands them to the
 +// node's replicator over the descriptor inherited at startup, and the output gate holds the object's answers until
@@ -873,8 +873,11 @@ index 0000000000000000000000000000000000000000..003258ef7a7187a6f2d38bb10187edfa
 +
 +namespace workerd::server {
 +
-+// Called once before serving, from cli-main: the inherited descriptor is wrapped with this provider.
++// Registered by Bootstrap before serving; the inherited descriptor uses this provider.
 +void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider);
++
++// Release the channel and its tasks while Bootstrap's provider and event loop still exist.
++void shutdownDurableLog();
 +
 +// Whether the actor storage factory ships what it opens: the descriptor is there.
 +bool durableLogEnabled();
@@ -981,124 +984,316 @@ index 0000000000000000000000000000000000000000..003258ef7a7187a6f2d38bb10187edfa
 +};
 +
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index 3bc7c68ddadf3fade22cc8d96c152f82e5395f46..598808a202d3be776bd4bbfc8e38cb04468bd3a7 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -9,6 +9,7 @@
- #include "coworkerd-cpu-limit.h"
- #include "coworkerd-gc.h"
- #include "coworkerd-steady.h"
-+#include "coworkerd-wal-shipper.h"
- #include "pyodide.h"
- #include "workerd-api.h"
+diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
+index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5 100644
+--- a/src/workerd/server/factory/worker-factory-actor.c++
++++ b/src/workerd/server/factory/worker-factory-actor.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
  
-@@ -789,6 +790,11 @@ class Server::ActorNamespace final {
+ #include "worker-factory-impl.h"
++#include "coworkerd-wal-shipper.h"
+ 
+ #include <workerd/api/actor-state.h>
+ #include <workerd/io/actor-cache.h>
+@@ -176,6 +177,7 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
+               : vfsDirectory->clone()),
+       vfs(*sqliteDirectory),
+       uniqueKey(kj::mv(uniqueKey)),
++      timer(factory.getImpl().timer),
+       alarmScheduler(kj::heap<AlarmScheduler>(kj::systemPreciseCalendarClock(),
+           factory.getImpl().timer,
+           vfs,
+@@ -206,6 +208,9 @@ void ActorStorage::Impl::deleteFacet(
+     const kj::Directory& dir, kj::StringPtr rootKey, FacetTreeIndex& index, uint facetId) {
+   index.forEachChild(
+       facetId, [&](uint childId, kj::StringPtr) { deleteFacet(dir, rootKey, index, childId); });
++  KJ_IF_SOME(name, actors->durable_log_name(toRust(rootKey))) {
++    durableLogFacetDeleted(kj::str(name), facetId);
++  }
+   // The database may not exist at all if the facet never ran.
+   dir.tryRemove(getSqlitePath(rootKey, facetId));
+   dir.tryRemove(getSqlitePath(rootKey, facetId, "-wal"));
+@@ -259,6 +264,19 @@ void ActorStorage::Impl::cloneFacet(const kj::Directory& dir,
+   }
+ }
+ 
++bool factory_durable_log_enabled() {
++  return durableLogEnabled();
++}
++
++::rust::String actor_id_name(const ActorIdHandle& id) {
++  KJ_IF_SOME(obj, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
++    KJ_IF_SOME(name, obj->getName()) {
++      return toRustString(name);
++    }
++  }
++  return ::rust::String();
++}
++
+ ActorStorage::ActorStorage(kj::Own<Impl> impl): impl(kj::mv(impl)) {}
+ ActorStorage::~ActorStorage() noexcept(false) = default;
+ ActorStorage::Impl& ActorStorage::getImpl() const {
+@@ -524,7 +542,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+     kj::String rootKey,
+     kj::Maybe<kj::String> actorName,
+     kj::Maybe<::rust::Box<Committer>> committer) {
++  KJ_REQUIRE(!(spec.shipped && spec.replicated),
++      "cluster mode and the node's Durable Object log are mutually exclusive");
+   return [storage = kj::mv(storage), durable = spec.durable, facetId = spec.facet_id,
++             shipped = spec.shipped, rootName = kj::str(spec.root_name),
++             facetName = kj::str(spec.facet_name), parentFacetId = spec.parent_facet_id,
+              rootKey = kj::mv(rootKey), actorName = kj::mv(actorName),
+              committer = kj::mv(committer)](const ActorCache::SharedLru& sharedLru,
+              OutputGate& outputGate, ActorCache::Hooks& hooks,
+@@ -553,10 +575,30 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+     // also deletes the child facets' storage; that is not transactional with the reset, as it is
+     // in production).
+     db->run("PRAGMA journal_mode=WAL;");
+-    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId](
+-                       SqliteDatabase& db) mutable {
++    kj::Maybe<kj::Own<DurableLogShipper>> shipper;
++    if (shipped) {
++      DurableObjectName name{
++        .objectName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr()),
++        .storageId = kj::str(rootKey),
++        .facetId = selfId,
++        .parentFacetId = parentFacetId.orDefault(0),
++        .facetName = kj::str(facetName),
++      };
++      shipper = kj::heap<DurableLogShipper>(*KJ_ASSERT_NONNULL(storage->directory),
++          storage->getSqlitePath(rootKey, selfId, "-wal"_kj),
++          storage->getSqlitePath(rootKey, selfId), kj::mv(name), *db, storage->timer);
++    }
++    DurableLogShipper* shipperPtr = nullptr;
++    KJ_IF_SOME(s, shipper) {
++      shipperPtr = s.get();
++    }
++    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId,
++                      shipperPtr](SqliteDatabase& db) mutable {
++      // Close descendant actors before deleting their files; preserve cluster reset handling.
+       storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
+       db.run("PRAGMA journal_mode=WAL;");
++      // Configure the replacement connection and order RESET before descendant DELETE records.
++      if (shipperPtr != nullptr) shipperPtr->afterReset(db);
+       storage->deleteDescendantStorage(*KJ_ASSERT_NONNULL(storage->directory), rootKey, selfId);
+     });
+     kj::Function<kj::Promise<void>(SpanParent)> commit = [](SpanParent) -> kj::Promise<void> {
+@@ -567,6 +609,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+                    SpanParent) -> kj::Promise<void> { return result_task_run(c->commit()); };
+       committer = kj::none;
+     }
++    KJ_IF_SOME(s, shipper) {
++      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> {
++        return s->onCommit();
++      };
++    }
+     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
+     KJ_IF_SOME(root, rootHooks) {
+       if (storage->actors->replicated()) {
+diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
+index 615edf45e3b11bf9ed647e349c3a2a2449f0fd90..ac800c4fd0d9c873b92e0f6e32a6058be97b3228 100644
+--- a/src/workerd/server/factory/worker-factory-impl.h
++++ b/src/workerd/server/factory/worker-factory-impl.h
+@@ -234,6 +234,7 @@ class ActorStorage::Impl final: public kj::Refcounted {
+   kj::Own<const kj::Directory> sqliteDirectory;
+   SqliteDatabase::Vfs vfs;
+   kj::String uniqueKey;
++  kj::Timer& timer;
+   kj::Own<AlarmScheduler> alarmScheduler;
+ 
+   // The facet index of the root actor `rootKey`, read from disk for one operation; none when it
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 6927d00b404cb721812250365346dc789058d1a1..49cf3a1f6dcc3199e7e93db460a1f3af885e35cc 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -280,6 +280,8 @@ kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start);
+ 
+ kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
+ ::rust::String actor_id_key(const ActorIdHandle& id);
++::rust::String actor_id_name(const ActorIdHandle& id);
++bool factory_durable_log_enabled();
+ kj::Own<ActorIdHandle> actor_id_from_name(::rust::Str name);
+ kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex);
+ 
+diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
+index d8fb80b75a6c1fea463c5400d213327d245b450c..c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0 100644
+--- a/src/workerd/server/server/actor.rs
++++ b/src/workerd/server/server/actor.rs
+@@ -123,6 +123,8 @@ pub struct ActorNamespace {
+     cluster: OnceCell<Rc<ClusterNode>>,
+     /// The namespace's directory, once linked on disk.
+     directory: OnceCell<String>,
++    /// Durable disk storage whose commits are confirmed by the node, rather than a cluster.
++    shipped: Cell<bool>,
+     /// Actors being resolved in the cluster, each woken when its first resolution ends.
+     resolving: RefCell<HashMap<String, Rc<Notify>>>,
+     /// Set for the namespace of a worker that cannot handle requests (`set_broken`).
+@@ -172,6 +174,7 @@ impl ActorNamespace {
+             cleanup_task: RefCell::new(None),
+             cluster: OnceCell::new(),
+             directory: OnceCell::new(),
++            shipped: Cell::new(false),
+             resolving: RefCell::new(HashMap::new()),
+             broken: Cell::new(false),
+             left_behind: RefCell::new(Vec::new()),
+@@ -578,6 +581,13 @@ impl ActorNamespace {
+             }
+             ActorConfig::Ephemeral { .. } => ("", ""),
+         };
++        let shipped = !path.is_empty() && ffi::factory_durable_log_enabled()?;
++        if shipped && self.cluster.get().is_some() {
++            return Err(kj::failed!(
++                "cluster mode and the node's Durable Object log are mutually exclusive"
++            ));
++        }
++        self.shipped.set(shipped);
+         if !path.is_empty() {
+             let directory = format!("{path}/{unique_key}");
+             if self.cluster.get().is_some() {
+@@ -773,6 +783,25 @@ impl ActorNamespaceHandle {
+         self.namespace().is_some_and(|ns| ns.cluster().is_some())
      }
  
-     void cloneFacet(kj::StringPtr src, kj::StringPtr dst) override {
-+      // Coworkerd: a clone copies a database's files behind SQLite's back, so none of it reaches the node's log.
-+      // Until there is a record for it, a shipped namespace refuses to clone (docs/compatibility.md).
-+      JSG_REQUIRE(!(durableLogEnabled() && ns.config.tryGet<Durable>() != kj::none), Error,
-+          "cloneFacet() is not supported for Durable Objects on this platform.");
-+
-       // Replacing a facet implies aborting it.
-       abortFacet(dst, JSG_KJ_EXCEPTION(FAILED, Error, "Facet was cloned-over."));
- 
-@@ -876,6 +882,10 @@ class Server::ActorNamespace final {
-     // ID of this facet. Initialized when getFacetId() is first called.
-     kj::Maybe<uint> facetId;
- 
-+    // Coworkerd: the name this object was made with (idFromName()/getByName()), kept on the root so that the
-+    // frames of every database of the object reach the node's replicator under the name the node knows it by.
-+    kj::Maybe<kj::String> durableObjectName;
-+
-     ActorMap facets;
- 
-     static kj::Rc<kj::TimePoint> makeLastAccess(
-@@ -948,6 +958,14 @@ class Server::ActorNamespace final {
-     void deleteFacetImpl(const kj::Directory& dir, FacetTreeIndex& index, uint facetId) {
-       deleteDescendantStorage(dir, index, facetId);
- 
-+      // Coworkerd: the facet's database goes away outside its own transactions, so the node is told rather than
-+      // left to find an object whose history ends without a reason.
-+      if (durableLogEnabled() && ns.config.tryGet<Durable>() != kj::none) {
-+        durableLogFacetDeleted(root.durableObjectName.map([](kj::String& n) {
-+          return kj::str(n);
-+        }).orDefault([&]() { return kj::str(root.key); }), facetId);
-+      }
-+
-       // Remove the database, WAL, and SHM files, if present. Note that the database may not
-       // exist at all if this facet didn't exist before delete() was called on it.
-       dir.tryRemove(getSqlitePathForId(facetId));
-@@ -1267,6 +1285,13 @@ class Server::ActorNamespace final {
-         }
-       }
- 
-+      // Coworkerd: the root's name is how the node knows this object (its databases are named after the id).
-+      if (parent == kj::none) {
-+        KJ_IF_SOME(n, actorName) {
-+          durableObjectName = kj::str(n);
++    pub(crate) fn durable_log_name(&self, root_key: &str) -> Result<KjMaybe<String>> {
++        let ns = self
++            .namespace()
++            .ok_or_else(|| kj::disconnected!("the namespace is gone"))?;
++        if !ns.shipped.get() {
++            return Ok(None.into());
 +        }
-+      }
++        let actors = ns.actors.borrow();
++        let root = actors
++            .get(root_key)
++            .ok_or_else(|| kj::failed!("the shipped root is gone"))?;
++        let name = if root.root_name.is_empty() {
++            &root.root_key
++        } else {
++            &root.root_name
++        };
++        Ok(Some(name.clone()).into())
++    }
 +
-       auto makeActorCache = [this, actorName = kj::mv(actorName)](
-                                 const ActorCache::SharedLru& sharedLru, OutputGate& outputGate,
-                                 ActorCache::Hooks& hooks, SqliteObserver& sqliteObserver) mutable {
-@@ -1296,8 +1321,37 @@ class Server::ActorNamespace final {
-             // do this after reset() is used, so register a callback for that.
-             db->run("PRAGMA journal_mode=WAL;");
- 
--            db->afterReset([this, &dir = *as.directory, selfId](SqliteDatabase& db) {
-+            // Coworkerd: ship every commit's WAL frames to the node's replicator and hold the output gate
-+            // until it confirms them, so that the object's data outlives this machine's files.
-+            kj::Maybe<kj::Own<DurableLogShipper>> shipper;
-+            if (durableLogEnabled()) {
-+              uint parentFacetId = 0;
-+              kj::String facetName;
-+              KJ_IF_SOME(p, parent) {
-+                parentFacetId = p.getFacetId();
-+                facetName = kj::str(key);
-+              }
-+              DurableObjectName name{
-+                .objectName = root.durableObjectName.map([](kj::String& n) {
-+                  return kj::str(n);
-+                }).orDefault([&]() { return kj::str(root.key); }),
-+                .storageId = kj::str(root.key),
-+                .facetId = selfId,
-+                .parentFacetId = parentFacetId,
-+                .facetName = kj::mv(facetName),
-+              };
-+              shipper = kj::heap<DurableLogShipper>(*as.directory,
-+                  getSqlitePathForId(selfId, "-wal"_kj), getSqlitePathForId(selfId), kj::mv(name),
-+                  *db, timer);
+     pub(crate) fn check_open(&self) -> Result<()> {
+         self.namespace().map_or(Ok(()), |ns| ns.require_lease())
+     }
+@@ -1036,6 +1065,8 @@ pub struct ActorContainer {
+     parent: Option<Weak<Self>>,
+     /// The key of the root actor whose storage this one shares: its own for a root.
+     root_key: String,
++    /// The root's idFromName name, shared by every database sent to the node's log.
++    root_name: String,
+     /// Shared by the whole facet tree: the namespace expires the tree as one.
+     last_access: Rc<Cell<Duration>>,
+     class_and_id: RefCell<ClassState>,
+@@ -1074,6 +1105,7 @@ pub struct ActorContainer {
+ impl ActorContainer {
+     fn new_root(key: String, ns: &ActorNamespace, id: KjOwn<ActorIdHandle>) -> Rc<Self> {
+         let class = Rc::clone(&ns.actor_class);
++        let root_name = ffi::actor_id_name(&id);
+         Rc::new_cyclic(|this| {
+             Self::init(
+                 Weak::clone(this),
+@@ -1081,6 +1113,7 @@ impl ActorContainer {
+                 Weak::clone(&ns.this),
+                 None,
+                 key,
++                root_name,
+                 Rc::new(Cell::new(ns.factory.now())),
+                 ClassState::Ready { class, id },
+             )
+@@ -1099,6 +1132,7 @@ impl ActorContainer {
+                 Weak::clone(&parent.namespace),
+                 Some(Weak::clone(&parent.this)),
+                 parent.root_key.clone(),
++                parent.root_name.clone(),
+                 Rc::clone(&parent.last_access),
+                 ClassState::Pending(pending),
+             )
+@@ -1111,6 +1145,7 @@ impl ActorContainer {
+         namespace: Weak<ActorNamespace>,
+         parent: Option<Weak<Self>>,
+         root_key: String,
++        root_name: String,
+         last_access: Rc<Cell<Duration>>,
+         class_and_id: ClassState,
+     ) -> Self {
+@@ -1120,6 +1155,7 @@ impl ActorContainer {
+             namespace,
+             parent,
+             root_key,
++            root_name,
+             last_access,
+             class_and_id: RefCell::new(class_and_id),
+             actor: RefCell::new(None),
+@@ -1394,6 +1430,18 @@ impl ActorContainer {
+             root_key: self.root_key.clone(),
+             facet_id: self.facet_id()?.into(),
+             replicated: ns.cluster().is_some(),
++            shipped: ns.shipped.get(),
++            root_name: self.root_name.clone(),
++            facet_name: if self.is_root() {
++                String::new()
++            } else {
++                self.key.clone()
++            },
++            parent_facet_id: match self.parent()? {
++                Some(parent) => Some(parent.facet_id()?.unwrap_or(0)),
++                None => None,
 +            }
-+            DurableLogShipper* shipperPtr = nullptr;
-+            KJ_IF_SOME(s, shipper) {
-+              shipperPtr = s.get();
-+            }
-+
-+            db->afterReset([this, &dir = *as.directory, selfId, shipperPtr](SqliteDatabase& db) {
-               db.run("PRAGMA journal_mode=WAL;");
-+              if (shipperPtr != nullptr) shipperPtr->afterReset(db);
++            .into(),
+         };
+         let actor = Rc::new(class.new_actor(NewActor {
+             id,
+@@ -2116,6 +2164,11 @@ impl ActorContainer {
+     }
  
-               // reset() is used when the app called deleteAll(), in which case we also want to
-               // delete all child facets.
-@@ -1310,8 +1364,15 @@ class Server::ActorNamespace final {
-               deleteDescendantStorage(dir, selfId);
-             });
+     fn clone_facet(&self, src: &str, dst: &str) -> Result<()> {
++        if self.namespace()?.shipped.get() {
++            return Err(kj::failed!(
++                "jsg.Error: cloneFacet() is not supported for Durable Objects on this platform."
++            ));
++        }
+         let ns = self.namespace()?;
+         // Replacing a facet implies aborting it.
+         self.abort_facet(dst, kj::failed!("jsg.Error: Facet was cloned-over."));
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index f07aaa51d0ce37deeadc68afb282829099a71b6a..eb17a2a7ecac3e7978c74b7570136bb03386fae1 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -185,6 +185,14 @@ pub mod ffi {
+         facet_id: KjMaybe<u32>,
+         /// The cluster replicates the actor's commits: each waits for `Committer::commit`.
+         replicated: bool,
++        /// The node confirms WAL commits over its inherited log channel; excludes replicated.
++        shipped: bool,
++        /// The root's idFromName name, or empty when its id carries no name.
++        root_name: String,
++        /// Empty for the root, otherwise the facet's name in its parent's tree.
++        facet_name: String,
++        /// None for a root; a direct child of the root has parent id zero.
++        parent_facet_id: KjMaybe<u32>,
+     }
  
--            return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
--                [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
-+            kj::Function<kj::Promise<void>(SpanParent)> commitCallback =
-+                [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; };
-+            KJ_IF_SOME(s, shipper) {
-+              commitCallback = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> {
-+                return s->onCommit();
-+              };
-+            }
-+            return kj::heap<ActorSqlite>(
-+                kj::mv(db), outputGate, kj::mv(commitCallback), *sqliteHooks)
-                 .attach(kj::mv(sqliteHooks));
-           } else {
-             // Create an ActorCache backed by a fake, empty storage. Elsewhere, we configure
+     /// What an alarm does when another instance owns its object: runs again later, a retry
+@@ -485,6 +493,10 @@ pub mod ffi {
+         fn actor_id_clone(id: &ActorIdHandle) -> KjOwn<ActorIdHandle>;
+         /// The key the server files the actor under: the hex id, or the name.
+         fn actor_id_key(id: &ActorIdHandle) -> String;
++        /// The durable id's original name, or empty when no name was retained.
++        fn actor_id_name(id: &ActorIdHandle) -> String;
++        /// C++ owns the first read and validation of the inherited log descriptor.
++        fn factory_durable_log_enabled() -> Result<bool>;
+         fn actor_id_from_name(name: &str) -> KjOwn<ActorIdHandle>;
+         /// The id of a durable namespace, from its hex text (a debug-port request).
+         fn actor_id_from_hex(hex: &str) -> Result<KjOwn<ActorIdHandle>>;
+@@ -960,6 +972,9 @@ pub mod ffi {
+         ) -> Result<KjOwn<WorkerInterface>>;
+         /// Whether the cluster replicates the namespace's actors.
+         fn replicated(self: &ActorNamespaceHandle) -> bool;
++        /// The node's object name for a shipped root, including while deleting unopened facets.
++        fn durable_log_name(self: &ActorNamespaceHandle, root_key: &str)
++        -> Result<KjMaybe<String>>;
+         /// Called as SQLite opens one of the namespace's files: fails once this instance's
+         /// cluster lease has lapsed.
+         fn check_open(self: &ActorNamespaceHandle) -> Result<()>;
