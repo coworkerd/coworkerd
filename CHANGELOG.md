@@ -2,6 +2,8 @@
 
 ## 0.5.4 (unreleased)
 
+- Regenerate compatibility tables for pin v1.20261108.1: 306 flags, maximum date 2026-11-15.
+
 - Fix the amd64 steady-state seccomp filter buffer overflow by allocating its exact architecture-specific instruction count and checking the emitted length (0.5.3 amd64 在开 steady enforce / observe 时潜伏).
 
 - Port shipped facet alarms and namespace resident-object limits to the Rust server, preserving hibernating WebSockets, wake accounting and the node's refusal-code protocol. This completes the stage 3 Durable Object port.
