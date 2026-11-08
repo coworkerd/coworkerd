@@ -2,7 +2,8 @@
 
 ## 0.5.4 (unreleased)
 
-- Port Durable Object WAL shipping to the Rust server's actor tree and C++ factory, preserving the node protocol, confirmation gate, reset/delete notifications and shipped `cloneFacet()` rejection. Facet alarms and residency policy remain deferred to the next port stage.
+- Port shipped facet alarms and namespace resident-object limits to the Rust server, preserving hibernating WebSockets, wake accounting and the node's refusal-code protocol. This completes the stage 3 Durable Object port.
+- Port Durable Object WAL shipping to the Rust server's actor tree and C++ factory, preserving the node protocol, confirmation gate, reset/delete notifications and shipped `cloneFacet()` rejection.
 - Define an explicit `internet` network service without TLS options in generated workerd configurations, so the Rust server does not load system trust roots; tenant egress continues through the node proxy.
 - Reject simultaneous startup and steady-state `observe` filters before launch: the startup filter owns the sole seccomp notification listener (`EBUSY`); `auto` warns and disables the steady filter, and `launcher` refuses to start.
 

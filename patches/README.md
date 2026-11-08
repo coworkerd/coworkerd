@@ -70,8 +70,9 @@ operations validate the series before mutating a checkout or exporting files.
 
 The `port-0.5.4` series targets `v1.20261108.1` and is exported from
 `coworkerd-v1.20261108.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018 and 0013, in that order.
-0013 is the sixteenth patch; 0014 remains deferred outside `series`.
+0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018, 0013 and 0014, in that order.
+0014 is the seventeenth patch and completes the stage 3 Durable Object port.
+The deferred patch list is empty.
 
 ### 0013: Durable Object WAL shipping
 
@@ -96,8 +97,31 @@ Bootstrap registers the same Tokio provider used by the parent-liveness channel.
 The replicator wraps fd 9 once on first use and is shut down before that provider is
 destroyed. Its empty static owner does not use the provider at process exit.
 These hooks depend on actor/storage metadata and factory lifetime, not on Worker
-loading shape. Facet alarms, residency policy and the 0014 refusal-code extensions
-remain deferred.
+loading shape.
+
+### 0014: facet alarms and resident objects
+
+Shipped facets report alarm changes through the existing shipper write chain and
+report the stored alarm, including its absence, each time their database opens.
+They use the same root name as WAL shipping. Non-shipped facets keep the upstream
+alarm rejection; root alarms retain `ActorSqliteHooks` and `AlarmScheduler`.
+The original shipper additions preserve alarm and residency messages, refusal
+codes, and database size reports while retaining 0013's ownership adaptation.
+
+Rust owns the namespace's resident-root count, LRU pass, and eviction/wake
+accounting. A root or any resident descendant counts as one tree. C++ first reads
+`COWORKERD_DO_RESIDENT_OBJECTS` (4096 by default; 0 is unlimited), and a successful
+root start triggers one pass when over the limit. Facets are evicted before their
+root; busy trees and namespaces with `preventEviction` are skipped, with activity
+checked again after awaits. Hibernate-capable WebSockets use upstream shutdown
+semantics. If every tree is busy, a later root start may trigger another pass.
+Changed residency numbers are reported immediately, without a timer or throttle.
+The limit is per namespace; Coworkerd deploys one namespace per process.
+
+The exact Rust exceptions are `src/workerd/server/server/actor.rs`, for this
+policy and `was_evicted` accounting, and `src/workerd/server/server/bridge.rs`,
+for the C++-read cap and Rust-to-C++ residency report. These hooks depend on actor
+and storage lifetime, not on the Worker loading shape or node/runtime changes.
 
 ### 0003 / 0004: dynamic Worker lifecycle
 
@@ -172,9 +196,9 @@ supply this record when their integration is ported.
 | Upstream tag | Commit | V8 | Series |
 | --- | --- | --- | --- |
 | `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
-| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches plus the 0013 WAL port (16 total) |
+| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches plus the 0013 and 0014 Durable Object ports (17 total) |
 
 The November 8 replay keeps the upstream handoff metadata accessors alongside the
 Coworkerd invocation-identity setter. The creation-record contract is unchanged;
-0013 adds only its two exact Rust path exceptions described above. Upstream cluster
+0013 and 0014 each add only their two exact Rust path exceptions described above. Upstream cluster
 features remain inactive.
