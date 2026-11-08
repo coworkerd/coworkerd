@@ -9,7 +9,7 @@ Ported from the 0.5.3 series 0011
 Restore bounded GC CPU exclusion, pause events, and the static isolate heap limit. Idle collector registration and lifecycle collection snapshots remain deferred; their lifecycle owner is not part of this change.
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index f14f992e920b95a85abff31b13d6ca4af2ffe249..3c2984c66e718862040babb2797230f7bdcadd71 100644
+index 63e1001767d5bc2b871356a3e914842ccc3f58d7..c00956627b903b055179c0071865e0e896f2a45b 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
 @@ -34,6 +34,8 @@ wd_cc_library(

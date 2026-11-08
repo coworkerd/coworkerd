@@ -381,10 +381,10 @@ index ffd993267a7fb6883f7776e0c0af1fbeacbe8c30..40ed3c6f0167e47675e5167c553be608
  kj::Own<IsolateObserver> idleIsolateObserver(kj::StringPtr name,
      bool dynamic, IdleWorkerRef worker, kj::Own<IsolateObserver> inner);
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 0b8ebd9552ce552ad2a87ade4564b75d7597d530..853811b56697f9fdd95887f3586d7980a4d5be6a 100644
+index 3ca5d9cbc1902473414c277eb0d799002f95c3e6..d83d0ff230768bf48992261e5eaa118033458aae 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -1149,7 +1149,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+@@ -1160,7 +1160,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
    auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
        *worker.cpuLimits, invocationIdentity, [channel = ioChannelFactory.addRef()]() mutable {
          channel->abortIsolate("CPU limit exceeded");
@@ -393,7 +393,7 @@ index 0b8ebd9552ce552ad2a87ade4564b75d7597d530..853811b56697f9fdd95887f3586d7980
    auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
        entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits),
        idleActivity(worker.idleWorker),
-@@ -1651,7 +1651,7 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1716,7 +1716,7 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
                           kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
      impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
          kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
@@ -402,7 +402,7 @@ index 0b8ebd9552ce552ad2a87ade4564b75d7597d530..853811b56697f9fdd95887f3586d7980
      auto limitEnforcer = kj::addRef(*impl->cpuLimits);
      auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
        return Worker::Api::InboundListener{
-@@ -1825,6 +1825,16 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
+@@ -1887,6 +1887,16 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
    impl.idleChannels = kj::mv(channels);
    impl.idleReady = true;
    idleWorkerReady(impl.idleWorker);

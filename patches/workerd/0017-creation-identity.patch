@@ -122,7 +122,7 @@ index 3d63f70982f17df37b2e3f37859180da004c7ff0..e4a7ca000b36a7860bd10f756df7a15c
  
  }  // namespace workerd::api
 diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
-index 7d1987f00a82ef8dfb92a6da8c87b0b6ec90da76..47863f33799ce670aeb6e9ef05eff87b546029e3 100644
+index b901108f8a58f19a874fc437a021a7c1dddfde63..a7ffc2e0209eda35cb6559d7b813ae1c59c81373 100644
 --- a/src/workerd/io/io-channels.h
 +++ b/src/workerd/io/io-channels.h
 @@ -36,6 +36,19 @@ inline kj::String captureMemoryStartupIdentity() {
@@ -145,7 +145,7 @@ index 7d1987f00a82ef8dfb92a6da8c87b0b6ec90da76..47863f33799ce670aeb6e9ef05eff87b
  class WorkerInterface;
  
  // Indicates whether the target worker of a stub had the `allow_irrevocable_stub_storage` compat
-@@ -495,7 +508,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
+@@ -514,7 +527,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
    virtual kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
        kj::Maybe<kj::String> name,
        kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
@@ -457,10 +457,10 @@ index d6cd2afb63cd3080fde1ae67dff33b674d67cd0c..7ad4a2a8bbbcc35daf778f7b56f67aee
    kj::Maybe<kj::Own<ThreadCpuClock>> clock;
  
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 98c45245b509749d6eb9ae6c873e0b20135e5ab8..380348373aebb55827efb93f17d1b5233e958c60 100644
+index 19be60c2e51a3d2c40cd7798671bdf7ff2bd247f..56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -900,11 +900,14 @@ class RustIoChannelFactory final: public IoChannelFactory {
+@@ -903,11 +903,14 @@ class RustIoChannelFactory final: public IoChannelFactory {
    kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
        kj::Maybe<kj::String> name,
        kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource,
@@ -477,7 +477,7 @@ index 98c45245b509749d6eb9ae6c873e0b20135e5ab8..380348373aebb55827efb93f17d1b523
    }
  
    kj::Network& getWorkerdDebugPortNetwork() override {
-@@ -1539,8 +1542,12 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1603,8 +1606,12 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
    TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
    auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
    impl->isDynamic = dynamicSource != kj::none;
@@ -492,7 +492,7 @@ index 98c45245b509749d6eb9ae6c873e0b20135e5ab8..380348373aebb55827efb93f17d1b523
    ErrorReporter errorReporter;
    auto& options = *factory.options;
    bool experimental = options.experimental;
-@@ -1619,8 +1626,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1684,8 +1691,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
    auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                           kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
      impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
@@ -504,10 +504,10 @@ index 98c45245b509749d6eb9ae6c873e0b20135e5ab8..380348373aebb55827efb93f17d1b523
      auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
        return Worker::Api::InboundListener{
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index a5531e8fd32e0d21c048690ae83db9d224f8a808..ad640ee73accdc5ade4b29aec299d183e266830e 100644
+index b4fd48128434a80c032a12045c8fa5eba395a319..a194a8c0b6fbab27481ecaf8161ac5db3077d952 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
-@@ -105,11 +105,22 @@ pub mod ffi {
+@@ -107,11 +107,22 @@ pub mod ffi {
          env_actor_classes: u32,
      }
  
@@ -533,7 +533,7 @@ index a5531e8fd32e0d21c048690ae83db9d224f8a808..ad640ee73accdc5ade4b29aec299d183
          /// The worker's inbound TCP listeners, for `Worker::Api::getInboundListeners()`.
          inbound_listeners: Vec<InboundListener>,
          /// The `env` object: an encoded `Globals` message (compiled-bindings.capnp), in words.
-@@ -822,7 +833,7 @@ pub mod ffi {
+@@ -896,7 +907,7 @@ pub mod ffi {
              loader_channel: u32,
              name: KjMaybe<&str>,
              source: KjOwn<DynamicSource>,
@@ -543,7 +543,7 @@ index a5531e8fd32e0d21c048690ae83db9d224f8a808..ad640ee73accdc5ade4b29aec299d183
          /// Whether this worker has the workerd debug port binding.
          fn has_debug_port(self: &ChannelFactory) -> bool;
 diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
-index d3ee83ab3043803b174d15a9e240f494fc84fbed..3c07edd8edec414452cf9c1d5543f087de02478f 100644
+index f8f87f2a74169184c893f704863c90f750b86310..132722010c7a56486f5b4cb2fad46bd76baa938b 100644
 --- a/src/workerd/server/server/loader.rs
 +++ b/src/workerd/server/server/loader.rs
 @@ -67,7 +67,7 @@ impl WorkerLoaderNamespace {
@@ -592,10 +592,10 @@ index d3ee83ab3043803b174d15a9e240f494fc84fbed..3c07edd8edec414452cf9c1d5543f087
              abort_isolate,
          )
 diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
-index e9bff10653d89b195fb1eefdc45d3a1f8cd434ab..7f16cd7034f857bf44304b6dcfd9b20a847baa63 100644
+index 0fb4a355691d2e371f3336d78bb130803e251d0a..0366735403309cd8018c1bb170ffd3e637569d52 100644
 --- a/src/workerd/server/server/worker.rs
 +++ b/src/workerd/server/server/worker.rs
-@@ -177,7 +177,7 @@ impl WorkerService {
+@@ -186,7 +186,7 @@ impl WorkerService {
  
          let spec = ffi::WorkerSpec {
              name: name.to_owned(),
@@ -604,7 +604,7 @@ index e9bff10653d89b195fb1eefdc45d3a1f8cd434ab..7f16cd7034f857bf44304b6dcfd9b20a
              inbound_listeners,
              globals: std::mem::take(&mut bindings.globals),
              access_blob_header: access_blob_header.into(),
-@@ -269,13 +269,13 @@ impl WorkerService {
+@@ -279,13 +279,13 @@ impl WorkerService {
          factory: Rc<Factory>,
          name: String,
          source: KjOwn<DynamicSource>,
@@ -620,7 +620,7 @@ index e9bff10653d89b195fb1eefdc45d3a1f8cd434ab..7f16cd7034f857bf44304b6dcfd9b20a
              inbound_listeners: Vec::new(),
              globals: Vec::new(),
              access_blob_header: KjMaybe::None,
-@@ -1089,7 +1089,7 @@ impl ChannelFactory {
+@@ -1144,7 +1144,7 @@ impl ChannelFactory {
          loader_channel: u32,
          name: KjMaybe<&str>,
          source: KjOwn<DynamicSource>,
@@ -629,7 +629,7 @@ index e9bff10653d89b195fb1eefdc45d3a1f8cd434ab..7f16cd7034f857bf44304b6dcfd9b20a
      ) -> Result<Box<WorkerStub>> {
          let loader = self
              .0
-@@ -1099,7 +1099,7 @@ impl ChannelFactory {
+@@ -1154,7 +1154,7 @@ impl ChannelFactory {
          Ok(Box::new(WorkerStub(loader.load(
              name.into(),
              source,

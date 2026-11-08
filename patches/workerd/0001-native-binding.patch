@@ -10,10 +10,10 @@ metadata bridge for fetch and custom events. Require capnpConnectHost for
 the explicit Capnp transport.
 
 diff --git a/src/workerd/server/server/services/mod.rs b/src/workerd/server/server/services/mod.rs
-index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132814718e7 100644
+index 22ef84223912570e289f90f3047d554f4f5ba55c..dfc13ea0b24c53129b603177a0e9fd635e28a8dc 100644
 --- a/src/workerd/server/server/services/mod.rs
 +++ b/src/workerd/server/server/services/mod.rs
-@@ -214,12 +214,18 @@ fn fixed_pool(dialer: Dialer, style: Style) -> ClientPool {
+@@ -215,12 +215,18 @@ fn fixed_pool(dialer: Dialer, style: Style) -> ClientPool {
  /// A capnp connection to the external server, over an HTTP CONNECT tunnel.
  struct RpcConnection(KjOwn<ffi::RpcClient>);
  
@@ -33,7 +33,7 @@ index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132
      /// when it is lost.
      rpc: RefCell<Option<Rc<RpcConnection>>>,
  }
-@@ -259,11 +265,19 @@ impl ExternalHttp {
+@@ -260,11 +266,19 @@ impl ExternalHttp {
      }
  }
  
@@ -54,7 +54,7 @@ index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132
          Ok(ExternalHttpRequest {
              service: Rc::clone(&self.0),
              metadata,
-@@ -552,11 +566,12 @@ pub fn make_external_service(
+@@ -553,11 +567,12 @@ pub fn make_external_service(
              ));
          }
      };
@@ -68,7 +68,7 @@ index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132
              rpc: RefCell::new(None),
          })))
      };
-@@ -566,6 +581,20 @@ pub fn make_external_service(
+@@ -567,6 +582,20 @@ pub fn make_external_service(
              Ok(http(
                  rewriter,
                  Dialer::new(&address, 80, None, factory.loopback()),
@@ -89,7 +89,7 @@ index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132
              ))
          }
          Ok(external_server::Which::Https(https)) => {
-@@ -575,6 +604,7 @@ pub fn make_external_service(
+@@ -576,6 +605,7 @@ pub fn make_external_service(
              Ok(http(
                  rewriter,
                  Dialer::new(&address, 443, Some((tls, host)), factory.loopback()),
@@ -98,10 +98,10 @@ index a01530a1b951abb7df37ba0f56643eabc5931f20..10d1f156c4a399077a3d5a32594fd132
          }
          Ok(external_server::Which::Tcp(tcp)) => {
 diff --git a/src/workerd/server/workerd.capnp b/src/workerd/server/workerd.capnp
-index 63457f6613c6caee9aa854a963efd69408d3edb7..d458a03f33e25b8a31da1aef0e1c47a08d6a06e1 100644
+index bc79bba9fb19f9d4280ddd24dd7918f03d3b7f43..cfaae2c35cd539af27465a253a44b117d28b6bb8 100644
 --- a/src/workerd/server/workerd.capnp
 +++ b/src/workerd/server/workerd.capnp
-@@ -1004,7 +1004,9 @@ struct ExternalServer {
+@@ -1139,7 +1139,9 @@ struct ExternalServer {
        certificateHost @6 :Text;
      }
  

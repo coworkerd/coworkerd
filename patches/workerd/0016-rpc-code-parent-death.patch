@@ -7,10 +7,10 @@ Subject: [PATCH] Preserve RPC platform codes and exit when the node parent is
 Ported from the 0.5.3 series 0016
 
 diff --git a/src/workerd/jsg/BUILD.bazel b/src/workerd/jsg/BUILD.bazel
-index f1b400a690ca6de07ff9fad61fe0c7970a919d7a..cbec9833fa8c06223bcca51dc2fee9aa3adc774e 100644
+index 5a0df052264ea9ce01dbb6956cf9162abeca0442..c7313f1734d8abbfdca53f7e03da4554ef67ec83 100644
 --- a/src/workerd/jsg/BUILD.bazel
 +++ b/src/workerd/jsg/BUILD.bazel
-@@ -104,6 +104,7 @@ wd_cc_library(
+@@ -105,6 +105,7 @@ wd_cc_library(
          "ser.c++",
          "setup.c++",
          "util.c++",
@@ -18,7 +18,7 @@ index f1b400a690ca6de07ff9fad61fe0c7970a919d7a..cbec9833fa8c06223bcca51dc2fee9aa
          "v8-platform-wrapper.c++",
          "wrappable.c++",
      ],
-@@ -121,6 +122,7 @@ wd_cc_library(
+@@ -123,6 +124,7 @@ wd_cc_library(
          "snapshot.h",
          "unwrap-args.h",
          "util.h",
@@ -68,10 +68,10 @@ index 0000000000000000000000000000000000000000..b82413c9bae32a96f505bdda2a7c5dec
 +}
 +}  // namespace workerd::jsg
 diff --git a/src/workerd/jsg/util.c++ b/src/workerd/jsg/util.c++
-index 5833dba68e81a764945372a0c370672c44b22743..f957caf58c5d9bc421b75a8953491dc269eeb6b1 100644
+index 7a4180fe92f2c87265f5c9b916cf496f0419352b..c0e58cd748d6848e0447352eb58cf0e87af92bfd 100644
 --- a/src/workerd/jsg/util.c++
 +++ b/src/workerd/jsg/util.c++
-@@ -396,6 +396,9 @@ v8::Local<v8::Value> exceptionToJs(
+@@ -426,6 +426,9 @@ v8::Local<v8::Value> exceptionToJs(
    // TODO(cleanup): decodeTunneledException is currently only used here, consider
    // inlining it back into this function.
    auto tunneledException = decodeTunneledException(isolate, exception, options);
@@ -82,10 +82,10 @@ index 5833dba68e81a764945372a0c370672c44b22743..f957caf58c5d9bc421b75a8953491dc2
    if (tunneledException.isInternal) {
      // Don't log exceptions that have been explicitly marked with worker_do_not_log or are
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index ed07fa559101008a6aa6eef827ea71fa8a9b8c6b..6ff00fbd4c10ceb8072f091e72766fbc5e4d555c 100644
+index 3b47e350a87b113b60185feb4d6fa7bcf432e044..d3cfda7e9d95445da68862a58e2de16c155b1d3b 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
-@@ -85,7 +85,7 @@ wd_cc_library(
+@@ -84,7 +84,7 @@ wd_cc_library(
  # V8 on the Rust-owned event loop and builds the worker factory the Rust server runs.
  wd_cc_library(
      name = "bootstrap",
@@ -95,7 +95,7 @@ index ed07fa559101008a6aa6eef827ea71fa8a9b8c6b..6ff00fbd4c10ceb8072f091e72766fbc
      deps = [
          ":bootstrap-hdrs",
 diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
-index 75a5e8356f9cc27625fdaf900dc8ddd76371295f..1788c2e6babb3465115133d2022d2d3b0443a320 100644
+index 10001d6e27250d22451828c264ebdb96c63ba2c7..0b61718cc33f8ed6f525a4519fd32676d92d78c6 100644
 --- a/src/workerd/server/factory/bootstrap.c++
 +++ b/src/workerd/server/factory/bootstrap.c++
 @@ -3,6 +3,7 @@
@@ -106,7 +106,7 @@ index 75a5e8356f9cc27625fdaf900dc8ddd76371295f..1788c2e6babb3465115133d2022d2d3b
  #include "coworkerd-channels.h"
  
  #include "worker-factory.h"
-@@ -146,8 +147,10 @@ class Bootstrap {
+@@ -147,8 +148,10 @@ class Bootstrap {
        kj::Maybe<const BenchOptions&> bench)
        : timer(loop.getTimer()),
          monotonicClock(kj::systemPreciseMonotonicClock()),
@@ -117,7 +117,7 @@ index 75a5e8356f9cc27625fdaf900dc8ddd76371295f..1788c2e6babb3465115133d2022d2d3b
      KJ_IF_SOME(path, serveOrTest.perfetto_trace_path) {
  #ifdef WORKERD_USE_PERFETTO
        perfettoSession = PerfettoSession(kj::str(path),
-@@ -217,6 +220,7 @@ class Bootstrap {
+@@ -218,6 +221,7 @@ class Bootstrap {
    kj::Timer& timer;
    // The loop's monotonic clock, consistent with `timer`.
    const kj::MonotonicClock& monotonicClock;

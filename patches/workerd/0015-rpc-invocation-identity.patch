@@ -78,10 +78,10 @@ index 1ccfccc2a5dabb63e710574786dfeb5cd4a2834d..91044886c90e5cb60e8679efb0d6e381
  }
  
 diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
-index eee2cee959f74c0be7a9478280ee785ca2204583..7d1987f00a82ef8dfb92a6da8c87b0b6ec90da76 100644
+index 3b4a604a2932bbdabbb18d93e5c2d1e1b279ddb0..b901108f8a58f19a874fc437a021a7c1dddfde63 100644
 --- a/src/workerd/io/io-channels.h
 +++ b/src/workerd/io/io-channels.h
-@@ -215,6 +215,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
+@@ -234,6 +234,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
  
      // Address of the client as IP:port on whose behalf this request is being made.
      kj::Maybe<kj::String> clientAddress;
@@ -92,7 +92,7 @@ index eee2cee959f74c0be7a9478280ee785ca2204583..7d1987f00a82ef8dfb92a6da8c87b0b6
    };
  
    // Parameters that can influence the version of a worker that is used to serve a subrequest.
-@@ -581,9 +585,11 @@ class WorkerStubChannel: public kj::Refcounted {
+@@ -600,9 +604,11 @@ class WorkerStubChannel: public kj::Refcounted {
    // As with IoChannelFactory::getSubrequestChannel(), the non-virtual method waits for `props` to
    // resolve first, then calls the virtual method.
    kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypoint(
@@ -145,10 +145,10 @@ index 98c2d8bb161c59d87e16945a82465d319922e309..437be40e561922c005fc600f39115363
    KJ_ASSERT(capTable.size() == 1);
    auto& nested = KJ_ASSERT_NONNULL(kj::tryDowncast<MockSubrequestChannel>(*capTable[0]));
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 3ef00a6ccf291854ea649c69c96aeaf97258ca39..98c45245b509749d6eb9ae6c873e0b20135e5ab8 100644
+index 3fd7b10a9803d7b88e69c0e9f725c0f2cfc57089..19be60c2e51a3d2c40cd7798671bdf7ff2bd247f 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -628,8 +628,10 @@ class WorkerStubChannelHandle final: public WorkerStubChannel {
+@@ -631,8 +631,10 @@ class WorkerStubChannelHandle final: public WorkerStubChannel {
    explicit WorkerStubChannelHandle(::rust::Box<WorkerStub> stub): stub(kj::mv(stub)) {}
  
    kj::Rc<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
@@ -161,7 +161,7 @@ index 3ef00a6ccf291854ea649c69c96aeaf97258ca39..98c45245b509749d6eb9ae6c873e0b20
    }
    kj::Rc<IoChannelFactory::ActorClassChannel> getActorClassResolved(
        kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
-@@ -1137,8 +1139,10 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+@@ -1148,8 +1150,10 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
    }
  
    auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
@@ -173,8 +173,8 @@ index 3ef00a6ccf291854ea649c69c96aeaf97258ca39..98c45245b509749d6eb9ae6c873e0b20
          channel->abortIsolate("CPU limit exceeded");
        });
    auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
-@@ -1239,6 +1243,11 @@ void request_metadata_set_from_persistent_stub(RequestMetadata& metadata, bool p
-   if (persistent) metadata.fromPersistentStub = Persistent::YES;
+@@ -1292,6 +1296,11 @@ void request_metadata_set_cause(
+   metadata.causedBy = KJ_MAP(object, causedBy) { return kj::str(object); };
  }
  
 +void request_metadata_set_coworkerd_invocation_identity(
@@ -186,25 +186,25 @@ index 3ef00a6ccf291854ea649c69c96aeaf97258ca39..98c45245b509749d6eb9ae6c873e0b20
  
  // The self-token of a root actor, for `ctx.restore()`: only the namespace and id, so that
 diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
-index cfb2311fd1a22f976646f2fefe7b4e0e637a96ce..26437373dac337a20476e8896ad0efbe1f487379 100644
+index f137b9c4e0f49d23e5284de5e1b4a3ab7c732823..29d7b5c8e8328e1d250e3143f76d841cea5a83f8 100644
 --- a/src/workerd/server/factory/worker-factory.h
 +++ b/src/workerd/server/factory/worker-factory.h
-@@ -316,6 +316,8 @@ kj::Own<RequestMetadata> new_request_metadata(
-     kj::Maybe<::rust::Str> cfBlobJson, kj::Maybe<::rust::Str> clientAddress);
- kj::Maybe<::rust::String> request_metadata_cf_blob_json(const RequestMetadata& metadata);
- void request_metadata_set_from_persistent_stub(RequestMetadata& metadata, bool persistent);
+@@ -339,6 +339,8 @@ bool request_metadata_from_handoff(const RequestMetadata& metadata);
+ ::rust::Vec<::rust::String> request_metadata_caused_by(const RequestMetadata& metadata);
+ void request_metadata_set_cause(
+     RequestMetadata& metadata, bool fromHandoff, ::rust::Vec<::rust::String> causedBy);
 +void request_metadata_set_coworkerd_invocation_identity(
 +    RequestMetadata& metadata, ::rust::Str identity);
  void request_metadata_set_actor_self_token(const WorkerFactory& factory,
      RequestMetadata& metadata,
      ::rust::Str uniqueKey,
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index d4f8faddbd1e0460b2c20a4f4f98bfadcec7007d..a5531e8fd32e0d21c048690ae83db9d224f8a808 100644
+index 6fcdc31fe647aea72361055e61a3b9943bd2cc43..b4fd48128434a80c032a12045c8fa5eba395a319 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
-@@ -532,6 +532,11 @@ pub mod ffi {
-             metadata: Pin<&mut RequestMetadata>,
-             persistent: bool,
+@@ -574,6 +574,11 @@ pub mod ffi {
+             from_handoff: bool,
+             caused_by: Vec<String>,
          );
 +        /// Copies the reporting identity bound to a Coworkerd dynamic entrypoint.
 +        fn request_metadata_set_coworkerd_invocation_identity(
@@ -214,7 +214,7 @@ index d4f8faddbd1e0460b2c20a4f4f98bfadcec7007d..a5531e8fd32e0d21c048690ae83db9d2
          /// Makes stubs the request creates for the actor itself restorable: they encode the
          /// actor's namespace and id.
          fn request_metadata_set_actor_self_token(
-@@ -828,6 +833,7 @@ pub mod ffi {
+@@ -902,6 +907,7 @@ pub mod ffi {
              self: &WorkerStub,
              name: KjMaybe<&str>,
              props: KjOwn<Frankenvalue>,
@@ -223,7 +223,7 @@ index d4f8faddbd1e0460b2c20a4f4f98bfadcec7007d..a5531e8fd32e0d21c048690ae83db9d2
          fn actor_class(
              self: &WorkerStub,
 diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
-index e76daa25c4cf18ec50fe119e2c40795f0b74e285..d3ee83ab3043803b174d15a9e240f494fc84fbed 100644
+index 3a985a824df15183446a07d0fcdc4b2a744ce8a7..f8f87f2a74169184c893f704863c90f750b86310 100644
 --- a/src/workerd/server/server/loader.rs
 +++ b/src/workerd/server/server/loader.rs
 @@ -221,11 +221,13 @@ impl crate::channels::WorkerStub {

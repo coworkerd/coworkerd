@@ -8,7 +8,7 @@ Ported from the 0.5.3 series 0010
 Install the existing serving-time seccomp policy and non-dumpable setting at the first request. Preserve per-Worker CPU and memory limits from the final loader-key segment.
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index aa35890bc98e447c6feb21a5ac54c0e5b624bebb..f14f992e920b95a85abff31b13d6ca4af2ffe249 100644
+index 303eb0aa1d92813a5456f96abf5ea2b3eec7587c..63e1001767d5bc2b871356a3e914842ccc3f58d7 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
 @@ -32,6 +32,8 @@ wd_cc_library(
@@ -411,7 +411,7 @@ index 0000000000000000000000000000000000000000..b9bcb7d8629e65dec163f9e7449c6f47
 +void coworkerdServing();
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 263699ea2270289c59d5db761f433dfd8f24ca51..3ef00a6ccf291854ea649c69c96aeaf97258ca39 100644
+index ebe870bc175f078c0c329918aa54c16c5e1597eb..3fd7b10a9803d7b88e69c0e9f725c0f2cfc57089 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -1,3 +1,4 @@
@@ -419,7 +419,7 @@ index 263699ea2270289c59d5db761f433dfd8f24ca51..3ef00a6ccf291854ea649c69c96aeaf9
  // Copyright (c) 2026 Cloudflare, Inc.
  // Licensed under the Apache 2.0 license found in the LICENSE file or at:
  //     https://opensource.org/licenses/Apache-2.0
-@@ -1158,6 +1159,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+@@ -1169,6 +1170,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
      ::rust::Box<ChannelFactory> channels,
      kj::Own<RequestMetadata> metadata,
      ::rust::Box<WorkerInterfaceList> tails) {

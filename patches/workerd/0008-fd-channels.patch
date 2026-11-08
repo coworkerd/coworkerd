@@ -7,7 +7,7 @@ Subject: [PATCH] Deliver the Server's channels as descriptors inherited at
 Ported from the 0.5.3 series 0008
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index 10e11b7cb9bd0790c20144a1c7f0ee92349479d9..ed07fa559101008a6aa6eef827ea71fa8a9b8c6b 100644
+index 58c9b45830e60ba5920dfc6f7b77f62936abd33b..3b47e350a87b113b60185feb4d6fa7bcf432e044 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
 @@ -35,6 +35,7 @@ wd_cc_library(
@@ -19,7 +19,7 @@ index 10e11b7cb9bd0790c20144a1c7f0ee92349479d9..ed07fa559101008a6aa6eef827ea71fa
      deps = [
          ":worker-factory-hdrs",
 diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
-index 20563d6674c53a37c6b17e013aba60dd35303a7f..75a5e8356f9cc27625fdaf900dc8ddd76371295f 100644
+index bb21e18b31638c0956482881448a5abb7f435728..10001d6e27250d22451828c264ebdb96c63ba2c7 100644
 --- a/src/workerd/server/factory/bootstrap.c++
 +++ b/src/workerd/server/factory/bootstrap.c++
 @@ -3,6 +3,7 @@
@@ -30,7 +30,7 @@ index 20563d6674c53a37c6b17e013aba60dd35303a7f..75a5e8356f9cc27625fdaf900dc8ddd7
  
  #include "worker-factory.h"
  
-@@ -146,6 +147,7 @@ class Bootstrap {
+@@ -147,6 +148,7 @@ class Bootstrap {
        : timer(loop.getTimer()),
          monotonicClock(kj::systemPreciseMonotonicClock()),
          provider(loop.getTimer()) {

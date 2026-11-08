@@ -4,7 +4,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 
 | Path | What it is |
 | --- | --- |
-| `workerd/UPSTREAM` | The upstream tag and commit the series applies to (`v1.20261012.1`, `5358e3d`) |
+| `workerd/UPSTREAM` | The upstream tag and commit the series applies to (`v1.20261108.1`, `88b5871e`) |
 | `workerd/series` | The order of the patches |
 | `workerd/0001-native-binding.patch` ... | One patch per file; the header of each states its purpose |
 | `kj-http-abort.diff` | A change to Cap'n Proto's KJ that `CMakeLists.txt` applies when it builds the daemons: KJ's HTTP entity writers honor `abortWrite()`, so a response that fails midway ends with an error instead of looking complete |
@@ -12,7 +12,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261012.1`), which is the tag plus one commit per patch.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261108.1`), which is the tag plus one commit per patch.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
 - **Thin patches.** Changes stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with one explicit
@@ -66,10 +66,10 @@ hashes in `scripts/release.sh`. `check` is the source side of checking a sync: t
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
 
-## Rust server port (v1.20261031.1)
+## Rust server port (v1.20261108.1)
 
-The `port-0.5.4` series targets `v1.20261031.1` and is exported from
-`coworkerd-v1.20261031.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
+The `port-0.5.4` series targets `v1.20261108.1` and is exported from
+`coworkerd-v1.20261108.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
 0010, 0011, 0015, 0017, 0001, 0003, 0004 and 0018, in that order.
 Deferred patches remain outside `series`.
 
@@ -140,3 +140,14 @@ The exact API/io exceptions are `src/workerd/api/worker-loader.h`,
 are `src/workerd/server/server/bridge.rs`, `src/workerd/server/server/loader.rs` and
 `src/workerd/server/server/worker.rs`; other Rust files remain excluded. Runtime callers must
 supply this record when their integration is ported.
+
+### Upstream pin history
+
+| Upstream tag | Commit | V8 | Series |
+| --- | --- | --- | --- |
+| `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
+| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | Same 15 patches replayed in series order |
+
+The November 8 replay keeps the upstream handoff metadata accessors alongside the
+Coworkerd invocation-identity setter. The Rust path exceptions and creation-record
+contract are unchanged. Upstream cluster features remain inactive.
