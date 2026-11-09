@@ -2,14 +2,15 @@
 
 ## 0.5.4 (unreleased)
 
-- Regenerate compatibility tables for pin v1.20261108.1: 306 flags, maximum date 2026-11-15.
-
-- Fix the amd64 steady-state seccomp filter buffer overflow by allocating its exact architecture-specific instruction count and checking the emitted length (0.5.3 amd64 在开 steady enforce / observe 时潜伏).
-
-- Port shipped facet alarms and namespace resident-object limits to the Rust server, preserving hibernating WebSockets, wake accounting and the node's refusal-code protocol. This completes the stage 3 Durable Object port.
-- Port Durable Object WAL shipping to the Rust server's actor tree and C++ factory, preserving the node protocol, confirmation gate, reset/delete notifications and shipped `cloneFacet()` rejection.
-- Define an explicit `internet` network service without TLS options in generated workerd configurations, so the Rust server does not load system trust roots; tenant egress continues through the node proxy.
-- Reject simultaneous startup and steady-state `observe` filters before launch: the startup filter owns the sole seccomp notification listener (`EBUSY`); `auto` warns and disables the steady filter, and `launcher` refuses to start.
+- Update the compatibility table for workerd `v1.20261108.1` to 306 flags with a maximum table date of 2026-11-15.
+- Fix the amd64 steady-state seccomp filter buffer overflow present in 0.5.3 with steady enforcement or observation enabled by allocating its exact instruction count and checking the emitted length.
+- Port facet alarms and namespace resident-object limits to the Rust server, preserving hibernating WebSockets, wake accounting and the node's refusal-code protocol.
+- Port Durable Object WAL shipping to the Rust server, preserving the node protocol, confirmation gate, reset/delete notifications and `cloneFacet()` rejection.
+- Define an explicit `internet` network service without TLS options in generated workerd configurations so the Rust server does not load system trust roots, while tenant egress continues through the node proxy.
+- Reject simultaneous startup and steady-state `observe` filters because startup owns the sole seccomp notification listener (`EBUSY`); `auto` warns and disables the steady filter, and `launcher` refuses to start.
+- Reject v2 definition dates later than the current UTC date in both the control plane and node, while preserving the existing rejection of invalid dates and dates beyond the kernel table limit.
+- Pin the release script to the `v1.20261108.1` kernels with 17 patches, add `--check-only` before any Docker operation, and record each binary's GLIBC requirement with a 2.38 packaging limit.
+- Update the installation, compatibility and upgrade guides for 0.5.4, document the bare-metal glibc ≥ 2.38 requirement, and clarify descriptor handoff numbers and their measured runtime reuse.
 
 ## 0.5.3 (2026-11-06)
 

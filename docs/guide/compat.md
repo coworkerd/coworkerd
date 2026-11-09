@@ -1,6 +1,6 @@
 # Coworkerd compatibility scope: which features of a wrangler project work
 
-> For release 0.5.3. Compiled from [compatibility with Cloudflare Workers](https://github.com/coworkerd/coworkerd/blob/main/docs/compatibility.md).
+> For release 0.5.4. Compiled from [compatibility with Cloudflare Workers](https://github.com/coworkerd/coworkerd/blob/main/docs/compatibility.md).
 > `cowctl deploy` uses wrangler to read the configuration and build the project, then converts it into a Coworkerd code bundle; unsupported configuration keys are listed together at conversion and refused -- rule files in the asset directory after the build, compatibility dates and flags at upload --, never silently ignored.
 
 ## 1. What works
@@ -8,7 +8,7 @@
 | wrangler configuration / feature | Notes |
 | --- | --- |
 | `name`, `main` | The Worker name (the name within the tenant, full name `tenant/name`; lowercase letters, digits and `-`, at most 63 characters) and the main module; `main` may be TypeScript, built by wrangler |
-| `compatibility_date` | Carried by each version; may not be later than the maximum of the bundled workerd (`v1.20261012.1`), 2026-10-19 |
+| `compatibility_date` | Carried by each version; may not be later than the bundled kernel table limit (`v1.20261108.1`, 2026-11-15), or the UTC date on the day of upload |
 | `compatibility_flags` | The non-experimental flags this workerd knows, including `nodejs_compat`; the platform always turns on `enable_request_signal`, and `disable_request_signal` is refused |
 | `vars` | Plain-text and JSON environment variables, part of the version definition; at most 64, each at most 5 KiB |
 | Secrets | Names come from the project's `.dev.vars.example` (only the names are read) or `deploy --secret NAME`; values are set with `cowctl secret put`, stored in the cluster, and read in the Worker as `env.NAME`; at most 64, each at most 5 KiB of UTF-8 text without NUL. `cowctl` never reads `.dev.vars` or `.env` and never publishes them; a project with its own wrangler builds in place, where a wrangler too old for `--env-file`, or the project's own build command, can still read them; wrangler's own `secrets` key (`secrets.required`) is refused at conversion (section 2) |
@@ -22,6 +22,10 @@
 | `import { env } from "cloudflare:workers"` at the module's top level | Gets the variables and secrets |
 | Inbound WebSocket | A `fetch` handler answers an upgrade with `new Response(null, { status: 101, webSocket })`: the client end of a `WebSocketPair` whose other end the Worker accepted, or a WebSocket it opened with `fetch()` (outgoing, through the node's egress); text and binary messages up to 32 MiB and close frames with their code and reason pass both ways, and the subprotocol the Worker names (`Sec-WebSocket-Protocol`) reaches the client; section 3 has the limits |
 | `durable_objects`, `migrations` | `durable_objects.bindings` -- `name` and `class_name`, with a `script_name` only when it names the Worker itself (a class of another Worker is refused) -- and `migrations`, applied in order: `new_sqlite_classes` and `new_classes` (both declare a SQLite class), `renamed_classes`, `deleted_classes`, `tag`; `transferred_classes` is refused. `env.NAME` is the class's namespace: `idFromName`, `newUniqueId`, `idFromString`, `get`, `getByName`; a stub has `fetch`, WebSocket upgrades included, and the class has `ctx.storage.sql`, the key-value methods and transactions. An object runs on the node that owns its shard, wherever its call comes from, and keeps its data on that node's disk; after another node takes the shard over, the object is rebuilt from its snapshot, log segments and surviving peer tail; section 3 has the differences |
+
+The control plane and nodes compare version dates with their own current UTC date. With clocks advancing normally,
+a definition accepted today remains acceptable on later days. Keep both clocks synchronized with NTP: a node whose
+clock is more than a day behind the control plane can reject a definition the control plane has accepted.
 
 **Accepted, ignored, with a notice** (Cloudflare's own platform settings, which do not change what the code does): `observability`, `placement`, `workers_dev`, `preview_urls`,
 and entries with empty values (`[]`, `{}` and the like, which build tools often write). In a configuration redirected by a build tool such as a Vite plugin, fields wrangler computes itself and fields equal to their defaults are ignored as well.

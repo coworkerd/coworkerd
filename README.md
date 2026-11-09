@@ -21,14 +21,13 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: 0.5.3 released
+## Status: preparing 0.5.4
 
-[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) (2026-11-06) is the current stable release, the maintenance release of the stable 0.5 series: the bundled Compose
-store is sized from the disk instead of a fixed 1.25 GiB, a takeover accepts a peer's open before rebuilding the
-object and refused writes are repaired at once, the daemon's memory is observable and bounded, stateless sub-calls
-run on the caller's node by default, and RPC platform errors carry a `.code` ([CHANGELOG.md](CHANGELOG.md)). Its
-package validation, the twelve stateful scenarios and the 720-minute run passed on the released amd64 assets
-(run b25). The 0.5.2 assets remain published and unchanged.
+0.5.4 moves the upstream pin to `v1.20261108.1` with 17 patches ported to the Rust server, fixes the amd64 steady-state
+seccomp filter, updates the compatibility table to 306 flags with a 2026-11-15 table limit and an additional current-UTC-date
+limit when defining a version, and documents the bare-metal Linux requirement of glibc ≥ 2.38.
+[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) remains the current stable release; see the
+[CHANGELOG](CHANGELOG.md) and [upgrade instructions](docs/guide/install.md#9-upgrades-and-draining).
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
@@ -54,14 +53,14 @@ Boundaries to know about:
 - **The object store must hold its promises.** For more than one writer of the desired state at a time, create-if-absent
   has to hold under concurrency: the compose files pin SeaweedFS 4.48, whose concurrent create-if-absent behavior was verified; `coworkerd check storage`
   measures it. Durable Object ownership also requires atomic create-if-absent on a single-node cluster; otherwise requests fail with `DO_UNSUPPORTED_STORE`.
-- **The upstream runtime** is workerd `v1.20261012.1` with the patch series in [patches/workerd/](patches/workerd/);
+- **The upstream runtime** is workerd `v1.20261108.1` with the patch series in [patches/workerd/](patches/workerd/);
   the patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd), and
   [patches/README.md](patches/README.md) describes how it follows upstream.
 
 ## Trying it
 
 With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a cluster, a tenant and a first deployed
-Worker take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
+Worker from the current stable 0.5.3 release take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
 tar -xzf coworkerd-0.5.3-linux-arm64.tar.gz

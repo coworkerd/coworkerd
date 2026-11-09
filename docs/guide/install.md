@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.5.3.
+> For release 0.5.4.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.5.3-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.3-linux-<arch>/` (the next table) |
-| `coworkerd-0.5.3-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.3`, for `docker load` |
-| `coworkerd-0.5.3-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 |
+| `coworkerd-0.5.4-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.4-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.4-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.4`, for `docker load` |
+| `coworkerd-0.5.4-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 and the required GLIBC version of each binary |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -46,14 +46,16 @@ storage termination remains a failure; a supervisor exiting does not imply that 
 Requirements: **Docker Engine 28 or newer** (compose's internal network uses `gateway_mode_ipv4: isolated`, which only exists from 28.0; 27.x rejects it) and the Docker Compose plugin (Docker Desktop on the Mac includes it; the compose file uses volume `subpath` and the healthcheck's
 `start_interval`; use a Compose version that supports both). Budget memory for the ordinary and quarantine slots, the durable processes and their resident isolates, plus the control plane and object store; the durable process count and resident-object target are configured below.
 
+Bare-metal Linux requires **glibc ≥ 2.38**: Debian 13 or Ubuntu 24.04 and later; Ubuntu 22.04 and Debian 12 report `GLIBC_2.38 not found`. Compose users are unaffected because the image includes its Debian trixie base.
+
 ## 2. Option one: compose, one node (one command)
 
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.5.3-linux-amd64.tar.gz
-docker load -i coworkerd-0.5.3-linux-amd64-image.tar.gz
-cd coworkerd-0.5.3-linux-amd64/docker
+tar -xzf coworkerd-0.5.4-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.4-linux-amd64-image.tar.gz
+cd coworkerd-0.5.4-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -98,13 +100,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.5.3 version` |
+| Show the version | `docker run --rm coworkerd:0.5.4 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.5.3` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.4` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -126,7 +128,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.5.3}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.4}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -202,6 +204,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --wait
 ```
 
 ## 4. Option three: bare metal (Linux, systemd)
+
+Bare-metal Linux requires **glibc ≥ 2.38**: Debian 13 or Ubuntu 24.04 and later; Ubuntu 22.04 and Debian 12 report `GLIBC_2.38 not found`. Compose users are unaffected because the image includes its Debian trixie base.
 
 For running the nodes and the control plane directly on Linux hosts, with your own object storage.
 
@@ -591,6 +595,20 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   `processes.sandbox.pendingRestart` says the new one is used only after a restart; so replace it together with the node, then restart the node. When the prerequisites are met through an AppArmor profile (section 4),
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
+
+**Upgrading 0.5.3 to 0.5.4 keeps the existing data layout.** Update the complete package together, including the
+node, control plane, launcher, runtime, workerd and both system call tables; retain the bucket, keys, node identities
+and data volumes, and upgrade nodes one at a time as described above.
+The kernel moves to `v1.20261108.1` with the 17 patches listed in [patches/README.md](../../patches/README.md);
+replace both tables with ones generated for the new bytes, following the section 4 "System call allowlist" order:
+install tables covering both old and new bytes before replacing workerd, then install the new-only tables.
+The compatibility table has 306 flags and an upper date of 2026-11-15; defining a version also rejects a date later
+than that day's UTC date, as described in the [compatibility guide](compat.md).
+The amd64 steady-state seccomp filter fixes a buffer overflow present in 0.5.3 when steady enforcement or observation
+was enabled. Generated configurations now name an `internet` network service without TLS options; tenant egress
+continues through the node proxy and no operator configuration is needed.
+There are **no default changes** in 0.5.4; the image tag and command-line package version move to 0.5.4.
+The bare-metal glibc requirement is 2.38, as in sections 1 and 4; no data conversion or key rotation is required.
 
 **Upgrading 0.5.2 to 0.5.3 keeps the existing data layout.** Update the complete package: the patch series gained
 `0016`, so the runtime, workerd and the launcher's system call allowlist belong together, and a 0.5.3 node must not run a

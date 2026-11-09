@@ -133,16 +133,21 @@ An ordinary or quarantine slot is replaced by a new generation in steps, at most
 
 workerd listens on no TCP port, has no network beyond what the sandbox leaves it (section 12) and ordinary processes open no file of the node after their first request; durable processes open SQLite and facet files under their assigned durable directory; what it shares with its node is handed over when it starts:
 
-| Descriptor or path | Carries |
-| --- | --- |
-| 1, 2 | Standard output and error: pipes to `coworkerd-wlog` |
-| 3 | The event pipe: limit events, culprits, out-of-memory identities and the end of every request, one `write()` per row |
-| 4 | The process's listening Unix socket, `run/<slot>-<generation>.sock`, for calls and probes |
-| 5 | Shared memory with the snapshot of the process's resident Workers, written double-buffered |
-| 9 (durable processes) | Transaction frames and confirmation / checkpoint commands over an inherited socket to the node's replicator |
-| 6 | Shared memory with the memory band, sealed against resizing (only with the watermark on) |
-| `run/binding.sock`, `run/source.sock` | The runtime bridge's calls back into the node: Bindings; the code of a version, and the tenants' log lines (`POST /v1/log`) |
-| `run/egress.sock` | Tenant code's outgoing requests, to the node's egress policy point |
+| Descriptor at handoff or path | Carries | Where it goes while running |
+| --- | --- | --- |
+| 1, 2 | Standard output and error: pipes to `coworkerd-wlog` | Unchanged |
+| 3 | The event pipe: limit events, culprits, out-of-memory identities and the end of every request, one `write()` per row | Unchanged |
+| 4 | The process's listening Unix socket, `run/<slot>-<generation>.sock`, passed as `--socket-fd rpc=4` | The server's I/O layer takes ownership under another descriptor number (7 in the measured processes); 4 is reused for an epoll instance |
+| 5 | Shared memory with the double-buffered snapshot of resident Workers and their lifecycle | Mapped once, then closed; the number is reused and the mapping remains in `/proc/<pid>/maps` |
+| 6 (only with the watermark on) | Shared memory with the memory band, sealed against resizing | Mapped once, then closed; the number is reused and the mapping remains in `/proc/<pid>/maps` |
+| 9 (durable processes) | Transaction frames and confirmation / checkpoint commands over an inherited socket to the node's replicator | Unchanged |
+| 10 (since 0.5.3) | The parent-liveness channel, an inherited socketpair: workerd exits when its node dies | Unchanged |
+| `run/binding.sock`, `run/source.sock` | The runtime bridge's calls back into the node: Bindings; the code of a version, and the tenants' log lines (`POST /v1/log`) | Paths, not inherited descriptor numbers |
+| `run/egress.sock` | Tenant code's outgoing requests, to the node's egress policy point | Path, not an inherited descriptor number |
+
+A running process's `/proc/<pid>/fd` does not correspond one-to-one with the handoff column: verify shared memory
+by its inode in `maps`, and the listening socket by the inode's `run/<slot>-<generation>.sock` path in `/proc/net/unix`.
+The launcher's own descriptors 7 and 8 are close-on-exec and do not reach workerd; the running server can reuse those numbers.
 
 `run/` is readable only by the node's user. The end of every request is written whether or not it used CPU, so draining knows when a generation is idle, and at an exit the node reads the event pipe to its end, so the evidence of a crash is not lost.
 
