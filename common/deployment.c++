@@ -15,6 +15,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -254,6 +255,13 @@ void validateDefinition(const VersionDefinition& version) {
         std::chrono::month{static_cast<unsigned>(std::stoi(date.substr(5, 2)))},
         std::chrono::day{static_cast<unsigned>(std::stoi(date.substr(8, 2)))}};
     KJ_REQUIRE(calendar.ok() && date <= MAX_COMPATIBILITY_DATE, "compatibility date exceeds workerd maximum or is invalid");
+    const auto utc = std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(
+        std::chrono::system_clock::now())};
+    std::ostringstream todayText;
+    todayText << std::setfill('0') << std::setw(4) << int(utc.year()) << '-'
+              << std::setw(2) << unsigned(utc.month()) << '-' << std::setw(2) << unsigned(utc.day());
+    const auto today = todayText.str();
+    KJ_REQUIRE(date <= today, "compatibility date exceeds today's date (UTC)", date.c_str(), today.c_str(), MAX_COMPATIBILITY_DATE);
     std::set<std::string> flags;
     for (const auto& flag : version.compatibilityFlags) {
       KJ_REQUIRE(std::find(COMPATIBILITY_FLAGS.begin(), COMPATIBILITY_FLAGS.end(), flag) != COMPATIBILITY_FLAGS.end(),

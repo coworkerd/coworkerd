@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a Coworkerd release for this machine's Linux architecture.
 #
-#   scripts/release.sh <version> [--arch amd64|arm64] [--out DIR] [--no-image]
+#   scripts/release.sh <version> [--arch amd64|arm64] [--out DIR] [--no-image] [--check-only]
 #
 # Builds coworkerd (the node daemon), coworkerd-apiserver (the control plane, with the deployment tool) and
 # coworkerd-launcher (the workerd processes' least-privilege environment) in a
@@ -39,18 +39,23 @@
 # It builds: run one at a time on a machine (the toolchain container's tree is shared by every run).
 set -euo pipefail
 
+# Bare-metal Linux minimum documented in docs/guide/install.md, Requirements.
+GLIBC_FLOOR=2.38
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION=${1:?usage: scripts/release.sh <version> [--arch amd64|arm64] [--out DIR] [--no-image]}
+VERSION=${1:?usage: scripts/release.sh <version> [--arch amd64|arm64] [--out DIR] [--no-image] [--check-only]}
 shift
 [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "invalid version: $VERSION" >&2; exit 2; }
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; arm64|aarch64) ARCH=arm64 ;; *) ARCH=unknown ;; esac
 OUT="$ROOT/build/release/$VERSION"
 IMAGE=true
+CHECK_ONLY=false
 while (($#)); do
   case $1 in
     --arch) ARCH=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --no-image) IMAGE=false; shift ;;
+    --check-only) CHECK_ONLY=true; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,13 +64,13 @@ CONTAINER=${COWORKERD_BUILD_CONTAINER:-coworkerd-capacity-linux}
 TREE=${COWORKERD_BUILD_TREE:-/work/coworkerd-build}
 JOBS=${COWORKERD_BUILD_JOBS:-6}
 
-# The workerd builds of the current patch series (upstream v1.20261012.1 + patches/workerd 0001-0008, 0010-0016), by
+# The workerd builds of the current patch series (upstream v1.20261108.1 + 17 patches in patches/workerd), by
 # architecture, each pinned by its SHA-256: built from the fork's branch (patches/README.md) on a Linux machine of that
 # architecture, and put at the default path below or named by COWORKERD_RELEASE_WORKERD. A new series needs its own
 # builds here.
 case $ARCH in
-  arm64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-arm64/workerd"; WORKERD_SHA256=37099103b2795ec6779e4c03130ca36198499301fbd51f0ce2089dc40d1b6f29 ;;
-  amd64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-amd64/workerd"; WORKERD_SHA256=5fe82e700c767a935c09e923c62dd2eb88c4d451fcf042b805149928ded3274e ;;
+  arm64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-arm64/workerd"; WORKERD_SHA256=cf996c8dca76e036d6b3a2faafb13778e01865de41104431745478d60088e81e ;;
+  amd64) WORKERD_DEFAULT="$ROOT/build/workerd-linux-amd64/workerd"; WORKERD_SHA256=1935b67a0a540339d41a129c7663574cc1e02a2734e5b525cc18c5ce690d898b ;;
 esac
 WORKERD=${COWORKERD_RELEASE_WORKERD:-$WORKERD_DEFAULT}
 SERIES_DIR="$ROOT/patches/workerd"
@@ -107,6 +112,28 @@ DIRTY=$(cd "$ROOT" && { git diff --full-index HEAD -- common node apiserver laun
 EMPTY=$(printf '' | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)
 SOURCE=$COMMIT
 [[ $DIRTY == "$EMPTY" ]] || SOURCE="$COMMIT+$DIRTY"
+if $CHECK_ONLY; then
+  python3 - "$VERSION" "$ARCH" "$SOURCE" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$SERIES_NAMES" "$SERIES_SHA256" \
+      "$WORKERD_SHA256" "$ALLOWLIST" "$GLIBC_FLOOR" "$(node --version)" "$(npm --version)" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+(version, arch, source, tag, commit, series, series_sha, workerd_sha, allowlist, floor, node, npm) = sys.argv[1:]
+directory = Path(allowlist)
+record = json.loads((directory / "allowlist.json").read_text())
+syscalls = {kind: {"file": record[kind]["file"], "calls": record[kind]["count"],
+                  "sha256": hashlib.sha256((directory / record[kind]["file"]).read_bytes()).hexdigest()}
+            for kind in ("startup", "steady")}
+syscalls["recordSha256"] = hashlib.sha256((directory / "allowlist.json").read_bytes()).hexdigest()
+print(json.dumps({"checkOnly": True, "version": version, "architecture": arch, "source": source,
+    "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","),
+                "patchSeriesSha256": series_sha, "sha256": workerd_sha},
+    "syscalls": syscalls, "GLIBC_FLOOR": floor,
+    "checks": {"workerd": True, "allowlist": True,
+               "guides": ["install", "quickstart", "compat", "errors", "databases", "durable-objects"],
+               "node": node, "npm": npm}}))
+PY
+  exit 0
+fi
 HEADER="// Written by scripts/release.sh; read by common/support.h (the daemons' --version).
 #define COWORKERD_VERSION \"$VERSION\"
 #define COWORKERD_SOURCE \"$SOURCE\"
@@ -138,6 +165,8 @@ for binary in coworkerd coworkerd-apiserver coworkerd-launcher; do
 done
 cp "$WORKERD" "$STAGE/bin/workerd"
 chmod 0755 "$STAGE/bin/workerd"
+GLIBC=$(cd "$STAGE" && python3 "$ROOT/scripts/glibc-requirement.py" --floor "$GLIBC_FLOOR" \
+  bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/workerd)
 # The allowlist beside the node daemon: that is where it looks for it (sandbox.syscalls.allowlistPath's default),
 # and the record of how it was generated travels with it.
 cp "$ALLOWLIST/coworkerd-syscalls-startup.txt" "$ALLOWLIST/coworkerd-syscalls-steady.txt" "$STAGE/bin/"
@@ -264,9 +293,9 @@ fi
 
 # ---- The record and the sums --------------------------------------------------------------------------------
 python3 - "$OUT" "$NAME" "$ARCH" "$VERSION" "$SOURCE" "$SERIES_SHA256" "$SERIES_NAMES" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" \
-    "$WORKERD" "$BUILD_SECONDS" "$IMAGE_ID" "$IMAGE_TAR" "${COWORKERD_IMAGE_BASE:-}" <<'PY'
+    "$WORKERD" "$BUILD_SECONDS" "$IMAGE_ID" "$IMAGE_TAR" "${COWORKERD_IMAGE_BASE:-}" "$GLIBC" <<'PY'
 import hashlib, json, os, sys
-(out, name, arch, version, source, series_sha, series, tag, commit, workerd, seconds, image_id, image_tar, image_base) = sys.argv[1:]
+(out, name, arch, version, source, series_sha, series, tag, commit, workerd, seconds, image_id, image_tar, image_base, glibc) = sys.argv[1:]
 def sha(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -276,6 +305,7 @@ def sha(path):
 stage = os.path.join(out, name)
 record = {
     "version": version, "architecture": arch, "source": source,
+    "glibc": json.loads(glibc),
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","), "patchSeriesSha256": series_sha,
                 "from": workerd, "sha256": sha(os.path.join(stage, "bin/workerd"))},
     "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/workerd", "runtime/runtime.js",
