@@ -46,6 +46,8 @@ void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(basePort > 0 && uint64_t(basePort) + count + quarantineProcesses + 1 <= 65536, "invalid process port range");
   KJ_REQUIRE(probeIntervalMs > 0 && probeOverdueMs > probeIntervalMs && stuckTimeoutMs > probeOverdueMs,
       "probe interval < overdue threshold < stuck timeout is required");
+  KJ_REQUIRE(pausedAdmissionWaitMs < stuckTimeoutMs,
+      "processPool.pausedAdmissionWaitMs must be less than stuckTimeoutMs (0 disables waiting)");
   KJ_REQUIRE(restartBackoffMs > 0 && restartMaxMs >= restartBackoffMs, "invalid restart backoff");
   KJ_REQUIRE(idleDestroyIntervalMs > 0, "idleDestroyIntervalMs must be positive");
   KJ_REQUIRE(idleEvictMs == 0 || idleEvictMs > heatIdleMs, "idleEvictMs must exceed placement.idleMs");
@@ -168,6 +170,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
+  result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.cpuLimitMs = root.getCpuLimitMs();
   result.processPool.memoryLimitMiB = root.getMemoryLimitMiB();
   // A limit of 0 leaves the isolates of this node without one, and with it the culprit a stuck or exhausted process

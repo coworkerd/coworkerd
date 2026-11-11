@@ -563,6 +563,8 @@ struct ProcessPoolConfig {
   restartBackoffMs @6 :UInt32 = 100;
   restartMaxMs @7 :UInt32 = 2000;
   watchdog @8 :Bool = true;
+  # Wait only for a live paused process, within the call's lease. 0 keeps immediate refusal.
+  pausedAdmissionWaitMs @9 :UInt32 = 1000;
 }
 
 struct RotationConfig {

@@ -3088,6 +3088,28 @@ bool ProcessPool::available(const std::string& worker) {
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && impl->admitted(*s.current)) return true;
   return false;
 }
+bool ProcessPool::PausedAdmission::alive() const {
+  for (const auto& p : processes)
+    if (p->pid > 0 && (p->state == "paused" || p->state == "ready") && p->runtime &&
+        !p->runtime->disconnected && !p->closing && !p->retiring) return true;
+  return false;
+}
+ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& worker, const std::string& objectKey) {
+  impl->refresh();
+  PausedAdmission result;
+  if (impl->closingAll || (!objectKey.empty() && impl->durableClosed)) return result;
+  const auto quarantine = quarantined(worker);
+  const auto durableId = objectKey.empty() ? std::string() : impl->durableSlotFor(objectKey);
+  for (const auto& s : impl->slots) {
+    if (objectKey.empty() ? (s.durable || s.quarantine != quarantine) : (!s.durable || s.id != durableId)) continue;
+    const auto& p = s.current;
+    if (!p) continue;
+    if (impl->admitted(*p)) return {};
+    if (p->state == "paused" && p->pid > 0 && p->runtime && !p->runtime->disconnected &&
+        !p->closing && !p->retiring && p->inFlight < impl->config.inFlightLimit) result.processes.push_back(p);
+  }
+  return result;
+}
 uint32_t ProcessPool::durableProcesses() const { return impl->config.durableProcesses; }
 bool ProcessPool::durableHot(const std::string& hash) const {
   for (const auto& s : impl->slots) if (s.durable && s.current && s.current->pid > 0) {

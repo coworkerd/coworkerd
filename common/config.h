@@ -24,6 +24,7 @@ struct ProcessPoolConfig {
   uint32_t restartBackoffMs = 100;
   uint32_t restartMaxMs = 2000;
   bool watchdog = true;
+  uint32_t pausedAdmissionWaitMs = 1000;
   uint32_t cpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes

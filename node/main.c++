@@ -404,6 +404,13 @@ struct InvocationRejection {
   }
 };
 
+bool pausedRefusal(const InvocationRejection& refusal) {
+  return refusal.status == 503 &&
+      ((refusal.code == "PROCESS_UNAVAILABLE" && refusal.category == "paused-ordinary") ||
+       (refusal.code == "QUARANTINE_UNAVAILABLE" && refusal.category == "paused-quarantine") ||
+       (refusal.code == "DO_UNAVAILABLE" && refusal.category == "paused-durable"));
+}
+
 // A load failure is the version's own and the same everywhere -- except a code package
 // this Server could not get or verify, which another Server (another cache) may have.
 constexpr const char* PACKAGE_UNAVAILABLE = "package-unavailable";
@@ -1380,6 +1387,7 @@ public:
   }
 
   void observeRefusal(const InvocationRejection& refusal, const std::string& source = "localBinding") {
+    if (pausedRefusal(refusal)) return;  // A scheduling hint, before the call's final outcome.
     ++placementRejections[refusal.code];
     if (refusal.code == "QUARANTINE_UNAVAILABLE") decision("quarantineUnavailable", source == "localIngress" || source == "peerIngress");
     ++placementRejectionReasons[cleanReason(refusal.reason)];
@@ -1387,6 +1395,7 @@ public:
   }
 
   void observeLocalRefusal(const InvocationRejection& refusal, const std::string& source) {
+    if (pausedRefusal(refusal)) return;
     observeCounter("refusal", source, refusal.code);
     std::cout << "[refusal-count] {\"nodeId\":\"" << serverConfig.serverId
               << "\",\"source\":\"" << source << "\",\"code\":\"" << refusal.code
@@ -1399,7 +1408,8 @@ public:
   }
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
-      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr) {
+      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr,
+      bool reserved = false, bool checkProcess = true) {
     auto started = monotonicTimeMs();
     auto timing = kj::defer([&] { phaseTiming("admission", started); });
     auto rejected = [&](std::string code, std::string reason, uint status = 503) {
@@ -1411,21 +1421,106 @@ public:
       if (record) rejectExpiredLease("lease expired before admission");
       return rejected("LEASE_EXPIRED", "lease expired before admission", 410);
     }
-    if (inFlightRoots + inFlightNested >= (root ? serverConfig.rootLimit : serverConfig.nestedLimit))
+    if (inFlightRoots + inFlightNested - (reserved ? 1 : 0) >= (root ? serverConfig.rootLimit : serverConfig.nestedLimit))
       return rejected("OVERLOADED", "concurrency limit reached");
     const auto band = memory.effectiveBand();
     if ((!root || forwardedRoot) && (band == "red" ||
         (band == "yellow" && !(durable ? runtime.durableHot(hash) : hot(hash)))))
       return rejected("LOAD_BAND_REJECTED", band == "red" ?
           (forwardedRoot ? "red band rejects forwarded roots" : "red band rejects nested invocations") : "yellow band rejects cold version");
-    if (durable) {
-      if (!runtime.durableAvailable(durable->key()))
-        return rejected("DO_UNAVAILABLE", "the durable process of this object (" + runtime.durableProcessFor(durable->key()) + ") is not ready");
-      return std::nullopt;
+    if (!checkProcess || (durable ? runtime.durableAvailable(durable->key()) : runtime.available(worker))) return std::nullopt;
+    auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
+        runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
+    if (serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
+      value.category = durable ? "paused-durable" : runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
+      value.avoidMs = 0;
     }
-    if (!runtime.available(worker)) return rejected(runtime.quarantined(worker) ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
-        runtime.quarantined(worker) ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch");
-    return std::nullopt;
+    if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+    return value;
+  }
+
+  uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
+  bool durablePaused(const std::string& worker, const std::string& objectKey) {
+    return pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
+  }
+  struct Admission {
+    std::optional<InvocationRejection> refused;
+    std::shared_ptr<AdmissionSlot> slot;
+  };
+  kj::Promise<Admission> admit(const std::string& worker, const std::string& hash, bool root, double deadline,
+      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr, bool wait = true) {
+    auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable);
+    if (!failure) co_return Admission{std::nullopt, reserve(root)};
+    auto reject = [&](InvocationRejection value) {
+      value.category.clear();
+      value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
+      if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return Admission{std::move(value), {}};
+    };
+    if (!wait || !pausedRefusal(*failure)) {
+      if (!wait && pausedRefusal(*failure)) co_return Admission{std::move(failure), {}};
+      co_return reject(std::move(*failure));
+    }
+    auto paused = runtime.pausedAdmission(worker, durable ? durable->key() : "");
+    if (!paused) co_return reject(std::move(*failure));
+    const auto kind = failure->category.substr(7);
+    const auto began = monotonicTimeMs();
+    const auto until = std::min(deadline, began + pausedAdmissionWaitMs());
+    auto slot = reserve(root);
+    const auto id = beginAdmissionWait(kind);
+    std::string outcome = "canceled";
+    auto done = kj::defer([&] { endAdmissionWait(kind, id, began, outcome); });
+    while (true) {
+      // Admission rechecks every original guard while accounting for this request's own reserved slot.
+      auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, true);
+      if (current && current->code == "LEASE_EXPIRED") {
+        outcome = "lease";
+        if (record) rejectExpiredLease("lease expired during paused admission");
+        co_return reject(std::move(*current));
+      }
+      if (!paused.alive()) { outcome = "killed"; co_return reject(std::move(*failure)); }
+      if (!current) { outcome = "resumed"; co_return Admission{std::nullopt, std::move(slot)}; }
+      if (!pausedRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
+      if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
+      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
+    }
+  }
+
+  uint64_t beginAdmissionWait(const std::string& kind) {
+    auto& count = pausedAdmissionCounts[kind];
+    ++count.count; ++count.active; count.maxActive = std::max(count.maxActive, count.active);
+    const auto id = nextAdmissionWaitId++;
+    std::cout << "[admission-wait] {\"nodeId\":\"" << serverConfig.serverId << "\",\"event\":\"begin\",\"id\":" << id
+              << ",\"class\":\"" << kind << "\",\"active\":" << count.active
+              << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    return id;
+  }
+  void endAdmissionWait(const std::string& kind, uint64_t id, double began, const std::string& outcome) {
+    auto& count = pausedAdmissionCounts[kind];
+    KJ_ASSERT(count.active > 0); --count.active; ++count.outcomes[outcome];
+    const auto elapsed = monotonicTimeMs() - began;
+    count.totalWaitMs += elapsed; count.maxWaitMs = std::max(count.maxWaitMs, elapsed);
+    std::cout << std::setprecision(17) << "[admission-wait] {\"nodeId\":\"" << serverConfig.serverId
+              << "\",\"event\":\"end\",\"id\":" << id << ",\"class\":\"" << kind << "\",\"outcome\":\"" << outcome
+              << "\",\"waitMs\":" << elapsed << ",\"active\":" << count.active
+              << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+  }
+  std::string pausedAdmissionJson() const {
+    std::ostringstream out; out << std::setprecision(17) << '{';
+    bool first = true;
+    for (const auto* kind : {"ordinary", "quarantine", "durable"}) {
+      auto found = pausedAdmissionCounts.find(kind);
+      const auto count = found == pausedAdmissionCounts.end() ? PausedAdmissionCounts{} : found->second;
+      out << (first ? "" : ",") << '"' << kind << "\":{\"count\":" << count.count << ",\"active\":" << count.active
+          << ",\"maxActive\":" << count.maxActive << ",\"totalWaitMs\":" << count.totalWaitMs << ",\"maxWaitMs\":" << count.maxWaitMs;
+      first = false;
+      for (const auto* outcome : {"resumed", "expired", "killed", "lease", "unavailable", "canceled"}) {
+        auto value = count.outcomes.find(outcome);
+        out << ",\"" << outcome << "\":" << (value == count.outcomes.end() ? 0 : value->second);
+      }
+      out << '}';
+    }
+    out << '}'; return out.str();
   }
 
   std::shared_ptr<AdmissionSlot> reserve(bool root) {
@@ -1522,6 +1617,7 @@ public:
     counts("decisions", placementDecisions); counts("reroutes", placementReroutes); counts("rejections", placementRejections); counts("rejectionsByReason", placementRejectionReasons);
     out << ",\"ingressPlacement\":" << (serverConfig.ingressPlacement ? "true" : "false")
         << ",\"proxyingIngress\":" << proxyingIngress
+        << ",\"pausedAdmission\":" << pausedAdmissionJson()
         << ",\"observability\":" << countersJson()
         << ",\"coldStarts\":{";
     size_t coldIndex = 0;
@@ -2748,6 +2844,13 @@ private:
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
   uint32_t inFlightRoots = 0;
   uint32_t inFlightNested = 0;
+  struct PausedAdmissionCounts {
+    uint64_t count = 0, active = 0, maxActive = 0;
+    double totalWaitMs = 0, maxWaitMs = 0;
+    std::map<std::string, uint64_t> outcomes;
+  };
+  std::map<std::string, PausedAdmissionCounts> pausedAdmissionCounts;
+  uint64_t nextAdmissionWaitId = 1;
   uint64_t nextPlacementSequence = 1;
   uint64_t nextTreeSequence = 1;
   uint64_t nextTrialSequence = 1;
@@ -3832,13 +3935,58 @@ public:
 
   rpc::EventDispatcher::Client open(const std::string& targetServerId, RemoteInvocationData invocation) {
     const auto deadline = invocation.expiresAtMonotonicMs;
-    auto promise = tryOpen(targetServerId, std::move(invocation)).then(
+    auto promise = openStatic(targetServerId, std::move(invocation)).then(
         [this, deadline, targetServerId](InvocationAttempt&& result) -> rpc::EventDispatcher::Client {
       server.observeStaticAttempt(targetServerId, result.failure);
       if (!result.failure) return std::move(result.dispatcher);
       return rejectedDispatcher(factory, headerTable, *result.failure, deadline);
     });
     return rpc::EventDispatcher::Client(std::move(promise));
+  }
+
+  kj::Promise<InvocationAttempt> openStatic(std::string target, RemoteInvocationData invocation) {
+    auto result = co_await tryOpen(target, invocation);
+    co_return co_await waitRemote(target, std::move(invocation), std::move(result));
+  }
+
+  kj::Promise<InvocationAttempt> waitRemote(const std::string& target, RemoteInvocationData invocation, InvocationAttempt result) {
+    if (!result.failure || !pausedRefusal(*result.failure) || !server.pausedAdmissionWaitMs()) co_return result;
+    const auto original = *result.failure;
+    const auto deadline = invocation.expiresAtMonotonicMs;
+    auto guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
+        deadline, false, false, nullptr, false, false);
+    if (guard) co_return InvocationAttempt{nullptr, std::move(guard), true};
+    auto slot = server.reserve(invocation.ingressRoot);
+    const auto kind = original.category.substr(7);
+    const auto began = monotonicTimeMs();
+    const auto until = std::min(deadline, began + server.pausedAdmissionWaitMs());
+    const auto id = server.beginAdmissionWait(kind);
+    std::string outcome = "canceled";
+    auto done = kj::defer([&] { server.endAdmissionWait(kind, id, began, outcome); });
+    while (true) {
+      guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
+          deadline, false, false, nullptr, true, false);
+      if (guard) {
+        outcome = guard->code == "LEASE_EXPIRED" ? "lease" : "unavailable";
+        co_return InvocationAttempt{nullptr, std::move(guard), true};
+      }
+      if (monotonicTimeMs() >= until) {
+        outcome = "expired";
+        auto failure = original; failure.category.clear();
+        failure.avoidMs = std::min(server.placementConfig().rejectionAvoidMs, server.placementConfig().avoidMaxMs);
+        co_return InvocationAttempt{nullptr, std::move(failure), true};
+      }
+      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
+      if (monotonicTimeMs() >= until) continue;
+      // Only explicit refusals permit another open; accepted or uncertain commits this attempt.
+      result = co_await tryOpen(target, invocation, until);
+      if (!result.failure) { outcome = "resumed"; co_return result; }
+      if (!pausedRefusal(*result.failure)) {
+        outcome = result.failure->code == "LEASE_EXPIRED" ? "lease" :
+            (result.failure->code == "PROCESS_UNAVAILABLE" || result.failure->code == "QUARANTINE_UNAVAILABLE") ? "killed" : "unavailable";
+        co_return result;
+      }
+    }
   }
 
   // A Durable Object log stream to one peer: the member's current epoch is addressed, and the stream stays on that
@@ -3905,7 +4053,7 @@ public:
     co_return answer;
   }
 
-  kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation) {
+  kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation, double waitUntil = 0) {
     const auto& config = server.placementConfig();
     auto peer = server.member(targetServerId);
     if (peer == nullptr) {
@@ -3923,7 +4071,8 @@ public:
     }
     kj::Maybe<kj::Rc<PeerConnection>> connected;
     try {
-      connected = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
+      connected = co_await getConnection(targetServerId, address, identity, waitUntil > 0 ?
+          std::max(1u, static_cast<uint32_t>(std::min<double>(config.peerTimeoutMs, std::max(0.0, waitUntil - monotonicTimeMs())))) : config.peerTimeoutMs);
     } catch (const kj::Exception& error) {
       auto reason = "peer unavailable node=" + targetServerId + " detail=" + error.getDescription().cStr();
       server.rejectPeerUnavailable(reason);
@@ -3977,7 +4126,8 @@ public:
     try {
       // No capability is exposed to workerd until this explicit result arrives.
       auto started = monotonicTimeMs();
-      auto response = co_await timer.timeoutAfter(config.peerTimeoutMs * kj::MILLISECONDS, request.send());
+      const auto timeoutMs = waitUntil > 0 ? std::min<double>(config.peerTimeoutMs, std::max(0.0, waitUntil - monotonicTimeMs())) : config.peerTimeoutMs;
+      auto response = co_await timer.timeoutAfter(static_cast<int64_t>(timeoutMs * 1000) * kj::MICROSECONDS, request.send());
       recordSend();
       phaseTiming("peer-open-response", started);
       auto result = response.getResult();
@@ -4160,52 +4310,62 @@ public:
     pathMark(allocation.timing, "placement-logs");
     std::string failures = "["; size_t attempted = 0;
     bool packagesUnavailable = true;  // every candidate tried failed to load the package
+    auto attemptHere = [&](bool wait) -> kj::Promise<InvocationAttempt> {
+      InvocationAttempt result;
+      pathMark(allocation.timing, "admission-start");
+      auto admitted = co_await server.admit(version->workerId, version->definitionHash, allocation.ingressRoot,
+          allocation.expiresAtMonotonicMs, false, false, nullptr, wait);
+      pathMark(allocation.timing, "admission-end");
+      if (admitted.refused) result = {nullptr, std::move(admitted.refused), true};
+      else {
+        auto slot = std::move(admitted.slot);
+        pathMark(allocation.timing, "code-start");
+        auto unavailable = co_await server.ensureCode(*version, allocation.expiresAtMonotonicMs);
+        pathMark(allocation.timing, "code-end");
+        if (!unavailable.empty()) {
+          server.rejectVersionUnavailable(unavailable);
+          result = {nullptr, server.refusal("VERSION_UNAVAILABLE", unavailable, 409), true};
+        } else if (remainingLeaseMs(allocation.expiresAtMonotonicMs) == 0) {
+          result = {nullptr, server.refusal("LEASE_EXPIRED", "lease expired before execution", 410), true};
+        } else if (auto missing = server.secretRefusal(*version, allocation.ingressRoot)) {
+          result = {nullptr, std::move(missing), true};
+        } else if (auto check = co_await server.loadCheck(version, allocation.entrypoint, allocation.expiresAtMonotonicMs,
+                       allocation.ingressRoot); check.refusal) {
+          // Nothing of the call ran: another candidate only for a package this Server lacks.
+          const bool retry = rerouteAfter(*check.refusal);
+          result = {nullptr, std::move(check.refusal), retry};
+        } else {
+          try {
+            auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
+            // Dispatch is committed. Pipeline HTTP now; its wrapper reports uncertainty.
+            result = {std::move(opened.dispatcher), std::nullopt, false};
+          } catch (const ProcessUnavailable& error) {
+            result = {nullptr, server.processRefusal(error), true};
+          } catch (const kj::Exception& error) {
+            result = {nullptr, server.refusal("RESULT_UNCERTAIN", error.getDescription().cStr()), false};
+          }
+        }
+      }
+      co_return result;
+    };
+    auto invocationFor = [&](uint8_t remainingHops) {
+      const auto& pin = allocation.pins->at(version->workerId);
+      return RemoteInvocationData{version->workerId, pin.versionId, pin.contentHash,
+          allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
+          allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
+          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint};
+    };
+    bool allPaused = true;
+    std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
       if (hops == 0) break;
       --hops;
       InvocationAttempt result;
       const auto startedAt = wallTimeMsForTest();
-      if (id == config.serverId) {
-        pathMark(allocation.timing, "admission-start");
-        auto refused = server.admission(version->workerId, version->definitionHash, allocation.ingressRoot, allocation.expiresAtMonotonicMs, false);
-        pathMark(allocation.timing, "admission-end");
-        if (refused) result = {nullptr, std::move(refused), true};
-        else {
-          auto slot = server.reserve(allocation.ingressRoot);
-          pathMark(allocation.timing, "code-start");
-          auto unavailable = co_await server.ensureCode(*version, allocation.expiresAtMonotonicMs);
-          pathMark(allocation.timing, "code-end");
-          if (!unavailable.empty()) {
-            server.rejectVersionUnavailable(unavailable);
-            result = {nullptr, server.refusal("VERSION_UNAVAILABLE", unavailable, 409), true};
-          } else if (remainingLeaseMs(allocation.expiresAtMonotonicMs) == 0) {
-            result = {nullptr, server.refusal("LEASE_EXPIRED", "lease expired before execution", 410), true};
-          } else if (auto missing = server.secretRefusal(*version, allocation.ingressRoot)) {
-            result = {nullptr, std::move(missing), true};
-          } else if (auto check = co_await server.loadCheck(version, allocation.entrypoint, allocation.expiresAtMonotonicMs,
-                         allocation.ingressRoot); check.refusal) {
-            // Nothing of the call ran: another candidate only for a package this Server lacks.
-            const bool retry = rerouteAfter(*check.refusal);
-            result = {nullptr, std::move(check.refusal), retry};
-          } else {
-            try {
-              auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
-              // Dispatch is committed. Pipeline HTTP now; its wrapper reports uncertainty.
-              result = {std::move(opened.dispatcher), std::nullopt, false};
-            } catch (const ProcessUnavailable& error) {
-              result = {nullptr, server.processRefusal(error), true};
-            } catch (const kj::Exception& error) {
-              result = {nullptr, server.refusal("RESULT_UNCERTAIN", error.getDescription().cStr()), false};
-            }
-          }
-        }
-      } else {
-        const auto& pin = allocation.pins->at(version->workerId);
-        result = co_await tryOpen(id, {version->workerId, pin.versionId, pin.contentHash,
-          allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
-          allocation.depth, hops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
-          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint});
-      }
+      if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1);
+      else result = co_await tryOpen(id, invocationFor(hops));
+      allPaused = allPaused && result.failure && pausedRefusal(*result.failure);
+      if (result.failure && pausedRefusal(*result.failure) && !firstPaused) firstPaused = result.failure;
       server.observeAttempt(id, allocation.ingressRoot, result.failure);
       if (id == config.serverId && result.failure && result.retryable)
       {
@@ -4260,6 +4420,26 @@ public:
       } else avoid.failures = 0;
       avoid.until = monotonicTimeMs() + delay;
       if (attempted < ordered.size() && hops > 0) server.reroute(result.failure->code);
+    }
+    // Every candidate explicitly refused before execution because its eligible processes were paused.
+    // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
+    if (allPaused && firstPaused && attempted == ordered.size() && server.pausedAdmissionWaitMs()) {
+      const bool local = std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end();
+      const auto target = local ? config.serverId : ordered.front();
+      auto result = local ? co_await attemptHere(true) :
+          co_await waitRemote(target, invocationFor(hops), {nullptr, firstPaused, true});
+      server.observeAttempt(target, allocation.ingressRoot, result.failure);
+      if (!result.failure) {
+        avoidance.erase(target);
+        if (forwarded) *forwarded = !local;
+        if (placedOn) *placedOn = target;
+        server.decision(local ? "localPausedResumed" : "peerPausedResumed", allocation.ingressRoot);
+        co_return std::move(result.dispatcher);
+      }
+      server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
+      if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)
+        co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
+      failures += ",{\"nodeId\":\"" + target + "\",\"failure\":" + result.failure->json() + "}";
     }
     failures += ']';
     auto refusal = server.refusal("PLACEMENT_EXHAUSTED", hops == 0 ? "placement hops exhausted" : "all candidates rejected or unavailable", 503, allocation.ingressRoot);
@@ -5232,12 +5412,13 @@ public:
         };
         co_return Dispatched{peerForwarder.open(targetServerId, std::move(invocation))};
       }
-      if (auto refusal = server.admission(version->workerId, version->definitionHash, false, expiresAtMonotonicMs)) {
-        server.observeStaticAttempt(targetServerId, refusal);
-        co_return Dispatched{rejectedDispatcher(factory, headerTable, *refusal, expiresAtMonotonicMs)};
+      auto admitted = co_await server.admit(version->workerId, version->definitionHash, false, expiresAtMonotonicMs);
+      if (admitted.refused) {
+        server.observeStaticAttempt(targetServerId, admitted.refused);
+        co_return Dispatched{rejectedDispatcher(factory, headerTable, *admitted.refused, expiresAtMonotonicMs)};
       }
       pathMark(timing, "admission-end");
-      auto slot = server.reserve(false);
+      auto slot = std::move(admitted.slot);
       pathMark(timing, "code-start");
       auto unavailable = co_await server.ensureCode(*version, expiresAtMonotonicMs);
       pathMark(timing, "code-end");
@@ -5570,11 +5751,11 @@ private:
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
-    while (!server.durableReady(target.key()) && monotonicTimeMs() < waitUntil)
+    while (!server.durableReady(target.key()) && !server.durablePaused(version->workerId, target.key()) && monotonicTimeMs() < waitUntil)
       co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
-    if (auto refusal = server.admission(version->workerId, version->definitionHash, false, deadline, false, false, &target))
-      co_return refused(*refusal);
-    auto slot = server.reserve(false);
+    auto admitted = co_await server.admit(version->workerId, version->definitionHash, false, deadline, false, false, &target);
+    if (admitted.refused) co_return refused(*admitted.refused);
+    auto slot = std::move(admitted.slot);
     slot->durable = true;
     slot->timing = request.timing;
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
@@ -7216,11 +7397,11 @@ private:
           kj::str("http://", host.c_str(), url), headers.clone(), requestBody, response, timing, selected.version->key(),
           std::move(webSocket));
     }
-    auto refusal = server.admission(selected.version->workerId, selected.version->definitionHash, true, deadline);
+    auto admitted = co_await server.admit(selected.version->workerId, selected.version->definitionHash, true, deadline);
     pathMark(timing, "admission-end");
-    if (refusal) co_return co_await sendText(response, refusal->status, statusText(refusal->status), refusalBody(*refusal, deadline),
+    if (admitted.refused) co_return co_await sendText(response, admitted.refused->status, statusText(admitted.refused->status), refusalBody(*admitted.refused, deadline),
         "application/json");
-    auto slot = server.reserve(true);
+    auto slot = std::move(admitted.slot);
     slot->timing = timing;
     pathMark(timing, "code-start");
     std::string unavailable;
@@ -7816,6 +7997,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
       << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
+      << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
       << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs
       << "},\"limits\":{\"cpuLimitMs\":" << p.cpuLimitMs << ",\"memoryLimitMiB\":" << p.memoryLimitMiB
       << "},\"rotation\":{\"drainTimeoutMs\":" << p.rotationDrainTimeoutMs << ",\"termGraceMs\":" << p.rotationTermGraceMs

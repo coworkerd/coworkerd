@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.5 (unreleased)
+
+- Wait within `processPool.pausedAdmissionWaitMs` (1000 ms by default; 0 disables it) when the only eligible ordinary, quarantine or durable process is alive but paused by an overdue probe. This fixes the transient admission 503s present in 0.5.3 and 0.5.4. Ready processes and other candidate nodes still take calls immediately; stuck processes retain the original watchdog deadline.
+
 ## 0.5.4 (unreleased)
 
 - Update the compatibility table for workerd `v1.20261108.1` to 306 flags with a maximum table date of 2026-11-15.

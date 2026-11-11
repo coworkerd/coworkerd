@@ -66,6 +66,16 @@ public:
   ~ProcessPool() noexcept(false);
   kj::Promise<void> run();
   bool available(const std::string& worker);
+  // The original paused generations, only when none of this target's processes is admitted.
+  // Retaining the snapshot never waits for a replacement generation after death or rotation.
+  struct PausedAdmission {
+    explicit operator bool() const { return !processes.empty(); }
+    bool alive() const;
+  private:
+    friend class ProcessPool;
+    std::vector<std::shared_ptr<ProcessGeneration>> processes;
+  };
+  PausedAdmission pausedAdmission(const std::string& worker, const std::string& objectKey = {});
   bool quarantined(const std::string& worker) const;
   // Ready to take work: every ordinary process (a quarantine shard's state does not decide it).
   bool ready() const;
