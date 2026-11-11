@@ -1411,7 +1411,7 @@ public:
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
       bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr,
-      bool reserved = false, bool checkProcess = true) {
+      bool reserved = false, bool checkProcess = true, bool checkMemoryBand = true) {
     auto started = monotonicTimeMs();
     auto timing = kj::defer([&] { phaseTiming("admission", started); });
     auto rejected = [&](std::string code, std::string reason, uint status = 503) {
@@ -1426,7 +1426,7 @@ public:
     if (inFlightRoots + inFlightNested - (reserved ? 1 : 0) >= (root ? serverConfig.rootLimit : serverConfig.nestedLimit))
       return rejected("OVERLOADED", "concurrency limit reached");
     const auto band = memory.effectiveBand();
-    if ((!root || forwardedRoot) && (band == "red" ||
+    if (checkMemoryBand && (!root || forwardedRoot) && (band == "red" ||
         (band == "yellow" && !(durable ? runtime.durableHot(hash) : hot(hash)))))
       return rejected("LOAD_BAND_REJECTED", band == "red" ?
           (forwardedRoot ? "red band rejects forwarded roots" : "red band rejects nested invocations") : "yellow band rejects cold version");
@@ -3962,7 +3962,7 @@ public:
     const auto original = *result.failure;
     const auto deadline = invocation.expiresAtMonotonicMs;
     auto guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-        deadline, false, false, nullptr, false, false);
+        deadline, false, false, nullptr, false, false, false);
     if (guard) co_return InvocationAttempt{nullptr, std::move(guard), true};
     auto slot = server.reserve(invocation.ingressRoot);
     const auto kind = original.category.substr(7);
@@ -3973,7 +3973,7 @@ public:
     auto done = kj::defer([&] { server.endAdmissionWait(kind, id, began, outcome); });
     while (true) {
       guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-          deadline, false, false, nullptr, true, false);
+          deadline, false, false, nullptr, true, false, false);
       if (guard) {
         outcome = guard->code == "LEASE_EXPIRED" ? "lease" : "unavailable";
         co_return InvocationAttempt{nullptr, std::move(guard), true};
@@ -3987,7 +3987,7 @@ public:
       co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
       if (monotonicTimeMs() >= until) continue;
       // Only explicit refusals permit another open; accepted or uncertain commits this attempt.
-      result = co_await tryOpen(target, invocation, until);
+      result = co_await tryOpen(target, invocation);
       if (!result.failure) { outcome = "resumed"; co_return result; }
       if (!pausedRefusal(*result.failure)) {
         outcome = result.failure->code == "LEASE_EXPIRED" ? "lease" :
@@ -4061,7 +4061,7 @@ public:
     co_return answer;
   }
 
-  kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation, double waitUntil = 0) {
+  kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation) {
     const auto& config = server.placementConfig();
     auto peer = server.member(targetServerId);
     if (peer == nullptr) {
@@ -4079,8 +4079,7 @@ public:
     }
     kj::Maybe<kj::Rc<PeerConnection>> connected;
     try {
-      connected = co_await getConnection(targetServerId, address, identity, waitUntil > 0 ?
-          std::max(1u, static_cast<uint32_t>(std::min<double>(config.peerTimeoutMs, std::max(0.0, waitUntil - monotonicTimeMs())))) : config.peerTimeoutMs);
+      connected = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
     } catch (const kj::Exception& error) {
       auto reason = "peer unavailable node=" + targetServerId + " detail=" + error.getDescription().cStr();
       server.rejectPeerUnavailable(reason);
@@ -4134,7 +4133,9 @@ public:
     try {
       // No capability is exposed to workerd until this explicit result arrives.
       auto started = monotonicTimeMs();
-      const auto timeoutMs = waitUntil > 0 ? std::min<double>(config.peerTimeoutMs, std::max(0.0, waitUntil - monotonicTimeMs())) : config.peerTimeoutMs;
+      // The wait budget controls whether to send another open, never how long
+      // to await a result that may already have committed execution.
+      const auto timeoutMs = std::min<double>(config.peerTimeoutMs, remaining);
       auto response = co_await timer.timeoutAfter(static_cast<int64_t>(timeoutMs * 1000) * kj::MICROSECONDS, request.send());
       recordSend();
       phaseTiming("peer-open-response", started);
