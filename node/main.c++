@@ -428,6 +428,8 @@ struct AdmissionSlot {
   // connection (AdmissionHttpService), which gives the slot back at the 101.
   ServerCore* server = nullptr;
   bool root = false;
+  // Every pre-dispatch recheck shares this slot and the call's one paused-wait budget.
+  double pausedWaitMs = 0;
   std::string ingressNodeId;
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
@@ -1448,9 +1450,10 @@ public:
     std::shared_ptr<AdmissionSlot> slot;
   };
   kj::Promise<Admission> admit(const std::string& worker, const std::string& hash, bool root, double deadline,
-      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr, bool wait = true) {
-    auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable);
-    if (!failure) co_return Admission{std::nullopt, reserve(root)};
+      bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr, bool wait = true,
+      std::shared_ptr<AdmissionSlot> slot = {}) {
+    auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+    if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root)};
     auto reject = [&](InvocationRejection value) {
       value.category.clear();
       value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
@@ -1465,11 +1468,16 @@ public:
     if (!paused) co_return reject(std::move(*failure));
     const auto kind = failure->category.substr(7);
     const auto began = monotonicTimeMs();
-    const auto until = std::min(deadline, began + pausedAdmissionWaitMs());
-    auto slot = reserve(root);
+    if (!slot) slot = reserve(root);
+    const auto until = std::min(deadline, began + std::max(0.0, pausedAdmissionWaitMs() - slot->pausedWaitMs));
     const auto id = beginAdmissionWait(kind);
     std::string outcome = "canceled";
-    auto done = kj::defer([&] { endAdmissionWait(kind, id, began, outcome); });
+    // Keep a reference even when the successful return moves the slot into its result.
+    auto waitingSlot = slot;
+    auto done = kj::defer([&] {
+      waitingSlot->pausedWaitMs += monotonicTimeMs() - began;
+      endAdmissionWait(kind, id, began, outcome);
+    });
     while (true) {
       // Admission rechecks every original guard while accounting for this request's own reserved slot.
       auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, true);
@@ -4329,12 +4337,19 @@ public:
           result = {nullptr, server.refusal("LEASE_EXPIRED", "lease expired before execution", 410), true};
         } else if (auto missing = server.secretRefusal(*version, allocation.ingressRoot)) {
           result = {nullptr, std::move(missing), true};
+        } else if (auto current = co_await server.admit(version->workerId, version->definitionHash,
+                       allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot);
+                   current.refused) {
+          result = {nullptr, std::move(current.refused), true};
         } else if (auto check = co_await server.loadCheck(version, allocation.entrypoint, allocation.expiresAtMonotonicMs,
                        allocation.ingressRoot); check.refusal) {
           // Nothing of the call ran: another candidate only for a package this Server lacks.
           const bool retry = rerouteAfter(*check.refusal);
           result = {nullptr, std::move(check.refusal), retry};
         } else {
+          auto finalAdmission = co_await server.admit(version->workerId, version->definitionHash,
+              allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot);
+          if (finalAdmission.refused) co_return InvocationAttempt{nullptr, std::move(finalAdmission.refused), true};
           try {
             auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
             // Dispatch is committed. Pipeline HTTP now; its wrapper reports uncertainty.
@@ -4845,10 +4860,16 @@ public:
       reject(server.refusal("LEASE_EXPIRED", "lease expired before remote execution", 410)); co_return;
     }
     if (auto missing = server.secretRefusal(*version, invocation.ingressRoot)) { reject(*missing); co_return; }
+    auto current = co_await server.admit(version->workerId, version->definitionHash, invocation.ingressRoot,
+        invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
+    if (current.refused) { reject(*current.refused); co_return; }
     // The load check: a version that does not load here is refused before acceptance; the sender
     // decides whether another candidate follows (only for a package this Server lacks).
     auto check = co_await server.loadCheck(version, invocation.entrypoint, invocation.expiresAtMonotonicMs, invocation.ingressRoot);
     if (check.refusal) { reject(*check.refusal); co_return; }
+    current = co_await server.admit(version->workerId, version->definitionHash, invocation.ingressRoot,
+        invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
+    if (current.refused) { reject(*current.refused); co_return; }
     try {
       auto opened = server.openGranted(std::move(version), invocation.treeId, invocation.parentInvocationId,
           invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
@@ -5434,12 +5455,24 @@ public:
         server.observeStaticAttempt(targetServerId, missing);
         co_return Dispatched{rejectedDispatcher(factory, headerTable, *missing, expiresAtMonotonicMs)};
       }
+      auto current = co_await server.admit(version->workerId, version->definitionHash, false,
+          expiresAtMonotonicMs, true, false, nullptr, true, slot);
+      if (current.refused) {
+        server.observeStaticAttempt(targetServerId, current.refused);
+        co_return Dispatched{rejectedDispatcher(factory, headerTable, *current.refused, expiresAtMonotonicMs)};
+      }
       auto check = co_await server.loadCheck(version, allocation.entrypoint, expiresAtMonotonicMs, false);
       if (check.refusal) {
         server.observeLocalRefusal(*check.refusal, "localBinding");
         server.observeStaticAttempt(targetServerId, check.refusal);
         if (check.refusal->code == "LOAD_FAILED") server.loadFailed(*version, *check.refusal, targetServerId, "binding", false);
         co_return Dispatched{rejectedDispatcher(factory, headerTable, *check.refusal, expiresAtMonotonicMs)};
+      }
+      current = co_await server.admit(version->workerId, version->definitionHash, false,
+          expiresAtMonotonicMs, true, false, nullptr, true, slot);
+      if (current.refused) {
+        server.observeStaticAttempt(targetServerId, current.refused);
+        co_return Dispatched{rejectedDispatcher(factory, headerTable, *current.refused, expiresAtMonotonicMs)};
       }
       auto opened = server.executeAllocated(std::move(version), "binding", std::move(allocation), std::move(slot), check);
       server.observeStaticAttempt(targetServerId, std::nullopt);
@@ -5771,6 +5804,9 @@ private:
     // A call another node sent carries no lock table: its lease names the object's version here.
     if (request.allocation && !request.allocation->pins)
       request.allocation->pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
+    auto current = co_await server.admit(version->workerId, version->definitionHash, false,
+        deadline, false, false, &target, true, slot);
+    if (current.refused) co_return refused(*current.refused);
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot);
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
@@ -7423,6 +7459,10 @@ private:
       co_return co_await sendText(response, missing->status, statusText(missing->status),
           rejectionJson(missing->code, missing->reason, deadline), "application/json");
     }
+    auto current = co_await server.admit(selected.version->workerId, selected.version->definitionHash, true,
+        deadline, true, false, nullptr, true, slot);
+    if (current.refused) co_return co_await sendText(response, current.refused->status, statusText(current.refused->status),
+        refusalBody(*current.refused, deadline), "application/json");
     auto check = co_await server.loadCheck(selected.version, "", deadline, true);
     if (check.refusal) {
       server.observeLocalRefusal(*check.refusal, "localIngress");
@@ -7431,6 +7471,10 @@ private:
       co_return co_await sendText(response, check.refusal->status, statusText(check.refusal->status),
           refusalBody(*check.refusal, deadline), "application/json");
     }
+    current = co_await server.admit(selected.version->workerId, selected.version->definitionHash, true,
+        deadline, true, false, nullptr, true, slot);
+    if (current.refused) co_return co_await sendText(response, current.refused->status, statusText(current.refused->status),
+        refusalBody(*current.refused, deadline), "application/json");
     std::optional<InvocationRejection> processFailure;
     try {
     auto targetKey = selected.version->key();
