@@ -4133,10 +4133,7 @@ public:
     try {
       // No capability is exposed to workerd until this explicit result arrives.
       auto started = monotonicTimeMs();
-      // The wait budget controls whether to send another open, never how long
-      // to await a result that may already have committed execution.
-      const auto timeoutMs = std::min<double>(config.peerTimeoutMs, remaining);
-      auto response = co_await timer.timeoutAfter(static_cast<int64_t>(timeoutMs * 1000) * kj::MICROSECONDS, request.send());
+      auto response = co_await timer.timeoutAfter(config.peerTimeoutMs * kj::MILLISECONDS, request.send());
       recordSend();
       phaseTiming("peer-open-response", started);
       auto result = response.getResult();
@@ -4439,17 +4436,16 @@ public:
     }
     // Every candidate explicitly refused before execution because its eligible processes were paused.
     // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
-    if (allPaused && firstPaused && attempted == ordered.size() && server.pausedAdmissionWaitMs()) {
-      const bool local = std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end();
-      const auto target = local ? config.serverId : ordered.front();
-      auto result = local ? co_await attemptHere(true) :
-          co_await waitRemote(target, invocationFor(hops), {nullptr, firstPaused, true});
+    if (allPaused && firstPaused && attempted == ordered.size() && server.pausedAdmissionWaitMs() &&
+        std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
+      const auto target = config.serverId;
+      auto result = co_await attemptHere(true);
       server.observeAttempt(target, allocation.ingressRoot, result.failure);
       if (!result.failure) {
         avoidance.erase(target);
-        if (forwarded) *forwarded = !local;
+        if (forwarded) *forwarded = false;
         if (placedOn) *placedOn = target;
-        server.decision(local ? "localPausedResumed" : "peerPausedResumed", allocation.ingressRoot);
+        server.decision("localPausedResumed", allocation.ingressRoot);
         co_return std::move(result.dispatcher);
       }
       server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
