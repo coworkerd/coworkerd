@@ -369,9 +369,21 @@ public:
     if (now < nextRound) return;
     nextRound = now + config.intervalMs;
     if (pid > 0 || memoryBand() != "green") { ++skipped; log(); return; }
-    try { spawn(); }
-    catch (const std::exception& error) { closeFd(parentWrite); failed(error.what()); }
-    catch (const kj::Exception&) { closeFd(parentWrite); failed("cannot start host check"); }
+    spawn();
+  }
+  void tickFailed(const char* reason) noexcept {
+    ++errors; available = false;
+    if (pid <= 0) { closeFd(parentWrite); closeFd(result); }
+    try { lastError = reason; } catch (...) {}
+    try { nextRound = monotonicMs() + config.intervalMs; }
+    catch (...) { nextRound += config.intervalMs; }
+    try { log(); } catch (...) {}
+  }
+  void safeTick() noexcept {
+    try { tick(); }
+    catch (const kj::Exception& error) { tickFailed(error.getDescription().cStr()); }
+    catch (const std::exception& error) { tickFailed(error.what()); }
+    catch (...) { tickFailed("unknown host check failure"); }
   }
 };
 HostCheck::HostCheck(HostCheckConfig config, std::function<std::string()> band)
@@ -380,11 +392,17 @@ HostCheck::~HostCheck() = default;
 std::string HostCheck::json() const { return impl->json(); }
 bool HostCheck::takeOomExposure() { const bool exposed = impl->exposure || impl->pid > 0; impl->exposure = false; return exposed; }
 kj::Promise<void> HostCheck::run(kj::Timer& timer) {
-  if (!impl->config.intervalMs) { impl->log(); co_await kj::Promise<void>(kj::NEVER_DONE); }
-  for (;;) {
-    impl->tick();
-    const auto delay = impl->pid > 0 ? 10 : std::max<double>(1, impl->nextRound - monotonicMs());
-    co_await timer.afterDelay(static_cast<int64_t>(delay) * kj::MILLISECONDS);
-  }
+  try {
+    if (!impl->config.intervalMs) { impl->log(); co_await kj::Promise<void>(kj::NEVER_DONE); }
+    for (;;) {
+      impl->safeTick();
+      const auto delay = impl->pid > 0 ? 10 : std::max<double>(1, impl->nextRound - monotonicMs());
+      co_await timer.afterDelay(static_cast<int64_t>(delay) * kj::MILLISECONDS);
+    }
+  } catch (const kj::Exception& error) { impl->tickFailed(error.getDescription().cStr()); }
+    catch (const std::exception& error) { impl->tickFailed(error.what()); }
+    catch (...) { impl->tickFailed("unknown host check loop failure"); }
+  // A broken diagnostic loop never wins the node's exclusiveJoin.
+  co_await kj::Promise<void>(kj::NEVER_DONE);
 }
 }  // namespace coworkerd

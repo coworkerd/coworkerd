@@ -3576,7 +3576,11 @@ public:
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
-      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
+      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
+          .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
+        process->snapshotAfterFailure();
+        return kj::mv(error);
+      });
       co_await kj::mv(request).attach(std::move(finish));
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
@@ -3584,6 +3588,7 @@ public:
       slot->report(tracked->status(), limitCode());
       co_return;
     } catch (const kj::Exception& error) {
+      if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
     }
@@ -3604,6 +3609,7 @@ private:
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
       co_await request;
     } catch (const kj::Exception& error) {
+      if (slot->process) slot->process->snapshotAfterFailure();
       failed = error.clone();
       failure = error.getDescription().cStr();
     }

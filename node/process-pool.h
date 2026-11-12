@@ -29,6 +29,8 @@ class ProcessCall final {
 public:
   ~ProcessCall();
   void finish();
+  // Exceptional completion only: capture a dying generation before its calls are released.
+  void snapshotAfterFailure() noexcept;
   kj::Promise<void> onExit();
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;

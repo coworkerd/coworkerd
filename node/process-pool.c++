@@ -821,6 +821,7 @@ struct ProcessGeneration {
   std::string eventSha256;            // its value once the pipe ended
   pid_t spawnPid = 0;
   std::string eventTail;
+  bool fatalMemoryEventPending = false;
   std::vector<LimitEvent> unappliedEvents;
   std::array<std::set<std::string>, 2> terminatedCalls;  // CPU, memory: pid, invocation, Worker, version
   // A durable process's limit rows name the request that started the object's context (workerd keeps one per object),
@@ -953,7 +954,18 @@ struct ProcessGeneration {
       if (n < 0) break;  // EAGAIN: every byte written so far has been read
       eventBytes += n;
       if (eventDigest) EVP_DigestUpdate(eventDigest, buffer, size_t(n));
+      const auto previousSize = eventTail.size();
       eventTail.append(buffer, n);
+      if (!fatalMemoryEventPending) {
+        // Scan each new byte once (plus a bounded overlap for a split marker),
+        // never the accumulated tail on the per-call completion path.
+        constexpr std::string_view undetermined = "\"memory-oom-undetermined\"";
+        constexpr std::string_view culprit = "\"memory-culprit\"";
+        constexpr auto overlap = std::max(undetermined.size(), culprit.size()) - 1;
+        const auto start = previousSize > overlap ? previousSize - overlap : 0;
+        fatalMemoryEventPending = eventTail.find(undetermined, start) != std::string::npos ||
+            eventTail.find(culprit, start) != std::string::npos;
+      }
     }
   }
   std::string currentEventSha256() const {
@@ -969,12 +981,10 @@ struct ProcessGeneration {
   }
   void snapshotMemoryCrashCalls() {
     if (memoryCrashInFlight) return;
-    // A nonblocking read also covers EOF arriving before the RPC disconnect
-    // callback. Parse early only for a possible fatal row, not ordinary traffic.
-    drainEvents();
+    // Ordinary completions only inspect these fixed-size flags. The observer
+    // maintains them as bytes arrive; exceptional completions may drain first.
     if (!eventsEnded && !oomSignalled && oomCulpritRow.empty() &&
-        eventTail.find("\"memory-oom-undetermined\"") == std::string::npos &&
-        eventTail.find("\"memory-culprit\"") == std::string::npos) return;
+        !fatalMemoryEventPending) return;
     pullEvents();
     if (eventsEnded || oomSignalled || !oomCulpritRow.empty()) memoryCrashInFlight = inFlightJson();
   }
@@ -1075,6 +1085,17 @@ ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process)
   ++this->process->inFlight;
 }
 ProcessCall::~ProcessCall() { finish(); }
+void ProcessCall::snapshotAfterFailure() noexcept {
+  if (process->memoryCrashInFlight) return;
+  try {
+    // RPC rejection can beat the pipe observer. This read is confined to the
+    // exceptional path and precedes the existing call release.
+    process->drainEvents();
+    process->snapshotMemoryCrashCalls();
+  } catch (...) {
+    // Diagnostics must not replace the request's original failure.
+  }
+}
 void ProcessCall::finish() {
   if (finished) return;
   process->snapshotMemoryCrashCalls();
@@ -3327,7 +3348,10 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   // From this send onward, a lost connection or a dead child is never retried.
   call->dispatched = true;
   auto result = p->runtime->open(descriptor);
-  result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).attach(std::shared_ptr<ProcessCall>(call));
+  result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
+    call->snapshotAfterFailure();
+    return kj::mv(error);
+  }).attach(std::shared_ptr<ProcessCall>(call));
   return result;
 }
 std::string ProcessPool::json(uint32_t idleMs) const {
