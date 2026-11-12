@@ -8069,7 +8069,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"staticPeers\":" << c.peers.size() << ",\"staticPlacements\":" << c.placements.size()
       << "},\"memoryWatermark\":{\"enabled\":" << b(c.memoryWatermarkEnabled) << ",\"budgetBytes\":" << c.memoryBudgetBytes
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
-      << ",\"probation\":" << b(c.suspectProbation)
+      << ",\"probation\":" << b(c.suspectProbation) << ",\"probationLimit\":" << c.suspectProbationLimit
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
       << ",\"ingress\":{\"webSocketsPerTenant\":" << c.webSocketsPerTenant << "}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
@@ -8172,12 +8172,16 @@ int run(Launch launch) {
   const auto stackDirectory = launch.stackDirectory;
   // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).
   coworkerd::Suspects suspects(membership.get(), serverConfig.serverId, serverConfig.suspectBaseMs,
-      serverConfig.suspectMaxMs, timer, serverConfig.suspectProbation && serverConfig.processPool.quarantineProcesses > 0);
+      serverConfig.suspectMaxMs, timer, serverConfig.suspectProbation && serverConfig.processPool.quarantineProcesses > 0,
+      serverConfig.suspectProbationLimit);
   // The tenants' records: deletion, log quotas (handed to the log drainer), default limits -- from the desired state's
   // manifests, at every revision it applies.
   coworkerd::TenantView tenantView;
   desiredState->onTenants([&tenantView](const std::map<std::string, std::optional<coworkerd::TenantRecord>>& records,
       uint64_t revision, bool known) { tenantView.update(records, revision, known); });
+  suspects.onTenantUnavailable([&](const std::string& tenant) {
+    return desiredState->tenantsKnown() && !tenantView.unavailable(tenant).empty();
+  });
   struct QuotaTasks final: kj::TaskSet::ErrorHandler {
     void taskFailed(kj::Exception&& error) override {
       std::cerr << "[tenant] log quota not handed to the drainer: " << error.getDescription().cStr() << std::endl;
@@ -8611,7 +8615,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
   const fs::path directory = pattern;
   try {
     coworkerd::Suspects suspects(nullptr, c.serverId, c.suspectBaseMs, c.suspectMaxMs, timer,
-        c.suspectProbation && c.processPool.quarantineProcesses > 0);
+        c.suspectProbation && c.processPool.quarantineProcesses > 0, c.suspectProbationLimit);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
     coworkerd::ProcessPool pool(c.processPool, launch->workerd, launch->runtime, directory.string(),

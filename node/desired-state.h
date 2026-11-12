@@ -44,6 +44,8 @@ public:
   // Full status (`full`) or the deployment summary without per-Worker maps.
   virtual std::string json(bool full = true) const = 0;
   virtual const DesiredStateConfig& config() const = 0;
+  // A successfully applied tenant-record view whose latest poll reached the store.
+  virtual bool tenantsKnown() const { return false; }
   // A read of the desired state now (the object store's: the index's hint, and what changed), shared with a poll
   // already running -- one that started after this call, so that a write made before it is seen. A trial load that names
   // a newer revision than this node applied asks for it instead of waiting for the next poll.

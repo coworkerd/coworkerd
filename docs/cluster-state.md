@@ -223,6 +223,10 @@ An interrupted request leaves at most immutable objects -- a package's objects, 
 
 Only unexpired suspicions are stored or rewritten. By default (`suspectProbation: true`, with quarantine processes), an expired mark remains **locally** in probation until an invocation dispatched into this node's quarantine process after the deadline finishes its runtime context, including background work, without harming the process. An isolate limit termination or a tenant's 5xx counts when the process survives. Each node decides independently; no probation state or release message is shared. Reoffending during probation doubles the previous duration, capped by `suspectMaxMs`, and publishes a new active mark. A restart loses local probation; expired entries are not restored, so the tenant goes straight to ordinary processes on that node. With `suspectProbation: false` or `quarantineProcesses: 0`, expiry retains its original behavior.
 
+Local probation is bounded by `suspectProbationLimit` (default 1024). The 250 ms maintenance loop first clears expired marks when a ready tenant-record view with a successful latest poll establishes that the tenant is deleted or being deleted, then clears excess expired marks in oldest-deadline order. Unready views, failed storage reads and the file backend do not establish absence. A cleared tenant returns to ordinary processes; a later tenant with the same name starts clean. Active suspicions are unaffected.
+
+`state.processes.suspects.cleared` reports cumulative `tenantUnavailable` and `capacity` counts, and effective `configuration.probationLimit` reports the bound. Both are omitted when probation is disabled or there are no quarantine processes.
+
 `state.processes.suspects.entries` includes active and probation tenants; with probation enabled, `state` is `suspected` or `probation`. Its `configuration.probation: true` is present when probation is effective (omitted for the legacy disabled mode), and `objectSuspects` counts only synchronized, unexpired entries. The effective startup configuration also reports the configured `suspects.probation` flag. The `[suspect]` events mean:
 
 | Event | Meaning |
@@ -233,9 +237,10 @@ Only unexpired suspicions are stored or rewritten. By default (`suspectProbation
 | `restored` | This node recovered its own unexpired mark from an earlier epoch |
 | `probation` | The deadline passed; this node still routes the tenant to quarantine |
 | `released` | A qualifying invocation completed in a surviving quarantine process; this node released the tenant. `completion` identifies its Worker, invocation, process and generation |
+| `cleared` | A local probation mark was removed by maintenance. `reason` is `tenant-unavailable` (known deleted or deleting) or `capacity` (oldest deadline above the configured bound); the tenant returns to ordinary processes |
 | `expired` | With probation disabled or no quarantine processes, the deadline passed and the local mark was removed, as before |
 
-Expiry removes an entry from the storage object even while local probation continues; it does not mean the tenant was released. No `probation` or `released` events are emitted with the feature disabled.
+Expiry removes an entry from the storage object even while local probation continues; it does not mean the tenant was released. No `probation`, `released` or `cleared` events are emitted with the feature disabled.
 
 ## 10. Draining and rolling upgrades
 

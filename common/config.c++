@@ -218,6 +218,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.suspectBaseMs = root.getSuspectBaseMs();
   result.suspectMaxMs = root.getSuspectMaxMs();
   result.suspectProbation = root.getSuspectProbation();
+  result.suspectProbationLimit = root.getSuspectProbationLimit();
+  KJ_REQUIRE(result.suspectProbationLimit > 0, "suspectProbationLimit must be positive");
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
   result.webSocketsPerTenant = root.getIngress().getWebSocketsPerTenant();

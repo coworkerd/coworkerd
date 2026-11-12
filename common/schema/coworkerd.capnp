@@ -311,6 +311,8 @@ struct ServerConfig {
   hostCheck @44 :HostCheckConfig;
   # After expiry, require one completed invocation in this node's quarantine process.
   suspectProbation @45 :Bool = true;
+  # Maximum expired marks retained for local probation; active suspicions are not counted.
+  suspectProbationLimit @46 :UInt32 = 1024;
 
   struct HostCheckConfig {
     # 0 disables it; otherwise 1000..86400000. A fresh process and fresh pages each round.

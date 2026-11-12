@@ -1,11 +1,14 @@
 #include "suspects.h"
 #include "tenancy.h"
 #include <capnp/message.h>
+#include <algorithm>
+#include <vector>
 #include <chrono>
 #include <cmath>
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <string_view>
 
 namespace coworkerd {
 namespace {
@@ -51,10 +54,11 @@ std::string Suspect::json(bool includeState) const {
       (includeState ? std::string(",\"state\":\"") + (probation ? "probation" : "suspected") + "\"" : "") + "}";
 }
 Suspects::Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer,
-    bool probationEnabled)
+    bool probationEnabled, uint32_t probationLimit)
     : membership(membership), serverId(std::move(serverId)), baseMs(baseMs), maxMs(maxMs),
-      probationEnabled(probationEnabled), timer(timer) {
+      probationEnabled(probationEnabled), probationLimit(probationLimit), timer(timer) {
   KJ_REQUIRE(baseMs > 0 && maxMs >= baseMs, "invalid suspicion durations");
+  KJ_REQUIRE(probationLimit > 0, "suspectProbationLimit must be positive");
   // The members' objects, as the membership reads them (installed before it starts: its first listing adopts them).
   if (keepsObjects()) {
     membership->onSuspects([this](const std::string& nodeId, const std::string& epoch, const std::string& bytes) {
@@ -70,6 +74,9 @@ Suspects::~Suspects() noexcept(false) {
   }
 }
 bool Suspects::keepsObjects() const { return membership != nullptr && membership->view().backend == "objectStore"; }
+void Suspects::onTenantUnavailable(std::function<bool(const std::string&)> predicate) {
+  tenantUnavailable = std::move(predicate);
+}
 bool Suspects::contains(const std::string& tenant) const {
   if (probationEnabled) return entries.contains(tenant);
   return unexpired(tenant);
@@ -132,14 +139,40 @@ void Suspects::confirm(const std::string& worker, const std::string& process,
   // Written at once (the maintenance loop wakes up).
   if (wake && wake->isWaiting()) wake->fulfill();
 }
+void Suspects::clear(const std::string& tenant, const char* reason) {
+  auto found = entries.find(tenant);
+  if (found == entries.end()) return;
+  std::cout << "[suspect] {\"event\":\"cleared\",\"reason\":" << json::quote(reason)
+      << ",\"nodeId\":" << json::quote(serverId) << ",\"observedAtUnixMs\":" << wall()
+      << ",\"record\":" << found->second.json(true) << "}" << std::endl;
+  if (std::string_view(reason) == "tenant-unavailable") ++clearedTenantUnavailable;
+  else ++clearedCapacity;
+  deadlines.erase(tenant);
+  counts.erase(tenant);
+  entries.erase(found);
+}
 void Suspects::expire() {
   for (auto it = entries.begin(); it != entries.end();) {
     if (unexpired(it->first)) { ++it; continue; }
-    if (probationEnabled) { enterProbation(it->second); ++it; continue; }
+    if (probationEnabled) {
+      enterProbation(it->second);
+      if (tenantUnavailable && tenantUnavailable(it->first)) {
+        const auto tenant = (it++)->first;
+        clear(tenant, "tenant-unavailable");
+      } else ++it;
+      continue;
+    }
     std::cout << "[suspect] {\"event\":\"expired\",\"nodeId\":" << json::quote(serverId)
         << ",\"observedAtUnixMs\":" << wall() << ",\"record\":" << it->second.json() << "}" << std::endl;
     deadlines.erase(it->first); it = entries.erase(it);
   }
+  if (!probationEnabled) return;
+  std::vector<std::pair<double, std::string>> probation;
+  for (const auto& [tenant, record] : entries)
+    if (record.probation) probation.emplace_back(deadlines.at(tenant), tenant);
+  if (probation.size() <= probationLimit) return;
+  std::sort(probation.begin(), probation.end());
+  for (size_t i = 0; i < probation.size() - probationLimit; ++i) clear(probation[i].second, "capacity");
 }
 std::string Suspects::ownObject() const {
   std::string out;
@@ -229,8 +262,10 @@ kj::Promise<void> Suspects::run() { return maintain(); }
 std::string Suspects::json() const {
   std::ostringstream out;
   out << "{\"configuration\":{\"baseMs\":" << baseMs << ",\"maxMs\":" << maxMs
-      << (probationEnabled ? ",\"probation\":true" : "")
+      << (probationEnabled ? ",\"probation\":true,\"probationLimit\":" + std::to_string(probationLimit) : "")
       << "},\"backend\":" << (keepsObjects() ? "\"objectStore\"" : "\"local\"")
+      << (probationEnabled ? ",\"cleared\":{\"tenantUnavailable\":" + std::to_string(clearedTenantUnavailable) +
+          ",\"capacity\":" + std::to_string(clearedCapacity) + "}" : "")
       << ",\"objectEpoch\":" << json::quote(writtenEpoch) << ",\"objectSuspects\":" << [&] {
            size_t count = 0;
            for (const auto& [tenant, record] : entries) if (record.sourceServerId == serverId && record.synced && unexpired(tenant)) ++count;

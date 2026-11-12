@@ -5,6 +5,7 @@
 
 #include <kj/async-io.h>
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -38,7 +39,9 @@ class Suspects final {
 public:
   // Without a membership that keeps objects (the file membership, the self-check) the suspicions stay on this node.
   Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer,
-      bool probationEnabled = true);
+      bool probationEnabled = true, uint32_t probationLimit = 1024);
+  // Consulted only by the maintenance loop, never by dispatch. Unknown views return false.
+  void onTenantUnavailable(std::function<bool(const std::string&)> predicate);
   ~Suspects() noexcept(false);
   bool contains(const std::string& tenant) const;
   // Nonzero only for an invocation dispatched after the current suspicion's deadline.
@@ -57,6 +60,9 @@ private:
   std::string serverId;
   uint32_t baseMs, maxMs;
   bool probationEnabled;
+  uint32_t probationLimit;
+  std::function<bool(const std::string&)> tenantUnavailable;
+  uint64_t clearedTenantUnavailable = 0, clearedCapacity = 0;
   uint64_t nextRevision = 0;
   kj::Timer& timer;
   std::map<std::string, Suspect> entries;
@@ -75,6 +81,7 @@ private:
   bool adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes);
   kj::Promise<void> maintain();
   void expire();
+  void clear(const std::string& tenant, const char* reason);
   bool unexpired(const std::string& tenant) const;
   void enterProbation(Suspect& record);
   void remember(Suspect record, const char* event);

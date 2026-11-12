@@ -219,6 +219,7 @@ public:
     return out.str();
   }
   const DesiredStateConfig& config() const override { return settings; }
+  bool tenantsKnown() const override { return started && lastPollOk; }
   void onTenants(std::function<void(const std::map<std::string, std::optional<TenantRecord>>&, uint64_t, bool)> sink) override {
     tenantSink = std::move(sink);
   }
