@@ -8069,6 +8069,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"staticPeers\":" << c.peers.size() << ",\"staticPlacements\":" << c.placements.size()
       << "},\"memoryWatermark\":{\"enabled\":" << b(c.memoryWatermarkEnabled) << ",\"budgetBytes\":" << c.memoryBudgetBytes
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
+      << ",\"probation\":" << b(c.suspectProbation)
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
       << ",\"ingress\":{\"webSocketsPerTenant\":" << c.webSocketsPerTenant << "}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
@@ -8171,7 +8172,7 @@ int run(Launch launch) {
   const auto stackDirectory = launch.stackDirectory;
   // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).
   coworkerd::Suspects suspects(membership.get(), serverConfig.serverId, serverConfig.suspectBaseMs,
-      serverConfig.suspectMaxMs, timer);
+      serverConfig.suspectMaxMs, timer, serverConfig.suspectProbation && serverConfig.processPool.quarantineProcesses > 0);
   // The tenants' records: deletion, log quotas (handed to the log drainer), default limits -- from the desired state's
   // manifests, at every revision it applies.
   coworkerd::TenantView tenantView;
@@ -8609,7 +8610,8 @@ int runSelfCheck(const std::vector<std::string>& args) {
   KJ_REQUIRE(mkdtemp(pattern.data()) != nullptr, "cannot create the check's temporary directory", strerror(errno));
   const fs::path directory = pattern;
   try {
-    coworkerd::Suspects suspects(nullptr, c.serverId, c.suspectBaseMs, c.suspectMaxMs, timer);
+    coworkerd::Suspects suspects(nullptr, c.serverId, c.suspectBaseMs, c.suspectMaxMs, timer,
+        c.suspectProbation && c.processPool.quarantineProcesses > 0);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
     coworkerd::ProcessPool pool(c.processPool, launch->workerd, launch->runtime, directory.string(),

@@ -217,6 +217,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.heatIdleMs = result.idleMs;
   result.suspectBaseMs = root.getSuspectBaseMs();
   result.suspectMaxMs = root.getSuspectMaxMs();
+  result.suspectProbation = root.getSuspectProbation();
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
   result.webSocketsPerTenant = root.getIngress().getWebSocketsPerTenant();

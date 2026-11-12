@@ -309,6 +309,8 @@ struct ServerConfig {
   durableObjects @43 :DurableObjectsConfig;
   # Node-local first-touch diagnostics; never changes request or memory limits.
   hostCheck @44 :HostCheckConfig;
+  # After expiry, require one completed invocation in this node's quarantine process.
+  suspectProbation @45 :Bool = true;
 
   struct HostCheckConfig {
     # 0 disables it; otherwise 1000..86400000. A fresh process and fresh pages each round.

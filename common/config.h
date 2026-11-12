@@ -237,6 +237,7 @@ struct ServerConfig {
   coworkerd::ProcessPoolConfig processPool;
   coworkerd::MembershipConfig membership;
   uint32_t suspectBaseMs = 600000, suspectMaxMs = 3600000;
+  bool suspectProbation = true;
   coworkerd::DesiredStateConfig desiredState;
   // The Server's exit; COWORKERD_DRAIN_TIMEOUT_MS overrides it. The test knob delays
   // the authority write of the announcement (the Server refuses new work at once), widening

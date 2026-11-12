@@ -221,6 +221,22 @@ An interrupted request leaves at most immutable objects -- a package's objects, 
 
 **Suspects.** A node that identified a tenant as a culprit ([process isolation](process-isolation.md), section 7) applies the mark at once and writes the suspicions it identified, every tenant with its Worker, the call and its expiry, as one object beside its heartbeat, `members/<nodeId>/<epoch>.suspects`: at once when they change, again with the same bytes every 60 s while there are any -- which refreshes its `LastModified` and keeps its ETag -- and never while its epoch is expired. It removes the object when none is left; graceful exit preserves any unexpired suspicions with their original expiry times. The other nodes find the object in their membership listing and read it only when its ETag changed, so a node's suspects cost each reader one GET per change and nothing in between; each adopts every suspicion until its own expiry, which every node judges by its clock, and never lifts one because the object disappeared. A node that started again reads its previous epoch's suspects, writes the recovered unexpired entries into its new epoch's object with unchanged expiry times, and only then removes the old object. A failed read, invalid content or failed write leaves the old object in place for a later attempt. The other nodes adopt a mark within one listing interval -- measured, 6 s.
 
+Only unexpired suspicions are stored or rewritten. By default (`suspectProbation: true`, with quarantine processes), an expired mark remains **locally** in probation until an invocation dispatched into this node's quarantine process after the deadline finishes its runtime context, including background work, without harming the process. An isolate limit termination or a tenant's 5xx counts when the process survives. Each node decides independently; no probation state or release message is shared. Reoffending during probation doubles the previous duration, capped by `suspectMaxMs`, and publishes a new active mark. A restart loses local probation; expired entries are not restored, so the tenant goes straight to ordinary processes on that node. With `suspectProbation: false` or `quarantineProcesses: 0`, expiry retains its original behavior.
+
+`state.processes.suspects.entries` includes active and probation tenants; with probation enabled, `state` is `suspected` or `probation`. Its `configuration.probation: true` is present when probation is effective (omitted for the legacy disabled mode), and `objectSuspects` counts only synchronized, unexpired entries. The effective startup configuration also reports the configured `suspects.probation` flag. The `[suspect]` events mean:
+
+| Event | Meaning |
+| --- | --- |
+| `recognized` | This node identified a new offense and set a new deadline and count |
+| `synchronized` | This node wrote its active suspicion to the object store |
+| `shared` | This node adopted another node's unexpired mark |
+| `restored` | This node recovered its own unexpired mark from an earlier epoch |
+| `probation` | The deadline passed; this node still routes the tenant to quarantine |
+| `released` | A qualifying invocation completed in a surviving quarantine process; this node released the tenant. `completion` identifies its Worker, invocation, process and generation |
+| `expired` | With probation disabled or no quarantine processes, the deadline passed and the local mark was removed, as before |
+
+Expiry removes an entry from the storage object even while local probation continues; it does not mean the tenant was released. No `probation` or `released` events are emitted with the feature disabled.
+
 ## 10. Draining and rolling upgrades
 
 A node that receives SIGTERM or SIGINT, or `POST /__coworkerd/drain`:

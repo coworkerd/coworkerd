@@ -41,16 +41,19 @@ std::string objectRecord(const Suspect& record) {
       ",\"expiresAtUnixMs\":" + std::to_string(record.expiresAtUnixMs) + ",\"durationMs\":" + std::to_string(record.durationMs) + "}";
 }
 }
-std::string Suspect::json() const {
+std::string Suspect::json(bool includeState) const {
   return "{\"tenant\":" + json::quote(tenant) + ",\"workerId\":" + json::quote(workerId) + ",\"sourceNodeId\":" + json::quote(sourceServerId) +
       ",\"processId\":" + json::quote(processId) + ",\"generation\":" + std::to_string(generation) +
       ",\"invocationId\":" + json::quote(invocationId) + ",\"count\":" + std::to_string(count) +
       ",\"recognizedAtUnixMs\":" + std::to_string(recognizedAtUnixMs) +
       ",\"expiresAtUnixMs\":" + std::to_string(expiresAtUnixMs) +
-      ",\"durationMs\":" + std::to_string(durationMs) + ",\"synced\":" + (synced ? "true" : "false") + "}";
+      ",\"durationMs\":" + std::to_string(durationMs) + ",\"synced\":" + (synced ? "true" : "false") +
+      (includeState ? std::string(",\"state\":\"") + (probation ? "probation" : "suspected") + "\"" : "") + "}";
 }
-Suspects::Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer)
-    : membership(membership), serverId(std::move(serverId)), baseMs(baseMs), maxMs(maxMs), timer(timer) {
+Suspects::Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer,
+    bool probationEnabled)
+    : membership(membership), serverId(std::move(serverId)), baseMs(baseMs), maxMs(maxMs),
+      probationEnabled(probationEnabled), timer(timer) {
   KJ_REQUIRE(baseMs > 0 && maxMs >= baseMs, "invalid suspicion durations");
   // The members' objects, as the membership reads them (installed before it starts: its first listing adopts them).
   if (keepsObjects()) {
@@ -68,17 +71,53 @@ Suspects::~Suspects() noexcept(false) {
 }
 bool Suspects::keepsObjects() const { return membership != nullptr && membership->view().backend == "objectStore"; }
 bool Suspects::contains(const std::string& tenant) const {
+  if (probationEnabled) return entries.contains(tenant);
+  return unexpired(tenant);
+}
+bool Suspects::unexpired(const std::string& tenant) const {
   auto found = deadlines.find(tenant);
   return found != deadlines.end() && found->second > mono();
+}
+void Suspects::enterProbation(Suspect& record) {
+  if (record.probation) return;
+  record.probation = true;
+  std::cout << "[suspect] {\"event\":\"probation\",\"nodeId\":" << json::quote(serverId)
+      << ",\"observedAtUnixMs\":" << wall() << ",\"record\":" << record.json(true) << "}" << std::endl;
+}
+uint64_t Suspects::probationTicket(const std::string& tenant) {
+  if (!probationEnabled) return 0;
+  auto found = entries.find(tenant);
+  if (found == entries.end() || unexpired(tenant)) return 0;
+  enterProbation(found->second);
+  return found->second.revision;
+}
+void Suspects::completed(const std::string& worker, uint64_t ticket, const std::string& process,
+    uint64_t generation, const std::string& invocation) {
+  if (!ticket || !probationEnabled) return;
+  const auto tenant = tenantOf(worker);
+  auto found = entries.find(tenant);
+  if (found == entries.end() || found->second.revision != ticket || unexpired(tenant)) return;
+  enterProbation(found->second);
+  std::cout << "[suspect] {\"event\":\"released\",\"nodeId\":" << json::quote(serverId)
+      << ",\"observedAtUnixMs\":" << wall() << ",\"record\":" << found->second.json(true)
+      << ",\"completion\":{\"workerId\":" << json::quote(worker) << ",\"processId\":" << json::quote(process)
+      << ",\"generation\":" << generation << ",\"invocationId\":" << json::quote(invocation) << "}}" << std::endl;
+  deadlines.erase(tenant);
+  entries.erase(found);
 }
 void Suspects::remember(Suspect record, const char* event) {
   const auto now = wall();
   if (record.expiresAtUnixMs <= now) return;
+  auto previous = entries.find(record.tenant);
+  const bool same = previous != entries.end() && previous->second.invocationId == record.invocationId &&
+      previous->second.sourceServerId == record.sourceServerId && previous->second.expiresAtUnixMs == record.expiresAtUnixMs;
+  record.revision = same ? previous->second.revision : ++nextRevision;
+  record.probation = same && previous->second.probation;
   counts[record.tenant] = std::max(counts[record.tenant], record.count);
   deadlines[record.tenant] = mono() + (record.expiresAtUnixMs - now);
   entries[record.tenant] = record;
   std::cout << "[suspect] {\"event\":" << json::quote(event) << ",\"nodeId\":" << json::quote(serverId)
-      << ",\"observedAtUnixMs\":" << now << ",\"record\":" << record.json() << "}" << std::endl;
+      << ",\"observedAtUnixMs\":" << now << ",\"record\":" << record.json(probationEnabled) << "}" << std::endl;
 }
 void Suspects::confirm(const std::string& worker, const std::string& process,
     uint64_t generation, const std::string& invocation) {
@@ -95,7 +134,8 @@ void Suspects::confirm(const std::string& worker, const std::string& process,
 }
 void Suspects::expire() {
   for (auto it = entries.begin(); it != entries.end();) {
-    if (contains(it->first)) { ++it; continue; }
+    if (unexpired(it->first)) { ++it; continue; }
+    if (probationEnabled) { enterProbation(it->second); ++it; continue; }
     std::cout << "[suspect] {\"event\":\"expired\",\"nodeId\":" << json::quote(serverId)
         << ",\"observedAtUnixMs\":" << wall() << ",\"record\":" << it->second.json() << "}" << std::endl;
     deadlines.erase(it->first); it = entries.erase(it);
@@ -104,7 +144,7 @@ void Suspects::expire() {
 std::string Suspects::ownObject() const {
   std::string out;
   for (const auto& [tenant, record] : entries) {
-    if (record.sourceServerId != serverId || !contains(tenant)) continue;
+    if (record.sourceServerId != serverId || !unexpired(tenant)) continue;
     out += (out.empty() ? "{" : ",") + json::quote(tenant) + ":" + objectRecord(record);
   }
   return out.empty() ? out : out + "}";
@@ -168,7 +208,7 @@ kj::Promise<void> Suspects::maintain() {
           lastError.clear();
           // This node's suspicions the object now holds are synchronized.
           for (auto& [tenant, record] : entries) {
-            if (record.sourceServerId != serverId || record.synced || !contains(tenant)) continue;
+            if (record.sourceServerId != serverId || record.synced || !unexpired(tenant)) continue;
             auto synchronized = record;
             synchronized.synced = true;
             remember(synchronized, "synchronized");
@@ -189,10 +229,11 @@ kj::Promise<void> Suspects::run() { return maintain(); }
 std::string Suspects::json() const {
   std::ostringstream out;
   out << "{\"configuration\":{\"baseMs\":" << baseMs << ",\"maxMs\":" << maxMs
+      << (probationEnabled ? ",\"probation\":true" : "")
       << "},\"backend\":" << (keepsObjects() ? "\"objectStore\"" : "\"local\"")
       << ",\"objectEpoch\":" << json::quote(writtenEpoch) << ",\"objectSuspects\":" << [&] {
            size_t count = 0;
-           for (const auto& [tenant, record] : entries) if (record.sourceServerId == serverId && record.synced && contains(tenant)) ++count;
+           for (const auto& [tenant, record] : entries) if (record.sourceServerId == serverId && record.synced && unexpired(tenant)) ++count;
            return count;
          }()
       << ",\"writes\":" << writes << ",\"removals\":" << removals << ",\"writeFailures\":" << writeFailures
@@ -201,7 +242,9 @@ std::string Suspects::json() const {
   size_t i = 0;
   for (const auto& [tenant, record] : entries) if (contains(tenant)) {
     if (i++) out << ',';
-    out << record.json();
+    auto visible = record;
+    if (probationEnabled && !unexpired(tenant)) visible.probation = true;
+    out << visible.json(probationEnabled);
   }
   out << "]}";
   return out.str();

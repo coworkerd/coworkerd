@@ -838,9 +838,11 @@ struct ProcessGeneration {
   // Tenant request contexts. workerd writes a `completed` row when a request's context
   // ends -- after its waitUntil work, whether or not it ran JavaScript, limits or not -- so
   // a dispatched invocation stays open until that row is read.
-  struct OpenContext { std::string workerId, versionId; double finishedAt = 0; };
+  struct OpenContext { std::string workerId, versionId; double finishedAt = 0; uint64_t probationTicket = 0; };
   bool contextsVisible = false;
   std::unordered_map<std::string, OpenContext> openContexts;
+  struct ProbationCompletion { std::string workerId, invocationId; uint64_t ticket; };
+  std::vector<ProbationCompletion> probationCompletions;
   // The CPU a request that lasts -- a WebSocket connection, whose context ends with it -- has already been metered with,
   // from its cpu-progress rows, until its completed row comes.
   std::unordered_map<std::string, uint64_t> meteredCpu;
@@ -1033,8 +1035,16 @@ struct ProcessGeneration {
           if (durable) terminatedWorkers[event == "terminated" ? 0 : 1][callKey(report.getPid(), "", report.getWorkerId().cStr(),
               report.getVersionId().cStr())] = mono();
         }
-        if (event == "completed" && !openContexts.empty() &&
-            openContexts.erase(std::string(report.getInvocationId().cStr()))) ++contextsCompleted;
+        if (event == "completed" && !openContexts.empty()) {
+          auto context = openContexts.find(report.getInvocationId().cStr());
+          if (context != openContexts.end()) {
+            if (context->second.probationTicket && context->second.workerId == report.getWorkerId().cStr() &&
+                context->second.versionId == report.getVersionId().cStr())
+              probationCompletions.push_back({context->second.workerId, report.getInvocationId().cStr(), context->second.probationTicket});
+            openContexts.erase(context);
+            ++contextsCompleted;
+          }
+        }
         // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
         // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same. A request that lasts reports its CPU
         // so far in cpu-progress rows (at most once a second, at its events), each counted for what it adds, and its
@@ -2447,6 +2457,22 @@ public:
       }
     }
     p.unappliedEvents.clear();
+    if (!p.probationCompletions.empty()) {
+      // A completed row can be buffered before a fatal row or an unobserved exit.
+      // Examine the whole batch, then inspect without consuming the reaper's status.
+      bool alive = p.pid > 0 && p.state != "killed" && !p.closing && !p.eventsEnded &&
+          !p.fatalMemoryEventPending && !p.oomSignalled && p.oomCulpritRow.empty() && p.culpritRow.empty() &&
+          p.runtime && !p.runtime->disconnected;
+      if (alive) {
+        siginfo_t info = {};
+        int result;
+        do { result = waitid(P_PID, p.pid, &info, WEXITED | WNOHANG | WNOWAIT); } while (result < 0 && errno == EINTR);
+        alive = result == 0 && info.si_pid == 0;
+      }
+      if (alive) for (const auto& completion : p.probationCompletions)
+        suspects.completed(completion.workerId, completion.ticket, p.id, p.generation, completion.invocationId);
+      p.probationCompletions.clear();
+    }
   }
   void syncEvents() { for (auto& s : slots) eachGeneration(s, [&](const auto& p) { applyEvents(s, *p); }); }
   // The supervisor cadence: each live generation's events at most once per LIMIT_EVENT_SYNC_MS.
@@ -3344,7 +3370,11 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   ++p->dispatched;
   // An object's requests share its context in workerd, whose completed row comes when the object leaves memory: a durable
   // process is drained once its requests in flight are done (a WebSocket connection is told to go away).
-  if (p->contextsVisible && !p->durable) p->openContexts[call->invocationId] = {call->workerId, call->versionId};
+  if (p->contextsVisible && !p->durable) {
+    const auto ticket = p->quarantine && call->invocationId.find("-invocation-") != std::string::npos
+        ? impl->suspects.probationTicket(tenantOf(call->workerId)) : 0;
+    p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
+  }
   // From this send onward, a lost connection or a dead child is never retried.
   call->dispatched = true;
   auto result = p->runtime->open(descriptor);

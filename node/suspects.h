@@ -17,25 +17,34 @@ struct Suspect {
   uint64_t generation = 0, count = 0, recognizedAtUnixMs = 0;
   uint64_t expiresAtUnixMs = 0, durationMs = 0;
   bool synced = false;
-  std::string json() const;
+  // Local only: never included in the membership object.
+  bool probation = false;
+  uint64_t revision = 0;
+  std::string json(bool includeState = false) const;
 };
 
 // The request path reads only this local view. Only a validated watchdog report
 // may create a local suspicion; the object store's I/O runs independently of dispatch.
 // A suspicion is of a tenant (control-plane-api.md section 1): any Worker of it confirmed as a culprit
-// puts every Worker of the tenant into the quarantine processes until the observation period ends. Each node
+// puts every Worker of the tenant into the quarantine processes until its period ends and (when enabled) a local
+// probation invocation completes without harming the process. Each node
 // writes the suspicions it recognized as one object beside its heartbeat, members/<nodeId>/<epoch>.suspects (through its
 // membership: written when they change and every 60 s while there are any, removed once none is left, and with the
 // epoch's other objects when the node leaves or registers a new epoch), and adopts every live member's -- its membership
 // reads them in its listing cycle, each one only when its ETag changed. An adopted suspicion ends at its own expiry
 // (expiresAtUnixMs, against this machine's clock, which the membership's clock check keeps within 2 s of the store's),
-// never because its object went.
+// never because its object went. Probation is local and is lost on restart.
 class Suspects final {
 public:
   // Without a membership that keeps objects (the file membership, the self-check) the suspicions stay on this node.
-  Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer);
+  Suspects(Membership* membership, std::string serverId, uint32_t baseMs, uint32_t maxMs, kj::Timer& timer,
+      bool probationEnabled = true);
   ~Suspects() noexcept(false);
   bool contains(const std::string& tenant) const;
+  // Nonzero only for an invocation dispatched after the current suspicion's deadline.
+  uint64_t probationTicket(const std::string& tenant);
+  void completed(const std::string& worker, uint64_t ticket, const std::string& process,
+      uint64_t generation, const std::string& invocation);
   // The culprit's Worker (a full name); its tenant is the suspect.
   void confirm(const std::string& worker, const std::string& process,
       uint64_t generation, const std::string& invocation);
@@ -47,6 +56,8 @@ private:
   Membership* membership;
   std::string serverId;
   uint32_t baseMs, maxMs;
+  bool probationEnabled;
+  uint64_t nextRevision = 0;
   kj::Timer& timer;
   std::map<std::string, Suspect> entries;
   std::map<std::string, uint64_t> counts;
@@ -64,6 +75,8 @@ private:
   bool adopt(const std::string& nodeId, const std::string& epoch, const std::string& bytes);
   kj::Promise<void> maintain();
   void expire();
+  bool unexpired(const std::string& tenant) const;
+  void enterProbation(Suspect& record);
   void remember(Suspect record, const char* event);
 };
 }  // namespace coworkerd
