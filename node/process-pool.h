@@ -93,6 +93,9 @@ public:
     std::function<uint32_t()> maxMemoryMiB;
   };
   void setWorkerLimits(WorkerLimitsView view);
+  // cgroup OOM counters have no victim identity: helper exposure makes a new
+  // increment foreign, rather than evidence against a workerd SIGKILL exit.
+  void setHostCheckOomGuard(std::function<bool()> guard);
   // The limits in force for one Worker here: what it names, else this node's own.
   WorkerLimits effectiveLimits(const std::string& workerId) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;

@@ -89,6 +89,50 @@ A node therefore cannot change what is deployed, cannot read the credentials ind
 
 A node also measures, in the background at startup, whether the store's create-if-absent holds under concurrency -- 4 writers on one key in each of 5 rounds, below its own `members/<nodeId>/probe/` -- and reports it in a `[membership] {"event":"conditional-put",...}` line and the state endpoint's `storage.conditionalPutAtomic`. Membership does not rely on it; more than one control plane on a bucket does (section 8).
 
+### Host first-touch diagnostics
+
+The authenticated state endpoint includes `host`. This is local observed state; it is not written to membership,
+sent to peers or used for admission. `hostCheck.intervalMs` defaults to 60000 and `hostCheck.sampleMiB` to 16.
+An interval of 0 disables the check. Each enabled round execs an independent helper, maps fresh anonymous memory,
+touches every page and releases it. There is no idle helper or retained sample memory. Yellow/red memory bands
+skip a round; a round still running at the next interval is also skipped. A helper failure or 30 s timeout does not
+stop service, and a later interval tries again. The helper dies with the node, including a node killed by SIGKILL.
+
+| `host` field | Meaning (since this node started) |
+| --- | --- |
+| `enabled`, `available` | Configured on; whether the last completed attempt produced a valid measurement (`false` before the first result or after failure) |
+| `intervalMs`, `sampleMiB` | Effective configuration |
+| `rounds`, `skippedRounds`, `errors` | Completed measurements, skipped intervals and failed attempts; a skip does not increase `touchedMiB` |
+| `touchedMiB` | Total measured MiB in completed rounds |
+| `chunksAtLeast20ms`, `chunksAtLeast100ms` | Counts of 1 MiB chunks at or above each wall-time threshold |
+| `maxChunkWallMs`, `maxChunkSystemMs` | Largest chunk's wall time and the system CPU of that same chunk |
+| `lastStallAtUnixMs` | End of the most recent chunk at least 20 ms, in real Unix milliseconds; 0 before any stall |
+| `pid` | Current helper pid, or 0 between rounds |
+| `lastResult`, `lastError` | Last successful measurement, or `null` before one; most recent failure, cleared by success |
+| `balloon` | Startup detection: status, aggregate `freePageReporting`, and each device's complete `featureBits` and bit-5 result. Unknown reads are `null`, distinct from `false` |
+
+A result includes requested/touched MiB, chunk/page sizes, counts at 5/20/100 ms, `stalledMsTotal` (sum of chunks
+at least 5 ms), whole-round wall/user/system times, start/end/stall timestamps, and `largest` (at most eight chunks
+with index, wall/user/system times and `observedAtUnixMs`). `coworkerd check host [MiB]` prints the same measurement
+with current balloon detection, default 256 MiB; exit 1 means at least one chunk took 20 ms, 2 means a check error.
+The [installation guide](guide/install.md#10-troubleshooting) explains interpretation and operator remedies.
+
+`[host-check]` has `event: "startup"` for the first outcome (including skipped, unavailable or disabled), its real
+`observedAtUnixMs`, and the cumulative `host` object containing that round's result. Startup warns when free page
+reporting is negotiated or the first sample has a chunk at least 20 ms. Later only such slow rounds produce a line,
+with `event: "result"`; successful quiet rounds and errors remain visible in state without recurring log traffic.
+
+The helper stays in the node's cgroup. Its OOM kill must not count as a workerd's: `processes.kernelOomKills` counts
+new cgroup OOM increments during a helper exposure window under `other` and `hostCheckUnattributed`, rather than
+allowing a workerd SIGKILL to claim them. The window includes the last counter read after helper reaping. If helper
+and workerd deaths overlap, this conservatively leaves the pid-less increment unattributed; a workerd's own V8 OOM
+report and culprit are still read normally. Request limits and their accounting do not change.
+
+`[process-memory-crash]` carries `inFlight` just like `[process-kill]`: all calls still held by the process, each with
+`workerId`, `versionId`, `invocationId`, `treeId` (strings), `startedAtMonotonicMs`, `startedAtUnixMs` (numbers), and
+`dispatched` (boolean); no calls gives `[]`. The same offending tenant can lead to a watchdog kill or a process's own
+V8 memory crash, so both kinds of line can point to the same culprit.
+
 ## 4. Deployment state
 
 A deployment publishes the immutable parts first -- the package's objects and `definitions/<definitionHash>`, then the trial load -- and only then writes the tenant's next manifest, which flips the pointers: the active versions and the routes; the manifest's hint and the tenant index follow. Each node applies the deployment state in revision order, never going back to an older one, and a change takes effect on a node all at once.

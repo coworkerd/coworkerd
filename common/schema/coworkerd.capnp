@@ -307,6 +307,14 @@ struct ServerConfig {
   ingress @42 :IngressConfig;
   # Durable Objects (docs/compatibility.md, section 7): the workerd processes that run them on this node.
   durableObjects @43 :DurableObjectsConfig;
+  # Node-local first-touch diagnostics; never changes request or memory limits.
+  hostCheck @44 :HostCheckConfig;
+
+  struct HostCheckConfig {
+    # 0 disables it; otherwise 1000..86400000. A fresh process and fresh pages each round.
+    intervalMs @0 :UInt32 = 60000;
+    sampleMiB @1 :UInt32 = 16;
+  }
 
   struct DurableObjectsConfig {
     # The durable processes d0, d1, ...: each object runs in one of them, chosen by the object's id. They are not replaced

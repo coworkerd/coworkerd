@@ -140,6 +140,12 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.ingressPlacement = root.getIngressPlacement();
   result.memoryWatermarkEnabled = root.getMemoryWatermarkEnabled();
   result.memoryBudgetBytes = root.getMemoryBudgetBytes();
+  result.hostCheck = {root.getHostCheck().getIntervalMs(), root.getHostCheck().getSampleMiB()};
+  KJ_REQUIRE(result.hostCheck.intervalMs == 0 ||
+      (result.hostCheck.intervalMs >= 1000 && result.hostCheck.intervalMs <= 86400000),
+      "hostCheck.intervalMs must be 0 or between 1000 and 86400000");
+  KJ_REQUIRE(result.hostCheck.sampleMiB >= 1 && result.hostCheck.sampleMiB <= 4096,
+      "hostCheck.sampleMiB must be between 1 and 4096");
   result.disableAlreadyPlacedForTest = root.getDisableAlreadyPlacedForTest();
   result.peerTimeoutMs = root.getPeerTimeoutMs();
   result.clockOffsetMsForTest = root.getClockOffsetMsForTest();

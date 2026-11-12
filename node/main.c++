@@ -15,6 +15,7 @@
 #include "process-pool.h"
 #include "async-log.h"
 #include "memory-watermark.h"
+#include "host-check.h"
 #include "memory-observation.h"
 #include "egress.h"
 #include "json.h"
@@ -7877,6 +7878,7 @@ constexpr const char* USAGE =
     "usage: coworkerd --config FILE\n"
     "       coworkerd check --config FILE  (the node's self-check: the configuration, the object store, the sandbox)\n"
     "       coworkerd check storage ENDPOINT BUCKET  (the object store's self-check)\n"
+    "       coworkerd check host [MiB]  (fresh-memory first touches and virtio balloon features)\n"
     "       coworkerd --version\n"
     "       coworkerd <manifest> <workerd> <http-address> <binding-rpc-address> <source-address> [server-config]"
     "  (the regressions' form)\n";
@@ -8035,6 +8037,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"credentials\":" << q(credentials) << ",\"credentialsFile\":" << q(c.storageCredentialsFile)
       << ",\"cacheDirectory\":" << q(d.cache.directory.string()) << ",\"cacheMaxBytes\":" << d.cache.maxBytes
       << ",\"prefetchConcurrency\":" << d.cache.prefetchConcurrency
+      << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
       << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
@@ -8181,6 +8184,7 @@ int run(Launch launch) {
   });
   serverConfig.processPool.heatIdleMs = serverConfig.idleMs;
   coworkerd::MemoryWatermark memory(serverConfig.memoryWatermarkEnabled, serverConfig.memoryBudgetBytes);
+  coworkerd::HostCheck hostCheck(serverConfig.hostCheck, [&memory]() { return memory.effectiveBand(); });
   serverConfig.processPool.memoryBandFd = memory.channelDescriptor();
   // workerd calls back (the runtime's SERVER and SOURCE services) over Unix sockets in the stack's
   // run directory, the one directory a sandboxed workerd needs. The loopback TCP addresses
@@ -8208,6 +8212,7 @@ int run(Launch launch) {
   coworkerd::ProcessPool runtime(serverConfig.processPool, launch.workerd, launch.runtime,
       stackDirectory.string(), bindingSocketAddress, sourceSocketAddress, *io.provider, io.unixEventPort,
       *headerTable, suspects);
+  runtime.setHostCheckOomGuard([&hostCheck]() { return hostCheck.takeOomExposure(); });
   if (egressOn) runtime.enableEgress("unix:" + egressSocket);
   // The heartbeats announce the durable processes: a node without one is no Durable Object shard's default owner.
   membership->setDurableProcesses(runtime.durableProcesses());
@@ -8240,6 +8245,7 @@ int run(Launch launch) {
       *desiredState, runtime, memory, leaseConfig, std::move(serverConfig), *membership, httpOverCapnpFactory, *headerTable,
       timer);
   server.setTenancy(&tenantView, &tenantUsage);
+  server.addStateSection("host", [&hostCheck]() { return hostCheck.json(); });
   // The limits each Worker names: the pool reads the limit rows its processes write against them, and
   // sizes a new generation's WebAssembly memory cap by the largest of them.
   runtime.setWorkerLimits({[&server](const std::string& workerId) { return server.namedLimits(workerId); },
@@ -8430,6 +8436,7 @@ int run(Launch launch) {
       .exclusiveJoin(peerAuth.run())
       .exclusiveJoin(runtime.run())
       .exclusiveJoin(memory.run(timer))
+      .exclusiveJoin(hostCheck.run(timer))
       .exclusiveJoin(suspects.run())
       .exclusiveJoin(tenantUsage.run())
       .exclusiveJoin(runLeaseReaper(server, timer))
@@ -8462,7 +8469,7 @@ int run(Launch launch) {
 int runSelfCheck(const std::vector<std::string>& args) {
   const std::vector<std::string> options(args.begin() + 1, args.end());
   KJ_REQUIRE(!options.empty() && (options[0] == "--config" || options[0].starts_with("--config=")),
-      "usage: coworkerd check --config FILE, or coworkerd check storage ENDPOINT BUCKET");
+      "usage: coworkerd check --config FILE, coworkerd check storage ENDPOINT BUCKET, or coworkerd check host [MiB]");
   bool ok = true;
   auto report = [&ok](const std::string& check, bool passed, const std::string& fields) {
     ok = ok && passed;
@@ -8617,6 +8624,12 @@ int runSelfCheck(const std::vector<std::string>& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // This internal helper execs into its own address space and registers parent
+  // death before allocating a sample or constructing the node's logging system.
+  if (argc >= 2 && std::string_view(argv[1]) == "--host-check-child") {
+    coworkerd::executableArgument = argv[0];
+    return coworkerd::runHostCheckChild(argc - 2, argv + 2);
+  }
   coworkerd::MemoryWatermark::initializeDaemonThp();
   std::unique_ptr<coworkerd::AsyncLog> logging;
   std::unique_ptr<coworkerd::WorkerdOutput> workerdOutput;
@@ -8633,6 +8646,7 @@ int main(int argc, char** argv) {
     }
     // The self-checks: the object store's and the node's.
     if (args[0] == "check" && args.size() >= 2 && args[1] == "storage") return coworkerd::runStorageCheck(argc - 2, argv + 2);
+    if (args[0] == "check" && args.size() >= 2 && args[1] == "host") return coworkerd::runHostCheck(argc - 3, argv + 3);
     if (args[0] == "check") return runSelfCheck(args);
     std::optional<Launch> launch;
     // The test-only naive lease: this explicit switch, in either form, and nothing else.

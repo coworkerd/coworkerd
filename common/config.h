@@ -203,6 +203,11 @@ struct DurableLogConfig {
   void validate() const;
 };
 
+struct HostCheckConfig {
+  uint32_t intervalMs = 60000;  // 0 disables the independent first-touch helper.
+  uint32_t sampleMiB = 16;
+};
+
 struct ServerConfig {
   // The node's id: `nodeId` in the configuration file, the segment of its objects members/<nodeId>/ and
   // nodes/<nodeId>/. The C++ name is `serverId` (the code calls the node's id this throughout).
@@ -226,6 +231,7 @@ struct ServerConfig {
   std::string subcalls = "home";
   bool memoryWatermarkEnabled = true;
   uint64_t memoryBudgetBytes = 0;
+  HostCheckConfig hostCheck;
   bool equalLimitsForTest = false;
   bool ingressPlacement = true;
   coworkerd::ProcessPoolConfig processPool;

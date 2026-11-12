@@ -48,6 +48,21 @@ Requirements: **Docker Engine 28 or newer** (compose's internal network uses `ga
 
 Bare-metal Linux requires **glibc ≥ 2.38**: Debian 13 or Ubuntu 24.04 and later; Ubuntu 22.04 and Debian 12 report `GLIBC_2.38 not found`. Compose users are unaffected because the image includes its Debian trixie base.
 
+**Virtual-machine hosts.** Provision memory so the host does not reclaim the guest's free pages. Before installing,
+run `coworkerd check host` (default 256 MiB), or `coworkerd check host 3072` for a larger sample. It requests fresh
+anonymous memory, writes each page, and prints one JSON line with counts of 1 MiB chunks taking at least 5, 20 and
+100 ms, their total slow-chunk wall time, and the eight largest chunks' wall, user and system CPU times. Exit status
+is 1 when any chunk took at least 20 ms, 0 otherwise, and 2 when the check could not complete. A clean sample does
+not rule out intermittent stalls. `balloon` lists each Linux virtio balloon device's feature bits and whether bit 5
+(free page reporting) was negotiated; a missing driver, no devices, a read error and a non-Linux system are reported
+separately. Negotiation is a warning, not proof of a current stall.
+
+In our validation VMs, a first touch of 1 MiB took as long as 419 ms and the guest charged most of that time as the
+faulting thread's system CPU. A light request can therefore exceed its CPU limit before doing much application work.
+An operator can disable free-page reclaim on the host or reserve guest memory so it stays backed. Another option is
+to make the guest's balloon driver inactive; that is a root-level system configuration for the operator to apply and
+maintain. Coworkerd only measures and reports: it does not change the driver, kernel settings or request limits.
+
 ## 2. Option one: compose, one node (one command)
 
 ```bash
@@ -440,6 +455,8 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `processPool.pausedAdmissionWaitMs` | `1000` | Admission wait for a live paused process when no ready process or candidate node can take the call; bounded by the lease and concurrency limits. `0` disables it; must be less than `processPool.stuckTimeoutMs` |
 | `quarantineProcesses` | `2` | The number of quarantine processes. A **tenant** identified as the culprit (all its Workers) is kept here for an observation period, assigned to one of them by the tenant's hash, so that a tenant crashing a quarantine process does not affect the tenants in another shard; deployment **trial loads** run here too (in the target tenant's shard), so that a new version crashing a process does not take the in-flight requests of the ordinary processes with it. `0`: no quarantine processes; suspects and trial loads both fall back to the ordinary processes (not recommended) |
 | `cpuLimitMs` / `memoryLimitMiB` | `200` / `128` | The CPU limit per request and the memory limit per isolate (the node's defaults; a limit the Worker declares takes precedence, see the end of this section) |
+| `hostCheck.intervalMs` | `60000` | Independent first-touch check at startup and once per interval; `0` disables it, otherwise `1000` to `86400000` ms. A yellow or red memory band skips the round. No measurement process or sample mapping remains between rounds |
+| `hostCheck.sampleMiB` | `16` | Fresh anonymous memory touched per round, `1` to `4096` MiB; larger samples increase both detection probability and cost. A failed helper is reported in `state.host` and retried at the next interval; service continues |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off (a drain closes the node's WebSocket connections with `1001` at its start) |
 | `ingress.webSocketsPerTenant` | `1000` | The open WebSocket connections this node's ingress holds for one tenant: an upgrade beyond them is refused before the Worker runs, `429 WEBSOCKET_LIMIT`, and other requests are not affected; `0`: no limit |
@@ -567,6 +584,7 @@ these ports either (section 11).
 | `GET /__coworkerd/ready` | Readiness (503 while draining, and while an ordinary process slot is not ready -- the quarantine shards, where trial loads and suspect tenants run, do not count, and `state` shows them under `readiness`; load balancers take the node out on it) | Not needed |
 | `GET /__coworkerd/probe` | Liveness (200 as long as the process is there) | Not needed |
 | `GET /__coworkerd/state` | State: `nodeId`, members (`membership`), the object store (`storage`: its create-if-absent measurement, the clock check and `appliedTenantsRevision`, the tenant index revision it serves), tenants (`tenants`), per-tenant usage (`usage`), processes (including the quarantine shards and the per-tenant suspects), deployment, version (`version`), effective configuration (`configuration`), the Durable Object shards it holds, its takeovers, releases and refusals and its owner cache (`durableShards`), the objects' log -- the confirmation latency, what is not confirmed and not sealed, the segments and uploads, the peers, the rebuilds, this machine's files, the resident objects of each durable process with its evictions and wakes, the alarms it has to fire, the namespaces it holds objects of and what each tenant's objects hold (`durableLog`) --, counters; on both the ingress and the peer port | Needed |
+| `state.host` | First-touch diagnostics: whether enabled/available, completed and skipped rounds, total MiB, counts of chunks at least 20/100 ms, the maximum chunk's wall and system CPU, last stall time, last result/error and balloon features | Needed |
 | `state.memory.daemon` | Daemon RSS/PSS/anonymous/swap and `anonHugeBytes` (Linux smaps; macOS RSS), glibc allocator in-use/free/mmap bytes, and retained container entries/payload bytes (including the log drainer's tenant buffers); unavailable measurements are `null` | Needed |
 | `GET /__coworkerd/logs?worker=<tenant>/<worker>` | A Worker's recent log lines on this node, what `/v1`'s logs gather (on both the ingress and the peer port) | Needed |
 | `POST /__coworkerd/control-plane` | A control plane announces its addresses (on the peer port) | Needed |
@@ -651,6 +669,20 @@ from every configuration: a 0.4 daemon refuses a configuration that names them, 
 Use the pinned SeaweedFS 4.48 or another store verified to have the properties in section 4; on the 0.3.x compose files' SeaweedFS 3.97 create-if-absent does not hold under concurrency: a 0.4 node starts there with a warning, and only one writer of the desired state may run at a time.
 
 ## 10. Troubleshooting
+
+**Light requests intermittently get `CPU_LIMIT_EXCEEDED`, probes are overdue, or node logs have gaps.** Read
+`GET /__coworkerd/state` with the management token and inspect `host`, then run `coworkerd check host 3072` on the
+same guest. Match `host.lastStallAtUnixMs` and `[host-check]`'s `observedAtUnixMs` to the affected requests. A slow
+chunk's `systemMs` close to its `wallMs` is consistent with the host first-touch stalls we measured; a long wall time
+with little CPU can instead be a scheduling or explicit process pause. These measurements identify evidence, not a
+universal diagnosis. Check the host's reclaim/reservation policy with its operator (section 1); do not solve this by
+raising tenants' CPU limits. The periodic check uses its own process, releases each sample, and skips yellow/red
+memory bands. It logs its first outcome even when disabled, and later only rounds with chunks at least 20 ms.
+
+For a tenant that exhausts memory, the process may be ended by the watchdog or may crash itself with a V8 OOM.
+`[process-kill]` and `[process-memory-crash]` can identify the same culprit; both carry the full `inFlight` list,
+including other tenants' affected calls. An empty list is `[]`; `dispatched` distinguishes calls already sent.
+
 
 | Symptom | Cause and remedy |
 | --- | --- |

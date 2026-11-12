@@ -103,6 +103,7 @@ add_executable(coworkerd
   node/process-pool.c++
   node/async-log.c++
   node/memory-watermark.c++
+  node/host-check.c++
   node/suspects.c++
   node/membership.c++
   node/durable-shards.c++

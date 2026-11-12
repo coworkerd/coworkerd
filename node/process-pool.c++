@@ -781,6 +781,23 @@ struct ProcessGeneration {
   uint32_t inFlight = 0;
   uint64_t dispatched = 0;
   std::map<std::string, ProcessCall*> calls;
+  // RPC failure may finish the calls before waitpid observes the crash. This is
+  // diagnostic data only: it never holds a ProcessCall or delays its release.
+  std::optional<std::string> memoryCrashInFlight;
+  std::string inFlightJson() const {
+    std::ostringstream out;
+    out << std::setprecision(17) << '[';
+    size_t i = 0;
+    for (const auto& [id, call] : calls) {
+      if (i++) out << ',';
+      out << "{\"workerId\":\"" << call->workerId << "\",\"versionId\":\"" << call->versionId
+          << "\",\"invocationId\":\"" << id << "\",\"treeId\":\"" << call->treeId
+          << "\",\"startedAtMonotonicMs\":" << call->startedAtMonotonicMs << ",\"startedAtUnixMs\":" << call->startedAtUnixMs
+          << ",\"dispatched\":" << (call->dispatched ? "true" : "false") << "}";
+    }
+    out << ']';
+    return out.str();
+  }
   struct CompletedIdentity { std::string workerId, versionId, invocationId; };
   std::deque<CompletedIdentity> recentDispatched;
   std::map<std::string, double> heat;
@@ -950,6 +967,17 @@ struct ProcessGeneration {
     EVP_MD_CTX_free(copy);
     return value;
   }
+  void snapshotMemoryCrashCalls() {
+    if (memoryCrashInFlight) return;
+    // A nonblocking read also covers EOF arriving before the RPC disconnect
+    // callback. Parse early only for a possible fatal row, not ordinary traffic.
+    drainEvents();
+    if (!eventsEnded && !oomSignalled && oomCulpritRow.empty() &&
+        eventTail.find("\"memory-oom-undetermined\"") == std::string::npos &&
+        eventTail.find("\"memory-culprit\"") == std::string::npos) return;
+    pullEvents();
+    if (eventsEnded || oomSignalled || !oomCulpritRow.empty()) memoryCrashInFlight = inFlightJson();
+  }
   static std::string callKey(uint64_t pid, std::string_view invocation, std::string_view worker, std::string_view version) {
     return std::to_string(pid).append(1, '\n').append(invocation).append(1, '\n').append(worker).append(1, '\n').append(version);
   }
@@ -1049,6 +1077,7 @@ ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process)
 ProcessCall::~ProcessCall() { finish(); }
 void ProcessCall::finish() {
   if (finished) return;
+  process->snapshotMemoryCrashCalls();
   finished = true;
   KJ_ASSERT(process->inFlight > 0);
   --process->inFlight;
@@ -1164,10 +1193,16 @@ public:
   // with when it was seen (observeOomKills, at the supervisor cadence and at every exit).
   const std::string memoryEvents = memoryEventsPath();
   uint64_t lastOomKills = kernelOomKills(memoryEvents), foreignOomKills = 0, poolOomKills = 0;
+  uint64_t hostCheckOomUnattributed = 0;
+  std::function<bool()> hostCheckOomGuard;
   std::deque<double> unattributedOomKills;
   void observeOomKills() {
     const auto now = mono();
-    for (const auto count = kernelOomKills(memoryEvents); lastOomKills < count; ++lastOomKills) unattributedOomKills.push_back(now);
+    const bool exposed = hostCheckOomGuard && hostCheckOomGuard();
+    for (const auto count = kernelOomKills(memoryEvents); lastOomKills < count; ++lastOomKills) {
+      if (exposed) { ++foreignOomKills; ++hostCheckOomUnattributed; }
+      else unattributedOomKills.push_back(now);
+    }
     while (!unattributedOomKills.empty() && now - unattributedOomKills.front() > OOM_ATTRIBUTION_MS) {
       unattributedOomKills.pop_front();
       ++foreignOomKills;
@@ -2451,7 +2486,7 @@ public:
     out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"observedAtUnixMs\":" << wall()
         << ",\"reason\":\"" << p.lastReason << "\",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
-        << "\",\"culprit\":" << offender << "}";
+        << "\",\"culprit\":" << offender << ",\"inFlight\":" << p.memoryCrashInFlight.value_or(p.inFlightJson()) << "}";
     if (memoryCrashes.size() == 32) memoryCrashes.pop_front();
     memoryCrashes.push_back(out.str());
     std::cout << "[process-memory-crash] " << out.str() << std::endl;
@@ -2487,15 +2522,7 @@ public:
     std::ostringstream out; out << std::setprecision(17) << "{\"processId\":\"" << p.id
         << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"reason\":\"" << escape(reason)
-        << "\",\"stuckDurationMs\":" << duration << ",\"observedAtUnixMs\":" << wall() << ",\"inFlight\":[";
-    size_t i = 0;
-    for (const auto& [id, call] : p.calls) {
-      if (i++) out << ',';
-      out << "{\"workerId\":\"" << call->workerId << "\",\"versionId\":\"" << call->versionId
-          << "\",\"invocationId\":\"" << id << "\",\"treeId\":\"" << call->treeId
-          << "\",\"startedAtMonotonicMs\":" << call->startedAtMonotonicMs << ",\"startedAtUnixMs\":" << call->startedAtUnixMs
-          << ",\"dispatched\":" << (call->dispatched ? "true" : "false") << "}";
-    }
+        << "\",\"stuckDurationMs\":" << duration << ",\"observedAtUnixMs\":" << wall() << ",\"inFlight\":" << p.inFlightJson();
     auto offender = culprit(p);
     if (reason == "watchdog timeout" && offender != "null") {
       capnp::MallocMessageBuilder message;
@@ -2503,7 +2530,7 @@ public:
       capnp::JsonCodec().decode(kj::StringPtr(offender.c_str()), report);
       suspects.confirm(report.getWorkerId().cStr(), p.id, p.generation, report.getInvocationId().cStr());
     }
-    out << "],\"culprit\":" << offender << ",\"culpritStatus\":\""
+    out << ",\"culprit\":" << offender << ",\"culpritStatus\":\""
         << (offender == "null" ? "undetermined" : "confirmed") << "\"}";
     if (kills.size() == 32) kills.pop_front();
     kills.push_back(out.str()); std::cout << "[process-kill] " << out.str() << std::endl;
@@ -3204,6 +3231,7 @@ std::string ProcessPool::quarantineReadinessJson() const {
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
 void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = std::move(view); }
+void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId) const { return impl->limitsOf(workerId); }
 bool ProcessPool::hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const {
   const auto quarantine = quarantined(worker);
@@ -3391,6 +3419,7 @@ std::string ProcessPool::json(uint32_t idleMs) const {
   // The cgroup's OOM kills as this pool attributed them: its own processes', and the others' (not this pool's exits).
   out << "],\"kernelOomKills\":{\"memoryEvents\":\"" << escape(impl->memoryEvents) << "\",\"counted\":" << impl->lastOomKills
       << ",\"pool\":" << impl->poolOomKills << ",\"other\":" << impl->foreignOomKills
+      << ",\"hostCheckUnattributed\":" << impl->hostCheckOomUnattributed
       << ",\"unattributed\":" << impl->unattributedOomKills.size() << "}";
   out << ",\"recentMemoryCrashes\":[";
   for (size_t j = 0; j < impl->memoryCrashes.size(); ++j) { if (j) out << ','; out << impl->memoryCrashes[j]; }
