@@ -2,6 +2,10 @@
 
 ## 0.5.5 (unreleased)
 
+- Preserve acknowledged Durable Object tails across takeover by collecting complete source epochs and publishing adopted records before serving. Missing holders are named after the bounded recovery wait and a snapshot cut prevents late history from being merged into a newer branch. Preserve snapshot shard epochs across ordinary seals.
+- Heal vulnerable earlier takeover histories from complete trusted local files. Upgrading affected 0.5.3 / 0.5.4 nodes requires the documented maintenance procedure: pause DO/D1 traffic, stop all nodes without draining, preserve the boot and volumes, start all fixed nodes and wait for healing. Ordinary rolling drain can lose the surviving complete copy; already missing pages require a verified backup.
+- Limit a single encoded WAL record to what the existing recovery RPC can return (67,104,768 bytes by default; smaller peer buffers lower it). A record over 32 MiB can occupy a recovery page alone. An over-limit commit now fails with `STORAGE_UNAVAILABLE` before it can be confirmed; the object is repaired from confirmed history. This is an intentional change from acknowledging records that could not later be retrieved. SQL payloads have a lower limit because WAL and record headers count; CPU and memory limits still apply.
+
 - Wait within `processPool.pausedAdmissionWaitMs` (1000 ms by default; 0 disables it) when the only eligible ordinary, quarantine or durable process is alive but paused by an overdue probe. This fixes the transient admission 503s present in 0.5.3 and 0.5.4. Ready processes and other candidate nodes still take calls immediately; stuck processes retain the original watchdog deadline.
 
 ## 0.5.4 (unreleased)

@@ -200,8 +200,11 @@ DurableShards::Owner DurableShards::ownerOf(const ShardEpoch& record) const {
   if (found != membership.members.end()) {
     const auto epoch = decimal(found->second.epoch);
     if (epoch == record.nodeEpoch) return found->second.state == "draining" ? Owner::DRAINING : Owner::ALIVE;
-    // A newer epoch of the node replaced the owner's; an older one means the table has not seen the owner's yet.
-    return epoch > record.nodeEpoch ? Owner::GONE : Owner::ALIVE;
+    // A live replacement can reclaim its own shard and reuse its trusted files.
+    // A draining replacement must not be asked to take it back.
+    if (epoch > record.nodeEpoch)
+      return found->second.state == "draining" || found->second.durableProcesses == 0 ? Owner::GONE : Owner::ALIVE;
+    return Owner::ALIVE;  // The member table has not seen the owner's epoch yet.
   }
   // Not in the table: gone when the table was listed after the epoch was created -- a node that took a shard had a heartbeat
   // then and keeps it live a TTL plus the grace after its last one --, else the table may not know the node yet.
@@ -271,6 +274,16 @@ ShardRoute DurableShards::forwardTo(const ShardEpoch& record, const std::string&
   route.nodeEpoch = record.nodeEpoch;
   route.epoch = record.epoch;
   route.source = source;
+  if (auto member = membership.members.find(record.nodeId); member != membership.members.end() &&
+      decimal(member->second.epoch) > record.nodeEpoch && member->second.state != "draining" &&
+      member->second.durableProcesses > 0) {
+    route.nodeEpoch = decimal(member->second.epoch);
+    route.epoch = 0;  // Ask this process to resolve/reclaim the shard, not to serve its predecessor's epoch.
+    route.source = "restart-forward";
+    log("restart-forwarded", record.namespaceId, record.shard,
+        "\"owner\":" + quote(record.nodeId) + ",\"oldNodeEpoch\":\"" + std::to_string(record.nodeEpoch) +
+        "\",\"newNodeEpoch\":\"" + std::to_string(route.nodeEpoch) + "\"");
+  }
   return route;
 }
 
@@ -475,7 +488,12 @@ kj::Promise<ShardRoute> DurableShards::decide(std::string namespaceId, uint32_t 
   }
   // An owner the member table counts live that a request could not reach, or that this node was asked to replace: its
   // liveness from the store now.
-  if (owner == Owner::ALIVE && (forwardedHere || (retry && failedNode == record.nodeId))) owner = co_await probeOwner(record);
+  if (owner == Owner::ALIVE && (forwardedHere || (retry && failedNode == record.nodeId))) {
+    auto probe = record;
+    if (auto member = membership.members.find(record.nodeId); member != membership.members.end() &&
+        decimal(member->second.epoch) > record.nodeEpoch) probe.nodeEpoch = decimal(member->second.epoch);
+    owner = co_await probeOwner(probe);
+  }
   if (owner == Owner::ALIVE || owner == Owner::DRAINING) {
     if (forwardedHere)
       co_return ShardRoute::refuse(409, "DO_SHARD_EPOCH_MISMATCH", "the shard is held by node " + record.nodeId + " at epoch " +

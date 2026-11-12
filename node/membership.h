@@ -29,6 +29,7 @@ struct Member {
   // objectStore: its durable processes (durableObjects.processes, from its heartbeat): a member with none is no Durable
   // Object shard's default owner.
   uint32_t durableProcesses = 1;
+  std::string instance = {};
 };
 
 // All access takes place on the Server's KJ event loop. Request handling only
@@ -59,6 +60,11 @@ struct MembershipView {
   uint64_t revokedAtUnixMs = 0;
   uint64_t memberChanges = 0;
   std::map<std::string, Member> members;
+  // Recovery may need a process that is no longer a live member. This is an address
+  // cache, never an authority for placement or a proof that a missing process died.
+  std::map<std::string, Member> recoveryMembers;
+  bool recoveryHistoryIncomplete = false;
+  void rememberForRecovery(const Member& member);
   // Member keys whose value cannot be read (skipped: the other members are applied as usual), and how many
   // such values were skipped since this process started.
   std::set<std::string> invalidMembers;

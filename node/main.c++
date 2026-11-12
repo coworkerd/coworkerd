@@ -3734,6 +3734,8 @@ public:
   rpc::PeerServer::Client& client() {
     return peer;
   }
+  void setOwnerTailSupport(bool supported) { ownerTailSupport = supported; }
+  bool supportsOwnerTail() const { return ownerTailSupport; }
 
   kj::Promise<void> onDisconnect() {
     return rpcSystem->onDisconnect();
@@ -3761,6 +3763,7 @@ private:
   kj::Own<capnp::TwoPartyClient> rpcSystem;
   rpc::PeerServer::Client peer;
   bool disconnected = false;
+  bool ownerTailSupport = false;
 };
 
 class AttachedHttpService final: public kj::HttpService {
@@ -4030,13 +4033,15 @@ public:
 
   // What a node holds of a previous owner's log for one shard.
   kj::Promise<coworkerd::DurableTailAnswer> fetchDurableTail(std::string targetServerId,
-      coworkerd::DurableTailAsk ask) {
+      coworkerd::DurableTailAsk ask, std::string address = {}, std::string epoch = {}) {
     const auto& config = server.placementConfig();
-    auto peer = server.member(targetServerId);
-    KJ_REQUIRE(peer != nullptr, "the peer is not in the member table", targetServerId.c_str());
-    const auto identity = peer->address + "#" + peer->epoch;
-    const auto address = peer->address;
-    const auto epoch = peer->epoch;
+    if (address.empty()) {
+      auto peer = server.member(targetServerId);
+      KJ_REQUIRE(peer != nullptr, "the peer is not in the member table", targetServerId.c_str());
+      address = peer->address;
+      epoch = peer->epoch;
+    }
+    const auto identity = address + "#" + epoch;
     auto connection = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
     auto request = connection->client().fetchDurableTailRequest();
     auto parameters = request.initRequest();
@@ -4050,6 +4055,7 @@ public:
     auto response = co_await request.send();
     auto result = response.getResult();
     coworkerd::DurableTailAnswer answer;
+    answer.ownerConfirmed = connection->supportsOwnerTail();
     answer.firstSeq = result.getFirstSeq();
     answer.lastSeq = result.getLastSeq();
     answer.droppedTo = result.getDroppedTo();
@@ -4062,8 +4068,11 @@ public:
       for (const auto& encoded : coworkerd::splitRecords(
                std::string_view(reinterpret_cast<const char*>(records.begin()), records.size()), &error)) {
         auto record = coworkerd::decodeLogRecord(encoded);
-        if (record) answer.records.push_back(std::move(*record));
+        KJ_REQUIRE(record.has_value(), "a peer tail contains an invalid record");
+        answer.records.push_back(std::move(*record));
       }
+      KJ_REQUIRE(error.empty(), "a peer tail is truncated", error.c_str());
+      KJ_REQUIRE(answer.count == answer.records.size(), "a peer tail's record count does not match");
     }
     co_return answer;
   }
@@ -4587,6 +4596,13 @@ private:
           .then([connection = connection.addRef()](
                     kj::HttpClient::ConnectRequest::Status&& status) mutable {
         KJ_REQUIRE(status.statusCode == 200, "peer rejected Cap'n Proto CONNECT");
+        bool supported = false;
+        status.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
+          std::string key(name.cStr());
+          std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+          if (key == "x-coworkerd-tail-owner" && value == "1") supported = true;
+        });
+        connection->setOwnerTailSupport(supported);
         return std::move(connection);
       }).attach(std::move(connection));
     }));
@@ -5235,7 +5251,9 @@ public:
       response.reject(401, "Unauthorized", kj::HttpHeaders(headerTable), uint64_t(0));
       return kj::READY_NOW;
     }
-    response.accept(200, "OK", kj::HttpHeaders(headerTable));
+    kj::HttpHeaders accepted(headerTable);
+    accepted.addPtrPtr("X-Coworkerd-Tail-Owner", "1");
+    response.accept(200, "OK", accepted);
     if (verdict.keyTag.empty()) return rpcServer.accept(connection);
     // A session accepted with a key that later leaves the key file ends windowMs after it left.
     return rpcServer.accept(connection).exclusiveJoin(peerAuth.retired(verdict.keyTag).then(
@@ -5846,6 +5864,9 @@ private:
   // line on the owner.
   void log(const Line& line, const DurableTarget& target, const coworkerd::ProcessCall* process, uint status, const std::string& code,
       double started) {
+    if (process != nullptr && status >= 500)
+      durableLog.objectFailed(target.namespaceId, target.objectId, target.shardEpoch, "request",
+          code.empty() ? "HTTP " + std::to_string(status) : code);
     std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
               << jsonEscape(line.workerId) << "\",\"versionId\":\"" << jsonEscape(line.versionId) << "\",\"className\":\""
               << jsonEscape(target.className) << "\",\"namespaceId\":\"" << target.namespaceId.substr(0, 12) << "\",\"objectId\":\""
@@ -8271,7 +8292,9 @@ int run(Launch launch) {
   // (node/durable-log.h).
   coworkerd::DurableLog durableLog({server.placementConfig().serverId, membership->view().instance, launch.stackDirectory,
       coworkerd::DURABLE_HOST_UNIQUE_KEY, server.placementConfig().durableLog,
-      membership->view().backend == "objectStore" && runtime.durableProcesses() > 0},
+      membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
+      uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {
@@ -8295,6 +8318,17 @@ int run(Launch launch) {
                    << ",\"reason\":\"" << jsonEscape(reason) << "\"}" << std::endl;
          co_return;
        }});
+  durableLog.setTailAtHook([&peerForwarder](coworkerd::DurableTailTarget target, coworkerd::DurableTailAsk ask) {
+    return peerForwarder.fetchDurableTail(std::move(target.nodeId), std::move(ask),
+        std::move(target.address), std::move(target.destinationEpoch));
+  });
+  durableLog.setHealOwnershipHook([&shards](coworkerd::DurableLog::ObjectIdentity identity)
+      -> kj::Promise<std::optional<uint64_t>> {
+    auto route = co_await shards.route(identity.namespaceId, identity.shard);
+    if (route.kind != coworkerd::ShardRoute::Kind::LOCAL || route.dataEpoch != identity.dataEpoch)
+      co_return std::nullopt;
+    co_return route.epoch;
+  });
   runtime.setDurableChannel([&durableLog](const std::string& processId) { return durableLog.openChannel(processId); },
       [&durableLog](const std::string& processId) { durableLog.closeChannel(processId); },
       server.placementConfig().durableLog);

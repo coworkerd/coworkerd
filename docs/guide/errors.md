@@ -51,6 +51,14 @@ Once the Worker accepted a WebSocket (`101`), the connection ends with a close c
 | 413 | `DO_OBJECT_TOO_LARGE` | A write would take the object past `durableObjects.objectBytes` (10 GiB), as its databases last reported their size. Growing transactions are refused; the object is marked for repair immediately, and the next request waits for recovery before reads or non-growing transactions resume | Not durable: no peer holds the refused transaction, no segment and no manifest name it, so it is gone from the object's history. The node immediately marks the object for repair; the next request rebuilds from confirmed history before serving, so it cannot read the refused transaction | Delete rows, or ask the administrator to raise `durableObjects.objectBytes`; transactions that do not grow the database remain permitted |
 | 422 | `QUOTA_EXCEEDED` | A write while the tenant's Durable Objects already hold more than its `durableObjectBytes` quota (10 GiB by default). What the tenant holds is what the nodes publish of their own objects every `durableObjects.usagePublishMs` (an hour), so enforcement lags; failed publication or reads can delay it beyond an hour. Only growing transactions are refused | Not durable; immediate repair and recovery before the next request, as above | Delete data, or ask the administrator to raise the quota (`cowctl tenant update T --quota durableObjectBytes=N`); transactions that do not grow their database are permitted |
 
+**Oversized WAL records (0.5.5).** A record larger than `durableLog.settings.recordLimitBytes` is refused with
+`STORAGE_UNAVAILABLE` before it enters the node log or any peer. The default limit is 67,104,768 encoded bytes;
+WAL page headers and record metadata are included, so this is not the SQL value size. The node logs
+`record-limit-refused` and increments `durableLog.recovery.recordLimitRefusals`. It marks the object for repair;
+the next event waits for confirmed history, discarding the refused local commit. Split the transaction into
+smaller application operations instead of retrying the same oversized transaction. CPU and memory limits may
+reject it earlier. The error code retains its existing meaning: the write did not receive durable confirmation.
+
 **A write's result can be uncertain.** A Durable Object's write waits for peer confirmation, or requires a successful local flush when the selected peer list is empty. A failed flush answers `STORAGE_UNAVAILABLE` and is not acknowledged. Uploaded history and a surviving confirmed tail can be recovered; simultaneous loss of the owner and all confirming peers can lose the unuploaded tail. The other way round
 does not hold: when the owner dies between the moment its peers hold a write and the moment its answer reaches the
 caller, the caller sees a failure (`RESULT_UNCERTAIN`, or a broken connection) for a write that did happen -- about

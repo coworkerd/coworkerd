@@ -532,6 +532,21 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
+A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`
+(67,104,768 bytes with defaults), so an acknowledged record fits the existing peer recovery RPC. The normal
+32 MiB page budget permits one larger record by itself. `durableLog.settings.recordLimitBytes` reports the
+limit; it is not a new configuration key. Oversized commits fail with `STORAGE_UNAVAILABLE` before replication
+and are discarded by the existing repair path; split large transactions. CPU and memory limits can reject
+smaller transactions. See the record-size discussion in cluster-state section 12.
+
+A takeover collects tails for at most `membership.ttlSeconds * 1000 + membership.livenessGraceMs` (25 s by default),
+without restarting the deadline on retries. A complete answer from the original owner ends collection early;
+otherwise recovery publishes a full snapshot cut before serving. An unavailable owner can therefore add 25 s plus
+snapshot time after takeover. `recoverTimeoutMs` limits each request's wait, not the background recovery. Watch
+`durableLog.recovery` and `[do-log] owner-silent` / `tail-recovery-bounded`; the latter names unanswered possible
+holders. `confirmed-tail-unaccounted` requires investigation and preserved old segments; it does not prove loss.
+See [cluster state, section 12](../cluster-state.md#12-durable-object-durability) for the recovery boundary.
+
 The stack directory holds `cache/` for verified code and assets, `do/` for recovered object databases and facet indexes, and `do/log/` for the local append log and recovery metadata, alongside `processes/`, `run/` and `logs/`. Object databases live under `do/coworkerd-do-host-v1/` with hashed Host ids, `.sqlite` / facet files, not paths named by the application's object name. Use a persistent writable volume and leave headroom for SQLite WAL, logs and snapshots; `diskBytes` bounds evictable recovered files, not all disk use. Do not remove a single-node cache or append log while it can contain the only confirmed tail. Files are reused only when boot / clean-exit markers and confirmed positions permit it; an unclean machine reboot rebuilds from uploaded history and surviving peers. On macOS the boot identifier is unavailable, so an unclean process exit also drops local durable files. On Linux a same-boot restart with the volume intact reuses the append log and its confirmed WAL positions. See [cluster state](../cluster-state.md), section 12.
 
 **Tenants** are the platform's users: the administrator (the platform) creates a tenant with the admin credential, registers hostnames for it, sets its quota, and then issues it a tenant credential; the tenant deploys its own Workers with its own credential.
@@ -617,6 +632,42 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
 
+**Preserving Durable Objects and D1 when moving from an affected 0.5.3 / 0.5.4 node to the takeover fix.** A
+previous takeover may have left a complete local database whose older tail was never published. Ordinary rolling
+**drain** releases that shard before the surviving copy can be healed. A restart without draining also changes the
+membership epoch, so peers still running the old node can take the shard before healing. Use a maintenance window:
+
+1. Pause Durable Object and D1 traffic, including background callers, and disable automatic restart / rescheduling
+   while replacing the nodes. Keep storage available. Preserve every node's existing id, volume, key and host.
+2. Stop all nodes together without draining, killing their workerd children too. For existing containers use
+   `docker kill --signal=KILL <all-node-containers>`; do not substitute `docker compose stop`, a SIGTERM, `tool drain`
+   or a normal rolling image replacement. On bare metal, stop the supervisor from restarting old binaries and kill
+   each node's complete service process group. From the last heartbeat of each node, wait at least the old
+   membership TTL (15 s by default) and a safety margin; waiting TTL plus grace (25 s by default) after the last
+   process stops is conservative. Old heartbeats otherwise delay or reject registration. Keep traffic paused
+   until every replacement has registered. Do not reboot the hosts between stopping and starting: reuse of
+   these files requires the same Linux boot and intact volumes.
+3. Replace **all** nodes with the fixed build and start them together on their original volumes. A fixed peer
+   forwards a shard still assigned to a live owner's older membership epoch back to that owner to reclaim it.
+   Background healing also reclaims such locally cached shards, one object at a time, without application traffic;
+   this adds storage reads, epoch writes and snapshot uploads during startup. Before resuming
+   traffic, check every node's authenticated state: `durableLog.recovery.healPending` must be `0`, `healBusy` must be
+   `false`, and `healFailures` must be `0`. Readiness alone is insufficient. Successful `heal-snapshot` logs identify
+   the objects and published cuts; progress is limited to one healer per node and 64 MiB/s of snapshot payload.
+4. Verify affected application objects, then resume traffic and supervision. Preserve the original files and
+   logs if any object fails. `object-operation-failed` names the object and step, with the original error code.
+   The fix cannot invent pages already missing from storage and every surviving local copy; those objects need
+   verified backups or preserved source material. A generic execution error is not by itself proof of corruption.
+
+In the three-node validation, an eight-row object with a 278,528-byte cache took 29.6 s from pausing traffic to
+healing completion, including a conservative 27 s lease wait (all nodes registered after 28.4 s). This is an
+example, not a downtime bound: startup, the number and size of cached objects, storage and the snapshot throttle
+add to the lease wait. Budget the maintenance window for the whole cache.
+
+After healing, ordinary draining and rolling upgrades use the normal procedure above. This repair has no data
+format migration or new configuration key. Until all recovery participants are upgraded, takeovers performed by
+an old node retain the old behavior; a fixed receiver treats an unmarked old owner's answer as partial evidence.
+
 **Upgrading 0.5.3 to 0.5.4 keeps the existing data layout.** Update the complete package together, including the
 node, control plane, launcher, runtime, workerd and both system call tables; retain the bucket, keys, node identities
 and data volumes, and upgrade nodes one at a time as described above.
@@ -694,6 +745,7 @@ including other tenants' affected calls. An empty list is `[]`; `dispatched` dis
 | A node or the control plane refuses to start: `the bucket ... holds no cluster/format/1` | The bucket is not a cluster's yet, or it is the wrong bucket: compose's `init` writes the marker; on bare metal `coworkerd-apiserver tool init` ("A new cluster's bucket" in section 4) |
 | `init`'s contract line or `check storage` reports `"conditionalPutAtomic":false` | The store's create-if-absent does not hold under concurrency (observed on SeaweedFS 3.97). Use a verified store, such as the pinned 4.48. Until then run one desired-state writer only; Durable Objects are unavailable |
 | A node refuses to start: `membership refuses to start: clock skew` | This machine's clock is more than `membership.clockSkewToleranceMs` (2 s) from the store's `Date`; the reason says by how much and which store. Install NTP |
+| `DO_OWNER_EXPIRED` while readiness is green | The node lost its storage-backed membership lease. Restore storage readability and writes (including free space); nodes re-register automatically. Fixed nodes collect surviving acknowledged tails and publish recovery history before serving the object. An unavailable owner can add 25 s plus snapshot time. A bounded recovery reports unanswered holders and cannot promise their missing tail. Check `durableLog.recovery`; for older takeover history use the healing procedure in section 9 |
 | A node refuses to start: `membership nodeId conflict` | Another process holds this `nodeId`: its heartbeat was written again while this one waited. Stop one of them; a node that finds its id taken while it runs exits with 3 |
 | A node refuses to start: `no management token: ...` | Set `COWORKERD_MANAGEMENT_TOKEN` (or `management.token`); compose's `secrets` step generates one. Only a development node may run without, with `management.allowWithoutToken: true` (section 8) |
 | A node or the control plane refuses to start: `0.4 has no etcd: ...` | A configuration from 0.3.x: see "Upgrading from 0.3.x" in section 9 |

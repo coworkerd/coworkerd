@@ -335,7 +335,7 @@ private:
 
   Member selfMember() const {
     return {serverId, config.advertisedAddress, std::to_string(epoch), startedAtUnixMs, state.draining ? "draining" : "active",
-        state.lastHeartbeatAtUnixMs, 0, state.durableProcesses};
+        state.lastHeartbeatAtUnixMs, 0, state.durableProcesses, instance};
   }
 
   kj::Promise<std::pair<ObjectListing, ClockSample>> timedList(std::string prefix) {
@@ -738,7 +738,7 @@ private:
       auto record = co_await addressOf(live.id, live.epoch);
       if (!record) continue;
       next[live.id] = {live.id, record->address, std::to_string(live.epoch), record->startedAtUnixMs,
-          live.draining ? "draining" : "active", live.heartbeatUnixMs, live.ageMs, record->durableProcesses};
+          live.draining ? "draining" : "active", live.heartbeatUnixMs, live.ageMs, record->durableProcesses, record->instance};
     }
     std::erase_if(addresses, [&](const auto& entry) { return !seen.contains(entry.first); });
     // The suspects objects ride this listing: a live member's is read only when its ETag changed since the last read.
@@ -754,6 +754,8 @@ private:
     state.lastListMembers = next.size();
     logMemberChanges(serverId, state.members, next, state.lists, state);
     state.members.swap(next);
+    for (const auto& [id, member] : next) state.rememberForRecovery(member);
+    for (const auto& [id, member] : state.members) state.rememberForRecovery(member);
   }
 
   // The heartbeats of an epoch go out on a fixed cadence: one every interval from its first, whether the one before has
@@ -877,6 +879,17 @@ private:
 
 }  // namespace
 
+void MembershipView::rememberForRecovery(const Member& member) {
+  if (member.id.empty() || member.epoch.empty() || member.address.empty()) return;
+  recoveryMembers[member.id + "/" + member.epoch] = member;
+  // A capped address cache cannot certify complete discovery when it has evicted entries.
+  // Current membership and retained registration objects remain independent sources.
+  if (recoveryMembers.size() > 4096) {
+    recoveryMembers.erase(recoveryMembers.begin());
+    recoveryHistoryIncomplete = true;
+  }
+}
+
 std::string MembershipView::json() const {
   std::ostringstream output;
   if (backend == "objectStore") {
@@ -891,6 +904,8 @@ std::string MembershipView::json() const {
            << ",\"lastHeartbeatAtUnixMs\":" << lastHeartbeatAtUnixMs << ",\"lists\":" << lists << ",\"listFailures\":" << listFailures
            << ",\"lastListAtUnixMs\":" << lastListAtUnixMs << ",\"lastListDateUnixMs\":" << lastListDateUnixMs
            << ",\"lastListMembers\":" << lastListMembers << ",\"durableProcesses\":" << durableProcesses
+           << ",\"recoveryMemberAddresses\":" << recoveryMembers.size()
+           << ",\"recoveryHistoryIncomplete\":" << (recoveryHistoryIncomplete ? "true" : "false")
            << ",\"addressReads\":" << addressReads << ",\"ignoredKeys\":" << ignoredKeys
            << ",\"selfExpired\":" << (selfExpired ? "true" : "false") << ",\"selfExpiries\":" << selfExpiries
            << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"recoveries\":" << recoveries
