@@ -1,6 +1,6 @@
 # Durable Objects
 
-> For release 0.5.4. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
+> For release 0.5.5. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
 
 ## 1. Write a class
 
@@ -128,7 +128,14 @@ Before a write's response is released, reachable peers acknowledge its committed
 
 Simultaneous loss of the owner and all confirming peers can lose the tail not yet uploaded. The normal segment interval is 30 s, but an upload outage can make that tail longer. Same-boot Linux restarts can reuse closed, validated object caches. Objects left open by a daemon or durable-process crash rebuild before serving; a process failure can invalidate every object it still had open. A clean drain does not grant cache reuse after a machine reboot. Native macOS has no boot identifier, so restarts rebuild the cache. Raw log prefixes and durable exclusions are retained across power loss; losing the only disk before upload still loses its tail.
 
-A failed confirmation returns `STORAGE_UNAVAILABLE`. The node synchronizes its repair/exclusion before replacing files, publishing exclusions or writing on a repaired image. Peers receive drops, including on reopened sessions; manifests carry the exclusions before the repaired object becomes LOCAL. Another node can still adopt an uncertain write before it receives that exclusion, but later history must remain consistent with that choice. Disk or sidecar failure freezes further confirmation for that log epoch. If an open marker cannot be written, even a first read is unavailable. A legacy cache that may be the only complete copy enters HOLD when admission fails and is preserved for recovery. [Installation](install.md), section 9, gives the coordinated upgrade and downgrade procedures; [cluster state](../cluster-state.md), sections 11–12, explains the fences and cache checks. Use application operation IDs or inspect state before retrying uncertain increments.
+A failed confirmation returns `STORAGE_UNAVAILABLE`. The node synchronizes its repair/exclusion before replacing files, publishing exclusions or writing on a repaired image. Peers receive drops, including on reopened sessions; manifests carry the exclusions before the repaired object becomes LOCAL. Another node can still adopt an uncertain write before it receives that exclusion, but later history must remain consistent with that choice. A log append, short-write or flush failure freezes that epoch's append/confirmation: every later DO write
+on this node is refused, even after disk space is freed. Restart the node daemon to begin a new node epoch
+before retrying writes. A sidecar failure similarly freezes DO service until restart. If an open marker cannot be written, even a first read is unavailable. A legacy cache that may be the only complete copy enters HOLD when admission fails and is preserved for recovery. [Installation](install.md), section 9, gives the coordinated upgrade and downgrade procedures; [cluster state](../cluster-state.md), sections 11–12, explains the fences and cache checks. Use application operation IDs or inspect state before retrying uncertain increments.
+
+The remaining restart-cache, WAL, healing and resource limitations in
+[Known issues in 0.5.5](install.md#known-issues-in-055) apply to DO and D1 data. Back up storage and each
+node's data directory before a stateful upgrade; the admission and repair checks do not cover all those cases.
+Fixes continue in 0.5.6.
 
 ## 8. Checked differences from Cloudflare
 

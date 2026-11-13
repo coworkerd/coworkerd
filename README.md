@@ -21,13 +21,17 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: preparing 0.5.4
+## Status: preparing 0.5.5
 
-0.5.4 moves the upstream pin to `v1.20261108.1` with 17 patches ported to the Rust server, fixes the amd64 steady-state
-seccomp filter, updates the compatibility table to 306 flags with a 2026-11-15 table limit and an additional current-UTC-date
-limit when defining a version, and documents the bare-metal Linux requirement of glibc ≥ 2.38.
-[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) remains the current stable release; see the
-[CHANGELOG](CHANGELOG.md) and [upgrade instructions](docs/guide/install.md#9-upgrades-and-draining).
+0.5.5 updates the node daemon while retaining the workerd kernel and system call tables from the 0.5.4
+prerelease. It reduces paused-process admission failures, adds host first-touch diagnostics and suspect probation,
+and repairs takeover paths that could omit acknowledged Durable Object writes or later rebuild a corrupt database.
+Stateful upgrades from 0.5.3 or 0.5.4 require a coordinated maintenance window and backups; read the
+[upgrade procedure and known issues](docs/guide/install.md#upgrading-053-or-054-to-055).
+Further durability and resource fixes continue in 0.5.6.
+[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) remains the current stable release while
+0.5.5 is prepared. The 0.5.4 prerelease is superseded; deployments using DO or D1 should upgrade to 0.5.5
+rather than remain on 0.5.4. See the [CHANGELOG](CHANGELOG.md).
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
@@ -76,7 +80,7 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 
 - **The daemons**: `scripts/build.sh` builds `coworkerd` and `coworkerd-apiserver` for the host with CMake and Ninja
   (it fetches Cap'n Proto and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff)); OpenSSL is required.
-- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261012.1`), checked out into `workerd/` with the series applied by
+- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261108.1`), checked out into `workerd/` with the series applied by
   `python3 scripts/workerd-patches.py apply`; [patches/README.md](patches/README.md) explains the series and how it
   is maintained.
 - **A release**: `scripts/release.sh <version>` builds the Linux binaries in a toolchain container

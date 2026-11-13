@@ -400,9 +400,12 @@ and never reads the previous owner's files.
   Candidate and cursor handling uses one FIFO transfer-slot queue for the whole node, not one-millisecond
   polling per object. Multiple objects share `recoverParallelism`; a known local owner's complete proof does
   not start an unnecessary peer batch, and retained self registrations share one local query. Incoming records are
-  CRC-validated on admission; page selection reads retained metadata and skips records at or below the cursor,
-  then decodes/copies only the selected page. Each page still scans at most the retained records after its
-  cursor; metadata uses O(retained record count) memory within the configured byte buffer. Store member
+  CRC-validated on admission. Incoming-buffer and current-epoch page selection read retained metadata, skip
+  records at or below the cursor, and decode/copy the selected page. For a held earlier epoch, each page first
+  re-encodes every matching record above its cursor, including CRC work and copies outside the selected page.
+  Large tails and multiple recovering objects repeat this work; transient bytes can reach the remaining
+  matching tail size. The page transfer limit is not a bound on that temporary allocation or CPU work.
+  Metadata uses O(retained record count) memory within the configured byte buffer. Store member
   discovery remains per recovering object, at most once per second. Unless every source already has a complete
   owner proof, even an attempt after the 25 s clock performs one bounded full discovery before its final holder
   round. Previously discovered addresses and unresolved keys survive failed attempts. Each LIST and member
@@ -453,7 +456,11 @@ and never reads the previous owner's files.
   `healErrors` counts currently unresolved healing failures; `healFailures` is cumulative, with one failure and
   one object-operation-failed log per operation rather than per waiting request. This publishes a trusted surviving copy; it
   cannot reconstruct pages already absent from that copy. WAL checks do not constitute a SQLite integrity check.
-- **This machine's files.** They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
+- **A node id has one location.** Run a node id in only one place at a time. When moving it to another
+  machine, confirm that the old machine's node processes stopped before reusing it. Missing heartbeats or
+  expired registrations do not prove that the old machine has stopped.
+- **This machine's files.** The remaining admission, WAL and healing gaps are listed in
+  [Known issues in 0.5.5](guide/install.md#known-issues-in-055). They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
   are all in a segment, go when that is full. Reuse requires the same Linux boot; a clean drain does not grant
   reuse across boots because SQLite uses `synchronous=OFF`. Startup synchronizes `clean:false` before trusting
@@ -468,7 +475,9 @@ and never reads the previous owner's files.
   Each node epoch has a versioned `.recovery` sidecar even when empty. REPAIR_BEGIN and exclusions are
   synchronized before replacing files, publishing exclusions/SEAL or appending on the repaired image.
   Unexcluded decodable raw records are possible writes; there is no CONFIRMED sidecar or second healthy-path
-  synchronization. An append or local flush failure freezes that epoch's append/confirmation. A sidecar failure
+  synchronization. An append, short-write or local flush failure freezes that epoch's append/confirmation. Every subsequent
+  DO write on the node is refused, even if disk space is freed. Restart the node daemon to begin a new node
+  epoch before retrying writes. A sidecar failure
   freezes this process's DO service until restart, preserves `cache.json` and possible unique copies, and prevents
   a clean marker. Required database files and named-facet indexes must be readable; explicitly deleted facets
   are exempt. Missing files are never handed to workerd to create an empty replacement. A possibly unique legacy

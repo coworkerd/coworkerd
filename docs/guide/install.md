@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.5.4.
+> For release 0.5.5.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.5.4-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.4-linux-<arch>/` (the next table) |
-| `coworkerd-0.5.4-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.4`, for `docker load` |
-| `coworkerd-0.5.4-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 and the required GLIBC version of each binary |
+| `coworkerd-0.5.5-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.5-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.5-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.5`, for `docker load` |
+| `coworkerd-0.5.5-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 and the required GLIBC version of each binary |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -68,9 +68,9 @@ maintain. Coworkerd only measures and reports: it does not change the driver, ke
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.5.4-linux-amd64.tar.gz
-docker load -i coworkerd-0.5.4-linux-amd64-image.tar.gz
-cd coworkerd-0.5.4-linux-amd64/docker
+tar -xzf coworkerd-0.5.5-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.5-linux-amd64-image.tar.gz
+cd coworkerd-0.5.5-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -115,13 +115,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.5.4 version` |
+| Show the version | `docker run --rm coworkerd:0.5.5 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.5.4` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.5` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -143,7 +143,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.5.4}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.5}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -377,6 +377,8 @@ and a read of `cluster/credentials/current`, must be refused with `AccessDenied`
 A node needs a management token and refuses to start without one: it goes into the environment file `/etc/coworkerd/env` (mode 0600): `COWORKERD_MANAGEMENT_TOKEN=...` (16 to 4096 visible characters, no spaces; the same for every node and the control plane); do not put it on the command line. Only a development node may start without one, with `"management": {"allowWithoutToken": true}` in its configuration: its management endpoints are then open to whoever reaches it (section 8).
 `nodeId` is this node's name in the cluster and the name of its prefixes `members/<nodeId>/` and `nodes/<nodeId>/`: do not change it once set (a changed one is a new node, which needs its identity first).
 `advertisedAddress` is what the other nodes dial; without it, the host's name and the peer port.
+
+A node id must run in one place at a time. Before moving it to another machine, confirm that the old machine's node processes have stopped; an expired or missing heartbeat alone does not establish this.
 
 **The control plane** `coworkerd-apiserver --config /etc/coworkerd/control.json` reads the same kind of configuration file; it uses `storage` (the **deploy** identity), `secrets.keyFile`, like the nodes `management.token`, `usage.retentionHours` (its daily removal of every node's old usage objects), `membership.ttlSeconds` and `membership.livenessGraceMs`
 (which members are live) and `desiredState.startupTimeoutMs`, and the `control` section: `control.listenAddress` (default `0.0.0.0:8940`), `control.adminCredential` (the admin credential, 16-4096 visible characters; better put into the environment file as
@@ -622,6 +624,8 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
 
 ## 9. Upgrades and draining
 
+For DO/D1 upgrades from 0.5.3 or 0.5.4 to 0.5.5, use the coordinated procedure below. The general rolling-drain procedure does not protect their legacy risk objects.
+
 - **One node exits**: `SIGTERM` (`docker compose stop`, `systemctl stop`) or `coworkerd-apiserver tool drain --server http://<ingress> --wait`
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
   writes out the current hour's usage, removes its heartbeat and drain marker, then exits. A second SIGTERM exits immediately. compose allows 45 seconds (`stop_grace_period`).
@@ -634,95 +638,173 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
 
-**Preserving Durable Objects and D1 when moving from an affected 0.5.3 / 0.5.4 node to the takeover fix.** A
-previous takeover may have left a complete local database whose older tail was never published. Ordinary rolling
-**drain** releases that shard before the surviving copy can be healed. A restart without draining also changes the
-membership epoch, so peers still running the old node can take the shard before healing. Use a maintenance window:
+### Upgrading 0.5.3 or 0.5.4 to 0.5.5
 
-1. Pause Durable Object and D1 traffic, including WebSocket clients, control-plane SQL and background callers, and disable automatic restart / rescheduling
-   while replacing the nodes. Keep storage available. Preserve every node's existing id, volume, key and host.
-2. Sample each live node every 5 s, for at most 120 s (four default 30 s sealing periods, each at most 16 MiB). Seek
-   `durableLog.log.unsealed == 0`, `sealedSeq == nextSeq`, `confirm.unconfirmed == 0`, `objects.repairing == 0`, no new
-   `repair-needed` since the pause, and unchanged `segments.uploadFailures` / `manifests.failures` across two samples.
-   The old earlier-record count is `memory.daemon.containers.durableLog.earlierRecords.entries`; the new count is
-   `durableLog.earlierRecords`. Missing fields are unknown. Wait while the count falls. If it stays fixed while
-   `manifests.fenced` and `segments.sealed` rise, record the repeated `segment-earlier` epoch and named
-   `manifest-fenced` objects, then continue: the new node releases these fenced predecessors. Inspect stdout for
-   `log-write-failed`, `log-file-failed`, `log-flush-failed` and stdout-source `log-dropped`; gaps mean unknown coverage.
-   A flush failure does not itself prove an ACK was lost. At the bound, **proceed even if conditions remain unmet**,
-   retaining the samples and logs. Old exclusions not yet in manifests can return, and an old repaired generation
-   can already depend on inconsistent history. This is a residual old-version risk, not a safe-drain guarantee.
-   Already stopped nodes stay stopped; do not launch their old binary to inspect them.
-3. Stop all nodes together without draining, killing their workerd children too. Re-read each node immediately before
-   its SIGKILL; if `nextSeq` or `alarms.fired` changed, sample again before killing it. For existing containers use
-   `docker kill --signal=KILL <all-node-containers>`; do not substitute `docker compose stop`, a SIGTERM, `tool drain`
-   or a normal rolling image replacement. On bare metal, stop the supervisor from restarting old binaries and kill
-   each node's complete service process group. From the last heartbeat of each node, wait at least the old
-   membership TTL (15 s by default) and a safety margin; waiting TTL plus grace (25 s by default) after the last
-   process stops is conservative. Old heartbeats otherwise delay or reject registration. Keep traffic paused
-   until every replacement has registered and every node's member table lists all replacements at their new epochs. Do not reboot the hosts between stopping and starting: reuse of
-   these files requires the same Linux boot and intact volumes.
-4. Replace **all** nodes with the fixed build and start them together on their original volumes. Each startup classifies
-   restored records as byte-verified history, fenced by a higher shard manifest, or default adoption/resealing. Read
-   the named `restored-startup-classified` results before resuming traffic. A fenced tail is preserved in an uploaded
-   original segment before release. Historical verification deduplicates `(nodeId, nodeEpoch, firstSeq, lastSeq)`
-   batches, reads at most 256 segments and 256 older manifest revisions, and limits its receipt cache to 64 MiB;
-   unread or over-budget evidence defaults to adoption/resealing. All old local logs are read into memory first;
-   `startupClassification` reports log-read time and daemon peak RSS. A fixed peer
-   forwards a shard still assigned to a live owner's older membership epoch back to that owner to reclaim it.
-   Background healing also reclaims such locally cached shards, one object at a time, without application traffic;
-   this adds storage reads, epoch writes and snapshot uploads during startup. Before resuming
-   traffic, check every node's authenticated state: `durableLog.recovery.healPending` must be `0`, `healBusy` must be
-   `false`, and `healErrors` must be `0`. `healFailures` is cumulative and may remain nonzero after a successful retry. Readiness alone is insufficient. Successful `heal-snapshot` logs identify
-   the objects and published cuts; progress is limited to one healer per node and 64 MiB/s of snapshot payload.
-5. Verify affected application objects, then resume traffic and supervision. Preserve the original files and
-   logs if any object fails. `object-operation-failed` names the object and step, with the original error code.
-   The fix cannot invent pages already missing from storage and every surviving local copy; those objects need
-   verified backups or preserved source material. A generic execution error is not by itself proof of corruption.
+Back up the object store and every node's data directory before upgrading a cluster with data to retain.
+Some old takeover histories have a complete surviving local copy that has not reached storage; ordinary
+rolling drain can release that shard before this copy is healed. The protection in 0.5.5 still has the
+[known gaps below](#known-issues-in-055). A backup is a precaution, not proof that a damaged history can be repaired.
+Keep storage running throughout this procedure.
 
-In the three-node validation, an eight-row object with a 278,528-byte cache took 29.6 s from pausing traffic to
-healing completion, including a conservative 27 s lease wait (all nodes registered after 28.4 s). This is an
-example, not a downtime bound: startup, the number and size of cached objects, storage and the snapshot throttle
-add to the lease wait. Budget the maintenance window for the whole cache.
+1. Pause every DO and D1 entry point, including WebSocket clients, control-plane SQL and background callers.
+   Disable automatic node restarts or rescheduling. Keep already stopped nodes stopped; do not start an old
+   binary to inspect it. Preserve node ids, keys, volumes and hosts.
+2. Sample each live node's authenticated state every 5 seconds for at most 120 seconds. Seek
+   `durableLog.log.unsealed == 0`, `sealedSeq == nextSeq`, `confirm.unconfirmed == 0`, `objects.repairing == 0`,
+   no new `repair-needed`, and unchanged segment-upload and manifest-failure counters across two samples.
+   On old versions, the earlier-record count is `memory.daemon.containers.durableLog.earlierRecords.entries`;
+   on 0.5.5 it is `durableLog.earlierRecords`. Missing fields mean unknown, not zero. Retain the samples and
+   stdout coverage. Check `log-write-failed`, `log-file-failed`, `log-flush-failed` and stdout-source `log-dropped`;
+   freeing disk space after an append failure alone does not restore writes. Record stuck epochs, objects and
+   repeated `manifest-fenced` / `segment-earlier` activity. **Proceed at 120 seconds even if the conditions
+   remain unmet**, recording that result. The bound is four default 30-second sealing periods, not a promise
+   that the old history is complete. Old exclusions or already inconsistent repaired generations remain a risk.
+3. Immediately before stopping each live node, re-read `nextSeq` and `alarms.fired`; if either changed since
+   the last sample, sample again. Stop the whole node process group without draining, including its workerd
+   children, using the Compose or systemd commands below. The validated procedure uses SIGKILL.
+4. Wait for the old membership registrations to age out. With defaults, wait **27 seconds after the last
+   node process group stops**: TTL 15 seconds + liveness grace 10 seconds + a 2-second safety margin. For a
+   custom configuration, use `membership.ttlSeconds * 1000 + membership.livenessGraceMs + 2000` milliseconds,
+   rounded up to seconds. The membership startup collision allowance uses that same window. Heartbeat cadence
+   is 5 seconds and member listing is 10 seconds by default; they affect observation and convergence after
+   startup. There is no cluster-wide "all old leases expired" endpoint. A new registration can report
+   `waiting-for-old-epoch`; wait for registration and inspect current member epochs rather than forcing it.
+5. Replace the complete package on every node, including the control plane, launcher, runtime, workerd and
+   both tables, then start all 0.5.5 nodes together on their original volumes. From 0.5.3, the kernel and tables
+   change as a set while the nodes are stopped, so there is no live table-switch sequence. Read the named
+   `restored-startup-classified` results: byte-verified history, higher-shard-epoch fencing, or default adoption
+   and resealing. Unread or over-budget evidence defaults to adoption; a registration alone is not completion.
+6. Before resuming traffic, verify on **every node** that its membership table lists every replacement at its
+   new epoch and `durableLog.recovery.healPending == 0`, `healBusy == false`, `healErrors == 0`, and
+   **`durableLog.objects.hold == 0`**. `healFailures` is cumulative; `healPending` can count all objects after
+   an untrusted startup and does not by itself identify legacy risk objects. Readiness alone is insufficient.
+   Verify affected acknowledged data and a cold takeover, then resume traffic and supervision. Preserve the
+   original files and logs if verification fails. `object-operation-failed` names an object and the failed step.
 
-The original append-log, peer and object-store encodings remain compatible; this version adds local `.recovery`,
-`.closed` and position fields. It adds no configuration key. A `HOLD` object may own the only complete legacy copy:
-it is unavailable and its files are preserved. Repair storage access and retry when admission alone failed. HOLD
-clears when a verified published snapshot covers that ownership run; otherwise retain the stack and restore a
-complete verified backup. An explicit decision to discard the local history requires stopping the node and keeping
-the old stack offline before configuring a fresh stack from the accepted published history; incomplete published
-history can still fail to reconstruct. Do not edit recovery markers to force admission.
+Three requirements apply throughout:
 
-Downgrade requires four steps: pause traffic and wait for current and earlier records to reach zero with no
-REPAIR, HOLD or `healPending`; stop every node; preserve a backup and remove `cache.json`, object caches and
-positions; then start the old version against the published history. If these conditions fail, do not downgrade.
-Old takeover and checkpoint defects return on the old binary.
+- **Do not reboot the hosts between stopping and starting.** Eligible local-file reuse requires the same Linux boot.
+- **Every node must run 0.5.5 before traffic resumes.** Old nodes still perform the old takeover behavior.
+- **Do not drain nodes one at a time.** A drain writes shard-release markers and can hand off a unique surviving copy.
 
-An old-version checkpoint can already have placed frames absent from the daemon log into a cached database.
-Old positions cannot prove those pages are absent. The upgrade preserves eligible legacy copies to heal old
-takeover history, so it cannot retrospectively validate such pages; retain backups and verify affected objects.
-New open markers and checkpoint checks prevent reusing a cache after the corresponding new-version crash.
+Pausing external traffic does not pause alarms. The alarm loop dispatches due alarms as ordinary object requests;
+those requests can route to another node and acquire a shard once its owner is released or judged expired.
+While nodes are being stopped in sequence, a live old node can therefore take over a stopped node's shard.
+Stop the groups together or in quick succession, re-sample immediately before each stop, and include internal
+alarm activity in the maintenance plan. The release validation schedules its two alarms beyond the 120-second
+barrier. This is not an atomic cross-machine stop or a guarantee that no internal call occurs.
 
-Until all recovery participants are upgraded, takeovers performed by
-an old node retain the old behavior; a fixed receiver treats an unmarked old owner's answer as partial evidence.
-Mixed operation also has a large-record limit: old peers may confirm a 32–64 MiB record but cannot return it in
-recovery. Losing its fixed owner while only old holders remain can cut that acknowledged tail. Replace all
-nodes and verify every member table before resuming stateful traffic. Segments already written by old nodes
-above the store client's 64 MiB read limit remain unreadable; preserve intact local copies and backups.
+**Compose example (an existing three-node project).** Run from that project's existing `docker/` directory,
+retaining its project name, `.env` and volumes. Use the current Compose file for the stop, and do not run `down`
+or recreate storage. Complete the sampling above before the kill command; include any extra node services.
 
-**Upgrading 0.5.3 to 0.5.4 keeps the existing data layout.** Update the complete package together, including the
-node, control plane, launcher, runtime, workerd and both system call tables; retain the bucket, keys, node identities
-and data volumes, and upgrade nodes one at a time as described above.
-The kernel moves to `v1.20261108.1` with the 17 patches listed in [patches/README.md](../../patches/README.md);
-replace both tables with ones generated for the new bytes, following the section 4 "System call allowlist" order:
-install tables covering both old and new bytes before replacing workerd, then install the new-only tables.
-The compatibility table has 306 flags and an upper date of 2026-11-15; defining a version also rejects a date later
-than that day's UTC date, as described in the [compatibility guide](compat.md).
-The amd64 steady-state seccomp filter fixes a buffer overflow present in 0.5.3 when steady enforcement or observation
-was enabled. Generated configurations now name an `internet` network service without TLS options; tenant egress
-continues through the node proxy and no operator configuration is needed.
-There are **no default changes** in 0.5.4; the image tag and command-line package version move to 0.5.4.
-The bare-metal glibc requirement is 2.38, as in sections 1 and 4; no data conversion or key rotation is required.
+```bash
+# Bash: collect only currently running node containers; keep stopped old nodes stopped.
+set -- $(docker compose --profile cluster ps -q node-1 node-2 node-3)
+if [ "$#" -gt 0 ]; then
+  docker update --restart=no "$@"
+  # Re-sample each live node's authenticated state now, immediately before stopping it.
+  docker kill --signal=KILL "$@"
+fi
+docker compose stop apiserver
+sleep 27  # default TTL + grace + safety margin, measured from the last node stop
+```
+
+Replace the package files while retaining the same Compose project, `.env`, secrets and data volumes.
+Load the new image and set `COWORKERD_VERSION=0.5.5` in `.env`. Then start all node services and the control
+plane together; `--no-deps` keeps storage and its initialization services unchanged:
+
+```bash
+docker load -i /path/to/coworkerd-0.5.5-linux-amd64-image.tar.gz
+docker compose --profile cluster up -d --no-deps apiserver node-1 node-2 node-3
+```
+
+Do not resume clients at this command's return: apply step 6. Restoring the Compose definition restores its
+normal restart policy on the new containers. `docker compose stop` sends SIGTERM to nodes and starts draining;
+it is not the non-draining stop used here.
+
+**systemd example (the `coworkerd.service` unit from section 4).** On every node host, override automatic restart
+before killing the old unit. For multiple node units, apply this to all of them; keep already stopped units stopped.
+After the final state sample, run:
+
+```bash
+sudo install -d -m 0755 /run/systemd/system/coworkerd.service.d
+printf '[Service]\nRestart=no\n' | sudo tee /run/systemd/system/coworkerd.service.d/zz-upgrade-0.5.5.conf >/dev/null
+sudo systemctl daemon-reload
+test "$(systemctl show --property=Restart --value coworkerd.service)" = no
+sudo systemctl kill --kill-whom=all --signal=KILL coworkerd.service
+sudo systemctl stop coworkerd.service  # only after its complete process group is dead
+```
+
+Wait the configured lease window from the last process-group stop across the cluster (27 seconds with defaults),
+replace the complete package on every host, then remove the temporary restart override and start all replacement units together:
+
+```bash
+sudo rm /run/systemd/system/coworkerd.service.d/zz-upgrade-0.5.5.conf
+sudo systemctl daemon-reload
+sudo systemctl start coworkerd.service
+```
+
+Do not use a plain `systemctl stop` or `restart` on the live old unit: its SIGTERM drains and releases shards.
+The `drainTimeoutMs: 0` immediate-stop path exists, but the validated maintenance procedure and commands above
+use SIGKILL. The validation covers a coordinated process-group stop, not these systemd service-manager commands;
+the release upgrade check exercises the Compose commands.
+
+Healing concentrates disk reads, manifest operations and snapshot uploads. In the accepted three-node baseline,
+traffic pause to safe resumption was 38.505 seconds for the original risk object, 63.608 seconds with the default
+sealing barrier, 39.854 / 33.568 seconds with missing / stale member views, and 66.948 seconds when the healer
+was interrupted. These are fixture observations, not downtime bounds. Cache size, object count, storage and the
+snapshot throttle add to the lease wait. An already damaged database cannot be repaired by upgrading; retain
+verified backups. Generic execution errors alone do not prove corruption.
+
+Downgrade requires pausing traffic, current and earlier record counts at zero and no REPAIR, HOLD or pending
+healing; stop every node, retain a backup, remove `cache.json` and object caches/positions, then start the old
+binary against published history. If these conditions fail, do not downgrade. The original append-log, peer and
+store encodings remain compatible, but the old binary ignores new local recovery state and its old defects return.
+
+### Known issues in 0.5.5
+
+Fixes continue in 0.5.6. These conditions and consequences remain in this release; do not treat the upgrade
+procedure or a successful readiness check as proof that none applies.
+
+1. **Local-cache admission after restart is incomplete.** A hibernating-WebSocket wake followed by a node kill
+   before its new write reaches the daemon can expose an unconfirmed write after a same-boot restart. After a
+   power loss, rebuilt objects can rebuild again on every later same-boot restart; in a rare case a WAL containing
+   acknowledged writes can be removed. After a same-boot restart and shard reclaim, a periodic snapshot can omit
+   an earlier write still in one facet's WAL. The latter also affects 0.5.4.
+2. **Descriptor exhaustion or a database read error** while reopening a closed object can remove its WAL,
+   including acknowledged writes.
+3. **Legacy-risk protection during upgrade is incomplete.** Back up storage and each node's data directory.
+   A legacy cache containing an isolated failed write can pass the pre-healing check. A risk object whose shard
+   is lost and reclaimed before the healing snapshot publishes can be rebuilt as an ordinary object, deleting
+   its complete local copy. Healing reads all manifest-referenced segments; one unreadable segment can keep
+   that object unavailable.
+4. **A short or damaged log/sidecar tail**, such as after a short write on a full disk or power loss, can make
+   every later startup rebuild all objects and retain old logs indefinitely. Risk objects can remain stopped.
+5. **A continuously written large object** can repeatedly abandon periodic snapshots. Abandoned attempts can
+   leave unreferenced snapshot parts in storage.
+6. **Recovery interrupted before publication, followed by a node restart**, can leave the object unavailable.
+   Have another node take over the shard.
+7. **A silently lost machine and many simultaneous recoveries** can make total recovery time grow with object
+   count, beyond one object's nominal missing-evidence wait.
+8. **A fenced former owner** that fails five consecutive reads of the new owner's segments can stop completing
+   seals for all its objects until its process restarts. Restart that node.
+9. **Some retained state has no cleanup bound.** Adopted recovery tails remain after object ownership is lost;
+   recovery state in sidecars is not compacted; failed-rebuild temporary files remain until the next untrusted
+   startup. These consume memory or disk during repeated failures.
+10. **Recovery counters need interpretation.** `healPending` includes all objects after an untrusted startup;
+    inspect the named startup classifications. Before traffic resumes, also require `durableLog.objects.hold == 0`.
+
+Slow disks can additionally block synchronous node metadata writes and whole-file snapshot reads. This can delay
+heartbeats and make the watchdog attribute a node-side stall to a durable process. Upgrade healing concentrates
+that I/O. Mixed old nodes may acknowledge 32–64 MiB records they cannot return during recovery, and old segments
+over the store client's 64 MiB read ceiling remain unreadable. Preserve intact local copies and backups.
+
+0.5.4 was a prerelease and is superseded by 0.5.5; DO/D1 deployments should use this coordinated upgrade rather
+than remain on 0.5.4. Compared with 0.5.3, 0.5.5 also includes the `v1.20261108.1` kernel, 17 patches, 306-entry
+compatibility table with its 2026-11-15 table limit and current-UTC definition-date check, the amd64 steady-filter
+fix, and the explicit `internet` service. The bare-metal daemon requirement remains glibc 2.38. No data conversion
+or key rotation is required.
 
 **Upgrading 0.5.2 to 0.5.3 keeps the existing data layout.** Update the complete package: the patch series gained
 `0016`, so the runtime, workerd and the launcher's system call allowlist belong together, and a 0.5.3 node must not run a
