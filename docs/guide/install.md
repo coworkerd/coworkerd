@@ -547,7 +547,9 @@ snapshot time after takeover. `recoverTimeoutMs` limits each request's wait, not
 holders. `confirmed-tail-unaccounted` requires investigation and preserved old segments; it does not prove loss.
 See [cluster state, section 12](../cluster-state.md#12-durable-object-durability) for the recovery boundary.
 
-The stack directory holds `cache/` for verified code and assets, `do/` for recovered object databases and facet indexes, and `do/log/` for the local append log and recovery metadata, alongside `processes/`, `run/` and `logs/`. Object databases live under `do/coworkerd-do-host-v1/` with hashed Host ids, `.sqlite` / facet files, not paths named by the application's object name. Use a persistent writable volume and leave headroom for SQLite WAL, logs and snapshots; `diskBytes` bounds evictable recovered files, not all disk use. Do not remove a single-node cache or append log while it can contain the only confirmed tail. Files are reused only when boot / clean-exit markers and confirmed positions permit it; an unclean machine reboot rebuilds from uploaded history and surviving peers. On macOS the boot identifier is unavailable, so an unclean process exit also drops local durable files. On Linux a same-boot restart with the volume intact reuses the append log and its confirmed WAL positions. See [cluster state](../cluster-state.md), section 12.
+The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Object files use hashed Host ids under `do/coworkerd-do-host-v1/`. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
+
+Cache reuse requires the same Linux boot. A clean drain does not authorize reuse after a machine reboot. Within one boot, only closed objects with readable files, valid positions and no unfinished repair can reuse their cache. Objects still open when the daemon or durable process died rebuild before serving; one process failure can invalidate all of its resident objects. Startup first synchronizes `clean:false`; failure gates all DO/D1 service without changing object files. Each handoff also needs a writable open marker, so disk exhaustion can refuse a first read. macOS has no usable boot identifier and rebuilds cached files after restart. Original log prefixes and persistent exclusions survive an untrusted startup; epochs crossed by power loss never become absence proofs on a later same-boot restart. See [cluster state](../cluster-state.md), section 12.
 
 **Tenants** are the platform's users: the administrator (the platform) creates a tenant with the admin credential, registers hostnames for it, sets its quota, and then issues it a tenant credential; the tenant deploys its own Workers with its own credential.
 `cowctl tenant create|list|get|update|delete` and `cowctl credential create|list|revoke` are the administrator's subcommands (see sections 2 and 11 of the [quickstart](quickstart.md));
@@ -637,24 +639,43 @@ previous takeover may have left a complete local database whose older tail was n
 **drain** releases that shard before the surviving copy can be healed. A restart without draining also changes the
 membership epoch, so peers still running the old node can take the shard before healing. Use a maintenance window:
 
-1. Pause Durable Object and D1 traffic, including background callers, and disable automatic restart / rescheduling
+1. Pause Durable Object and D1 traffic, including WebSocket clients, control-plane SQL and background callers, and disable automatic restart / rescheduling
    while replacing the nodes. Keep storage available. Preserve every node's existing id, volume, key and host.
-2. Stop all nodes together without draining, killing their workerd children too. For existing containers use
+2. Sample each live node every 5 s, for at most 120 s (four default 30 s sealing periods, each at most 16 MiB). Seek
+   `durableLog.log.unsealed == 0`, `sealedSeq == nextSeq`, `confirm.unconfirmed == 0`, `objects.repairing == 0`, no new
+   `repair-needed` since the pause, and unchanged `segments.uploadFailures` / `manifests.failures` across two samples.
+   The old earlier-record count is `memory.daemon.containers.durableLog.earlierRecords.entries`; the new count is
+   `durableLog.earlierRecords`. Missing fields are unknown. Wait while the count falls. If it stays fixed while
+   `manifests.fenced` and `segments.sealed` rise, record the repeated `segment-earlier` epoch and named
+   `manifest-fenced` objects, then continue: the new node releases these fenced predecessors. Inspect stdout for
+   `log-write-failed`, `log-file-failed`, `log-flush-failed` and stdout-source `log-dropped`; gaps mean unknown coverage.
+   A flush failure does not itself prove an ACK was lost. At the bound, **proceed even if conditions remain unmet**,
+   retaining the samples and logs. Old exclusions not yet in manifests can return, and an old repaired generation
+   can already depend on inconsistent history. This is a residual old-version risk, not a safe-drain guarantee.
+   Already stopped nodes stay stopped; do not launch their old binary to inspect them.
+3. Stop all nodes together without draining, killing their workerd children too. Re-read each node immediately before
+   its SIGKILL; if `nextSeq` or `alarms.fired` changed, sample again before killing it. For existing containers use
    `docker kill --signal=KILL <all-node-containers>`; do not substitute `docker compose stop`, a SIGTERM, `tool drain`
    or a normal rolling image replacement. On bare metal, stop the supervisor from restarting old binaries and kill
    each node's complete service process group. From the last heartbeat of each node, wait at least the old
    membership TTL (15 s by default) and a safety margin; waiting TTL plus grace (25 s by default) after the last
    process stops is conservative. Old heartbeats otherwise delay or reject registration. Keep traffic paused
-   until every replacement has registered. Do not reboot the hosts between stopping and starting: reuse of
+   until every replacement has registered and every node's member table lists all replacements at their new epochs. Do not reboot the hosts between stopping and starting: reuse of
    these files requires the same Linux boot and intact volumes.
-3. Replace **all** nodes with the fixed build and start them together on their original volumes. A fixed peer
+4. Replace **all** nodes with the fixed build and start them together on their original volumes. Each startup classifies
+   restored records as byte-verified history, fenced by a higher shard manifest, or default adoption/resealing. Read
+   the named `restored-startup-classified` results before resuming traffic. A fenced tail is preserved in an uploaded
+   original segment before release. Historical verification deduplicates `(nodeId, nodeEpoch, firstSeq, lastSeq)`
+   batches, reads at most 256 segments and 256 older manifest revisions, and limits its receipt cache to 64 MiB;
+   unread or over-budget evidence defaults to adoption/resealing. All old local logs are read into memory first;
+   `startupClassification` reports log-read time and daemon peak RSS. A fixed peer
    forwards a shard still assigned to a live owner's older membership epoch back to that owner to reclaim it.
    Background healing also reclaims such locally cached shards, one object at a time, without application traffic;
    this adds storage reads, epoch writes and snapshot uploads during startup. Before resuming
    traffic, check every node's authenticated state: `durableLog.recovery.healPending` must be `0`, `healBusy` must be
-   `false`, and `healFailures` must be `0`. Readiness alone is insufficient. Successful `heal-snapshot` logs identify
+   `false`, and `healErrors` must be `0`. `healFailures` is cumulative and may remain nonzero after a successful retry. Readiness alone is insufficient. Successful `heal-snapshot` logs identify
    the objects and published cuts; progress is limited to one healer per node and 64 MiB/s of snapshot payload.
-4. Verify affected application objects, then resume traffic and supervision. Preserve the original files and
+5. Verify affected application objects, then resume traffic and supervision. Preserve the original files and
    logs if any object fails. `object-operation-failed` names the object and step, with the original error code.
    The fix cannot invent pages already missing from storage and every surviving local copy; those objects need
    verified backups or preserved source material. A generic execution error is not by itself proof of corruption.
@@ -664,9 +685,30 @@ healing completion, including a conservative 27 s lease wait (all nodes register
 example, not a downtime bound: startup, the number and size of cached objects, storage and the snapshot throttle
 add to the lease wait. Budget the maintenance window for the whole cache.
 
-After healing, ordinary draining and rolling upgrades use the normal procedure above. This repair has no data
-format migration or new configuration key. Until all recovery participants are upgraded, takeovers performed by
+The original append-log, peer and object-store encodings remain compatible; this version adds local `.recovery`,
+`.closed` and position fields. It adds no configuration key. A `HOLD` object may own the only complete legacy copy:
+it is unavailable and its files are preserved. Repair storage access and retry when admission alone failed. HOLD
+clears when a verified published snapshot covers that ownership run; otherwise retain the stack and restore a
+complete verified backup. An explicit decision to discard the local history requires stopping the node and keeping
+the old stack offline before configuring a fresh stack from the accepted published history; incomplete published
+history can still fail to reconstruct. Do not edit recovery markers to force admission.
+
+Downgrade requires four steps: pause traffic and wait for current and earlier records to reach zero with no
+REPAIR, HOLD or `healPending`; stop every node; preserve a backup and remove `cache.json`, object caches and
+positions; then start the old version against the published history. If these conditions fail, do not downgrade.
+Old takeover and checkpoint defects return on the old binary.
+
+An old-version checkpoint can already have placed frames absent from the daemon log into a cached database.
+Old positions cannot prove those pages are absent. The upgrade preserves eligible legacy copies to heal old
+takeover history, so it cannot retrospectively validate such pages; retain backups and verify affected objects.
+New open markers and checkpoint checks prevent reusing a cache after the corresponding new-version crash.
+
+Until all recovery participants are upgraded, takeovers performed by
 an old node retain the old behavior; a fixed receiver treats an unmarked old owner's answer as partial evidence.
+Mixed operation also has a large-record limit: old peers may confirm a 32–64 MiB record but cannot return it in
+recovery. Losing its fixed owner while only old holders remain can cut that acknowledged tail. Replace all
+nodes and verify every member table before resuming stateful traffic. Segments already written by old nodes
+above the store client's 64 MiB read limit remain unreadable; preserve intact local copies and backups.
 
 **Upgrading 0.5.3 to 0.5.4 keeps the existing data layout.** Update the complete package together, including the
 node, control plane, launcher, runtime, workerd and both system call tables; retain the bucket, keys, node identities

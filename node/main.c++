@@ -4172,18 +4172,19 @@ public:
 
   // A request to a Durable Object, to the node that owns its shard: refused or not connected -- nothing ran, the caller
   // may look for the owner again --, accepted, or uncertain once sent.
-  kj::Promise<InvocationAttempt> tryOpenObject(std::string targetServerId, ObjectInvocationData invocation) {
+  kj::Promise<InvocationAttempt> tryOpenObject(std::string targetServerId, ObjectInvocationData invocation,
+      std::string address = {}) {
     const auto& config = server.placementConfig();
-    auto peer = server.member(targetServerId);
-    if (peer == nullptr) {
-      auto reason = ("the owner of the object's shard is " + coworkerd::reasons::NOT_IN_MEMBERSHIP + ": node=") + targetServerId;
-      server.rejectPeerUnavailable(reason);
-      co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
+    if (address.empty()) {
+      auto peer = server.member(targetServerId);
+      if (peer == nullptr) {
+        auto reason = ("the owner of the object's shard is " + coworkerd::reasons::NOT_IN_MEMBERSHIP + ": node=") + targetServerId;
+        server.rejectPeerUnavailable(reason);
+        co_return InvocationAttempt{nullptr, server.refusal("PEER_UNAVAILABLE", reason), true};
+      }
+      address = peer->address;
     }
-    // The connection is the one the stateless calls to the node use (its address and the epoch the member table names);
-    // the request names the epoch the shard's record does, which the receiver checks.
-    const auto identity = peer->address + "#" + peer->epoch;
-    const auto address = peer->address;
+    const auto identity = address + "#" + std::to_string(invocation.destinationEpoch);
     const auto deadline = invocation.allocation ? invocation.allocation->expiresAtMonotonicMs : server.rootDeadline();
     if (remainingLeaseMs(deadline) == 0) {
       server.rejectExpiredLease("lease expired before forwarding");
@@ -4713,10 +4714,6 @@ public:
     auto parameters = context.getParams().getRequest();
     const auto destination = std::string(parameters.getDestinationEpoch().cStr());
     auto result = context.getResults().initResult();
-    if (!destination.empty() && !server.holdsEpoch(destination)) {
-      result.setRefused("this node does not hold the epoch the request is for");
-      return kj::READY_NOW;
-    }
     coworkerd::DurableTailAsk ask;
     ask.namespaceId = parameters.getNamespaceId().cStr();
     ask.shard = parameters.getShard();
@@ -4724,6 +4721,12 @@ public:
     ask.ownerNodeId = parameters.getOwnerNodeId().cStr();
     ask.ownerNodeEpoch = parameters.getOwnerNodeEpoch();
     ask.afterSeq = parameters.getAfterSeq();
+    std::string refusal;
+    if (!destination.empty() && !server.holdsEpoch(destination) &&
+        !durableLog.canAnswerRestoredTail(ask, destination, &refusal)) {
+      result.setRefused(refusal.empty() ? "this node does not hold the epoch the request is for" : refusal.c_str());
+      return kj::READY_NOW;
+    }
     auto answer = durableLog.tailFor(ask);
     if (!answer.refusal.empty()) {
       result.setRefused(answer.refusal.c_str());
@@ -5621,9 +5624,10 @@ class DurableDispatch final {
 public:
   static constexpr double DURABLE_WAIT_MS = 5000;
   DurableDispatch(ServerCore& server, PeerForwarder& peerForwarder, coworkerd::DurableShards& shards,
-      coworkerd::DurableLog& durableLog, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable)
+      coworkerd::DurableLog& durableLog, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable,
+      kj::Timer& timer)
       : server(server), peerForwarder(peerForwarder), shards(shards), durableLog(durableLog), factory(factory),
-        headerTable(headerTable) {}
+        headerTable(headerTable), timer(timer) {}
 
   struct Request {
     std::string workerId;
@@ -5676,10 +5680,12 @@ public:
       line.node = route.nodeId;
       request.target.shardEpoch = route.epoch;
       auto result = co_await peerForwarder.tryOpenObject(route.nodeId, {workerId, request.target, route.epoch, route.nodeEpoch,
-          request.allocation, request.callerNamespaceId, request.callerObjectId});
+          request.allocation, request.callerNamespaceId, request.callerObjectId}, route.address);
       if (!result.failure) {
         if (!designated) shards.confirmed(request.target.namespaceId, request.target.shard, route.epoch);
         shards.forwarded(designated, "accepted");
+        if (route.source == "restart-forward") shards.restartForwardAccepted(
+            request.target.namespaceId, request.target.shard, route.nodeId, route.nodeEpoch);
         // The owner writes the request's own line, with its answer.
         log(line, request.target, nullptr, 0, "", started);
         co_return BindingDispatch::Dispatched{kj::mv(result.dispatcher)};
@@ -5725,17 +5731,38 @@ public:
     if (request.target.shard != shard)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the request names shard " + std::to_string(shard) +
           " of the object, which this node counts in shard " + std::to_string(request.target.shard), 409));
-    auto route = co_await shards.accept(request.target.namespaceId, shard, expectedEpoch, from);
-    if (route.kind != coworkerd::ShardRoute::Kind::LOCAL) {
-      shards.countRefusal(route.code);
-      shardRefused(request.target, route.code, route.reason, expectedEpoch, from, "owner", started);
-      co_return refused(server.refusal(route.code, route.reason, route.status));
+    auto pendingRoute = shards.accept(request.target.namespaceId, shard, expectedEpoch, from).fork();
+    // A restart can be reclaiming this shard for the proactive healer. Keep
+    // immediate route refusals in open(), but do not spend its two-second RPC
+    // budget waiting for a slow epoch create. The accepted capability starts
+    // no object event until the first dispatcher operation below.
+    auto immediate = co_await pendingRoute.addBranch().then([](coworkerd::ShardRoute route) {
+      return std::optional<coworkerd::ShardRoute>(std::move(route));
+    }).exclusiveJoin(timer.afterDelay(50 * kj::MILLISECONDS).then([]() {
+      return std::optional<coworkerd::ShardRoute>{};
+    }));
+    if (immediate && immediate->kind != coworkerd::ShardRoute::Kind::LOCAL) {
+      shards.countRefusal(immediate->code);
+      shardRefused(request.target, immediate->code, immediate->reason, expectedEpoch, from, "owner", started);
+      co_return refused(server.refusal(immediate->code, immediate->reason, immediate->status));
     }
-    request.target.shardEpoch = route.epoch;
-    request.target.dataEpoch = route.dataEpoch;
     auto dispatcher = kj::heap<DeferredObjectDispatcher>(
-        [this, request = std::move(request), version = std::move(version), line, started, deadline]() mutable
+        [this, request = std::move(request), version = std::move(version), line, started, deadline,
+            pendingRoute = kj::mv(pendingRoute), shard, expectedEpoch, from = std::move(from)]() mutable
             -> kj::Promise<BindingDispatch::Dispatched> {
+      auto route = co_await pendingRoute.addBranch().catch_([](kj::Exception&& error) {
+        return coworkerd::ShardRoute::refuse(503, "STORAGE_UNAVAILABLE",
+            "the shard could not be reclaimed before object dispatch: " + std::string(error.getDescription().cStr()));
+      });
+      if (route.kind != coworkerd::ShardRoute::Kind::LOCAL) {
+        shards.countRefusal(route.code);
+        shardRefused(request.target, route.code, route.reason, expectedEpoch, from, "owner", started);
+        auto refusal = server.refusal(route.code, route.reason, route.status);
+        server.observeRefusal(refusal, "peerDurableObject");
+        log(line, request.target, nullptr, refusal.status, refusal.code, started);
+        co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, refusal, deadline)};
+      }
+      request.target.shardEpoch = route.epoch;request.target.dataEpoch = route.dataEpoch;
       auto ran = co_await runHere(std::move(request), std::move(version), line, started, deadline);
       if (ran.refusal) co_return BindingDispatch::Dispatched{
           rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
@@ -5886,6 +5913,7 @@ private:
   coworkerd::DurableLog& durableLog;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headerTable;
+  kj::Timer& timer;
 };
 
 // One request the node makes of an object itself, through the ordinary dispatch: the shard's owner runs it, which
@@ -8322,6 +8350,9 @@ int run(Launch launch) {
     return peerForwarder.fetchDurableTail(std::move(target.nodeId), std::move(ask),
         std::move(target.address), std::move(target.destinationEpoch));
   });
+  durableLog.setOwnerFenceHook([&shards](const std::string& namespaceId, uint32_t shard, uint64_t through) {
+    shards.fenceOwner(namespaceId, shard, through);
+  });
   durableLog.setHealOwnershipHook([&shards](coworkerd::DurableLog::ObjectIdentity identity)
       -> kj::Promise<std::optional<uint64_t>> {
     auto route = co_await shards.route(identity.namespaceId, identity.shard);
@@ -8342,7 +8373,7 @@ int run(Launch launch) {
     auto owner = server.namespaceOwner(namespaceId);
     durableLog.shardTaken(namespaceId, shard, shardEpoch, owner ? owner->tenant : std::string());
   });
-  DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable);
+  DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable, timer);
   // Firing an alarm is a request to the object, so it needs the dispatcher; the quota is the tenant's record.
   durableLog.setAlarmHook([&durable, &server, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {
     return fireDurableAlarm(durable, server, httpOverCapnpFactory, *headerTable, std::move(alarm));

@@ -95,6 +95,9 @@ struct LogRecord {
   std::string header;            // the generation's 32 byte WAL header, with its first record
   std::string frameBytes;        // frames x (24 byte frame header + one page)
   uint64_t segment = 0;          // SEAL
+  // Read-time evidence only; never encoded. The original shard owner put this
+  // record in a normal segment, so another object's old exclusion cannot drop it.
+  bool ownerSealed = false;
   // The object in the history: "<namespace>/<object>", without the data epoch.
   std::string key() const { return objectName + "/" + std::to_string(facetId); }
   // The database as the durable process names it: the Host's name, which carries the data epoch, and the facet.
@@ -241,6 +244,10 @@ struct DurableTailAnswer {
 // is still addressed: lease expiry alone does not destroy a process's tail.
 struct DurableTailTarget {
   std::string nodeId, address, destinationEpoch, instance;
+  // Store-clock observations for this recovery attempt, never wire fields.
+  uint64_t heartbeatUnixMs = 0, registeredUnixMs = 0, successorRegisteredUnixMs = 0;
+  uint32_t durableProcesses = 1;
+  bool timeVerified = false;
 };
 
 // One node's replicator: the channels to its durable processes, its log, its peers, its segments, the manifests of
@@ -308,6 +315,9 @@ public:
   void setNamespaceHook(std::function<bool(const std::string& namespaceId)> hook) {
     hooks.namespaceActive = std::move(hook);
   }
+  void setOwnerFenceHook(std::function<void(const std::string&, uint32_t, uint64_t)> hook) {
+    ownerFenceHook = std::move(hook);
+  }
   // Reads this machine's Durable Object directory: the files are reused when the machine did not restart unclean
   // (the boot id beside them, and the marker a clean exit writes), and otherwise thrown away. Then this node's own
   // log files are read and the records no segment covers are replayed into the files they belong to, so that what a
@@ -369,7 +379,9 @@ public:
   void dropIncoming(uint64_t streamId, const std::vector<uint64_t>& sequences);
   void closeIncoming(uint64_t streamId);
   // What this node holds of another node's log for one shard.
-  DurableTailAnswer tailFor(const DurableTailAsk& ask);
+  DurableTailAnswer tailFor(const DurableTailAsk& ask, bool remote = true);
+  bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
+      std::string* refusal = nullptr);
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
     hooks.fetchTailAt = std::move(hook);
   }
@@ -398,7 +410,17 @@ private:
     // the records that follow.
     uint64_t checkpointedSeq = 0;
     uint64_t databaseBytes = 0;
+    bool deleted = false;         // latest local log record explicitly deleted this facet
     bool open = false;             // a durable process has it open
+    std::string processId;
+    uint64_t openEpoch = 0, openGeneration = 0;
+    uint64_t loggedNodeEpoch = 0, loggedGeneration = 0, loggedSeq = 0;
+    uint32_t loggedFrame = 0, loggedSalt1 = 0, loggedSalt2 = 0;
+    uint32_t loggedPageSize = 0;
+    uint64_t checkpointGeneration = 0;
+    uint32_t checkpointFrames = 0, checkpointSalt1 = 0, checkpointSalt2 = 0;
+    bool checkpointSafe = true;
+    bool loggedCheckpointCovered = false;
   };
   enum class ObjectState { UNKNOWN, REBUILDING, LOCAL, REPAIR, GONE };
   struct Object {
@@ -411,20 +433,35 @@ private:
     uint64_t sinceSnapshotBytes = 0, snapshotAtUnixMs = 0;
     std::vector<ManifestFacet> snapshotFacets;
     std::vector<ManifestSegment> segments;   // sealed here and not yet in a manifest revision
+    std::vector<std::pair<uint64_t, uint64_t>> isolatedRecords;
     bool snapshotting = false;
+    uint64_t snapshotVersion = 0;  // changed content, checkpoint, isolation or rebuild invalidates a local image
     uint64_t bytes = 0;            // the databases together, as the last checkpoint reported
     bool overLimit = false;
     double lastAccessMs = 0, lastCheckpointAskMs = 0;
     bool manifestDirty = false;
     std::string repairReason;
+    std::pair<uint64_t, uint64_t> repairGeneration, rebuildGeneration, imageRepairGeneration;
+    uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0, cacheShardEpoch = 0;
+    bool cacheOpen = false, positionRead = false, recoveryPublished = false, healingInProgress = false;
+    bool cacheInvalid = false, cacheHold = false;
+    bool cacheAdmissionPending = false;
     uint64_t rebuilds = 0, repairs = 0;
     double lastRebuildMs = 0;
     // Request timeouts and storage retries share one tail deadline at this ownership epoch.
     double recoveryStartedMs = 0;
     uint64_t recoveryShardEpoch = 0;
     std::set<std::pair<uint64_t, uint64_t>> lateTails;
+    // Verified bytes survive failed publication and retries; they are released only after publication.
+    std::map<std::pair<uint64_t, uint64_t>, LogRecord> recoveryTails;
+    std::optional<uint64_t> recoveryManifestRevision;
+    bool recoveryRevisionChanged = false;
+    std::map<std::string, DurableTailTarget> recoveryAddresses;
+    std::set<std::string> recoveryUnknownKeys;
+    bool recoveryDiscoveryCompleted = false;
+    std::map<uint64_t, std::pair<std::string, uint64_t>> recoveryEpochReads;
     // Startup's trusted cache is checked before any workerd opens these files.
-    bool healPending = false;
+    bool healPending = false, healRequested = false, healError = false;
     double healRetryAfterMs = 0;
     // What each of its databases holds as its alarm (0: none), as the durable process reports it.
     std::map<uint32_t, uint64_t> alarms;
@@ -467,6 +504,7 @@ private:
     std::string inbox;
     uint64_t pid = 0, messages = 0, frames = 0, bytes = 0;
     bool open = false;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> openFacets;
     kj::Promise<void> writeChain = nullptr;
     kj::Promise<void> reader = nullptr;
   };
@@ -502,6 +540,7 @@ private:
     double openedAtMs = 0, lastAppendMs = 0;
     std::string fragment;                  // the pieces of a record whose last call has not come yet
     std::map<uint64_t, std::string> held;  // nodeSeq -> the encoded record
+    std::map<uint64_t, LogRecord> positions;  // validated metadata without frame/header bytes
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
   };
 
@@ -513,9 +552,38 @@ private:
   // The boot id of this machine ("" where it cannot be read) and the marker a clean exit leaves.
   std::string bootId() const;
   bool readCacheMarker(std::string& reason);
-  void writeCacheMarker(bool clean);
+  bool writeCacheMarker(bool clean);
+  enum class RecoveryKind : uint8_t {
+    HEADER, REPAIR_BEGIN, ISOLATED, REPAIR_DONE, REBUILD_BEGIN, REBUILD_DONE,
+    PUBLISHED, HEAL_BEGIN, HEAL_DONE
+  };
+  using RecoveryGeneration = std::pair<uint64_t, uint64_t>;
+  struct RecoveryEvent {
+    RecoveryKind kind = RecoveryKind::HEADER;
+    std::string objectName;
+    RecoveryGeneration generation;
+    uint64_t shardEpoch = 0, nodeSeq = 0, dataEpoch = 0;
+    uint32_t shard = 0;
+  };
+  struct RecoveryState {
+    RecoveryGeneration repair, rebuild, repaired;
+    bool repairPending = false, rebuildPending = false, published = false, healing = false;
+    std::map<std::pair<uint64_t, uint64_t>, RecoveryGeneration> exclusions;
+  };
+  struct RecoveryEpoch {
+    bool modern = false, complete = false, crossedBoot = false, present = false;
+  };
+  bool initializeRecovery();
+  void readRecovery();
+  void applyRecovery(const RecoveryEvent& event);
+  bool appendRecovery(const std::vector<RecoveryEvent>& events, bool sync);
+  bool beginRepair(Object& object);
+  RecoveryEvent recoveryEvent(RecoveryKind kind, const Object& object, RecoveryGeneration generation) const;
+  void failRecovery(const std::string& reason);
+  bool markCrossedBoot(uint64_t epoch);
   // The records this node's own log files hold, and each database cut back to the position they name.
   kj::Promise<void> readOwnLog();
+  kj::Promise<void> classifyEarlier();
   void cutBackWal(const std::string& storageId, uint32_t facetId, uint32_t salt1, uint32_t salt2, uint32_t pageSize,
       uint32_t lastFrame);
 
@@ -530,7 +598,7 @@ private:
 
   // ---- the log ----
   Object* objectOf(const std::string& objectName);
-  void appendToLogFile(const std::string& encoded);
+  bool appendToLogFile(const std::string& encoded);
   uint64_t recordLimitBytes() const;
   void takeRecord(Channel& channel, LogRecord&& record, uint64_t request);
   void sendOne(PeerStream& peer, uint64_t sequence, const std::string& encoded);
@@ -545,19 +613,34 @@ private:
   void onPeerAck(const std::string& nodeId, uint64_t accepted);
   void checkConfirmations();
   void isolate(const std::string& objectKey, uint64_t fromSeq, const std::string& reason);
+  void isolateRecords(const std::vector<uint64_t>& dropped, const std::string& key, const std::string& reason);
+  void isolateObjectPending(Object& object, const std::string& reason);
   void markRepair(Object& object, const std::string& reason);
+  bool ownerFenced(const std::string& namespaceId, uint32_t shard, uint64_t epoch) const;
+  void fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through,
+      const std::string& reason, bool notifyShard);
   kj::Promise<void> openPeer(std::string nodeId);
 
   // ---- segments, manifests, snapshots ----
+  struct SnapshotImage {
+    uint64_t sequence = 0, parts = 0, bytes = 0, atUnixMs = 0;
+    uint64_t nodeEpoch = 0, shardEpoch = 0, dataEpoch = 0, version = 0;
+    ObjectState state = ObjectState::REBUILDING;
+    std::vector<ManifestFacet> facets;
+  };
   kj::Promise<void> sealLoop();
   kj::Promise<void> sealNow(std::string reason);
   kj::Promise<bool> uploadSegment(const SegmentHeader& header, const std::string& body);
-  kj::Promise<bool> writeManifest(Object& object, bool withSnapshot);
+  kj::Promise<bool> writeManifest(Object& object, bool withSnapshot,
+      std::optional<uint64_t> expectedRevision = std::nullopt, const SnapshotImage* image = nullptr);
   kj::Promise<void> snapshotIfDue(std::string objectName);
   kj::Promise<void> uploadSnapshotPart(std::string namespaceId, std::string objectId, uint64_t sequence,
       uint32_t facetId, uint64_t part, std::string bytes);
   kj::Promise<void> housekeeping();
   kj::Promise<void> resealEarlier();
+  void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
+  void persistEarlierSeals();
+  void cleanupClosedEpoch();
   kj::Promise<void> dropColdFiles();
 
   // The object's size from its databases, and the single-object limit judged on it.
@@ -574,8 +657,14 @@ private:
 
   // ---- what this machine's files are at, so the same boot reuses them ----
   std::filesystem::path positionPath(const std::string& storageId) const;
-  void writePosition(const Object& object);
+  bool writePosition(const Object& object);
   void readPositions();
+  void admitPositions();
+  bool prepareOpen(Object& object);
+  kj::Promise<void> admitLegacyCache(std::string objectName);
+  bool hasLiveOpenFacets(const Object& object) const;
+  void channelEnded(Channel& channel, const std::string& reason);
+  void maybeCloseMarker(Object& object);
 
   // ---- Durable Object storage per tenant ----
   kj::Promise<void> usageLoop();
@@ -584,20 +673,22 @@ private:
 
   // ---- rebuilding an object ----
   kj::Promise<void> rebuild(std::string objectName, std::string reason);
+  kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
+  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const std::string& storageId);
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
       off_t offset);
   kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName);
   struct TailRecovery {
     std::vector<LogRecord> records;
-    bool cut = false, ownerSilent = false;
+    bool cut = false, ownerSilent = false, sourceLogUnavailable = false;
     double collectionMs = 0;
   };
-  kj::Promise<TailRecovery> fetchTails(Object object, uint64_t snapshotShardEpoch, double startedMs);
+  kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, uint64_t snapshotShardEpoch, double startedMs);
   void noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch);
   kj::Promise<void> publishRecovery(std::string objectName, const std::vector<LogRecord>& records);
-  kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false);
+  kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false);
   kj::Promise<void> healLoop();
   kj::Promise<void> healObject(std::string objectName);
   kj::Promise<void> materializeTrustedWal(std::string objectName, uint64_t shardEpoch);
@@ -621,6 +712,12 @@ private:
   uint64_t sealedSeq = 0;           // every record up to here is in a segment
   uint64_t segmentNumber = 0;
   int logFd = -1;                   // the append file of this node epoch's log
+  bool logAppendFailed = false;     // no more appends after a possibly partial record
+  int recoveryFd = -1;
+  bool recoveryWriteFailed = false;
+  uint64_t recoverySerial = 0, recoveryWriteFailures = 0;
+  std::map<uint64_t, RecoveryEpoch> recoveryEpochs;
+  std::map<std::string, RecoveryState> recoveryStates;
   std::filesystem::path logPath;
   // The records this node holds: those not yet in a segment (by sequence), and how many bytes they take.
   std::map<uint64_t, std::string> records;
@@ -629,16 +726,40 @@ private:
   // Records confirmed by the peers, and records isolated: never confirmed, never sealed.
   std::set<uint64_t> confirmed;
   std::set<uint64_t> isolated;
-  std::vector<std::pair<uint64_t, uint64_t>> isolatedReported;  // (shardEpoch, nodeSeq), for the manifest
   // The records of earlier epochs of this node that no segment covers (read at startup), by epoch.
   std::map<uint64_t, std::map<uint64_t, LogRecord>> earlier;
+  std::map<uint64_t, std::map<uint64_t, LogRecord>> earlierExcluded;
   // Startup's old log has no per-record confirmation marker. It cannot certify
   // a complete answer on behalf of the predecessor process (design (a')).
   std::set<uint64_t> restoredEpochs;
+  struct PredecessorLog {
+    bool complete = false;
+    uint64_t sealedTo = 0, retiredTo = 0, maxSeq = 0;
+    bool closed = false;
+    std::set<std::string> objects;
+    std::map<std::string, uint64_t> objectEpochs;
+    std::set<std::pair<std::string, uint32_t>> shards;
+    uint32_t sealFailures = 0;
+    // Immutable startup observation, including records subsequently published.
+    std::set<std::pair<std::string, uint64_t>> startupUnsealed;
+    // Publication is tracked per shard, independently of the current batch.
+    std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedShards;
+  };
+  std::map<uint64_t, PredecessorLog> predecessorLogs;
   std::map<std::string, std::pair<uint64_t, uint32_t>> fencedTailReadAttempts;
   std::map<uint64_t, ManifestSegment> earlierUploads;
+  std::map<uint64_t, std::map<std::string, uint32_t>> earlierPublishAttempts;
+  std::map<uint64_t, double> earlierRetryAfter;
+  uint64_t earlierCursor = 0;
+  std::deque<uint64_t> earlierPriority;
+  std::set<std::string> carriedRecoveryObjects;
 
   std::map<std::string, Object> objects;         // objectName -> object
+  // A complete remote owner proof freezes every earlier ownership in this
+  // process. Keep the boundary even when no object of an epoch is resident.
+  std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
+  std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
+  uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
   std::map<std::string, Residency> residency;    // processId -> its resident objects
   // What each node published of its tenants' Durable Object bytes, and what this node published last.
@@ -652,10 +773,27 @@ private:
   std::map<uint64_t, InFlight> inFlight;         // nodeSeq -> what waits for its peers
   std::map<uint64_t, PeerBuffer> incoming;       // streamId -> what this node buffers as a peer
   uint64_t nextStreamId = 0, incomingBytes = 0;
-  // A rebuild in flight per object; the requests of that object wait on a branch of it. A settled one is released by
-  // the next openObject(), never from its own continuation (the ForkHub would be destroyed while it runs).
-  std::map<std::string, kj::ForkedPromise<void>> rebuilding;
+  // All objects share the transfer concurrency used to size a tail page's budget.
+  uint32_t activeTailFetches = 0;
+  struct TailFetchWaiter {
+    kj::Own<kj::PromiseFulfiller<void>> ready;
+    bool* acquired = nullptr;  // Valid while ready has a waiting observer.
+  };
+  std::deque<TailFetchWaiter> tailFetchWaiters;
+  // Healing pins this logical object's manifest revision. Existing local
+  // background writes finish first; new ones keep their records for resealing.
+  struct ManifestGate {
+    uint32_t writers = 0, healers = 0;
+    std::vector<kj::Own<kj::PromiseFulfiller<void>>> drained;
+  };
+  std::map<std::pair<std::string, std::string>, ManifestGate> manifestGates;
+  bool healingManifest(const Object& object) const;
+
+  // The promises' cancellation callbacks use the gate and settled maps: both
+  // must outlive the last pending operation during process shutdown.
   std::set<std::string> settledRebuilds;
+  std::map<std::string, kj::ForkedPromise<void>> rebuilding;
+  std::map<std::string, std::unique_ptr<kj::Canceler>> rebuildCancelers;
 
   // Counters for the state endpoint.
   uint64_t confirmations = 0, confirmFailures = 0, refusals = 0, isolations = 0, segments = 0, segmentBytes = 0;
@@ -665,9 +803,12 @@ private:
   uint64_t recordsTaken = 0, framesTaken = 0, bytesTaken = 0, overLimitAnswers = 0, recoverTimeouts = 0;
   uint64_t tailRecoveryBounded = 0, ownerSilentRecoveries = 0, lateTailRecords = 0;
   uint64_t transferredTailRecords = 0, unaccountedTailRecords = 0, unaccountedTailBytes = 0;
+  uint64_t restoredUnaccountedRecords = 0, restoredUnaccountedBytes = 0;
+  uint64_t restoredEmptyAnswers = 0, restoredLogUnavailableAnswers = 0, localLogEmptyClosures = 0;
+  uint64_t ownerLogUnavailableRecoveries = 0;
   uint64_t healSnapshots = 0, healFailures = 0, healedWalFrames = 0, objectFailures = 0;
   bool healBusy = false;
-  double nextHealMs = 0;
+  uint32_t requestedHealWaiters = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
   uint64_t walCutBacks = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
@@ -681,6 +822,19 @@ private:
   std::vector<double> confirmSamples;
   std::string lastUploadError, lastManifestError, lastRebuildError, startupNote;
   bool diskTrusted = true;
+  bool sameBootCache = false;
+  std::string previousCacheBootId;
+  std::optional<std::string> cacheMarkerBootOverride;
+  bool startupAttempted = false, startupReady = false, startupMarkerRead = false, startupInitializing = false;
+  bool recoveryReadIncomplete = false;
+  uint64_t startupMarkerFailures = 0;
+  uint64_t startupCleanupFailures = 0;
+  uint64_t startupHistoryRecords = 0, startupFencedRecords = 0, startupAdoptRecords = 0, startupReadFallbackRecords = 0;
+  uint64_t startupSegmentReads = 0, startupOldManifestReads = 0;
+  double startupClassificationMs = 0;
+  double startupLogReadMs = 0;
+  uint64_t startupLogPeakRssBytes = 0, startupPeakRssBytes = 0;
+  double startupRetryAfterMs = 0;
   uint64_t diskLimitBytes = 0;
   kj::TaskSet tasks{*this};
 };

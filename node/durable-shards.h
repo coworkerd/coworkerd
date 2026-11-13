@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -59,7 +60,7 @@ struct ShardRoute {
   Kind kind = Kind::REFUSE;
   // LOCAL: the epoch this node holds the shard at and its data epoch. FORWARD: the node, its membership epoch, and the
   // shard's epoch it is expected to hold (0: it is asked to take the shard).
-  std::string nodeId;
+  std::string nodeId, address;
   uint64_t nodeEpoch = 0, epoch = 0, dataEpoch = 0;
   // REFUSE: the answer.
   uint status = 503;
@@ -103,6 +104,8 @@ public:
   void refusedBy(const std::string& namespaceId, uint32_t shard, const std::string& code);
   // A request was sent to another node (`designated`: asking it to take the shard), and how it ended.
   void forwarded(bool designated, const std::string& outcome);
+  void restartForwardAccepted(const std::string& namespaceId, uint32_t shard,
+      const std::string& nodeId, uint64_t nodeEpoch);
   void countRefusal(const std::string& code);
 
   // This node's membership expired, or another process took its id: every shard it holds is given up -- nothing is
@@ -122,6 +125,7 @@ public:
   // a read of its own; 0 when it knows nothing. The records it takes as another node's peer are judged by it: an
   // owner whose epoch is older than this has been fenced (node/durable-log.h).
   uint64_t knownShardEpoch(const std::string& namespaceId, uint32_t shard) const;
+  void fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through);
   // Called for every shard this node stops holding (released, lost or dropped), so its objects' data is left alone.
   void onShardGone(std::function<void(const std::string& namespaceId, uint32_t shard, const std::string& reason)> callback);
   // This node has taken a shard (an epoch of its own): the replicator reads the alarm hints of its objects, so the
@@ -180,6 +184,7 @@ private:
   kj::Promise<ShardRoute> waitForAtomic();
   void writeHint(const std::string& namespaceId, uint32_t shard, const ShardEpoch& record, bool released);
   ShardRoute forwardTo(const ShardEpoch& record, const std::string& source);
+  kj::Promise<void> refreshRestartForward(std::string namespaceId, uint32_t shard, std::string nodeId, uint64_t nodeEpoch);
   void log(const std::string& event, const std::string& namespaceId, uint32_t shard, const std::string& fields);
 
   Settings settings;
@@ -189,6 +194,7 @@ private:
   const MembershipView& membership;
   std::function<bool()> draining;
   std::map<Key, Held> held;
+  std::map<Key, uint64_t> ownerFenceThrough;
   std::map<Key, Cached> cache;
   // A first resolution of a shard in flight, and one after a refusal: requests for the same shard wait for it.
   std::map<Key, kj::ForkedPromise<ShardRoute>> resolving, retrying;
@@ -197,9 +203,12 @@ private:
   // An owner's liveness probed against the store: (node, membership epoch) -> verdict and when.
   struct Probe {
     Owner owner = Owner::ALIVE;
+    std::optional<Member> replacement;
     kj::TimePoint at = kj::origin<kj::TimePoint>();
   };
   std::map<std::pair<std::string, uint64_t>, Probe> probes;
+  std::map<Key, std::pair<uint64_t, uint64_t>> restartForwards;
+  std::set<Key> refreshingRestarts;
   std::map<std::string, uint64_t> takeovers, refusals, forwards;
   std::function<void(const std::string&, uint32_t, const std::string&)> shardGone;
   std::function<void(const std::string&, uint32_t, uint64_t, const std::string&)> shardTaken;

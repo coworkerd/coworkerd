@@ -297,10 +297,13 @@ and never reads the previous owner's files.
 - **Recoverable record size (0.5.5).** The normal tail page budget is 32 MiB. A larger encoded record
   occupies one page alone. The production peer `TwoPartyClient` / `TwoPartyServer` use Cap'n Proto's default
   `ReaderOptions`: 8,388,608 traversal words (64 MiB) and nesting limit 64; this fixed, flat result needs no deeper
-  nesting. The append stream uses 4 MiB messages and permits reassembled records up to 256 MiB, constrained by
-  `peerBufferBytes` (256 MiB by default). The local process channel has UInt32 message lengths, and the local
-  confirmation queue has no separate byte cap. The encoded record admission limit is the minimum of these
-  limits, minus 4 KiB for the RPC/result structs, length prefix and alignment: **67,104,768 bytes by default**.
+  nesting. The append stream uses 4 MiB messages and bounds each reassembled record by the same effective
+  record limit (including its four-byte framing), within `peerBufferBytes` (256 MiB by default). The local
+  process channel has UInt32 message lengths, and the local confirmation queue has no separate byte cap.
+  The effective encoded record admission limit is **67,104,768 bytes by default**. The governing constraint
+  is the existing recovery RPC's 64 MiB reader limit minus 4 KiB of result/framing/alignment headroom; that
+  reservation also covers a single record's store-segment envelope. Store segments are checked separately
+  against the client's 64 MiB read limit. The page timeout is increased rather than lowering this record limit.
   A smaller `peerBufferBytes` lowers this limit. WAL page headers and record metadata count, so the SQL payload
   limit is lower; CPU, memory and confirmation-time limits can reject a transaction earlier.
   The read-only state field `durableLog.settings.recordLimitBytes` reports the actual node limit. Oversized
@@ -312,7 +315,10 @@ and never reads the previous owner's files.
 
 - **Segments and manifests.** Every `durableObjects.segmentIntervalMs` (30 s) or `durableObjects.segmentBytes` (16 MiB)
   the replicator seals the records its peers hold, in sequence order up to the first one still waiting for them, into
-  one segment -- a header, the records, and a SHA-256 of all of it, with an index by object -- and creates it as
+  bounded segments. Normal sealing, earlier-epoch resealing and recovery publication all check before adding
+  the next record, including length prefixes, the JSON index and the digest in the 64 MiB store-read ceiling.
+  One large record occupies a segment alone; an earlier epoch with a large backlog is split into prefixes and
+  each prefix is retained until its manifests succeed. A segment is -- a header, the records, and a SHA-256 of all of it, with an index by object -- and creates it as
   `nodes/<node>/wal/<node epoch>/<segment>`. A segment combines records of the node's objects, sharing the segment upload across them. Manifest writes still occur per touched object. Then each object the segment touched gets the next revision of its manifest,
   `do/<namespace>/objects/<object>/manifest/<rev>`, created only if absent and carrying the writer's identity so a lost
   answer is decided by reading it back: the manifest names the object's latest snapshot and, after it, the segments to
@@ -338,9 +344,25 @@ and never reads the previous owner's files.
   cannot prove that their own tail is empty. A complete marked answer from each source owner ends collection
   immediately. Without that proof the
   object waits until `membership.ttlSeconds * 1000 + membership.livenessGraceMs` (25 s by default), measured from its
-  first rebuild attempt at this ownership epoch; request and storage retries do not restart that clock. A restarted
-  owner cannot certify its old unsealed log: the old format has no persistent per-record confirmation or isolation
-  boundary. Lease expiry, a missing member and a failed connection do not prove that a tail never existed.
+  first rebuild attempt at this ownership epoch; request and storage retries do not restart that clock.
+  Lease expiry, a missing member and a failed connection do not prove that a tail never existed.
+
+  A trusted successor on the same machine boot can answer for an old destination node epoch only after reading
+  every CRC-framed record through that epoch's log EOF. If all the records for the requested namespace and shard
+  have reached their objects' manifests, or have been fenced and classified, it returns an empty complete owner
+  answer. Otherwise it refuses without claiming that the epoch is absent, and prioritizes resealing that epoch's
+  prefix in segments below the store-read ceiling. A different object in the same shard can delay this answer.
+  Original destination epochs are always preserved in queries. During local recovery, a complete old log with
+  no startup-unsealed record for this object and source shard epoch also closes that source immediately; later
+  resealing cannot turn a positive startup observation into an absence proof.
+
+  A missing, incomplete or untrusted source log cannot provide this proof. One such epoch anywhere in the chain
+  can therefore add the default 25 s wait to the first open of every later new object in that shard, including
+  after an owner drains permanently or replaces its disk. A successor's new registration alone is insufficient.
+  `durableLog.recovery.ownerLogUnavailable` and `ownerLogUnavailable` in the bounded recovery log identify cases where a
+  responding successor explicitly reported that its source log was unavailable. Old nodes could acknowledge
+  writes after a local log write failure; their logs cannot prove those writes absent. Check for
+  `log-write-failed` and adequate log-disk space before stopping an old node for upgrade.
 
   Before the object serves, adopted tails are published as unchanged records in segments under the new owner's
   `nodes/<id>/wal/<epoch>/` path and a manifest references them. At the deadline the node first logs and counts
@@ -351,41 +373,132 @@ and never reads the previous owner's files.
   Late records received before that cut are logged and counted, and cannot be merged into the new history.
 
   A small complete recovery adds only collection and the writes needed to publish adopted tails. If the old owner
-  machine is unavailable, the first request after takeover can instead wait 25 s plus snapshot upload; default
-  failure detection and recovery together can take about 50 s plus snapshot time. A large snapshot takes longer.
+  machine is unavailable, the first request after takeover can instead wait the 25 s missing-evidence period, a bounded final
+  holder round described below, and snapshot upload; default failure detection adds about another 25 s. A large snapshot takes longer.
   Store read or publication failures return `STORAGE_UNAVAILABLE`; the deadline does not authorize serving an
-  unpublished history. A request waits at most `durableObjects.recoverTimeoutMs` (30 s) before `503 DO_RECOVERING`,
+  unpublished history. Tail collection runs alongside snapshot download and segment replay. Verified tails
+  survive publication failures and subsequent attempts until the object publishes successfully. Recovery
+  manifests use CAS against the last replayed revision: a newly added segment aborts publication and is replayed
+  by the retry, rather than being removed by an image that never contained it.
+
+  The 25 s clock limits retries for absent evidence, not whether to ask a known holder. Every attempt, including
+  one beginning after that clock expires, asks every known holder once. Connections keep `peerTimeoutMs`;
+  connected probes page to `more=false` within a finite drain round. Because the protocol gives no size before
+  a reply, each page reserves the largest legal page at 8 MiB/s aggregate divided among `recoverParallelism`
+  slots, plus connection time, and never less than `confirmTimeoutMs`. With defaults this is 34,000 ms per
+  page, independent of the remaining 25 s. A probe gets a drain window for one configured peer buffer at the
+  same rate (128,000 ms by default), and its final page retains its full budget. For N queued remote probes
+  and P node-wide slots, let Q include transfers already active or queued ahead of this round. A conservative
+  post-deadline bound is ceil((Q+N)/P) × (25,000 + 128,000 + 34,000) ms with default buffers and timeouts,
+  plus local metadata/encoding work. New arrivals cannot overtake this FIFO batch. A probe whose connected
+  source still has more data at the drain limit contributes only the verified pages already received; the
+  missing source is named in the bounded-cut log. The owner's zero-peer append backlog has no separate
+  byte cap and can exceed the configured peer-buffer drain window. A local probe does not consume a network slot. Requests may
+  answer `DO_RECOVERING` while that background collection continues. Registered nodes with zero durable
+  processes are excluded per membership epoch, including from missing-holder accounting.
+
+  Candidate and cursor handling uses one FIFO transfer-slot queue for the whole node, not one-millisecond
+  polling per object. Multiple objects share `recoverParallelism`; a known local owner's complete proof does
+  not start an unnecessary peer batch, and retained self registrations share one local query. Incoming records are
+  CRC-validated on admission; page selection reads retained metadata and skips records at or below the cursor,
+  then decodes/copies only the selected page. Each page still scans at most the retained records after its
+  cursor; metadata uses O(retained record count) memory within the configured byte buffer. Store member
+  discovery remains per recovering object, at most once per second. Unless every source already has a complete
+  owner proof, even an attempt after the 25 s clock performs one bounded full discovery before its final holder
+  round. Previously discovered addresses and unresolved keys survive failed attempts. Each LIST and member
+  metadata GET has its own `peerTimeoutMs` budget, including after the missing-evidence clock expires.
+  For O objects and M registrations, normal discovery work is O(O × M × recovery rounds). A malformed successor
+  registration can be read again for each predecessor, making the conservative full-round bound one LIST plus
+  M + M × (M - 1) / 2 metadata GETs, each with that budget. Successfully decoded registrations are reused within
+  the round. The retained in-process member history is capped at 4,096 entries;
+  eviction leaves `recoveryHistoryIncomplete` set until process restart, so early completion cannot assume that
+  all evicted addresses were rediscovered. A failed membership listing can also leave older member entries visible.
+
+  Candidate windows use only object-store LastModified times. A heartbeat older than the source's shard acquisition
+  by TTL, grace and one listing interval excludes that member epoch. With only a registration, exclusion also
+  needs a verified newer registration for a different instance before that margin. Missing dates, ambiguous
+  instances and registration-only members without such a successor remain candidates; they can force a
+  `tail-recovery-bounded` cut. Node-reported start times do not establish these windows.
+  A chain of S source epochs requires at most S serial immutable authority GETs per attempt, each bounded by
+  max(`peerTimeoutMs`, `confirmTimeoutMs`) (5 s by default). Successful reads are cached across attempts in this
+  object's current recovery, giving a first-pass bound of S × 5 s plus local work; failed reads may be retried.
+  A request waits at most `durableObjects.recoverTimeoutMs` (30 s) before `503 DO_RECOVERING`,
   while the same rebuild continues. The receiving peer returns its dispatcher before this wait; peer-open retains
   its two-second `peerTimeoutMs` bound, and an open known not to have sent an event may be tried elsewhere.
 - **Healing a trusted local copy.** On startup, objects recovered from trusted local files are checked before a
-  durable process opens them. If their manifest shows a takeover not covered by a snapshot (including an unknown
-  zero snapshot epoch), the node checks the shard's authority and reclaims its own shard at its new membership
+  durable process opens them. Risk is determined from the trusted position's `dataEpoch`, the start of this
+  node's uninterrupted ownership, the manifest's snapshot cut, and the local marker that a complete recovery
+  in this data epoch was already published by 0.5.5. A legacy takeover after that cut requires healing
+  even if it never produced a segment or the previous snapshot predates its tail. A data epoch of 1 has no
+  earlier owner. Own restarts and own seals do not increase the data epoch and cannot create a new risk after
+  a healing cut. For a risky object the node checks the shard's authority and reclaims its own shard at its new membership
   epoch, preserving the data epoch. It validates the known WAL prefix completely, then materializes it into the
-  database in bounded chunks and publishes a full snapshot. That object waits behind the healing operation; its
+  database in bounded chunks and publishes a full snapshot. A request routed through the same restart joins
+  that operation. Before reading the manifest, healing lets an existing local manifest write finish and defers
+  new background publications for this object until the snapshot settles. Deferred records keep their log
+  positions; changes by a remote writer still have to pass the manifest revision check. That object waits behind the healing operation; its
   files are protected from cache eviction. A failed check or publication keeps the local files and reports the
   object and failing step; it can retry after 30 s. A newer owner or data epoch is never repaired from stale files.
-  Healing is serial per node, with at least 100 ms between operations and snapshot payload limited to 64 MiB/s.
+  Risk checks run outside the serial snapshot gate, so a large healing snapshot does not block unrelated
+  healthy first opens. Requested risky objects take priority over the single background check; the background
+  scan does not enqueue work while the gate is busy. Snapshot payload is limited to 64 MiB/s per node.
   `heal-snapshot` records each successful publication; `heal-wal-materialized` records the known frames included.
-  The current process checks an eligible object once after success or an already covered history. A subsequent
-  restart may conservatively snapshot a new uncovered epoch again. This publishes a trusted surviving copy; it
+  The node materializes and synchronizes all live facet databases before synchronizing the object's
+  healing-in-progress marker and removing any WAL. Restart can reapply a surviving WAL or continue from
+  its synchronized database after WAL removal.
+  An empty legacy WAL is eligible when its position's generation matches the last logged FRAMES generation,
+  `lastFrame` is zero and `checkpointedSeq` covers that record. New positions retain checkpoint salts and frames.
+  A successfully healed ownership run needs no new healing after its own restart or seals. A facet explicitly
+  deleted by the latest local log record is omitted; an unexplained missing required file still fails healing.
+  `healErrors` counts currently unresolved healing failures; `healFailures` is cumulative, with one failure and
+  one object-operation-failed log per operation rather than per waiting request. This publishes a trusted surviving copy; it
   cannot reconstruct pages already absent from that copy. WAL checks do not constitute a SQLite integrity check.
-- **This machine's files.** They are a cache of the history, bounded by `durableObjects.diskBytes` (half of the
+- **This machine's files.** They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
-  are all in a segment, go when that is full, and the object is rebuilt when it is asked for again. Beside them the
-  node keeps the boot of the machine it ran on and a marker a clean exit writes: started again within the same boot, or
-  after a clean exit, it reuses the files and cuts each database's WAL back to the last frame its log names -- a
-  process that committed a transaction and died before its frames arrived leaves frames nobody was told about, and
-  nothing may read them. Beside each object the node also writes the position its files are confirmed at (its facets,
-  their transaction numbers, the frame each is at, the last checkpoint and the last snapshot), so a start that may
-  trust the disk at all serves the object's first request from the files instead of replaying its whole history. A
-  machine that restarted without a clean exit (`synchronous=OFF` leaves no promise about what the kernel wrote) loses
-  them all, and every object is rebuilt from its history.
-- **The fence.** Every record carries the shard's epoch. A peer rejects a record older than a nonzero shard epoch it knows; an unknown or higher epoch is not rejected by that comparison. Before publishing a manifest, the writer reads the previous revision and gives the object up if that revision names a newer shard epoch. These checks use each participant's current knowledge; they do not by themselves establish that every stale writer is refused by every peer.
+  are all in a segment, go when that is full. Reuse requires the same Linux boot; a clean drain does not grant
+  reuse across boots because SQLite uses `synchronous=OFF`. Startup synchronizes `clean:false` before trusting
+  or changing object files. Failure gates all DO service and retries without deleting caches. An untrusted
+  startup retains the previous boot identity until cleanup and classification finish; an interrupted startup
+  cannot make the remaining old files eligible for same-boot reuse. Before handing
+  files to workerd, an atomic position update marks an object open with an epoch and generation, without fsync.
+  Only the last matching facet close, with logged checkpoint coverage and no pending repair, clears it. A stale
+  close cannot clear a newer open. EOF or process closure invalidates every still-open object of that process;
+  the next event rebuilds it. Startup and cold rebuilds do not reset otherwise live durable processes.
+
+  Each node epoch has a versioned `.recovery` sidecar even when empty. REPAIR_BEGIN and exclusions are
+  synchronized before replacing files, publishing exclusions/SEAL or appending on the repaired image.
+  Unexcluded decodable raw records are possible writes; there is no CONFIRMED sidecar or second healthy-path
+  synchronization. An append or local flush failure freezes that epoch's append/confirmation. A sidecar failure
+  freezes this process's DO service until restart, preserves `cache.json` and possible unique copies, and prevents
+  a clean marker. Required database files and named-facet indexes must be readable; explicitly deleted facets
+  are exempt. Missing files are never handed to workerd to create an empty replacement. A possibly unique legacy
+  takeover cache enters named HOLD when admission fails; a 0.5.5 complete recovery instead rebuilds from its
+  published history. Store history is read and verified before original non-risk cache files are replaced.
+
+  Power-loss startup deletes database caches, indexes and positions but retains raw log and exclusion prefixes.
+  A persistent crossed-boot flag prevents these epochs from later proving absence in the same boot. Complete,
+  fully released predecessor logs can be replaced by `.closed` EOF/shard summaries only after unresolved repair,
+  rebuild, healing and cache-admission state is carried forward durably. Original record encodings are unchanged.
+  All files in `do/log/`, plus database/WAL bytes, count in the eviction accounting. Positions, facet indexes,
+  snapshot staging and code caches add other disk use. The active epoch, incomplete prefixes and crossed-boot
+  logs are protected; they have no configured byte ceiling and can exceed `diskBytes` after all eligible caches
+  are evicted. Filesystem capacity is the ultimate bound and a full disk refuses writes and marker-dependent
+  first reads. Monitor free space. Draining attempts one current segment and does not drain every earlier epoch;
+  it is no substitute for the bounded upgrade observations in [installation](guide/install.md), section 9.
+- **The fence.** Every record carries the shard's epoch. A peer rejects a record older than a nonzero shard epoch it knows. Before the first complete remote original-owner tail page, the owner fences its earlier ownerships: pending records are isolated, objects leave LOCAL, the shard leaves held routing, and those epochs can never append or confirm again in that process. GONE applies the same fence; a local self-repair probe is exempt. A higher manifest also fences older publication. These checks still depend on available authority, rather than every peer instantly knowing every change.
+- **The recovery lower bound.** Tail sources start at `L = max(snapshot shard epoch, dataEpoch of the latest manifest's shard-epoch record)`, recalculated after the final manifest reread. A same-node restart can raise the manifest epoch without raising the continuous-ownership start, so the manifest epoch itself is not the bound. This applies to every non-manifest source: local logs, predecessors, peers and owner answers. Earlier records below L are late-tail observations, not permanent isolated pairs. Above L, a complete same-boot local predecessor contributes all unexcluded records matching namespace and object id, regardless of data epoch. Adopted records are published before LOCAL and then retired from earlier logs. Records already present in referenced manifest segments remain valid even when their source predates L.
 - **When the store cannot be reached.** Uploads are retried with a growing wait, the peers keep holding the records,
   and the writes go on. A peer holds at most `durableObjects.peerBufferBytes` (256 MiB) for the owners it is a peer of
   and refuses records past it; an owner whose records nobody confirms within `durableObjects.confirmTimeoutMs` (5 s)
   fails that write with `STORAGE_UNAVAILABLE`, isolates the records it could not get confirmed locally, omits them from its segments, asks peers to drop them and records exclusions at the next seal, even when there are no new confirmed records to upload, then rebuilds the object from its history
   before serving it again. Reads of objects whose writes did not fail are answered as usual. Peer-drop delivery is best effort and repeated when a session reopens. Until exclusion metadata reaches a manifest, a tail retained by an unreachable peer may still be seen in recovery; a failed response does not prove rollback.
+  Buffers for an owner's old node epoch are not retired merely because a replacement registered: that does not
+  prove their records reached storage. Without an old owner's TRIM/DROP they remain until the holder restarts,
+  sharing the same 256 MiB aggregate payload budget with current epochs and potentially causing new appends to
+  be refused as full. `durableLog.buffer.bytes`, `limitBytes`, `refusals` and `owners` expose the retained bytes
+  and source epochs. This bound covers payload, not the per-record and per-stream metadata reported in memory state.
+  Old writers can also erase `snapshotShardEpoch` from a later manifest, invalidating a recovery cut; finish
+  replacing all writers before resuming traffic under the documented maintenance procedure.
 - **Accepted step back.** Peers hold frames in memory. Losing the owner and every holder before upload can lose
   the confirmed tail; a no-peer confirmation relies on the owner's flushed local disk. The normal 30 s segment
   interval does not bound that loss during an upload outage or backlog. Recovery uses every verified tail obtained
@@ -429,9 +542,25 @@ time, `recovery` counters (bounded, owner-silent, late, transferred and unaccoun
 uploads, the manifests, the snapshots, the rebuilds, a peer taking another's place, and a confirmation that failed with
 the records it isolated. A `[do]` line says how long a request waited for a rebuild (`recoveredMs`).
 
+`objects.hold` and `openCache` name caches that cannot yet serve or were handed to a durable process.
+`localRecovery.writeFailed`, `writeFailures`, `startupReady`, `startupMarkerFailures` and `startupCleanupFailures`
+expose local durability gates.
+`startupClassification` counts `history`, `fenced`, `adopt` and `readFallback`, its segment/old-manifest reads and time,
+the full log-read time, and absolute daemon peak RSS in bytes. Every startup names the object, source epoch,
+sequence range and byte count in `restored-startup-classified`. Fenced records remain until their original segment
+is uploaded; unproven records default to resealing. Historical lookup reads at most 256 deduplicated batches and
+256 older manifest revisions, with at most 64 MiB of receipt cache; unread and over-budget evidence is counted.
+
 `durableLog.recovery.healPending` and `healBusy` describe local healing still to finish; `healSnapshots`,
 `healFailures` and `healedWalFrames` count its work. `objectFailures` and `object-operation-failed` name failures at
 rebuild, healing or request stages. Request failures retain their original status and code. This counter includes
 execution errors and alone does not establish SQLite corruption. During an upgrade from an affected older node,
 that older node's own takeovers still have its old recovery behavior; use the maintenance procedure in
 [the installation guide](guide/install.md#9-upgrades-and-draining) before resuming Durable Object or D1 traffic.
+
+Known recovery limits in 0.5.5: mixed 0.5.3/0.5.4 peers can acknowledge 32–64 MiB records but cannot return
+such a record in their old 32 MiB tail page. During mixed operation, losing the fixed owner while only old
+holders remain can therefore lose that tail at a bounded cut. The maintenance procedure replaces every node
+before traffic resumes. Old versions could also write segments larger than the store client's 64 MiB read
+limit; this fix prevents new oversized segments but cannot retrieve those existing segments or invent missing
+pages. The SQL payload is below the effective encoded limit and may hit CPU/memory/confirmation limits first.
