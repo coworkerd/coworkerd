@@ -625,6 +625,7 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
 ## 9. Upgrades and draining
 
 For DO/D1 upgrades from 0.5.3 or 0.5.4 to 0.5.5, use the coordinated procedure below. The general rolling-drain procedure does not protect their legacy risk objects.
+Clusters using neither Durable Objects nor D1 can continue to upgrade from 0.5.3 one node at a time: stop one node, replace its complete package, then start it and wait until it is ready before proceeding to the next.
 
 - **One node exits**: `SIGTERM` (`docker compose stop`, `systemctl stop`) or `coworkerd-apiserver tool drain --server http://<ingress> --wait`
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
@@ -678,7 +679,7 @@ Keep storage running throughout this procedure.
    new epoch and `durableLog.recovery.healPending == 0`, `healBusy == false`, `healErrors == 0`, and
    **`durableLog.objects.hold == 0`**. `healFailures` is cumulative; `healPending` can count all objects after
    an untrusted startup and does not by itself identify legacy risk objects. Readiness alone is insufficient.
-   Verify affected acknowledged data and a cold takeover, then resume traffic and supervision. Preserve the
+   Read back known acknowledged data, then resume traffic and supervision. Preserve the
    original files and logs if verification fails. `object-operation-failed` names an object and the failed step.
 
 Three requirements apply throughout:
@@ -784,7 +785,9 @@ procedure or a successful readiness check as proof that none applies.
 5. **A continuously written large object** can repeatedly abandon periodic snapshots. Abandoned attempts can
    leave unreferenced snapshot parts in storage.
 6. **Recovery interrupted before publication, followed by a node restart**, can leave the object unavailable.
-   Have another node take over the shard.
+   Stop the affected node, wait for its old membership lease to expire (27 seconds with the defaults above),
+   then send a request for the affected object to another running node so it takes over the shard. Keep the
+   affected node stopped until the takeover completes, and retain its data directory and logs.
 7. **A silently lost machine and many simultaneous recoveries** can make total recovery time grow with object
    count, beyond one object's nominal missing-evidence wait.
 8. **A fenced former owner** that fails five consecutive reads of the new owner's segments can stop completing
