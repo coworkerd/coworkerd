@@ -3502,6 +3502,13 @@ std::string ProcessPool::placementJson(const std::vector<std::string>& workers) 
   }
   out << ']'; return out.str();
 }
+void ProcessPool::requestAutomaticRotation(const std::string& processId, const std::string& reason) {
+  KJ_REQUIRE(!impl->shuttingDown, "the Server is draining for its exit; no rotation starts");
+  auto found = std::find_if(impl->slots.begin(), impl->slots.end(), [&](const auto& slot) { return slot.id == processId; });
+  KJ_REQUIRE(found != impl->slots.end(), "unknown process slot", processId.c_str());
+  impl->enqueueAutomatic(size_t(found - impl->slots.begin()), reason);
+}
+
 std::string ProcessPool::requestRotation(const std::vector<std::string>& processIds, const std::string& reason) {
   KJ_REQUIRE(!impl->shuttingDown, "the Server is draining for its exit; no rotation starts");
   std::vector<size_t> targets;

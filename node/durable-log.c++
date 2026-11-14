@@ -3590,6 +3590,12 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
   if (object == nullptr || object->state != ObjectState::LOCAL || object->cacheAdmissionPending || object->healPending)
     return {false, 503, "DO_RECOVERING", "the object needs recovery before dispatch"};
   const auto target = processId + "-" + std::to_string(generation);
+  const auto selectedChannel = channels.find(target);
+  if (selectedChannel == channels.end() || !selectedChannel->second.open) {
+    ObjectReady result{false, 503, "STORAGE_UNAVAILABLE", "the selected durable generation has no replication channel"};
+    result.channelMissing = true;
+    return result;
+  }
   for (const auto& [id, channel] : channels) {
     if (!channel.open || id == target) continue;
     if (object->dispatchedChannel == id)

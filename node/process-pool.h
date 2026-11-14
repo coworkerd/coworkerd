@@ -143,6 +143,8 @@ public:
   // Queues a rotation of each named slot (all slots when empty); returns the request ids as JSON.
   // Throws for an unknown slot. Slots rotate one at a time on this machine.
   std::string requestRotation(const std::vector<std::string>& processIds, const std::string& reason);
+  // Queue an automatic rotation, deduplicating the slot's queued or active rotation without starting it inline.
+  void requestAutomaticRotation(const std::string& processId, const std::string& reason);
   // The rotation state, or with request ids, how far those requests are.
   std::string rotationJson(const std::vector<uint64_t>& requestIds = {}) const;
 

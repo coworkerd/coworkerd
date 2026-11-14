@@ -1973,6 +1973,13 @@ public:
                 << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
                 << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
                 << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
+      if (checked.channelMissing) {
+        try { runtime.requestAutomaticRotation(process->processId, "channel"); }
+        catch (...) {
+          std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
+                    << "\",\"generation\":" << process->generation << "}" << std::endl;
+        }
+      }
       throw DurableDispatchRefused{std::move(checked)};
     }
     const auto nowMonotonicMs = monotonicTimeMs();

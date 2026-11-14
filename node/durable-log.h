@@ -348,6 +348,7 @@ public:
     std::string code, reason;
     double elapsedMs = 0;
     bool rebuilt = false;
+    bool channelMissing = false;
   };
   // Before a request reaches a durable process: the object's files are brought up to date with its replicated
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
