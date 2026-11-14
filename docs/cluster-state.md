@@ -551,6 +551,15 @@ time, `recovery` counters (bounded, owner-silent, late, transferred and unaccoun
 uploads, the manifests, the snapshots, the rebuilds, a peer taking another's place, and a confirmation that failed with
 the records it isolated. A `[do]` line says how long a request waited for a rebuild (`recoveredMs`).
 
+`durableLog.log.walCutBackFailures` counts WAL read/write failures while preparing an object open.
+`wal-cut-back-failed` names the object, storage id, facet, step (`read`, `truncate`, `sync` or `remove`),
+operation and errno. A short header read reports errno 0 and `readBytes`. The request returns 503
+`STORAGE_UNAVAILABLE` with a WAL read/write reason before changing the open generation or position marker;
+it preserves shared memory and does not count or log a successful `wal-cut-back`. If truncation succeeded
+but its sync failed, the WAL remains truncated. A later request retries normally. Persistent errors keep
+the object unavailable rather than automatically starting repair. Have another node take over its shard,
+for example by draining this node; the new owner rebuilds from storage and peers.
+
 `objects.hold` and `openCache` name caches that cannot yet serve or were handed to a durable process.
 `localRecovery.writeFailed`, `writeFailures`, `startupReady`, `startupMarkerFailures` and `startupCleanupFailures`
 expose local durability gates.

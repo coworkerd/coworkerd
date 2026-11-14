@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.6 (unreleased)
+
+- Fail this object open when reading or writing its WAL fails, preserving its files and allowing a later request to retry. A successful truncation is not rolled back if the following sync fails.
+
 ## 0.5.5 (unreleased)
 
 - Wait for a live paused process within `processPool.pausedAdmissionWaitMs` (1000 ms by default; 0 disables it), reducing the transient single-process admission 503s in 0.5.3 and 0.5.4. Ready processes and other candidate nodes still take calls immediately. See [process admission](docs/cluster-state.md#7-placement).

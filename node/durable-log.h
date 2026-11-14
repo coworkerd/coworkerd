@@ -584,7 +584,7 @@ private:
   // The records this node's own log files hold, and each database cut back to the position they name.
   kj::Promise<void> readOwnLog();
   kj::Promise<void> classifyEarlier();
-  void cutBackWal(const std::string& storageId, uint32_t facetId, uint32_t salt1, uint32_t salt2, uint32_t pageSize,
+  std::optional<std::string> cutBackWal(const Object& object, uint32_t facetId, uint32_t salt1, uint32_t salt2, uint32_t pageSize,
       uint32_t lastFrame);
 
   // ---- the channel to a durable process ----
@@ -660,7 +660,7 @@ private:
   bool writePosition(const Object& object);
   void readPositions();
   void admitPositions();
-  bool prepareOpen(Object& object);
+  std::optional<std::string> prepareOpen(Object& object);
   kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
   void channelEnded(Channel& channel, const std::string& reason);
@@ -810,7 +810,7 @@ private:
   bool healBusy = false;
   uint32_t requestedHealWaiters = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
-  uint64_t walCutBacks = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
+  uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
   uint64_t positionsReused = 0, positionWrites = 0, quotaRefusals = 0;

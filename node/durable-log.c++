@@ -1555,44 +1555,66 @@ kj::Promise<void> DurableLog::classifyEarlier() {
 // Cuts a database's WAL back to `lastFrame` of the generation the log names and removes its shared memory, so that
 // the next process to open it sees exactly what this node has: with synchronous=OFF the kernel keeps what was
 // written, and what a process committed without handing it on was never answered to anybody.
-void DurableLog::cutBackWal(const std::string& storageId, uint32_t facetId, uint32_t salt1, uint32_t salt2,
+std::optional<std::string> DurableLog::cutBackWal(const Object& object, uint32_t facetId, uint32_t salt1, uint32_t salt2,
     uint32_t pageSize, uint32_t lastFrame) {
+  const auto& storageId = object.storageId;
   const auto wal = databasePath(storageId, facetId, "-wal");
   std::error_code code;
-  if (!std::filesystem::exists(wal, code)) return;
+  if (!std::filesystem::exists(wal, code)) return std::nullopt;
   const auto size = std::filesystem::file_size(wal, code);
-  if (code) return;
+  if (code) return std::nullopt;
+  auto failed = [&](const char* step, const char* operation, int error, ssize_t bytes = -1) -> std::optional<std::string> {
+    ++walCutBackFailures;
+    auto fields = "\"object\":" + quote(object.objectName) + ",\"storageId\":" + quote(storageId) +
+        ",\"facet\":" + std::to_string(facetId) + ",\"step\":" + quote(step) + ",\"operation\":" + quote(operation) +
+        ",\"errno\":" + std::to_string(error);
+    if (bytes >= 0) fields += ",\"readBytes\":" + std::to_string(bytes);
+    log("wal-cut-back-failed", fields);
+    return std::string("WAL ") + (std::string_view(step) == "read" ? "read" : "write") +
+        " failed at " + operation + " (errno " + std::to_string(error) + ")";
+  };
   uint64_t want = 0;
   if (size >= 32 && pageSize >= 512) {
     const int fd = ::open(wal.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      unsigned char header[32];
-      const auto got = ::pread(fd, header, sizeof(header), 0);
-      ::close(fd);
-      if (got == ssize_t(sizeof(header)) && beU32(header + 16) == salt1 && beU32(header + 20) == salt2) {
-        want = 32 + uint64_t(lastFrame) * (24 + uint64_t(pageSize));
-      }
+    if (fd < 0) return failed("read", "open", errno);
+    unsigned char header[32];
+    ssize_t got;
+    do { got = ::pread(fd, header, sizeof(header), 0); } while (got < 0 && errno == EINTR);
+    const auto error = got < 0 ? errno : 0;
+    ::close(fd);
+    if (got < 0 || got != ssize_t(sizeof(header))) return failed("read", "pread", error, got);
+    if (beU32(header + 16) == salt1 && beU32(header + 20) == salt2) {
+      want = 32 + uint64_t(lastFrame) * (24 + uint64_t(pageSize));
     }
   }
   if (want && want >= size) {
     std::filesystem::remove(databasePath(storageId, facetId, "-shm"), code);
-    return;
+    return std::nullopt;
   }
   // Either a generation this node has no record of (its frames were never handed on) or a tail past the last record.
   if (want) {
     const int fd = ::open(wal.c_str(), O_WRONLY);
-    if (fd >= 0) {
-      ::ftruncate(fd, off_t(want));
-      ::fsync(fd);
+    if (fd < 0) return failed("truncate", "open", errno);
+    if (::ftruncate(fd, off_t(want)) < 0) {
+      const auto error = errno;
       ::close(fd);
+      return failed("truncate", "ftruncate", error);
     }
+    if (::fsync(fd) < 0) {
+      const auto error = errno;
+      ::close(fd);
+      return failed("sync", "fsync", error);
+    }
+    ::close(fd);
   } else {
     std::filesystem::remove(wal, code);
+    if (code) return failed("remove", "remove", code.value());
   }
   std::filesystem::remove(databasePath(storageId, facetId, "-shm"), code);
   ++walCutBacks;
   log("wal-cut-back", "\"storageId\":" + quote(storageId) + ",\"facet\":" + std::to_string(facetId) + ",\"was\":\"" +
           std::to_string(size) + "\",\"now\":\"" + std::to_string(want) + "\"");
+  return std::nullopt;
 }
 
 kj::Promise<void> DurableLog::stop(double deadlineMonotonicMs) {
@@ -3614,7 +3636,7 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     else co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", "HOLD: the local cache may be the only complete copy"};
   }
   if (object.state == ObjectState::LOCAL && !healing) {
-    if (!prepareOpen(object)) co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", "the object open marker could not be written"};
+    if (auto error = prepareOpen(object)) co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
     co_return ObjectReady{};
   }
   if (healing && monotonicTimeMs() < object.healRetryAfterMs)
@@ -3673,8 +3695,8 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     for (auto& [id, facet] : entry->facets) facet.lastSeq = facet.checkpointedSeq = 0;
     entry->shardEpoch = identity.shardEpoch;
   }
-  if (!prepareOpen(*entry))
-    co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", "the object open marker could not be written"};
+  if (auto error = prepareOpen(*entry))
+    co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
   ObjectReady ready;
   ready.elapsedMs = monotonicTimeMs() - start;
   ready.rebuilt = true;
@@ -5532,18 +5554,20 @@ bool DurableLog::hasLiveOpenFacets(const Object& object) const {
   return false;
 }
 
-bool DurableLog::prepareOpen(Object& object) {
-  if (recoveryWriteFailed || object.state != ObjectState::LOCAL) return false;
-  if (hasLiveOpenFacets(object)) return true;  // These files are already handed to the same live process.
+std::optional<std::string> DurableLog::prepareOpen(Object& object) {
+  if (recoveryWriteFailed || object.state != ObjectState::LOCAL) return "the object open marker could not be written";
+  if (hasLiveOpenFacets(object)) return std::nullopt;  // These files are already handed to the same live process.
   KJ_REQUIRE(!object.cacheAdmissionPending, "legacy cache admission must precede handing files to workerd");
   for (const auto& [facetId, facet] : object.facets)
-    if (!facet.deleted && !facet.loggedCheckpointCovered)
-      cutBackWal(object.storageId, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame);
+    if (!facet.deleted && !facet.loggedCheckpointCovered) {
+      if (auto error = cutBackWal(object, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame))
+        return error;
+    }
   object.openGeneration = object.openEpoch == nodeEpoch ? object.openGeneration + 1 : 1;
   object.openEpoch = nodeEpoch;object.cacheOpen = true;
-  if (writePosition(object)) return true;
+  if (writePosition(object)) return std::nullopt;
   log("open-marker-failed", "\"object\":" + quote(object.objectName) + ",\"errno\":" + std::to_string(errno));
-  return false;
+  return "the object open marker could not be written";
 }
 
 kj::Promise<void> DurableLog::admitLegacyCache(std::string objectName) {
@@ -6360,6 +6384,7 @@ std::string DurableLog::json() const {
       << "},\"log\":{\"records\":" << recordsTaken << ",\"frames\":" << framesTaken << ",\"bytes\":\"" << bytesTaken
       << "\",\"unsealed\":" << records.size() << ",\"unsealedBytes\":\"" << recordBytes << "\",\"nextSeq\":\""
       << nextSeq << "\",\"sealedSeq\":\"" << sealedSeq << "\",\"walCutBacks\":" << walCutBacks
+      << ",\"walCutBackFailures\":" << walCutBackFailures
       << ",\"positionMismatches\":" << positionMismatches << "},\"segments\":{\"sealed\":" << segments
       << ",\"bytes\":\"" << segmentBytes << "\",\"number\":\"" << segmentNumber << "\",\"uploads\":" << uploads
       << ",\"uploadFailures\":" << uploadFailures << ",\"lastSegmentAgoMs\":"
