@@ -842,6 +842,8 @@ private:
   uint64_t startupLogPeakRssBytes = 0, startupPeakRssBytes = 0;
   double startupRetryAfterMs = 0;
   uint64_t diskLimitBytes = 0;
+  uint64_t coldFilesSkippedLive = 0;
+  double lastColdFilesSkippedLogMs = 0;
   kj::TaskSet tasks{*this};
 };
 

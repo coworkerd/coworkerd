@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep the local files of a Durable Object that a live durable process still holds when the node is over `durableObjects.diskBytes`: an object registered as open is skipped, and dispatching a request refreshes its last-access time. `durableLog.disk.coldFilesSkippedLive` and the `files-drop-live-skipped` log line show candidates kept for this reason. An object left with hibernating WebSockets only is not covered yet.
 - Stop rejecting `WITH` statements with many repeated CTE references in the workerd SQLite parser.
 
 ## 0.5.5 (2026-11-14)
