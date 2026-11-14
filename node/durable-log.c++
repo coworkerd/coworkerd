@@ -1826,6 +1826,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         log("open-unknown", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId));
         return;
       }
+      object->dispatchPending = false;
       auto& facet = object->facets[facetId];
       facet.open = true;facet.processId = channel.processId;
       facet.openEpoch = object->openEpoch;facet.openGeneration = object->openGeneration;
@@ -3554,8 +3555,10 @@ kj::Promise<void> DurableLog::dropColdFiles() {
 // ---- Opening an object: its files are brought up to date with its replicated history first ----
 
 void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
-  if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch)))
+  if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch))) {
     object->dispatchedChannel = processId + "-" + std::to_string(generation);
+    if (!hasLiveOpenFacets(*object)) object->dispatchPending = true;
+  }
 }
 
 kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity) {
@@ -3776,7 +3779,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     if (repair) KJ_REQUIRE(beginRepair(*object), "the repair exclusion could not be made durable");
     isolateObjectPending(*object, "pending records cannot outlive the image used by recovery");
     KJ_REQUIRE(!recoveryWriteFailed, "pending exclusions could not be made durable");
-    const bool closeLive = hasLiveOpenFacets(*object) || hasLiveDispatch(*object);
+    const bool closeLive = hasLiveOpenFacets(*object) || (hasLiveDispatch(*object) && object->dispatchPending);
     object->rebuildGeneration = {nodeEpoch, ++recoverySerial};
     KJ_REQUIRE(appendRecovery({recoveryEvent(RecoveryKind::REBUILD_BEGIN, *object, object->rebuildGeneration)}, false),
         "the rebuild begin marker could not be written");
@@ -5572,15 +5575,18 @@ std::optional<std::string> DurableLog::prepareOpen(Object& object) {
   KJ_REQUIRE(!object.cacheAdmissionPending, "legacy cache admission must precede handing files to workerd");
   if (!dispatched) {
     object.dispatchedChannel.clear();
+    object.dispatchPending = false;
     for (const auto& [facetId, facet] : object.facets)
       if (!facet.deleted && !facet.loggedCheckpointCovered) {
         if (auto error = cutBackWal(object, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame))
           return error;
       }
   }
+  const bool wasOpen = object.cacheOpen;
   object.openGeneration = object.openEpoch == nodeEpoch ? object.openGeneration + 1 : 1;
   object.openEpoch = nodeEpoch;object.cacheOpen = true;
   if (writePosition(object)) return std::nullopt;
+  object.cacheOpen = wasOpen;
   log("open-marker-failed", "\"object\":" + quote(object.objectName) + ",\"errno\":" + std::to_string(errno));
   return "the object open marker could not be written";
 }

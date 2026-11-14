@@ -447,6 +447,7 @@ private:
     uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0, cacheShardEpoch = 0;
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
+    bool dispatchPending = false;
     bool cacheOpen = false, positionRead = false, recoveryPublished = false, healingInProgress = false;
     bool cacheInvalid = false, cacheHold = false;
     bool cacheAdmissionPending = false;

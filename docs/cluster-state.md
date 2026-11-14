@@ -470,7 +470,9 @@ and never reads the previous owner's files.
   files to workerd, an atomic position update marks an object open with an epoch and generation, without fsync.
   Only the last matching facet close, with logged checkpoint coverage and no pending repair, clears it. A stale
   close cannot clear a newer open. EOF or process closure invalidates every still-open object of that process;
-  the next event rebuilds it. Startup and cold rebuilds do not reset otherwise live durable processes.
+  the next event rebuilds it. A rebuild resets durable processes only if the object has a live open facet or a
+  dispatched request whose `FROM_OPEN` has not yet been processed. A closed object's cold rebuild leaves
+  otherwise live durable processes running.
 
   Each node epoch has a versioned `.recovery` sidecar even when empty. REPAIR_BEGIN and exclusions are
   synchronized before replacing files, publishing exclusions/SEAL or appending on the repaired image.
@@ -555,6 +557,10 @@ Before preparing another open, the node checks whether the durable process gener
 files still has an open channel. While it does, the node skips `wal-cut-back`; if the cache open marker was cleared,
 it only advances the open generation and writes that marker again. Once that process generation is gone, normal
 WAL truncation resumes.
+If writing the open marker fails, the in-memory open flag is restored so a later request retries the write.
+Before rebuilding an image, the node resets durable processes only while an open facet is live or a request
+has been dispatched and its `FROM_OPEN` has not yet been processed; a closed object's old dispatch alone
+does not trigger a reset.
 
 `durableLog.log.walCutBackFailures` counts WAL read/write failures while preparing an object open.
 `wal-cut-back-failed` names the object, storage id, facet, step (`read`, `truncate`, `sync` or `remove`),
