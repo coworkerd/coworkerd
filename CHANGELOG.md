@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Re-check a Durable Object against the selected durable process generation right before a request is dispatched. A request whose object left the local state, lost its shard, or is still held by another generation while it waited is refused with `503 DO_RECOVERING`, `409 DO_SHARD_EPOCH_MISMATCH` or `503 DO_UNAVAILABLE` instead of being sent to a process that would open stale files; when nobody holds the object its WAL is cut back again before the dispatch. Refusals are logged as `[do-dispatch-refused]`.
 - Keep the local files of a Durable Object that a live durable process still holds when the node is over `durableObjects.diskBytes`: an object registered as open is skipped, and dispatching a request refreshes its last-access time. `durableLog.disk.coldFilesSkippedLive` and the `files-drop-live-skipped` log line show candidates kept for this reason. An object left with hibernating WebSockets only is not covered yet.
 - Stop rejecting `WITH` statements with many repeated CTE references in the workerd SQLite parser.
 

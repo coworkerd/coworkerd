@@ -353,6 +353,8 @@ public:
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
   // says what to tell the caller when they cannot be.
   kj::Promise<ObjectReady> openObject(ObjectIdentity identity);
+  // After selecting a durable generation, before any request is sent or accounted for.
+  ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // The shard is this node's no longer (released, lost or dropped): its objects' records stop going out.
@@ -665,7 +667,7 @@ private:
   bool writePosition(const Object& object);
   void readPositions();
   void admitPositions();
-  std::optional<std::string> prepareOpen(Object& object);
+  std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
   kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
   bool hasLiveDispatch(const Object& object) const;

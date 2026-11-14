@@ -481,7 +481,20 @@ and never reads the previous owner's files.
   close cannot clear a newer open. EOF or process closure invalidates every still-open object of that process;
   the next event rebuilds it. A rebuild resets durable processes only if the object has a live open facet or a
   dispatched request whose `FROM_OPEN` has not yet been processed. A closed object's cold rebuild leaves
-  otherwise live durable processes running.
+  otherwise live durable processes running. A request that already passed `openObject` is checked again after its
+  durable generation is selected; if the object now needs recovery it is refused rather than sent to unreconstructed
+  files.
+
+  This synchronous dispatch check precedes request accounting. An unavailable startup or recovery log refuses
+  with 503 `STORAGE_UNAVAILABLE`; lost or fenced ownership, a changed shard epoch, or GONE refuses with
+  409 `DO_SHARD_EPOCH_MISMATCH`. Recovery, legacy cache admission, or snapshot healing in progress refuses
+  with 503 `DO_RECOVERING`. A different live generation holding the object refuses with 503 `DO_UNAVAILABLE`.
+  Each refusal logs `[do-dispatch-refused]` with the object, selected process and generation, status, code and
+  reason. A matching live registration repairs a false open marker without changing its generation. A matching
+  live dispatch marker preserves its WAL; without a live holder, WAL preparation runs again before dispatch.
+  Preparation or marker-write failure refuses with 503 `STORAGE_UNAVAILABLE`. These refusals are returned
+  without retrying. This check does not cover an instance closing after dispatch: between its FROM_CLOSED
+  and subsequent FROM_OPEN, a concurrent rebuild can still miss that reopening instance.
 
   Each node epoch has a versioned `.recovery` sidecar even when empty. REPAIR_BEGIN and exclusions are
   synchronized before replacing files, publishing exclusions/SEAL or appending on the repaired image.
