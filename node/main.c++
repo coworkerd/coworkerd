@@ -253,6 +253,7 @@ struct PlacementDefinition {
 
 using coworkerd::OpenEvent;
 struct ProcessUnavailable { bool quarantine = false; };
+struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
 
 // Capture request stages without writing a log line at each measurement point.
 // All timestamps use the Server's monotonic clock; output is flushed as one line.
@@ -1960,9 +1961,18 @@ public:
   // A request to an object, on the object's durable process: from a stateless Worker a child of its call tree
   // (`allocation`, charged to its budget as a Binding call is), from an object the root of a new call tree.
   OpenEvent openDurable(std::shared_ptr<const VersionDefinition> version, const DurableTarget& target,
-      std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot) {
+      std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
+    auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+        target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
+    if (!checked.ready) {
+      std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
+                << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
+                << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
+                << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
+      throw DurableDispatchRefused{std::move(checked)};
+    }
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     const auto sequence = nextSequence++;
@@ -5857,7 +5867,7 @@ private:
         deadline, false, false, &target, true, slot);
     if (current.refused) co_return refused(*current.refused);
     try {
-      auto opened = server.openDurable(version, target, std::move(request.allocation), slot);
+      auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
       durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
           target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
@@ -5870,6 +5880,8 @@ private:
         log(line, target, process.get(), status, code, started);
       };
       co_return Ran{std::nullopt, BindingDispatch::Dispatched{std::move(opened.dispatcher), std::move(opened.ready)}};
+    } catch (const DurableDispatchRefused& failure) {
+      co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
     } catch (const ProcessUnavailable&) {
       co_return refused(server.refusal("DO_UNAVAILABLE", "the durable process of this object (" +
           server.durableProcessFor(target.key()) + ") is not ready", 503));

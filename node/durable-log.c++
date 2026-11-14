@@ -3566,6 +3566,31 @@ kj::Promise<void> DurableLog::dropColdFiles() {
 
 // ---- Opening an object: its files are brought up to date with its replicated history first ----
 
+DurableLog::ObjectReady DurableLog::checkObjectDispatch(
+    const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  if ((startupAttempted && !startupReady) || recoveryWriteFailed)
+    return {false, 503, "STORAGE_UNAVAILABLE", "the node's recovery log is not ready"};
+  auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch));
+  if (ownerFenced(identity.namespaceId, identity.shard, identity.shardEpoch) ||
+      (object != nullptr && (object->shardEpoch != identity.shardEpoch || object->state == ObjectState::GONE)))
+    return {false, 409, "DO_SHARD_EPOCH_MISMATCH", "the object's shard ownership changed before dispatch"};
+  if (object == nullptr || object->state != ObjectState::LOCAL || object->cacheAdmissionPending || object->healPending)
+    return {false, 503, "DO_RECOVERING", "the object needs recovery before dispatch"};
+  const auto target = processId + "-" + std::to_string(generation);
+  for (const auto& [id, channel] : channels) {
+    if (!channel.open || id == target) continue;
+    if (object->dispatchedChannel == id)
+      return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
+    for (const auto& [key, opened] : channel.openFacets)
+      if (key.starts_with(object->objectName + "/") &&
+          opened == std::make_pair(object->openEpoch, object->openGeneration))
+        return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
+  }
+  if (auto error = prepareOpen(*object, &target))
+    return {false, 503, "STORAGE_UNAVAILABLE", *error};
+  return {};
+}
+
 void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
   if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch))) {
     object->lastAccessMs = monotonicTimeMs();
@@ -5580,10 +5605,29 @@ bool DurableLog::hasLiveDispatch(const Object& object) const {
   return channel != channels.end() && channel->second.open;
 }
 
-std::optional<std::string> DurableLog::prepareOpen(Object& object) {
+std::optional<std::string> DurableLog::prepareOpen(Object& object, const std::string* targetChannel) {
   if (recoveryWriteFailed || object.state != ObjectState::LOCAL) return "the object open marker could not be written";
-  if (hasLiveOpenFacets(object)) return std::nullopt;  // These files are already handed to the same live process.
-  const bool dispatched = hasLiveDispatch(object);
+  const bool live = targetChannel == nullptr ? hasLiveOpenFacets(object) : [&]() {
+    const auto channel = channels.find(*targetChannel);
+    if (channel == channels.end() || !channel->second.open) return false;
+    for (const auto& [key, opened] : channel->second.openFacets)
+      if (key.starts_with(object.objectName + "/") &&
+          opened == std::make_pair(object.openEpoch, object.openGeneration)) return true;
+    return false;
+  }();
+  if (live) {
+    if (targetChannel != nullptr && !object.cacheOpen) {
+      object.cacheOpen = true;
+      if (!writePosition(object)) {
+        object.cacheOpen = false;
+        log("open-marker-failed", "\"object\":" + quote(object.objectName) + ",\"errno\":" + std::to_string(errno));
+        return "the object open marker could not be written";
+      }
+    }
+    return std::nullopt;
+  }
+  const bool dispatched = hasLiveDispatch(object) &&
+      (targetChannel == nullptr || object.dispatchedChannel == *targetChannel);
   if (dispatched && object.cacheOpen) return std::nullopt;
   KJ_REQUIRE(!object.cacheAdmissionPending, "legacy cache admission must precede handing files to workerd");
   if (!dispatched) {
