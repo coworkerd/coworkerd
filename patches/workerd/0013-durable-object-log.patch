@@ -28,7 +28,7 @@ index a5cbcf20b64de6a07a0462403449d22d7180ddff..27ead7ad05c3ce86c9476b81bb717914
          "//src/workerd/api:memory-cache",
          "//src/workerd/api:pyodide",
 diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
-index 0b61718cc33f8ed6f525a4519fd32676d92d78c6..f96e2ac9de03d05eedec664e7feafee5ece2a7fa 100644
+index c81fdfdc4c5861a0c1f82d0a1db7990b60825b62..9e1aa1f6ac4fe039908c6314aa19710eabbfeaa5 100644
 --- a/src/workerd/server/factory/bootstrap.c++
 +++ b/src/workerd/server/factory/bootstrap.c++
 @@ -3,6 +3,7 @@
@@ -985,7 +985,7 @@ index 0000000000000000000000000000000000000000..b19f85a4c1cfed6ad0dbbc94556d1e79
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
-index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5 100644
+index 782240475c852d3021f9341df174a1941ca8f8d0..d3d0e717cc460e34d90454d523b7143af99b1645 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
 +++ b/src/workerd/server/factory/worker-factory-actor.c++
 @@ -3,6 +3,7 @@
@@ -998,7 +998,7 @@ index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb461604751
  #include <workerd/io/actor-cache.h>
 @@ -176,6 +177,7 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
                : vfsDirectory->clone()),
-       vfs(*sqliteDirectory),
+       vfs(*sqliteDirectory, {.sync = factory.getImpl().options->syncStorage}),
        uniqueKey(kj::mv(uniqueKey)),
 +      timer(factory.getImpl().timer),
        alarmScheduler(kj::heap<AlarmScheduler>(kj::systemPreciseCalendarClock(),
@@ -1034,7 +1034,7 @@ index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb461604751
  ActorStorage::ActorStorage(kj::Own<Impl> impl): impl(kj::mv(impl)) {}
  ActorStorage::~ActorStorage() noexcept(false) = default;
  ActorStorage::Impl& ActorStorage::getImpl() const {
-@@ -524,7 +542,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -528,7 +546,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::String rootKey,
      kj::Maybe<kj::String> actorName,
      kj::Maybe<::rust::Box<Committer>> committer) {
@@ -1046,7 +1046,7 @@ index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb461604751
               rootKey = kj::mv(rootKey), actorName = kj::mv(actorName),
               committer = kj::mv(committer)](const ActorCache::SharedLru& sharedLru,
               OutputGate& outputGate, ActorCache::Hooks& hooks,
-@@ -553,10 +575,30 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -557,10 +579,30 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      // also deletes the child facets' storage; that is not transactional with the reset, as it is
      // in production).
      db->run("PRAGMA journal_mode=WAL;");
@@ -1079,7 +1079,7 @@ index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb461604751
        storage->deleteDescendantStorage(*KJ_ASSERT_NONNULL(storage->directory), rootKey, selfId);
      });
      kj::Function<kj::Promise<void>(SpanParent)> commit = [](SpanParent) -> kj::Promise<void> {
-@@ -567,6 +609,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -571,6 +613,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
                     SpanParent) -> kj::Promise<void> { return result_task_run(c->commit()); };
        committer = kj::none;
      }
@@ -1092,10 +1092,10 @@ index 6c8b358072e2dedbfa080c10c13723bb96c4954f..e5f6ea7a914590bb4dbcbdb461604751
      KJ_IF_SOME(root, rootHooks) {
        if (storage->actors->replicated()) {
 diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
-index 615edf45e3b11bf9ed647e349c3a2a2449f0fd90..ac800c4fd0d9c873b92e0f6e32a6058be97b3228 100644
+index e7bc127d4c8151d4419fb393c8811af169709381..a7d89b133e4e43271bf379887824ac881fc026f2 100644
 --- a/src/workerd/server/factory/worker-factory-impl.h
 +++ b/src/workerd/server/factory/worker-factory-impl.h
-@@ -234,6 +234,7 @@ class ActorStorage::Impl final: public kj::Refcounted {
+@@ -240,6 +240,7 @@ class ActorStorage::Impl final: public kj::Refcounted {
    kj::Own<const kj::Directory> sqliteDirectory;
    SqliteDatabase::Vfs vfs;
    kj::String uniqueKey;
@@ -1104,10 +1104,10 @@ index 615edf45e3b11bf9ed647e349c3a2a2449f0fd90..ac800c4fd0d9c873b92e0f6e32a6058b
  
    // The facet index of the root actor `rootKey`, read from disk for one operation; none when it
 diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
-index 6927d00b404cb721812250365346dc789058d1a1..49cf3a1f6dcc3199e7e93db460a1f3af885e35cc 100644
+index 98571c3fbe3900a7a32ea47274469dbb37e07c8c..a05ef8bbfd777fd2b5390a234f9d6c5b15f11791 100644
 --- a/src/workerd/server/factory/worker-factory.h
 +++ b/src/workerd/server/factory/worker-factory.h
-@@ -280,6 +280,8 @@ kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start);
+@@ -288,6 +288,8 @@ kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start);
  
  kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
  ::rust::String actor_id_key(const ActorIdHandle& id);
@@ -1258,7 +1258,7 @@ index d8fb80b75a6c1fea463c5400d213327d245b450c..c40b92c8ed7217dafe712b82f094ffe0
          // Replacing a facet implies aborting it.
          self.abort_facet(dst, kj::failed!("jsg.Error: Facet was cloned-over."));
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index f07aaa51d0ce37deeadc68afb282829099a71b6a..eb17a2a7ecac3e7978c74b7570136bb03386fae1 100644
+index 3e7e695627484d3c0eb5e0d25181b4427d5cc356..6c0520fadfb5e37f65171f09877a221e62c50cea 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
 @@ -185,6 +185,14 @@ pub mod ffi {
@@ -1276,7 +1276,7 @@ index f07aaa51d0ce37deeadc68afb282829099a71b6a..eb17a2a7ecac3e7978c74b7570136bb0
      }
  
      /// What an alarm does when another instance owns its object: runs again later, a retry
-@@ -485,6 +493,10 @@ pub mod ffi {
+@@ -506,6 +514,10 @@ pub mod ffi {
          fn actor_id_clone(id: &ActorIdHandle) -> KjOwn<ActorIdHandle>;
          /// The key the server files the actor under: the hex id, or the name.
          fn actor_id_key(id: &ActorIdHandle) -> String;
@@ -1287,7 +1287,7 @@ index f07aaa51d0ce37deeadc68afb282829099a71b6a..eb17a2a7ecac3e7978c74b7570136bb0
          fn actor_id_from_name(name: &str) -> KjOwn<ActorIdHandle>;
          /// The id of a durable namespace, from its hex text (a debug-port request).
          fn actor_id_from_hex(hex: &str) -> Result<KjOwn<ActorIdHandle>>;
-@@ -960,6 +972,9 @@ pub mod ffi {
+@@ -986,6 +998,9 @@ pub mod ffi {
          ) -> Result<KjOwn<WorkerInterface>>;
          /// Whether the cluster replicates the namespace's actors.
          fn replicated(self: &ActorNamespaceHandle) -> bool;

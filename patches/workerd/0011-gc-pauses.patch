@@ -22,10 +22,10 @@ index 63e1001767d5bc2b871356a3e914842ccc3f58d7..c00956627b903b055179c0071865e0e8
          "worker-factory-impl.h",
          "worker-factory-listen.c++",
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index ecba5faf0e24ca24540d964cae44bc8b0092c3b4..ea1fb3fcae08997b4d8501a73061cc95fb4b35bc 100644
+index c0c4c227f21b79dd99240933dae79ae17a127031..351e17522c3945771debb3279b62bddf4e9c9c0b 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-@@ -295,7 +295,7 @@ class RequestLimits final: public LimitEnforcer {
+@@ -302,7 +302,7 @@ class RequestLimits final: public LimitEnforcer {
            abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
      // The request context ends here, after its waitUntil work, whether or not it ran JavaScript. An actor's context
      // ends with the actor: its row has the CPU of all its events.
@@ -34,7 +34,7 @@ index ecba5faf0e24ca24540d964cae44bc8b0092c3b4..ea1fb3fcae08997b4d8501a73061cc95
      struct IdentityScope {
        jsg::AsyncContextFrame::StorageScope frame;
        MemoryStartupIdentityScope startup;
-@@ -305,13 +305,13 @@ class RequestLimits final: public LimitEnforcer {
+@@ -312,13 +312,13 @@ class RequestLimits final: public LimitEnforcer {
                  lock.v8Ref<v8::Value>(jsg::v8Str(lock.v8Isolate, owner.identity))),
              startup(owner.identity),
              limit(owner.limits->enterRequestJs(owner.cpuUsed, owner.identity,
@@ -50,7 +50,7 @@ index ecba5faf0e24ca24540d964cae44bc8b0092c3b4..ea1fb3fcae08997b4d8501a73061cc95
      }
      // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
      // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
-@@ -323,10 +323,10 @@ class RequestLimits final: public LimitEnforcer {
+@@ -330,10 +330,10 @@ class RequestLimits final: public LimitEnforcer {
        toppedUp += cpuUsed;
        cpuUsed = 0;
        const auto now = LimitWatchdog::now();
@@ -64,7 +64,7 @@ index ecba5faf0e24ca24540d964cae44bc8b0092c3b4..ea1fb3fcae08997b4d8501a73061cc95
        }
      }
      void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
-@@ -353,7 +353,7 @@ class RequestLimits final: public LimitEnforcer {
+@@ -360,7 +360,7 @@ class RequestLimits final: public LimitEnforcer {
      kj::Function<void()> abortIsolate;
      kj::String identity;
      // What the limit charged since the last top-up, before it, and the GC CPU it did not charge.

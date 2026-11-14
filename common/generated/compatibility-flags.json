@@ -1,8 +1,8 @@
 {
-  "workerdVersion": "v1.20261108.1",
-  "workerdCommit": "88b5871e8873a833b278f346473eed69a4443855",
-  "sourceSha256": "de49c0e7e4ad86e0af639e86be32c759d238d274792febc6770005324e341f19",
-  "maximumCompatibilityDate": "2026-11-15",
+  "workerdVersion": "v1.20261114.1",
+  "workerdCommit": "3d3093c8f01b9b53f4d36d20a8e4ea0a39787992",
+  "sourceSha256": "56b06afaa9c128a53b7fab26a3c0f92cebeade9d4984f06dffe970bbfac3e202",
+  "maximumCompatibilityDate": "2026-11-21",
   "flags": [
     "add_nodejs_compat_eol",
     "add_nodejs_compat_eol_v22",
@@ -189,6 +189,7 @@
     "no_nodejs_process_version_24",
     "no_nodejs_zlib",
     "no_pipe_to_backward_propagation",
+    "no_python_dedicated_snapshot_keep_import_caches",
     "no_python_workers_20250116",
     "no_python_workers_20260610",
     "no_python_workers_314",
@@ -228,6 +229,7 @@
     "pipe_to_backward_propagation",
     "python_check_rng_state",
     "python_dedicated_snapshot",
+    "python_dedicated_snapshot_keep_import_caches",
     "python_external_packages",
     "python_no_global_handlers",
     "python_process_pth_files",

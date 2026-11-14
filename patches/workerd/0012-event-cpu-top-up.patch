@@ -7,10 +7,10 @@ Subject: [PATCH] Top up every request's CPU for each new event and report it
 Ported from the 0.5.3 series 0012
 
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index 3981f4065eb9306bed41473aef277fa81ae976f0..e4881cb11011a143d78ae4c9e74de09ea511ba47 100644
+index 5d454dddce1633a64e63608d7a5089f6b99298f2..cce2d15c3feee19f307e8cd156a115c60c51d5b5 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-@@ -255,11 +255,20 @@ class RequestLimits final: public LimitEnforcer {
+@@ -262,11 +262,20 @@ class RequestLimits final: public LimitEnforcer {
          kj::String identity, kj::Function<void()> abortIsolate)
          : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
            abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
@@ -33,7 +33,7 @@ index 3981f4065eb9306bed41473aef277fa81ae976f0..e4881cb11011a143d78ae4c9e74de09e
      void newSubrequest(bool inHouse) override { fallback->newSubrequest(inHouse); }
      void newKvRequest(KvOpType type) override { fallback->newKvRequest(type); }
      void newAnalyticsEngineRequest() override { fallback->newAnalyticsEngineRequest(); }
-@@ -280,7 +289,8 @@ class RequestLimits final: public LimitEnforcer {
+@@ -287,7 +296,8 @@ class RequestLimits final: public LimitEnforcer {
      kj::Own<CpuIsolateLimitEnforcer> limits;
      kj::Function<void()> abortIsolate;
      kj::String identity;

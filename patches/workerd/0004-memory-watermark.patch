@@ -24,10 +24,10 @@ index cc05539b33d7ae641c3f5aa261c794b4bfb5a6b0..1cbc706a6325768a739bd59efc95309a
 +const uint32_t* coworkerdMemoryBandMapping();
  }  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index 347cee9e451bf85c9e1fec9973582cfaf5995944..83465d36f54eeb03c70132b0b749248e18165a94 100644
+index 81418dd2f9161efd9b0211bdfeaf856808e7b7cc..38150300875c76a16bc3b3ee9ec6519427f94f1c 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-@@ -181,11 +181,16 @@ void* coworkerdLifecycleMapping() {
+@@ -185,11 +185,16 @@ void* coworkerdLifecycleMapping() {
    return lifecycle.base;
  }
  

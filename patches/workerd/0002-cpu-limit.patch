@@ -5,6 +5,10 @@ Subject: [PATCH] Enforce dynamic Worker CPU budgets through isolated hooks
 
 Ported from the 0.5.3 series 0002
 
+Forward abandonAlarm through the CPU wrapper. Validate and cache the default
+CPU limit during factory initialization; keep empty-value diagnostics free
+of NUL operands.
+
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
 index 63dfe2f5047f0e3d7c6f85ae39d8bbdc31387fcd..58c9b45830e60ba5920dfc6f7b77f62936abd33b 100644
 --- a/src/workerd/server/factory/BUILD.bazel
@@ -20,10 +24,10 @@ index 63dfe2f5047f0e3d7c6f85ae39d8bbdc31387fcd..58c9b45830e60ba5920dfc6f7b77f629
          "worker-factory-listen.c++",
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..722916b9324d7ac99f0560217a52db2e4c6ef312
+index 0000000000000000000000000000000000000000..320135da691538551b7de43f42a63a507e4cb1bc
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,168 @@
 +#include "coworkerd-cpu-limit.h"
 +#include <workerd/util/autogate.h>
 +#include <cstdlib>
@@ -32,16 +36,20 @@ index 0000000000000000000000000000000000000000..722916b9324d7ac99f0560217a52db2e
 +
 +namespace workerd::server {
 +uint32_t cpuLimitFromEnvironment() {
-+  const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
-+  if (text == nullptr) return 0;
-+  KJ_REQUIRE(*text != '\0', "COWORKERD_CPU_LIMIT_MS must be an unsigned 32-bit integer");
-+  uint64_t value = 0;
-+  for (const char* p = text; *p; ++p) {
-+    KJ_REQUIRE(*p >= '0' && *p <= '9', "COWORKERD_CPU_LIMIT_MS must be an unsigned 32-bit integer");
-+    value = value * 10 + (*p - '0');
-+    KJ_REQUIRE(value <= std::numeric_limits<uint32_t>::max(), "COWORKERD_CPU_LIMIT_MS exceeds uint32");
-+  }
-+  return static_cast<uint32_t>(value);
++  static const uint32_t limit = []() -> uint32_t {
++    const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
++    if (text == nullptr) return 0;
++    KJ_REQUIRE(kj::StringPtr(text).size() > 0,
++        "COWORKERD_CPU_LIMIT_MS must be an unsigned 32-bit integer");
++    uint64_t value = 0;
++    for (const char* p = text; *p; ++p) {
++      KJ_REQUIRE(*p >= '0' && *p <= '9', "COWORKERD_CPU_LIMIT_MS must be an unsigned 32-bit integer");
++      value = value * 10 + (*p - '0');
++      KJ_REQUIRE(value <= std::numeric_limits<uint32_t>::max(), "COWORKERD_CPU_LIMIT_MS exceeds uint32");
++    }
++    return static_cast<uint32_t>(value);
++  }();
++  return limit;
 +}
 +kj::String cpuStateFromEnvironment() {
 +  const char* value = std::getenv("COWORKERD_CPU_STATE");
@@ -123,6 +131,9 @@ index 0000000000000000000000000000000000000000..722916b9324d7ac99f0560217a52db2e
 +  }
 +  kj::Promise<AlarmResult> runAlarm(kj::Date time, uint32_t retry) override {
 +    return inner->runAlarm(time, retry);
++  }
++  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date time) override {
++    return inner->abandonAlarm(time);
 +  }
 +  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
 +    return inner->customEvent(kj::mv(event));
@@ -419,7 +430,7 @@ index 0000000000000000000000000000000000000000..4c7583caad06a0477ed353c9bba8712a
 +    CpuIsolateLimitEnforcer& limits);
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
-index c94183b650ff5fa72b3e05f81a2cffef5a659e27..dbe00b6d98d36a053115490baff253759a3893f2 100644
+index a6fa52bfd6be3399df74c2c24f0ef45fcb60e60f..d819abda0735ba79262e3ab7caccbf4ea3555d1e 100644
 --- a/src/workerd/server/factory/worker-factory-impl.h
 +++ b/src/workerd/server/factory/worker-factory-impl.h
 @@ -7,6 +7,7 @@
@@ -428,9 +439,9 @@ index c94183b650ff5fa72b3e05f81a2cffef5a659e27..dbe00b6d98d36a053115490baff25375
  #include "worker-factory.h"
 +#include "coworkerd-cpu-limit.h"
  
+ #include <workerd/api/bench.h>
  #include <workerd/io/actor-sqlite.h>
- #include <workerd/io/io-thread-context.h>
-@@ -191,6 +192,8 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
+@@ -194,6 +195,8 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
    kj::Vector<kj::Rc<IoChannelFactory::RpcChannel>> rpcChannels;
    kj::Maybe<kj::String> accessBlobHeader;
    bool isDynamic = false;
@@ -440,10 +451,19 @@ index c94183b650ff5fa72b3e05f81a2cffef5a659e27..dbe00b6d98d36a053115490baff25375
    kj::Maybe<kj::Own<const Worker>> worker;
    // Held from compilation until `worker_set_ctx_exports()` fills the object in; none for a worker
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 61789b4a367342f194c7f593bf59ea03395d51a3..a287635ece5c3af34db7b7baa8e0c45878691134 100644
+index adac4c8e87a0e007b9e23f66bf858b06d4e0121c..7eda883d1d742cd5d144fa8ac65ea155f5a5302d 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -1145,12 +1145,17 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+@@ -89,6 +89,8 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
+           this->config.hasCluster() ? kj::Maybe<kj::StringPtr>(this->config.getCluster().getKey())
+                                     : kj::none),
+       tasks(*this) {
++  // Validate and cache the process default before any Worker is loaded.
++  (void)cpuLimitFromEnvironment();
+   // The config's logging settings go on top of the caller's.
+   auto& logging = this->options->loggingOptions;
+   auto& root = this->config;
+@@ -1146,12 +1148,17 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
    }
  
    auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
@@ -463,7 +483,7 @@ index 61789b4a367342f194c7f593bf59ea03395d51a3..a287635ece5c3af34db7b7baa8e0c458
  }
  
  }  // namespace
-@@ -1585,6 +1590,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1618,6 +1625,8 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
    auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
    impl->isDynamic = dynamicSource != kj::none;
@@ -472,7 +492,7 @@ index 61789b4a367342f194c7f593bf59ea03395d51a3..a287635ece5c3af34db7b7baa8e0c458
    ErrorReporter errorReporter;
    auto& options = *factory.options;
    bool experimental = options.experimental;
-@@ -1663,7 +1670,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1698,7 +1707,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    // The isolate of the Worker, or of the zygote that snapshots its startup.
    auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                           kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
