@@ -591,7 +591,9 @@ Before preparing another open, the node checks whether the durable process gener
 files still has an open channel. While it does, the node skips `wal-cut-back`; if the cache open marker was cleared,
 it only advances the open generation and writes that marker again. Once that process generation is gone, normal
 WAL truncation resumes.
-If writing the open marker fails, the in-memory open flag is restored so a later request retries the write.
+When a durable process reopens a LOCAL object itself, `FROM_OPEN` writes the open marker again without advancing
+the open generation. If that write fails, the node breaks access to the object and marks it for repair.
+A failed open or close marker write restores the in-memory open flag to its prior value.
 Before rebuilding an image, the node resets durable processes only while an open facet is live or a request
 has been dispatched and its `FROM_OPEN` has not yet been processed; a closed object's old dispatch alone
 does not trigger a reset.
