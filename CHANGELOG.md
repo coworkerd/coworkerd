@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refuse a Durable Object request when the selected durable process generation has no open replication channel (`503 STORAGE_UNAVAILABLE`) and queue one automatic rotation of that slot. This covers a process spawned after its channel could not be created, which until now served commits without replicating them, and a channel that ended while the process kept running.
 - Write a Durable Object's open marker back to true when its process reopens it without a new dispatch (a request sent before the close, or a message on a hibernating WebSocket), so that a same-boot restart no longer admits that cache as clean. If the marker cannot be written the instance is broken and the object repaired.
 - Replay and synchronize a rebuilt Durable Object image in staging before replacing local files, preserving them when recovery fails before replacement begins.
 - Look up a Durable Object's open registrations on a process channel by key prefix instead of scanning the whole table; with 8,000 registrations a dispatch check takes about 1/187 of the time. No behavior change.
