@@ -1855,6 +1855,16 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         facet.salt2 = salt2;
         facet.lastFrame = frames;
       }
+      if (object->state == ObjectState::LOCAL && !object->storageId.empty() && !object->cacheOpen) {
+        object->cacheOpen = true;
+        if (!writePosition(*object)) {
+          object->cacheOpen = false;
+          log("open-marker-failed", "\"object\":" + quote(objectName) + ",\"errno\":" + std::to_string(errno));
+          const auto reason = "the object open marker could not be written";
+          tellBreak(key, std::string("Durable Object storage is unavailable: ") + reason + " (STORAGE_UNAVAILABLE)");
+          markRepair(*object, reason);
+        }
+      }
       return;
     }
     case FROM_CHECKPOINT: {
@@ -5749,8 +5759,9 @@ void DurableLog::maybeCloseMarker(Object& object) {
       (state->second.repairPending || state->second.rebuildPending)) return;
   for (const auto& [facetId, facet] : object.facets)
     if (facet.open || !facet.checkpointSafe) return;
+  const bool wasOpen = object.cacheOpen;
   object.cacheOpen = false;
-  if (!writePosition(object)) object.cacheOpen = true;
+  if (!writePosition(object)) object.cacheOpen = wasOpen;
 }
 
 void DurableLog::channelEnded(Channel& channel, const std::string& reason) {
