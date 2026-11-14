@@ -338,6 +338,9 @@ and never reads the previous owner's files.
   is unknown, not an empty history. Records are deduplicated by shard epoch and owner sequence, and replay checks
   WAL generations, checksums and consecutive frames. These checks alone cannot detect every missing older generation.
   The latest manifest is checked again after collection in case the old owner sealed while answering.
+  The complete new image is replayed and synchronized under staging names before it replaces any local database,
+  WAL, shared-memory file or facet index. A failure before replacement preserves the old files; the object remains
+  REBUILDING and cannot serve them while the next request retries recovery.
 
   The authenticated peer CONNECT response advertises `X-Coworkerd-Tail-Owner: 1`. Only a marked original owner's
   complete answer proves coverage; older nodes answer only from their incoming buffers, so their empty answer
@@ -513,14 +516,16 @@ and never reads the previous owner's files.
   are exempt. For opens routed through the node, missing files are never handed to workerd to create an empty
   replacement; the hibernating-socket wake described above does not take that path. A possibly unique legacy
   takeover cache enters named HOLD when admission fails; a 0.5.5 complete recovery instead rebuilds from its
-  published history. Store history is read and verified before original non-risk cache files are replaced.
+  published history. Store history is read, verified, replayed and synchronized in staging before original non-risk
+  cache files are replaced.
 
   Power-loss startup deletes database caches, indexes and positions but retains raw log and exclusion prefixes.
   A persistent crossed-boot flag prevents these epochs from later proving absence in the same boot. Complete,
   fully released predecessor logs can be replaced by `.closed` EOF/shard summaries only after unresolved repair,
   rebuild, healing and cache-admission state is carried forward durably. Original record encodings are unchanged.
   All files in `do/log/`, plus database/WAL bytes, count in the eviction accounting. Positions, facet indexes,
-  snapshot staging and code caches add other disk use. The active epoch, incomplete prefixes and crossed-boot
+  snapshot staging and code caches add other disk use. During recovery, the old and staged databases coexist;
+  leave room for one additional object-sized image. The active epoch, incomplete prefixes and crossed-boot
   logs are protected; they have no configured byte ceiling and can exceed `diskBytes` after all eligible caches
   are evicted. Filesystem capacity is the ultimate bound and a full disk refuses writes and marker-dependent
   first reads. Monitor free space. Draining attempts one current segment and does not drain every earlier epoch;

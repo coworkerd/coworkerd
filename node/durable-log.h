@@ -178,7 +178,7 @@ public:
   ~DatabaseReplay();
   // Applies one record; false (with the reason) when its frames do not check out, which ends the replay there.
   bool apply(const LogRecord& record, std::string* error);
-  void finish();
+  bool finish();
   uint64_t appliedRecords() const { return records; }
   uint64_t appliedFrames() const { return framesApplied; }
 
@@ -709,10 +709,10 @@ private:
   kj::Promise<void> healObject(std::string objectName);
   kj::Promise<void> materializeTrustedWal(std::string objectName, uint64_t shardEpoch);
   kj::Promise<void> retireFencedTails(Object& object, const ObjectManifest& manifest);
-  void applyRecords(Object& object, std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
+  std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& storageId,
+      std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
       uint64_t snapshotShardEpoch, const std::set<std::pair<uint64_t, uint64_t>>& drop);
   void writeFacetIndex(const std::string& storageId, const std::vector<ManifestFacet>& facets);
-  void removeObjectFiles(const Object& object);
 
   Settings settings;
   std::optional<ObjectStore> store;

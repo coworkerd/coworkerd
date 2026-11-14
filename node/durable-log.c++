@@ -693,13 +693,15 @@ bool DatabaseReplay::apply(const LogRecord& record, std::string* error) {
   return true;
 }
 
-void DatabaseReplay::finish() {
+bool DatabaseReplay::finish() {
+  bool synced = true;
   if (fd >= 0) {
-    // The rebuilt file is the object's only copy until its next segment: this one waits for the disk.
-    ::fsync(fd);
+    // Finish synchronizing the replayed image before it can be used by recovery.
+    synced = ::fsync(fd) == 0;
     ::close(fd);
     fd = -1;
   }
+  return synced;
 }
 
 // ---- The replicator ----
@@ -3867,6 +3869,15 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
         "ownership changed during object recovery");
   };
   const auto stagingId = object->storageId + ".rebuild-" + std::to_string(nodeEpoch) + "-" + std::to_string(targetEpoch);
+  std::set<uint32_t> stagingFacets;
+  const auto cleanupStaging = kj::defer([this, stagingId, &stagingFacets]() noexcept {
+    for (auto facetId : stagingFacets) {
+      try {
+        std::error_code ignored;
+        std::filesystem::remove(databasePath(stagingId, facetId), ignored);
+      } catch (...) {}
+    }
+  });
   auto manifest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   const auto initialLowerBound = co_await recoveryLowerBound(objectName, manifest);
@@ -3890,6 +3901,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotSequence = manifest->snapshotSequence;
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
+      for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
       co_await downloadSnapshot(*manifest, stagingId);
       check();
       facets = manifest->facets;
@@ -3939,6 +3951,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotSequence = manifest->snapshotSequence;
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
+      for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
       co_await downloadSnapshot(*manifest, stagingId);
       check();
       facets = manifest->facets;
@@ -3999,24 +4012,39 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     if (!durableRecords.contains(position)) adopted.push_back(record);
     history.push_back(std::move(record));
   }
-  // Only now is every required store source readable. Keep the original files
-  // intact on a failed manifest/segment/snapshot read, including unique legacy caches.
-  check();removeObjectFiles(*object);object->facets.clear();
-  if (manifest && manifest->hasSnapshot) {
-    for (const auto& facet : facets) {
-      std::error_code code;
-      std::filesystem::rename(databasePath(stagingId, facet.facetId), databasePath(object->storageId, facet.facetId), code);
-      KJ_REQUIRE(!code, "a verified recovery snapshot could not replace the cache");
-    }
+  // Finish and synchronize the new image before touching any original file or facet entry.
+  for (const auto& record : history) stagingFacets.insert(record.facetId);
+  auto rebuilt = applyRecords(*object, stagingId, std::move(history), facets, snapshotShardEpoch, drop);
+  check();
+  KJ_REQUIRE(!recoveryWriteFailed && !object->cacheHold, "a held or unfenced local image cannot be deleted");
+  object->facets.clear();
+  auto removeFile = [&](const std::filesystem::path& path) {
+    std::error_code code;
+    std::filesystem::remove(path, code);
+    KJ_REQUIRE(!code, "cannot remove an old Durable Object file during replacement",
+        path.string().c_str(), code.message().c_str());
+  };
+  std::set<uint32_t> sidecars;
+  for (uint32_t id = 0; id < 64; ++id) sidecars.insert(id);
+  for (const auto& [id, facet] : rebuilt) sidecars.insert(id);
+  // No new database moves until every old WAL and shared-memory file is gone.
+  for (auto id : sidecars)
+    for (const char* suffix : {"-wal", "-shm"}) removeFile(databasePath(object->storageId, id, suffix));
+  for (const auto& [id, facet] : rebuilt) {
+    std::error_code code;
+    std::filesystem::rename(databasePath(stagingId, id), databasePath(object->storageId, id), code);
+    KJ_REQUIRE(!code, "a completed recovery image could not replace the cache", id, code.message().c_str());
   }
-  applyRecords(*object, std::move(history), facets, snapshotShardEpoch, drop);
+  for (uint32_t id = 0; id < 64; ++id)
+    if (!rebuilt.contains(id)) removeFile(databasePath(object->storageId, id));
   std::vector<ManifestFacet> index;
-  for (const auto& [id, facet] : object->facets) {
+  for (const auto& [id, facet] : rebuilt) {
     ManifestFacet entry;
     entry.facetId = id; entry.parentFacetId = facet.parentFacetId; entry.name = facet.facetName;
     index.push_back(std::move(entry));
   }
   writeFacetIndex(object->storageId, index);
+  object->facets = std::move(rebuilt);
   const auto publishingStarted = monotonicTimeMs();
   if (tails.cut) co_await forceRecoverySnapshot(objectName);
   else co_await publishRecovery(objectName, adopted);
@@ -4069,17 +4097,6 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
           "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\"");
 }
 
-void DurableLog::removeObjectFiles(const Object& object) {
-  KJ_REQUIRE(!recoveryWriteFailed && !object.cacheHold, "a held or unfenced local image cannot be deleted");
-  std::error_code code;
-  for (uint32_t facetId = 0; facetId < 64; ++facetId) {
-    for (const char* suffix : {"", "-wal", "-shm"}) {
-      std::filesystem::remove(databasePath(object.storageId, facetId, suffix), code);
-    }
-  }
-  std::filesystem::remove(durableDirectory() / (object.storageId + ".facets"), code);
-}
-
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
 kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const std::string& storageId) {
@@ -4100,7 +4117,7 @@ kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, c
       }
     }
     if (running.size() > 0) co_await kj::joinPromises(running.releaseAsArray());
-    ::fsync(fd);
+    KJ_REQUIRE(::fsync(fd) == 0, "cannot synchronize a Durable Object snapshot", path.string().c_str());
     // The file must be the one the snapshot names: a wrong digest would be read as the object's state.
     const auto bytes = readFile(path);
     KJ_REQUIRE(bytes.size() == facet.bytes && sha256Hex(bytes) == facet.sha256,
@@ -5182,7 +5199,8 @@ kj::Promise<void> DurableLog::healObject(std::string objectName) {
 // The records of an object, in the order they were written -- by the shard's epoch, then the owner's epoch, then its
 // sequence -- replayed into each of its databases. A gap in one owner's sequence ends that owner's part there: a
 // peer holds a prefix, so what follows a gap was never answered to anybody.
-void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
+std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
+    const Object& object, const std::string& storageId, std::vector<LogRecord> history,
     const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
     const std::set<std::pair<uint64_t, uint64_t>>& drop) {
   // A shard's epoch belongs to one owner and grows with every takeover, so (shard epoch, node sequence) is both the
@@ -5198,6 +5216,7 @@ void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
   std::map<uint32_t, uint64_t> rebuiltUpTo;
   if (snapshotShardEpoch == object.shardEpoch) rebuiltUpTo = covered;
   std::map<uint32_t, std::unique_ptr<DatabaseReplay>> replays;
+  std::map<uint32_t, Facet> rebuilt;
   uint64_t applied = 0, skipped = 0;
   for (const auto& [position, record] : ordered) {
     auto found = covered.find(record.facetId);
@@ -5210,7 +5229,7 @@ void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
     auto& replay = replays[record.facetId];
     if (!replay) {
       // A facet the snapshot brought goes on from its file; one it did not starts from nothing.
-      replay = std::make_unique<DatabaseReplay>(databasePath(object.storageId, record.facetId),
+      replay = std::make_unique<DatabaseReplay>(databasePath(storageId, record.facetId),
           covered.find(record.facetId) == covered.end());
     }
     std::string error;
@@ -5232,7 +5251,7 @@ void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
     ++applied;
     if (record.shardEpoch == object.shardEpoch)
       rebuiltUpTo[record.facetId] = std::max(rebuiltUpTo[record.facetId], record.nodeSeq);
-    auto& facet = object.facets[record.facetId];
+    auto& facet = rebuilt[record.facetId];
     facet.facetId = record.facetId;
     if (!record.facetName.empty()) {
       facet.facetName = record.facetName;
@@ -5241,19 +5260,16 @@ void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
     facet.txn = record.txn + (record.commits ? record.commits - 1 : 0);
   }
   for (auto& [facetId, replay] : replays) {
-    if (replay) replay->finish();
+    if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
+        databasePath(storageId, facetId).string().c_str());
   }
   for (const auto& facet : facets) {
-    auto& entry = object.facets[facet.facetId];
+    auto& entry = rebuilt[facet.facetId];
     entry.facetId = facet.facetId;
     entry.parentFacetId = facet.parentFacetId;
     if (!facet.name.empty()) entry.facetName = facet.name;
   }
-  // Every database of the object starts a fresh WAL under the next process that opens it.
-  std::error_code code;
-  for (auto& [facetId, facet] : object.facets) {
-    std::filesystem::remove(databasePath(object.storageId, facetId, "-wal"), code);
-    std::filesystem::remove(databasePath(object.storageId, facetId, "-shm"), code);
+  for (auto& [facetId, facet] : rebuilt) {
     facet.lastFrame = 0;
     facet.salt1 = 0;
     facet.salt2 = 0;
@@ -5262,18 +5278,25 @@ void DurableLog::applyRecords(Object& object, std::vector<LogRecord> history,
     facet.open = false;
   }
   log("replayed", "\"object\":" + quote(object.objectName) + ",\"records\":" + std::to_string(applied) +
-          ",\"skipped\":" + std::to_string(skipped) + ",\"facets\":" + std::to_string(object.facets.size()));
+          ",\"skipped\":" + std::to_string(skipped) + ",\"facets\":" + std::to_string(rebuilt.size()));
+  return rebuilt;
 }
 
 // The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a
 // rebuild writes the names and parents the records carry (experiment 25, D.6).
 void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector<ManifestFacet>& facets) {
+  const auto path = durableDirectory() / (storageId + ".facets");
+  auto removeIndex = [&]() {
+    std::error_code code;
+    std::filesystem::remove(path, code);
+    KJ_REQUIRE(!code, "cannot remove an obsolete Durable Object facet index", path.string().c_str(), code.message().c_str());
+  };
   std::vector<ManifestFacet> entries;
   for (const auto& facet : facets) {
     if (facet.facetId == 0 || facet.name.empty()) continue;
     entries.push_back(facet);
   }
-  if (entries.empty()) return;
+  if (entries.empty()) { removeIndex(); return; }
   std::sort(entries.begin(), entries.end(), [](const ManifestFacet& a, const ManifestFacet& b) {
     return a.facetId < b.facetId;
   });
@@ -5284,6 +5307,7 @@ void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector
     // The ids are the positions of the entries: a gap would give the next facet another id than it had.
     if (facet.facetId != expected) {
       log("facet-index-gap", "\"storageId\":" + quote(storageId) + ",\"facet\":" + std::to_string(facet.facetId));
+      removeIndex();
       return;
     }
     ++expected;
@@ -5293,18 +5317,17 @@ void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector
     bytes.push_back(char((facet.name.size() >> 8) & 0xff));
     bytes += facet.name;
   }
-  const auto path = durableDirectory() / (storageId + ".facets");
   const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0) return;
+  KJ_REQUIRE(fd >= 0, "cannot open a Durable Object facet index", path.string().c_str());
+  const auto close = kj::defer([fd]() { ::close(fd); });
   size_t done = 0;
   while (done < bytes.size()) {
     auto written = ::write(fd, bytes.data() + done, bytes.size() - done);
     if (written < 0 && errno == EINTR) continue;
-    if (written <= 0) break;
+    KJ_REQUIRE(written > 0, "cannot write a Durable Object facet index", path.string().c_str());
     done += size_t(written);
   }
-  ::fsync(fd);
-  ::close(fd);
+  KJ_REQUIRE(::fsync(fd) == 0, "cannot synchronize a Durable Object facet index", path.string().c_str());
 }
 
 // ---- Alarms ----
