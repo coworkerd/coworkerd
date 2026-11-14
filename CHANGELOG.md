@@ -2,6 +2,7 @@
 
 ## 0.5.6 (unreleased)
 
+- Preserve an object's WAL while the durable process generation last given its files is alive, including before the node receives its open message and when the same process reopens it.
 - Fail this object open when reading or writing its WAL fails, preserving its files and allowing a later request to retry. A successful truncation is not rolled back if the following sync fails.
 
 ## 0.5.5 (unreleased)

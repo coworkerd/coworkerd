@@ -5858,6 +5858,8 @@ private:
     if (current.refused) co_return refused(*current.refused);
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot);
+      durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+          target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
       server.objectBegin(target.key(), target.hops);
       slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops]() {

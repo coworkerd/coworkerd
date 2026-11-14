@@ -353,6 +353,8 @@ public:
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
   // says what to tell the caller when they cannot be.
   kj::Promise<ObjectReady> openObject(ObjectIdentity identity);
+  // Called synchronously after dispatch, before another request can prepare these files again.
+  void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // The shard is this node's no longer (released, lost or dropped): its objects' records stop going out.
   void shardGone(const std::string& namespaceId, uint32_t shard, const std::string& reason);
   // This node has taken the shard: the alarm hints of its objects are read, so the alarms the node before it had
@@ -443,6 +445,8 @@ private:
     std::string repairReason;
     std::pair<uint64_t, uint64_t> repairGeneration, rebuildGeneration, imageRepairGeneration;
     uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0, cacheShardEpoch = 0;
+    // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
+    std::string dispatchedChannel;
     bool cacheOpen = false, positionRead = false, recoveryPublished = false, healingInProgress = false;
     bool cacheInvalid = false, cacheHold = false;
     bool cacheAdmissionPending = false;
@@ -663,6 +667,7 @@ private:
   std::optional<std::string> prepareOpen(Object& object);
   kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
+  bool hasLiveDispatch(const Object& object) const;
   void channelEnded(Channel& channel, const std::string& reason);
   void maybeCloseMarker(Object& object);
 

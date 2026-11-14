@@ -3553,6 +3553,11 @@ kj::Promise<void> DurableLog::dropColdFiles() {
 
 // ---- Opening an object: its files are brought up to date with its replicated history first ----
 
+void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch)))
+    object->dispatchedChannel = processId + "-" + std::to_string(generation);
+}
+
 kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity) {
   if (!enabled()) co_return ObjectReady{};
   if (startupAttempted && !startupReady) {
@@ -3771,7 +3776,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     if (repair) KJ_REQUIRE(beginRepair(*object), "the repair exclusion could not be made durable");
     isolateObjectPending(*object, "pending records cannot outlive the image used by recovery");
     KJ_REQUIRE(!recoveryWriteFailed, "pending exclusions could not be made durable");
-    const bool closeLive = hasLiveOpenFacets(*object);
+    const bool closeLive = hasLiveOpenFacets(*object) || hasLiveDispatch(*object);
     object->rebuildGeneration = {nodeEpoch, ++recoverySerial};
     KJ_REQUIRE(appendRecovery({recoveryEvent(RecoveryKind::REBUILD_BEGIN, *object, object->rebuildGeneration)}, false),
         "the rebuild begin marker could not be written");
@@ -5554,15 +5559,25 @@ bool DurableLog::hasLiveOpenFacets(const Object& object) const {
   return false;
 }
 
+bool DurableLog::hasLiveDispatch(const Object& object) const {
+  const auto channel = channels.find(object.dispatchedChannel);
+  return channel != channels.end() && channel->second.open;
+}
+
 std::optional<std::string> DurableLog::prepareOpen(Object& object) {
   if (recoveryWriteFailed || object.state != ObjectState::LOCAL) return "the object open marker could not be written";
   if (hasLiveOpenFacets(object)) return std::nullopt;  // These files are already handed to the same live process.
+  const bool dispatched = hasLiveDispatch(object);
+  if (dispatched && object.cacheOpen) return std::nullopt;
   KJ_REQUIRE(!object.cacheAdmissionPending, "legacy cache admission must precede handing files to workerd");
-  for (const auto& [facetId, facet] : object.facets)
-    if (!facet.deleted && !facet.loggedCheckpointCovered) {
-      if (auto error = cutBackWal(object, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame))
-        return error;
-    }
+  if (!dispatched) {
+    object.dispatchedChannel.clear();
+    for (const auto& [facetId, facet] : object.facets)
+      if (!facet.deleted && !facet.loggedCheckpointCovered) {
+        if (auto error = cutBackWal(object, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame))
+          return error;
+      }
+  }
   object.openGeneration = object.openEpoch == nodeEpoch ? object.openGeneration + 1 : 1;
   object.openEpoch = nodeEpoch;object.cacheOpen = true;
   if (writePosition(object)) return std::nullopt;

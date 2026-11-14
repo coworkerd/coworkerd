@@ -551,6 +551,11 @@ time, `recovery` counters (bounded, owner-silent, late, transferred and unaccoun
 uploads, the manifests, the snapshots, the rebuilds, a peer taking another's place, and a confirmation that failed with
 the records it isolated. A `[do]` line says how long a request waited for a rebuild (`recoveredMs`).
 
+Before preparing another open, the node checks whether the durable process generation last given the object's
+files still has an open channel. While it does, the node skips `wal-cut-back`; if the cache open marker was cleared,
+it only advances the open generation and writes that marker again. Once that process generation is gone, normal
+WAL truncation resumes.
+
 `durableLog.log.walCutBackFailures` counts WAL read/write failures while preparing an object open.
 `wal-cut-back-failed` names the object, storage id, facet, step (`read`, `truncate`, `sync` or `remove`),
 operation and errno. A short header read reports errno 0 and `readBytes`. The request returns 503
