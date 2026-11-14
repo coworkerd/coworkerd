@@ -531,6 +531,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
 | `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
 | `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
+| `rebuildConcurrency` | `4` | Objects being rebuilt at once on each node; range 1–64; additional objects wait in FIFO order |
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 

@@ -33,6 +33,8 @@ void DurableLogConfig::validate() const {
   KJ_REQUIRE(checkpointBytes >= (1u << 16), "durableObjects.checkpointBytes is at least 65536");
   KJ_REQUIRE(recoverParallelism > 0 && recoverParallelism <= 16,
       "durableObjects.recoverParallelism is between 1 and 16");
+  KJ_REQUIRE(rebuildConcurrency > 0 && rebuildConcurrency <= 64,
+      "durableObjects.rebuildConcurrency is between 1 and 64");
   KJ_REQUIRE(uploadRetryMs > 0 && uploadRetryMaxMs >= uploadRetryMs,
       "durableObjects.uploadRetryMaxMs is at least uploadRetryMs");
 }
@@ -210,6 +212,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.uploadRetryMs = durable.getUploadRetryMs();
   result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();
   result.durableLog.recoverParallelism = durable.getRecoverParallelism();
+  result.durableLog.rebuildConcurrency = durable.getRebuildConcurrency();
   result.durableLog.residentObjects = durable.getResidentObjects();
   result.durableLog.usagePublishMs = durable.getUsagePublishMs();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
