@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Behavior change:** after a daemon restart no local Durable Object database file is reused. Every object starts unknown and is rebuilt from its replicated history at its first open, which removes the defects of deciding whether a local copy could be trusted (unconfirmed frames read after a restart, repeated rebuilds, held objects). The first request to each object after a restart reads the object store, and objects of a restarted node answer 503 while the store is unreachable. Data directories of older versions are not supported.
 - Refuse a Durable Object request when the selected durable process generation has no open replication channel (`503 STORAGE_UNAVAILABLE`) and queue one automatic rotation of that slot. This covers a process spawned after its channel could not be created, which until now served commits without replicating them, and a channel that ended while the process kept running.
 - Write a Durable Object's open marker back to true when its process reopens it without a new dispatch (a request sent before the close, or a message on a hibernating WebSocket), so that a same-boot restart no longer admits that cache as clean. If the marker cannot be written the instance is broken and the object repaired.
 - Replay and synchronize a rebuilt Durable Object image in staging before replacing local files, preserving them when recovery fails before replacement begins.

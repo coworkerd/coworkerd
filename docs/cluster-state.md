@@ -431,39 +431,19 @@ and never reads the previous owner's files.
   A request waits at most `durableObjects.recoverTimeoutMs` (30 s) before `503 DO_RECOVERING`,
   while the same rebuild continues. The receiving peer returns its dispatcher before this wait; peer-open retains
   its two-second `peerTimeoutMs` bound, and an open known not to have sent an event may be tried elsewhere.
-- **Healing a trusted local copy.** On startup, objects recovered from trusted local files are checked before a
-  durable process opens them. Risk is determined from the trusted position's `dataEpoch`, the start of this
-  node's uninterrupted ownership, the manifest's snapshot cut, and the local marker that a complete recovery
-  in this data epoch was already published by 0.5.5. A legacy takeover after that cut requires healing
-  even if it never produced a segment or the previous snapshot predates its tail. A data epoch of 1 has no
-  earlier owner. Own restarts and own seals do not increase the data epoch and cannot create a new risk after
-  a healing cut. For a risky object the node checks the shard's authority and reclaims its own shard at its new membership
-  epoch, preserving the data epoch. It validates the known WAL prefix completely, then materializes it into the
-  database in bounded chunks and publishes a full snapshot. A request routed through the same restart joins
-  that operation. Before reading the manifest, healing lets an existing local manifest write finish and defers
-  new background publications for this object until the snapshot settles. Deferred records keep their log
-  positions; changes by a remote writer still have to pass the manifest revision check. That object waits behind the healing operation; its
-  files are protected from cache eviction. A failed check or publication keeps the local files and reports the
-  object and failing step; it can retry after 30 s. A newer owner or data epoch is never repaired from stale files.
-  Risk checks run outside the serial snapshot gate, so a large healing snapshot does not block unrelated
-  healthy first opens. Requested risky objects take priority over the single background check; the background
-  scan does not enqueue work while the gate is busy. Snapshot payload is limited to 64 MiB/s per node.
-  `heal-snapshot` records each successful publication; `heal-wal-materialized` records the known frames included.
-  The node materializes and synchronizes all live facet databases before synchronizing the object's
-  healing-in-progress marker and removing any WAL. Restart can reapply a surviving WAL or continue from
-  its synchronized database after WAL removal.
-  An empty legacy WAL is eligible when its position's generation matches the last logged FRAMES generation,
-  `lastFrame` is zero and `checkpointedSeq` covers that record. New positions retain checkpoint salts and frames.
-  A successfully healed ownership run needs no new healing after its own restart or seals. A facet explicitly
-  deleted by the latest local log record is omitted; an unexplained missing required file still fails healing.
-  `healErrors` counts currently unresolved healing failures; `healFailures` is cumulative, with one failure and
-  one object-operation-failed log per operation rather than per waiting request. This publishes a trusted surviving copy; it
-  cannot reconstruct pages already absent from that copy. WAL checks do not constitute a SQLite integrity check.
+- **First open after restart.** Every object starts UNKNOWN after the node daemon restarts, including a clean
+  drain and a restart within the same machine boot. No surviving database image is admitted. The first open
+  rebuilds from manifests, snapshots, segments, local unsealed records and peer tails using the recovery path
+  above. Position files supply only object and shard identity, tenant and byte usage before that first open.
+  Pending repair generations are restored from recovery sidecars so the rebuild can complete the original repair.
+  Legacy cache admission, HOLD and snapshot-healing code remains present but startup no longer activates it.
+  Each object's first request reads the store and replays its history; a large object can take seconds to tens
+  of seconds. If the store is unreachable, objects on a restarted node return 503 until it recovers. Many first
+  opens can rebuild concurrently after restart; limiting that concurrency is separate work.
 - **A node id has one location.** Run a node id in only one place at a time. When moving it to another
   machine, confirm that the old machine's node processes stopped before reusing it. Missing heartbeats or
   expired registrations do not prove that the old machine has stopped.
-- **This machine's files.** The remaining admission, WAL and healing gaps are listed in
-  [Known issues in 0.5.5](guide/install.md#known-issues-in-055). They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
+- **This machine's files.** Object databases are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
   are all in a segment, go when that is full. An object registered as open on a live durable-process channel is
   skipped when its turn to evict arrives, as is an object with a request in flight or an open connection on a live
@@ -478,11 +458,13 @@ and never reads the previous owner's files.
   and `activeConnections` total the requests in flight and open connections on live channels. A closed process
   generation no longer contributes to these totals or protects files; its late completion callbacks only retire
   its remaining counts. A JS RPC session retains its request count until the caller releases its stub.
-  Reuse requires the same Linux boot; a clean drain does not grant
-  reuse across boots because SQLite uses `synchronous=OFF`. Startup synchronizes `clean:false` before trusting
-  or changing object files. Failure gates all DO service and retries without deleting caches. An untrusted
-  startup retains the previous boot identity until cleanup and classification finish; an interrupted startup
-  cannot make the remaining old files eligible for same-boot reuse. Before handing
+  Every daemon restart discards database, WAL, SHM, facet-index and staging files. A trusted startup retains
+  only `.position` files in the object-data directory; deletion failures are logged and do not fail startup,
+  and remaining images are still never admitted. An untrusted startup deletes positions too and retains its
+  existing cleanup gate. The boot identity still controls whether complete predecessor logs can prove that
+  no more records exist; it never grants database reuse. Startup synchronizes `clean:false` before changing
+  object files. Marker failure gates all DO service and retries without deleting caches. An untrusted startup
+  retains the previous boot identity until cleanup and classification finish. Before handing
   files to workerd, an atomic position update marks an object open with an epoch and generation, without fsync.
   Only the last matching facet close, with logged checkpoint coverage and no pending repair, clears it. A stale
   close cannot clear a newer open. EOF or process closure invalidates every still-open object of that process;
@@ -496,7 +478,7 @@ and never reads the previous owner's files.
 
   This synchronous dispatch check precedes request accounting. An unavailable startup or recovery log refuses
   with 503 `STORAGE_UNAVAILABLE`; lost or fenced ownership, a changed shard epoch, or GONE refuses with
-  409 `DO_SHARD_EPOCH_MISMATCH`. Recovery, legacy cache admission, or snapshot healing in progress refuses
+  409 `DO_SHARD_EPOCH_MISMATCH`. Recovery in progress refuses
   with 503 `DO_RECOVERING`. A selected generation without an open replication channel refuses with 503
   `STORAGE_UNAVAILABLE` and queues an automatic rotation of its slot, deduplicating a queued or active rotation;
   the refusal does not wait for that rotation. A different live generation holding the object refuses with 503 `DO_UNAVAILABLE`.
@@ -516,10 +498,9 @@ and never reads the previous owner's files.
   freezes this process's DO service until restart, preserves `cache.json` and possible unique copies, and prevents
   a clean marker. Required database files and named-facet indexes must be readable; explicitly deleted facets
   are exempt. For opens routed through the node, missing files are never handed to workerd to create an empty
-  replacement; the hibernating-socket wake described above does not take that path. A possibly unique legacy
-  takeover cache enters named HOLD when admission fails; a 0.5.5 complete recovery instead rebuilds from its
-  published history. Store history is read, verified, replayed and synchronized in staging before original non-risk
-  cache files are replaced.
+  replacement; the hibernating-socket wake described above does not take that path. Store history is read,
+  verified, replayed and synchronized in staging before replacement files are installed. Startup no longer
+  appends a repair record for every object on an untrusted boot: UNKNOWN objects already require a rebuild.
 
   Power-loss startup deletes database caches, indexes and positions but retains raw log and exclusion prefixes.
   A persistent crossed-boot flag prevents these epochs from later proving absence in the same boot. Complete,
@@ -551,7 +532,12 @@ and never reads the previous owner's files.
   interval does not bound that loss during an upload outage or backlog. Recovery uses every verified tail obtained
   before its deadline, but an unreachable holder may still have more. Bounded recovery explicitly reports that
   uncertainty and commits a snapshot cut before accepting new writes. Returning old records cannot repair a history
-  that has already branched. When an old owner is fenced, actual matching records in referenced segments count as
+  that has already branched. There is also a takeover window after a rebuilt image is swapped into place and
+  before its recovery publication, including the forced snapshot upload after a bounded cut. Peer tails obtained
+  during that rebuild may exist only in the peers' memory and the newly installed database. A daemon restart,
+  even in the same machine boot, now deletes that image and must obtain those tails again. If their peer holders
+  also restart before publication, those tails can be lost. Publishing before swapping files is separate work.
+  When an old owner is fenced, actual matching records in referenced segments count as
   `confirmed-tail-transferred`; records not accounted for by those segments after a newer snapshot cut count as
   `confirmed-tail-unaccounted`, and the uploaded old segment is retained. Unaccounted is not proof of loss: a normal
   later snapshot also removes old segment references. Unknown evidence remains pending for bounded retries.
@@ -609,7 +595,8 @@ but its sync failed, the WAL remains truncated. A later request retries normally
 the object unavailable rather than automatically starting repair. Have another node take over its shard,
 for example by draining this node; the new owner rebuilds from storage and peers.
 
-`objects.hold` and `openCache` name caches that cannot yet serve or were handed to a durable process.
+`objects.hold` is a retained legacy-cache counter; startup no longer creates HOLD objects. `openCache` counts
+objects marked open within the current daemon lifetime.
 `localRecovery.writeFailed`, `writeFailures`, `startupReady`, `startupMarkerFailures` and `startupCleanupFailures`
 expose local durability gates.
 `startupClassification` counts `history`, `fenced`, `adopt` and `readFallback`, its segment/old-manifest reads and time,
@@ -618,8 +605,8 @@ sequence range and byte count in `restored-startup-classified`. Fenced records r
 is uploaded; unproven records default to resealing. Historical lookup reads at most 256 deduplicated batches and
 256 older manifest revisions, with at most 64 MiB of receipt cache; unread and over-budget evidence is counted.
 
-`durableLog.recovery.healPending` and `healBusy` describe local healing still to finish; `healSnapshots`,
-`healFailures` and `healedWalFrames` count its work. `objectFailures` and `object-operation-failed` name failures at
+`durableLog.recovery.healPending`, `healBusy`, `healSnapshots`, `healFailures` and `healedWalFrames` remain for
+the retained healing code; startup no longer schedules it. `objectFailures` and `object-operation-failed` name failures at
 rebuild, healing or request stages. Request failures retain their original status and code. This counter includes
 execution errors and alone does not establish SQLite corruption. During an upgrade from an affected older node,
 that older node's own takeovers still have its old recovery behavior; use the maintenance procedure in

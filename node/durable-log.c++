@@ -1158,10 +1158,6 @@ kj::Promise<void> DurableLog::start() {
       if (!markCrossedBoot(epoch)) co_return;
       info.complete = false;
     }
-    for (auto& [name, object] : objects) {
-      markRepair(object, "the object cache crossed a machine boot");
-      if (recoveryWriteFailed) co_return;
-    }
     uint64_t removed = 0;
     for (const auto& entry : std::filesystem::directory_iterator(durableDirectory(), code)) {
       std::filesystem::remove_all(entry.path(), code);
@@ -1368,8 +1364,8 @@ kj::Promise<void> DurableLog::readOwnLog() {
       earlier[epoch] = std::move(unsealed);
     }
   }
-  // Recover logged positions independently of the cached positions. Admission
-  // must check both before any files are handed to a durable process.
+  // Keep ownership identity for classifying and resealing predecessor records.
+  // Local database images are discarded at startup and rebuilt on first open.
   for (auto& [key, position] : positions) {
     const auto name = position.objectName + "/" + std::to_string(position.dataEpoch);
     auto reference = parseDurableHostName(name);
@@ -1382,27 +1378,11 @@ kj::Promise<void> DurableLog::readOwnLog() {
     object.storageId = position.storageId;
     object.shard = position.shard;
     object.shardEpoch = std::max(object.shardEpoch, position.shardEpoch);
-    object.state = ObjectState::LOCAL;
-    object.healPending = true;
-    auto& facet = object.facets[position.facetId];
-    facet.facetId = position.facetId;
-    facet.parentFacetId = position.parentFacetId;
-    facet.facetName = position.facetName;
-    facet.generation = position.generation;
-    facet.salt1 = position.salt1;
-    facet.salt2 = position.salt2;
-    facet.txn = position.txn;
-    facet.deleted = position.deleted;
-    facet.lastFrame = position.lastFrame;
-    // The live seal cursor belongs to this node epoch. Preserve the old
-    // sequence separately for checkpoint/cache admission; it must not pin a
-    // fully published predecessor's cold files against the new epoch's zero.
-    facet.lastSeq = position.nodeEpoch == nodeEpoch ? position.nodeSeq : 0;
-    facet.loggedNodeEpoch = position.nodeEpoch;facet.loggedSeq = position.nodeSeq;
-    facet.loggedGeneration = position.generation;facet.loggedSalt1 = position.salt1;facet.loggedSalt2 = position.salt2;
-    facet.loggedFrame = position.lastFrame;facet.loggedPageSize = position.pageSize;
     object.positionNodeEpoch = std::max(object.positionNodeEpoch, position.nodeEpoch);
   }
+  for (auto& [name, object] : objects)
+    if (auto state = recoveryStates.find(name); state != recoveryStates.end() && state->second.repairPending)
+      object.repairGeneration = state->second.repair;
   log("log-read", "\"files\":" + std::to_string(files.size()) + ",\"fileNames\":" + fileNames +
           "],\"records\":" + std::to_string(read) +
           ",\"unsealed\":" + std::to_string(kept) + ",\"objects\":" + std::to_string(objects.size()) +
@@ -5797,7 +5777,6 @@ void DurableLog::readPositions() {
   for (const auto& entry : std::filesystem::directory_iterator(durableDirectory(), code)) {
     if (entry.path().extension() != ".position") continue;
     std::string bytes;
-    Object* reading = nullptr;
     try {
       bytes = readFile(entry.path());
     } catch (const kj::Exception&) {
@@ -5813,99 +5792,42 @@ void DurableLog::readPositions() {
       const auto objectId = json::text(reader, "objectId");
       if (objectName.empty() || namespaceId.size() != 64 || objectId.size() != 64) continue;
       auto& object = objects[objectName];
-      reading = &object;
-      object.positionRead = false;
-      // Logged positions take precedence over runtime WAL positions. Keep both
-      // until checkpoint coverage and the open marker have been checked.
+      // Positions retain identity and pre-open usage, never a reusable image.
       object.objectName = objectName;
       object.namespaceId = namespaceId;
       object.objectId = objectId;
       object.tenant = json::text(reader, "tenant");
       object.dataEpoch = decimal(json::text(reader, "dataEpoch"));
       object.shardEpoch = std::max(object.shardEpoch, decimal(json::text(reader, "shardEpoch")));
-      object.cacheShardEpoch = decimal(json::text(reader, "shardEpoch"));
       object.shard = uint32_t(numberField(reader, "shard"));
       object.storageId = durableHostId(settings.hostUniqueKey, objectName);
-      object.snapshotSequence = decimal(json::text(reader, "snapshotSequence"));
-      object.snapshotAtUnixMs = uint64_t(numberField(reader, "snapshotAtUnixMs"));
-      object.sinceSnapshotBytes = decimal(json::text(reader, "sinceSnapshotBytes"));
       object.bytes = decimal(json::text(reader, "bytes"));
-      const auto positionEpoch = json::integer(reader, "positionNodeEpoch");
-      if (positionEpoch) object.positionNodeEpoch = positionEpoch;
-      const auto source = recoveryEpochs.find(object.positionNodeEpoch);
-      const bool modern = source != recoveryEpochs.end() && source->second.modern;
-      if (modern) {
-        KJ_REQUIRE(json::field(reader, "cacheOpen").isBoolean() &&
-            json::field(reader, "openEpoch").isString() && json::field(reader, "openGeneration").isString(),
-            "a modern cache position is missing its open-generation fields");
-      }
-      object.cacheOpen = json::boolean(reader, "cacheOpen");
-      object.openEpoch = json::integer(reader, "openEpoch");
-      object.openGeneration = json::integer(reader, "openGeneration");
-      object.imageRepairGeneration = {json::integer(reader, "imageRepairEpoch"), json::integer(reader, "imageRepairSerial")};
-      object.recoveryPublished = json::boolean(reader, "recoveryPublished");
-      object.state = ObjectState::LOCAL;
-      object.healPending = true;
-      auto facetList = json::field(reader, "facets");
-      KJ_REQUIRE(facetList.isArray(), "the cache position has no facet list");
-      for (auto facet : facetList.getArray()) {
-        const auto facetId = uint32_t(numberField(facet, "facetId"));
-        auto& held = object.facets[facetId];
-        const bool seen = held.loggedNodeEpoch != 0;
-        held.facetId = facetId;
-        held.parentFacetId = uint32_t(numberField(facet, "parentFacetId"));
-        held.facetName = json::text(facet, "facetName");
-        held.databaseBytes = decimal(json::text(facet, "databaseBytes"));
-        held.deleted = held.deleted || json::boolean(facet, "deleted");
-        held.checkpointedSeq = decimal(json::text(facet, "checkpointedSeq"));
-        held.checkpointGeneration = json::integer(facet, "checkpointGeneration");
-        held.checkpointFrames = uint32_t(numberField(facet, "checkpointFrames"));
-        held.checkpointSalt1 = uint32_t(numberField(facet, "checkpointSalt1"));
-        held.checkpointSalt2 = uint32_t(numberField(facet, "checkpointSalt2"));
-        const auto positionGeneration = decimal(json::text(facet, "generation"));
-        const auto positionFrame = uint32_t(numberField(facet, "lastFrame"));
-        held.loggedCheckpointCovered = positionFrame == 0 && (!seen || (modern
-              ? held.checkpointGeneration == held.loggedGeneration && held.checkpointSalt1 == held.loggedSalt1 &&
-                  held.checkpointSalt2 == held.loggedSalt2 && held.checkpointFrames >= held.loggedFrame
-              : positionGeneration == held.loggedGeneration && held.checkpointedSeq >= held.loggedSeq));
-        if (seen) continue;
-        held.txn = decimal(json::text(facet, "txn"));
-        held.generation = decimal(json::text(facet, "generation"));
-        held.lastSeq = positionEpoch == nodeEpoch ? decimal(json::text(facet, "lastSeq")) : 0;
-        held.checkpointedSeq = decimal(json::text(facet, "checkpointedSeq"));
-        held.lastFrame = uint32_t(numberField(facet, "lastFrame"));
-        held.salt1 = uint32_t(numberField(facet, "salt1"));
-        held.salt2 = uint32_t(numberField(facet, "salt2"));
-        // A closed-epoch summary deliberately omits individual WAL positions.
-        // Preserve the cache's position for checking a surviving WAL before
-        // truncation; never interpret missing logged metadata as zero frames.
-        if (positionFrame && !held.deleted) {
-          const int fd = ::open(databasePath(object.storageId, facetId, "-wal").c_str(), O_RDONLY | O_CLOEXEC);
-          unsigned char header[32];ssize_t n = -1;
-          if (fd >= 0) {
-            do { n = ::pread(fd, header, sizeof(header), 0); } while (n < 0 && errno == EINTR);
-            ::close(fd);
-          }
-          const uint32_t page = n == sizeof(header) ? beU32(header + 8) : 0;
-          if (page < 512 || page > 65536 || (page & (page - 1)) || beU32(header + 16) != held.salt1 ||
-              beU32(header + 20) != held.salt2) { object.cacheInvalid = true;continue; }
-          held.loggedGeneration = held.generation;held.loggedSalt1 = held.salt1;held.loggedSalt2 = held.salt2;
-          held.loggedFrame = positionFrame;held.loggedPageSize = page;
-        }
-      }
-      object.positionRead = true;
+      if (auto state = recoveryStates.find(objectName); state != recoveryStates.end() && state->second.repairPending)
+        object.repairGeneration = state->second.repair;
       ++restored;
     } catch (const kj::Exception&) {
-      if (reading != nullptr) {
-        reading->positionRead = false;
-        reading->cacheInvalid = true;
-      }
       continue;
     }
   }
-  admitPositions();
-  positionsReused += restored;
-  if (restored) log("positions-reused", "\"objects\":" + std::to_string(restored));
+  if (restored) log("positions-read", "\"objects\":" + std::to_string(restored));
+  uint64_t removed = 0;
+  for (std::filesystem::directory_iterator entry(durableDirectory(), code), end;
+      !code && entry != end; entry.increment(code)) {
+    if (entry->path().filename().string().ends_with(".position")) continue;
+    std::error_code removal;
+    std::filesystem::remove_all(entry->path(), removal);
+    if (removal) {
+      ++startupCleanupFailures;
+      log("cache-cleanup-failed", "\"file\":" + quote(entry->path().filename().string()) +
+          ",\"reason\":" + quote(removal.message()));
+    } else ++removed;
+  }
+  if (code) {
+    ++startupCleanupFailures;
+    log("cache-cleanup-failed", "\"reason\":" + quote(code.message()));
+  }
+  filesDropped += removed;
+  if (removed) log("cache-dropped", "\"reason\":\"rebuild on first open after restart\",\"entries\":" + std::to_string(removed));
 }
 
 void DurableLog::admitPositions() {
