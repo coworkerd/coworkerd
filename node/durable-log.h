@@ -806,6 +806,15 @@ private:
   std::map<std::pair<std::string, std::string>, ManifestGate> manifestGates;
   bool healingManifest(const Object& object) const;
 
+  // Rebuild slots must outlive the coroutine guards in rebuilding.
+  uint32_t activeRebuilds = 0;
+  struct RebuildWaiter {
+    kj::Own<kj::PromiseFulfiller<void>> ready;
+    bool* acquired = nullptr;  // Valid while ready has a waiting observer.
+  };
+  // KJ exposes the observer check isWaiting() through a non-const interface.
+  mutable std::deque<RebuildWaiter> rebuildWaiters;
+
   // The promises' cancellation callbacks use the gate and settled maps: both
   // must outlive the last pending operation during process shutdown.
   std::set<std::string> settledRebuilds;

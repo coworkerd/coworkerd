@@ -331,7 +331,15 @@ and never reads the previous owner's files.
   `do/<namespace>/objects/<object>/snapshot/<sequence>/`, writes the index last, and then the manifest that names it.
   The first snapshot requires the size threshold; elapsed time alone does not create it.
   The segments the snapshot covers leave the manifest; the stored segments and snapshots themselves are retained.
-- **Rebuilding an object.** The first request waits while the node reads the latest manifest, verifies and downloads
+- **Rebuilding an object.** Each node runs at most `durableObjects.rebuildConcurrency` rebuilds at once
+  (default 4, range 1–64). Additional objects wait in FIFO order, and requests for the same object join its existing
+  rebuild. `durableLog.objects.activeRebuilds` counts running rebuilds; `queuedRebuilds` counts live waiters.
+  Queue time counts toward `recoverTimeoutMs`: a request can receive `DO_RECOVERING` while its background rebuild
+  remains queued or running. A rebuild keeps its slot through manifest retries and returns it on success, failure
+  or cancellation. Waiting objects retain their current state until their rebuild starts, using the ownership
+  epoch current when they acquire a slot.
+
+  The first request waits while the node reads the latest manifest, verifies and downloads
   its snapshot, and replays its segments. It also collects unsealed records from its own peer buffer, its own log,
   and the owners and possible holders of every source shard epoch after the snapshot cut. Retained member addresses
   can be used even when a lease has expired. Each source is paged to completion; a failed, refused or invalid answer
@@ -439,7 +447,7 @@ and never reads the previous owner's files.
   Legacy cache admission, HOLD and snapshot-healing code remains present but startup no longer activates it.
   Each object's first request reads the store and replays its history; a large object can take seconds to tens
   of seconds. If the store is unreachable, objects on a restarted node return 503 until it recovers. Many first
-  opens can rebuild concurrently after restart; limiting that concurrency is separate work.
+  opens share the node-wide rebuild limit above; additional objects wait in its FIFO queue.
 - **A node id has one location.** Run a node id in only one place at a time. When moving it to another
   machine, confirm that the old machine's node processes stopped before reusing it. Missing heartbeats or
   expired registrations do not prove that the old machine has stopped.

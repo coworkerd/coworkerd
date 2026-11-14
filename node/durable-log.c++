@@ -3776,6 +3776,29 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
 // when it is repairing an object of its own). The previous owner's files are never read.
 kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason) {
   const auto done = kj::defer([this, objectName]() { settledRebuilds.insert(objectName); });
+  bool active = false;
+  const auto release = kj::defer([&]() {
+    if (!active) return;
+    --activeRebuilds;
+    while (!rebuildWaiters.empty()) {
+      auto next = kj::mv(rebuildWaiters.front());
+      rebuildWaiters.pop_front();
+      if (!next.ready->isWaiting()) continue;
+      ++activeRebuilds;
+      // Reserve before waking so cancellation before resumption returns the slot.
+      *next.acquired = true;
+      next.ready->fulfill();
+      break;
+    }
+  });
+  if (activeRebuilds >= std::max<uint32_t>(1, settings.config.rebuildConcurrency)) {
+    auto available = kj::newPromiseAndFulfiller<void>();
+    rebuildWaiters.push_back({kj::mv(available.fulfiller), &active});
+    co_await kj::mv(available.promise);
+  } else {
+    ++activeRebuilds;
+  }
+  active = true;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
   const auto targetEpoch = object->shardEpoch, targetDataEpoch = object->dataEpoch;
@@ -6416,6 +6439,8 @@ std::string DurableLog::json() const {
     ++unconfirmed;
     unconfirmedBytes += flight.bytes;
   }
+  uint32_t queuedRebuilds = 0;
+  for (auto& waiter : rebuildWaiters) if (waiter.ready->isWaiting()) ++queuedRebuilds;
   uint32_t local = 0, rebuildingNow = 0, repairing = 0, pendingHeals = 0, currentHealErrors = 0, heldCaches = 0, openCaches = 0;
   uint64_t activeRequests = 0, activeConnections = 0;
   for (const auto& [name, object] : objects) {
@@ -6480,6 +6505,7 @@ std::string DurableLog::json() const {
       << snapshotBytesWritten << "\",\"failures\":" << snapshotFailures << "},\"checkpoints\":{\"done\":"
       << checkpoints << ",\"asked\":" << checkpointAsks << "},\"objects\":{\"known\":" << objects.size()
       << ",\"local\":" << local << ",\"rebuilding\":" << rebuildingNow << ",\"repairing\":" << repairing
+      << ",\"activeRebuilds\":" << activeRebuilds << ",\"queuedRebuilds\":" << queuedRebuilds
       << ",\"hold\":" << heldCaches << ",\"openCache\":" << openCaches
       << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
@@ -6609,7 +6635,8 @@ std::string DurableLog::json() const {
       << ",\"segmentBytes\":\"" << settings.config.segmentBytes << "\",\"snapshotBytes\":\""
       << settings.config.snapshotBytes << "\",\"objectBytes\":\"" << settings.config.objectBytes
       << "\",\"checkpointBytes\":\"" << settings.config.checkpointBytes << "\",\"recoverParallelism\":"
-      << settings.config.recoverParallelism << ",\"residentObjects\":" << settings.config.residentObjects
+      << settings.config.recoverParallelism << ",\"rebuildConcurrency\":" << settings.config.rebuildConcurrency
+      << ",\"residentObjects\":" << settings.config.residentObjects
       << ",\"usagePublishMs\":" << settings.config.usagePublishMs << "}}";
   return out.str();
 }

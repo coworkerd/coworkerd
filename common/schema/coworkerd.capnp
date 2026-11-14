@@ -364,6 +364,8 @@ struct ServerConfig {
     residentObjects @17 :UInt32 = 4096;
     # How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
     usagePublishMs @18 :UInt32 = 3600000;
+    # How many objects this node rebuilds at once; additional objects wait in FIFO order.
+    rebuildConcurrency @19 :UInt32 = 4;
   }
 
   struct IngressConfig {
