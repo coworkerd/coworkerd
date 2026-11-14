@@ -8396,13 +8396,6 @@ int run(Launch launch) {
   durableLog.setOwnerFenceHook([&shards](const std::string& namespaceId, uint32_t shard, uint64_t through) {
     shards.fenceOwner(namespaceId, shard, through);
   });
-  durableLog.setHealOwnershipHook([&shards](coworkerd::DurableLog::ObjectIdentity identity)
-      -> kj::Promise<std::optional<uint64_t>> {
-    auto route = co_await shards.route(identity.namespaceId, identity.shard);
-    if (route.kind != coworkerd::ShardRoute::Kind::LOCAL || route.dataEpoch != identity.dataEpoch)
-      co_return std::nullopt;
-    co_return route.epoch;
-  });
   runtime.setDurableChannel([&durableLog](const std::string& processId) { return durableLog.openChannel(processId); },
       [&durableLog](const std::string& processId) { durableLog.closeChannel(processId); },
       server.placementConfig().durableLog);

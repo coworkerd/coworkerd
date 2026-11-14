@@ -393,9 +393,6 @@ public:
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
     hooks.fetchTailAt = std::move(hook);
   }
-  void setHealOwnershipHook(std::function<kj::Promise<std::optional<uint64_t>>(ObjectIdentity)> hook) {
-    healOwnership = std::move(hook);
-  }
   void objectFailed(const std::string& namespaceId, const std::string& objectId, uint64_t shardEpoch,
       const std::string& step, const std::string& reason);
 
@@ -450,15 +447,13 @@ private:
     bool manifestDirty = false;
     std::string repairReason;
     std::pair<uint64_t, uint64_t> repairGeneration, rebuildGeneration, imageRepairGeneration;
-    uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0, cacheShardEpoch = 0;
+    uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0;
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
     struct Holders { uint64_t requests = 0, connections = 0; };
     std::map<std::string, Holders> holders;
     bool dispatchPending = false;
-    bool cacheOpen = false, positionRead = false, recoveryPublished = false, healingInProgress = false;
-    bool cacheInvalid = false, cacheHold = false;
-    bool cacheAdmissionPending = false;
+    bool cacheOpen = false, recoveryPublished = false;
     uint64_t rebuilds = 0, repairs = 0;
     double lastRebuildMs = 0;
     // Request timeouts and storage retries share one tail deadline at this ownership epoch.
@@ -473,9 +468,6 @@ private:
     std::set<std::string> recoveryUnknownKeys;
     bool recoveryDiscoveryCompleted = false;
     std::map<uint64_t, std::pair<std::string, uint64_t>> recoveryEpochReads;
-    // Startup's trusted cache is checked before any workerd opens these files.
-    bool healPending = false, healRequested = false, healError = false;
-    double healRetryAfterMs = 0;
     // What each of its databases holds as its alarm (0: none), as the durable process reports it.
     std::map<uint32_t, uint64_t> alarms;
   };
@@ -672,9 +664,7 @@ private:
   std::filesystem::path positionPath(const std::string& storageId) const;
   bool writePosition(const Object& object);
   void readPositions();
-  void admitPositions();
   std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
-  kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
   bool channelHasOpenObject(const Channel& channel, const Object& object) const;
   bool hasLiveHolders(const Object& object) const;
@@ -707,8 +697,6 @@ private:
   kj::Promise<void> publishRecovery(std::string objectName, const std::vector<LogRecord>& records);
   kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false);
   kj::Promise<void> healLoop();
-  kj::Promise<void> healObject(std::string objectName);
-  kj::Promise<void> materializeTrustedWal(std::string objectName, uint64_t shardEpoch);
   kj::Promise<void> retireFencedTails(Object& object, const ObjectManifest& manifest);
   std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& storageId,
       std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
@@ -722,7 +710,6 @@ private:
   kj::LowLevelAsyncIoProvider& lowLevel;
   const MembershipView& membership;
   Hooks hooks;
-  std::function<kj::Promise<std::optional<uint64_t>>(ObjectIdentity)> healOwnership;
 
   uint64_t nodeEpoch = 0;
   uint64_t nextSeq = 0;             // the node sequence of the next record
@@ -832,14 +819,12 @@ private:
   uint64_t restoredUnaccountedRecords = 0, restoredUnaccountedBytes = 0;
   uint64_t restoredEmptyAnswers = 0, restoredLogUnavailableAnswers = 0, localLogEmptyClosures = 0;
   uint64_t ownerLogUnavailableRecoveries = 0;
-  uint64_t healSnapshots = 0, healFailures = 0, healedWalFrames = 0, objectFailures = 0;
-  bool healBusy = false;
-  uint32_t requestedHealWaiters = 0;
+  uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
-  uint64_t positionsReused = 0, positionWrites = 0, quotaRefusals = 0;
+  uint64_t positionWrites = 0, quotaRefusals = 0;
   bool sealing = false, noPeerWarned = false;
   bool sealingForRecovery = false;
   uint32_t recoveryPublishWaiters = 0;
