@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Replay and synchronize a rebuilt Durable Object image in staging before replacing local files, preserving them when recovery fails before replacement begins.
 - Look up a Durable Object's open registrations on a process channel by key prefix instead of scanning the whole table; with 8,000 registrations a dispatch check takes about 1/187 of the time. No behavior change.
 - Count, per Durable Object and durable process generation, the requests in flight and the live WebSocket connections. An object with either is not evicted at `durableObjects.diskBytes`, which now also protects objects left with hibernating WebSockets only, and a rebuild of such an object resets the durable processes first. `durableLog.objects.activeRequests` and `activeConnections` report the totals.
 - Re-check a Durable Object against the selected durable process generation right before a request is dispatched. A request whose object left the local state, lost its shard, or is still held by another generation while it waited is refused with `503 DO_RECOVERING`, `409 DO_SHARD_EPOCH_MISMATCH` or `503 DO_UNAVAILABLE` instead of being sent to a process that would open stale files; when nobody holds the object its WAL is cut back again before the dispatch. Refusals are logged as `[do-dispatch-refused]`.
