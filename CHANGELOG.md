@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.5.5 (unreleased)
+## 0.5.5 (2026-11-14)
+
+- Validation (run v111 on the released assets, 2026-11-14): both architectures passed 30 package-content checks, eight delivery-feature checks and all 57 quickstart commands; on amd64, 31 Compose operations with a fourth node added while running passed; on arm64, concurrent opening of cold objects on three nodes (simultaneous and staggered arrivals) read back every acknowledged write and never cut a WAL while a process held it. The node code is commit `b8ce5f85` (25 core rows, 52 component checks and the checks of the two fixes made after the first candidate); the 36 short regression cells of the 0.5.5 development rounds ran on the first candidate `864b1ce5`, which was withdrawn before publication. The kernel and both system call tables are byte-identical to 0.5.4. The coordinated upgrades from 0.5.3 and 0.5.4 were exercised on the first candidate only. No full regression or 12-hour run was made for this release.
 
 - Wait for a live paused process within `processPool.pausedAdmissionWaitMs` (1000 ms by default; 0 disables it), reducing the transient single-process admission 503s in 0.5.3 and 0.5.4. Ready processes and other candidate nodes still take calls immediately. See [process admission](docs/cluster-state.md#7-placement).
 - Carry the paused-admission wait through remote placement while retaining lease checks and retries only after a known pre-execution refusal. See [placement](docs/guide/install.md#5-configuration-reference).

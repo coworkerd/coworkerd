@@ -21,17 +21,17 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: preparing 0.5.5
+## Status: 0.5.5 released
 
-0.5.5 updates the node daemon while retaining the workerd kernel and system call tables from the 0.5.4
-prerelease. It reduces paused-process admission failures, adds host first-touch diagnostics and suspect probation,
-and repairs takeover paths that could omit acknowledged Durable Object writes or later rebuild a corrupt database.
+[0.5.5](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.5) (2026-11-14) is the current stable release. It
+updates the node daemon while retaining the workerd kernel and system call tables from the 0.5.4 prerelease. It
+reduces paused-process admission failures, adds host first-touch diagnostics and suspect probation, and repairs
+takeover paths that could omit acknowledged Durable Object writes or later rebuild a corrupt database.
 Stateful upgrades from 0.5.3 or 0.5.4 require a coordinated maintenance window and backups; read the
 [upgrade procedure and known issues](docs/guide/install.md#upgrading-053-or-054-to-055).
-Further durability and resource fixes continue in 0.5.6.
-[0.5.3](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.3) remains the current stable release while
-0.5.5 is prepared. The 0.5.4 prerelease is superseded; deployments using DO or D1 should upgrade to 0.5.5
-rather than remain on 0.5.4. See the [CHANGELOG](CHANGELOG.md).
+Further durability and resource fixes continue on `main`. The 0.5.4 prerelease is superseded; deployments using
+DO or D1 should upgrade to 0.5.5 rather than remain on 0.5.4. The 0.5.3 assets remain published and unchanged.
+See the [CHANGELOG](CHANGELOG.md).
 
 0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
@@ -64,12 +64,12 @@ Boundaries to know about:
 ## Trying it
 
 With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a cluster, a tenant and a first deployed
-Worker from the current stable 0.5.3 release take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
+Worker from the current stable 0.5.5 release take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.5.3-linux-arm64.tar.gz
-docker load -i coworkerd-0.5.3-linux-arm64-image.tar.gz
-cd coworkerd-0.5.3-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.5.5-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.5-linux-arm64-image.tar.gz
+cd coworkerd-0.5.5-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 
