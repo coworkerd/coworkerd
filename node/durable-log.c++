@@ -3568,6 +3568,7 @@ kj::Promise<void> DurableLog::dropColdFiles() {
 
 DurableLog::ObjectReady DurableLog::checkObjectDispatch(
     const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  if (!enabled()) return {};
   if ((startupAttempted && !startupReady) || recoveryWriteFailed)
     return {false, 503, "STORAGE_UNAVAILABLE", "the node's recovery log is not ready"};
   auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch));
@@ -3581,10 +3582,8 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
     if (!channel.open || id == target) continue;
     if (object->dispatchedChannel == id)
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
-    for (const auto& [key, opened] : channel.openFacets)
-      if (key.starts_with(object->objectName + "/") &&
-          opened == std::make_pair(object->openEpoch, object->openGeneration))
-        return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
+    if (channelHasOpenObject(channel, *object))
+      return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
   }
   if (auto error = prepareOpen(*object, &target))
     return {false, 503, "STORAGE_UNAVAILABLE", *error};
@@ -5616,13 +5615,18 @@ bool DurableLog::writePosition(const Object& object) {
   return true;
 }
 
+bool DurableLog::channelHasOpenObject(const Channel& channel, const Object& object) const {
+  const auto prefix = object.objectName + "/";
+  const auto generation = std::make_pair(object.openEpoch, object.openGeneration);
+  for (auto it = channel.openFacets.lower_bound(prefix);
+      it != channel.openFacets.end() && it->first.starts_with(prefix); ++it)
+    if (it->second == generation) return true;
+  return false;
+}
+
 bool DurableLog::hasLiveOpenFacets(const Object& object) const {
-  for (const auto& [id, channel] : channels) {
-    if (!channel.open) continue;
-    for (const auto& [key, generation] : channel.openFacets)
-      if (key.starts_with(object.objectName + "/") &&
-          generation == std::make_pair(object.openEpoch, object.openGeneration)) return true;
-  }
+  for (const auto& [id, channel] : channels)
+    if (channel.open && channelHasOpenObject(channel, object)) return true;
   return false;
 }
 
@@ -5645,10 +5649,7 @@ std::optional<std::string> DurableLog::prepareOpen(Object& object, const std::st
   const bool live = targetChannel == nullptr ? hasLiveOpenFacets(object) : [&]() {
     const auto channel = channels.find(*targetChannel);
     if (channel == channels.end() || !channel->second.open) return false;
-    for (const auto& [key, opened] : channel->second.openFacets)
-      if (key.starts_with(object.objectName + "/") &&
-          opened == std::make_pair(object.openEpoch, object.openGeneration)) return true;
-    return false;
+    return channelHasOpenObject(channel->second, object);
   }();
   if (live) {
     if (targetChannel != nullptr && !object.cacheOpen) {

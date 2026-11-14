@@ -675,6 +675,7 @@ private:
   std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
   kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
+  bool channelHasOpenObject(const Channel& channel, const Object& object) const;
   bool hasLiveHolders(const Object& object) const;
   void finishObjectHolder(const ObjectIdentity& identity, const std::string& processId, uint64_t generation, bool connection);
   bool hasLiveDispatch(const Object& object) const;
