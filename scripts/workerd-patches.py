@@ -21,6 +21,10 @@ RPC_CODE_PATHS = frozenset({
     "src/workerd/jsg/util.c++", "src/workerd/jsg/BUILD.bazel",
     "src/workerd/jsg/coworkerd-rpc-code.h", "src/workerd/jsg/coworkerd-rpc-code.c++",
 })
+SQLITE_CTE_PATCH = "0019-sqlite-cte-backout.patch"
+SQLITE_CTE_PATHS = frozenset({
+    "MODULE.bazel", "patches/sqlite/0006-cte-nesting-depth.patch",
+})
 STARTUP_IDENTITY_PATCH = "0005-memory-limit.patch"
 STARTUP_IDENTITY_PATHS = frozenset({
     "src/workerd/api/worker-loader.c++", "src/workerd/io/io-channels.h",
@@ -89,7 +93,8 @@ def allowed_path(name, path):
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
-                          name == RPC_CODE_PATCH and path in RPC_CODE_PATHS)
+                          name == RPC_CODE_PATCH and path in RPC_CODE_PATHS or
+                          name == SQLITE_CTE_PATCH and path in SQLITE_CTE_PATHS)
 
 def validate_patch(checkout, name, data):
     """Validate Git's parsed paths and literal headers before any checkout mutation."""

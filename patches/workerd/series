@@ -15,3 +15,4 @@
 0018-idle-collector-lifecycle-gc.patch
 0013-durable-object-log.patch
 0014-durable-object-hibernation-alarms.patch
+0019-sqlite-cte-backout.patch

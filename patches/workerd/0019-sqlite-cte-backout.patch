@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jeff Wendling <jwendling@cloudflare.com>
+Date: Tue, 10 Nov 2026 15:23:40 -0500
+Subject: [PATCH] Back out SQLite CTE regression in 3.54.1
+
+SQLite 3.54.1 compares the cursor count against the expression-depth
+limit while resolving CTEs, causing shallow queries to fail when they
+have many references. Backport SQLite's upstream backout, retaining the
+actual nesting-depth limit.
+
+Applies https://sqlite.org/src/info/845190e3f2
+
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 66d19b584f05a54c2f5b9a59df9d8bbec5962617..acaa8ffe42dfa65bdb6636c9164a1cc89f282a41 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -17,6 +17,7 @@ archive_override(
+         "//:patches/sqlite/0003-sqlite-complete-early-exit.patch",
+         "//:patches/sqlite/0004-authorizer-rename-to-destination-name.patch",
+         "//:patches/sqlite/0005-legacy-subquery-subtypes.patch",
++        "//:patches/sqlite/0006-cte-nesting-depth.patch",
+     ],
+     remote_file_integrity = {
+         "MODULE.bazel": "sha256-y8b6x7BNbvOuFQxzh1vbyJ/1F/RP67Ho3gJUJU3wZeE=",
+diff --git a/patches/sqlite/0006-cte-nesting-depth.patch b/patches/sqlite/0006-cte-nesting-depth.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c7f89a852c5b85c682f6c960e4800dcc9ec5246
+--- /dev/null
++++ b/patches/sqlite/0006-cte-nesting-depth.patch
+@@ -0,0 +1,24 @@
++--- sqlite-src-pristine/src/select.c
+++++ sqlite-src-modified/src/select.c
++@@ -5902,12 +5902,4 @@
++ #if SQLITE_MAX_EXPR_DEPTH>0
++-    if( pParse->nTab>=db->aLimit[SQLITE_LIMIT_EXPR_DEPTH] ){
++-      /* Bug 2026-10-04T05:35:14Z: Prevent nested CTEs from generating
++-      ** an exponential number of cursors.  The error message here will
++-      ** be "Nested too deep", which isn't exactly correct, but it is
++-      ** sufficient, and we don't want to use extra code space for more
++-      ** detail on such an obscure error. */
++-      pParse->nNestSel = pParse->nTab;
++-    }
++     pParse->nNestSel++;
++     if( checkSubqueryNestingDepth(pParse) ) return 2;
++ #endif
++--- sqlite-src-pristine/test/with1.test
+++++ sqlite-src-modified/test/with1.test
++@@ -1090,5 +1090,5 @@
++        SELECT 3 FROM c,c,c,c,c,c,c,c,c
++     )
++     SELECT 4 FROM c,c,c,c,c,c,c,c,c;
++-  } {1 {VIEWs and/or subqueries nested too deep}}
+++  } {1 {too many FROM clause terms, max: 200}}
++ }
