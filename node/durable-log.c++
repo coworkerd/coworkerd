@@ -3532,7 +3532,7 @@ kj::Promise<void> DurableLog::dropColdFiles() {
     if (total <= diskLimitBytes) break;
     auto* object = objectOf(name);
     if (object == nullptr) continue;
-    if (hasLiveOpenFacets(*object)) {
+    if (hasLiveOpenFacets(*object) || hasLiveHolders(*object)) {
       ++coldFilesSkippedLive;
       continue;
     }
@@ -3594,9 +3594,34 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
 void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
   if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch))) {
     object->lastAccessMs = monotonicTimeMs();
+    ++object->holders[processId + "-" + std::to_string(generation)].requests;
     object->dispatchedChannel = processId + "-" + std::to_string(generation);
     if (!hasLiveOpenFacets(*object)) object->dispatchPending = true;
   }
+}
+
+void DurableLog::objectRequestFinished(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  finishObjectHolder(identity, processId, generation, false);
+}
+
+void DurableLog::objectConnectionOpened(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch)))
+    ++object->holders[processId + "-" + std::to_string(generation)].connections;
+}
+
+void DurableLog::objectConnectionClosed(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+  finishObjectHolder(identity, processId, generation, true);
+}
+
+void DurableLog::finishObjectHolder(
+    const ObjectIdentity& identity, const std::string& processId, uint64_t generation, bool connection) {
+  auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch));
+  if (object == nullptr) return;
+  auto holder = object->holders.find(processId + "-" + std::to_string(generation));
+  if (holder == object->holders.end()) return;
+  auto& count = connection ? holder->second.connections : holder->second.requests;
+  if (count != 0) --count;
+  if (holder->second.requests == 0 && holder->second.connections == 0) object->holders.erase(holder);
 }
 
 kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity) {
@@ -3817,7 +3842,8 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     if (repair) KJ_REQUIRE(beginRepair(*object), "the repair exclusion could not be made durable");
     isolateObjectPending(*object, "pending records cannot outlive the image used by recovery");
     KJ_REQUIRE(!recoveryWriteFailed, "pending exclusions could not be made durable");
-    const bool closeLive = hasLiveOpenFacets(*object) || (hasLiveDispatch(*object) && object->dispatchPending);
+    const bool closeLive = hasLiveOpenFacets(*object) || (hasLiveDispatch(*object) && object->dispatchPending) ||
+        hasLiveHolders(*object);
     object->rebuildGeneration = {nodeEpoch, ++recoverySerial};
     KJ_REQUIRE(appendRecovery({recoveryEvent(RecoveryKind::REBUILD_BEGIN, *object, object->rebuildGeneration)}, false),
         "the rebuild begin marker could not be written");
@@ -5600,6 +5626,15 @@ bool DurableLog::hasLiveOpenFacets(const Object& object) const {
   return false;
 }
 
+bool DurableLog::hasLiveHolders(const Object& object) const {
+  for (const auto& [id, holder] : object.holders) {
+    const auto channel = channels.find(id);
+    if ((holder.requests != 0 || holder.connections != 0) && channel != channels.end() && channel->second.open)
+      return true;
+  }
+  return false;
+}
+
 bool DurableLog::hasLiveDispatch(const Object& object) const {
   const auto channel = channels.find(object.dispatchedChannel);
   return channel != channels.end() && channel->second.open;
@@ -6419,7 +6454,15 @@ std::string DurableLog::json() const {
     unconfirmedBytes += flight.bytes;
   }
   uint32_t local = 0, rebuildingNow = 0, repairing = 0, pendingHeals = 0, currentHealErrors = 0, heldCaches = 0, openCaches = 0;
+  uint64_t activeRequests = 0, activeConnections = 0;
   for (const auto& [name, object] : objects) {
+    for (const auto& [id, holder] : object.holders) {
+      const auto channel = channels.find(id);
+      if (channel != channels.end() && channel->second.open) {
+        activeRequests += holder.requests;
+        activeConnections += holder.connections;
+      }
+    }
     if (object.cacheHold) ++heldCaches;
     if (object.cacheOpen) ++openCaches;
     if (object.healPending) ++pendingHeals;
@@ -6475,6 +6518,7 @@ std::string DurableLog::json() const {
       << checkpoints << ",\"asked\":" << checkpointAsks << "},\"objects\":{\"known\":" << objects.size()
       << ",\"local\":" << local << ",\"rebuilding\":" << rebuildingNow << ",\"repairing\":" << repairing
       << ",\"hold\":" << heldCaches << ",\"openCache\":" << openCaches
+      << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
       << ",\"recoverTimeouts\":" << recoverTimeouts << ",\"lastRebuildMs\":" << lastRebuildMs << ",\"lastError\":"
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"

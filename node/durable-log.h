@@ -357,6 +357,9 @@ public:
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
+  void objectRequestFinished(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
+  void objectConnectionOpened(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
+  void objectConnectionClosed(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // The shard is this node's no longer (released, lost or dropped): its objects' records stop going out.
   void shardGone(const std::string& namespaceId, uint32_t shard, const std::string& reason);
   // This node has taken the shard: the alarm hints of its objects are read, so the alarms the node before it had
@@ -449,6 +452,8 @@ private:
     uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0, cacheShardEpoch = 0;
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
+    struct Holders { uint64_t requests = 0, connections = 0; };
+    std::map<std::string, Holders> holders;
     bool dispatchPending = false;
     bool cacheOpen = false, positionRead = false, recoveryPublished = false, healingInProgress = false;
     bool cacheInvalid = false, cacheHold = false;
@@ -670,6 +675,8 @@ private:
   std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
   kj::Promise<void> admitLegacyCache(std::string objectName);
   bool hasLiveOpenFacets(const Object& object) const;
+  bool hasLiveHolders(const Object& object) const;
+  void finishObjectHolder(const ObjectIdentity& identity, const std::string& processId, uint64_t generation, bool connection);
   bool hasLiveDispatch(const Object& object) const;
   void channelEnded(Channel& channel, const std::string& reason);
   void maybeCloseMarker(Object& object);

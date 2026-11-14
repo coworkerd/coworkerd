@@ -463,14 +463,18 @@ and never reads the previous owner's files.
   [Known issues in 0.5.5](guide/install.md#known-issues-in-055). They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
   are all in a segment, go when that is full. An object registered as open on a live durable-process channel is
-  skipped when its turn to evict arrives. Dispatching a request refreshes its last-access time, keeping it out of
+  skipped when its turn to evict arrives, as is an object with a request in flight or an open connection on a live
+  durable-process channel. Dispatching a request refreshes its last-access time, keeping it out of
   the cold candidates for 60 seconds even before the open notification arrives. A dispatched request that never
   opens the object does not prevent eviction after that interval, and a matching close removes the live-open
-  protection. `durableLog.disk.coldFilesSkippedLive` counts candidates skipped in the latest eviction pass; it
+  registration protection. `durableLog.disk.coldFilesSkippedLive` counts candidates skipped in the latest eviction pass; it
   resets to zero on every pass. While nonzero, `files-drop-live-skipped` logs the count at most once per minute.
   These objects can keep the node over budget until their connection or request ends. An object with only a
-  hibernating WebSocket has no live instance registered; its files can still be evicted and a later socket message
-  can wake it inside workerd without passing through the node. That case is not protected by this rule.
+  hibernating WebSocket remains protected while that connection's process generation has an open channel,
+  even after the instance's close notification removes its registration. `durableLog.objects.activeRequests`
+  and `activeConnections` total the requests in flight and open connections on live channels. A closed process
+  generation no longer contributes to these totals or protects files; its late completion callbacks only retire
+  its remaining counts. A JS RPC session retains its request count until the caller releases its stub.
   Reuse requires the same Linux boot; a clean drain does not grant
   reuse across boots because SQLite uses `synchronous=OFF`. Startup synchronizes `clean:false` before trusting
   or changing object files. Failure gates all DO service and retries without deleting caches. An untrusted
@@ -480,7 +484,9 @@ and never reads the previous owner's files.
   Only the last matching facet close, with logged checkpoint coverage and no pending repair, clears it. A stale
   close cannot clear a newer open. EOF or process closure invalidates every still-open object of that process;
   the next event rebuilds it. A rebuild resets durable processes only if the object has a live open facet or a
-  dispatched request whose `FROM_OPEN` has not yet been processed. A closed object's cold rebuild leaves
+  dispatched request whose `FROM_OPEN` has not yet been processed, or a request or connection still held on a
+  live channel. Rebuilding an object with a live connection first resets this node's durable processes and closes
+  their connections. A closed object's cold rebuild leaves
   otherwise live durable processes running. A request that already passed `openObject` is checked again after its
   durable generation is selected; if the object now needs recovery it is refused rather than sent to unreconstructed
   files.
@@ -493,8 +499,8 @@ and never reads the previous owner's files.
   reason. A matching live registration repairs a false open marker without changing its generation. A matching
   live dispatch marker preserves its WAL; without a live holder, WAL preparation runs again before dispatch.
   Preparation or marker-write failure refuses with 503 `STORAGE_UNAVAILABLE`. These refusals are returned
-  without retrying. This check does not cover an instance closing after dispatch: between its FROM_CLOSED
-  and subsequent FROM_OPEN, a concurrent rebuild can still miss that reopening instance.
+  without retrying. The request and connection counts also protect an instance reopening after dispatch:
+  between its FROM_CLOSED and subsequent FROM_OPEN, a rebuild still resets a process with a live holder.
 
   Each node epoch has a versioned `.recovery` sidecar even when empty. REPAIR_BEGIN and exclusions are
   synchronized before replacing files, publishing exclusions/SEAL or appending on the repaired image.

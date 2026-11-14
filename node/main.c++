@@ -436,6 +436,8 @@ struct AdmissionSlot {
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
   bool durable = false;
+  coworkerd::DurableLog::ObjectIdentity durableObject;
+  coworkerd::DurableLog* durableLog = nullptr;
   std::function<void(uint status, const std::string& code)> outcome;
   void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
@@ -3209,6 +3211,8 @@ public:
     this->tenant = coworkerd::tenantOf(this->identity.workerId);
   }
   ~WebSocketRelay() noexcept(false) {
+    if (durableLog != nullptr)
+      durableLog->objectConnectionClosed(durableObject, durableProcessId, durableGeneration);
     if (!started) return;
     // Ended from outside before its own end: the request it runs in was canceled -- at the executing node, because the
     // ingress side went away (its peer session broke).
@@ -3221,6 +3225,12 @@ public:
     if (hooks.ended) hooks.ended();
   }
   void setPlace(std::string processId, uint64_t generation) { this->processId = std::move(processId); this->generation = generation; }
+  void holdObject(coworkerd::DurableLog& log, coworkerd::DurableLog::ObjectIdentity object,
+      std::string processId, uint64_t generation) {
+    durableObject = std::move(object); durableProcessId = std::move(processId); durableGeneration = generation;
+    log.objectConnectionOpened(durableObject, durableProcessId, durableGeneration);
+    durableLog = &log;
+  }
   // Until both directions have ended -- each with its close frame, or one abruptly --, or the grace after the first
   // close ran out.
   kj::Promise<void> run() {
@@ -3424,6 +3434,10 @@ private:
   kj::Timer& timer;
   Identity identity;
   Hooks hooks;
+  coworkerd::DurableLog* durableLog = nullptr;
+  coworkerd::DurableLog::ObjectIdentity durableObject;
+  std::string durableProcessId;
+  uint64_t durableGeneration = 0;
   kj::Own<kj::WebSocket> outer, inner;
   Writer outerWriter, innerWriter;
   struct Errors final: public kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } errors;
@@ -3546,6 +3560,8 @@ public:
     relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::EXECUTION, std::move(identity),
         kj::mv(ingress), kj::mv(pipe.ends[1]), std::move(hooks));
     relay->setPlace(process->processId, process->generation);
+    if (slot->durable && slot->durableLog != nullptr)
+      relay->holdObject(*slot->durableLog, slot->durableObject, process->processId, process->generation);
     server.holdLease(invocation);
     // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
     // leave it; its request context stays open in workerd until the connection ends.
@@ -5849,6 +5865,9 @@ private:
     if (admitted.refused) co_return refused(*admitted.refused);
     auto slot = std::move(admitted.slot);
     slot->durable = true;
+    slot->durableObject = {target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+        target.dataEpoch, target.shardEpoch, target.shard};
+    slot->durableLog = &durableLog;
     slot->timing = request.timing;
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
@@ -5872,7 +5891,10 @@ private:
           target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
       server.objectBegin(target.key(), target.hops);
-      slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops]() {
+      slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops,
+          log = slot->durableLog, object = slot->durableObject, processId = slot->process->processId,
+          generation = slot->process->generation]() {
+        log->objectRequestFinished(object, processId, generation);
         previous();
         server.objectEnd(key, hops);
       };
