@@ -12,15 +12,16 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261108.1`), which is the tag plus one commit per patch.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261108.1`), which contains the ordered patch commits plus the v95 follow-up to 0010.
+  The b35 candidate branch is `coworkerd-v1.20261108.1-b35` until acceptance.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
-- **Thin patches.** Changes stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with one explicit
-  exception: `0015-rpc-invocation-identity.patch` may also change `src/workerd/api/worker-loader.h`,
+- **Thin patches.** Changes normally stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with explicit
+  exceptions: `0015-rpc-invocation-identity.patch` may also change `src/workerd/api/worker-loader.h`,
   `src/workerd/api/worker-loader.c++`, `src/workerd/io/io-channels.h`, and `src/workerd/io/io-channels.c++`.
   These hooks carry an owned invocation identity from the trusted platform loader to each dynamic entrypoint;
   they do not change request lifetimes or accept identity from tenant headers, props, or logs. The exception is
-  bound to that patch and those exact paths. Other patches remain limited to the server directory; IoContext,
+  bound to that patch and those exact paths. Outside the named path exceptions, patches remain limited to the server directory; IoContext,
   V8 and the general RPC protocol are outside this exception. A second explicit exception,
   `0016-rpc-code-parent-death.patch`, changes `src/workerd/jsg/util.c++` at one conversion hook and
   `src/workerd/jsg/BUILD.bazel` to build our `coworkerd-rpc-code.h` and `coworkerd-rpc-code.c++` helpers there.
@@ -44,7 +45,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ```sh
 git clone https://github.com/cloudflare/workerd.git workerd
 git -C workerd switch --detach "$(sed -n 's/^tag=//p' patches/workerd/UPSTREAM)"
-python3 scripts/workerd-patches.py import     # one commit per patch (apply: the changes staged, no commits)
+python3 scripts/workerd-patches.py import     # import the patch files (apply: stage without commits)
 python3 scripts/workerd-patches.py check      # the checkout is exactly UPSTREAM plus the series
 ```
 
@@ -58,6 +59,10 @@ python3 scripts/workerd-patches.py export
 python3 scripts/workerd-patches.py check
 ```
 
+The current fork has the extra 0010 follow-up, so whole-branch `export` cannot map its commits to the series.
+Export a new commit with `format_commit()` in `scripts/workerd-patches.py` (the same deterministic
+`git format-patch` options), preserve the existing files, then run `check`.
+
 The export is deterministic (no commit hashes, signatures or statistics): exporting the same commits twice gives the
 same files. A new series also needs the compatibility flags the node accepts regenerated
 (`python3 scripts/compatibility-flags.py`, into `common/generated/`), new workerd builds for both architectures,
@@ -68,11 +73,19 @@ operations validate the series before mutating a checkout or exporting files.
 
 ## Rust server port (v1.20261108.1)
 
-The `port-0.5.4` series targets `v1.20261108.1` and is exported from
-`coworkerd-v1.20261108.1`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018, 0013 and 0014, in that order.
-0014 is the seventeenth patch and completes the stage 3 Durable Object port.
+The current series targets `v1.20261108.1`; the b35 candidate is exported from
+`coworkerd-v1.20261108.1-b35`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
+0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018, 0013, 0014 and 0019, in that order.
+0014 completes the stage 3 Durable Object port; 0019 is the eighteenth patch.
+The fork has 19 commits above the tag for these 18 files because 0010 also has the v95 follow-up.
 The deferred patch list is empty.
+
+### 0019: SQLite CTE backout
+
+This is an unchanged cherry-pick of upstream `0d01fe9f6850d038d80e6debb54c683a51a9ac65`,
+removing the SQLite 3.54.1 check that rejects repeated CTE references. Its only additional permitted paths
+are `MODULE.bazel` and `patches/sqlite/0006-cte-nesting-depth.patch`; remove this patch when the upstream
+pin advances to `v1.20261111.1` or later.
 
 ### 0013: Durable Object WAL shipping
 
@@ -196,7 +209,7 @@ supply this record when their integration is ported.
 | Upstream tag | Commit | V8 | Series |
 | --- | --- | --- | --- |
 | `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
-| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches plus the 0013 and 0014 Durable Object ports (17 total) |
+| `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches, the 0013 and 0014 Durable Object ports, and the 0019 SQLite CTE backout (18 total) |
 
 The November 8 replay keeps the upstream handoff metadata accessors alongside the
 Coworkerd invocation-identity setter. The creation-record contract is unchanged;
