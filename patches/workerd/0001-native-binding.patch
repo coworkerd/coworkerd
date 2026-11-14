@@ -98,10 +98,10 @@ index 22ef84223912570e289f90f3047d554f4f5ba55c..dfc13ea0b24c53129b603177a0e9fd63
          }
          Ok(external_server::Which::Tcp(tcp)) => {
 diff --git a/src/workerd/server/workerd.capnp b/src/workerd/server/workerd.capnp
-index bc79bba9fb19f9d4280ddd24dd7918f03d3b7f43..cfaae2c35cd539af27465a253a44b117d28b6bb8 100644
+index 28440d1e03d9c1d6e23ddd327350ece9a9c1ab65..5ab6a3aa2654c5b37f6c88e017d14c96b394afbc 100644
 --- a/src/workerd/server/workerd.capnp
 +++ b/src/workerd/server/workerd.capnp
-@@ -1139,7 +1139,9 @@ struct ExternalServer {
+@@ -1184,7 +1184,9 @@ struct ExternalServer {
        certificateHost @6 :Text;
      }
  

@@ -7,7 +7,7 @@ Subject: [PATCH] Watch CPU limits from one resident thread instead of one per
 Ported from the 0.5.3 series 0007
 
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index f80439ef4314bc63cd5e9e9d22de49eedaacd64c..71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412 100644
+index 898618e2678208f65e62f2b5f6fef4a7eb138c28..d883424f06174e15cf246e316c83b0db415f72ae 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 @@ -1,11 +1,78 @@
@@ -87,8 +87,8 @@ index f80439ef4314bc63cd5e9e9d22de49eedaacd64c..71a6cf8d77f4e4c6a167a3c3cfa7ee84
 +}
 +
  uint32_t cpuLimitFromEnvironment() {
-   const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
-   if (text == nullptr) return 0;
+   static const uint32_t limit = []() -> uint32_t {
+     const char* text = std::getenv("COWORKERD_CPU_LIMIT_MS");
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
 index 119c3596ea171fe53a6628dd1bd26e650b7eff21..ee559661003b9a18b94ff04206329e15fb3d997d 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h

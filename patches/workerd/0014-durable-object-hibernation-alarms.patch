@@ -138,7 +138,7 @@ index b19f85a4c1cfed6ad0dbbc94556d1e7979277e5a..51307d71925763619bbd990da483eb72
  // "<namespace>/<object>/<data epoch>" -- so the node needs no map from a path to an object; `storageId` is the
  // hexadecimal actor id its files are named after. `facetId` is 0 for the object itself, and a facet also carries its
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
-index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765dd53a135 100644
+index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4f651afc5 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
 +++ b/src/workerd/server/factory/worker-factory-actor.c++
 @@ -2,8 +2,8 @@
@@ -185,7 +185,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
  ::rust::String actor_id_name(const ActorIdHandle& id) {
    KJ_IF_SOME(obj, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
      KJ_IF_SOME(name, obj->getName()) {
-@@ -417,6 +431,18 @@ kj::Maybe<uint32_t> actor_storage_facet_id(const ActorStorage& storage,
+@@ -421,6 +435,18 @@ kj::Maybe<uint32_t> actor_storage_facet_id(const ActorStorage& storage,
  
  namespace {
  
@@ -204,7 +204,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
  // The actor's hooks into the server: the requests it raises for itself (alarms, hibernated
  // WebSocket events, which restart the actor if needed), its facets, and its transitions between
  // idle and active. The actor owns a reference as its loopback, so the hooks it borrows as its
-@@ -525,14 +551,29 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
+@@ -529,14 +555,29 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
    ActorKey actor;
  };
  
@@ -235,7 +235,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
  };
  
  // The actor's storage: SQLite in the namespace's directory, or an in-memory cache over empty
-@@ -560,11 +601,14 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -564,11 +605,14 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Own<ActorSqlite::Hooks> sqliteHooks;
      kj::Maybe<ActorSqliteHooks&> rootHooks;
      uint selfId = facetId.orDefault(0);
@@ -250,7 +250,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
      } else {
        sqliteHooks = kj::heap<FacetAlarmHooks>();
      }
-@@ -578,7 +622,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -582,7 +626,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Maybe<kj::Own<DurableLogShipper>> shipper;
      if (shipped) {
        DurableObjectName name{
@@ -259,7 +259,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
          .storageId = kj::str(rootKey),
          .facetId = selfId,
          .parentFacetId = parentFacetId.orDefault(0),
-@@ -592,8 +636,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -596,8 +640,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      KJ_IF_SOME(s, shipper) {
        shipperPtr = s.get();
      }
@@ -270,7 +270,7 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
        // Close descendant actors before deleting their files; preserve cluster reset handling.
        storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
        db.run("PRAGMA journal_mode=WAL;");
-@@ -610,9 +654,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -614,9 +658,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
        committer = kj::none;
      }
      KJ_IF_SOME(s, shipper) {
@@ -286,10 +286,10 @@ index e5f6ea7a914590bb4dbcbdb4616047512c2d5bb5..2c6a2fb0722f8d3dac385e9f7aeef765
      auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
      KJ_IF_SOME(root, rootHooks) {
 diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
-index 49cf3a1f6dcc3199e7e93db460a1f3af885e35cc..8f4e51b404f098ef0542de4c72b710e153d5b478 100644
+index a05ef8bbfd777fd2b5390a234f9d6c5b15f11791..9bd0cd5c7de6f0336e4e027d6550e76fb014da18 100644
 --- a/src/workerd/server/factory/worker-factory.h
 +++ b/src/workerd/server/factory/worker-factory.h
-@@ -282,6 +282,10 @@ kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
+@@ -290,6 +290,10 @@ kj::Own<ActorIdHandle> actor_id_clone(const ActorIdHandle& id);
  ::rust::String actor_id_key(const ActorIdHandle& id);
  ::rust::String actor_id_name(const ActorIdHandle& id);
  bool factory_durable_log_enabled();
@@ -722,7 +722,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
          }
          Ok(())
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index eb17a2a7ecac3e7978c74b7570136bb03386fae1..c7a932724e697f6709ecd23a06232170074e2278 100644
+index 6c0520fadfb5e37f65171f09877a221e62c50cea..6de3f8cbcb20ec7edf488ce1a09ec46af9189f00 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
 @@ -173,6 +173,18 @@ pub mod ffi {
@@ -744,7 +744,7 @@ index eb17a2a7ecac3e7978c74b7570136bb03386fae1..c7a932724e697f6709ecd23a06232170
      /// Where an actor keeps its data.
      struct ActorStorageSpec {
          /// Durable: keep state across requests. Ephemeral: no storage at all.
-@@ -497,6 +509,12 @@ pub mod ffi {
+@@ -518,6 +530,12 @@ pub mod ffi {
          fn actor_id_name(id: &ActorIdHandle) -> String;
          /// C++ owns the first read and validation of the inherited log descriptor.
          fn factory_durable_log_enabled() -> Result<bool>;

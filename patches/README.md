@@ -4,7 +4,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 
 | Path | What it is |
 | --- | --- |
-| `workerd/UPSTREAM` | The upstream tag and commit the series applies to (`v1.20261108.1`, `88b5871e`) |
+| `workerd/UPSTREAM` | The upstream tag and commit the series applies to (`v1.20261114.1`, `3d3093c8`) |
 | `workerd/series` | The order of the patches |
 | `workerd/0001-native-binding.patch` ... | One patch per file; the header of each states its purpose |
 | `kj-http-abort.diff` | A change to Cap'n Proto's KJ that `CMakeLists.txt` applies when it builds the daemons: KJ's HTTP entity writers honor `abortWrite()`, so a response that fails midway ends with an error instead of looking complete |
@@ -12,8 +12,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261108.1`), which contains the ordered patch commits plus the v95 follow-up to 0010.
-  The b35 candidate branch is `coworkerd-v1.20261108.1-b35` until acceptance.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch commits plus the v95 follow-up to 0010.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
 - **Thin patches.** Changes normally stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with explicit
@@ -59,9 +58,12 @@ python3 scripts/workerd-patches.py export
 python3 scripts/workerd-patches.py check
 ```
 
-The current fork has the extra 0010 follow-up, so whole-branch `export` cannot map its commits to the series.
-Export a new commit with `format_commit()` in `scripts/workerd-patches.py` (the same deterministic
-`git format-patch` options), preserve the existing files, then run `check`.
+The current fork has the extra 0010 follow-up adjacent to its original commit, so whole-branch `export`
+cannot map its commits to the series. Export each patch commit with `format_commit()` in
+`scripts/workerd-patches.py` (the same deterministic `git format-patch` options). For 0010, create a
+temporary commit with the first commit's parent and the follow-up's tree, preserving the original
+author/date and both messages; export that combined commit. This leaves both accepted commits in
+the fork's history. Run `check` against the complete fork tree after exporting.
 
 The export is deterministic (no commit hashes, signatures or statistics): exporting the same commits twice gives the
 same files. A new series also needs the compatibility flags the node accepts regenerated
@@ -71,21 +73,29 @@ hashes in `scripts/release.sh`. `check` is the source side of checking a sync: t
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
 
-## Rust server port (v1.20261108.1)
+## Rust server port (v1.20261114.1)
 
-The current series targets `v1.20261108.1`; the b35 candidate is exported from
-`coworkerd-v1.20261108.1-b35`. It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005,
-0010, 0011, 0015, 0017, 0001, 0003, 0004, 0018, 0013, 0014 and 0019, in that order.
-0014 completes the stage 3 Durable Object port; 0019 is the eighteenth patch.
-The fork has 19 commits above the tag for these 18 files because 0010 also has the v95 follow-up.
+The current series targets `v1.20261114.1` and is exported from `coworkerd-v1.20261114.1`.
+It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
+0001, 0003, 0004, 0018, 0013 and 0014, in that order.
+0014 is the seventeenth patch and completes the stage 3 Durable Object port.
+The fork has 18 commits above the tag for these 17 files because 0010 also has the v95 follow-up.
 The deferred patch list is empty.
 
-### 0019: SQLite CTE backout
+The SQLite CTE backout is part of this upstream tag (`0d01fe9f6850d038d80e6debb54c683a51a9ac65`).
+It requires no local patch or extra permitted path; the former 0019 is removed.
 
-This is an unchanged cherry-pick of upstream `0d01fe9f6850d038d80e6debb54c683a51a9ac65`,
-removing the SQLite 3.54.1 check that rejects repeated CTE references. Its only additional permitted paths
-are `MODULE.bazel` and `patches/sqlite/0006-cte-nesting-depth.patch`; remove this patch when the upstream
-pin advances to `v1.20261111.1` or later.
+### 0002: CPU wrapper and startup validation
+
+The CPU wrapper forwards `abandonAlarm()` to the wrapped Worker interface, preserving its returned
+alarm time. Factory initialization validates and caches `COWORKERD_CPU_LIMIT_MS` once per process,
+before loading any Worker. An empty value is checked by its numeric length so diagnostics contain
+no NUL operand.
+
+Upstream's queued outgoing WebSocket memory accounting (#8306) remains guarded by
+`workerd-autogate-websocket-outgoing-queue-memory`. When that gate is enabled, queued payloads and
+message records count toward isolate external memory and can reach the existing 0005 memory limit
+earlier. The default Coworkerd configuration does not enable this gate.
 
 ### 0013: Durable Object WAL shipping
 
@@ -210,8 +220,13 @@ supply this record when their integration is ported.
 | --- | --- | --- | --- |
 | `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
 | `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches, the 0013 and 0014 Durable Object ports, and the 0019 SQLite CTE backout (18 total) |
+| `v1.20261114.1` | `3d3093c8f01b9b53f4d36d20a8e4ea0a39787992` | `15.8.62.5` | 17 patches; SQLite CTE backout upstream; 0002 forwards abandonAlarm and validates the process CPU limit at factory initialization |
 
 The November 8 replay keeps the upstream handoff metadata accessors alongside the
 Coworkerd invocation-identity setter. The creation-record contract is unchanged;
 0013 and 0014 each add only their two exact Rust path exceptions described above. Upstream cluster
 features remain inactive.
+
+The November 14 replay keeps promise-owned resolved props in 0015 and the unconditional
+exception-to-JavaScript `.code` hook in 0016. The new upstream exception description path is used
+for reporting; it does not replace the JavaScript conversion hook.

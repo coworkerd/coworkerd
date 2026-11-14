@@ -7,7 +7,7 @@ Subject: [PATCH] Open the limit event channel once and write each event in one
 Ported from the 0.5.3 series 0006
 
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index 722916b9324d7ac99f0560217a52db2e4c6ef312..f80439ef4314bc63cd5e9e9d22de49eedaacd64c 100644
+index 320135da691538551b7de43f42a63a507e4cb1bc..898618e2678208f65e62f2b5f6fef4a7eb138c28 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 @@ -1,6 +1,7 @@
@@ -18,7 +18,7 @@ index 722916b9324d7ac99f0560217a52db2e4c6ef312..f80439ef4314bc63cd5e9e9d22de49ee
  #include <limits>
  #include <v8-isolate.h>
  
-@@ -23,6 +24,32 @@ kj::String cpuStateFromEnvironment() {
+@@ -27,6 +28,32 @@ kj::String cpuStateFromEnvironment() {
    KJ_REQUIRE(*value != '\0', "COWORKERD_CPU_STATE must be a non-empty path");
    return kj::str(value);
  }

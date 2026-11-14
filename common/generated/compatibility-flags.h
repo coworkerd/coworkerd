@@ -1,8 +1,8 @@
 #pragma once
 #include <array>
 namespace coworkerd {
-inline constexpr const char* MAX_COMPATIBILITY_DATE = "2026-11-15";
-inline constexpr std::array<const char*, 306> COMPATIBILITY_FLAGS = {
+inline constexpr const char* MAX_COMPATIBILITY_DATE = "2026-11-21";
+inline constexpr std::array<const char*, 308> COMPATIBILITY_FLAGS = {
   "add_nodejs_compat_eol",
   "add_nodejs_compat_eol_v22",
   "add_nodejs_compat_eol_v23",
@@ -188,6 +188,7 @@ inline constexpr std::array<const char*, 306> COMPATIBILITY_FLAGS = {
   "no_nodejs_process_version_24",
   "no_nodejs_zlib",
   "no_pipe_to_backward_propagation",
+  "no_python_dedicated_snapshot_keep_import_caches",
   "no_python_workers_20250116",
   "no_python_workers_20260610",
   "no_python_workers_314",
@@ -227,6 +228,7 @@ inline constexpr std::array<const char*, 306> COMPATIBILITY_FLAGS = {
   "pipe_to_backward_propagation",
   "python_check_rng_state",
   "python_dedicated_snapshot",
+  "python_dedicated_snapshot_keep_import_caches",
   "python_external_packages",
   "python_no_global_handlers",
   "python_process_pth_files",

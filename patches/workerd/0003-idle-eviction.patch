@@ -30,10 +30,10 @@ index 7fc2b592dae9c658b4083588f73f7d90cf38576b..cc05539b33d7ae641c3f5aa261c794b4
 +void* coworkerdLifecycleMapping();
  }  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index 365369bfafcf2b17eff78f1efe9d4e0236323a67..347cee9e451bf85c9e1fec9973582cfaf5995944 100644
+index df7613f27355db32f9ba561e595cdaafe0a17a02..81418dd2f9161efd9b0211bdfeaf856808e7b7cc 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-@@ -171,15 +171,20 @@ class InheritedMapping {
+@@ -175,15 +175,20 @@ class InheritedMapping {
  };
  }  // namespace
  
@@ -402,7 +402,7 @@ index 0000000000000000000000000000000000000000..ffd993267a7fb6883f7776e0c0af1fbe
 +    kj::Own<WorkerInterface> inner, const IdleWorkerRef& worker);
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
-index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a2449f0fd90 100644
+index d819abda0735ba79262e3ab7caccbf4ea3555d1e..e7bc127d4c8151d4419fb393c8811af169709381 100644
 --- a/src/workerd/server/factory/worker-factory-impl.h
 +++ b/src/workerd/server/factory/worker-factory-impl.h
 @@ -8,6 +8,7 @@
@@ -411,9 +411,9 @@ index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a24
  #include "coworkerd-cpu-limit.h"
 +#include "coworkerd-idle-eviction.h"
  
+ #include <workerd/api/bench.h>
  #include <workerd/io/actor-sqlite.h>
- #include <workerd/io/io-thread-context.h>
-@@ -129,6 +130,7 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
+@@ -132,6 +133,7 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
    // Background work no request owns: container cleanup, trace delivery, and the Rust server's
    // tasks (factory_spawn). Declared last, so that it is destroyed first: a task may hold anything
    // else here.
@@ -421,7 +421,7 @@ index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a24
    kj::TaskSet tasks;
    // How many tasks factory_spawn has added; factory_settle_tasks waits for it to stop growing.
    uint64_t spawnCount = 0;
-@@ -171,6 +173,7 @@ class WorkerTimerChannel final: public TimerChannel {
+@@ -174,6 +176,7 @@ class WorkerTimerChannel final: public TimerChannel {
  class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
   public:
    Impl(const WorkerFactory& factory, kj::String name);
@@ -429,7 +429,7 @@ index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a24
  
    const WorkerFactory& factory;
    kj::String name;
-@@ -193,6 +196,10 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
+@@ -196,6 +199,10 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
    kj::Maybe<kj::String> accessBlobHeader;
    bool isDynamic = false;
    kj::Maybe<CoworkerdWorkerIdentity> coworkerdIdentity;
@@ -441,18 +441,18 @@ index dbe00b6d98d36a053115490baff253759a3893f2..615edf45e3b11bf9ed647e349c3a2a24
  
    kj::Maybe<kj::Own<const Worker>> worker;
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d799002f95c3e6 100644
+index a4bc8c23f5aa8ffce059805980d85f9b7d69e31f..6bd11f1ded0ec676e4b75b2eee9b20a9a6c922dc 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -88,6 +88,7 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
+@@ -89,6 +89,7 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
        channelTokenHandler(factory,
            this->config.hasCluster() ? kj::Maybe<kj::StringPtr>(this->config.getCluster().getKey())
                                      : kj::none),
 +      idleReaper(server::idleReaper(timer)),
        tasks(*this) {
-   // The config's logging settings go on top of the caller's.
-   auto& logging = this->options->loggingOptions;
-@@ -897,6 +898,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
+   // Validate and cache the process default before any Worker is loaded.
+   (void)cpuLimitFromEnvironment();
+@@ -900,6 +901,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
          .attach(kj::addRef(*this));
    }
    void abortIsolate(kj::StringPtr reason) noexcept override {
@@ -460,7 +460,7 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
      channels->abort_isolate(toRustString(reason));
    }
  
-@@ -1160,12 +1162,14 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+@@ -1163,12 +1165,14 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
          channel->abortIsolate("CPU limit exceeded");
        });
    auto entry = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
@@ -477,7 +477,7 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
  }
  
  }  // namespace
-@@ -1411,6 +1415,22 @@ CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
+@@ -1414,6 +1418,22 @@ CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
        timerChannel(factory.getImpl().timer, factory.getImpl().monotonicClock),
        waitUntilTasks(*this) {}
  
@@ -500,7 +500,7 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
  void CompiledWorker::Impl::taskFailed(kj::Exception&& exception) {
    KJ_LOG(ERROR, exception);
  }
-@@ -1607,6 +1627,10 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1642,6 +1662,10 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
    impl->isDynamic = dynamicSource != kj::none;
    if (spec.load_identity.present) {
@@ -511,7 +511,7 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
      const auto& identity = spec.load_identity;
      impl->coworkerdIdentity = CoworkerdWorkerIdentity{kj::str(identity.tenant),
        kj::str(identity.worker_id), kj::str(identity.version_id), identity.generation,
-@@ -1710,7 +1734,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1747,7 +1771,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
          workerSource.variant.is<WorkerSource::ScriptSource>() && !usingNewModuleRegistry
          ? Worker::ConsoleMode::INSPECTOR_ONLY
          : options.loggingOptions.consoleMode;
@@ -522,7 +522,7 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
          isolateName, kj::mv(limitEnforcer), policy, kj::mv(isolateLoggingOptions));
    };
  
-@@ -1856,8 +1882,16 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
+@@ -1975,8 +2001,16 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
    });
  }
  
@@ -540,10 +540,10 @@ index 56ec7a798dc0c7818c7f2f3d15b4cf3a3dd3b2c6..3ca5d9cbc1902473414c277eb0d79900
    impl.subrequestChannels.clear();
    impl.actorClassChannels.clear();
 diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
-index 29d7b5c8e8328e1d250e3143f76d841cea5a83f8..6927d00b404cb721812250365346dc789058d1a1 100644
+index 382b6ff24dac566fcd75ee614dd777c538517ca1..98571c3fbe3900a7a32ea47274469dbb37e07c8c 100644
 --- a/src/workerd/server/factory/worker-factory.h
 +++ b/src/workerd/server/factory/worker-factory.h
-@@ -212,6 +212,7 @@ class CompiledWorker final {
+@@ -220,6 +220,7 @@ class CompiledWorker final {
  
  WorkerInfo worker_info(const CompiledWorker& worker);
  void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
@@ -552,10 +552,10 @@ index 29d7b5c8e8328e1d250e3143f76d841cea5a83f8..6927d00b404cb721812250365346dc78
  kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
      kj::Maybe<::rust::Str> entrypoint,
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index a194a8c0b6fbab27481ecaf8161ac5db3077d952..f07aaa51d0ce37deeadc68afb282829099a71b6a 100644
+index 66c9c705bb3a12dfc1a3103bbea1ca6798e9caa5..3e7e695627484d3c0eb5e0d25181b4427d5cc356 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
-@@ -380,6 +380,8 @@ pub mod ffi {
+@@ -401,6 +401,8 @@ pub mod ffi {
          /// Compiles `ctx.exports` from an encoded `Globals` message. Called once, after the
          /// server has numbered the worker's loopback channels.
          fn worker_set_ctx_exports(worker: &CompiledWorker, globals: &[u64]) -> Result<()>;
@@ -593,10 +593,10 @@ index 132722010c7a56486f5b4cb2fad46bd76baa938b..3504f63d19e78ccb282af9439e26f925
          Ok(stub)
      }
 diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
-index 0366735403309cd8018c1bb170ffd3e637569d52..3af55dd757acef7b05ec2fc0fc1de32fea7fbe45 100644
+index 31cbc225d487c1343ceb6ecf1a742f627e9efd0d..8879c490252686850917388d8bc5063914300b93 100644
 --- a/src/workerd/server/server/worker.rs
 +++ b/src/workerd/server/server/worker.rs
-@@ -369,6 +369,7 @@ impl WorkerService {
+@@ -377,6 +377,7 @@ impl WorkerService {
              },
              None,
          )?;

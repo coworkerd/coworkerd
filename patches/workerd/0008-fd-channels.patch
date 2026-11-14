@@ -19,7 +19,7 @@ index 58c9b45830e60ba5920dfc6f7b77f62936abd33b..3b47e350a87b113b60185feb4d6fa7bc
      deps = [
          ":worker-factory-hdrs",
 diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
-index bb21e18b31638c0956482881448a5abb7f435728..10001d6e27250d22451828c264ebdb96c63ba2c7 100644
+index 6346ca4e53fcfc1f492ce2005b86c8f8f966dc6b..773f86bc677039186892094f5c198ff5a422aa86 100644
 --- a/src/workerd/server/factory/bootstrap.c++
 +++ b/src/workerd/server/factory/bootstrap.c++
 @@ -3,6 +3,7 @@
@@ -53,7 +53,7 @@ index 0000000000000000000000000000000000000000..7fc2b592dae9c658b4083588f73f7d90
 +void initializeCoworkerdChannels();
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
-index 71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412..3981f4065eb9306bed41473aef277fa81ae976f0 100644
+index d883424f06174e15cf246e316c83b0db415f72ae..5d454dddce1633a64e63608d7a5089f6b99298f2 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
 @@ -3,6 +3,8 @@
@@ -65,9 +65,9 @@ index 71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412..3981f4065eb9306bed41473aef277fa8
  #include <limits>
  #include <v8-isolate.h>
  
-@@ -85,11 +87,9 @@ uint32_t cpuLimitFromEnvironment() {
-   }
-   return static_cast<uint32_t>(value);
+@@ -89,11 +91,9 @@ uint32_t cpuLimitFromEnvironment() {
+   }();
+   return limit;
  }
 -kj::String cpuStateFromEnvironment() {
 -  const char* value = std::getenv("COWORKERD_CPU_STATE");
@@ -80,7 +80,7 @@ index 71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412..3981f4065eb9306bed41473aef277fa8
  }
  int cpuEventsDescriptor() {
    static const int descriptor = []() {
-@@ -117,6 +117,53 @@ void writeLimitEvent(kj::StringPtr row) {
+@@ -121,6 +121,53 @@ void writeLimitEvent(kj::StringPtr row) {
    ssize_t written;
    do { written = write(fd, row.cStr(), row.size()); } while (written < 0 && errno == EINTR);
  }
@@ -134,7 +134,7 @@ index 71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412..3981f4065eb9306bed41473aef277fa8
  void recordPlatformFacts(kj::StringPtr name, bool dynamic) {
    auto line = kj::str("[coworkerd-platform] {\"isolate\":", escapeCpuJsonString(name),
        ",\"dynamic\":", dynamic ? "true" : "false", ",\"canCreateNewIsolateGroups\":",
-@@ -208,9 +255,7 @@ class RequestLimits final: public LimitEnforcer {
+@@ -215,9 +262,7 @@ class RequestLimits final: public LimitEnforcer {
          kj::String identity, kj::Function<void()> abortIsolate)
          : fallback(kj::mv(fallback)), limits(kj::addRef(limits)),
            abortIsolate(kj::mv(abortIsolate)), identity(kj::mv(identity)) {}
@@ -145,7 +145,7 @@ index 71a6cf8d77f4e4c6a167a3c3cfa7ee84c665d412..3981f4065eb9306bed41473aef277fa8
      kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
        return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); });
      }
-@@ -244,7 +289,7 @@ class RequestLimits final: public LimitEnforcer {
+@@ -251,7 +296,7 @@ class RequestLimits final: public LimitEnforcer {
  kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
      CpuIsolateLimitEnforcer& limits, kj::Maybe<kj::String>& metadata,
      kj::Function<void()> abortIsolate) {
