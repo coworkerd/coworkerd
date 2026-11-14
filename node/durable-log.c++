@@ -3494,6 +3494,7 @@ kj::Promise<void> DurableLog::resealEarlier() {
 // longest time and whose changes are all in a segment lose theirs. The object is rebuilt from its history when it
 // is asked for again.
 kj::Promise<void> DurableLog::dropColdFiles() {
+  coldFilesSkippedLive = 0;
   if (recoveryWriteFailed || (startupAttempted && !startupReady)) co_return;
   std::error_code code;
   uint64_t total = 0;
@@ -3531,6 +3532,10 @@ kj::Promise<void> DurableLog::dropColdFiles() {
     if (total <= diskLimitBytes) break;
     auto* object = objectOf(name);
     if (object == nullptr) continue;
+    if (hasLiveOpenFacets(*object)) {
+      ++coldFilesSkippedLive;
+      continue;
+    }
     uint64_t freed = 0;
     for (const auto& [facetId, facet] : object->facets) {
       for (const char* suffix : {"", "-wal", "-shm"}) {
@@ -3549,6 +3554,13 @@ kj::Promise<void> DurableLog::dropColdFiles() {
     log("files-dropped", "\"object\":" + quote(name) + ",\"bytes\":\"" + std::to_string(freed) +
             "\",\"reason\":\"this machine's share of Durable Object files is full\"");
   }
+  if (coldFilesSkippedLive != 0) {
+    const auto now = monotonicTimeMs();
+    if (lastColdFilesSkippedLogMs == 0 || now - lastColdFilesSkippedLogMs >= 60000) {
+      lastColdFilesSkippedLogMs = now;
+      log("files-drop-live-skipped", "\"objects\":" + std::to_string(coldFilesSkippedLive));
+    }
+  }
   co_return;
 }
 
@@ -3556,6 +3568,7 @@ kj::Promise<void> DurableLog::dropColdFiles() {
 
 void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
   if (auto* object = objectOf(durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch))) {
+    object->lastAccessMs = monotonicTimeMs();
     object->dispatchedChannel = processId + "-" + std::to_string(generation);
     if (!hasLiveOpenFacets(*object)) object->dispatchPending = true;
   }
@@ -6423,6 +6436,7 @@ std::string DurableLog::json() const {
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"
       << (diskTrusted ? "true" : "false") << ",\"note\":" << quote(startupNote) << ",\"limitBytes\":\""
       << diskLimitBytes << "\",\"usedBytes\":\"" << diskUsedBytes << "\",\"filesDropped\":" << filesDropped
+      << ",\"coldFilesSkippedLive\":" << coldFilesSkippedLive
       << "},\"buffer\":{\"bytes\":\"" << incomingBytes << "\",\"limitBytes\":\"" << settings.config.peerBufferBytes
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
       << fencedRecords << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";

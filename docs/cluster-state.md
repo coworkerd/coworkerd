@@ -462,7 +462,16 @@ and never reads the previous owner's files.
 - **This machine's files.** The remaining admission, WAL and healing gaps are listed in
   [Known issues in 0.5.5](guide/install.md#known-issues-in-055). They are a cache of the history, with a `durableObjects.diskBytes` budget (half of the
   filesystem the stack is on): the files of the objects nothing has asked for in the longest time, and whose changes
-  are all in a segment, go when that is full. Reuse requires the same Linux boot; a clean drain does not grant
+  are all in a segment, go when that is full. An object registered as open on a live durable-process channel is
+  skipped when its turn to evict arrives. Dispatching a request refreshes its last-access time, keeping it out of
+  the cold candidates for 60 seconds even before the open notification arrives. A dispatched request that never
+  opens the object does not prevent eviction after that interval, and a matching close removes the live-open
+  protection. `durableLog.disk.coldFilesSkippedLive` counts candidates skipped in the latest eviction pass; it
+  resets to zero on every pass. While nonzero, `files-drop-live-skipped` logs the count at most once per minute.
+  These objects can keep the node over budget until their connection or request ends. An object with only a
+  hibernating WebSocket has no live instance registered; its files can still be evicted and a later socket message
+  can wake it inside workerd without passing through the node. That case is not protected by this rule.
+  Reuse requires the same Linux boot; a clean drain does not grant
   reuse across boots because SQLite uses `synchronous=OFF`. Startup synchronizes `clean:false` before trusting
   or changing object files. Failure gates all DO service and retries without deleting caches. An untrusted
   startup retains the previous boot identity until cleanup and classification finish; an interrupted startup
@@ -482,7 +491,8 @@ and never reads the previous owner's files.
   epoch before retrying writes. A sidecar failure
   freezes this process's DO service until restart, preserves `cache.json` and possible unique copies, and prevents
   a clean marker. Required database files and named-facet indexes must be readable; explicitly deleted facets
-  are exempt. Missing files are never handed to workerd to create an empty replacement. A possibly unique legacy
+  are exempt. For opens routed through the node, missing files are never handed to workerd to create an empty
+  replacement; the hibernating-socket wake described above does not take that path. A possibly unique legacy
   takeover cache enters named HOLD when admission fails; a 0.5.5 complete recovery instead rebuilds from its
   published history. Store history is read and verified before original non-risk cache files are replaced.
 
