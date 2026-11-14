@@ -683,15 +683,16 @@ preparing the upgrade, and take the backup in a way that does neither.
    `restored-startup-classified` results: byte-verified history, higher-shard-epoch fencing, or default adoption
    and resealing. Unread or over-budget evidence defaults to adoption; a registration alone is not completion.
 6. Before resuming traffic, verify on **every node** that its membership table lists every replacement at its
-   new epoch and `durableLog.recovery.healPending == 0`, `healBusy == false`, `healErrors == 0`, and
-   **`durableLog.objects.hold == 0`**. `healFailures` is cumulative; `healPending` can count all objects after
-   an untrusted startup and does not by itself identify legacy risk objects. Readiness alone is insufficient.
-   Read back known acknowledged data, then resume traffic and supervision. Preserve the
-   original files and logs if verification fails. `object-operation-failed` names an object and the failed step.
+   new epoch, `durableLog.localRecovery.startupReady == true` and `writeFailed == false`. First opens rebuild
+   object images from published history and surviving log and peer records; observe
+   `durableLog.objects.activeRebuilds` and `queuedRebuilds` while those requests complete. Readiness alone
+   does not establish that an object's acknowledged data has been recovered. Read back known acknowledged
+   data, then resume traffic and supervision. Preserve the original files and logs if verification fails.
+   `object-operation-failed` names an object and the failed step.
 
 Three requirements apply throughout:
 
-- **Do not reboot the hosts between stopping and starting.** Eligible local-file reuse requires the same Linux boot.
+- **Do not reboot the hosts between stopping and starting.** Keeping the same Linux boot preserves trusted predecessor-log evidence.
 - **Every node must run 0.5.5 before traffic resumes.** Old nodes still perform the old takeover behavior.
 - **Do not drain nodes one at a time.** A drain writes shard-release markers and can hand off a unique surviving copy.
 
@@ -758,15 +759,13 @@ The `drainTimeoutMs: 0` immediate-stop path exists, but the validated maintenanc
 use SIGKILL. The validation covers a coordinated process-group stop, not these systemd service-manager commands;
 the release upgrade check exercises the Compose commands.
 
-Healing concentrates disk reads, manifest operations and snapshot uploads. In the accepted three-node baseline,
-traffic pause to safe resumption was 38.505 seconds for the original risk object, 63.608 seconds with the default
-sealing barrier, 39.854 / 33.568 seconds with missing / stale member views, and 66.948 seconds when the healer
-was interrupted. These are fixture observations, not downtime bounds. Cache size, object count, storage and the
-snapshot throttle add to the lease wait. An already damaged database cannot be repaired by upgrading; retain
-verified backups. Generic execution errors alone do not prove corruption.
+First-open rebuilds read stored snapshots and segments and collect surviving log and peer records. Each node
+runs at most `durableObjects.rebuildConcurrency` rebuilds at once (default 4); additional objects wait in FIFO
+order. A request that reaches `recoverTimeoutMs` returns `DO_RECOVERING` while its background rebuild continues.
+Recovery time depends on object size, missing peer evidence and storage throughput. An already damaged database
+cannot be repaired by upgrading; retain verified backups. Generic execution errors alone do not prove corruption.
 
-Downgrade requires pausing traffic, current and earlier record counts at zero and no REPAIR, HOLD or pending
-healing; stop every node, retain a backup, remove `cache.json` and object caches/positions, then start the old
+Downgrade requires pausing traffic, current and earlier record counts at zero and no REPAIR; stop every node, retain a backup, remove `cache.json` and object caches/positions, then start the old
 binary against published history. If these conditions fail, do not downgrade. The original append-log, peer and
 store encodings remain compatible, but the old binary ignores new local recovery state and its old defects return.
 
@@ -803,9 +802,6 @@ procedure or a successful readiness check as proof that none applies.
 9. **Some retained state has no cleanup bound.** Adopted recovery tails remain after object ownership is lost;
    recovery state in sidecars is not compacted; failed-rebuild temporary files remain until the next untrusted
    startup. These consume memory or disk during repeated failures.
-10. **Recovery counters need interpretation.** `healPending` includes all objects after an untrusted startup;
-    inspect the named startup classifications. Before traffic resumes, also require `durableLog.objects.hold == 0`.
-
 11. **A node at its local-cache budget can drop the files of an object that a process still holds open.** When
     Durable Object files and logs exceed `durableObjects.diskBytes`, the node deletes the local files of objects
     that have had no request through the node for 60 seconds, without checking whether the durable process still
@@ -905,7 +901,7 @@ including other tenants' affected calls. An empty list is `[]`; `dispatched` dis
 | A node or the control plane refuses to start: `the bucket ... holds no cluster/format/1` | The bucket is not a cluster's yet, or it is the wrong bucket: compose's `init` writes the marker; on bare metal `coworkerd-apiserver tool init` ("A new cluster's bucket" in section 4) |
 | `init`'s contract line or `check storage` reports `"conditionalPutAtomic":false` | The store's create-if-absent does not hold under concurrency (observed on SeaweedFS 3.97). Use a verified store, such as the pinned 4.48. Until then run one desired-state writer only; Durable Objects are unavailable |
 | A node refuses to start: `membership refuses to start: clock skew` | This machine's clock is more than `membership.clockSkewToleranceMs` (2 s) from the store's `Date`; the reason says by how much and which store. Install NTP |
-| `DO_OWNER_EXPIRED` while readiness is green | The node lost its storage-backed membership lease. Restore storage readability and writes (including free space); nodes re-register automatically. Fixed nodes collect surviving acknowledged tails and publish recovery history before serving the object. An unavailable owner can add 25 s plus snapshot time. A bounded recovery reports unanswered holders and cannot promise their missing tail. Check `durableLog.recovery`; for older takeover history use the healing procedure in section 9 |
+| `DO_OWNER_EXPIRED` while readiness is green | The node lost its storage-backed membership lease. Restore storage readability and writes (including free space); nodes re-register automatically. Fixed nodes collect surviving acknowledged tails and publish recovery history before serving the object. An unavailable owner can add 25 s plus snapshot time. A bounded recovery reports unanswered holders and cannot promise their missing tail. Check `durableLog.recovery`; use the restart and recovery checks in section 9 |
 | A node refuses to start: `membership nodeId conflict` | Another process holds this `nodeId`: its heartbeat was written again while this one waited. Stop one of them; a node that finds its id taken while it runs exits with 3 |
 | A node refuses to start: `no management token: ...` | Set `COWORKERD_MANAGEMENT_TOKEN` (or `management.token`); compose's `secrets` step generates one. Only a development node may run without, with `management.allowWithoutToken: true` (section 8) |
 | A node or the control plane refuses to start: `0.4 has no etcd: ...` | A configuration from 0.3.x: see "Upgrading from 0.3.x" in section 9 |

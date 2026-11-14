@@ -256,7 +256,7 @@ A Durable Object namespace has a fixed number of shards -- 1024, set when the co
   - a shard without an epoch is taken by its **default owner**: the first, in the rendezvous order of `<namespace>/<shard>` (section 7's rule), of the members that run durable processes and are not draining. Another node that gets a request for it sends the request to the default owner, which takes the shard; only when the default owner refuses or cannot be reached does that node wait 200 to 500 ms, read the shard again and take it itself;
   - a shard whose owner is live -- its membership epoch is in the member table -- is not taken: its requests go to the owner;
   - a shard whose owner's membership epoch has expired -- its heartbeat is the TTL plus the grace old by the store's clock, the recovery anchor included, or a newer epoch of the node replaced it -- or whose owner released it is taken over by the default owner among the other members; each other member waits its rank in that order times 1 s, reads the shard again and takes it only if nobody did, so that few nodes ever compete for one epoch (on SeaweedFS 4.48 each waiting writer of one key waits about 1 s more). A node that cannot reach an owner its member table still counts live lists the owner's own heartbeats and judges it by the store's clock at that moment;
-  - a shard whose epoch names this node under an earlier membership epoch -- the node started again, or registered again after its own expiry -- is taken back at once with a new epoch; its objects recover through section 12's path, reusing trusted files and their confirmed WAL positions when available.
+  - a shard whose epoch names this node under an earlier membership epoch -- the node started again, or registered again after its own expiry -- is taken back at once with a new epoch; its objects recover through section 12's path, rebuilding images from published history and surviving log and peer records.
 - **Requests and their check.** Node-originated requests (HTTP SQL and alarms) follow the same forwarding path with no calling object or call tree; the trusted peer accepts them only with zero hops and a database or alarm target. A node that does not own an object's shard sends the request to the owner through the peer session -- a WebSocket upgrade too, and the hop count of the Durable Object calls that led to it (at most 8) --, naming the shard and the epoch it expects the owner to hold. The owner runs it only when it holds the shard at that epoch, and refuses it otherwise, `409 DO_SHARD_EPOCH_MISMATCH`, before anything ran. A refusal, or a connection that could not be made, sends the caller's node to the store once more -- it lists the shard's epochs -- and the request to the owner it finds, once; a request whose answer was lost after it was sent is `RESULT_UNCERTAIN`. Each node keeps a cache of the owners it found -- the owner, its membership epoch, the shard's epoch, where it was found and when a request last confirmed it --, and drops an entry when its owner refuses with a mismatch, when the owner's membership epoch expires, when the shard turns out released, and when no request confirmed it for 60 s.
 - **Expiry fences a node off.** A node whose own membership epoch expires (section 3) gives up every shard it holds at once, writing nothing: from then on it answers requests to objects `503 DO_OWNER_EXPIRED`, tells their WebSocket connections to go away (`1001`), lets the requests in flight run for up to a second and starts its durable processes again, empty -- every object's facet closed. It keeps serving stateless calls. It expires at most 20 s after the last heartbeat the store took, while the other nodes take its shards over only a TTL plus the grace (25 s) after that heartbeat by the store's clock, so a shard is never served by two nodes at once. Back with a new membership epoch, it does not take back the shards others took, and a request that names its old epoch of such a shard is refused with `DO_SHARD_EPOCH_MISMATCH`.
 - **Draining releases.** A draining node refuses new requests to its objects, `503 DO_OWNER_DRAINING`, and closes their WebSocket connections with `1001` at once; when the requests in flight on its durable processes are done (within the drain period) it closes those processes, then writes a release marker `do/<namespace>/shards/<shard>/epochs/<n>.released` beside each epoch it holds, and the hint saying released: the next owner takes the shard at once, while the rest of the drain goes on. The drain record counts the shards and the time (`durableObjects`). A node that leaves without releasing -- killed, or its markers could not be written -- loses its shards a TTL plus the grace after its last heartbeat. A node whose identity another process took writes no marker.
@@ -444,7 +444,6 @@ and never reads the previous owner's files.
   rebuilds from manifests, snapshots, segments, local unsealed records and peer tails using the recovery path
   above. Position files supply only object and shard identity, tenant and byte usage before that first open.
   Pending repair generations are restored from recovery sidecars so the rebuild can complete the original repair.
-  Legacy cache admission, HOLD and snapshot-healing code remains present but startup no longer activates it.
   Each object's first request reads the store and replays its history; a large object can take seconds to tens
   of seconds. If the store is unreachable, objects on a restarted node return 503 until it recovers. Many first
   opens share the node-wide rebuild limit above; additional objects wait in its FIFO queue.
@@ -513,7 +512,7 @@ and never reads the previous owner's files.
   Power-loss startup deletes database caches, indexes and positions but retains raw log and exclusion prefixes.
   A persistent crossed-boot flag prevents these epochs from later proving absence in the same boot. Complete,
   fully released predecessor logs can be replaced by `.closed` EOF/shard summaries only after unresolved repair,
-  rebuild, healing and cache-admission state is carried forward durably. Original record encodings are unchanged.
+  rebuild and repair state, exclusions and legacy healing markers are carried forward durably. Original record encodings are unchanged.
   All files in `do/log/`, plus database/WAL bytes, count in the eviction accounting. Positions, facet indexes,
   snapshot staging and code caches add other disk use. During recovery, the old and staged databases coexist;
   leave room for one additional object-sized image. The active epoch, incomplete prefixes and crossed-boot
@@ -579,7 +578,7 @@ On Linux the daemon disables transparent huge pages to keep sparse allocator pag
 
 The state endpoint's `durableLog` shows the confirmation latency (mean, p50, p99), the bytes not confirmed and not
 sealed, the segments and the last upload, the peers and the streams to them, the checkpoints, the rebuilds and their
-time, `recovery` counters (bounded, owner-silent, late, transferred and unaccounted records, healing progress and failures), the buffer this node holds for others, and this machine's files; `[do-log]` lines record the sealing, the
+time, `recovery` counters (bounded, owner-silent, late, transferred and unaccounted records), the buffer this node holds for others, and this machine's files; `[do-log]` lines record the sealing, the
 uploads, the manifests, the snapshots, the rebuilds, a peer taking another's place, and a confirmation that failed with
 the records it isolated. A `[do]` line says how long a request waited for a rebuild (`recoveredMs`).
 
@@ -603,7 +602,7 @@ but its sync failed, the WAL remains truncated. A later request retries normally
 the object unavailable rather than automatically starting repair. Have another node take over its shard,
 for example by draining this node; the new owner rebuilds from storage and peers.
 
-`objects.hold` is a retained legacy-cache counter; startup no longer creates HOLD objects. `openCache` counts
+`openCache` counts
 objects marked open within the current daemon lifetime.
 `localRecovery.writeFailed`, `writeFailures`, `startupReady`, `startupMarkerFailures` and `startupCleanupFailures`
 expose local durability gates.
@@ -613,9 +612,7 @@ sequence range and byte count in `restored-startup-classified`. Fenced records r
 is uploaded; unproven records default to resealing. Historical lookup reads at most 256 deduplicated batches and
 256 older manifest revisions, with at most 64 MiB of receipt cache; unread and over-budget evidence is counted.
 
-`durableLog.recovery.healPending`, `healBusy`, `healSnapshots`, `healFailures` and `healedWalFrames` remain for
-the retained healing code; startup no longer schedules it. `objectFailures` and `object-operation-failed` name failures at
-rebuild, healing or request stages. Request failures retain their original status and code. This counter includes
+`objectFailures` and `object-operation-failed` name failures at rebuild or request stages. Request failures retain their original status and code. This counter includes
 execution errors and alone does not establish SQLite corruption. During an upgrade from an affected older node,
 that older node's own takeovers still have its old recovery behavior; use the maintenance procedure in
 [the installation guide](guide/install.md#9-upgrades-and-draining) before resuming Durable Object or D1 traffic.
