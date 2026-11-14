@@ -647,6 +647,12 @@ rolling drain can release that shard before this copy is healed. The protection 
 [known gaps below](#known-issues-in-055). A backup is a precaution, not proof that a damaged history can be repaired.
 Keep storage running throughout this procedure.
 
+Until every node runs 0.5.5, old nodes keep the old takeover behavior. An old node also gives up its shards when
+it loses its membership lease, that is, when it cannot renew it in time (a heartbeat every 5 seconds and a
+15-second TTL by default) because its process is suspended or storage is unreachable. The object is then rebuilt
+from storage, with the same effect as a drain. Do not freeze old nodes or interrupt their storage while
+preparing the upgrade, and take the backup in a way that does neither.
+
 1. Pause every DO and D1 entry point, including WebSocket clients, control-plane SQL and background callers.
    Disable automatic node restarts or rescheduling. Keep already stopped nodes stopped; do not start an old
    binary to inspect it. Preserve node ids, keys, volumes and hosts.
@@ -773,8 +779,9 @@ procedure or a successful readiness check as proof that none applies.
    power loss, rebuilt objects can rebuild again on every later same-boot restart; in a rare case a WAL containing
    acknowledged writes can be removed. After a same-boot restart and shard reclaim, a periodic snapshot can omit
    an earlier write still in one facet's WAL. The latter also affects 0.5.4.
-2. **Descriptor exhaustion or a database read error** while reopening a closed object can remove its WAL,
-   including acknowledged writes.
+2. **An object that deleted a child facet** can keep its open marker after it closes. At the next same-boot
+   restart its local cache is then rejected and the object is rebuilt from storage on its first request; for a
+   large object that request answers `DO_RECOVERING`. This costs availability, not data.
 3. **Legacy-risk protection during upgrade is incomplete.** Back up storage and each node's data directory.
    A legacy cache containing an isolated failed write can pass the pre-healing check. A risk object whose shard
    is lost and reclaimed before the healing snapshot publishes can be rebuilt as an ordinary object, deleting
@@ -798,10 +805,35 @@ procedure or a successful readiness check as proof that none applies.
 10. **Recovery counters need interpretation.** `healPending` includes all objects after an untrusted startup;
     inspect the named startup classifications. Before traffic resumes, also require `durableLog.objects.hold == 0`.
 
+11. **A node at its local-cache budget can drop the files of an object that a process still holds open.** When
+    Durable Object files and logs exceed `durableObjects.diskBytes`, the node deletes the local files of objects
+    that have had no request through the node for 60 seconds, without checking whether the durable process still
+    has them open; an object kept alive by an accepted WebSocket or by a request longer than a minute is such a
+    case. Later commits of that instance can be answered without being replicated, and they are lost when the
+    instance ends. Also present in 0.5.3 and 0.5.4. Size `durableObjects.diskBytes` and the filesystem so that
+    the node never logs `files-dropped`.
+12. **A request admitted just before its durable process is replaced is not checked again.** When a durable
+    process is killed (by the watchdog, by a memory limit, or by the reset that precedes another object's
+    rebuild), a request for an object that was open in it can be sent to the replacement process although the
+    object has meanwhile been marked for repair. Usually this costs one read that may include rejected frames
+    and one more process reset. If that object's rebuild overlaps, the new instance can go on serving from the
+    replaced files, and its commits are then answered without being replicated or diverge from the log. Also
+    present in 0.5.3 and 0.5.4.
+13. **A durable process whose replication channel could not be created at spawn** still starts and serves
+    requests; its commits are not replicated until that process exits. This needs a socket-pair failure at
+    exactly that step and has not been observed. Present since 0.5.0.
+
 Slow disks can additionally block synchronous node metadata writes and whole-file snapshot reads. This can delay
 heartbeats and make the watchdog attribute a node-side stall to a durable process. Upgrade healing concentrates
 that I/O. Mixed old nodes may acknowledge 32–64 MiB records they cannot return during recovery, and old segments
 over the store client's 64 MiB read ceiling remain unreadable. Preserve intact local copies and backups.
+
+**Inherited from the 0.5.4 kernel, not present in 0.5.3:** the bundled workerd carries SQLite 3.54.1, which
+refuses a statement that refers to a common table expression once the statement already names about 100 tables
+or subqueries; the error reads `VIEWs and/or subqueries nested too deep`. A statement without `WITH`, or with a
+few expressions each used a few times (recursive ones included), is not affected, and no statement returns a
+wrong result. Write the expression as a subquery in `FROM`, make it a view, or split the statement. Upstream
+workerd removed the check on 2026-11-10; taking that change is planned for 0.5.6.
 
 0.5.4 was a prerelease and is superseded by 0.5.5; DO/D1 deployments should use this coordinated upgrade rather
 than remain on 0.5.4. Compared with 0.5.3, 0.5.5 also includes the `v1.20261108.1` kernel, 17 patches, 306-entry

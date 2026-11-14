@@ -1,10 +1,5 @@
 # Changelog
 
-## 0.5.6 (unreleased)
-
-- Preserve an object's WAL while the durable process generation last given its files is alive, including before the node receives its open message and when the same process reopens it.
-- Fail this object open when reading or writing its WAL fails, preserving its files and allowing a later request to retry. A successful truncation is not rolled back if the following sync fails.
-
 ## 0.5.5 (unreleased)
 
 - Wait for a live paused process within `processPool.pausedAdmissionWaitMs` (1000 ms by default; 0 disables it), reducing the transient single-process admission 503s in 0.5.3 and 0.5.4. Ready processes and other candidate nodes still take calls immediately. See [process admission](docs/cluster-state.md#7-placement).
@@ -12,6 +7,8 @@
 - Add `coworkerd check host` and host first-touch reporting so operators can distinguish host page-fault stalls from Worker CPU use. See [host checks](docs/cluster-state.md#host-first-touch-diagnostics).
 - Keep an expired suspect tenant in probation on its quarantine process until a later complete call succeeds with the process intact. The suspect record reports `suspected` or `probation`; successful probation logs `released`. See [suspects](docs/cluster-state.md#9-usage-and-suspects).
 - Repair takeover paths that could omit acknowledged Durable Object tails or later replay new pages on incomplete history and corrupt a database. Recovery collects source epochs, publishes adopted history before serving, preserves snapshot cuts, adds local repair exclusions and open-generation checks, and heals eligible surviving legacy copies. See [Durable Object recovery](docs/cluster-state.md#12-durable-object-durability).
+- Preserve an object's WAL while the durable process generation last given its files is alive, including before the node receives its open message and when the same process reopens it.
+- Fail this object open when reading or writing its WAL fails, preserving its files and allowing a later request to retry. A successful truncation is not rolled back if the following sync fails.
 - **Intentional behavior change:** a single encoded WAL record above 67,104,768 bytes (or the smaller configured peer-buffer limit) is refused with `STORAGE_UNAVAILABLE` before confirmation. Records over the normal 32 MiB page budget can occupy a page alone. SQL payload capacity is lower because WAL and record headers count, and Worker CPU and memory limits still apply. See [errors](docs/guide/errors.md).
 - Use the coordinated [0.5.3 / 0.5.4 upgrade procedure](docs/guide/install.md#upgrading-053-or-054-to-055), retaining backups, all node volumes and the same host boot. The kernel and system call tables are unchanged from 0.5.4; an upgrade from 0.5.3 replaces the complete package while stopped.
 - Known data-correctness, recovery-availability and resource issues remain. Read every item in [Known issues in 0.5.5](docs/guide/install.md#known-issues-in-055) before a stateful upgrade. Fixes continue in 0.5.6. Slow storage can also stall the node event loop and cause the watchdog to attribute that delay to a durable process; upgrade healing concentrates disk reads and snapshot uploads.
