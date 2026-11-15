@@ -95,6 +95,8 @@ public:
     std::function<uint32_t()> maxMemoryMiB;
   };
   void setWorkerLimits(WorkerLimitsView view);
+  // Local namespace removals from the node's current catalog, retried independently for each durable generation.
+  void setRootMaintenance(std::function<std::string()> request);
   // cgroup OOM counters have no victim identity: helper exposure makes a new
   // increment foreign, rather than evidence against a workerd SIGKILL exit.
   void setHostCheckOomGuard(std::function<bool()> guard);

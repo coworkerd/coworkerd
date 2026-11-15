@@ -1978,6 +1978,7 @@ public:
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
+    rootNamespaces.insert(target.namespaceId);
     auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
     if (!checked.ready) {
@@ -2342,6 +2343,16 @@ public:
 
   void reload() {
     desiredState.reload();
+  }
+  std::string rootMaintenanceRequest() const {
+    std::ostringstream out;out << "{\"namespaces\":[";
+    bool first = true;
+    for (const auto& id : rootNamespaces) {
+      const auto owner = desiredState.state().namespaceOwner(id);
+      if (owner && owner->active() && !tenantDeleting(owner->tenant)) continue;
+      out << (first ? "" : ",") << '"' << id << '"';first = false;
+    }
+    return out.str() + "]}";
   }
 
   std::string deploymentJson() const {
@@ -2887,6 +2898,7 @@ private:
   std::map<std::string, double> loadConfirmed;
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
+  std::set<std::string> rootNamespaces;
   double lastObjectPrune = 0;
   uint64_t nextLoadCheckSequence = 1, loadChecks = 0, loadCheckColdLoads = 0, loadFailureReroutes = 0, lateBackendFailures = 0;
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
@@ -8508,6 +8520,7 @@ int run(Launch launch) {
   runtime.setRetiring([&server](const std::string& processId, uint64_t generation) {
     return server.webSockets().goAwayGeneration(processId, generation, "rotation");
   });
+  runtime.setRootMaintenance([&server]() { return server.rootMaintenanceRequest(); });
   server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {
     return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +

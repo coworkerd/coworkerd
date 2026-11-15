@@ -803,6 +803,10 @@ struct ProcessGeneration {
   bool probePending = false;
   double probeAttemptAt = 0;
   uint64_t probeAttempts = 0, probeFailures = 0;
+  bool rootMaintenancePending = false;
+  double nextRootMaintenance = 0;
+  std::string rootMaintenanceApplied;
+  uint64_t rootMaintenanceAttempts = 0, rootMaintenanceFailures = 0;
   // Limit event channel: the read end of the pipe whose write end the child
   // inherited. An observer on the event loop moves whatever arrives into `eventTail` (so the pipe
   // never fills and workerd's writes never wait); rows are parsed and applied only when needed --
@@ -1258,6 +1262,7 @@ public:
   // process writes -- each row carries the limit it was measured against -- and the largest memory limit to
   // size a new generation's process-wide WebAssembly memory cap.
   ProcessPool::WorkerLimitsView workerLimits;
+  std::function<std::string()> rootMaintenance;
   BinarySignature configuredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
@@ -2422,6 +2427,44 @@ public:
     if (p->probeStartedAt == 0) p->probeStartedAt = p->probeAttemptAt;
     tasks.add(probe(p));
   }
+  kj::Promise<void> maintainRoots(std::shared_ptr<ProcessGeneration> p, std::string body) {
+    auto completed = kj::defer([p] { p->rootMaintenancePending = false; });
+    ++p->rootMaintenanceAttempts;
+    try {
+      // A separate client keeps a closing namespace from delaying this generation's health probes.
+      auto client = kj::newHttpClient(provider.getTimer(), headers, *p->probeAddress);
+      kj::HttpHeaders requestHeaders(headers);requestHeaders.setPtr(kj::HttpHeaderId::HOST, "runtime");
+      requestHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+      auto request = client->request(kj::HttpMethod::POST, "/__coworkerd/root-maintenance", requestHeaders, body.size());
+      co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS,
+          request.body->write(kj::arrayPtr(body.data(), body.size()).asBytes()));
+      request.body = nullptr;
+      auto response = co_await provider.getTimer().timeoutAfter(35000 * kj::MILLISECONDS, kj::mv(request.response));
+      auto text = co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS, response.body->readAllText(2 * 1024 * 1024));
+      if (p->pid == 0 || p->closing || p->retiring) co_return;
+      if (response.statusCode != 200) {
+        if (std::string(text.cStr()).find("namespace-closing") != std::string::npos) {
+          for (size_t i = 0; i < slots.size(); ++i) if (slots[i].current == p) {
+            enqueueAutomatic(i, "root-namespace-close");
+            break;
+          }
+        }
+        KJ_FAIL_REQUIRE("root namespace cleanup was refused", response.statusCode);
+      }
+      p->rootMaintenanceApplied = std::move(body);
+    } catch (const kj::Exception&) {
+      ++p->rootMaintenanceFailures;
+    }
+  }
+  void maybeMaintainRoots(const std::shared_ptr<ProcessGeneration>& p) {
+    if (!rootMaintenance || !p || !p->durable || p->rootMaintenancePending ||
+        p->closing || p->retiring || p->state != "ready" || !p->probeAddress || mono() < p->nextRootMaintenance) return;
+    p->nextRootMaintenance = mono() + 1000;
+    auto body = rootMaintenance();
+    if (body.empty() || body == p->rootMaintenanceApplied) return;
+    p->rootMaintenancePending = true;
+    tasks.add(maintainRoots(p, std::move(body)));
+  }
   // Applies the generation's newly read limit events to the counters.
   void applyEvents(Slot& s, ProcessGeneration& p) {
     p.pullEvents();
@@ -3141,6 +3184,7 @@ kj::Promise<void> ProcessPool::run() {
       if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
           && !(s.durable && impl->durableClosed) && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
+      impl->maybeMaintainRoots(s.current);
       for (const auto& p : s.retiring) impl->maybeProbe(p);
     }
     co_await impl->provider.getTimer().afterDelay(10 * kj::MILLISECONDS);
@@ -3272,6 +3316,7 @@ std::string ProcessPool::quarantineReadinessJson() const {
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
 void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = std::move(view); }
+void ProcessPool::setRootMaintenance(std::function<std::string()> request) { impl->rootMaintenance = std::move(request); }
 void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId) const { return impl->limitsOf(workerId); }
 bool ProcessPool::hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const {
@@ -3411,6 +3456,8 @@ std::string ProcessPool::json(uint32_t idleMs) const {
         << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
         << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
+        << ",\"rootMaintenanceAttempts\":" << (p ? p->rootMaintenanceAttempts : 0)
+        << ",\"rootMaintenanceFailures\":" << (p ? p->rootMaintenanceFailures : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
         << ",\"lastReason\":\"" << escape(p && !p->lastReason.empty() ? p->lastReason : s.lastReason) << "\",\"inFlight\":" << (p ? p->inFlight : 0)
         << ",\"lastExitCategory\":\"" << s.lastExitCategory << "\",\"memoryTerminatedRequests\":" << s.memoryTerminatedRequests
