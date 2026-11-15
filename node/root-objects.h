@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace coworkerd {
@@ -9,14 +10,13 @@ namespace coworkerd {
 class DeploymentState;
 struct VersionDefinition;
 
-constexpr const char* DURABLE_HOST_UNIQUE_KEY = "coworkerd-do-host-v1";
 constexpr const char* DURABLE_ROOT_UNIQUE_KEY_PREFIX = "coworkerd-do-root-v1-";
 
 // Local storage is selected by trusted object identity, never by a reported filename.
 struct RootStorageRef {
   std::string namespaceId, objectId;
   uint64_t dataEpoch = 0;
-  std::string uniqueKey = DURABLE_HOST_UNIQUE_KEY;
+  std::string uniqueKey;
   std::string storageId;
 
   std::filesystem::path directory(const std::filesystem::path& stack) const;
@@ -27,14 +27,18 @@ struct RootStorageRef {
 };
 
 RootStorageRef makeRootStorageRef(const std::string& namespaceId, const std::string& objectId,
-    uint64_t dataEpoch, bool roots, const std::string& hostUniqueKey = DURABLE_HOST_UNIQUE_KEY);
-bool isObjectStorageDirectory(const std::string& name, const std::string& hostUniqueKey);
+    uint64_t dataEpoch);
+bool isObjectStorageDirectory(const std::string& name);
 std::string rootNamespaceUniqueKey(const std::string& namespaceId);
 
-bool rootObjectsForTest();
 std::string rootLoaderBinding(bool durable);
 std::string rootLoaderService(bool durable, const std::string& storageDirectory);
-std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState& catalog,
+struct RootDispatch {
+  std::string plan, selection;
+  std::string descriptor(std::string encoded) const;
+};
+
+std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
     const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
     bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId);

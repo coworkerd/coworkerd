@@ -9,18 +9,17 @@
 
 #include <algorithm>
 #include <string_view>
-#include <cstdlib>
 #include <sstream>
 
 namespace coworkerd {
 
 RootStorageRef makeRootStorageRef(const std::string& namespaceId, const std::string& objectId,
-    uint64_t dataEpoch, bool roots, const std::string& hostUniqueKey) {
+    uint64_t dataEpoch) {
   RootStorageRef ref;
   ref.namespaceId = namespaceId;
   ref.objectId = objectId;
   ref.dataEpoch = dataEpoch;
-  ref.uniqueKey = roots ? rootNamespaceUniqueKey(namespaceId) : hostUniqueKey;
+  ref.uniqueKey = rootNamespaceUniqueKey(namespaceId);
   ref.storageId = durableHostId(ref.uniqueKey, durableHostName(namespaceId, objectId, dataEpoch));
   return ref;
 }
@@ -45,8 +44,7 @@ std::filesystem::path RootStorageRef::positionPath(const std::filesystem::path& 
   return directory(stack) / (storageId + ".position");
 }
 
-bool isObjectStorageDirectory(const std::string& name, const std::string& hostUniqueKey) {
-  if (name == hostUniqueKey) return true;
+bool isObjectStorageDirectory(const std::string& name) {
   const std::string_view prefix = DURABLE_ROOT_UNIQUE_KEY_PREFIX;
   if (!name.starts_with(prefix)) return false;
   const auto namespaceId = std::string_view(name).substr(prefix.size());
@@ -59,24 +57,16 @@ std::string rootNamespaceUniqueKey(const std::string& namespaceId) {
   return std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId;
 }
 
-bool rootObjectsForTest() {
-  static const bool enabled = [] {
-    const auto* value = std::getenv("COWORKERD_ROOT_OBJECTS_FOR_TEST");
-    return value != nullptr && std::string_view(value) == "1";
-  }();
-  return enabled;
-}
-
 std::string rootLoaderBinding(bool durable) {
-  return durable && rootObjectsForTest() ? "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n" : "";
+  return durable ? "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n" : "";
 }
 
 std::string rootLoaderService(bool durable, const std::string& storageDirectory) {
-  return durable && rootObjectsForTest() ? "(name = \"roots\", coworkerdRootLoader = (storagePath = " +
+  return durable ? "(name = \"roots\", coworkerdRootLoader = (storagePath = " +
       json::quote(storageDirectory) + ")),\n" : "";
 }
 
-std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState& catalog,
+std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
     const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
     bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
@@ -94,13 +84,14 @@ std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState
   };
   if (database) {
     if (const auto* databases = catalog.databases(tenant))
-      for (const auto& [name, value] : *databases) space(value, "SqlDatabase");
+      for (const auto& [name, value] : *databases)
+        if (value.id == namespaceId) space(value, "SqlDatabase");
   } else {
     for (const auto& name : version.declaredClasses)
       if (const auto* value = catalog.durableNamespace(version.workerId, name)) space(*value, "__coworkerd_do_"+name);
   }
   spaces << ']';
-  KJ_REQUIRE(selected, "a checked root dispatch must name a namespace in the deployment catalog");
+  if (!selected) return std::nullopt;
   std::ostringstream plan;
   plan << "{\"kind\":" << quote(database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
       << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
@@ -113,8 +104,7 @@ std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState
     plan << ",\"platformClass\":" << target("SqlDatabase", "{}");
   } else {
     const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
-    plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+sha256Hex(spaces.str()))
-        << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)
+    plan << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)
         << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
         << ",\"cpuLimitMs\":" << cpuLimitMs << ",\"memoryLimitMib\":" << memoryLimitMib << '}'
         << ",\"globalOutbound\":" << target("Egress", identity)
@@ -135,6 +125,17 @@ std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState
       firstBinding = false;
     }
     plan << ']';
+    // The source definition alone does not identify resolved bindings or rotated secrets.
+    // Hash their current trusted values without putting those values in keys or telemetry.
+    std::ostringstream environment;
+    for (const auto& value : version.variables)
+      environment << quote(value.name) << ':' << quote(value.type) << ':' << quote(value.value) << ',';
+    for (const auto& name : version.secrets) {
+      const auto* value = catalog.secret(version.workerId, name);
+      environment << quote(name) << ':' << (value ? quote(value->value) : "null") << ',';
+    }
+    plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
+        sha256Hex(plan.str()+environment.str()));
   }
   plan << '}';
   std::ostringstream selection;
@@ -142,9 +143,13 @@ std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState
       << ",\"dataEpoch\":" << quote(std::to_string(dataEpoch)) << ",\"dispatchChecked\":true";
   if (alarmAtUnixMs) selection << ",\"alarmFacetId\":" << alarmFacetId;
   selection << '}';
-  KJ_REQUIRE(!descriptor.empty() && descriptor.back() == '}', "an invocation descriptor is a JSON object");
-  descriptor.pop_back();
-  return descriptor+",\"rootPlan\":"+plan.str()+",\"rootSelection\":"+selection.str()+'}';
+  return RootDispatch{plan.str(), selection.str()};
+}
+
+std::string RootDispatch::descriptor(std::string encoded) const {
+  KJ_REQUIRE(!encoded.empty() && encoded.back() == '}', "an invocation descriptor is a JSON object");
+  encoded.pop_back();
+  return encoded+",\"rootPlan\":"+plan+",\"rootSelection\":"+selection+'}';
 }
 
 }  // namespace coworkerd

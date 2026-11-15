@@ -1940,7 +1940,7 @@ public:
     return worker->version;
   }
   // The "version" a request to a database's object runs. A database's class is the platform's own SQL Worker class,
-  // which the Host takes from its SQL_CLASS Binding: there is no tenant code and no package, so this definition
+  // selected by a platform root plan: there is no tenant code and no package, so this definition
   // carries only the identity the node's accounting, its leases and the runtime's descriptor need. Its Worker name
   // cannot be a tenant's (a Worker name never begins with an underscore), so the databases of a tenant have their
   // own lines, their own usage rows and their own admission.
@@ -1983,6 +1983,18 @@ public:
       }
       throw DurableDispatchRefused{std::move(checked)};
     }
+    // Prepare from the current catalog before registering this event or its lease. A
+    // namespace removed while admission/recovery waited is an ordinary refusal.
+    if (!target.isDatabase()) {
+      if (auto missing = secretRefusal(*version, false))
+        throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
+    }
+    const auto limits = namedLimits(version->workerId);
+    auto root = coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
+        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
+        target.alarmFacetId);
+    if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
+        "the Durable Object namespace is unavailable or being deleted"}};
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     const auto sequence = nextSequence++;
@@ -1995,14 +2007,16 @@ public:
           allocation->pins, allocation->ingressServerId});
       return execute(std::move(version), sequence, std::move(id), allocation->treeId, "durable", allocation->parentInvocationId,
           allocation->callSequence, allocation->orderSequence, allocation->grant, allocation->remainingAfter, allocation->depth,
-          allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target);
+          allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
+          &*root);
     }
     auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
     const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
     addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
     return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
-        leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target);
+        leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
+        &*root);
   }
 
   ChildAllocation allocateChild(
@@ -2252,7 +2266,8 @@ private:
       uint16_t depth,
       double expiresAtMonotonicMs,
       SharedVersionPins pins, std::shared_ptr<AdmissionSlot> slot, std::shared_ptr<coworkerd::ProcessCall> process,
-      std::string ingressServerId = {}, bool coldLoaded = false, const DurableTarget* durable = nullptr) {
+      std::string ingressServerId = {}, bool coldLoaded = false, const DurableTarget* durable = nullptr,
+      const coworkerd::RootDispatch* root = nullptr) {
 
     auto timing = slot ? slot->timing : nullptr;
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }
@@ -2266,7 +2281,7 @@ private:
         orderSequence,
         depth,
         expiresAtMonotonicMs,
-        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable);
+        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable, root);
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
@@ -2680,7 +2695,7 @@ private:
       const SharedVersionPins& pins, const coworkerd::ProcessCall& process,
       const std::string& ingressServerId, const std::string& entrypoint, bool trial = false,
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
-      const DurableTarget* durable = nullptr) const {
+      const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr) const {
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
     descriptor.setServerId(serverConfig.serverId.c_str());
@@ -2793,11 +2808,9 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
-      if (coworkerd::rootObjectsForTest()) {
-        const auto root = coworkerd::rootDispatchDescriptor(json.encode(descriptor.asReader()).cStr(),
-            desiredState.state(), version, limits.cpuMs, limits.memoryMiB, durable->namespaceId,
-            durable->objectId, durable->dataEpoch, durable->isDatabase(), durable->alarmAtUnixMs, durable->alarmFacetId);
-        return kj::str(root.c_str());
+      if (root != nullptr) {
+        const auto encoded = root->descriptor(json.encode(descriptor.asReader()).cStr());
+        return kj::str(encoded.c_str());
       }
       return json.encode(descriptor.asReader());
     }
@@ -8388,11 +8401,10 @@ int run(Launch launch) {
   // on the object store as segments, and rebuilds an object from that history when this node takes its shard over
   // (node/durable-log.h).
   coworkerd::DurableLog durableLog({server.placementConfig().serverId, membership->view().instance, launch.stackDirectory,
-      coworkerd::DURABLE_HOST_UNIQUE_KEY, server.placementConfig().durableLog,
+      server.placementConfig().durableLog,
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
-          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
-      coworkerd::rootObjectsForTest()},
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {

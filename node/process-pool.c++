@@ -126,9 +126,6 @@ constexpr int LAUNCHER_STATUS_FD = 7, LAUNCHER_PROGRAM_FD = 8;
 constexpr int DURABLE_LOG_FD = 9;
 // The node alone holds the write end; EOF on this read end ends workerd after node death.
 constexpr int PARENT_FD = 10;
-// The unique key of the durable processes' Host namespace, the same on every node: an object's Host id is
-// HOST.idFromName(<namespace id>/<object id>) under it, and its databases are in <stack>/do/<key>/.
-constexpr const char* DURABLE_HOST_KEY = "coworkerd-do-host-v1";
 // The launcher's interface version (launcher/PROTOCOL.md) and its exit status for a failed launch.
 constexpr int LAUNCHER_PROTOCOL = 2, LAUNCH_FAILED_STATUS = 125;
 // A process the system call filter ended leaves this signal (the enforce mode).
@@ -2061,8 +2058,7 @@ public:
       for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
       configFile << "],\n";
     }
-    // A durable process's runtime also has the Host class's namespace (runtime.js: each object is a Host running its
-    // Worker's class as a facet), stored on the local disk below <stack>/do, and the Host Binding. The runtime runs with
+    // A durable process selects tenant and platform roots through its private root loader. The runtime runs with
     // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
     // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
     configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
@@ -2073,16 +2069,11 @@ public:
         << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
             p->egressToken + "\"),\n")
         << rootLoaderBinding(p->durable)
-        << (p->durable ? "(name = \"HOST\", durableObjectNamespace = \"Host\"),\n"
-            "(name = \"SQL_CLASS\", durableObjectClass = (name = \"runtime\", entrypoint = \"SqlDatabase\")),\n" : "") <<
-        "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
+        << "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
         << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
-        << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\""
-        << (p->durable ? std::string(",\ndurableObjectNamespaces = [(className = \"Host\", uniqueKey = \"") + DURABLE_HOST_KEY +
-            "\", enableSql = true)],\ndurableObjectStorage = (localDisk = \"do-disk\")" : std::string()) << ")),\n"
+        << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
         << rootLoaderService(p->durable, durableDirectory())
-        << (p->durable ? "(name = \"do-disk\", disk = (path = \"" + escape(durableDirectory()) + "\", writable = true)),\n" : "") <<
-        "(name = \"server\", external = (address = \"" << escape(bindingAddress)
+        << "(name = \"server\", external = (address = \"" << escape(bindingAddress)
         << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
         "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
         // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).

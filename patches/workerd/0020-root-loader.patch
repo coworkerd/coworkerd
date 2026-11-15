@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 15 Nov 2026 21:50:51 +0800
-Subject: [PATCH] Load private tenant roots and reuse configured platform
- classes
+Date: Mon, 16 Nov 2026 01:07:40 +0800
+Subject: [PATCH] Load tenant and platform roots with explicit node selection
 
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
@@ -50,10 +49,10 @@ index b93462531c985a6f50435d33906d156df352a1da..4b2b90fad3d89ee6756709f43c55a355
  
 diff --git a/src/workerd/server/coworkerd-root-loader.c++ b/src/workerd/server/coworkerd-root-loader.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9c2392f67223deb5229be0f0ca6e51fb3dc0fcb
+index 0000000000000000000000000000000000000000..051a58c19fe2a0f32ae4b5f03168c55798260899
 --- /dev/null
 +++ b/src/workerd/server/coworkerd-root-loader.c++
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,66 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -101,21 +100,28 @@ index 0000000000000000000000000000000000000000..c9c2392f67223deb5229be0f0ca6e51f
 +
 +}  // namespace
 +
-+jsg::Ref<api::Fetcher> CoworkerdRootLoader::getRoot(jsg::Lock& js, kj::String selectionJson) {
++jsg::Promise<jsg::Ref<api::Fetcher>> CoworkerdRootLoader::getRoot(
++    jsg::Lock& js, kj::String selectionJson) {
 +  auto& context = IoContext::current();
 +  auto request = context.getIoChannelFactory().getWorkerdDebugPort().getEntrypointRequest();
 +  request.setService(service);
 +  Frankenvalue::fromJson(kj::mv(selectionJson)).toCapnp(request.initProps());
-+  kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<RootBootstrapChannel>(
-+      request.send().getEntrypoint(), context.getHttpOverCapnpFactory(), context.getByteStreamFactory());
-+  return js.alloc<api::Fetcher>(
-+      context.addObject(kj::mv(channel)), api::Fetcher::RequiresHostAndProtocol::NO);
++  // Resolve the selection before exposing a Fetcher, so refreshing a reclaimed plan never replays an event.
++  return context.awaitIo(js, request.send(),
++      [](jsg::Lock& js, capnp::Response<rpc::WorkerdDebugPort::GetEntrypointResults> response)
++          -> jsg::Ref<api::Fetcher> {
++    auto& context = IoContext::current();
++    kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<RootBootstrapChannel>(
++        response.getEntrypoint(), context.getHttpOverCapnpFactory(), context.getByteStreamFactory());
++    return js.alloc<api::Fetcher>(
++        context.addObject(kj::mv(channel)), api::Fetcher::RequiresHostAndProtocol::NO);
++  });
 +}
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/coworkerd-root-loader.h b/src/workerd/server/coworkerd-root-loader.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ddeba3c92eaa0a9e7956817c3f7bf84b194cb88a
+index 0000000000000000000000000000000000000000..6d0f07748f0fa68afb26da6791f85bedfd798437
 --- /dev/null
 +++ b/src/workerd/server/coworkerd-root-loader.h
 @@ -0,0 +1,28 @@
@@ -135,7 +141,7 @@ index 0000000000000000000000000000000000000000..ddeba3c92eaa0a9e7956817c3f7bf84b
 +  CoworkerdRootLoader(uint channel, kj::String service)
 +      : Fetcher(channel, RequiresHostAndProtocol::YES), service(kj::mv(service)) {}
 +
-+  jsg::Ref<api::Fetcher> getRoot(jsg::Lock& js, kj::String selectionJson);
++  jsg::Promise<jsg::Ref<api::Fetcher>> getRoot(jsg::Lock& js, kj::String selectionJson);
 +
 +  JSG_RESOURCE_TYPE(CoworkerdRootLoader) {
 +    JSG_INHERIT(api::Fetcher);
@@ -1686,10 +1692,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b07fee7c5dc8eadf596c80018fd59892c16b15dd
+index 0000000000000000000000000000000000000000..005072cf58e482f167c51b005f2ab0e6a6699f52
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,2028 @@
+@@ -0,0 +1,2037 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -3422,6 +3428,12 @@ index 0000000000000000000000000000000000000000..b07fee7c5dc8eadf596c80018fd59892
 +        if !selection.dispatch_checked {
 +            return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
 +        }
++        // Let the trusted runtime refresh a cached key before starting an object event.
++        if !self.plans.borrow().contains_key(&selection.plan) {
++            return Err(kj::failed!(
++                "jsg.Error: ROOT_PLAN_MISSING: the root plan was reclaimed"
++            ));
++        }
 +        Ok(Rc::new(RootSelectedChannel {
 +            registry: self
 +                .this
@@ -3463,7 +3475,10 @@ index 0000000000000000000000000000000000000000..b07fee7c5dc8eadf596c80018fd59892
 +        let selection = self.selection.clone();
 +        registry.stamp_metadata(&selection, &mut metadata)?;
 +        Ok(worker::PromisedInterface::new(async move {
-+            registry.root(selection).await?.start_request(metadata)
++            let channel = registry.root(selection).await.map_err(|error| {
++                kj::failed!("jsg.Error: ROOT_PREPARATION_FAILED: {}", error.description())
++            })?;
++            channel.start_request(metadata)
 +        })
 +        .into_kj())
 +    }
