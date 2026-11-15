@@ -465,7 +465,11 @@ private:
     if (segments[1] != "tenants") co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
     if (n == 2) {
       if (!caller.admin) co_return co_await adminOnly();
-      if (is(kj::HttpMethod::POST)) co_return co_await send(response, co_await coworkerd::createTenant(state, co_await readBody(body)));
+      if (is(kj::HttpMethod::POST)) {
+        auto text = co_await readBody(body, response);
+        if (text) co_await send(response, co_await coworkerd::createTenant(state, *text));
+        co_return;
+      }
       if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::listTenants(state));
       co_return co_await methodNotAllowed(response, "GET, POST");
     }
@@ -477,7 +481,11 @@ private:
     if (n == 3) {
       if (is(kj::HttpMethod::GET)) co_return co_await tenantSummary(tenant, response);
       if (!caller.admin) co_return co_await adminOnly();
-      if (is(kj::HttpMethod::PATCH)) co_return co_await send(response, co_await coworkerd::updateTenant(state, tenant, co_await readBody(body)));
+      if (is(kj::HttpMethod::PATCH)) {
+        auto text = co_await readBody(body, response);
+        if (text) co_await send(response, co_await coworkerd::updateTenant(state, tenant, *text));
+        co_return;
+      }
       if (is(kj::HttpMethod::DELETE)) co_return co_await send(response, co_await coworkerd::deleteTenant(context, tenant));
       co_return co_await methodNotAllowed(response, "GET, PATCH, DELETE");
     }
@@ -491,8 +499,11 @@ private:
     if (area == "credentials") {
       if (n == 4) {
         if (!caller.admin) co_return co_await adminOnly();
-        if (is(kj::HttpMethod::POST))
-          co_return co_await send(response, co_await coworkerd::createCredential(state, tenant, co_await readBody(body)));
+        if (is(kj::HttpMethod::POST)) {
+          auto text = co_await readBody(body, response);
+          if (text) co_await send(response, co_await coworkerd::createCredential(state, tenant, *text));
+          co_return;
+        }
         if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::listCredentials(state, tenant));
         co_return co_await methodNotAllowed(response, "GET, POST");
       }
@@ -549,8 +560,9 @@ private:
       if (!controlName(version)) co_return co_await fail(response, 400, "INVALID_REQUEST", "invalid version name");
       if (activation) {
         if (!is(kj::HttpMethod::POST)) co_return co_await methodNotAllowed(response, "POST");
-        auto text = co_await readBody(body);
-        if (text.find_first_not_of(" \t\r\n{}") != std::string::npos)
+        auto text = co_await readBody(body, response);
+        if (!text) co_return;
+        if (text->find_first_not_of(" \t\r\n{}") != std::string::npos)
           co_return co_await fail(response, 400, "INVALID_REQUEST", "the activation takes no body (routes: PUT .../routes)");
         co_return co_await answer(response, co_await coworkerd::controlActivate(context, id, version, std::nullopt), "deploy");
       }
@@ -589,9 +601,14 @@ private:
     co_return co_await fail(response, 404, "NOT_FOUND", "no such endpoint");
   }
 
-  kj::Promise<std::string> readBody(kj::AsyncInputStream& body, uint64_t limit = 64 * 1024) {
-    auto text = co_await body.readAllText(limit);
-    co_return std::string(text.cStr(), text.size());
+  kj::Promise<std::optional<std::string>> readBody(kj::AsyncInputStream& body, ControlResponse& response,
+      uint64_t limit = 64 * 1024, const char* reason = "the request body is at most 64 KiB") {
+    auto bytes = co_await readAtMost(body, limit);
+    if (!bytes) {
+      co_await fail(response, 413, "REQUEST_TOO_LARGE", reason);
+      co_return std::nullopt;
+    }
+    co_return std::string(reinterpret_cast<const char*>(bytes->begin()), bytes->size());
   }
   // A body of at most `limit` bytes: read with one byte more, so that one of exactly `limit` bytes is taken (KJ's
   // read with a limit fails once the bytes read reach it). None when the body is longer.
@@ -1138,7 +1155,8 @@ private:
       co_return co_await fail(response, 400, "INVALID_REQUEST", "resultsFormat is ARRAY_OF_OBJECTS or ROWS_AND_COLUMNS");
     auto record = coworkerd::readDatabaseRecord(state, tenant, database);
     if (record.status != 200) co_return co_await send(response, record);
-    auto text = co_await readBody(body, 1024 * 1024);
+    auto text = co_await readBody(body, response, 1024 * 1024, "a statement is at most 1 MiB");
+    if (!text) co_return;
     auto list = co_await members();
     if (list.empty())
       co_return co_await fail(response, 503, "STORAGE_UNAVAILABLE", "no node is a live member of the cluster");
@@ -1147,7 +1165,7 @@ private:
     std::optional<Fetched> refused;
     for (const auto& member : list) {
       auto answer = co_await ask(member.address, "/__coworkerd/databases/" + tenant + "/" + database +
-          "/query?resultsFormat=" + format, text, 15000);
+          "/query?resultsFormat=" + format, *text, 15000);
       if (answer.ok) {
         std::string code;
         try {

@@ -535,8 +535,8 @@ export async function applyMigrations({ directory, table, query, files, onApplie
   for (const name of files) {
     try {
       const body = migrationBody(await readFile(join(directory, name), "utf8"), name, table);
-      if (Buffer.byteLength(body, "utf8") >= MAX_QUERY_BYTES)
-        throw new Error("file is too large: the JSON request including the ledger reaches or exceeds 1 MiB; split the file");
+      if (Buffer.byteLength(body, "utf8") > MAX_QUERY_BYTES)
+        throw new Error("file is too large: the JSON request including the ledger exceeds 1 MiB; split the file");
       let recovered = false;
       try { checked(await query(body)); }
       catch (error) {
@@ -672,7 +672,7 @@ const exportLiteral = column => {
 };
 async function exportAnswers(query, statements) {
   const body = JSON.stringify(statements);
-  if (Buffer.byteLength(body) >= MAX_QUERY_BYTES) throw new Error("export query exceeds the 1 MiB request limit; select fewer tables with --table");
+  if (Buffer.byteLength(body) > MAX_QUERY_BYTES) throw new Error("export query exceeds the 1 MiB request limit; select fewer tables with --table");
   return checked(await query(body));
 }
 async function exportState(query) {

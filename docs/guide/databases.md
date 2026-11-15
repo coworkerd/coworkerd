@@ -120,10 +120,10 @@ curl -s -X POST "$CONTROL_PLANE/v1/tenants/acme/databases/books/query" \
 Set `CONTROL_PLANE` to your API URL and `COWCTL_TOKEN` to your tenant credential. CLI `--param` values are strings (the SQL engine applies its conversions); the HTTP `params` array can also carry numbers, null and byte arrays. The public endpoint is `/query`; `/execute` is not routed. It accepts an object or an array of statement objects. `resultsFormat=ARRAY_OF_OBJECTS` (the default) returns row objects; `resultsFormat=ROWS_AND_COLUMNS` returns `{columns,rows}`, also used by the JavaScript client for `raw()`. Other format names are refused. The answer is D1's: `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a
 statement that failed. An array of `{"sql","params"}` runs one transaction and answers an array; a failing statement rolls the transaction back.
 
-The public HTTP JSON request must be **strictly below 1 MiB**. A single byte-array parameter therefore holds less
+The public HTTP JSON request may be **at most 1 MiB (1,048,576 bytes)**. A single byte-array parameter therefore holds less
 binary data than the body size: commas and decimal digits count too. With a short INSERT and all bytes equal to 255,
 262,128 binary bytes (about 256 KiB) fit in a 1,048,574-byte request; one more byte made a 1,048,578-byte request and was
-rejected at the control-plane body limit. SQL text, other parameters and the byte values change that boundary.
+rejected with HTTP 413 `REQUEST_TOO_LARGE` at the control-plane body limit. SQL text, other parameters and the byte values change that boundary.
 64 KiB and 200 KiB arrays containing the full byte range were verified end to end.
 
 A single object request may contain multiple SQL statements in its `sql` string. SQLite handles statement boundaries,
@@ -179,7 +179,7 @@ last statement for the SQL interface. The ledger INSERT remains a separate array
 
 Migration files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger
 `BEGIN … END` bodies are supported. The full JSON-encoded request, including escapes and the ledger statement, must be
-strictly less than **1 MiB** (at most 1,048,575 bytes). An oversized file is rejected locally before its execution request is sent; split it into smaller files.
+at most **1 MiB** (1,048,576 bytes). An oversized file is rejected locally before its execution request is sent; split it into smaller files.
 One file consumes one database-object event. The node's default CPU configuration is 200 ms, but enforcement of that
 budget for this internal SQL event is **not verified** by this change; do not treat 200 ms as a verified migration limit.
 

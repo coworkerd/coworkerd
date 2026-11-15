@@ -5259,14 +5259,15 @@ public:
           "{\"code\":\"INVALID_REQUEST\",\"reason\":\"a tenant and a database are named [a-z0-9][a-z0-9-]{0,62}\"}");
       co_return;
     }
-    auto text = co_await body.readAllText(LIMIT + 1);
-    if (text.size() > LIMIT) {
+    kj::Maybe<kj::String> text;
+    try { text = co_await body.readAllText(LIMIT + 1); } catch (const kj::Exception&) {}
+    if (text == kj::none || KJ_ASSERT_NONNULL(text).size() > LIMIT) {
       co_await sendJson(response, 413, "Payload Too Large",
           "{\"code\":\"REQUEST_TOO_LARGE\",\"reason\":\"a statement is at most 1 MiB\"}");
       co_return;
     }
     auto answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
-        std::string(text.cStr(), text.size()), resultsFormat);
+        std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat);
     co_await sendJson(response, answer.status ? answer.status : 503,
         answer.status == 200 ? "OK" : "Error",
         answer.body.empty() ? std::string("{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the database answered nothing\"}")
