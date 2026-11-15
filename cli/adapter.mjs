@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants, existsSync, readFileSync } from "node:fs";
-import { cp, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, open, link, rename, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -656,6 +656,153 @@ export async function importSql({ file, query, onProgress = () => {} }) {
   } finally {
     stream?.destroy();
     await handle?.close();
+  }
+}
+
+// D1 export uses database-produced SQL literals, never JavaScript representations of cell values.
+export const EXPORT_PAGE_ROWS = 1000;
+export const EXPORT_STATEMENT_BYTES = 100000;
+const exportSchemaSql = "SELECT rowid,name,type,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid";
+const exportStateStatements = [{ sql: "SELECT quote(total_changes()) AS changes" }, { sql: exportSchemaSql }];
+const exportTooLarge = error => /D1_RESULT_TOO_LARGE|string or blob too big/i.test(error.message);
+const exportLiteral = column => {
+  const c = identifier(column);
+  // SQLite quote(TEXT) stops at NUL. Let SQLite quote the complete bytes and construct a TEXT expression instead.
+  return `CASE WHEN typeof(${c})='text' AND instr(${c},char(0))>0 THEN 'CAST('||quote(CAST(${c} AS BLOB))||' AS TEXT)' ELSE quote(${c}) END`;
+};
+async function exportAnswers(query, statements) {
+  const body = JSON.stringify(statements);
+  if (Buffer.byteLength(body) >= MAX_QUERY_BYTES) throw new Error("export query exceeds the 1 MiB request limit; select fewer tables with --table");
+  return checked(await query(body));
+}
+async function exportState(query) {
+  const answers = await exportAnswers(query, exportStateStatements);
+  return { changes: answers[0].results[0].changes, schema: answers[1].results };
+}
+function exportTableList(schema, filter) {
+  return schema.filter(o => o.type === "table" && (!filter.size || filter.has(o.name))).map(o => ({ ...o })).sort((a, b) =>
+    Number(a.name === "sqlite_sequence") - Number(b.name === "sqlite_sequence") || a.rowid - b.rowid).filter(o => {
+    if (/^CREATE\s+VIRTUAL\s+TABLE/i.test(o.sql)) throw new Error(`cannot export virtual table ${o.name}`);
+    return !o.name.startsWith("_cf_") && (o.name === "sqlite_sequence" || /^sqlite_stat./.test(o.name) || !o.name.startsWith("sqlite_"));
+  });
+}
+function exportSelect(table, { limit, after } = {}) {
+  const values = table.columns.map((c, i) => `${exportLiteral(c.name)} AS v${i}`);
+  const keys = table.keys.map((c, i) => `${exportLiteral(c)} AS k${i}`);
+  const ids = table.keys.map(identifier);
+  const where = after ? ` WHERE (${ids.join(",")}) > (${after.join(",")})` : "";
+  return `SELECT ${[...values, ...keys].join(",")} FROM ${identifier(table.name)}${where} ORDER BY ${ids.join(",")}${limit ? ` LIMIT ${limit}` : ""}`;
+}
+
+export async function exportSql({ file, query, noSchema = false, noData = false, tables = [], force = false,
+  allowWrites = false, onProgress = () => {} }) {
+  if (noSchema && noData) throw new Error("--no-schema and --no-data cannot be combined");
+  if (typeof file !== "string" || !file) throw new Error("export needs --output FILE");
+  const output = resolve(file);
+  if (!force && existsSync(output)) throw new Error(`${output} already exists; use --force to replace it`);
+  const report = { file: output, mode: "atomic", rows: 0, tables: [], bytes: 0, pages: 0, retries: 0,
+    initialPageRows: EXPORT_PAGE_ROWS, consistency: { checked: false, changesDetected: false, allowWrites },
+    oversizedStatements: 0, oversizedTables: {} };
+  let directory, handle;
+  try {
+    const start = await exportState(query), filter = new Set(tables);
+    const plan = exportTableList(start.schema, filter);
+    for (const table of plan) {
+      if (noData) { table.columns = []; table.keys = []; continue; }
+      table.columns = (await sql(query, `PRAGMA table_info(${identifier(table.name)})`)).results;
+      const names = new Set(table.columns.map(c => c.name.toLowerCase()));
+      const alias = ["_rowid_", "rowid", "oid"].find(name => !names.has(name));
+      table.keys = !/\bWITHOUT\s+ROWID\b/i.test(table.sql) && alias ? [alias] :
+        table.columns.filter(c => c.pk).sort((a, b) => a.pk - b.pk).map(c => c.name);
+      if (!table.columns.length || !table.keys.length) throw new Error(`cannot paginate table ${table.name}: no accessible rowid or primary key`);
+    }
+    let snapshot;
+    try {
+      snapshot = await exportAnswers(query, [...exportStateStatements, ...(!noData ? plan.map(t => ({ sql: exportSelect(t) })) : [])]);
+      if (canonical(snapshot[1].results) !== canonical(start.schema))
+        throw new Error("database schema changed while planning export; stop writes and retry");
+    } catch (error) {
+      if (!exportTooLarge(error)) throw error;
+      report.mode = "paged"; report.retries++;
+      onProgress({ phase: "retry", pageRows: EXPORT_PAGE_ROWS, reason: error.message });
+    }
+    directory = await mkdtemp(join(dirname(output), ".cowctl-export-"));
+    handle = await open(join(directory, "export.sql"), "wx", 0o600);
+    const emit = async statement => { const text = statement + "\n"; await handle.writeFile(text); report.bytes += Buffer.byteLength(text); };
+    await emit("PRAGMA defer_foreign_keys=TRUE;");
+    for (const [index, table] of plan.entries()) {
+      const item = { name: table.name, rows: 0 }; report.tables.push(item);
+      if (!noSchema) {
+        if (table.name === "sqlite_sequence") await emit("DELETE FROM sqlite_sequence;");
+        else if (/^sqlite_stat./.test(table.name)) await emit("ANALYZE sqlite_schema;");
+        else await emit((/CREATE TABLE ['"].*/.test(table.sql) ? `CREATE TABLE IF NOT EXISTS ${table.sql.substring(13)}` : table.sql) + ";");
+      }
+      if (noData) continue;
+      const writeRows = async rows => {
+        for (const row of rows) {
+          const literals = table.columns.map((_, i) => row[`v${i}`]);
+          if (literals.some(v => typeof v !== "string")) throw new Error(`invalid quoted value in table ${table.name}`);
+          const statement = `INSERT INTO ${identifier(table.name)} (${table.columns.map(c => identifier(c.name)).join(",")}) VALUES(${literals.join(",")});`;
+          if (Buffer.byteLength(statement) > EXPORT_STATEMENT_BYTES) {
+            report.oversizedStatements++;
+            report.oversizedTables[table.name] = (report.oversizedTables[table.name] ?? 0) + 1;
+          }
+          await emit(statement); item.rows++; report.rows++;
+        }
+      };
+      if (snapshot) await writeRows(snapshot[index + 2].results);
+      else {
+        let after, pageRows = EXPORT_PAGE_ROWS;
+        for (;;) {
+          let rows;
+          try { rows = (await sql(query, exportSelect(table, { limit: pageRows, after }))).results; }
+          catch (error) {
+            if (!exportTooLarge(error)) throw new Error(`table ${table.name}: ${error.message}`, { cause: error });
+            report.retries++;
+            if (pageRows === 1) {
+              const ids = table.keys.map(identifier);
+              const where = after ? ` WHERE (${ids.join(",")}) > (${after.join(",")})` : "";
+              const row = (await sql(query, `SELECT ${table.keys.map((c, i) => `${exportLiteral(c)} AS k${i}`).join(",")} FROM ${identifier(table.name)}${where} ORDER BY ${ids.join(",")} LIMIT 1`)).results[0];
+              throw new Error(`table ${table.name}, row key (${table.keys.map((_, i) => row?.[`k${i}`]).join(",")}): one row exceeds the 7340032-byte reply limit`);
+            }
+            pageRows = Math.max(1, Math.floor(pageRows / 2));
+            onProgress({ phase: "retry", table: table.name, pageRows, reason: error.message });
+            continue;
+          }
+          await writeRows(rows); report.pages++;
+          onProgress({ phase: "page", table: table.name, rows: item.rows, pageRows });
+          if (rows.length < pageRows) break;
+          after = table.keys.map((_, i) => rows.at(-1)[`k${i}`]);
+        }
+      }
+      onProgress({ phase: "table", table: table.name, rows: item.rows });
+    }
+    if (!noSchema) {
+      const schema = snapshot ? snapshot[1].results : start.schema;
+      const rest = schema.filter(o => ["index", "trigger", "view"].includes(o.type) &&
+        !o.name.startsWith("_cf_") && !o.tbl_name.startsWith("_cf_") && (!filter.size || filter.has(o.name)))
+        .sort((a, b) => a.type.localeCompare(b.type, "en") || a.rowid - b.rowid);
+      for (const object of rest) await emit(object.sql + ";");
+    }
+    if (!snapshot) {
+      const end = await exportState(query);
+      report.consistency.checked = true;
+      report.consistency.changesDetected = start.changes !== end.changes || canonical(start.schema) !== canonical(end.schema);
+      if (report.consistency.changesDetected && !allowWrites)
+        throw new Error("database changed during export; stop writes and retry, or use --allow-writes for a potentially inconsistent export");
+      if (report.consistency.changesDetected) await emit("-- WARNING: database changed during export; --allow-writes accepted a potentially inconsistent file.");
+    }
+    await handle.close(); handle = undefined;
+    const temporary = join(directory, "export.sql");
+    if (force) await rename(temporary, output);
+    else await link(temporary, output); // Atomic no-clobber publication, including a file created while exporting.
+    return report;
+  } catch (error) {
+    error.export = { ...report, error: error.message };
+    throw error;
+  } finally {
+    if (handle) await handle.close();
+    if (directory) await rm(directory, { recursive: true, force: true });
   }
 }
 

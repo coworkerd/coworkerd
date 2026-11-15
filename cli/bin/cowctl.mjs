@@ -57,6 +57,8 @@ usage: cowctl <command> [options]              (in the project's directory)
      execute <name> (--sql SQL [--param V]... | --file FILE [--yes]) [--json]
                               the tenant's databases; execute sends SQL or imports a UTF-8 file in atomic chunks. A created database
                               is waited for until every node serves it (at most 15 s)
+     export <name> --output FILE [--no-schema | --no-data] [--table NAME]... [--force] [--allow-writes] [--json]
+                              export SQL using quoted database values; large results are paginated
      migrations create <database> <description> | list <database> | apply <database> [--yes]
                               versioned SQL files; --dir DIR and --table TABLE override Wrangler configuration;
                               one file and its ledger row in one transaction (--json for structured results)
@@ -602,6 +604,7 @@ function bytesText(value) {
 async function d1(args) {
   const [operation, ...rest] = args;
   if (operation === "migrations") return databaseMigrations(rest);
+  if (operation === "export") return databaseExport(rest);
   if (!["create", "list", "delete", "execute"].includes(operation ?? ""))
     throw usage("d1 create <name> | d1 list | d1 delete <name> | d1 execute <name> (--sql SQL | --file FILE)");
   const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", file: "value", param: "list",
@@ -690,6 +693,29 @@ async function d1(args) {
     `${one.meta?.rows_written ?? 0} written, ${one.meta?.changes ?? 0} change${one.meta?.changes === 1 ? "" : "s"}`);
   for (const row of rows.slice(0, 100)) console.log(`  ${JSON.stringify(row)}`);
   if (rows.length > 100) console.log(`  ... ${rows.length - 100} more (--json for all of them)`);
+}
+
+async function databaseExport(args) {
+  const { options, positional } = parse(args, { tenant: "value", json: "flag", output: "value", table: "list",
+    "no-schema": "flag", "no-data": "flag", force: "flag", "allow-writes": "flag" });
+  if (positional.length !== 1 || !NAME.test(positional[0]) || !options.output)
+    throw usage("d1 export <name> --output FILE [--no-schema | --no-data] [--table NAME]... [--force] [--allow-writes]");
+  const config = loadConfig(), tenant = tenantOf(options, config), [name] = positional;
+  try {
+    const { exportSql } = await import(ADAPTER);
+    const result = await exportSql({ file: options.output, noSchema: options["no-schema"], noData: options["no-data"],
+      tables: options.table, force: options.force, allowWrites: options["allow-writes"],
+      query: async body => (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
+        { body, headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(20000) })).json,
+      onProgress: p => console.error(`export: ${p.phase}; ${p.table ?? "database"}; ${p.rows ?? 0} rows; page ${p.pageRows ?? "all"}`),
+    });
+    if (result.consistency.changesDetected) console.error("export: WARNING: database changed; --allow-writes accepted a potentially inconsistent file");
+    if (result.oversizedStatements) console.error(`export: WARNING: ${result.oversizedStatements} INSERT statements exceed 100000 bytes in ${Object.entries(result.oversizedTables).map(([t, n]) => `${t} (${n})`).join(", ")}; cowctl d1 execute --file cannot import those statements`);
+    console.log(options.json ? JSON.stringify({ success: true, ...result }, null, 2) : `exported ${result.rows} rows to ${result.file} (${result.mode})`);
+  } catch (error) {
+    if (options.json && error.export) console.log(JSON.stringify({ success: false, ...error.export }, null, 2));
+    throw new Failure(error.message);
+  }
 }
 
 async function databaseMigrations(args) {
