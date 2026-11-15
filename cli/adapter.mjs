@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants, existsSync, readFileSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join, matchesGlob, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -535,8 +535,8 @@ export async function applyMigrations({ directory, table, query, files, onApplie
   for (const name of files) {
     try {
       const body = migrationBody(await readFile(join(directory, name), "utf8"), name, table);
-      if (Buffer.byteLength(body, "utf8") > MAX_QUERY_BYTES)
-        throw new Error("file is too large: the JSON request including the ledger exceeds 1 MiB; split the file");
+      if (Buffer.byteLength(body, "utf8") >= MAX_QUERY_BYTES)
+        throw new Error("file is too large: the JSON request including the ledger reaches or exceeds 1 MiB; split the file");
       let recovered = false;
       try { checked(await query(body)); }
       catch (error) {
@@ -556,6 +556,107 @@ export async function applyMigrations({ directory, table, query, files, onApplie
     }
   }
   return applied;
+}
+
+// SQLite, in the SQL Worker, chooses statement boundaries. Keep incomplete text verbatim.
+// Inspect only the last SQL token, without splitting or executing statements. An extra empty
+// statement is refused by native ingest, so an already terminated file must not gain another ';'.
+function sqlTail(text) {
+  let quote = null, comment = null, last = "";
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i], next = text[i + 1];
+    if (comment === "line") { if (char === "\n" || char === "\r") comment = null; continue; }
+    if (comment === "block") { if (char === "*" && next === "/") { comment = null; i++; } continue; }
+    if (quote) {
+      if (char === quote) { if (next === quote && quote !== "]") i++; else quote = null; }
+      continue;
+    }
+    if (char === "-" && next === "-") { comment = "line"; i++; continue; }
+    if (char === "/" && next === "*") { comment = "block"; i++; continue; }
+    if (/\s/.test(char)) continue;
+    last = char;
+    if (["'", '"', "`", "["].includes(char)) quote = char === "[" ? "]" : char;
+  }
+  return last;
+}
+
+export const IMPORT_CHUNK_BYTES = 32 * 1024;
+export const IMPORT_REQUEST_BYTES = MAX_QUERY_BYTES - 64 * 1024;
+export async function importSql({ file, query, onProgress = () => {} }) {
+  const report = { file: resolve(file), committedOffset: 0, statementCount: 0, chunks: 0, rowsRead: 0, rowsWritten: 0 };
+  let pending = "", sentBytes = 0, sourceBytes = 0, handle, stream;
+  const bodyOf = text => JSON.stringify({ ingest: text });
+  const size = text => Buffer.byteLength(bodyOf(text), "utf8");
+  const send = async text => {
+    const answer = checked(await query(bodyOf(text)))[0], ingest = answer.ingest;
+    if (typeof ingest?.remainder !== "string" || !text.endsWith(ingest.remainder) ||
+        !Number.isSafeInteger(ingest.statementCount) || ingest.statementCount < 0)
+      throw new Error("the SQL Worker returned an invalid ingest answer; current chunk commit is uncertain");
+    pending = ingest.remainder;
+    report.committedOffset = Math.min(sourceBytes, sentBytes - Buffer.byteLength(pending, "utf8"));
+    report.statementCount += ingest.statementCount;
+    report.rowsRead += ingest.rowsRead;
+    report.rowsWritten += ingest.rowsWritten;
+    report.chunks++;
+    onProgress({ ...report });
+  };
+  try {
+    handle = await open(report.file, "r");
+    if (!(await handle.stat()).isFile()) throw new Error("the import source must be a regular UTF-8 file");
+    stream = handle.createReadStream({ highWaterMark: IMPORT_CHUNK_BYTES, autoClose: false });
+    async function* texts() {
+      // Fatal decoding preserves the relationship between UTF-8 byte positions and SQLite's remainder.
+      const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+      for await (const bytes of stream) { const text = decoder.decode(bytes, { stream: true }); if (text) yield text; }
+      const tail = decoder.decode(); if (tail) yield tail;
+    }
+    const iterator = texts()[Symbol.asyncIterator]();
+    let current = await iterator.next();
+    while (!current.done) {
+      const next = await iterator.next();
+      sourceBytes += Buffer.byteLength(current.value, "utf8");
+      // Look ahead to EOF: a small file, including a missing final semicolon, is one transaction.
+      const tail = next.done ? sqlTail(pending + current.value) : null;
+      if (tail === "") { pending = ""; break; } // EOF contains only whitespace and comments.
+      let text = current.value + (next.done && tail !== ";" ? "\n;" : "");
+      while (text) {
+        let length = text.length;
+        if (size(pending + text) > IMPORT_REQUEST_BYTES) {
+          let low = 0, high = length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            if (size(pending + text.slice(0, mid)) <= IMPORT_REQUEST_BYTES) low = mid;
+            else high = mid - 1;
+          }
+          length = low;
+          // Never cut a Unicode code point between its UTF-16 surrogate halves.
+          if (length && /[\uD800-\uDBFF]/.test(text[length - 1])) length--;
+          if (!length) {
+            const bytes = Buffer.byteLength(pending, "utf8") + Buffer.byteLength(String.fromCodePoint(text.codePointAt(0)), "utf8");
+            throw new Error(`statement at file byte ${report.committedOffset} is too large: at least ${bytes} source bytes; its JSON request exceeds ${IMPORT_REQUEST_BYTES} bytes (960 KiB); oversized request was not sent`);
+          }
+        }
+        const part = text.slice(0, length); text = text.slice(length);
+        sentBytes += Buffer.byteLength(part, "utf8");
+        await send(pending + part);
+      }
+      current = next;
+    }
+    if (hasStatement(pending)) throw new Error("incomplete statement at end of file after appending a newline and semicolon");
+    // SQLite may leave only whitespace/comments in its remainder. These contain no uncommitted SQL.
+    report.committedOffset = sourceBytes;
+    onProgress({ ...report });
+    return report;
+  } catch (error) {
+    const isUncertain = uncertain(error) || error.message.includes("current chunk commit is uncertain");
+    const reason = isUncertain ? `current chunk commit is uncertain; request was not resent: ${error.message}` : error.message;
+    const failure = new Error(`${report.file}: committed through file byte ${report.committedOffset}; ${report.statementCount} statements executed; ${reason}`, { cause: error });
+    failure.import = { ...report, uncertain: isUncertain, error: error.message };
+    throw failure;
+  } finally {
+    stream?.destroy();
+    await handle?.close();
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

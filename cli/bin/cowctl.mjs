@@ -54,8 +54,8 @@ usage: cowctl <command> [options]              (in the project's directory)
   do list [--json]            the Worker's Durable Object namespaces
   do inspect <class> [--json] one namespace: its shards, the owner of each shard taken, objects and bytes
   d1 create <name> [--no-wait] | list | delete <name> [--yes] [--no-wait]
-     execute <name> --sql SQL [--param V]... [--json]
-                              the tenant's databases; execute sends one statement to the database. A created database
+     execute <name> (--sql SQL [--param V]... | --file FILE [--yes]) [--json]
+                              the tenant's databases; execute sends SQL or imports a UTF-8 file in atomic chunks. A created database
                               is waited for until every node serves it (at most 15 s)
      migrations create <database> <description> | list <database> | apply <database> [--yes]
                               versioned SQL files; --dir DIR and --table TABLE override Wrangler configuration;
@@ -603,8 +603,8 @@ async function d1(args) {
   const [operation, ...rest] = args;
   if (operation === "migrations") return databaseMigrations(rest);
   if (!["create", "list", "delete", "execute"].includes(operation ?? ""))
-    throw usage("d1 create <name> | d1 list | d1 delete <name> | d1 execute <name> --sql SQL");
-  const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", param: "list",
+    throw usage("d1 create <name> | d1 list | d1 delete <name> | d1 execute <name> (--sql SQL | --file FILE)");
+  const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", file: "value", param: "list",
     "no-wait": "flag" });
   const config = loadConfig(), tenant = tenantOf(options, config);
   const show = (answer) => { console.log(JSON.stringify(answer, null, 2)); };
@@ -657,7 +657,28 @@ async function d1(args) {
     console.log(`database ${tenant}/${name}: ${answer.database.status}`);
     return;
   }
-  if (typeof options.sql !== "string" || !options.sql.trim()) throw usage("d1 execute takes --sql SQL");
+  if (options.file !== undefined) {
+    if (options.sql !== undefined || options.param !== undefined) throw usage("--file cannot be combined with --sql or --param");
+    if (!options.yes && process.stdin.isTTY && !process.env.CI) {
+      const reply = await prompt(`import ${options.file} into ${tenant}/${name}? each chunk commits separately [y/N] `);
+      if (!/^y(es)?$/i.test(reply.trim())) throw new Failure("not imported", { code: 1 });
+    }
+    const { importSql } = await import(ADAPTER.href);
+    try {
+      const answer = await importSql({ file: options.file,
+        query: async body => (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
+          { body, headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(20000) })).json,
+        onProgress: progress => console.error(`import: committed through byte ${progress.committedOffset}; ${progress.statementCount} statements; ${progress.chunks} chunks`),
+      });
+      if (options.json) return show({ success: true, ...answer });
+      console.log(`imported ${answer.file}: ${answer.statementCount} statements, ${answer.committedOffset} bytes committed`);
+    } catch (error) {
+      if (options.json && error.import) show({ success: false, ...error.import });
+      throw new Failure(error.message);
+    }
+    return;
+  }
+  if (typeof options.sql !== "string" || !options.sql.trim()) throw usage("d1 execute takes --sql SQL or --file FILE");
   const body = JSON.stringify({ sql: options.sql, params: options.param ?? [] });
   const answer = (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
     { body, headers: { "content-type": "application/json" } })).json;

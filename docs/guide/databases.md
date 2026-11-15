@@ -63,7 +63,7 @@ export default {
 
 The runtime provides this client over the platform SQL Worker. What is there: `prepare()`, `bind()`, `run()`, `all()`, `first()` and `first("column")`, `raw({columnNames})`, `batch()`
 and `exec()`, with D1's `meta` (`changes`, `last_row_id`, `rows_read`, `rows_written`, `changed_db`, `size_after`) and
-D1's errors ([error codes](errors.md), section 4). What is not: import and export, restore to a point
+D1's errors ([error codes](errors.md), section 4). What is not: export, restore to a point
 in time, read replicas, and the Sessions API -- `withSession()`, `dump()` and `query()` are refused.
 
 `batch()` executes its statements in order within one transaction. Any statement failure rolls back the whole batch and rejects the promise with `D1_ERROR:`. `exec()` splits its argument by lines and runs each as a statement, stops at the first failure, and keeps earlier successful lines; `D1_EXEC_ERROR` names the failing line. It does not roll back earlier lines.
@@ -119,7 +119,7 @@ last statement for the SQL interface. The ledger INSERT remains a separate array
 
 Migration files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger
 `BEGIN … END` bodies are supported. The full JSON-encoded request, including escapes and the ledger statement, must be
-at most **1 MiB**. An oversized file is rejected locally before its execution request is sent; split it into smaller files.
+strictly less than **1 MiB** (at most 1,048,575 bytes). An oversized file is rejected locally before its execution request is sent; split it into smaller files.
 One file consumes one database-object event. The node's default CPU configuration is 200 ms, but enforcement of that
 budget for this internal SQL event is **not verified** by this change; do not treat 200 ms as a verified migration limit.
 
@@ -127,7 +127,61 @@ On a timeout or `503 RESULT_UNCERTAIN`, the CLI does **not resend the file**. It
 present it continues, otherwise it stops with instructions to run `apply` again. If the ledger read also fails it stops.
 The earlier write might have committed despite a lost reply; a later `apply` checks the ledger before choosing files.
 
-## 7. Delete one
+## 7. Import a SQL file
+
+```bash
+cowctl d1 execute books --file books.sql --yes
+```
+
+`--file` reads a UTF-8 SQL file and is mutually exclusive with `--sql` and `--param`. Without `--yes`, an interactive
+terminal asks before importing. Progress goes to standard error; `--json` returns the result, including
+`committedOffset` (a zero-based byte offset), `statementCount` and `chunks`. A SQL error exits nonzero and reports the
+last confirmed offset, statement count and SQLite error. There is no resume option in this release.
+
+To move a database from Cloudflare, export it, create an empty destination, then import:
+
+```bash
+wrangler d1 export books --remote --output books.sql
+cowctl d1 create books
+cowctl d1 execute books --file books.sql --yes
+```
+
+**Each chunk is one transaction; the entire file is not.** A failing chunk rolls back completely, while earlier
+chunks stay committed. Import into a newly created, empty database. Fixing a file and rerunning it can repeat earlier
+INSERTs, so the reported offset is diagnostic rather than an automatic retry point. A timeout or `503 RESULT_UNCERTAIN`
+stops immediately, reports the last confirmed offset and says that the current chunk may have committed. It never
+resends that chunk.
+
+The CLI reads 32 KiB at a time and sends the previous SQLite `remainder` with the next text. JSON-encoded requests are
+capped at 960 KiB, leaving 64 KiB below the control plane's 1 MiB boundary, including escapes. The small read size also
+lets statements below SQLite's SQL-length limit span several reads. An oversized incomplete statement is rejected
+locally with its starting byte offset and a lower bound on its size; no oversized request is sent. Earlier incomplete
+prefixes may have reached SQLite without executing a statement. SQLite also enforces its own statement limits and can
+return `statement too long: SQLITE_TOOBIG` below the HTTP limit.
+
+At EOF, a final statement without a semicolon receives a newline and semicolon. Already terminated SQL receives no extra
+empty statement; trailing whitespace/comments need no execution. A small file that fits one read uses one transaction,
+including when its final semicolon is missing. Remaining incomplete SQL, such as an unclosed string, is an error.
+Files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger `BEGIN … END` bodies work.
+
+Foreign keys are checked for each committed chunk. `PRAGMA defer_foreign_keys=TRUE;` lasts only until that chunk's
+transaction ends. If a child row refers to a parent row in a later chunk, the child chunk fails with `EXECUTION_FAILED` and the object is reset and rolled back to its last known good state.
+The observed reason ends with `FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)`. Put referenced tables and their rows before
+referencing rows; the pragma at the start of a Wrangler export does not defer constraints across the whole import.
+
+The HTTP protocol also accepts a standalone `POST /v1/tenants/{t}/databases/{d}/query` body:
+
+```json
+{"ingest":"CREATE TABLE books(id INTEGER PRIMARY KEY); INSERT INTO books VALUES(1);"}
+```
+
+`ingest` must be a string, without `sql` or `params`, and cannot appear in an array. SQLite executes its complete
+statements within `transactionSync`; an error rolls back that request. A successful answer has `success: true`,
+`results: []`, the usual `meta`, and `ingest: {remainder, statementCount, rowsRead, rowsWritten}`. Send the returned
+remainder unchanged before the next text; SQLite chooses statement boundaries, including trigger bodies and quoted
+semicolons. Failure uses the usual `success: false` and SQLite error text. Existing SQL object/array requests are unchanged.
+
+## 8. Delete one
 
 ```bash
 cowctl d1 delete books --yes
@@ -137,7 +191,7 @@ The database is marked deleting: no Binding to it works and no new statement rea
 the tenant's storage. Its data stays in the object store (there is no data reclamation in 0.5), so the name cannot
 be used again in this release.
 
-## 8. Failure and consistency
+## 9. Failure and consistency
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 

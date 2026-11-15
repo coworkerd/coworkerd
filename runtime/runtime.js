@@ -1176,7 +1176,8 @@ export class SqlDatabase extends DurableObject {
     const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
     const one = (statement) => {
       try {
-        return this.runStatement(statement, resultsFormat);
+        return query && statement && Object.hasOwn(statement, "ingest")
+          ? this.runIngest(statement) : this.runStatement(statement, resultsFormat);
       } catch (error) {
         // What D1 does with a failing statement: the answer says so, it is not an exception of the object.
         return { success: false, error: String(error instanceof Error ? error.message : error) };
@@ -1202,7 +1203,26 @@ export class SqlDatabase extends DurableObject {
     return Response.json(answers);
   }
 
+  runIngest(statement) {
+    if (typeof statement.ingest !== "string" || Object.hasOwn(statement, "sql") || Object.hasOwn(statement, "params"))
+      throw new Error("ingest must be a string, without sql or params, sent as a standalone /query object");
+    return this.ctx.storage.transactionSync(() => {
+      const sqlite = this.ctx.storage.sql;
+      const counters = () => sqlite.exec("SELECT total_changes() AS changes, last_insert_rowid() AS last_row_id").toArray()[0];
+      const before = counters(), sizeBefore = sqlite.databaseSize;
+      const ingest = sqlite.ingest(statement.ingest);
+      const after = counters(), sizeAfter = sqlite.databaseSize;
+      return { success: true, results: [], ingest, meta: {
+        duration: 0, changes: after.changes - before.changes, last_row_id: after.last_row_id,
+        changed_db: after.changes !== before.changes || after.last_row_id !== before.last_row_id || sizeAfter !== sizeBefore,
+        size_after: sizeAfter, rows_read: ingest.rowsRead, rows_written: ingest.rowsWritten,
+      } };
+    });
+  }
+
   runStatement(statement, resultsFormat) {
+    if (statement && Object.hasOwn(statement, "ingest"))
+      throw new Error("ingest is only accepted as a standalone /query object");
     const { sql, params = [] } = statement ?? {};
     if (typeof sql !== "string") throw new Error("a statement names its sql");
     const sqlite = this.ctx.storage.sql;
