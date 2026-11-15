@@ -1979,6 +1979,12 @@ public:
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
     rootNamespaces.insert(target.namespaceId);
+    if (!target.isDatabase()) {
+      // One installation registers every declared class, including classes never opened here.
+      for (const auto& name : version->declaredClasses)
+        if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
+            space != nullptr && space->status == "active") rootNamespaces.insert(space->id);
+    }
     auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
     if (!checked.ready) {
