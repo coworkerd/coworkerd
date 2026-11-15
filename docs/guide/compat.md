@@ -72,3 +72,11 @@ D1 numbers follow JavaScript precision: integers outside the safe range may lose
 `1`; select `quote()` or `printf()` text for an exact stored representation. HTTP SQL byte-array parameters share the
 strictly-below-1-MiB JSON request limit (about 256 KiB of all-255 data in the measured short INSERT). The database guide
 includes a candidate-row query for historical binary values stored as text; it is a hint, not proof or automatic repair.
+
+HTTP SQL and `env.DB` limit each complete UTF-8 JSON reply to **7 MiB (7,340,032 bytes)**, including columns, `meta`,
+array entries and framing, and BLOBs expanded to number arrays. Overflow is a statement error:
+HTTP 200 with `success:false` and `D1_RESULT_TOO_LARGE: ...`, or `D1_ERROR: D1_RESULT_TOO_LARGE: ...` from `env.DB`
+(`exec()` retains its `D1_EXEC_ERROR` wrapper). The remaining cursor is consumed and the object stays usable.
+A single object `INSERT ... RETURNING` keeps its committed writes despite the result error; an array `/query` or
+`batch()` rolls back. `exec()` keeps earlier successful lines. Use `LIMIT` to paginate. Cursor draining has no separate
+time limit, and the reply cap does not bound process memory. See [databases](databases.md#result-size).
