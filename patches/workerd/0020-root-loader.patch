@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 15 Nov 2026 19:44:05 +0800
-Subject: [PATCH] Load private roots with bounded storage fences and node alarm
- targets
+Date: Sun, 15 Nov 2026 21:50:51 +0800
+Subject: [PATCH] Load private tenant roots and reuse configured platform
+ classes
 
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
@@ -1474,7 +1474,7 @@ index 62f81319fac9290082865af6b0f74557b5989cff..f2614ff7e16957afa140d26b34ff022f
      /// start).
      fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
 diff --git a/src/workerd/server/server/config.rs b/src/workerd/server/server/config.rs
-index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c06e538b4 100644
+index eb27593debd3d2f2bd33f095691ff9c46bb0160f..25790e578e8be4d1c8505c0f70ce1acf7968f0ef 100644
 --- a/src/workerd/server/server/config.rs
 +++ b/src/workerd/server/server/config.rs
 @@ -65,6 +65,7 @@ use crate::worker::WorkerService;
@@ -1546,7 +1546,7 @@ index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c
          // Third pass: the links.
          for (name, worker) in server.workers() {
              tolerate_deployment(&server.report, name, server.link_worker(name, worker))?;
-@@ -1510,6 +1530,34 @@ impl Server {
+@@ -1510,6 +1530,48 @@ impl Server {
          Ok(server)
      }
  
@@ -1574,6 +1574,20 @@ index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c
 +            .ok_or_else(|| kj::failed!("root bridge entrypoint missing"))
 +    }
 +
++    pub(crate) fn root_platform_worker(
++        &self,
++        service: &str,
++        class: &str,
++    ) -> Result<Rc<WorkerService>> {
++        self.services
++            .0
++            .get(service)
++            .and_then(Service::as_worker)
++            .filter(|worker| worker.has_actor_class(class))
++            .cloned()
++            .ok_or_else(|| kj::failed!("root platform class must belong to a configured worker"))
++    }
++
 +    pub(crate) fn has_configured_namespace_key(&self, key: &str) -> bool {
 +        self.namespaces_by_unique_key.contains_key(key)
 +    }
@@ -1581,7 +1595,7 @@ index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c
      /// Resolves everything `worker`'s config names into its channel table.
      fn link_worker(self: &Rc<Self>, name: &str, worker: &Rc<WorkerService>) -> Result<()> {
          let Some(pending) = worker.take_pending_link() else {
-@@ -1796,6 +1844,17 @@ async fn make_service(
+@@ -1796,6 +1858,17 @@ async fn make_service(
                      .map(Service::Disk),
              ))
          }
@@ -1599,7 +1613,7 @@ index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c
          // Made once the cluster is joined (`make_bucket_services`).
          Ok(service::Which::Bucket(_)) => Ok(Service::Leaf(Rc::new(InvalidConfigChannel))),
          Err(capnp::NotInSchema(_)) => {
-@@ -1839,6 +1898,19 @@ impl ServerHandle {
+@@ -1839,6 +1912,19 @@ impl ServerHandle {
          persistent: bool,
      ) -> Result<Box<ActorClassChannel>> {
          let class_name: Option<&str> = class_name.into();
@@ -1619,7 +1633,7 @@ index eb27593debd3d2f2bd33f095691ff9c46bb0160f..1d06e17b0f21312b27eb27977de9805c
          self.server()?
              .stub_worker(service_name)?
              .actor_class(class_name, Some(props), persistent)
-@@ -1859,6 +1931,13 @@ impl ServerHandle {
+@@ -1859,6 +1945,13 @@ impl ServerHandle {
          persistent: bool,
      ) -> Result<Box<SubrequestChannel>> {
          let server = self.server()?;
@@ -1672,10 +1686,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936465dcd0a
+index 0000000000000000000000000000000000000000..b07fee7c5dc8eadf596c80018fd59892c16b15dd
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,1888 @@
+@@ -0,0 +1,2028 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1689,6 +1703,7 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +use std::rc::{Rc, Weak};
 +use std::time::{Duration, SystemTime};
 +
++use base64::Engine as _;
 +use futures::FutureExt;
 +use futures::future::LocalBoxFuture;
 +use futures::future::Shared;
@@ -1720,6 +1735,7 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +    tenant: String,
 +    worker_id: String,
 +    version_id: String,
++    #[serde(default)]
 +    generation: u64,
 +    cpu_limit_ms: u32,
 +    memory_limit_mib: u32,
@@ -1732,6 +1748,8 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +struct Module {
 +    name: String,
 +    source: String,
++    #[serde(rename = "type", default)]
++    module_type: String,
 +}
 +
 +#[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -1806,8 +1824,14 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +#[serde(rename_all = "camelCase")]
 +struct Deployment {
 +    kind: String,
++    #[serde(default)]
++    tenant: String,
++    #[serde(default)]
++    platform_class: Option<RootTarget>,
 +    worker_id: String,
 +    version_id: String,
++    #[serde(default)]
++    version_fingerprint: String,
 +    compatibility_date: String,
 +    #[serde(default)]
 +    compatibility_flags: Vec<String>,
@@ -1830,6 +1854,26 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +}
 +
 +impl Deployment {
++    fn is_platform(&self) -> bool {
++        self.kind == "platform"
++    }
++
++    fn owner_tenant(&self) -> Result<&str> {
++        if self.is_platform() {
++            Ok(&self.tenant)
++        } else {
++            Ok(&self.record()?.tenant)
++        }
++    }
++
++    fn initial_generation(&self) -> Result<u64> {
++        if self.is_platform() {
++            Ok(0)
++        } else {
++            Ok(self.record()?.generation)
++        }
++    }
++
 +    fn record(&self) -> Result<&CreationRecord> {
 +        let record = self
 +            .creation_record
@@ -1862,18 +1906,55 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +    }
 +
 +    fn plan_key(&self) -> Result<String> {
++        if self.is_platform() {
++            return serde_json::to_string(&json!({
++                "kind": "platform", "tenant": self.tenant, "workerId": self.worker_id,
++                "versionId": self.version_id, "platformClass": self.platform_class,
++                "namespaces": self.namespaces,
++            }))
++            .map_err(|error| kj::failed!("root key: {error}"));
++        }
 +        let record = self.record()?;
 +        serde_json::to_string(&json!({
 +            "workerId": self.worker_id, "versionId": self.version_id,
 +            "cpuLimitMs": record.cpu_limit_ms, "memoryLimitMib": record.memory_limit_mib,
 +            "generation": record.generation,
++            "versionFingerprint": self.version_fingerprint,
 +        }))
 +        .map_err(|error| kj::failed!("root key: {error}"))
 +    }
 +
 +    fn validate(&self) -> Result<()> {
-+        self.record()?;
-+        if self.modules.is_empty() || self.namespaces.is_empty() {
++        if self.is_platform() {
++            let class = self
++                .platform_class
++                .as_ref()
++                .ok_or_else(|| kj::failed!("platform root class missing"))?;
++            if self.tenant.is_empty()
++                || self.worker_id.is_empty()
++                || self.version_id.is_empty()
++                || class.service.is_empty()
++                || class.entrypoint.is_none()
++                || self.creation_record.is_some()
++                || !self.modules.is_empty()
++                || !self.environment.is_empty()
++                || !self.durable_objects.is_empty()
++                || self.global_outbound.is_some()
++                || self.streaming_tail.is_some()
++            {
++                return Err(kj::failed!(
++                    "platform root plans cannot load tenant code or records"
++                ));
++            }
++        } else {
++            self.record()?;
++            if self.platform_class.is_some() {
++                return Err(kj::failed!(
++                    "tenant root plans cannot select a platform class"
++                ));
++            }
++        }
++        if (!self.is_platform() && self.modules.is_empty()) || self.namespaces.is_empty() {
 +            return Err(kj::failed!(
 +                "a root deployment needs modules and namespaces"
 +            ));
@@ -1888,6 +1969,15 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        }
 +        let (mut ids, mut bindings, mut keys) = (HashSet::new(), HashSet::new(), HashSet::new());
 +        for namespace in &self.namespaces {
++            if self.is_platform()
++                && self
++                    .platform_class
++                    .as_ref()
++                    .and_then(|class| class.entrypoint.as_ref())
++                    != Some(&namespace.class_name)
++            {
++                return Err(kj::failed!("platform root namespace class mismatch"));
++            }
 +            if !::cluster::compose::is_path_component(&namespace.unique_key)
 +                || namespace.id.is_empty()
 +                || namespace.class_name.is_empty()
@@ -2068,7 +2158,11 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +            .collect();
 +        let mut workers = Vec::new();
 +        for key in unused {
-+            self.plans.borrow_mut().remove(&key);
++            let platform = self
++                .plans
++                .borrow_mut()
++                .remove(&key)
++                .is_some_and(|plan| plan.deployment.is_platform());
 +            let instances: Vec<_> = self
 +                .compiled
 +                .borrow()
@@ -2078,7 +2172,9 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +                .collect();
 +            for instance in instances {
 +                if let Some(worker) = self.compiled.borrow_mut().remove(&instance) {
-+                    workers.push(worker);
++                    if !platform {
++                        workers.push(worker);
++                    }
 +                }
 +            }
 +        }
@@ -2177,6 +2273,17 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +    }
 +
 +    async fn compile(&self, deployment: &Deployment, key: &WorkerKey) -> Result<Rc<WorkerService>> {
++        if let Some(class) = &deployment.platform_class {
++            return self
++                .server
++                .borrow()
++                .upgrade()
++                .ok_or_else(|| kj::disconnected!("root server gone"))?
++                .root_platform_worker(
++                    &class.service,
++                    class.entrypoint.as_deref().unwrap_or("default"),
++                );
++        }
 +        // A binding invocation must yield its calling isolate before compiling another isolate.
 +        self.factory.sleep(Duration::ZERO).await;
 +        let errors = Rc::new(RefCell::new(Vec::new()));
@@ -2208,7 +2315,23 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +            for (index, source) in deployment.modules.iter().enumerate() {
 +                let mut module = modules.reborrow().get(index as u32);
 +                module.set_name(source.name.as_str());
-+                module.set_es_module(source.source.as_str());
++                match source.module_type.as_str() {
++                    "" | "js" => module.set_es_module(source.source.as_str()),
++                    "cjs" => module.set_common_js_module(source.source.as_str()),
++                    "text" => module.set_text(source.source.as_str()),
++                    "json" => module.set_json(source.source.as_str()),
++                    "data" | "wasm" => {
++                        let bytes = base64::engine::general_purpose::STANDARD
++                            .decode(&source.source)
++                            .map_err(|error| kj::failed!("root module base64: {error}"))?;
++                        if source.module_type == "data" {
++                            module.set_data(&bytes);
++                        } else {
++                            module.set_wasm(&bytes);
++                        }
++                    }
++                    _ => return Err(kj::failed!("unsupported root module type")),
++                }
 +            }
 +            conf.reborrow()
 +                .init_durable_object_storage()
@@ -2286,6 +2409,9 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        worker: &Rc<WorkerService>,
 +        spaces: &HashMap<String, NamespaceEntry>,
 +    ) -> Result<()> {
++        if plan.deployment.is_platform() {
++            return Ok(());
++        }
 +        let _ = spaces;
 +        let pending = worker
 +            .take_pending_link()
@@ -2483,7 +2609,7 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +                        .ok_or_else(|| kj::failed!("namespace source missing"))?;
 +                    if existing.unique_key != namespace.unique_key
 +                        || owner.deployment.worker_id != deployment.worker_id
-+                        || owner.deployment.record()?.tenant != deployment.record()?.tenant
++                        || owner.deployment.owner_tenant()? != deployment.owner_tenant()?
 +                    {
 +                        return Err(kj::failed!(
 +                            "a root namespace cannot change its owner or storage"
@@ -2499,7 +2625,7 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +                }
 +            }
 +        }
-+        let key = deployment.key(deployment.record()?.generation)?;
++        let key = deployment.key(deployment.initial_generation()?)?;
 +        let plan = Rc::new(Plan {
 +            deployment,
 +            lock: tokio::sync::Mutex::new(()),
@@ -2511,12 +2637,16 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
 +            Ok(spaces) => spaces,
 +            Err(error) => {
-+                worker.unlink();
++                if !plan.deployment.is_platform() {
++                    worker.unlink();
++                }
 +                return Err(error);
 +            }
 +        };
 +        if let Err(error) = self.link(&plan_key, &plan, &key, &worker, &spaces) {
-+            worker.unlink();
++            if !plan.deployment.is_platform() {
++                worker.unlink();
++            }
 +            return Err(error);
 +        }
 +        for entry in spaces.values() {
@@ -2575,7 +2705,9 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        let worker = self.compile(&plan.deployment, &key).await?;
 +        let linked = self.link(plan_key, &plan, &key, &worker, &self.namespaces.borrow());
 +        if let Err(error) = linked {
-+            worker.unlink();
++            if !plan.deployment.is_platform() {
++                worker.unlink();
++            }
 +            return Err(error);
 +        }
 +        assert!(
@@ -2766,6 +2898,9 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        let Some(plan) = self.plans.borrow().get(plan_key).cloned() else {
 +            return false;
 +        };
++        if plan.deployment.is_platform() {
++            return false;
++        }
 +        let current = self.compiled.borrow().get(key).cloned();
 +        let matches = plan.loaded.borrow().as_ref() == Some(key)
 +            && current.as_ref().is_some_and(|current| {
@@ -2917,6 +3052,11 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +            "plan": id, "workerId": plan.deployment.worker_id, "versionId": plan.deployment.version_id,
 +            "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
 +            "key": *plan.loaded.borrow(), "namespaces": plan.deployment.namespaces,
++            "kind": plan.deployment.kind, "tenant": plan.deployment.owner_tenant().ok(),
++            "platformClass": plan.deployment.platform_class,
++            "configuredWorker": if plan.deployment.is_platform() {
++                self.loaded(plan).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
++            } else { None },
 +        })).collect();
 +        plans.sort_by(|a, b| a["plan"].as_str().cmp(&b["plan"].as_str()));
 +        let mut namespaces: Vec<_> = self.namespaces.borrow().iter().map(|(id, entry)| json!({
@@ -2939,8 +3079,15 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +                .abort_all(Some(&kj::disconnected!("root registry shutdown")));
 +        }
 +        let workers = std::mem::take(&mut *self.compiled.borrow_mut());
-+        for worker in workers.values() {
-+            worker.unlink();
++        for (key, worker) in &workers {
++            if !self
++                .plans
++                .borrow()
++                .get(&key.plan_key)
++                .is_some_and(|plan| plan.deployment.is_platform())
++            {
++                worker.unlink();
++            }
 +        }
 +        for worker in std::mem::take(&mut *self.retiring.borrow_mut()).values() {
 +            worker.unlink();
@@ -3384,6 +3531,13 @@ index 0000000000000000000000000000000000000000..bb233e8c935e16d362088e3193d01936
 +        let text = std::str::from_utf8(url).map_err(|error| kj::failed!("root URL: {error}"))?;
 +        let url = url::Url::parse(text).map_err(|error| kj::failed!("root URL: {error}"))?;
 +        let value = match (method, url.path()) {
++            (Method::POST, "/lookup") => {
++                let deployment: Deployment = serde_json::from_value(read_json(body).await?)
++                    .map_err(|error| kj::failed!("root lookup: {error}"))?;
++                let key = deployment.plan_key()?;
++                let present = self.registry.plans.borrow().contains_key(&key);
++                json!({"plan": if present { Some(key) } else { None }})
++            }
 +            (Method::POST, "/install") => {
 +                let deployment = serde_json::from_value(read_json(body).await?)
 +                    .map_err(|error| kj::failed!("root deployment: {error}"))?;
