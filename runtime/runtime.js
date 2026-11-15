@@ -1225,13 +1225,29 @@ export class SqlDatabase extends DurableObject {
       throw new Error("ingest is only accepted as a standalone /query object");
     const { sql, params = [] } = statement ?? {};
     if (typeof sql !== "string") throw new Error("a statement names its sql");
+    const typeError = value => {
+      let text;
+      try { text = String(value); } catch { text = Object.prototype.toString.call(value); }
+      return new Error("D1_TYPE_ERROR: Type '" + typeof value + "' not supported for value '" + text + "'");
+    };
+    if (!Array.isArray(params)) throw typeError(params);
+    const bindings = params.map(value => {
+      if (Array.isArray(value)) {
+        if (!value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) throw typeError(value);
+        return new Uint8Array(value);
+      }
+      if (value !== null && typeof value === "object") throw typeError(value);
+      return value;
+    });
     const sqlite = this.ctx.storage.sql;
     const counters = sqlite.prepare("SELECT total_changes() AS changes, last_insert_rowid() AS last_row_id");
     const sizeBefore = sqlite.databaseSize;
     const [[changesBefore, lastRowBefore]] = Array.from(counters().raw());
-    const cursor = sqlite.prepare(sql)(...params);
+    const cursor = sqlite.prepare(sql)(...bindings);
     const columns = cursor.columnNames;
-    const rows = Array.from(cursor.raw());
+    const rows = Array.from(cursor.raw(), row => row.map(value =>
+      value instanceof ArrayBuffer ? Array.from(new Uint8Array(value)) :
+      ArrayBuffer.isView(value) ? Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : value));
     const results = resultsFormat === "ROWS_AND_COLUMNS"
       ? { columns, rows }
       : rows.map((row) => Object.fromEntries(columns.map((column, i) => [column, row[i]])));
