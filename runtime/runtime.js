@@ -1361,15 +1361,17 @@ async function trialLoad(descriptor, env, ctx) {
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
       invocationId: descriptor.invocationId, treeId: descriptor.treeId };
     report = await (await worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch("http://coworkerd-trial/", { cf })).json();
-    if (report.ok && descriptor.loadCheck !== true && descriptor.format === "v2" && (descriptor.durableObjectClasses ?? []).length) {
+    if (report.ok && descriptor.loadCheck !== true && descriptor.format === "v2" &&
+        (descriptor.durableObjectClasses ?? []).length && report.durableObjectClasses?.every(value => value.usable)) {
       const rootWorker = env.LOADER.get(loaderKey(descriptor) + "#root-trial", async () => {
         coldLoad = true;
         try { return await makeWorkerCode(descriptor, env, ctx, true); }
         catch (error) { stage = "code"; codeStage = stageOf(error); throw error; }
       }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0,
         cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
-      report = await (await rootWorker.getEntrypoint(undefined, invocationOptions(descriptor, props))
+      const rootReport = await (await rootWorker.getEntrypoint(undefined, invocationOptions(descriptor, props))
         .fetch("http://coworkerd-root-trial/", { cf })).json();
+      if (!rootReport.ok) report = { ...rootReport, durableObjectClasses: report.durableObjectClasses };
       report.rootBridgeChecked = true;
     }
   } catch (error) {
@@ -1433,11 +1435,11 @@ function rootManagementFailure(error, missing = false) {
 }
 const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
-async function selectedRoot(descriptor, env, ctx) {
-  return prepareSelectedRoot(descriptor, env, ctx);
+async function selectedRoot(descriptor, env, ctx, preparationNonce) {
+  return prepareSelectedRoot(descriptor, env, ctx, preparationNonce);
 }
 
-async function prepareSelectedRoot(descriptor, env, ctx) {
+async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
   if (!descriptor.rootPlan || !descriptor.rootSelection || descriptor.rootSelection.dispatchChecked !== true)
     throw new Error("Missing trusted root dispatch");
   const base = descriptor.rootPlan;
@@ -1458,7 +1460,9 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
   const install = async () => {
     let deployment = base;
     if (base.kind === "tenant") {
-      const code = await makeWorkerCode(descriptor, env, ctx, true);
+      let code;
+      try { code = await makeWorkerCode(descriptor, env, ctx, true); }
+      catch (error) { throw rootManagementFailure(error); }
       const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
       deployment = { ...base, compatibilityDate: code.compatibilityDate, compatibilityFlags: code.compatibilityFlags,
         environment: code.env, modules: names.map(name => rootModule(name, code.modules[name])) };
@@ -1472,7 +1476,7 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
     return plan;
   };
   const remember = plan => {
-    if (typeof plan !== "string") throw new Error("Invalid root plan reply");
+    if (typeof plan !== "string") throw rootManagementFailure(new Error("Invalid root plan reply"));
     rootPlanKeys.delete(cacheKey);
     rootPlanKeys.set(cacheKey, plan);
     if (rootPlanKeys.size > MAX_ROOT_PLAN_KEYS) rootPlanKeys.delete(rootPlanKeys.keys().next().value);
@@ -1484,13 +1488,12 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
     plan = remember(plan === null ? await install() : plan);
   } else remember(plan);
   const select = async () => {
-    const selection = { ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env) };
-    const prepared = await manage("prepare", selection);
+    const selection = { ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env), preparationNonce };
     try {
-      return await env.ROOTS.getRoot(JSON.stringify({ ...selection, preparedTicket: prepared.ticket }));
+      return await env.ROOTS.getRoot(JSON.stringify(selection));
     } catch (error) {
-      // This private binding call never delivers a tenant event; its missing-ticket reply is safe to refresh.
-      throw rootManagementFailure(error, String(error?.message ?? error).includes("ROOT_PLAN_MISSING:"));
+      // This private binding call never delivers an event. Its own missing-plan reply can refresh the key.
+      throw rootManagementFailure(error, rootPreparationKind(error, preparationNonce) === "plan-missing");
     }
   };
   try { return await select(); }
@@ -1502,14 +1505,19 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
   }
 }
 
-function rootPreparationFailed(error) {
-  return error && typeof error === "object" && rootPreparationErrors.has(error);
+function rootPreparationKind(error, nonce) {
+  if (error && typeof error === "object" && rootPreparationErrors.has(error)) return "platform";
+  const message = String(error?.message ?? error);
+  for (const kind of ["platform", "plan-missing", "tenant-code"])
+    if (nonce && message.includes("COWORKERD_ROOT_PREPARATION:" + nonce + ":" + kind + ":")) return kind;
+  return null;
 }
 
 async function serveRoot(request, descriptor, env, ctx) {
   const target = descriptor.durableObject;
+  const preparationNonce = crypto.randomUUID();
   try {
-    const root = await selectedRoot(descriptor, env, ctx);
+    const root = await selectedRoot(descriptor, env, ctx, preparationNonce);
     const headers = new Headers(request.headers);
     headers.set(DO_HOPS_HEADER, String(target.hops ?? 0));
     headers.delete(DO_ALARM_HEADER);
@@ -1523,8 +1531,10 @@ async function serveRoot(request, descriptor, env, ctx) {
     }
     return await root.fetch(new Request(request, { headers, cf: tenantCf(descriptor, env) }));
   } catch (error) {
-    const reason = cleanDurableReason(error, descriptor.secrets), code = durableCode(error);
-    if (code === "EXECUTION_FAILED" && rootPreparationFailed(error))
+    const preparation = rootPreparationKind(error, preparationNonce);
+    const reason = cleanDurableReason(error, descriptor.secrets);
+    const code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
+    if (preparation && preparation !== "tenant-code")
       return Response.json({ error: "Durable Object is unavailable", code: "DO_UNAVAILABLE", reason, retryable: true },
         { status: 503 });
     if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true)
@@ -1543,10 +1553,12 @@ async function rpcEntrypoint(value, env, ctx) {
   const target = descriptor.durableObject;
   if (target) {
     if (target.database) throw new Error("a database has no methods");
-    try { return await (await selectedRoot(descriptor, env, ctx)).__coworkerdRpcTarget; }
+    const preparationNonce = crypto.randomUUID();
+    try { return await (await selectedRoot(descriptor, env, ctx, preparationNonce)).__coworkerdRpcTarget; }
     catch (error) {
-      const reason = String(error?.message ?? error), code = durableCode(error);
-      throw new Error((code === "EXECUTION_FAILED" && rootPreparationFailed(error) ? "DO_UNAVAILABLE" : code) +
+      const preparation = rootPreparationKind(error, preparationNonce);
+      const reason = String(error?.message ?? error), code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
+      throw new Error((preparation && preparation !== "tenant-code" ? "DO_UNAVAILABLE" : code) +
         ": " + reason.slice(0, 300));
     }
   }
