@@ -2794,9 +2794,10 @@ private:
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       if (coworkerd::rootObjectsForTest()) {
-        return kj::str(coworkerd::rootDispatchDescriptor(json.encode(descriptor.asReader()).cStr(),
+        const auto root = coworkerd::rootDispatchDescriptor(json.encode(descriptor.asReader()).cStr(),
             desiredState.state(), version, limits.cpuMs, limits.memoryMiB, durable->namespaceId,
-            durable->objectId, durable->dataEpoch, durable->isDatabase(), durable->alarmAtUnixMs, durable->alarmFacetId));
+            durable->objectId, durable->dataEpoch, durable->isDatabase(), durable->alarmAtUnixMs, durable->alarmFacetId);
+        return kj::str(root.c_str());
       }
       return json.encode(descriptor.asReader());
     }
