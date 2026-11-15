@@ -68,6 +68,40 @@ in time, read replicas, and the Sessions API -- `withSession()`, `dump()` and `q
 
 `batch()` executes its statements in order within one transaction. Any statement failure rolls back the whole batch and rejects the promise with `D1_ERROR:`. `exec()` splits its argument by lines and runs each as a statement, stops at the first failure, and keeps earlier successful lines; `D1_EXEC_ERROR` names the failing line. It does not roll back earlier lines.
 
+### Binary values and numbers
+
+BLOB values round trip as bytes. Bind an `ArrayBuffer`, a typed-array view, or a JavaScript array of byte integers;
+HTTP SQL uses a nested byte array in `params`. The SQL Worker validates every element as an integer from 0 through 255
+before binding it as binary data. An empty array is a zero-length BLOB. Invalid arrays and ordinary objects return
+`D1_TYPE_ERROR` instead of becoming text; a view containing an out-of-range element, such as `new Uint16Array([256])`,
+is rejected. `all()`, `raw()`, `first()` and both HTTP result formats return BLOB cells as **arrays of numbers**.
+
+```js
+await env.DB.prepare("INSERT INTO attachments (body) VALUES (?)")
+  .bind(new Uint8Array([0, 1, 127, 128, 255])).run();
+const bytes = await env.DB.prepare("SELECT body FROM attachments LIMIT 1").first("body");
+// bytes is [0, 1, 127, 128, 255]
+```
+
+**Historical data:** releases 0.5.0 through 0.5.6 stored binary values supplied through parameter binding as
+comma-separated number text, despite reporting success. This runtime fix does not automatically rewrite those rows.
+SQL BLOB literals and migration/import files stored the binary value correctly. To look for candidate affected rows,
+replace the example table/column names (and `rowid` with your primary key where needed):
+
+```sql
+SELECT rowid, typeof(body) AS stored_type, length(body) AS stored_length, body
+FROM attachments
+WHERE typeof(body) = 'text' AND body NOT GLOB '*[^0-9,]*';
+```
+
+This query is only a hint: legitimate text, empty strings and invalid byte lists can also match. Check against the
+original data before changing any row; this release provides no automatic repair.
+
+As with Cloudflare D1, JavaScript numbers cannot preserve all integers outside the safe integer range: for example,
+`9007199254740993` reads as `9007199254740992`. A stored REAL `1.0` reads as JSON `1`. To retrieve the precise stored
+representation, select `quote(value)` or an appropriate `printf()` format as text; `typeof(value)` reports SQLite's
+storage type. BigInt is not supported by the D1 API.
+
 ## 5. Without a Worker
 
 The same protocol is an HTTP endpoint, with the tenant's own credential:
@@ -85,6 +119,12 @@ curl -s -X POST "$CONTROL_PLANE/v1/tenants/acme/databases/books/query" \
 
 Set `CONTROL_PLANE` to your API URL and `COWCTL_TOKEN` to your tenant credential. CLI `--param` values are strings (the SQL engine applies its conversions); the HTTP `params` array can also carry numbers, null and byte arrays. The public endpoint is `/query`; `/execute` is not routed. It accepts an object or an array of statement objects. `resultsFormat=ARRAY_OF_OBJECTS` (the default) returns row objects; `resultsFormat=ROWS_AND_COLUMNS` returns `{columns,rows}`, also used by the JavaScript client for `raw()`. Other format names are refused. The answer is D1's: `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a
 statement that failed. An array of `{"sql","params"}` runs one transaction and answers an array; a failing statement rolls the transaction back.
+
+The public HTTP JSON request must be **strictly below 1 MiB**. A single byte-array parameter therefore holds less
+binary data than the body size: commas and decimal digits count too. With a short INSERT and all bytes equal to 255,
+262,128 binary bytes (about 256 KiB) fit in a 1,048,574-byte request; one more byte made a 1,048,578-byte request and was
+rejected at the control-plane body limit. SQL text, other parameters and the byte values change that boundary.
+64 KiB and 200 KiB arrays containing the full byte range were verified end to end.
 
 A single object request may contain multiple SQL statements in its `sql` string. SQLite handles statement boundaries,
 including trigger bodies, comments and semicolons inside strings. That object request is **not a transaction**: if a later
