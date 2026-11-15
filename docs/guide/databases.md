@@ -63,7 +63,7 @@ export default {
 
 The runtime provides this client over the platform SQL Worker. What is there: `prepare()`, `bind()`, `run()`, `all()`, `first()` and `first("column")`, `raw({columnNames})`, `batch()`
 and `exec()`, with D1's `meta` (`changes`, `last_row_id`, `rows_read`, `rows_written`, `changed_db`, `size_after`) and
-D1's errors ([error codes](errors.md), section 4). What is not: a migration tool, import and export, restore to a point
+D1's errors ([error codes](errors.md), section 4). What is not: import and export, restore to a point
 in time, read replicas, and the Sessions API -- `withSession()`, `dump()` and `query()` are refused.
 
 `batch()` executes its statements in order within one transaction. Any statement failure rolls back the whole batch and rejects the promise with `D1_ERROR:`. `exec()` splits its argument by lines and runs each as a statement, stops at the first failure, and keeps earlier successful lines; `D1_EXEC_ERROR` names the failing line. It does not roll back earlier lines.
@@ -86,7 +86,47 @@ curl -s -X POST "$CONTROL_PLANE/v1/tenants/acme/databases/books/query" \
 Set `CONTROL_PLANE` to your API URL and `COWCTL_TOKEN` to your tenant credential. CLI `--param` values are strings (the SQL engine applies its conversions); the HTTP `params` array can also carry numbers, null and byte arrays. The public endpoint is `/query`; `/execute` is not routed. It accepts an object or an array of statement objects. `resultsFormat=ARRAY_OF_OBJECTS` (the default) returns row objects; `resultsFormat=ROWS_AND_COLUMNS` returns `{columns,rows}`, also used by the JavaScript client for `raw()`. Other format names are refused. The answer is D1's: `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a
 statement that failed. An array of `{"sql","params"}` runs one transaction and answers an array; a failing statement rolls the transaction back.
 
-## 6. Delete one
+A single object request may contain multiple SQL statements in its `sql` string. SQLite handles statement boundaries,
+including trigger bodies, comments and semicolons inside strings. That object request is **not a transaction**: if a later
+statement fails, earlier effects remain. Use an array of statement objects for a transaction that rolls back as a whole.
+
+## 6. Versioned migrations
+
+```bash
+cowctl d1 migrations create books "create books table"
+# Edit migrations/0001_create_books_table.sql, then:
+cowctl d1 migrations list books
+cowctl d1 migrations apply books --yes
+```
+
+Files are top-level `.sql` files. `create` chooses the next leading number, pads it to at least four digits and changes
+spaces in the description to underscores; the file starts with a comment ready for SQL. `list` shows pending filenames.
+`apply` runs files in numeric order, with a character-order tiebreaker, and records their filenames in `d1_migrations`.
+It skips files already recorded; a comment-only or empty file is recorded as a no-op. `--json` returns structured results.
+Without `--yes`, an interactive terminal asks for confirmation; non-interactive/CI runs proceed without prompting.
+
+`--dir DIR` and `--table TABLE` take priority over the matching `database_name` entry's `migrations_dir` and
+`migrations_table` in Wrangler configuration. Defaults are `migrations` and `d1_migrations`. Configured directories are
+relative to the Wrangler file; `--dir` is relative to the current directory. The adapter accepts these settings and
+`migrations_pattern` during deployment, but deployment does not use them. Migration commands reject `migrations_pattern`
+and subdirectory layouts in this release.
+
+Each file and its ledger INSERT are two items in **one array request and one transaction**. A failed file rolls back
+all of that file, including its ledger row; earlier successful files remain applied, and later files are not attempted.
+The command names the file and SQLite error and exits nonzero. Fix the file and run `apply` again. SQL is sent intact,
+so a missing final semicolon or trailing comment does not interfere with the separate ledger INSERT.
+
+Migration files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger
+`BEGIN … END` bodies are supported. The full JSON-encoded request, including escapes and the ledger statement, must be
+at most **1 MiB**. An oversized file is rejected locally before its execution request is sent; split it into smaller files.
+One file consumes one database-object event. The node's default CPU configuration is 200 ms, but enforcement of that
+budget for this internal SQL event is **not verified** by this change; do not treat 200 ms as a verified migration limit.
+
+On a timeout or `503 RESULT_UNCERTAIN`, the CLI does **not resend the file**. It reads the ledger: if the filename is
+present it continues, otherwise it stops with instructions to run `apply` again. If the ledger read also fails it stops.
+The earlier write might have committed despite a lost reply; a later `apply` checks the ledger before choosing files.
+
+## 7. Delete one
 
 ```bash
 cowctl d1 delete books --yes
@@ -96,7 +136,7 @@ The database is marked deleting: no Binding to it works and no new statement rea
 the tenant's storage. Its data stays in the object store (there is no data reclamation in 0.5), so the name cannot
 be used again in this release.
 
-## 7. Failure and consistency
+## 8. Failure and consistency
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
