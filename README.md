@@ -59,7 +59,7 @@ Boundaries to know about:
 - **The object store must hold its promises.** For more than one writer of the desired state at a time, create-if-absent
   has to hold under concurrency: the compose files pin SeaweedFS 4.48, whose concurrent create-if-absent behavior was verified; `coworkerd check storage`
   measures it. Durable Object ownership also requires atomic create-if-absent on a single-node cluster; otherwise requests fail with `DO_UNSUPPORTED_STORE`.
-- **The upstream runtime** is workerd `v1.20261108.1` with the patch series in [patches/workerd/](patches/workerd/);
+- **The upstream runtime** is workerd `v1.20261114.1` with the patch series in [patches/workerd/](patches/workerd/);
   the patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd), and
   [patches/README.md](patches/README.md) describes how it follows upstream.
 
@@ -82,7 +82,7 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 
 - **The daemons**: `scripts/build.sh` builds `coworkerd` and `coworkerd-apiserver` for the host with CMake and Ninja
   (it fetches Cap'n Proto and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff)); OpenSSL is required.
-- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261108.1`), checked out into `workerd/` with the series applied by
+- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261114.1`), checked out into `workerd/` with the series applied by
   `python3 scripts/workerd-patches.py apply`; [patches/README.md](patches/README.md) explains the series and how it
   is maintained.
 - **A release**: `scripts/release.sh <version>` builds the Linux binaries in a toolchain container

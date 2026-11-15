@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Move the kernel to workerd `v1.20261114.1` with 17 patches (the SQLite `WITH` fix of 0.5.6 is now upstream) and update the compatibility table to 308 flags with a maximum table date of 2026-11-21. The system call tables are unchanged apart from the kernel hash they name. workerd now checks its process-wide default CPU limit at startup instead of at the first Worker load.
+
 ## 0.5.6 (unreleased)
 
 - Remove the cache admission, hold and healing code that can no longer be reached now that local files are not reused after a restart. The node state loses `durableLog.recovery.healPending`, `healBusy`, `healErrors`, `healSnapshots`, `healFailures`, `healedWalFrames`, `durableLog.objects.hold` and `durableLog.storage.positionsReused`.

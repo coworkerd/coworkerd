@@ -8,7 +8,7 @@
 | wrangler configuration / feature | Notes |
 | --- | --- |
 | `name`, `main` | The Worker name (the name within the tenant, full name `tenant/name`; lowercase letters, digits and `-`, at most 63 characters) and the main module; `main` may be TypeScript, built by wrangler |
-| `compatibility_date` | Carried by each version; may not be later than the bundled kernel table limit (`v1.20261108.1`, 2026-11-15), or the UTC date on the day of upload |
+| `compatibility_date` | Carried by each version; may not be later than the bundled kernel table limit (`v1.20261114.1`, 2026-11-21), or the UTC date on the day of upload |
 | `compatibility_flags` | The non-experimental flags this workerd knows, including `nodejs_compat`; the platform always turns on `enable_request_signal`, and `disable_request_signal` is refused |
 | `vars` | Plain-text and JSON environment variables, part of the version definition; at most 64, each at most 5 KiB |
 | Secrets | Names come from the project's `.dev.vars.example` (only the names are read) or `deploy --secret NAME`; values are set with `cowctl secret put`, stored in the cluster, and read in the Worker as `env.NAME`; at most 64, each at most 5 KiB of UTF-8 text without NUL. `cowctl` never reads `.dev.vars` or `.env` and never publishes them; a project with its own wrangler builds in place, where a wrangler too old for `--env-file`, or the project's own build command, can still read them; wrangler's own `secrets` key (`secrets.required`) is refused at conversion (section 2) |
