@@ -30,3 +30,8 @@ rows. The final claiming transaction and Miniflare condition/checksum semantics
 remain intact. Retirement now runs only in alarms, with a persistent retry state;
 request handlers enqueue names and schedule an alarm. Both list queries add a
 `key >= prefix` index lower bound without changing filtering or ordering.
+
+`r2Object.worker.ts` now pumps metadata and body through one final length-checked
+stream using a reusable 64 KiB BYOB buffer. The chunk reader is a byte stream
+that fills consumer-provided buffers. The first blob response is checked before
+metadata is exposed, including empty objects. Wire fields remain unchanged.

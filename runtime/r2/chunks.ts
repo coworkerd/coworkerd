@@ -30,7 +30,7 @@ export async function uploadChunks(blob: BlobStore,id: string,body: ReadableStre
    const stream = new FixedLengthStream(length);
    const writer = stream.writable.getWriter();
    const name = `${id}/${index}`;
-   
+
    attempted.push(name); // Also retire an ambiguous failed PUT, which may have stored its bytes.
    const pumping = (async () => {
     try {
