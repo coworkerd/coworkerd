@@ -33,6 +33,7 @@ public:
     uint64_t defaultLiveBytes = 10ull << 30;
     // Unset: the effective live limit, including a target's override.
     std::optional<uint64_t> defaultGarbageBytes;
+    uint32_t maxTargets = 1024;
   };
   static constexpr uint64_t MAX_BLOB_BYTES = 25ull << 20;
   struct Range { uint64_t offset = 0, length = 0; };
@@ -58,6 +59,9 @@ public:
   struct Sweep {
     uint64_t blobsRemoved = 0, markersRemoved = 0, deferred = 0;
   };
+  struct CacheInfo {
+    uint64_t targets = 0, pendingNames = 0, activeCalls = 0, evictions = 0;
+  };
   // Unknown publication must return nullopt, never a guessed sequence. Positions describe the same object's
   // published history, ordered by shard epoch then node sequence, including snapshot coverage.
   using Published = std::function<kj::Promise<std::optional<Position>>(const Target&)>;
@@ -77,6 +81,8 @@ public:
   kj::Promise<Usage> usage(Target target);
   kj::Promise<Usage> rebuild(Target target);
   kj::Promise<Sweep> sweep(Target target);
+  // Diagnostics only; does not create, load or touch cached state. No blob names are returned.
+  CacheInfo cacheInfo(std::optional<Target> target = std::nullopt) const;
 
   static bool validName(std::string_view name);
   static bool validTarget(const Target& target);

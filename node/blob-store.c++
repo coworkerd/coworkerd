@@ -83,20 +83,18 @@ Marker parseMarker(const Target& target, const std::string& name, const std::str
 
 struct NodeBlobStore::Impl {
   struct Turn;
+  struct Pending {
+    Marker marker;
+    uint64_t bytes = 0;
+    bool bodyRemoved = true;
+  };
   struct State {
     std::string tenant;
     bool loaded = false, busy = false;
-    std::map<std::string, uint64_t> blobs;
-    std::map<std::string, Marker> trash;
+    Usage used;
+    std::map<std::string, Pending> trash;
+    uint64_t active = 0, touched = 0;
     std::deque<kj::Own<kj::PromiseFulfiller<kj::Own<Turn>>>> waiting;
-    Usage totals() const {
-      Usage out;
-      for (const auto& [name, bytes] : blobs) {
-        auto& total = trash.contains(name) ? out.garbageBytes : out.liveBytes;
-        total = add(total, bytes);
-      }
-      return out;
-    }
   };
   struct Turn {
     State& state;
@@ -114,16 +112,41 @@ struct NodeBlobStore::Impl {
   Published published;
   Clock clock;
   std::map<std::string, std::unique_ptr<State>> states;
+  uint64_t serial = 0, evictions = 0;
+  struct Use {
+    Impl& owner;
+    State& state;
+    Use(Impl& owner, State& state): owner(owner), state(state) { ++state.active; state.touched = ++owner.serial; }
+    ~Use() noexcept { --state.active; state.touched = ++owner.serial; }
+  };
 
   Impl(ObjectStore& store, Settings settings, Published published, Clock clock)
       : store(store), settings(settings), published(std::move(published)), clock(std::move(clock)) {
     KJ_REQUIRE(bool(this->published) && bool(this->clock), "blob publication and clock callbacks are required");
+    KJ_REQUIRE(settings.maxTargets > 0, "blob target cache limit must be positive");
   }
-  State& state(const Target& target) {
-    auto& entry = states[prefix(target)];
-    if (!entry) { entry = std::make_unique<State>(); entry->tenant = target.tenant; }
-    KJ_REQUIRE(entry->tenant == target.tenant, "a blob target cannot change tenants");
-    return *entry;
+  kj::Own<Use> useIfCached(const Target& target) {
+    auto entry = states.find(prefix(target));
+    if (entry == states.end()) return {};
+    KJ_REQUIRE(entry->second->tenant == target.tenant, "a blob target cannot change tenants");
+    return kj::heap<Use>(*this, *entry->second);
+  }
+  kj::Own<Use> use(const Target& target) {
+    auto held = useIfCached(target);
+    if (held.get() != nullptr) return held;
+    while (states.size() >= settings.maxTargets) {
+      auto oldest = states.end();
+      for (auto at = states.begin(); at != states.end(); ++at) {
+        if (at->second->active || at->second->busy) continue;
+        if (oldest == states.end() || at->second->touched < oldest->second->touched) oldest = at;
+      }
+      requireStorage(oldest != states.end(), "all blob target cache entries are in use");
+      states.erase(oldest); ++evictions;
+    }
+    auto entry = std::make_unique<State>(); entry->tenant = target.tenant;
+    auto& state = *entry;
+    states.emplace(prefix(target), std::move(entry));
+    return kj::heap<Use>(*this, state);
   }
   kj::Promise<kj::Own<Turn>> turn(State& state) {
     if (!state.busy) { state.busy = true; return kj::heap<Turn>(state); }
@@ -138,24 +161,32 @@ struct NodeBlobStore::Impl {
   kj::Promise<void> load(const Target& target, State& state) {
     if (state.loaded) co_return;
     const auto root = prefix(target), bodies = root + "b/", markers = root + "trash/";
-    std::map<std::string, uint64_t> blobs;
-    std::map<std::string, Marker> trash;
-    auto listedBlobs = co_await list(bodies);
-    for (const auto& item : listedBlobs.objects) {
-      requireStorage(item.key.starts_with(bodies), "blob listing escaped its prefix");
-      auto name = item.key.substr(bodies.size());
-      requireStorage(validName(name), "blob listing contains an invalid relative name");
-      blobs.emplace(std::move(name), item.size);
+    Usage used;
+    std::map<std::string, Pending> trash;
+    {
+      auto listedMarkers = co_await list(markers);
+      for (const auto& item : listedMarkers.objects) {
+        requireStorage(item.key.starts_with(markers), "trash listing escaped its prefix");
+        auto name = item.key.substr(markers.size());
+        requireStorage(validName(name), "trash listing contains an invalid relative name");
+        auto answer = co_await store.get(item.key); checkRead(answer);
+        if (answer.status == 200) trash.emplace(name, Pending{parseMarker(target, name, answer.bytes)});
+      }
     }
-    auto listedMarkers = co_await list(markers);
-    for (const auto& item : listedMarkers.objects) {
-      requireStorage(item.key.starts_with(markers), "trash listing escaped its prefix");
-      auto name = item.key.substr(markers.size());
-      requireStorage(validName(name), "trash listing contains an invalid relative name");
-      auto answer = co_await store.get(item.key); checkRead(answer);
-      if (answer.status == 200) trash.emplace(name, parseMarker(target, name, answer.bytes));
+    {
+      // The listing is temporary. Resident state retains only counters and pending trash names.
+      auto listedBlobs = co_await list(bodies);
+      for (const auto& item : listedBlobs.objects) {
+        requireStorage(item.key.starts_with(bodies), "blob listing escaped its prefix");
+        auto name = item.key.substr(bodies.size());
+        requireStorage(validName(name), "blob listing contains an invalid relative name");
+        if (auto pending = trash.find(name); pending != trash.end()) {
+          pending->second.bytes = item.size; pending->second.bodyRemoved = false;
+          used.garbageBytes = add(used.garbageBytes, item.size);
+        } else used.liveBytes = add(used.liveBytes, item.size);
+      }
     }
-    state.blobs = std::move(blobs); state.trash = std::move(trash); state.loaded = true;
+    state.used = used; state.trash = std::move(trash); state.loaded = true;
   }
 };
 
@@ -183,46 +214,42 @@ kj::Promise<NodeBlobStore::Reply> NodeBlobStore::put(Target target, std::string 
   if (!validTarget(target) || !validName(name)) co_return status(400, "INVALID_BLOB_NAME_OR_TARGET");
   if (length > MAX_BLOB_BYTES || body.size() > MAX_BLOB_BYTES) co_return status(413, "BLOB_TOO_LARGE");
   if (body.size() != length) co_return status(400, "BLOB_LENGTH_MISMATCH");
-  auto& state = impl->state(target);
+  auto use = impl->use(target);
+  auto& state = use->state;
   auto held = co_await impl->turn(state);
   // Invalidate after cancellation or uncertain I/O too: a create may have taken effect without its answer.
   bool complete = false;
   auto invalidate = kj::defer([&]() { if (!complete) state.loaded = false; });
-  const auto root = prefix(target), key = root + "b/" + name;
-  auto trash = co_await impl->store.get(root + "trash/" + name); checkRead(trash);
-  if (trash.status == 200) { complete = true; co_return status(409, "BLOB_DELETED"); }
-  auto old = co_await impl->store.get(key); checkRead(old);
-  if (old.status == 200) {
-    complete = true;
-    co_return old.bytes == body ? metadata(200, body) : status(409, "BLOB_CONFLICT");
-  }
+  const auto key = prefix(target) + "b/" + name;
   co_await impl->load(target, state);
-  const auto used = state.totals();
+  if (state.trash.contains(name)) { complete = true; co_return status(409, "BLOB_DELETED"); }
+  const auto used = state.used;
   const auto live = target.limits.liveBytes.value_or(impl->settings.defaultLiveBytes);
   const auto garbage = target.limits.garbageBytes.value_or(impl->settings.defaultGarbageBytes.value_or(live));
   if (used.liveBytes > live || length > live - used.liveBytes || used.garbageBytes >= garbage) {
-    complete = true; co_return status(422, "BLOB_QUOTA_EXCEEDED");
+    // A no-growth retry is still allowed at quota. Never attempt a new create without admission.
+    auto old = co_await impl->store.get(key); checkRead(old);
+    complete = true;
+    if (old.status == 200) co_return old.bytes == body ? metadata(200, body) : status(409, "BLOB_CONFLICT");
+    co_return status(422, "BLOB_QUOTA_EXCEEDED");
   }
   auto made = co_await impl->store.create(key, body);
   if (!made.created) {
     auto back = co_await impl->store.get(key); checkRead(back);
     requireStorage(back.status == 200, "a conflicting blob could not be read back");
-    state.blobs[name] = back.bytes.size();
     complete = true;
     co_return back.bytes == body ? metadata(200, body) : status(409, "BLOB_CONFLICT");
   }
-  state.blobs[name] = length; complete = true;
+  state.used.liveBytes = add(state.used.liveBytes, length); complete = true;
   co_return metadata(201, body);
 }
 
 kj::Promise<NodeBlobStore::Reply> NodeBlobStore::get(Target target, std::string name, std::optional<Range> range) {
   if (!validTarget(target) || !validName(name)) co_return status(400, "INVALID_BLOB_NAME_OR_TARGET");
   if (range && range->length == 0) co_return status(400, "INVALID_BLOB_RANGE");
-  auto& state = impl->state(target);
-  auto held = co_await impl->turn(state);
+  // Pin an existing cache entry, but reads neither load state nor join the mutation queue.
+  auto use = impl->useIfCached(target);
   const auto root = prefix(target);
-  auto trash = co_await impl->store.get(root + "trash/" + name); checkRead(trash);
-  if (trash.status == 200) co_return status(404, "BLOB_NOT_FOUND");
   auto answer = co_await impl->store.get(root + "b/" + name); checkRead(answer);
   if (answer.status == 404) co_return status(404, "BLOB_NOT_FOUND");
   // The existing client downloads at most 64 MiB; this component currently downloads a whole blob for a range.
@@ -238,16 +265,18 @@ kj::Promise<NodeBlobStore::Reply> NodeBlobStore::get(Target target, std::string 
 
 kj::Promise<NodeBlobStore::Reply> NodeBlobStore::erase(Target target, std::string name, Position position) {
   if (!validTarget(target) || !validName(name)) co_return status(400, "INVALID_BLOB_NAME_OR_TARGET");
-  auto& state = impl->state(target);
+  auto use = impl->use(target);
+  auto& state = use->state;
   auto held = co_await impl->turn(state);
   bool complete = false;
   auto invalidate = kj::defer([&]() { if (!complete) state.loaded = false; });
   const auto key = prefix(target) + "trash/" + name;
   co_await impl->load(target, state);
-  auto old = co_await impl->store.get(key); checkRead(old);
-  if (old.status == 200) {
-    state.trash[name] = parseMarker(target, name, old.bytes); complete = true; co_return status(204);
-  }
+  if (state.trash.contains(name)) { complete = true; co_return status(204); }
+  // Exact GET is one round trip even when other names share this prefix. The client has no HEAD length API.
+  auto body = co_await impl->store.get(prefix(target) + "b/" + name); checkRead(body);
+  const auto bytes = body.status == 200 ? body.bytes.size() : 0;
+  requireStorage(bytes <= state.used.liveBytes, "blob accounting must be rebuilt before deleting");
   Marker marker{name, position, add(impl->clock(), impl->settings.retentionMs)};
   auto made = co_await impl->store.create(key, markerJson(target, marker));
   if (!made.created) {
@@ -255,42 +284,59 @@ kj::Promise<NodeBlobStore::Reply> NodeBlobStore::erase(Target target, std::strin
     requireStorage(back.status == 200, "an existing blob trash marker could not be read back");
     marker = parseMarker(target, name, back.bytes);
   }
-  state.trash[name] = std::move(marker); complete = true;
+  state.trash.emplace(name, Impl::Pending{std::move(marker), bytes, body.status == 404});
+  state.used.liveBytes -= bytes;
+  state.used.garbageBytes = add(state.used.garbageBytes, bytes); complete = true;
   co_return status(204);
 }
 
 kj::Promise<NodeBlobStore::Usage> NodeBlobStore::usage(Target target) {
-  auto& state = impl->state(target); auto held = co_await impl->turn(state);
+  auto use = impl->use(target); auto& state = use->state; auto held = co_await impl->turn(state);
   co_await impl->load(target, state);
-  co_return state.totals();
+  co_return state.used;
 }
 kj::Promise<NodeBlobStore::Usage> NodeBlobStore::rebuild(Target target) {
-  auto& state = impl->state(target); auto held = co_await impl->turn(state);
+  auto use = impl->use(target); auto& state = use->state; auto held = co_await impl->turn(state);
   state.loaded = false; co_await impl->load(target, state);
-  co_return state.totals();
+  co_return state.used;
 }
 kj::Promise<NodeBlobStore::Sweep> NodeBlobStore::sweep(Target target) {
-  auto& state = impl->state(target); auto held = co_await impl->turn(state);
-  state.loaded = false; co_await impl->load(target, state);
+  auto use = impl->use(target); auto& state = use->state; auto held = co_await impl->turn(state);
+  co_await impl->load(target, state);
   auto published = co_await impl->published(target);
   const auto now = impl->clock();
   const auto root = prefix(target);
   Sweep result;
   for (auto entry = state.trash.begin(); entry != state.trash.end();) {
-    const auto& marker = entry->second;
+    auto& pending = entry->second;
+    const auto& marker = pending.marker;
     if (!published || *published < marker.position || now < marker.notBeforeUnixMs) {
       ++result.deferred; ++entry; continue;
     }
     auto removed = co_await impl->store.remove(root + "b/" + marker.name);
     requireStorage(removed.status == 200 || removed.status == 204 || removed.status == 404,
         "a garbage blob could not be removed");
-    state.blobs.erase(marker.name); ++result.blobsRemoved;
+    if (!pending.bodyRemoved) {
+      requireStorage(pending.bytes <= state.used.garbageBytes, "invalid blob garbage accounting");
+      state.used.garbageBytes -= pending.bytes; pending.bodyRemoved = true;
+    }
+    ++result.blobsRemoved;
     auto unmarked = co_await impl->store.remove(root + "trash/" + marker.name);
     requireStorage(unmarked.status == 200 || unmarked.status == 204 || unmarked.status == 404,
         "a completed blob trash marker could not be removed");
     entry = state.trash.erase(entry); ++result.markersRemoved;
   }
   co_return result;
+}
+
+NodeBlobStore::CacheInfo NodeBlobStore::cacheInfo(std::optional<Target> target) const {
+  CacheInfo out; out.evictions = impl->evictions;
+  const auto wanted = target ? prefix(*target) : std::string();
+  for (const auto& [key, state] : impl->states) {
+    if (target && key != wanted) continue;
+    ++out.targets; out.pendingNames += state->trash.size(); out.activeCalls += state->active;
+  }
+  return out;
 }
 
 kj::Promise<NodeBlobStore::Reply> NodeBlobStore::handle(Target target, Request request) {
