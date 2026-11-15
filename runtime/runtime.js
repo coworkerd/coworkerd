@@ -1454,6 +1454,11 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
       if (reply?.error?.kind === "tenant-code") throw error;
       throw rootManagementFailure(error, reply?.error?.kind === "plan-missing");
     }
+    if (!reply || typeof reply !== "object" ||
+        (path === "lookup" && reply.plan !== null && typeof reply.plan !== "string") ||
+        (path === "install" && (typeof reply.plan !== "string" || !Array.isArray(reply.state?.plans) ||
+          reply.state.plans.some(value => !value || typeof value !== "object"))))
+      throw rootManagementFailure(new Error("Invalid root plan " + path + " reply"));
     return reply;
   };
   const cacheKey = JSON.stringify(base);

@@ -2441,7 +2441,7 @@ public:
       request.body = nullptr;
       auto response = co_await provider.getTimer().timeoutAfter(35000 * kj::MILLISECONDS, kj::mv(request.response));
       auto text = co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS, response.body->readAllText(2 * 1024 * 1024));
-      if (p->pid == 0 || p->closing || p->retiring) co_return;
+      if (p->pid == 0 || p->closing) co_return;
       if (response.statusCode != 200) {
         if (std::string(text.cStr()).find("namespace-closing") != std::string::npos) {
           for (size_t i = 0; i < slots.size(); ++i) if (slots[i].current == p) {
@@ -2458,7 +2458,8 @@ public:
   }
   void maybeMaintainRoots(const std::shared_ptr<ProcessGeneration>& p) {
     if (!rootMaintenance || !p || !p->durable || p->rootMaintenancePending ||
-        p->closing || p->retiring || p->state != "ready" || !p->probeAddress || mono() < p->nextRootMaintenance) return;
+        p->closing || (p->state != "ready" && p->state != "draining") ||
+        !p->probeAddress || mono() < p->nextRootMaintenance) return;
     p->nextRootMaintenance = mono() + 1000;
     auto body = rootMaintenance();
     if (body.empty() || body == p->rootMaintenanceApplied) return;
@@ -3184,7 +3185,7 @@ kj::Promise<void> ProcessPool::run() {
       if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
           && !(s.durable && impl->durableClosed) && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
-      impl->maybeMaintainRoots(s.current);
+      Impl::eachGeneration(s, [&](const auto& p) { impl->maybeMaintainRoots(p); });
       for (const auto& p : s.retiring) impl->maybeProbe(p);
     }
     co_await impl->provider.getTimer().afterDelay(10 * kj::MILLISECONDS);
