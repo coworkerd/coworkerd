@@ -63,7 +63,7 @@ export default {
 
 The runtime provides this client over the platform SQL Worker. What is there: `prepare()`, `bind()`, `run()`, `all()`, `first()` and `first("column")`, `raw({columnNames})`, `batch()`
 and `exec()`, with D1's `meta` (`changes`, `last_row_id`, `rows_read`, `rows_written`, `changed_db`, `size_after`) and
-D1's errors ([error codes](errors.md), section 4). What is not: export, restore to a point
+D1's errors ([error codes](errors.md), section 4). What is not: restore to a point
 in time, read replicas, and the Sessions API -- `withSession()`, `dump()` and `query()` are refused.
 
 `batch()` executes its statements in order within one transaction. Any statement failure rolls back the whole batch and rejects the promise with `D1_ERROR:`. `exec()` splits its argument by lines and runs each as a statement, stops at the first failure, and keeps earlier successful lines; `D1_EXEC_ERROR` names the failing line. It does not roll back earlier lines.
@@ -241,7 +241,75 @@ statements within `transactionSync`; an error rolls back that request. A success
 remainder unchanged before the next text; SQLite chooses statement boundaries, including trigger bodies and quoted
 semicolons. Failure uses the usual `success: false` and SQLite error text. Existing SQL object/array requests are unchanged.
 
-## 8. Delete one
+## 8. Export a SQL file
+
+```bash
+cowctl d1 export books --output books.sql
+cowctl d1 export books --output schema.sql --no-data
+cowctl d1 export books --output selected.sql --table authors --table books
+```
+
+The file starts with `PRAGMA defer_foreign_keys=TRUE;`, without `BEGIN` or `COMMIT`. Tables follow their creation
+order, with each table's CREATE followed by its INSERTs. `sqlite_sequence` comes last, with DELETE followed by its
+rows; indexes, triggers and views follow the table data. Migration ledger tables are ordinary exported tables.
+Internal `_cf_` tables and other `sqlite_` tables are excluded, with Wrangler's exceptions for `sqlite_sequence`
+and `sqlite_stat*` statistics. Virtual tables are refused.
+
+Values are SQL expressions produced by SQLite's `quote()` in the database: large integers stay exact, and BLOBs
+become hex literals. The command only joins those values into INSERT statements. Text containing NUL uses a
+SQLite-produced `CAST(X'...' AS TEXT)` expression, because `quote(TEXT)` alone would truncate it.
+
+Options:
+
+- `--no-schema` writes data without CREATE statements; `--no-data` writes schema without INSERTs. They cannot be combined.
+- Repeat `--table NAME` to select names. As with Wrangler, later index/trigger/view objects are included only when
+  their own names match the filter. Omit `--table` for a complete backup, including sequences and all schema objects.
+- An existing output file is preserved unless `--force` is given. The completed file is published only after all
+  checks pass; a failed export leaves no partial replacement.
+- `--json` prints a result with file, row/table counts, bytes, mode, pages, retries, consistency and oversized-INSERT
+  counts. Progress and warnings go to stderr.
+- `--allow-writes` accepts changes detected during pagination. The JSON result, stderr and SQL file then explicitly
+  mark the export as potentially inconsistent.
+
+After discovering the schema, the command first tries to fetch the schema and all data in **one array request**.
+If that complete reply fits within 7,340,032 bytes, it is an atomic read of one database state. Writes before or after
+that request do not make its contents inconsistent. Larger databases use key pagination: rowid where accessible,
+otherwise the primary key (including composite keys for WITHOUT ROWID tables). Each table starts at **1,000 rows per
+page**. `D1_RESULT_TOO_LARGE` halves the page size and retries the same unread page; if one row still exceeds the reply
+limit, the command fails with its table and exact row key.
+
+A paginated export compares `total_changes()` and the complete schema at the beginning and end. A difference fails
+the export by default, with instructions to stop writes and retry. This check is **best effort**: an object restart
+resets the connection's counter, and matching endpoints do not prove no writes occurred between them. For a reliable
+backup, stop all writes for the entire export and prevent database-object restarts. `--allow-writes` provides no
+snapshot guarantee. Export does not block writers or offer point-in-time recovery.
+
+An INSERT exceeding **100,000 UTF-8 bytes** is written normally, but the final result and warning count such
+statements by table. Those statements cannot be imported by `cowctl d1 execute --file`; splitting the export into
+smaller pages does not make an individual row's INSERT shorter. Other tables can also require referenced rows to be
+loaded first: export keeps creation order and does not reorder tables for foreign keys. The importer's per-chunk
+foreign-key checks still apply.
+
+The SQL layout follows Wrangler 4.136.1. Byte-for-byte output differs: SQLite quote literals keep newlines inside
+text rather than Wrangler's replace/char expressions, hex case can differ, and this exporter preserves integers
+outside JavaScript's safe range that Wrangler's local exporter can round. Warnings here use the exact 100,000-byte
+import limit. These differences do not require a different SQL importer.
+
+For a backup and restore, stop writers, export the complete database, retain the SQL file, then restore into a new,
+empty database and compare schema, row counts and content before switching applications:
+
+```bash
+cowctl d1 export books --output books-backup.sql
+cowctl d1 create books-restored
+cowctl d1 execute books-restored --file books-backup.sql --yes
+```
+
+To move this file to a local Wrangler database, configure its D1 binding and run
+`wrangler d1 execute books --local --file books-backup.sql`. For a remote destination, use `--remote` and its
+credentials. Check that destination's SQL and statement limits first, review oversized-INSERT warnings, and verify
+the restored data. `env.DB.dump()` remains unsupported; export is a CLI operation.
+
+## 9. Delete one
 
 ```bash
 cowctl d1 delete books --yes
@@ -251,7 +319,7 @@ The database is marked deleting: no Binding to it works and no new statement rea
 the tenant's storage. Its data stays in the object store (there is no data reclamation in 0.5), so the name cannot
 be used again in this release.
 
-## 9. Failure and consistency
+## 10. Failure and consistency
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
