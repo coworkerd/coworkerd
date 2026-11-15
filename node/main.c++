@@ -8301,6 +8301,7 @@ int run(Launch launch) {
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
       io.provider->getNetwork(), timer, *headerTable);
   const auto stackDirectory = launch.stackDirectory;
+  coworkerd::checkRootStorageFormat(stackDirectory, true);
   // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).
   coworkerd::Suspects suspects(membership.get(), serverConfig.serverId, serverConfig.suspectBaseMs,
       serverConfig.suspectMaxMs, timer, serverConfig.suspectProbation && serverConfig.processPool.quarantineProcesses > 0);
@@ -8700,12 +8701,18 @@ int runSelfCheck(const std::vector<std::string>& args) {
       coworkerd::ObjectStore storage(store, io.provider->getNetwork(), timer);
       const auto marker = storage.get(coworkerd::CLUSTER_FORMAT_KEY).wait(io.waitScope);
       KJ_REQUIRE(marker.status == 200 || marker.status == 404, "object store read failed", marker.status);
+      const auto rootFormat = storage.get(coworkerd::DO_ROOT_FORMAT_KEY).wait(io.waitScope);
+      KJ_REQUIRE(rootFormat.status == 200 || rootFormat.status == 404, "object store read failed", rootFormat.status);
+      const bool rootFormatOk = rootFormat.status == 200 && rootFormat.bytes == coworkerd::DO_ROOT_FORMAT_BYTES;
+      coworkerd::checkRootStorageFormat(launch->stackDirectory, false);
       auto hint = coworkerd::readHintRevision(storage, coworkerd::indexHintKey(coworkerd::TENANT_INDEX_PREFIX)).wait(io.waitScope);
       fields += std::string(",\"clusterFormat\":") + (marker.status == 200 ? "true" : "false") + ",\"tenantsRevision\":" +
           (hint ? "\"" + std::to_string(*hint) + "\"" : std::string("null"));
       if (marker.status != 200)
         fields += ",\"reason\":\"the bucket holds no cluster/format/1 (the cluster's init writes it): the node would not start\"";
-      report("desiredState", marker.status == 200, fields);
+      else if (!rootFormatOk)
+        fields += ",\"reason\":\"the bucket has no compatible cluster/format/do-root-1; run coworkerd-apiserver tool init\"";
+      report("desiredState", marker.status == 200 && rootFormatOk, fields);
     } catch (const kj::Exception& error) {
       report("desiredState", false, fields + ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
     }

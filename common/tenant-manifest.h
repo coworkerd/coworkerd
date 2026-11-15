@@ -29,6 +29,8 @@ namespace coworkerd {
 // A hint holds {"rev":n} and only says which revision is current: a reader always reads that revision's object, and
 // lists the prefix for the largest revision when the hint is missing or behind what it knows.
 inline constexpr const char* CLUSTER_FORMAT_KEY = "cluster/format/1";
+inline constexpr const char* DO_ROOT_FORMAT_KEY = "cluster/format/do-root-1";
+inline constexpr const char* DO_ROOT_FORMAT_BYTES = "coworkerd-do-root-1\n";
 inline constexpr const char* TENANT_INDEX_PREFIX = "cluster/tenants";
 inline constexpr const char* CREDENTIAL_INDEX_PREFIX = "cluster/credentials";
 inline constexpr const char* TENANT_OBJECTS_PREFIX = "tenants/";

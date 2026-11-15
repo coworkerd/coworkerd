@@ -5125,6 +5125,10 @@ void DurableLog::sized(Object& object) {
 }
 
 void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, uint64_t atUnixMs) {
+  if (facetId != 0) {
+    log("alarm-invalid-facet", "\"facet\":" + std::to_string(facetId));
+    return;
+  }
   auto* object = objectOf(objectName);
   if (object == nullptr) {
     log("alarm-unknown", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId));
@@ -5209,57 +5213,25 @@ kj::Promise<void> DurableLog::readAlarmHints(std::string namespaceId, uint32_t s
   for (const auto& listed : listing.objects) {
     if (!listed.key.starts_with(prefix)) continue;
     const auto relative = listed.key.substr(prefix.size());
-    const auto slash = relative.find('/');
-    const auto objectId = relative.substr(0, slash);
+    if (relative.size() != 66 || !relative.ends_with("/0")) continue;
+    const auto objectId = relative.substr(0, 64);
     if (objectId.size() != 64) continue;
-    std::optional<uint32_t> keyFacet;
-    if (slash != std::string::npos) {
-      const auto text = relative.substr(slash + 1);
-      if (text.empty() || text.size() > 10) continue;
-      uint64_t number = 0;
-      bool valid = true;
-      for (char c : text) {
-        if (c < '0' || c > '9') { valid = false; break; }
-        number = number * 10 + uint64_t(c - '0');
-      }
-      if (!valid || number > UINT32_MAX) continue;
-      keyFacet = uint32_t(number);
-    }
     uint64_t atUnixMs = 0;
-    uint32_t facetId = keyFacet.value_or(1);
-    std::string hintBytes;
+    constexpr uint32_t facetId = 0;
     try {
       auto answer = co_await store->get(listed.key);
       if (answer.status != 200) continue;
-      hintBytes = answer.bytes;
       capnp::MallocMessageBuilder message;
       auto value = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.bytes.data(), answer.bytes.size()), value);
       auto reader = value.asReader();
       atUnixMs = uint64_t(numberField(reader, "atUnixMs"));
       const auto facetValue = json::field(reader, "facetId");
-      if (facetValue.which() != capnp::JsonValue::NULL_) {
-        if (facetValue.which() != capnp::JsonValue::NUMBER) continue;
-        const auto facet = facetValue.getNumber();
-        if (!std::isfinite(facet) || facet < 0 || facet > UINT32_MAX || facet != uint32_t(facet)) continue;
-        facetId = uint32_t(facet);
-      }
-      if (keyFacet && *keyFacet != facetId) continue;
+      if (facetValue.which() != capnp::JsonValue::NUMBER || facetValue.getNumber() != 0) continue;
     } catch (const kj::Exception&) {
       continue;
     }
     if (!atUnixMs) continue;
-    if (!keyFacet) {
-      // Adopt existing Host/app hints into the per-facet key without replacing a newer hint.
-      try {
-        const auto canonical = shardAlarmKey(namespaceId, shard, objectId, facetId);
-        auto current = co_await store->get(canonical);
-        if (current.status == 404) co_await store->put(canonical, hintBytes);
-        if (current.status == 200 || current.status == 404) co_await store->remove(listed.key);
-      } catch (const kj::Exception&) {
-        ++alarmHintFailures;
-      }
-    }
     const auto key = namespaceId + "/" + objectId + "/" + std::to_string(facetId);
     auto found = alarms.find(key);
     // An alarm the objects here already reported is the truth: a hint never replaces it.

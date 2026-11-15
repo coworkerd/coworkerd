@@ -4,14 +4,52 @@
 #include "durable-shards.h"
 #include "json.h"
 #include "support.h"
+#include "tenant-manifest.h"
 
 #include <kj/debug.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <string_view>
 #include <sstream>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace coworkerd {
+
+void checkRootStorageFormat(const std::filesystem::path& stack, bool initialize) {
+  const auto directory = stack / "do", marker = directory / "format";
+  if (std::filesystem::exists(marker)) {
+    KJ_REQUIRE(readFile(marker) == DO_ROOT_FORMAT_BYTES,
+        "this data directory has an incompatible Durable Object format marker; use a new directory");
+    return;
+  }
+  KJ_REQUIRE(!std::filesystem::exists(directory) || std::filesystem::is_empty(directory),
+      "this data directory contains old-format Durable Object files without a format marker; use a new directory");
+  if (!initialize) return;
+  std::filesystem::create_directories(directory);
+  const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0 && errno == EEXIST) {
+    KJ_REQUIRE(readFile(marker) == DO_ROOT_FORMAT_BYTES, "incompatible Durable Object format marker; use a new directory");
+    return;
+  }
+  KJ_REQUIRE(fd >= 0, "cannot create the local Durable Object format marker", strerror(errno));
+  const auto close = kj::defer([fd]() { ::close(fd); });
+  const std::string bytes = DO_ROOT_FORMAT_BYTES;
+  size_t offset = 0;
+  while (offset < bytes.size()) {
+    const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+    if (written < 0 && errno == EINTR) continue;
+    KJ_REQUIRE(written > 0, "cannot write the local Durable Object format marker", strerror(errno));
+    offset += size_t(written);
+  }
+  KJ_REQUIRE(::fsync(fd) == 0, "cannot sync the local Durable Object format marker", strerror(errno));
+  const int directoryFd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  KJ_REQUIRE(directoryFd >= 0, "cannot open the Durable Object data directory", strerror(errno));
+  const auto closeDirectory = kj::defer([directoryFd]() { ::close(directoryFd); });
+  KJ_REQUIRE(::fsync(directoryFd) == 0, "cannot sync the Durable Object data directory", strerror(errno));
+}
 
 RootStorageRef makeRootStorageRef(const std::string& namespaceId, const std::string& objectId,
     uint64_t dataEpoch) {
