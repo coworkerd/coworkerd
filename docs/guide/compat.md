@@ -66,19 +66,19 @@ holds two of them: `email-routing-template` and `x402-proxy-template`. The other
 
 The [Durable Object guide](durable-objects.md) shows migrations, IDs, fetch, methods, WebSockets and alarms. A class's env contains variables, secrets, DO and D1 bindings, without Service Bindings. Object-to-object calls start independent trees, bounded by eight hops. Confirming peers buffer frames in memory: simultaneous loss of the owner and all confirming peers can lose the unuploaded tail; the normal 30 s upload interval is not a maximum loss window during an outage. A missing alarm hint can delay a due alarm until the object is opened again. `batch` statements run in one transaction, rolled back on any statement failure; `exec` keeps earlier lines and stops at its first failure. The template counts above are the stateless baseline, not a rerun against all 0.5 features.
 
-D1 bindings work without a declared DO class. Migration requests must be strictly below 1 MiB after JSON encoding. SQL imports read 32 KiB at a time with a 960 KiB JSON request cap; chunks commit independently, and foreign-key deferral does not span chunks. A timeout or uncertain reply is reconciled through the migration ledger without resending the file. The CPU budget actually enforced for the internal SQL event is not verified by the migration-tool change. HTTP SQL preserves node errors and does not replay an uncertain request. See [Durable Objects](durable-objects.md) for recovery boundaries and [databases](databases.md) for the supported SQL API.
+D1 bindings work without a declared DO class. Migration requests may be at most 1 MiB (1,048,576 bytes) after JSON encoding; larger HTTP SQL bodies return 413 REQUEST_TOO_LARGE. SQL imports read 32 KiB at a time with a 960 KiB JSON request cap; chunks commit independently, and foreign-key deferral does not span chunks. A timeout or uncertain reply is reconciled through the migration ledger without resending the file. The CPU budget actually enforced for the internal SQL event is not verified by the migration-tool change. HTTP SQL preserves node errors and does not replay an uncertain request. See [Durable Objects](durable-objects.md) for recovery boundaries and [databases](databases.md) for the supported SQL API.
 
 D1 numbers follow JavaScript precision: integers outside the safe range may lose precision, and REAL `1.0` reads as
 `1`; select `quote()` or `printf()` text for an exact stored representation. HTTP SQL byte-array parameters share the
-strictly-below-1-MiB JSON request limit (about 256 KiB of all-255 data in the measured short INSERT). The database guide
+1 MiB (1,048,576-byte) maximum JSON request size (about 256 KiB of all-255 data in the measured short INSERT). The database guide
 includes a candidate-row query for historical binary values stored as text; it is a hint, not proof or automatic repair.
 
 HTTP SQL and `env.DB` limit each complete UTF-8 JSON reply to **7 MiB (7,340,032 bytes)**, including columns, `meta`,
 array entries and framing, and BLOBs expanded to number arrays. Overflow is a statement error:
 HTTP 200 with `success:false` and `D1_RESULT_TOO_LARGE: ...`, or `D1_ERROR: D1_RESULT_TOO_LARGE: ...` from `env.DB`
 (`exec()` retains its `D1_EXEC_ERROR` wrapper). The remaining cursor is consumed and the object stays usable.
-A single object `INSERT ... RETURNING` keeps its committed writes despite the result error; an array `/query` or
-`batch()` rolls back. `exec()` keeps earlier successful lines. Use `LIMIT` to paginate. Cursor draining has no separate
+A single `/query` object, including `INSERT ... RETURNING`, rolls back its writes on a statement or result error;
+an array `/query` or `batch()` also rolls back. `exec()` keeps earlier successful lines. Use `LIMIT` to paginate. Cursor draining has no separate
 time limit, and the reply cap does not bound process memory. See [databases](databases.md#result-size).
 
 
