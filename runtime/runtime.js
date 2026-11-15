@@ -864,10 +864,10 @@ async function makeWorkerCode(descriptor, env, ctx, root = false) {
     const bridge = `import { __coworkerdLog } from "./${PRELUDE_MODULE}";
 import { withEnv, DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
-${TRIAL_SOURCE}
+${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""}${TRIAL_SOURCE}
 ${RPC_SOURCE}
 ${DURABLE_SOURCE}
-${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)}${root ? ", true" : ""});\n`).join("")}
+${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)}${root ? ", true" : ""});\n`).join("")}${root ? classes.map(name => `export const ${name} = ${DURABLE_EXPORT_PREFIX}${name};\n`).join("") : ""}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
   return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
@@ -1538,7 +1538,12 @@ async function selectedRoot(descriptor, env, ctx) {
       deployment = { ...base, compatibilityDate: code.compatibilityDate, compatibilityFlags: code.compatibilityFlags,
         environment: code.env, modules: names.map(name => rootModule(name, code.modules[name])) };
     }
-    ({ plan } = await manage("install", deployment));
+    const installed = await manage("install", deployment);
+    plan = installed.plan;
+    console.log("[root-plan] " + JSON.stringify({ kind: base.kind, tenant: base.tenant, workerId: base.workerId,
+      versionId: base.versionId, creationRecord: base.creationRecord?.present === true,
+      platformClasses: installed.state.plans.filter(value => value.kind === "platform")
+        .map(({ tenant, workerId, configuredWorker, platformClass }) => ({ tenant, workerId, configuredWorker, platformClass })) }));
   }
   if (typeof plan !== "string") throw new Error("Invalid root plan reply");
   return env.ROOTS.getRoot(JSON.stringify({ ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env) }));
