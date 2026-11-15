@@ -3661,7 +3661,7 @@ void DurableLog::finishObjectHolder(
   if (holder->second.requests == 0 && holder->second.connections == 0) object->holders.erase(holder);
 }
 
-kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity) {
+kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity, bool prepareDispatch) {
   if (!enabled()) co_return ObjectReady{};
   if (startupAttempted && !startupReady) {
     if (!startupInitializing && monotonicTimeMs() >= startupRetryAfterMs) co_await start();
@@ -3711,7 +3711,9 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
   // An object past durableObjects.objectBytes is not turned away here: only its writes are refused, at the moment
   // their frames would be confirmed (413 DO_OBJECT_TOO_LARGE), and everything that only reads is served.
   if (object.state == ObjectState::LOCAL) {
-    if (auto error = prepareOpen(object)) co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
+    if (prepareDispatch) {
+      if (auto error = prepareOpen(object)) co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
+    }
     co_return ObjectReady{};
   }
   if (object.state == ObjectState::GONE) {
@@ -3768,8 +3770,10 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     for (auto& [id, facet] : entry->facets) facet.lastSeq = facet.checkpointedSeq = 0;
     entry->shardEpoch = identity.shardEpoch;
   }
-  if (auto error = prepareOpen(*entry))
-    co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
+  if (prepareDispatch) {
+    if (auto error = prepareOpen(*entry))
+      co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE", *error};
+  }
   ObjectReady ready;
   ready.elapsedMs = monotonicTimeMs() - start;
   ready.rebuilt = true;

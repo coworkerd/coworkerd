@@ -527,8 +527,7 @@ async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
 }
 function __coworkerdDurableClass(namespace, name) {
   const base = Object.prototype.hasOwnProperty.call(namespace, name) ? namespace[name] : undefined;
-  const missing = class { constructor() { throw new Error("Durable Object class " + name + " is not a class of this version"); } };
-  if (typeof base !== "function") return missing;
+  if (typeof base !== "function") throw new Error("Durable Object class " + name + " is not a class of this version");
   try {
     const wrapped = class extends base {
       constructor(ctx, variables) {
@@ -559,8 +558,8 @@ function __coworkerdDurableClass(namespace, name) {
     } });
     Object.defineProperty(wrapped, "name", { value: name });
     return wrapped;
-  } catch {
-    return missing;
+  } catch (error) {
+    throw new Error("Durable Object class " + name + " cannot be loaded: " + String(error?.message ?? error));
   }
 }
 `;
