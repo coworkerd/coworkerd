@@ -29,14 +29,17 @@ export type MultipartUploadRow = {
 	http_metadata: string; // JSON-serialised `R2HTTPMetadata` (workers-types)
 	custom_metadata: string; // JSON-serialised user-defined metadata
 	state: ValueOf<typeof MultipartUploadState>;
-	// NOTE: we need to keep completed/aborted uploads around for referential
-	// integrity, and because error messages are different when attempting to
-	// upload parts to them
+	created_at: number;
+	expires_at: number;
+	// Retain final states until expires_at for Miniflare-compatible errors.
+	// Completed parts remain valid after this upload record is removed.
 };
 export type MultipartPartRow = {
 	upload_id: string;
 	part_number: number;
 	blob_id: string;
+	chunk_size: number;
+	chunk_count: number;
 	size: number; // NOTE: used to identify which parts to read for range requests
 	etag: string; // NOTE: multipart part ETag's are not MD5 checksums
 	checksum_md5: string; // NOTE: used in construction of final object's ETag
@@ -56,6 +59,30 @@ CREATE TABLE IF NOT EXISTS _mf_objects (
     http_metadata TEXT NOT NULL,
     custom_metadata TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS _mf_multipart_uploads (
+    upload_id TEXT PRIMARY KEY,
+    key TEXT NOT NULL,
+    http_metadata TEXT NOT NULL,
+    custom_metadata TEXT NOT NULL,
+    state TINYINT DEFAULT 0 NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS _r2_upload_expiry ON _mf_multipart_uploads(expires_at);
+CREATE TABLE IF NOT EXISTS _mf_multipart_parts (
+    -- Completed parts outlive the seven-day upload record, so no upload FK.
+    upload_id TEXT NOT NULL,
+    part_number INTEGER NOT NULL,
+    blob_id TEXT NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    etag TEXT NOT NULL,
+    checksum_md5 TEXT NOT NULL,
+    object_key TEXT REFERENCES _mf_objects(key) DEFERRABLE INITIALLY DEFERRED,
+    PRIMARY KEY (upload_id, part_number)
+);
+CREATE INDEX IF NOT EXISTS _r2_parts_key ON _mf_multipart_parts(object_key, part_number);
 `;
 // NOTE: `object_key` foreign key constraint is deferred, meaning we can delete
 // the linked object row, *then* the multipart part rows in a transaction,
