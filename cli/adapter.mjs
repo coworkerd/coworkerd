@@ -521,8 +521,9 @@ function hasStatement(text) {
   return false;
 }
 export function migrationBody(text, name, table) {
-  // Separate items handle missing semicolons and trailing comments. Empty files are ledgered no-ops.
-  return JSON.stringify([{ sql: hasStatement(text) ? text : "SELECT 1" },
+  // A final no-op gives prepare/exec a concrete last statement even after trailing comments.
+  // A newline ends a line comment; the separator also handles a missing terminal semicolon.
+  return JSON.stringify([{ sql: hasStatement(text) ? `${text}\n;\nSELECT 1` : "SELECT 1" },
     { sql: `INSERT INTO ${identifier(table)} (name) VALUES (?)`, params: [name] }]);
 }
 function uncertain(error) {

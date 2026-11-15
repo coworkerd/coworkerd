@@ -113,8 +113,9 @@ and subdirectory layouts in this release.
 
 Each file and its ledger INSERT are two items in **one array request and one transaction**. A failed file rolls back
 all of that file, including its ledger row; earlier successful files remain applied, and later files are not attempted.
-The command names the file and SQLite error and exits nonzero. Fix the file and run `apply` again. SQL is sent intact,
-so a missing final semicolon or trailing comment does not interfere with the separate ledger INSERT.
+The command names the file and SQLite error and exits nonzero. Fix the file and run `apply` again. SQL is not split:
+the CLI appends a separator and a no-op `SELECT 1` so a missing final semicolon or trailing comment leaves a concrete
+last statement for the SQL interface. The ledger INSERT remains a separate array item in the same transaction.
 
 Migration files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger
 `BEGIN … END` bodies are supported. The full JSON-encoded request, including escapes and the ledger statement, must be
