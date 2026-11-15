@@ -12,7 +12,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch commits plus the v95 follow-up to 0010.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch commits plus the v95 follow-up to 0010. Feature branches carry additions until they are merged into the tag branch.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
 - **Thin patches.** Changes normally stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with explicit
@@ -75,11 +75,12 @@ operations validate the series before mutating a checkout or exporting files.
 
 ## Rust server port (v1.20261114.1)
 
-The current series targets `v1.20261114.1` and is exported from `coworkerd-v1.20261114.1`.
+The current series targets `v1.20261114.1`, with the runtime root loader added to the
+baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013 and 0014, in that order.
-0014 is the seventeenth patch and completes the stage 3 Durable Object port.
-The fork has 18 commits above the tag for these 17 files because 0010 also has the v95 follow-up.
+0001, 0003, 0004, 0018, 0013, 0014 and 0020, in that order.
+0014 completes the Durable Object port; 0020 adds the private runtime root loader.
+The complete tree has 19 commits above the tag for these 18 files because 0010 also has the v95 follow-up.
 The deferred patch list is empty.
 
 The SQLite CTE backout is part of this upstream tag (`0d01fe9f6850d038d80e6debb54c683a51a9ac65`).
@@ -213,6 +214,42 @@ The exact API/io exceptions are `src/workerd/api/worker-loader.h`,
 are `src/workerd/server/server/bridge.rs`, `src/workerd/server/server/loader.rs` and
 `src/workerd/server/server/worker.rs`; other Rust files remain excluded. Runtime callers must
 supply this record when their integration is ported.
+
+### 0020: private runtime root loader
+
+A trusted process configuration can declare a `coworkerdRootLoader` service with an absolute
+`storagePath` and bind it as `ROOTS` to its runtime. It uses the existing service binding `fetch`
+capability; no additional descriptor, public node endpoint or Fetcher method is introduced.
+The loader never adds this binding to a loaded Worker's environment, and its capability cannot
+be transferred. The existing node entry path continues to use Host/app.
+
+The private service accepts `POST /install` with an owned deployment description: Worker and
+version ids, compatibility date/flags, ES modules, namespace ids, class names, binding names,
+storage unique keys and an explicit creation record. The creation record supplies tenant,
+Worker/version ids, load generation, CPU limit in milliseconds and memory limit in MiB.
+Missing records are rejected. The owned Cap'n Proto Worker config survives with its compiled
+script. Limits continue to read only `WorkerSpec.load_identity`; loader keys and class names
+are never parsed for identity.
+
+`RootRegistry` indexes compiled Workers by Worker id, version, limits and load generation.
+Namespace entries retain their own storage and a mutable class-source reference. All root
+classes in one deployment share its compiled isolate and creation record. The initial
+generation is supplied by the trusted caller; reloads increment that plan's private generation.
+After link, the existing ready hook attaches idle, watermark and GC lifecycle machinery.
+Retirement aborts that generation's actors, unlinks its Worker and releases the compiled
+instance. Its generation and weak instance identity are checked after awaits, so an old abort
+cannot remove a replacement. Namespace storage remains available for the next load.
+
+`GET /state` inspects the private registry, `/invoke?plan=...` forwards an event to a plan's
+default entrypoint, and `POST /retire` conditionally retires a specified plan generation.
+Install publishes its namespaces only after compilation, exported-class validation and link
+succeed. Public object identity, transferable facet classes, deployment bindings/logging and
+changing a namespace's class source are later integration work.
+
+The exact Rust paths permitted for this patch are `server/server/bridge.rs`, `config.rs`,
+`lib.rs`, `root_loader.rs` and `worker.rs` below `src/workerd/`. Its other changes are the
+server configuration schema and the factory's owned-config compile hook. The preceding patch
+files retain their original bytes and behavior.
 
 ### Upstream pin history
 

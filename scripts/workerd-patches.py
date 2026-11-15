@@ -41,6 +41,13 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0020-root-loader.patch": frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/config.rs",
+        "src/workerd/server/server/lib.rs",
+        "src/workerd/server/server/root_loader.rs",
+        "src/workerd/server/server/worker.rs",
+    }),
     # Rust owns root-tree residency and wake accounting; the bridge carries the
     # C++-read limit and residency reports without changing the node protocol.
     "0014-durable-object-hibernation-alarms.patch": frozenset({
