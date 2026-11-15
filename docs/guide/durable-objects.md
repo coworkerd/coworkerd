@@ -104,6 +104,8 @@ async alarm({ retryCount, isRetry }) {
 
 `setAlarm`, `getAlarm` and `deleteAlarm` store the time in the object's database, replicated and recovered with it. The shard owner schedules due alarms and invokes `alarm(alarmInfo)` as an event. A successful handler's unchanged alarm is deleted; setting another time preserves that new alarm. A throwing handler is retried with backoff; a class without a handler has its alarm removed.
 
+After an owner node stops, a new owner appears only when a request reaches that shard; alarms in that shard do not fire before then.
+
 Object-store hints identify which objects the next shard owner should wake, but the database decides whether an alarm is due. A stale hint can cause a harmless wake; a missing hint delays discovery until the object is opened again. Treat delivery as retryable, with no exactly-once side-effect guarantee.
 
 ## 6. Limits and quotas
