@@ -42,9 +42,13 @@ def git(checkout, *args, env=None, input=None):
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
     "0020-root-loader.patch": frozenset({
+        "src/workerd/server/server/actor.rs",
+        "src/workerd/server/server/bindings.rs",
         "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/channels.rs",
         "src/workerd/server/server/config.rs",
         "src/workerd/server/server/lib.rs",
+        "src/workerd/server/server/loader.rs",
         "src/workerd/server/server/root_loader.rs",
         "src/workerd/server/server/worker.rs",
     }),
