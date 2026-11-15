@@ -11,14 +11,19 @@ async function fixture(fn) {
 }
 const answer = (remainder = "", statementCount = 1) => ({ success: true, results: [], ingest: { remainder, statementCount, rowsRead: 0, rowsWritten: 1 } });
 
-test("exactly 1 MiB migration JSON is rejected before sending", () => fixture(async directory => {
+test("migration JSON accepts exactly 1 MiB and rejects one more byte before sending", () => fixture(async directory => {
   const base = "SELECT 1;", name = "boundary.sql", table = "ledger";
   const text = base + " ".repeat(MAX_QUERY_BYTES - Buffer.byteLength(migrationBody(base, name, table)));
   assert.equal(Buffer.byteLength(migrationBody(text, name, table)), MAX_QUERY_BYTES);
   await writeFile(join(directory, name), text);
-  let calls = 0;
-  await assert.rejects(applyMigrations({ directory, table, files: [name], query: async () => { calls++; } }), /too large/);
-  assert.equal(calls, 0);
+  const sent = [];
+  const query = async body => { sent.push(Buffer.byteLength(body)); return [{success:true}, {success:true}]; };
+  assert.deepEqual(await applyMigrations({directory, table, files:[name], query}), [name]);
+  assert.deepEqual(sent, [MAX_QUERY_BYTES]);
+  await writeFile(join(directory, name), text + " ");
+  await assert.rejects(applyMigrations({directory, table, files:[name], query}), /too large/);
+  assert.deepEqual(sent, [MAX_QUERY_BYTES]);
+  assert.equal(IMPORT_REQUEST_BYTES, MAX_QUERY_BYTES - 64 * 1024);
 }));
 
 test("small file without a semicolon is one request and reports UTF-8 bytes", () => fixture(async directory => {
