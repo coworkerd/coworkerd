@@ -117,6 +117,7 @@ add_executable(coworkerd
   node/storage-probe.c++
   node/egress.c++
   node/peer-auth.c++
+  node/blob-store.c++
 )
 target_include_directories(coworkerd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
 target_link_libraries(coworkerd PRIVATE common kj-tls-local)
