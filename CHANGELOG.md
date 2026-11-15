@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `cowctl d1 migrations create`, `list` and `apply`: versioned SQL files in a migrations directory, applied in numeric order, each file together with its row in the `d1_migrations` table in one transaction. The directory and table come from `--dir` and `--table`, then from `migrations_dir` and `migrations_table` of the Wrangler configuration, which `cowctl deploy` now accepts along with `migrations_pattern`; the migration commands do not support `migrations_pattern` or subdirectory layouts yet. After a timeout or `503 RESULT_UNCERTAIN` the file is not sent again; the command reads the table to decide.
 - Move the kernel to workerd `v1.20261114.1` with 17 patches (the SQLite `WITH` fix of 0.5.6 is now upstream) and update the compatibility table to 308 flags with a maximum table date of 2026-11-21. The system call tables are unchanged apart from the kernel hash they name. workerd now checks its process-wide default CPU limit at startup instead of at the first Worker load.
 
 ## 0.5.6 (2026-11-15)
