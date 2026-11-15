@@ -5,19 +5,15 @@ export class BlobStore {
  constructor(readonly binding: Fetcher) {}
  #url(id: string) {return `http://blobs/${id}`;}
  async put(id: string, body: ReadableStream<Uint8Array>, size: number) {
-  // Preserve known length across a TransformStream; BLOBS must never accept unknown length.
-  const fixed = new FixedLengthStream(size);
+  // uploadChunks supplies a FixedLengthStream. Do not couple two native fixed streams.
   const abort = new AbortController();
-  const pumping = body.pipeTo(fixed.writable, {signal:abort.signal});
-  void pumping.catch(() => {});
   try {
-   const response = await this.binding.fetch(this.#url(id),{method:"PUT",body:fixed.readable,headers:{"Content-Length":String(size)}});
+   const response = await this.binding.fetch(this.#url(id),{method:"PUT",body,signal:abort.signal,headers:{"Content-Length":String(size)}});
    await response.arrayBuffer();
    if (!response.ok) throw new Error(`BLOBS PUT failed (${response.status})`);
-   await pumping;
-  } catch (error) {
+  } catch(error) {
    abort.abort(error);
-   await pumping.catch(() => {});
+   await body.cancel(error).catch(() => {});
    throw error;
   }
  }

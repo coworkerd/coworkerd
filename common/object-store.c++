@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -406,6 +407,14 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
   KJ_IF_SOME(value, response.headers->get(lastModifiedHeader)) {
     lastModified = httpDateUnixMs(std::string_view(value.begin(), value.size()));
   }
+  if (call.headLength != nullptr) {
+    *call.headLength = std::nullopt;
+    KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::CONTENT_LENGTH)) {
+      uint64_t length = 0;
+      const auto parsed = std::from_chars(value.begin(), value.end(), length);
+      if (parsed.ec == std::errc{} && parsed.ptr == value.end()) *call.headLength = length;
+    }
+  }
   std::string body;
   std::string buffer(CHUNK, '\0');
   while (true) {
@@ -422,6 +431,18 @@ kj::Promise<bool> ObjectStore::exists(std::string key) {
   auto response = co_await request(kj::HttpMethod::HEAD, std::move(key));
   requireStorage(response.status == 200 || response.status == 404, "object HEAD failed: HTTP " + std::to_string(response.status));
   co_return response.status == 200;
+}
+kj::Promise<std::optional<uint64_t>> ObjectStore::headSize(std::string key) {
+  KJ_REQUIRE(settings.backend == "s3", "object length HEAD requires the S3 backend");
+  KJ_REQUIRE(!key.empty(), "object length HEAD needs a key");
+  std::optional<uint64_t> length;
+  Call call{kj::HttpMethod::HEAD, std::move(key), "", true};
+  call.headLength = &length;
+  auto response = co_await send(std::move(call));
+  requireStorage(response.status == 200 || response.status == 404, "object HEAD failed: HTTP " + std::to_string(response.status));
+  if (response.status == 404) co_return std::nullopt;
+  requireStorage(length.has_value(), "object HEAD did not provide a valid Content-Length");
+  co_return length;
 }
 kj::Promise<ObjectResponse> ObjectStore::put(std::string key, std::string bytes) {
   auto response = co_await request(kj::HttpMethod::PUT, std::move(key), std::move(bytes));

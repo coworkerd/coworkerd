@@ -99,10 +99,26 @@ export class InternalR2ObjectBody extends InternalR2Object {
 		const { metadataSize, value: metadata } = super.encode();
 		const size = this.range?.length ?? this.size;
 		const identity = new FixedLengthStream(size + metadataSize);
-		void metadata
-			.pipeTo(identity.writable, { preventClose: true })
-			.then(() => this.body.pipeTo(identity.writable))
-			.catch((error) => identity.writable.abort(error).catch(() => {}));
+		// Explicit BYOB pumping reuses one buffer; pipeTo's default JS reader allocates per packet.
+		void (async () => {
+			const writer = identity.writable.getWriter();
+			let reader: ReadableStreamBYOBReader | undefined;
+			try {
+				await writer.write(new Uint8Array(await new Response(metadata).arrayBuffer()));
+				reader = this.body.getReader({ mode: "byob" });
+				let buffer = new ArrayBuffer(64 * 1024);
+				for (;;) {
+					const { value, done } = await reader.read(new Uint8Array(buffer));
+					if (value) buffer = value.buffer;
+					if (done) break;
+					await writer.write(value);
+				}
+				await writer.close();
+			} catch (error) {
+				await reader?.cancel(error).catch(() => {});
+				await writer.abort(error).catch(() => {});
+			} finally { reader?.releaseLock(); writer.releaseLock(); }
+		})();
 		return {
 			metadataSize: metadataSize,
 			value: identity.readable,

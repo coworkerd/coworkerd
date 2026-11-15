@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -102,6 +103,8 @@ class ObjectStore {
 public:
   ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Timer& timer);
   kj::Promise<bool> exists(std::string key);
+  // S3 object length from one HEAD; nullopt for 404. No body or listing is read.
+  kj::Promise<std::optional<uint64_t>> headSize(std::string key);
   // An overwrite.
   kj::Promise<ObjectResponse> put(std::string key, std::string bytes);
   kj::Promise<ObjectResponse> get(std::string key);
@@ -135,6 +138,8 @@ private:
     // Parameters besides the signature's (a listing's), signed with it.
     std::vector<std::pair<std::string, std::string>> query;
     bool ifNoneMatch = false;
+    // Only headSize supplies this; existing operations do not parse length.
+    std::optional<uint64_t>* headLength = nullptr;
   };
   ObjectStoreConfig settings;
   ObjectStoreStats statistics;

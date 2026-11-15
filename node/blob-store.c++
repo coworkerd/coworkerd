@@ -273,9 +273,10 @@ kj::Promise<NodeBlobStore::Reply> NodeBlobStore::erase(Target target, std::strin
   const auto key = prefix(target) + "trash/" + name;
   co_await impl->load(target, state);
   if (state.trash.contains(name)) { complete = true; co_return status(204); }
-  // Exact GET is one round trip even when other names share this prefix. The client has no HEAD length API.
-  auto body = co_await impl->store.get(prefix(target) + "b/" + name); checkRead(body);
-  const auto bytes = body.status == 200 ? body.bytes.size() : 0;
+  // HEAD obtains the exact object's size without downloading its immutable body.
+  const auto bodySize = co_await impl->store.headSize(prefix(target) + "b/" + name);
+  const bool found = bodySize.has_value();
+  const auto bytes = bodySize.value_or(0);
   requireStorage(bytes <= state.used.liveBytes, "blob accounting must be rebuilt before deleting");
   Marker marker{name, position, add(impl->clock(), impl->settings.retentionMs)};
   auto made = co_await impl->store.create(key, markerJson(target, marker));
@@ -284,7 +285,7 @@ kj::Promise<NodeBlobStore::Reply> NodeBlobStore::erase(Target target, std::strin
     requireStorage(back.status == 200, "an existing blob trash marker could not be read back");
     marker = parseMarker(target, name, back.bytes);
   }
-  state.trash.emplace(name, Impl::Pending{std::move(marker), bytes, body.status == 404});
+  state.trash.emplace(name, Impl::Pending{std::move(marker), bytes, !found});
   state.used.liveBytes -= bytes;
   state.used.garbageBytes = add(state.used.garbageBytes, bytes); complete = true;
   co_return status(204);

@@ -12,8 +12,9 @@ import { InternalR2Object, InternalR2ObjectBody } from "./r2Object.worker";
 import { R2BindingRequestSchema, SQL_SCHEMA } from "./schemas.worker";
 import type { ObjectRow, R2Conditional, InternalR2PutOptions, InternalR2GetOptions, InternalR2ListOptions, R2Range } from "./schemas.worker";
 import type { InternalR2Objects } from "./r2Object.worker";
-import { Validator, R2_HASH_ALGORITHMS } from "./validator.worker";
+import { Validator } from "./validator.worker";
 import { BlobStore } from "./blobs";
+import { bodyNames, uploadChunks, readChunks } from "./chunks";
 
 const validate = new Validator();
 const unsupported = (message: string) => new R2Error(400, `Not supported: ${message}`, 10029);
@@ -40,21 +41,21 @@ function encodeResult(result: InternalR2Object | InternalR2Objects) {
 function sqlStmts(db: TypedSql) {
 	const stmtGetPreviousByKey = db.stmt<
 		Pick<ObjectRow, "key">,
-		Pick<ObjectRow, "blob_id" | "etag" | "uploaded">
-	>("SELECT blob_id, etag, uploaded FROM _mf_objects WHERE key = :key");
+		Pick<ObjectRow, "blob_id" | "etag" | "uploaded" | "chunk_size" | "chunk_count">
+	>("SELECT blob_id, etag, uploaded, chunk_size, chunk_count FROM _mf_objects WHERE key = :key");
 	// Regular statements
 	const stmtGetByKey = db.stmt<Pick<ObjectRow, "key">, ObjectRow>(`
-    SELECT key, blob_id, version, size, etag, uploaded, checksums, http_metadata, custom_metadata
+    SELECT key, blob_id, chunk_size, chunk_count, version, size, etag, uploaded, checksums, http_metadata, custom_metadata
     FROM _mf_objects WHERE key = :key
   `);
 	const stmtPut = db.stmt<ObjectRow>(`
-    INSERT OR REPLACE INTO _mf_objects (key, blob_id, version, size, etag, uploaded, checksums, http_metadata, custom_metadata)
-    VALUES (:key, :blob_id, :version, :size, :etag, :uploaded, :checksums, :http_metadata, :custom_metadata)
+    INSERT OR REPLACE INTO _mf_objects (key, blob_id, chunk_size, chunk_count, version, size, etag, uploaded, checksums, http_metadata, custom_metadata)
+    VALUES (:key, :blob_id, :chunk_size, :chunk_count, :version, :size, :etag, :uploaded, :checksums, :http_metadata, :custom_metadata)
   `);
 	const stmtDelete = db.stmt<
 		Pick<ObjectRow, "key">,
-		Pick<ObjectRow, "blob_id">
-	>("DELETE FROM _mf_objects WHERE key = :key RETURNING blob_id");
+		Pick<ObjectRow, "blob_id" | "chunk_size" | "chunk_count">
+	>("DELETE FROM _mf_objects WHERE key = :key RETURNING blob_id, chunk_size, chunk_count");
 
 	function stmtListWithoutDelimiter<ExtraColumns extends (keyof ObjectRow)[]>(
 		...extraColumns: ExtraColumns
@@ -75,7 +76,7 @@ function sqlStmts(db: TypedSql) {
 		>(`
       SELECT ${columns.join(", ")}
       FROM _mf_objects
-      WHERE substr(key, 1, length(:prefix)) = :prefix
+      WHERE key >= :prefix AND substr(key, 1, length(:prefix)) = :prefix
       AND (:start_after IS NULL OR key > :start_after)
       ORDER BY key LIMIT :limit
     `);
@@ -87,12 +88,12 @@ function sqlStmts(db: TypedSql) {
    const previous = get(stmtGetPreviousByKey({key: row.key}));
    validate.condition(previous, onlyIf);
    stmtPut(row);
-   if (previous?.blob_id) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", previous.blob_id);
+   if (previous?.blob_id) for (const name of bodyNames(previous)) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);
   }),
   deleteByKeys: db.txn((keys: string[]) => {
    for (const key of keys) {
     const old = get(stmtDelete({key}));
-    if (old?.blob_id) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", old.blob_id);
+    if (old?.blob_id) for (const name of bodyNames(old)) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);
    }
   }),
 
@@ -133,7 +134,7 @@ function sqlStmts(db: TypedSql) {
         -- NOTE: we'll ignore metadata for delimited prefix rows, so it doesn't matter which keys' we return
         version, size, etag, uploaded, checksums, http_metadata, custom_metadata
       FROM _mf_objects
-      WHERE substr(key, 1, length(:prefix)) = :prefix
+      WHERE key >= :prefix AND substr(key, 1, length(:prefix)) = :prefix
       AND (:start_after IS NULL OR key > :start_after)
       GROUP BY delimited_prefix_or_key -- Group keys with same delimited prefix into a row, leaving others in their own rows
       ORDER BY last_key LIMIT :limit;
@@ -147,37 +148,48 @@ export class R2BucketObject {
  readonly #stmts: ReturnType<typeof sqlStmts>;
  readonly db: TypedSql;
  readonly blob: BlobStore;
- #gc?: Promise<void>;
+ #gcRunning = false;
  constructor(readonly ctx: DurableObjectState, readonly env: {BLOBS: Fetcher}) {
   this.db = createTypedSql(ctx.storage);
   this.db.exec(SQL_SCHEMA);
+  const columns = new Set(all(this.db.exec("PRAGMA table_info(_mf_objects)")).map(row => row.name));
+  if (!columns.has("chunk_size")) this.db.exec("ALTER TABLE _mf_objects ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 0");
+  if (!columns.has("chunk_count")) this.db.exec("ALTER TABLE _mf_objects ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1");
   this.db.exec("CREATE TABLE IF NOT EXISTS _r2_pending_gc (blob_id TEXT PRIMARY KEY NOT NULL)");
+  this.db.exec("CREATE TABLE IF NOT EXISTS _r2_gc_state (id INTEGER PRIMARY KEY CHECK(id = 1), retry_ms INTEGER NOT NULL)");
+  this.db.exec("INSERT OR IGNORE INTO _r2_gc_state VALUES (1, 1000)");
   this.#stmts = sqlStmts(this.db);
   ctx.blockConcurrencyWhile(async () => {
-   if (get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) await ctx.storage.setAlarm(Date.now());
+   await this.#scheduleGc();
   });
   this.blob = new BlobStore(env.BLOBS);
  }
- async alarm() { await this.#drainGc(); }
- async #drainGc() {
-  if (this.#gc) return this.#gc;
-  this.#gc = this.#runGc();
-  try { await this.#gc; } finally { this.#gc = undefined; }
+ async #scheduleGc() {
+  if (this.#gcRunning || !get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) return;
+  if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
  }
- async #runGc() {
-  // Persist retry intent before the first external DELETE. SQL/output durability uses the DO gate.
-  const rows = all(this.db.exec<{blob_id: string}>("SELECT blob_id FROM _r2_pending_gc LIMIT 1024"));
-  if (!rows.length) return;
-  await this.ctx.storage.setAlarm(Date.now() + 1000);
-  await this.ctx.storage.sync();
-  for (const {blob_id} of rows) {
-   try {
-    await this.blob.delete(blob_id);
-    this.db.exec("DELETE FROM _r2_pending_gc WHERE blob_id = ?", blob_id);
-   } catch { /* Keep the durable row; alarm/open retries it. */ }
-  }
-  if (get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) await this.ctx.storage.setAlarm(Date.now() + 1000);
-  else await this.ctx.storage.deleteAlarm();
+ async alarm() {
+  this.#gcRunning = true;
+  try {
+   const rows = all(this.db.exec<{blob_id:string}>("SELECT blob_id FROM _r2_pending_gc ORDER BY rowid LIMIT 64"));
+   if (!rows.length) return;
+   // Only alarms send retirement requests, after the dereferencing SQL is durable.
+   await this.ctx.storage.sync();
+   let failed = false;
+   for (let i = 0; i < rows.length; i += 8) {
+    const outcomes = await Promise.all(rows.slice(i,i+8).map(async ({blob_id}) => {
+     try {await this.blob.delete(blob_id);return {blob_id,ok:true};}
+     catch {return {blob_id,ok:false};}
+    }));
+    this.ctx.storage.transactionSync(() => {
+     for (const result of outcomes) if (result.ok) this.db.exec("DELETE FROM _r2_pending_gc WHERE blob_id = ?",result.blob_id);
+    });
+    if (outcomes.some(result => !result.ok)) {failed = true;break;}
+   }
+   const previous = Number(get(this.db.exec("SELECT retry_ms FROM _r2_gc_state WHERE id = 1"))!.retry_ms);
+   this.db.exec("UPDATE _r2_gc_state SET retry_ms = ? WHERE id = 1",failed ? Math.min(previous * 2,60000) : 1000);
+   if (get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) await this.ctx.storage.setAlarm(Date.now() + (failed ? previous : 1));
+  } finally {this.#gcRunning = false;}
  }
  async #head(key: string) {
   validate.key(key);
@@ -197,38 +209,30 @@ export class R2BucketObject {
   const range = validate.range(opts, row.size);
   const r2Range = range ? {offset:range.start,length:range.end-range.start+1} : full;
   assert(row.blob_id !== null);
-  const body = await this.blob.get(row.blob_id, range, r2Range.length);
+  const body = await readChunks(this.blob,row,r2Range);
   return new InternalR2ObjectBody(row, body, r2Range);
  }
  async #put(key: string, value: ReadableStream<Uint8Array>, size: number, opts: InternalR2PutOptions) {
   try {
    if (!Number.isSafeInteger(size) || size < 0) throw new InvalidMetadata();
-   if (size > R2Limits.MAX_VALUE_SIZE) throw unsupported("PUT above 25 MiB (chunking is not implemented)");
+   if (size > R2Limits.MAX_VALUE_SIZE) throw unsupported("PUT above 1 GiB");
    validate.key(key).size(size).metadataSize(opts.customMetadata);
   } catch(error) {await discard(value).catch(() => {});throw error;}
   const blobId = version();
-  const algorithms = R2_HASH_ALGORITHMS.filter(({field}) => field === "md5" || opts[field] !== undefined);
-  const digests = new Map();
-  const hashes = algorithms.map(({name}) => new crypto.DigestStream(name));
-  const writers = hashes.map(hash => hash.getWriter());
-  const digesting = new TransformStream<Uint8Array,Uint8Array>({
-   async transform(chunk, controller) {for (const writer of writers) await writer.write(chunk);controller.enqueue(chunk);},
-   async flush() {for(let i=0;i<hashes.length;i++){await writers[i].close();digests.set(algorithms[i].name, Buffer.from(await hashes[i].digest));}}
-  });
+  const attempted: string[] = [];
   let row: ObjectRow;
   try {
-   await this.blob.put(blobId, value.pipeThrough(digesting), size);
+   const digests = await uploadChunks(this.blob,blobId,value,size,opts,attempted);
    const checksums = validate.hash(digests, opts);
-   row = {key,blob_id:blobId,version:version(),size,etag:digests.get("MD5").toString("hex"),uploaded:Date.now(),checksums:JSON.stringify(checksums),http_metadata:JSON.stringify(opts.httpMetadata ?? {}),custom_metadata:JSON.stringify(opts.customMetadata ?? {})};
+   row = {key,blob_id:blobId,chunk_size:R2Limits.CHUNK_SIZE,chunk_count:Math.max(1,Math.ceil(size/R2Limits.CHUNK_SIZE)),version:version(),size,etag:digests.get("MD5")!.toString("hex"),uploaded:Date.now(),checksums:JSON.stringify(checksums),http_metadata:JSON.stringify(opts.httpMetadata ?? {}),custom_metadata:JSON.stringify(opts.customMetadata ?? {})};
    // The condition is deliberately checked after the body, inside the claiming transaction.
    this.#stmts.put(row, opts.onlyIf);
   } catch (error) {
-   this.db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", blobId);
-   await this.#drainGc();
+   this.ctx.storage.transactionSync(() => {for (const name of attempted) this.db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);});
+   await this.#scheduleGc();
    throw error;
   }
-  // Cleanup errors after a successful claim must never retire the current body.
-  await this.#drainGc();
+  await this.#scheduleGc();
   return new InternalR2Object(row);
  }
  async #delete(keys: string | string[]) {
@@ -236,7 +240,7 @@ export class R2BucketObject {
   if (keys.length > 1000) throw unsupported("delete above 1000 keys");
   for (const key of keys) validate.key(key);
   this.#stmts.deleteByKeys(keys);
-  await this.#drainGc();
+  await this.#scheduleGc();
  }
 
 	#listWithoutDelimiterQuery(excludeHttp: boolean, excludeCustom: boolean) {
@@ -360,8 +364,6 @@ export class R2BucketObject {
 
  async fetch(req: Request) {
   try {
-   // Opening the bucket also retries a queue left by an interrupted prior instance.
-   await this.#drainGc();
    if (req.method === "GET") {
     const header = req.headers.get(R2Headers.REQUEST);
     if (!header) throw new InvalidMetadata();
@@ -374,7 +376,10 @@ export class R2BucketObject {
     if (metadata.method === "put") {
      const length = req.headers.get("Content-Length");
      if (length === null) throw new InvalidMetadata();
-     return encodeResult(await this.#put(metadata.object,value,Number(length)-metadataSize,metadata));
+     const operation = this.#put(metadata.object,value,Number(length)-metadataSize,metadata);
+     // A producer can abort before fetch() settles; keep the failure cleanup alive.
+     this.ctx.waitUntil(operation.then(() => {},() => {}));
+     return encodeResult(await operation);
     }
     if (metadata.method === "delete") {
      await this.#delete("object" in metadata ? metadata.object : metadata.objects);

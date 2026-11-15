@@ -21,3 +21,12 @@ The schema dependency Zod is pinned to `4.4.3` (MIT) in `package-lock.json`;
 esbuild `0.28.1` is a build dependency. Dependencies are installed rather than
 vendored. Their npm packages include their respective license notices. No
 Miniflare runtime framework or local filesystem blob implementation is required.
+
+## Chunked-object extension
+
+The chunking/stream adapter in `chunks.ts` is Coworkerd code (Apache-2.0).
+The object table adds upload chunk size/count while migrating old single-blob
+rows. The final claiming transaction and Miniflare condition/checksum semantics
+remain intact. Retirement now runs only in alarms, with a persistent retry state;
+request handlers enqueue names and schedule an alarm. Both list queries add a
+`key >= prefix` index lower bound without changing filtering or ordering.
