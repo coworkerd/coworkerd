@@ -21,19 +21,21 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: 0.5.5 released
+## Status: preparing 0.5.6
 
-[0.5.5](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.5) (2026-11-14) is the current stable release. It
-updates the node daemon while retaining the workerd kernel and system call tables from the 0.5.4 prerelease. It
-reduces paused-process admission failures, adds host first-touch diagnostics and suspect probation, and repairs
-takeover paths that could omit acknowledged Durable Object writes or later rebuild a corrupt database.
-Stateful upgrades from 0.5.3 or 0.5.4 require a coordinated maintenance window and backups; read the
-[upgrade procedure and known issues](docs/guide/install.md#upgrading-053-or-054-to-055).
-Further durability and resource fixes continue on `main`. The 0.5.4 prerelease is superseded; deployments using
-DO or D1 should upgrade to 0.5.5 rather than remain on 0.5.4. The 0.5.3 assets remain published and unchanged.
-See the [CHANGELOG](CHANGELOG.md).
+0.5.6 updates the node daemon and workerd kernel. Durable Object files are rebuilt from replicated history
+at the first open after every daemon restart, with a configurable limit on concurrent rebuilds. It also
+protects objects held by requests or WebSocket connections, rechecks dispatch and replication channels,
+and removes the workerd SQLite parser's regression for repeated `WITH` references.
+There is no in-place upgrade for clusters that use Durable Objects or D1; install with new data directories
+and a new bucket, then move data at the application level. Read the
+[upgrade procedure and known issues](docs/guide/install.md#upgrading-to-056).
+[0.5.5](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.5) remains the current stable release while
+0.5.6 is prepared. See the [CHANGELOG](CHANGELOG.md).
 
-0.5 runs stateless and stateful Workers. 0.4.x installations upgrade in place, keeping the bucket and volumes; update every component and node's storage policy before using DO / D1. 0.3.x installations require rebuilding because their state was in etcd.
+0.5 runs stateless and stateful Workers. The 0.5.6 stateful installation requires new storage; stateless
+clusters can replace packages one node at a time. 0.3.x installations also require rebuilding their control
+plane because their state was in etcd.
 Each architecture comes as a package (the node daemon `coworkerd`, the control plane `coworkerd-apiserver`, the
 launcher `coworkerd-launcher`, the patched `workerd`, `cowctl`) and a container image, with compose files for one or
 three nodes, to which more nodes can be added while they run. [CHANGELOG.md](CHANGELOG.md) lists what it contains.

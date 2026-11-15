@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 (unreleased)
 
 - Remove the cache admission, hold and healing code that can no longer be reached now that local files are not reused after a restart. The node state loses `durableLog.recovery.healPending`, `healBusy`, `healErrors`, `healSnapshots`, `healFailures`, `healedWalFrames`, `durableLog.objects.hold` and `durableLog.storage.positionsReused`.
 - Limit how many Durable Objects a node rebuilds at once with `durableObjects.rebuildConcurrency` (4 by default, 1 to 64); further rebuilds wait first-come first-served. `durableLog.objects.activeRebuilds` and `queuedRebuilds` report the state.

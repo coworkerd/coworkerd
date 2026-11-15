@@ -1,6 +1,6 @@
 # Installing and running Coworkerd
 
-> For release 0.5.5.
+> For release 0.5.6.
 > For platform operators meeting Coworkerd for the first time: follow this page to start a cluster on your own machine, create a tenant, deploy a Worker and send the first request.
 > Tenants, credentials, deployments, logs, new versions, rollbacks, secrets and usage are done with the command line `cowctl`, see the [quickstart](quickstart.md); this page covers installation, startup, configuration and operations.
 
@@ -17,9 +17,9 @@ Each version comes in two architectures (`linux/amd64`, `linux/arm64`), three fi
 
 | File | Contents |
 | --- | --- |
-| `coworkerd-0.5.5-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.5-linux-<arch>/` (the next table) |
-| `coworkerd-0.5.5-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.5`, for `docker load` |
-| `coworkerd-0.5.5-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 and the required GLIBC version of each binary |
+| `coworkerd-0.5.6-linux-<arch>.tar.gz` | The package, unpacked into `coworkerd-0.5.6-linux-<arch>/` (the next table) |
+| `coworkerd-0.5.6-linux-<arch>-image.tar.gz` | The image `coworkerd:0.5.6`, for `docker load` |
+| `coworkerd-0.5.6-linux-<arch>.json` | The release record: which sources and binaries this architecture's package was built from, each with its SHA-256 and the required GLIBC version of each binary |
 | `SHA256SUMS` | The SHA-256 of each file above (both architectures) |
 
 The package:
@@ -68,9 +68,9 @@ maintain. Coworkerd only measures and reports: it does not change the driver, ke
 ```bash
 # 1. Verify, unpack, load the image (amd64 as the example)
 sha256sum -c --ignore-missing SHA256SUMS      # skips the other architecture's lines when you downloaded only one; on a Mac: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar -xzf coworkerd-0.5.5-linux-amd64.tar.gz
-docker load -i coworkerd-0.5.5-linux-amd64-image.tar.gz
-cd coworkerd-0.5.5-linux-amd64/docker
+tar -xzf coworkerd-0.5.6-linux-amd64.tar.gz
+docker load -i coworkerd-0.5.6-linux-amd64-image.tar.gz
+cd coworkerd-0.5.6-linux-amd64/docker
 
 # 2. Start the cluster: the object store, initialization, one node and the control plane; --wait waits until the ingress is ready (usually 10-30 seconds)
 docker compose up -d --wait
@@ -115,13 +115,13 @@ Common operations:
 | Rotate the cluster key | `docker compose run --rm secrets rotate-cluster-key add`, then `promote`, then `retire` (section 12) |
 | Stop (keep the data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Show the version | `docker run --rm coworkerd:0.5.5 version` |
+| Show the version | `docker run --rm coworkerd:0.5.6 version` |
 
 To change ports, tokens or the project directory, copy `.env.example` to `.env` and edit it (every entry may be left out):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `COWORKERD_VERSION` | `0.5.5` | The tag of the image the services start |
+| `COWORKERD_VERSION` | `0.5.6` | The tag of the image the services start |
 | `COWORKERD_BIND` | `127.0.0.1` | The local address the ingress ports and the control plane's port bind to; set `0.0.0.0` to let other machines reach them |
 | `COWORKERD_HTTP_PORT` (`_2`, `_3`) | `18080` (`18081`, `18082`) | The local port of node-1's (node-2's, node-3's) ingress |
 | `COWORKERD_CONTROL_PORT` | `18090` | The local port of the control plane (the API `cowctl` connects to) |
@@ -143,7 +143,7 @@ docker compose run --rm secrets add-node node-4
 cat > docker-compose.node-4.yml <<'YAML'
 services:
   node-4:
-    image: coworkerd:${COWORKERD_VERSION:-0.5.5}
+    image: coworkerd:${COWORKERD_VERSION:-0.5.6}
     init: true
     restart: unless-stopped
     stop_grace_period: 45s
@@ -552,7 +552,7 @@ See [cluster state, section 12](../cluster-state.md#12-durable-object-durability
 
 The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Object files use hashed Host ids under `do/coworkerd-do-host-v1/`. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
 
-Cache reuse requires the same Linux boot. A clean drain does not authorize reuse after a machine reboot. Within one boot, only closed objects with readable files, valid positions and no unfinished repair can reuse their cache. Objects still open when the daemon or durable process died rebuild before serving; one process failure can invalidate all of its resident objects. Startup first synchronizes `clean:false`; failure gates all DO/D1 service without changing object files. Each handoff also needs a writable open marker, so disk exhaustion can refuse a first read. macOS has no usable boot identifier and rebuilds cached files after restart. Original log prefixes and persistent exclusions survive an untrusted startup; epochs crossed by power loss never become absence proofs on a later same-boot restart. See [cluster state](../cluster-state.md), section 12.
+Every daemon restart discards local Durable Object database, WAL, SHM, facet-index and staging files; no object reuses its database files, even within the same Linux boot. Each object is rebuilt from stored history and surviving logs at its first request. While the object store is unreachable, objects of a restarted node answer `503`. Startup first synchronizes `clean:false`; failure gates all DO/D1 service without changing object files. A trusted startup retains position files, while an untrusted startup removes them too. The boot identity still determines whether predecessor logs can prove that no records are missing; it never authorizes database reuse. Original log prefixes and persistent exclusions survive an untrusted startup; epochs crossed by power loss never become absence proofs on a later same-boot restart. Each handoff also needs a writable open marker, so disk exhaustion can refuse a first read. A durable process failure invalidates its open objects. Rebuilding an object with a live request or connection, including a hibernating WebSocket, first resets the node's durable processes and closes their connections. See [cluster state](../cluster-state.md), section 12.
 
 **Tenants** are the platform's users: the administrator (the platform) creates a tenant with the admin credential, registers hostnames for it, sets its quota, and then issues it a tenant credential; the tenant deploys its own Workers with its own credential.
 `cowctl tenant create|list|get|update|delete` and `cowctl credential create|list|revoke` are the administrator's subcommands (see sections 2 and 11 of the [quickstart](quickstart.md));
@@ -625,8 +625,8 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
 
 ## 9. Upgrades and draining
 
-For DO/D1 upgrades from 0.5.3 or 0.5.4 to 0.5.5, use the coordinated procedure below. The general rolling-drain procedure does not protect their legacy risk objects.
-Clusters using neither Durable Objects nor D1 can continue to upgrade from 0.5.3 one node at a time: stop one node, replace its complete package, then start it and wait until it is ready before proceeding to the next.
+Clusters using Durable Objects or D1 require a new installation for 0.5.6; see [Upgrading to 0.5.6](#upgrading-to-056) below.
+Clusters using neither Durable Objects nor D1 can replace packages one node at a time: stop one node, replace its complete package, then start it and wait until it is ready before proceeding to the next.
 
 - **One node exits**: `SIGTERM` (`docker compose stop`, `systemctl stop`) or `coworkerd-apiserver tool drain --server http://<ingress> --wait`
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
@@ -640,242 +640,25 @@ Clusters using neither Durable Objects nor D1 can continue to upgrade from 0.5.3
   which attaches by path, stop the node first, then replace the file: a running node keeps executing the launcher it opened at startup, which after a replacement is no longer at the profile's path (how the profile then applies has not been tested).
 - **Version**: `coworkerd --version` (`coworkerd-apiserver --version` in the same format) prints the version, the source it was built from, and the workerd it expects: the upstream version and the SHA-256 of the patch series; the state endpoint's `version` says the same.
 
-### Upgrading 0.5.3 or 0.5.4 to 0.5.5
+### Upgrading to 0.5.6
 
-Back up the object store and every node's data directory before upgrading a cluster with data to retain.
-Some old takeover histories have a complete surviving local copy that has not reached storage; ordinary
-rolling drain can release that shard before this copy is healed. The protection in 0.5.5 still has the
-[known gaps below](#known-issues-in-055). A backup is a precaution, not proof that a damaged history can be repaired.
-Keep storage running throughout this procedure.
+There is no in-place upgrade to 0.5.6 for clusters that use Durable Objects or D1. A 0.5.6 node does not reuse the local Durable Object files of an earlier version: at its first start it discards them and rebuilds every object from the object store and the replicated log, and state that an earlier version held only in local files (see the known issues of 0.5.3, 0.5.4 and 0.5.5) is not recovered. Install 0.5.6 with new data directories and a new bucket, and move data at the application level. Clusters that use neither Durable Objects nor D1 can replace the packages one node at a time as described above.
 
-Until every node runs 0.5.5, old nodes keep the old takeover behavior. An old node also gives up its shards when
-it loses its membership lease, that is, when it cannot renew it in time (a heartbeat every 5 seconds and a
-15-second TTL by default) because its process is suspended or storage is unreachable. The object is then rebuilt
-from storage, with the same effect as a drain. Do not freeze old nodes or interrupt their storage while
-preparing the upgrade, and take the backup in a way that does neither.
+### Known issues in 0.5.6
 
-1. Pause every DO and D1 entry point, including WebSocket clients, control-plane SQL and background callers.
-   Disable automatic node restarts or rescheduling. Keep already stopped nodes stopped; do not start an old
-   binary to inspect it. Preserve node ids, keys, volumes and hosts.
-2. Sample each live node's authenticated state every 5 seconds for at most 120 seconds. Seek
-   `durableLog.log.unsealed == 0`, `sealedSeq == nextSeq`, `confirm.unconfirmed == 0`, `objects.repairing == 0`,
-   no new `repair-needed`, and unchanged segment-upload and manifest-failure counters across two samples.
-   On old versions, the earlier-record count is `memory.daemon.containers.durableLog.earlierRecords.entries`;
-   on 0.5.5 it is `durableLog.earlierRecords`. Missing fields mean unknown, not zero. Retain the samples and
-   stdout coverage. Check `log-write-failed`, `log-file-failed`, `log-flush-failed` and stdout-source `log-dropped`;
-   freeing disk space after an append failure alone does not restore writes. Record stuck epochs, objects and
-   repeated `manifest-fenced` / `segment-earlier` activity. **Proceed at 120 seconds even if the conditions
-   remain unmet**, recording that result. The bound is four default 30-second sealing periods, not a promise
-   that the old history is complete. Old exclusions or already inconsistent repaired generations remain a risk.
-3. Immediately before stopping each live node, re-read `nextSeq` and `alarms.fired`; if either changed since
-   the last sample, sample again. Stop the whole node process group without draining, including its workerd
-   children, using the Compose or systemd commands below. The validated procedure uses SIGKILL.
-4. Wait for the old membership registrations to age out. With defaults, wait **27 seconds after the last
-   node process group stops**: TTL 15 seconds + liveness grace 10 seconds + a 2-second safety margin. For a
-   custom configuration, use `membership.ttlSeconds * 1000 + membership.livenessGraceMs + 2000` milliseconds,
-   rounded up to seconds. The membership startup collision allowance uses that same window. Heartbeat cadence
-   is 5 seconds and member listing is 10 seconds by default; they affect observation and convergence after
-   startup. There is no cluster-wide "all old leases expired" endpoint. A new registration can report
-   `waiting-for-old-epoch`; wait for registration and inspect current member epochs rather than forcing it.
-5. Replace the complete package on every node, including the control plane, launcher, runtime, workerd and
-   both tables, then start all 0.5.5 nodes together on their original volumes. From 0.5.3, the kernel and tables
-   change as a set while the nodes are stopped, so there is no live table-switch sequence. Read the named
-   `restored-startup-classified` results: byte-verified history, higher-shard-epoch fencing, or default adoption
-   and resealing. Unread or over-budget evidence defaults to adoption; a registration alone is not completion.
-6. Before resuming traffic, verify on **every node** that its membership table lists every replacement at its
-   new epoch, `durableLog.localRecovery.startupReady == true` and `writeFailed == false`. First opens rebuild
-   object images from published history and surviving log and peer records; observe
-   `durableLog.objects.activeRebuilds` and `queuedRebuilds` while those requests complete. Readiness alone
-   does not establish that an object's acknowledged data has been recovered. Read back known acknowledged
-   data, then resume traffic and supervision. Preserve the original files and logs if verification fails.
-   `object-operation-failed` names an object and the failed step.
+0.5.6 no longer reuses local database files after a restart, which removes known issues 1, 2 and 10 of 0.5.5, and it fixes known issues 11, 12 and 13 and the SQLite `WITH` regression of the 0.5.4 kernel. These conditions and consequences remain.
 
-Three requirements apply throughout:
+1. **A short or damaged log or sidecar tail**, such as after a short write on a full disk or a power loss, keeps that node's earlier logs on disk indefinitely. The first open of each affected object then waits for the tails its peers hold (up to 25 seconds with defaults) and publishes a full snapshot.
+2. **A continuously written large object** can repeatedly abandon periodic snapshots. Abandoned attempts can leave unreferenced snapshot parts in storage.
+3. **A silently lost machine and many simultaneous recoveries** can make total recovery time grow with object count. A node rebuilds at most `durableObjects.rebuildConcurrency` objects at a time (4 by default); a request that waits longer than `durableObjects.recoverTimeoutMs` answers `503 DO_RECOVERING` and can be retried.
+4. **A fenced former owner** that fails five consecutive reads of the new owner's segments can stop completing seals for all its objects until its process restarts. Restart that node.
+5. **Some retained state has no cleanup bound.** Recovery tails adopted from peers remain in memory after the object's ownership is lost, and recovery state in sidecars is not compacted. These consume memory or disk during repeated failures.
+6. **A takeover interrupted between replacing the local files and publishing them** depends on its peers a second time: the local copy is not kept across a daemon restart, and peers hold such tails in memory only. If the daemon restarts in that window and those peers restart as well before the object is opened again, the writes that only they held are lost. One failure alone loses nothing; the next open collects the tails again.
+7. **Rebuilding an object that a durable process still holds** (an open instance, a request in flight, or a WebSocket connection, hibernating ones included) restarts the durable processes of that node first. This closes the WebSocket connections of every Durable Object on the node.
 
-- **Do not reboot the hosts between stopping and starting.** Keeping the same Linux boot preserves trusted predecessor-log evidence.
-- **Every node must run 0.5.5 before traffic resumes.** Old nodes still perform the old takeover behavior.
-- **Do not drain nodes one at a time.** A drain writes shard-release markers and can hand off a unique surviving copy.
+Slow disks can additionally block synchronous node metadata writes and whole-file snapshot reads. This can delay heartbeats and make the watchdog attribute a node-side stall to a durable process.
 
-Pausing external traffic does not pause alarms. The alarm loop dispatches due alarms as ordinary object requests;
-those requests can route to another node and acquire a shard once its owner is released or judged expired.
-While nodes are being stopped in sequence, a live old node can therefore take over a stopped node's shard.
-Stop the groups together or in quick succession, re-sample immediately before each stop, and include internal
-alarm activity in the maintenance plan. The release validation schedules its two alarms beyond the 120-second
-barrier. This is not an atomic cross-machine stop or a guarantee that no internal call occurs.
-
-**Compose example (an existing three-node project).** Run from that project's existing `docker/` directory,
-retaining its project name, `.env` and volumes. Use the current Compose file for the stop, and do not run `down`
-or recreate storage. Complete the sampling above before the kill command; include any extra node services.
-
-```bash
-# Bash: collect only currently running node containers; keep stopped old nodes stopped.
-set -- $(docker compose --profile cluster ps -q node-1 node-2 node-3)
-if [ "$#" -gt 0 ]; then
-  docker update --restart=no "$@"
-  # Re-sample each live node's authenticated state now, immediately before stopping it.
-  docker kill --signal=KILL "$@"
-fi
-docker compose stop apiserver
-sleep 27  # default TTL + grace + safety margin, measured from the last node stop
-```
-
-Replace the package files while retaining the same Compose project, `.env`, secrets and data volumes.
-Load the new image and set `COWORKERD_VERSION=0.5.5` in `.env`. Then start all node services and the control
-plane together; `--no-deps` keeps storage and its initialization services unchanged:
-
-```bash
-docker load -i /path/to/coworkerd-0.5.5-linux-amd64-image.tar.gz
-docker compose --profile cluster up -d --no-deps apiserver node-1 node-2 node-3
-```
-
-Do not resume clients at this command's return: apply step 6. Restoring the Compose definition restores its
-normal restart policy on the new containers. `docker compose stop` sends SIGTERM to nodes and starts draining;
-it is not the non-draining stop used here.
-
-**systemd example (the `coworkerd.service` unit from section 4).** On every node host, override automatic restart
-before killing the old unit. For multiple node units, apply this to all of them; keep already stopped units stopped.
-After the final state sample, run:
-
-```bash
-sudo install -d -m 0755 /run/systemd/system/coworkerd.service.d
-printf '[Service]\nRestart=no\n' | sudo tee /run/systemd/system/coworkerd.service.d/zz-upgrade-0.5.5.conf >/dev/null
-sudo systemctl daemon-reload
-test "$(systemctl show --property=Restart --value coworkerd.service)" = no
-sudo systemctl kill --kill-whom=all --signal=KILL coworkerd.service
-sudo systemctl stop coworkerd.service  # only after its complete process group is dead
-```
-
-Wait the configured lease window from the last process-group stop across the cluster (27 seconds with defaults),
-replace the complete package on every host, then remove the temporary restart override and start all replacement units together:
-
-```bash
-sudo rm /run/systemd/system/coworkerd.service.d/zz-upgrade-0.5.5.conf
-sudo systemctl daemon-reload
-sudo systemctl start coworkerd.service
-```
-
-Do not use a plain `systemctl stop` or `restart` on the live old unit: its SIGTERM drains and releases shards.
-The `drainTimeoutMs: 0` immediate-stop path exists, but the validated maintenance procedure and commands above
-use SIGKILL. The validation covers a coordinated process-group stop, not these systemd service-manager commands;
-the release upgrade check exercises the Compose commands.
-
-First-open rebuilds read stored snapshots and segments and collect surviving log and peer records. Each node
-runs at most `durableObjects.rebuildConcurrency` rebuilds at once (default 4); additional objects wait in FIFO
-order. A request that reaches `recoverTimeoutMs` returns `DO_RECOVERING` while its background rebuild continues.
-Recovery time depends on object size, missing peer evidence and storage throughput. An already damaged database
-cannot be repaired by upgrading; retain verified backups. Generic execution errors alone do not prove corruption.
-
-Downgrade requires pausing traffic, current and earlier record counts at zero and no REPAIR; stop every node, retain a backup, remove `cache.json` and object caches/positions, then start the old
-binary against published history. If these conditions fail, do not downgrade. The original append-log, peer and
-store encodings remain compatible, but the old binary ignores new local recovery state and its old defects return.
-
-### Known issues in 0.5.5
-
-Fixes continue in 0.5.6. These conditions and consequences remain in this release; do not treat the upgrade
-procedure or a successful readiness check as proof that none applies.
-
-1. **Local-cache admission after restart is incomplete.** A hibernating-WebSocket wake followed by a node kill
-   before its new write reaches the daemon can expose an unconfirmed write after a same-boot restart. After a
-   power loss, rebuilt objects can rebuild again on every later same-boot restart; in a rare case a WAL containing
-   acknowledged writes can be removed. After a same-boot restart and shard reclaim, a periodic snapshot can omit
-   an earlier write still in one facet's WAL. The latter also affects 0.5.4.
-2. **An object that deleted a child facet** can keep its open marker after it closes. At the next same-boot
-   restart its local cache is then rejected and the object is rebuilt from storage on its first request; for a
-   large object that request answers `DO_RECOVERING`. This costs availability, not data.
-3. **Legacy-risk protection during upgrade is incomplete.** Back up storage and each node's data directory.
-   A legacy cache containing an isolated failed write can pass the pre-healing check. A risk object whose shard
-   is lost and reclaimed before the healing snapshot publishes can be rebuilt as an ordinary object, deleting
-   its complete local copy. Healing reads all manifest-referenced segments; one unreadable segment can keep
-   that object unavailable.
-4. **A short or damaged log/sidecar tail**, such as after a short write on a full disk or power loss, can make
-   every later startup rebuild all objects and retain old logs indefinitely. Risk objects can remain stopped.
-5. **A continuously written large object** can repeatedly abandon periodic snapshots. Abandoned attempts can
-   leave unreferenced snapshot parts in storage.
-6. **Recovery interrupted before publication, followed by a node restart**, can leave the object unavailable.
-   Stop the affected node, wait for its old membership lease to expire (27 seconds with the defaults above),
-   then send a request for the affected object to another running node so it takes over the shard. Keep the
-   affected node stopped until the takeover completes, and retain its data directory and logs.
-7. **A silently lost machine and many simultaneous recoveries** can make total recovery time grow with object
-   count, beyond one object's nominal missing-evidence wait.
-8. **A fenced former owner** that fails five consecutive reads of the new owner's segments can stop completing
-   seals for all its objects until its process restarts. Restart that node.
-9. **Some retained state has no cleanup bound.** Adopted recovery tails remain after object ownership is lost;
-   recovery state in sidecars is not compacted; failed-rebuild temporary files remain until the next untrusted
-   startup. These consume memory or disk during repeated failures.
-11. **A node at its local-cache budget can drop the files of an object that a process still holds open.** When
-    Durable Object files and logs exceed `durableObjects.diskBytes`, the node deletes the local files of objects
-    that have had no request through the node for 60 seconds, without checking whether the durable process still
-    has them open; an object kept alive by an accepted WebSocket or by a request longer than a minute is such a
-    case. Later commits of that instance can be answered without being replicated, and they are lost when the
-    instance ends. Also present in 0.5.3 and 0.5.4. Size `durableObjects.diskBytes` and the filesystem so that
-    the node never logs `files-dropped`.
-12. **A request admitted just before its durable process is replaced is not checked again.** When a durable
-    process is killed (by the watchdog, by a memory limit, or by the reset that precedes another object's
-    rebuild), a request for an object that was open in it can be sent to the replacement process although the
-    object has meanwhile been marked for repair. Usually this costs one read that may include rejected frames
-    and one more process reset. If that object's rebuild overlaps, the new instance can go on serving from the
-    replaced files, and its commits are then answered without being replicated or diverge from the log. Also
-    present in 0.5.3 and 0.5.4.
-13. **A durable process whose replication channel could not be created at spawn** still starts and serves
-    requests; its commits are not replicated until that process exits. This needs a socket-pair failure at
-    exactly that step and has not been observed. Present since 0.5.0.
-
-Slow disks can additionally block synchronous node metadata writes and whole-file snapshot reads. This can delay
-heartbeats and make the watchdog attribute a node-side stall to a durable process. Upgrade healing concentrates
-that I/O. Mixed old nodes may acknowledge 32–64 MiB records they cannot return during recovery, and old segments
-over the store client's 64 MiB read ceiling remain unreadable. Preserve intact local copies and backups.
-
-**Inherited from the 0.5.4 kernel, not present in 0.5.3:** the bundled workerd carries SQLite 3.54.1, which
-refuses a statement that refers to a common table expression once the statement already names about 100 tables
-or subqueries; the error reads `VIEWs and/or subqueries nested too deep`. A statement without `WITH`, or with a
-few expressions each used a few times (recursive ones included), is not affected, and no statement returns a
-wrong result. Write the expression as a subquery in `FROM`, make it a view, or split the statement. Upstream
-workerd removed the check on 2026-11-10; taking that change is planned for 0.5.6.
-
-0.5.4 was a prerelease and is superseded by 0.5.5; DO/D1 deployments should use this coordinated upgrade rather
-than remain on 0.5.4. Compared with 0.5.3, 0.5.5 also includes the `v1.20261108.1` kernel, 17 patches, 306-entry
-compatibility table with its 2026-11-15 table limit and current-UTC definition-date check, the amd64 steady-filter
-fix, and the explicit `internet` service. The bare-metal daemon requirement remains glibc 2.38. No data conversion
-or key rotation is required.
-
-**Upgrading 0.5.2 to 0.5.3 keeps the existing data layout.** Update the complete package: the patch series gained
-`0016`, so the runtime, workerd and the launcher's system call allowlist belong together, and a 0.5.3 node must not run a
-0.5.2 workerd or its tables. Retain the bucket, keys, node identities and data volumes. The bundled store's entrypoint
-sizes its volumes differently (`-volume.max=0 -master.volumeSizeLimitMB=1024`, section 2), so recreate the storage
-container with the new Compose file and entrypoint on the existing data volume: the volumes 0.5.2 wrote stay readable and
-new ones use the new size (the 0.5.2 validation store, restarted this way after it had filled up, served its objects
-again within 27 seconds). Plan the same stateful write pause as for 0.5.2: wait for confirmed records to upload, stop
-storage within its 40-second budget, start the new one and check its readiness before resuming writes; then upgrade
-the control plane and the nodes one at a time with stateless traffic. Two defaults change: `placement.subcalls` is
-now `local` (set `home` explicitly to keep the previous placement; the state endpoint's
-`configuration.placement.subcalls` shows the effective value), and the Linux daemon runs with transparent huge pages
-disabled for itself (`memory.daemon` reports it; nothing to configure). No data conversion or key rotation is
-required. The 0.5.0 and 0.5.1 procedures below apply unchanged when upgrading those versions to 0.5.3.
-
-**Upgrading 0.5.1 to 0.5.2 keeps the existing data layout.** Update the complete package: the runtime and workerd
-carry matching RPC identity changes, and the launcher allowlist must match the new workerd bytes. Retain the
-bucket, keys, node identities and data volumes. For the bundled Compose store, plan a stateful write pause while
-replacing the Compose file and both entrypoint scripts and recreating the storage container. Wait for confirmed
-records to upload before stopping storage, allow its full 40-second stop budget, and check storage readiness before
-resuming writes. Upgrade the control plane and nodes with the new package; do not combine the new runtime with
-an old workerd or reuse an old syscall allowlist.
-
-**Upgrading 0.5.0 to 0.5.2 also preserves the data layout.** The 0.5.1 fix for repeated WAL headers after object
-reopening is included, including replay of history written by 0.5.0. Before replacing any peer, pause DO, D1 and
-state-changing WebSocket writes and wait for confirmed history to upload. Keep that pause until all nodes use the
-new package, ownership has settled and reads have been checked. Old 0.5.0 writers do not have the later peer
-reconnection fixes, so this procedure does not promise uninterrupted stateful writes during a mixed-version roll.
-No data conversion or key rotation is required.
-
-**Upgrading 0.4.x to 0.5.2 is in place.** Keep the bucket, cluster marker, secrets and peer keys, node ids and persistent volumes. The object layout adds `do/` and node WAL / usage objects without rewriting the 0.4 desired-state layout. Back up the bucket and configuration as for any upgrade, load the new image, update the compose / entry point files from the new package, and rerun `docker compose run --rm secrets` so each node's storage policy can read `do/` and `nodes/` and write the shared DO shard / object prefixes. On bare metal, update those policies yourself (section 4).
-
-Upgrade the control plane and then nodes one at a time, waiting for each readiness check before continuing; retain the old volumes. Keep stateless traffic during this sequence, with ordinary retry handling for a node that drains or is unavailable. Finish upgrading all nodes and writers before deploying DO / D1 definitions or adding the new configuration keys: a 0.4 daemon does not understand the new runtime / ownership protocol or those keys. `/v1` keeps its fields and adds new fields and endpoints; clients must also handle the new errors in [errors](errors.md).
-
-**Upgrading from 0.3.x** is not an upgrade in place: 0.3.x kept the cluster's state in etcd, 0.4 keeps all of it in the object store and reads nothing of 0.3's, and nothing is migrated. Build the cluster anew:
-deploy tenants, credentials, Workers and secrets again through `/v1` (`cowctl`) on a new 0.4 cluster. Under compose that means a new project or `down -v` first -- the `secrets` volume as well:
-a 0.4 node needs an identity of the store of its own, and a 0.3 `secrets` volume holds in each node's directory the one read identity 0.3 gave every node, which a 0.4 `secrets` step would keep. On bare metal, give every node its own identity and the secrets key, and remove `etcdEndpoint` and `etcdCredentialsFile`
-from every configuration: a 0.4 daemon refuses a configuration that names them, or an `etcd` backend, with `0.4 has no etcd: ... (the members, the desired state, the suspects and the usage are on the object store: the storage block)`.
-Use the pinned SeaweedFS 4.48 or another store verified to have the properties in section 4; on the 0.3.x compose files' SeaweedFS 3.97 create-if-absent does not hold under concurrency: a 0.4 node starts there with a warning, and only one writer of the desired state may run at a time.
+**After a restart** every Durable Object is rebuilt from the object store and the node's log at its first request. That request takes as long as reading the object's snapshot and segments, and while the object store is unreachable the objects of a restarted node answer `503`.
 
 ## 10. Troubleshooting
 

@@ -1,6 +1,6 @@
 # Durable Objects
 
-> For release 0.5.5. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
+> For release 0.5.6. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
 
 ## 1. Write a class
 
@@ -126,16 +126,15 @@ A class namespace has 1024 shards; the first eight ID bytes, interpreted big-end
 
 Before a write's response is released, reachable peers acknowledge its committed frames in memory; with an empty selected peer list the owner calls a local disk flush. If selected peers exist but all are unreachable, confirmation waits and can time out instead. A failed local flush is logged and returns `STORAGE_UNAVAILABLE`; it does not confirm the write. Confirmed frames enter uploaded segments and per-object manifests, with snapshots to bound replay. The new owner restores the snapshot, replays segments and asks surviving peers for the remaining tail. The request waits, with a default 30 s recovery timeout (`503 DO_RECOVERING`). The class is constructed again; volatile fields and connections on failed processes are gone.
 
-Simultaneous loss of the owner and all confirming peers can lose the tail not yet uploaded. The normal segment interval is 30 s, but an upload outage can make that tail longer. Same-boot Linux restarts can reuse closed, validated object caches. Objects left open by a daemon or durable-process crash rebuild before serving; a process failure can invalidate every object it still had open. A clean drain does not grant cache reuse after a machine reboot. Native macOS has no boot identifier, so restarts rebuild the cache. Raw log prefixes and durable exclusions are retained across power loss; losing the only disk before upload still loses its tail.
+Simultaneous loss of the owner and all confirming peers can lose the tail not yet uploaded. The normal segment interval is 30 s, but an upload outage can make that tail longer. Every daemon restart discards local database, WAL, SHM, facet-index and staging files; each object is rebuilt from stored history and surviving logs at its first request. While the object store is unreachable, objects of a restarted node answer `503`. A durable-process failure invalidates the objects it still had open. Raw log prefixes and durable exclusions are retained across power loss; losing the only disk before upload still loses its tail.
 
 A failed confirmation returns `STORAGE_UNAVAILABLE`. The node synchronizes its repair/exclusion before replacing files, publishing exclusions or writing on a repaired image. Peers receive drops, including on reopened sessions; manifests carry the exclusions before the repaired object becomes LOCAL. Another node can still adopt an uncertain write before it receives that exclusion, but later history must remain consistent with that choice. A log append, short-write or flush failure freezes that epoch's append/confirmation: every later DO write
 on this node is refused, even after disk space is freed. Restart the node daemon to begin a new node epoch
-before retrying writes. A sidecar failure similarly freezes DO service until restart. If an open marker cannot be written, even a first read is unavailable. A legacy cache that may be the only complete copy enters HOLD when admission fails and is preserved for recovery. [Installation](install.md), section 9, gives the coordinated upgrade and downgrade procedures; [cluster state](../cluster-state.md), sections 11–12, explains the fences and cache checks. Use application operation IDs or inspect state before retrying uncertain increments.
+before retrying writes. A sidecar failure similarly freezes DO service until restart. If an open marker cannot be written, even a first read is unavailable. [Installation](install.md#upgrading-to-056) describes the required new stateful installation and stateless package replacement; [cluster state](../cluster-state.md), sections 11–12, explains the fences and recovery gates. Use application operation IDs or inspect state before retrying uncertain increments.
 
-The remaining restart-cache, WAL, healing and resource limitations in
-[Known issues in 0.5.5](install.md#known-issues-in-055) apply to DO and D1 data. Back up storage and each
-node's data directory before a stateful upgrade; the admission and repair checks do not cover all those cases.
-Fixes continue in 0.5.6.
+The remaining WAL, recovery and resource limitations in
+[Known issues in 0.5.6](install.md#known-issues-in-056) apply to DO and D1 data. There is no in-place stateful
+upgrade: use new data directories and a new bucket, and move data at the application level.
 
 ## 8. Checked differences from Cloudflare
 
