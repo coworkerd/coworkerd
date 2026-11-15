@@ -1,4 +1,5 @@
 #include "process-pool.h"
+#include "root-objects.h"
 #include "memory-observation.h"
 #include "tenancy.h"
 #include "support.h"
@@ -2071,6 +2072,7 @@ public:
         "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
         << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
             p->egressToken + "\"),\n")
+        << rootLoaderBinding(p->durable)
         << (p->durable ? "(name = \"HOST\", durableObjectNamespace = \"Host\"),\n"
             "(name = \"SQL_CLASS\", durableObjectClass = (name = \"runtime\", entrypoint = \"SqlDatabase\")),\n" : "") <<
         "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
@@ -2078,6 +2080,7 @@ public:
         << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\""
         << (p->durable ? std::string(",\ndurableObjectNamespaces = [(className = \"Host\", uniqueKey = \"") + DURABLE_HOST_KEY +
             "\", enableSql = true)],\ndurableObjectStorage = (localDisk = \"do-disk\")" : std::string()) << ")),\n"
+        << rootLoaderService(p->durable, durableDirectory())
         << (p->durable ? "(name = \"do-disk\", disk = (path = \"" + escape(durableDirectory()) + "\", writable = true)),\n" : "") <<
         "(name = \"server\", external = (address = \"" << escape(bindingAddress)
         << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"

@@ -1,8 +1,16 @@
 #include "root-objects.h"
 #include "durable-log.h"
+#include "deployment.h"
+#include "durable-shards.h"
+#include "json.h"
+#include "support.h"
+
+#include <kj/debug.h>
 
 #include <algorithm>
 #include <string_view>
+#include <cstdlib>
+#include <sstream>
 
 namespace coworkerd {
 
@@ -12,7 +20,7 @@ RootStorageRef makeRootStorageRef(const std::string& namespaceId, const std::str
   ref.namespaceId = namespaceId;
   ref.objectId = objectId;
   ref.dataEpoch = dataEpoch;
-  ref.uniqueKey = roots ? std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId : hostUniqueKey;
+  ref.uniqueKey = roots ? rootNamespaceUniqueKey(namespaceId) : hostUniqueKey;
   ref.storageId = durableHostId(ref.uniqueKey, durableHostName(namespaceId, objectId, dataEpoch));
   return ref;
 }
@@ -45,6 +53,98 @@ bool isObjectStorageDirectory(const std::string& name, const std::string& hostUn
   return namespaceId.size() == 64 && std::all_of(namespaceId.begin(), namespaceId.end(), [](char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
   });
+}
+
+std::string rootNamespaceUniqueKey(const std::string& namespaceId) {
+  return std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId;
+}
+
+bool rootObjectsForTest() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("COWORKERD_ROOT_OBJECTS_FOR_TEST");
+    return value != nullptr && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+std::string rootLoaderBinding(bool durable) {
+  return durable && rootObjectsForTest() ? "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n" : "";
+}
+
+std::string rootLoaderService(bool durable, const std::string& storageDirectory) {
+  return durable && rootObjectsForTest() ? "(name = \"roots\", coworkerdRootLoader = (storagePath = " +
+      json::quote(storageDirectory) + ")),\n" : "";
+}
+
+std::string rootDispatchDescriptor(std::string descriptor, const DeploymentState& catalog,
+    const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
+    const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
+    bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
+  using json::quote;
+  const auto tenant = tenantOf(version.workerId);
+  std::ostringstream spaces;
+  spaces << '[';
+  bool first = true, selected = false;
+  auto space = [&](const DurableObjectNamespace& value, const std::string& className) {
+    if (value.status != "active") return;
+    spaces << (first ? "" : ",") << "{\"id\":" << quote(value.id) << ",\"className\":" << quote(className)
+        << ",\"binding\":" << quote("root_"+value.id) << ",\"uniqueKey\":" << quote(rootNamespaceUniqueKey(value.id)) << '}';
+    first = false;
+    selected |= value.id == namespaceId;
+  };
+  if (database) {
+    if (const auto* databases = catalog.databases(tenant))
+      for (const auto& [name, value] : *databases) space(value, "SqlDatabase");
+  } else {
+    for (const auto& name : version.declaredClasses)
+      if (const auto* value = catalog.durableNamespace(version.workerId, name)) space(*value, "__coworkerd_do_"+name);
+  }
+  spaces << ']';
+  KJ_REQUIRE(selected, "a checked root dispatch must name a namespace in the deployment catalog");
+  std::ostringstream plan;
+  plan << "{\"kind\":" << quote(database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
+      << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
+      << ",\"compatibilityDate\":" << quote(version.compatibilityDate) << ",\"compatibilityFlags\":[],\"modules\":[]"
+      << ",\"namespaces\":" << spaces.str();
+  auto target = [&](const std::string& entrypoint, const std::string& props) {
+    return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
+  };
+  if (database) {
+    plan << ",\"platformClass\":" << target("SqlDatabase", "{}");
+  } else {
+    const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
+    plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+sha256Hex(spaces.str()))
+        << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)
+        << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
+        << ",\"cpuLimitMs\":" << cpuLimitMs << ",\"memoryLimitMib\":" << memoryLimitMib << '}'
+        << ",\"globalOutbound\":" << target("Egress", identity)
+        << ",\"streamingTail\":" << target("TenantLog", identity) << ",\"durableObjects\":[";
+    bool firstBinding = true;
+    for (const auto& binding : version.durableObjects) {
+      const auto* value = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
+          : catalog.database(tenant, binding.database);
+      const auto ns = value != nullptr && value->status == "active" ? value->id : "";
+      const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
+      const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
+          ",\"namespaceId\":"+quote(ns)+",\"database\":"+quote(binding.database)+",\"objectId\":"+quote(id)+'}';
+      const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
+          ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
+          ",\"namespaceId\":"+quote(ns)+",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
+      plan << (firstBinding ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":"
+          << target("DurableNamespace", props) << '}';
+      firstBinding = false;
+    }
+    plan << ']';
+  }
+  plan << '}';
+  std::ostringstream selection;
+  selection << "{\"namespaceId\":" << quote(namespaceId) << ",\"objectId\":" << quote(objectId)
+      << ",\"dataEpoch\":" << quote(std::to_string(dataEpoch)) << ",\"dispatchChecked\":true";
+  if (alarmAtUnixMs) selection << ",\"alarmFacetId\":" << alarmFacetId;
+  selection << '}';
+  KJ_REQUIRE(!descriptor.empty() && descriptor.back() == '}', "an invocation descriptor is a JSON object");
+  descriptor.pop_back();
+  return descriptor+",\"rootPlan\":"+plan.str()+",\"rootSelection\":"+selection.str()+'}';
 }
 
 }  // namespace coworkerd

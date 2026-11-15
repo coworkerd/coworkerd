@@ -2793,6 +2793,11 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
+      if (coworkerd::rootObjectsForTest()) {
+        return kj::str(coworkerd::rootDispatchDescriptor(json.encode(descriptor.asReader()).cStr(),
+            desiredState.state(), version, limits.cpuMs, limits.memoryMiB, durable->namespaceId,
+            durable->objectId, durable->dataEpoch, durable->isDatabase(), durable->alarmAtUnixMs, durable->alarmFacetId));
+      }
       return json.encode(descriptor.asReader());
     }
     auto bindingPins = pins;
@@ -8385,7 +8390,8 @@ int run(Launch launch) {
       coworkerd::DURABLE_HOST_UNIQUE_KEY, server.placementConfig().durableLog,
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
-          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
+      coworkerd::rootObjectsForTest()},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {

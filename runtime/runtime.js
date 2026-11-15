@@ -823,7 +823,7 @@ async function loadSource(descriptor, env) {
   return value.source;
 }
 
-async function makeWorkerCode(descriptor, env, ctx) {
+async function makeWorkerCode(descriptor, env, ctx, root = false) {
   for (const binding of descriptor.bindings) {
     if (
       typeof binding.name !== "string" ||
@@ -867,7 +867,7 @@ import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${TRIAL_SOURCE}
 ${RPC_SOURCE}
 ${DURABLE_SOURCE}
-${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\n`).join("")}
+${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)}${root ? ", true" : ""});\n`).join("")}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
   return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
@@ -1506,10 +1506,85 @@ function rpcBind(env, ctx) {
 
 // The capability a method call is delivered to: the object's own, from its Host, or the version's entrypoint, from the
 // isolate the Worker Loader keeps under this version's loader key -- the same isolate its requests run in.
+function rootModule(name, value) {
+  if (typeof value === "string") return { name, source: value };
+  const type = Object.keys(value)[0], source = value[type];
+  if (type === "json") return { name, type, source: JSON.stringify(source) };
+  if (type === "data" || type === "wasm") {
+    let binary = "";
+    for (let at = 0; at < source.length; at += 8192) binary += String.fromCharCode(...source.subarray(at, at + 8192));
+    return { name, type, source: btoa(binary) };
+  }
+  return { name, type, source };
+}
+
+async function selectedRoot(descriptor, env, ctx) {
+  if (!descriptor.rootPlan || !descriptor.rootSelection || descriptor.rootSelection.dispatchChecked !== true)
+    throw new Error("Missing trusted root dispatch");
+  const base = descriptor.rootPlan;
+  const manage = async (path, value) => {
+    const response = await env.ROOTS.fetch("http://roots/" + path, {
+      method: "POST", body: JSON.stringify(value),
+    });
+    if (!response.ok) throw new Error("Root plan " + path + " failed: " + (await response.text()).slice(0, 400));
+    return response.json();
+  };
+  let { plan } = await manage("lookup", base);
+  if (plan === null) {
+    let deployment = base;
+    if (base.kind === "tenant") {
+      const code = await makeWorkerCode(descriptor, env, ctx, true);
+      const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+      deployment = { ...base, compatibilityDate: code.compatibilityDate, compatibilityFlags: code.compatibilityFlags,
+        environment: code.env, modules: names.map(name => rootModule(name, code.modules[name])) };
+    }
+    ({ plan } = await manage("install", deployment));
+  }
+  if (typeof plan !== "string") throw new Error("Invalid root plan reply");
+  return env.ROOTS.getRoot(JSON.stringify({ ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env) }));
+}
+
+async function serveRoot(request, descriptor, env, ctx) {
+  const target = descriptor.durableObject;
+  try {
+    const root = await selectedRoot(descriptor, env, ctx);
+    const headers = new Headers(request.headers);
+    headers.set(DO_HOPS_HEADER, String(target.hops ?? 0));
+    headers.delete(DO_ALARM_HEADER);
+    headers.delete(DO_ALARM_RETRY_HEADER);
+    const scheduled = Number(target.alarmAtUnixMs ?? 0);
+    if (scheduled > 0) {
+      if (!target.database)
+        return Response.json(await root.__coworkerdAlarm(scheduled, Number(target.alarmRetryCount ?? 0)));
+      headers.set(DO_ALARM_HEADER, String(scheduled));
+      headers.set(DO_ALARM_RETRY_HEADER, String(Number(target.alarmRetryCount ?? 0)));
+    }
+    return await root.fetch(new Request(request, { headers, cf: tenantCf(descriptor, env) }));
+  } catch (error) {
+    const reason = cleanDurableReason(error, descriptor.secrets), code = facetCode(error);
+    if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true)
+      return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
+        code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
+        code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
+        code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" :
+        code === "QUOTA_EXCEEDED" ? "the tenant's Durable Object storage quota is exhausted" : "Durable Object reset",
+        code, reason }, { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : code === "QUOTA_EXCEEDED" ? 422 : 503 });
+    return Response.json({ error: "Durable Object execution failed", code: "EXECUTION_FAILED", reason }, { status: 500 });
+  }
+}
+
 async function rpcEntrypoint(value, env, ctx) {
   const descriptor = descriptorFrom({ cf: value, headers: new Headers() });
   const target = descriptor.durableObject;
   if (target) {
+    if (env.ROOTS) {
+      if (target.database) throw new Error("a database has no methods");
+      try { return await (await selectedRoot(descriptor, env, ctx)).__coworkerdRpcTarget; }
+      catch (error) {
+        const reason = String(error?.message ?? error), code = facetCode(error);
+        throw new Error(code + ": " + reason.slice(0, 300));
+      }
+    }
     if (!env.HOST) throw new Error("A Durable Object method call reached a process without Durable Objects");
     const dataEpoch = String(target.dataEpoch ?? "0");
     const host = env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
@@ -1530,6 +1605,7 @@ async function serve(request, env, ctx) {
   // this node's copy of the object's shard is the one (the node's data epoch for it): a shard this node took over from
   // another node starts its objects from empty, one it took back from itself keeps them.
   if (descriptor.durableObject) {
+    if (env.ROOTS) return serveRoot(request, descriptor, env, ctx);
     if (!env.HOST) throw new Error("A Durable Object request reached a process without Durable Objects");
     const target = descriptor.durableObject;
     const dataEpoch = String(target.dataEpoch ?? "0");
