@@ -5100,34 +5100,40 @@ public:
   kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
     this->status = status;
-    return kj::heap<Collector>(body);
+    return kj::heap<Collector>(body, overflowed);
   }
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
     KJ_FAIL_REQUIRE("this request cannot become a connection");
   }
   uint status = 0;
   std::string body;
+  bool overflowed = false;
+  static constexpr const char* OVERFLOW_REASON = "the object's response exceeds the node's 8388608-byte limit";
 
 private:
   class Collector final: public kj::AsyncOutputStream {
   public:
-    explicit Collector(std::string& into): into(into) {}
+    Collector(std::string& into, bool& overflowed): into(into), overflowed(overflowed) {}
     kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
-      if (into.size() < BODY_LIMIT) into.append(reinterpret_cast<const char*>(buffer.begin()), buffer.size());
+      append(buffer);
       return kj::READY_NOW;
     }
     kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
-      for (auto& piece : pieces) {
-        if (into.size() >= BODY_LIMIT) break;
-        into.append(reinterpret_cast<const char*>(piece.begin()), piece.size());
-      }
+      for (auto& piece : pieces) append(piece);
       return kj::READY_NOW;
     }
     kj::Promise<void> whenWriteDisconnected() override { return kj::Promise<void>(kj::NEVER_DONE); }
 
   private:
     static constexpr size_t BODY_LIMIT = 8u << 20;
+    void append(kj::ArrayPtr<const kj::byte> buffer) {
+      if (overflowed) return;
+      const auto remaining = BODY_LIMIT - into.size();
+      into.append(reinterpret_cast<const char*>(buffer.begin()), std::min(buffer.size(), remaining));
+      if (buffer.size() > remaining) overflowed = true;
+    }
     std::string& into;
+    bool& overflowed;
   };
 };
 
@@ -5978,6 +5984,12 @@ kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOv
   CollectedResponse collected;
   // A refused dispatch answers without reading the body. Once the response is complete, cancel any remaining upload.
   co_await service->request(kj::HttpMethod::POST, path, headers, *pipe.in, collected);
+  if (collected.overflowed) {
+    // The object may already have executed. Return a complete error, never a partial reply or a reroute refusal.
+    collected.status = 502;
+    collected.body = std::string("{\"code\":\"RESPONSE_TOO_LARGE\",\"reason\":\"") +
+        CollectedResponse::OVERFLOW_REASON + "\"}";
+  }
   co_return kj::mv(collected);
 }
 
@@ -6016,6 +6028,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
         std::string(error.getDescription().cStr())};
   }
+  if (answer.overflowed)
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, CollectedResponse::OVERFLOW_REASON};
   // The runtime answers {"outcome":"fired"|"notDue"|"failed","atUnixMs":N,"reason":...}; anything else is a refusal
   // of the dispatch (no owner, the object being rebuilt, a limit) and counts against nothing.
   std::string outcome, reason;
