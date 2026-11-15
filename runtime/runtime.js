@@ -1361,7 +1361,7 @@ async function trialLoad(descriptor, env, ctx) {
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
       invocationId: descriptor.invocationId, treeId: descriptor.treeId };
     report = await (await worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch("http://coworkerd-trial/", { cf })).json();
-    if (report.ok && descriptor.format === "v2" && (descriptor.durableObjectClasses ?? []).length) {
+    if (report.ok && descriptor.loadCheck !== true && descriptor.format === "v2" && (descriptor.durableObjectClasses ?? []).length) {
       const rootWorker = env.LOADER.get(loaderKey(descriptor) + "#root-trial", async () => {
         coldLoad = true;
         try { return await makeWorkerCode(descriptor, env, ctx, true); }
