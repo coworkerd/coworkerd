@@ -1599,8 +1599,7 @@ int runDeploymentTool(int argc, char** argv) {
     auto rootFormat = storage.get(DO_ROOT_FORMAT_KEY).wait(io.waitScope);
     KJ_REQUIRE(rootFormat.status == 200 || rootFormat.status == 404, "cannot read the Durable Object format marker", rootFormat.status);
     if (rootFormat.status == 404) {
-      const auto objects = storage.list("do/", 1).wait(io.waitScope);
-      KJ_REQUIRE(objects.objects.empty(),
+      KJ_REQUIRE(!storage.hasAny("do/").wait(io.waitScope),
           "this bucket contains old-format Durable Object data; this version does not read it; use a new bucket; nothing written");
     } else {
       KJ_REQUIRE(rootFormat.bytes == DO_ROOT_FORMAT_BYTES, "the bucket has an incompatible Durable Object format marker; use a new bucket");

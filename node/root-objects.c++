@@ -164,13 +164,13 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     }
     plan << ']';
     // The source definition alone does not identify resolved bindings or rotated secrets.
-    // Hash their current trusted values without putting those values in keys or telemetry.
+    // Secret revisions identify rotation without deriving any observable bytes from secret values.
     std::ostringstream environment;
     for (const auto& value : version.variables)
       environment << quote(value.name) << ':' << quote(value.type) << ':' << quote(value.value) << ',';
     for (const auto& name : version.secrets) {
       const auto* value = catalog.secret(version.workerId, name);
-      environment << quote(name) << ':' << (value ? quote(value->value) : "null") << ',';
+      environment << quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
     }
     plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
         sha256Hex(plan.str()+environment.str()));

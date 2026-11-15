@@ -98,7 +98,7 @@ struct LogRecord {
   bool ownerSealed = false;
   // The object in the history: "<namespace>/<object>", without the data epoch.
   std::string key() const { return objectName + "/" + std::to_string(facetId); }
-  // The database as the durable process names it: the Host's name, which carries the data epoch, and the facet.
+  // The database as the durable process names it: the namespace/object/data-epoch identity and the facet.
   std::string shipperKey() const {
     return objectName + "/" + std::to_string(dataEpoch) + "/" + std::to_string(facetId);
   }

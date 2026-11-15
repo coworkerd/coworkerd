@@ -148,7 +148,7 @@ void validateRunWorkerFirstRules(const std::vector<std::string>& rules) {
 namespace {
 // A Durable Object class's name: a JavaScript identifier, never one of the bridge's own (__coworkerd_...).
 bool durableClassName(const std::string& name) {
-  return environmentName(name) && !name.starts_with("__coworkerd");
+  return environmentName(name) && name != "default" && !name.starts_with("__coworkerd");
 }
 // The Durable Object Bindings and classes of a v2 version: Binding names share env with variables, secrets and the other
 // Bindings (`names`), each Binding names a declared class, a class is declared or deleted (once), and a rename names a
@@ -159,6 +159,7 @@ void validateDurableObjects(const VersionDefinition& version, std::set<std::stri
       "a version names more than 64 Durable Object classes");
   std::set<std::string> declared, deleted;
   for (const auto& name : version.declaredClasses) {
+    KJ_REQUIRE(name != "default", "Durable Object class name default is reserved for the Worker's default entrypoint");
     KJ_REQUIRE(durableClassName(name), "invalid Durable Object class name", name.c_str());
     KJ_REQUIRE(declared.insert(name).second, "a Durable Object class is declared twice", name.c_str());
   }
