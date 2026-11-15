@@ -6,8 +6,8 @@ import { R2_HASH_ALGORITHMS } from "./validator.worker";
 import type { DigestAlgorithm } from "./validator.worker";
 import type { ObjectRow, InternalR2PutOptions, R2Range } from "./schemas.worker";
 
-type Layout = Pick<ObjectRow,"blob_id"|"chunk_size"|"chunk_count">;
-export function bodyNames(row: Layout): string[] {
+export type BodyLayout = Pick<ObjectRow,"blob_id"|"chunk_size"|"chunk_count">;
+export function bodyNames(row: BodyLayout): string[] {
  if (!row.blob_id) return [];
  if (!row.chunk_size) return [row.blob_id]; // Existing r32 index, before migration.
  return Array.from({length:row.chunk_count!},(_,i) => `${row.blob_id}/${i}`);
@@ -86,26 +86,34 @@ export async function uploadChunks(blob: BlobStore,id: string,body: ReadableStre
 }
 
 /** Byte-stream output lets native consumers supply buffers instead of allocating per packet. */
-export async function readChunks(blob: BlobStore,row: ObjectRow,range: R2Range) {
+export async function readChunks(blob: BlobStore,rows: (BodyLayout & {size:number})[],range: R2Range) {
  const offset = range.offset ?? 0;
- const length = range.length ?? row.size;
- const chunkSize = row.chunk_size || row.size || 1;
- const names = bodyNames(row);
- let index = Math.floor(offset/chunkSize);
- const last = length ? Math.floor((offset+length-1)/chunkSize) : index;
+ const length = range.length ?? rows.reduce((n,row) => n+row.size,0);
+ const segments: {name:string;start:number;end:number;size:number}[] = [];
+ let position = 0;
+ for (const row of rows) {
+  const chunkSize = row.chunk_size || row.size || 1;
+  for (const [i,name] of bodyNames(row).entries()) {
+   const size = row.chunk_size ? Math.min(chunkSize,row.size-i*chunkSize) : row.size;
+   const start = Math.max(0,offset-position);
+   const end = Math.min(size,offset+length-position);
+   if (end>start || (!length && row.size===0)) segments.push({name,start,end,size});
+   position += size;
+  }
+ }
+ let index = 0;
+ const last = segments.length-1;
  let reader: ReadableStreamBYOBReader | undefined;
  let expected = 0;
  let received = 0;
  const open = async () => {
-  const chunkLength=row.chunk_size ? Math.min(chunkSize,row.size-index*chunkSize) : row.size;
-  const start=Math.max(0,offset-index*chunkSize);
-  const end=Math.min(chunkLength,offset+length-index*chunkSize);
+  const {name,start,end,size} = segments[index];
   expected=end-start;received=0;
-  const body=await blob.get(names[index],start!==0 || end!==chunkLength ? {start,end:end-1} : undefined,expected);
+  const body=await blob.get(name,start!==0 || end!==size ? {start,end:end-1} : undefined,expected);
   reader=body.getReader({mode:"byob"});
  };
- // Validate the first response before exposing metadata, including empty objects.
- await open();
+ // Validate the first response before exposing metadata, including empty single PUTs.
+ if (segments.length) await open();
  return new ReadableStream<Uint8Array>({
   type:"bytes",
   autoAllocateChunkSize:64 * 1024,

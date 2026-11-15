@@ -2,26 +2,26 @@
 // Copyright (c) 2020 Cloudflare, Inc. <wrangler@cloudflare.com>
 // Adapted from cloudflare/workers-sdk 264fb4408b40f6847b6f0eaaac4c190bea46ecbd
 // packages/miniflare/src/workers/; see LICENSE-MIT and UPSTREAM.md.
-import assert from "node:assert";
 import { Buffer } from "node:buffer";
 import { all, get, base64Decode, base64Encode, maybeApply, readPrefix, discard, createTypedSql } from "./shared";
 import type { TypedSql } from "./sql.worker";
-import { R2Headers, R2Limits } from "./constants";
-import { R2Error, InternalError, InvalidMetadata, NoSuchKey, PreconditionFailed } from "./errors.worker";
+import { R2Headers, R2Limits, MULTIPART_UPLOAD_TTL_MS } from "./constants";
+import { R2Error, InternalError, InvalidMetadata, NoSuchKey, PreconditionFailed, EntityTooLarge } from "./errors.worker";
 import { InternalR2Object, InternalR2ObjectBody } from "./r2Object.worker";
-import { R2BindingRequestSchema, SQL_SCHEMA } from "./schemas.worker";
-import type { ObjectRow, R2Conditional, InternalR2PutOptions, InternalR2GetOptions, InternalR2ListOptions, R2Range } from "./schemas.worker";
+import { R2BindingRequestSchema, SQL_SCHEMA, MultipartUploadState } from "./schemas.worker";
+import type { ObjectRow, R2Conditional, InternalR2PutOptions, InternalR2GetOptions, InternalR2ListOptions, R2Range, InternalR2CreateMultipartUploadOptions, R2PublishedPart } from "./schemas.worker";
 import type { InternalR2Objects } from "./r2Object.worker";
 import { Validator } from "./validator.worker";
 import { BlobStore } from "./blobs";
-import { bodyNames, uploadChunks, readChunks } from "./chunks";
+import { uploadChunks, readChunks } from "./chunks";
+import { multipartStmts, queueBodies, retireObject, generateId } from "./multipart";
 
 const validate = new Validator();
 const unsupported = (message: string) => new R2Error(400, `Not supported: ${message}`, 10029);
 const version = () => crypto.randomUUID().replaceAll("-", "");
 function parseMetadata(raw: any) {
  if (typeof raw.method !== "string") throw new InvalidMetadata();
- if (!["head","get","put","delete","list"].includes(raw.method)) throw unsupported(`R2 method ${raw.method}`);
+ if (!["head","get","put","delete","list","createMultipartUpload","uploadPart","completeMultipartUpload","abortMultipartUpload"].includes(raw.method)) throw unsupported(`R2 method ${raw.method}`);
  if (raw.storageClass !== undefined && raw.storageClass !== "Standard") throw unsupported("storageClass other than Standard");
  if (raw.ssecKey !== undefined || raw.ssec !== undefined || raw.encryption !== undefined) throw unsupported("ssecKey");
  return R2BindingRequestSchema.parse(raw);
@@ -37,6 +37,20 @@ async function decodeMetadata(req: Request) {
 function encodeResult(result: InternalR2Object | InternalR2Objects) {
  const encoded = result instanceof InternalR2Object ? result.encode() : InternalR2Object.encodeMultiple(result);
  return new Response(encoded.value, {headers:{[R2Headers.METADATA_SIZE]: String(encoded.metadataSize), "Content-Type":"application/json"}});
+}
+export function prefixSuccessor(prefix: string): string | null {
+ const points = Array.from(prefix, ch => ch.codePointAt(0)!);
+ while (points.length) {
+  const last = points.pop()!;
+  if (last === 0x10ffff) continue;
+  points.push(last === 0xd7ff ? 0xe000 : last + 1);
+  return String.fromCodePoint(...points);
+ }
+ return null;
+}
+function encodeJSONResult(result: unknown) {
+ const encoded = JSON.stringify(result);
+ return new Response(encoded, {headers:{[R2Headers.METADATA_SIZE]:String(Buffer.byteLength(encoded)), "Content-Type":"application/json"}});
 }
 function sqlStmts(db: TypedSql) {
 	const stmtGetPreviousByKey = db.stmt<
@@ -58,7 +72,7 @@ function sqlStmts(db: TypedSql) {
 	>("DELETE FROM _mf_objects WHERE key = :key RETURNING blob_id, chunk_size, chunk_count");
 
 	function stmtListWithoutDelimiter<ExtraColumns extends (keyof ObjectRow)[]>(
-		...extraColumns: ExtraColumns
+		bounded: boolean, ...extraColumns: ExtraColumns
 	) {
 		const columns: (keyof ObjectRow)[] = [
 			"key",
@@ -71,12 +85,12 @@ function sqlStmts(db: TypedSql) {
 		];
 		// TODO: consider applying same `:start_after IS NULL` trick to KeyValueStore
 		return db.stmt<
-			{ limit: number; prefix: string; start_after: string | null },
+			{ limit: number; prefix: string; start_after: string | null; prefix_end?: string },
 			Omit<ObjectRow, "blob_id"> & Pick<ObjectRow, ExtraColumns[number]>
 		>(`
       SELECT ${columns.join(", ")}
       FROM _mf_objects
-      WHERE key >= :prefix AND substr(key, 1, length(:prefix)) = :prefix
+      WHERE key >= :prefix ${bounded ? "AND key < :prefix_end" : ""} AND substr(key, 1, length(:prefix)) = :prefix
       AND (:start_after IS NULL OR key > :start_after)
       ORDER BY key LIMIT :limit
     `);
@@ -88,28 +102,26 @@ function sqlStmts(db: TypedSql) {
    const previous = get(stmtGetPreviousByKey({key: row.key}));
    validate.condition(previous, onlyIf);
    stmtPut(row);
-   if (previous?.blob_id) for (const name of bodyNames(previous)) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);
+   retireObject(db, row.key, previous);
   }),
   deleteByKeys: db.txn((keys: string[]) => {
    for (const key of keys) {
     const old = get(stmtDelete({key}));
-    if (old?.blob_id) for (const name of bodyNames(old)) db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);
+    retireObject(db, key, old);
    }
   }),
 
-		listWithoutDelimiter: stmtListWithoutDelimiter(),
-		listHttpMetadataWithoutDelimiter: stmtListWithoutDelimiter("http_metadata"),
+		listWithoutDelimiter: [stmtListWithoutDelimiter(false), stmtListWithoutDelimiter(true)],
+		listHttpMetadataWithoutDelimiter: [stmtListWithoutDelimiter(false,"http_metadata"), stmtListWithoutDelimiter(true,"http_metadata")],
 		listCustomMetadataWithoutDelimiter:
-			stmtListWithoutDelimiter("custom_metadata"),
-		listHttpCustomMetadataWithoutDelimiter: stmtListWithoutDelimiter(
-			"http_metadata",
-			"custom_metadata"
-		),
-		listMetadata: db.stmt<
+			[stmtListWithoutDelimiter(false,"custom_metadata"), stmtListWithoutDelimiter(true,"custom_metadata")],
+		listHttpCustomMetadataWithoutDelimiter: [stmtListWithoutDelimiter(false,"http_metadata","custom_metadata"), stmtListWithoutDelimiter(true,"http_metadata","custom_metadata")],
+		listMetadata: [false, true].map(bounded => db.stmt<
 			{
 				limit: number;
 				start_after: string | null;
 				prefix: string;
+				prefix_end?: string;
 				delimiter: string;
 			},
 			Omit<ObjectRow, "key" | "blob_id"> & {
@@ -134,11 +146,11 @@ function sqlStmts(db: TypedSql) {
         -- NOTE: we'll ignore metadata for delimited prefix rows, so it doesn't matter which keys' we return
         version, size, etag, uploaded, checksums, http_metadata, custom_metadata
       FROM _mf_objects
-      WHERE key >= :prefix AND substr(key, 1, length(:prefix)) = :prefix
+      WHERE key >= :prefix ${bounded ? "AND key < :prefix_end" : ""} AND substr(key, 1, length(:prefix)) = :prefix
       AND (:start_after IS NULL OR key > :start_after)
       GROUP BY delimited_prefix_or_key -- Group keys with same delimited prefix into a row, leaving others in their own rows
       ORDER BY last_key LIMIT :limit;
-    `),
+    `)),
 
  };
 }
@@ -148,48 +160,68 @@ export class R2BucketObject {
  readonly #stmts: ReturnType<typeof sqlStmts>;
  readonly db: TypedSql;
  readonly blob: BlobStore;
+ readonly #multipart: ReturnType<typeof multipartStmts>;
+ readonly #uploadTtl: number;
  #gcRunning = false;
- constructor(readonly ctx: DurableObjectState, readonly env: {BLOBS: Fetcher}) {
+ constructor(readonly ctx: DurableObjectState, readonly env: {BLOBS: Fetcher; MINIFLARE_TEST_MULTIPART_UPLOAD_TTL_MS?: string}) {
   this.db = createTypedSql(ctx.storage);
   this.db.exec(SQL_SCHEMA);
   const columns = new Set(all(this.db.exec("PRAGMA table_info(_mf_objects)")).map(row => row.name));
   if (!columns.has("chunk_size")) this.db.exec("ALTER TABLE _mf_objects ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 0");
   if (!columns.has("chunk_count")) this.db.exec("ALTER TABLE _mf_objects ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1");
-  this.db.exec("CREATE TABLE IF NOT EXISTS _r2_pending_gc (blob_id TEXT PRIMARY KEY NOT NULL)");
-  this.db.exec("CREATE TABLE IF NOT EXISTS _r2_gc_state (id INTEGER PRIMARY KEY CHECK(id = 1), retry_ms INTEGER NOT NULL)");
-  this.db.exec("INSERT OR IGNORE INTO _r2_gc_state VALUES (1, 1000)");
+  this.db.exec("CREATE TABLE IF NOT EXISTS _r2_pending_gc (blob_id TEXT PRIMARY KEY NOT NULL, next_retry_at INTEGER NOT NULL DEFAULT 0, retry_ms INTEGER NOT NULL DEFAULT 1000)");
+  const gcColumns = new Set(all(this.db.exec("PRAGMA table_info(_r2_pending_gc)")).map(row => row.name));
+  if (!gcColumns.has("next_retry_at")) this.db.exec("ALTER TABLE _r2_pending_gc ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0");
+  if (!gcColumns.has("retry_ms")) this.db.exec("ALTER TABLE _r2_pending_gc ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 1000");
+  this.db.exec("CREATE INDEX IF NOT EXISTS _r2_gc_due ON _r2_pending_gc(next_retry_at)");
   this.#stmts = sqlStmts(this.db);
-  ctx.blockConcurrencyWhile(async () => {
-   await this.#scheduleGc();
-  });
+  this.#multipart = multipartStmts(this.db);
+  const ttl = Number(env.MINIFLARE_TEST_MULTIPART_UPLOAD_TTL_MS ?? MULTIPART_UPLOAD_TTL_MS);
+  this.#uploadTtl = Number.isSafeInteger(ttl) && ttl > 0 ? ttl : MULTIPART_UPLOAD_TTL_MS;
   this.blob = new BlobStore(env.BLOBS);
+  ctx.blockConcurrencyWhile(() => this.#scheduleGc());
  }
  async #scheduleGc() {
-  if (this.#gcRunning || !get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) return;
-  if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
+  if (this.#gcRunning) return;
+  const gc = get(this.db.exec("SELECT min(next_retry_at) AS due FROM _r2_pending_gc"))!.due;
+  const expiry = get(this.db.exec("SELECT min(expires_at) AS due FROM _mf_multipart_uploads"))!.due;
+  const due = Math.min(gc === null ? Infinity : Number(gc),expiry === null ? Infinity : Number(expiry));
+  if (Number.isFinite(due)) {
+   const when = Math.max(Date.now()+1,due);
+   const alarm = await this.ctx.storage.getAlarm();
+   if (alarm === null || alarm > when || alarm < Date.now()) await this.ctx.storage.setAlarm(when);
+  }
  }
  async alarm() {
   this.#gcRunning = true;
   try {
-   const rows = all(this.db.exec<{blob_id:string}>("SELECT blob_id FROM _r2_pending_gc ORDER BY rowid LIMIT 64"));
+   const now = Date.now();
+   // Terminal upload records may disappear while completed object parts remain.
+   // Expire after cleanup so an expired upload first transitions to ABORTED.
+   this.ctx.storage.transactionSync(() => {
+    this.db.exec("DELETE FROM _mf_multipart_uploads WHERE expires_at <= ? AND state != ?",now,MultipartUploadState.IN_PROGRESS);
+    const expired = all(this.db.exec<{upload_id:string}>("SELECT upload_id FROM _mf_multipart_uploads WHERE expires_at <= ? AND state = ?",now,MultipartUploadState.IN_PROGRESS));
+    for (const {upload_id} of expired) {
+     queueBodies(this.db, all(this.db.exec("DELETE FROM _mf_multipart_parts WHERE upload_id = ? RETURNING blob_id,chunk_size,chunk_count",upload_id)));
+     this.db.exec("UPDATE _mf_multipart_uploads SET state = ? WHERE upload_id = ?",MultipartUploadState.ABORTED,upload_id);
+    }
+   });
+   const rows = all(this.db.exec<{blob_id:string;retry_ms:number}>("SELECT blob_id,retry_ms FROM _r2_pending_gc WHERE next_retry_at <= ? ORDER BY next_retry_at,rowid LIMIT 64",now));
    if (!rows.length) return;
-   // Only alarms send retirement requests, after the dereferencing SQL is durable.
-   await this.ctx.storage.sync();
-   let failed = false;
+   await this.ctx.storage.sync(); // Retirement follows durable dereferencing.
    for (let i = 0; i < rows.length; i += 8) {
-    const outcomes = await Promise.all(rows.slice(i,i+8).map(async ({blob_id}) => {
-     try {await this.blob.delete(blob_id);return {blob_id,ok:true};}
-     catch {return {blob_id,ok:false};}
+    const outcomes = await Promise.all(rows.slice(i,i+8).map(async row => {
+     try {await this.blob.delete(row.blob_id);return {...row,ok:true};}
+     catch {return {...row,ok:false};}
     }));
     this.ctx.storage.transactionSync(() => {
-     for (const result of outcomes) if (result.ok) this.db.exec("DELETE FROM _r2_pending_gc WHERE blob_id = ?",result.blob_id);
+     for (const result of outcomes) {
+      if (result.ok) {this.db.exec("DELETE FROM _r2_pending_gc WHERE blob_id = ?",result.blob_id);}
+      else this.db.exec("UPDATE _r2_pending_gc SET next_retry_at = ?, retry_ms = ? WHERE blob_id = ?",Date.now()+result.retry_ms,Math.min(result.retry_ms*2,60000),result.blob_id);
+     }
     });
-    if (outcomes.some(result => !result.ok)) {failed = true;break;}
    }
-   const previous = Number(get(this.db.exec("SELECT retry_ms FROM _r2_gc_state WHERE id = 1"))!.retry_ms);
-   this.db.exec("UPDATE _r2_gc_state SET retry_ms = ? WHERE id = 1",failed ? Math.min(previous * 2,60000) : 1000);
-   if (get(this.db.exec("SELECT blob_id FROM _r2_pending_gc LIMIT 1"))) await this.ctx.storage.setAlarm(Date.now() + (failed ? previous : 1));
-  } finally {this.#gcRunning = false;}
+  } finally {this.#gcRunning = false;await this.#scheduleGc();}
  }
  async #head(key: string) {
   validate.key(key);
@@ -208,8 +240,8 @@ export class R2BucketObject {
   }
   const range = validate.range(opts, row.size);
   const r2Range = range ? {offset:range.start,length:range.end-range.start+1} : full;
-  assert(row.blob_id !== null);
-  const body = await readChunks(this.blob,row,r2Range);
+  const parts = row.blob_id === null ? this.#multipart.getPartsByKey(key) : [row];
+  const body = await readChunks(this.blob,parts,r2Range);
   return new InternalR2ObjectBody(row, body, r2Range);
  }
  async #put(key: string, value: ReadableStream<Uint8Array>, size: number, opts: InternalR2PutOptions) {
@@ -228,12 +260,51 @@ export class R2BucketObject {
    // The condition is deliberately checked after the body, inside the claiming transaction.
    this.#stmts.put(row, opts.onlyIf);
   } catch (error) {
-   this.ctx.storage.transactionSync(() => {for (const name of attempted) this.db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)", name);});
+   this.#queueAttempted(attempted);
    await this.#scheduleGc();
    throw error;
   }
   await this.#scheduleGc();
   return new InternalR2Object(row);
+ }
+ #queueAttempted(names: string[]) {
+  this.ctx.storage.transactionSync(() => {for (const name of names) this.db.exec("INSERT OR IGNORE INTO _r2_pending_gc (blob_id) VALUES (?)",name);});
+ }
+ async #createMultipartUpload(key: string, opts: InternalR2CreateMultipartUploadOptions) {
+  validate.key(key);
+  const uploadId = generateId();
+  const now = Date.now();
+  this.#multipart.createMultipartUpload({key,upload_id:uploadId,http_metadata:JSON.stringify(opts.httpMetadata ?? {}),custom_metadata:JSON.stringify(opts.customMetadata ?? {}),created_at:now,expires_at:now+this.#uploadTtl});
+  await this.#scheduleGc();
+  return {uploadId};
+ }
+ async #uploadPart(key: string, uploadId: string, partNumber: number, value: ReadableStream<Uint8Array>, size: number) {
+  try {
+   validate.key(key);
+   if (!Number.isSafeInteger(size) || size < 0) throw new InvalidMetadata();
+   if (size > R2Limits.MAX_PART_SIZE) throw new EntityTooLarge();
+  } catch(error) {await discard(value).catch(() => {});throw error;}
+  const blobId = version();
+  const attempted: string[] = [];
+  try {
+   const digests = await uploadChunks(this.blob,blobId,value,size,{},attempted);
+   const etag = generateId();
+   // Check state and expiry only after streaming, in the claiming transaction.
+   this.#multipart.putPart(key,{upload_id:uploadId,part_number:partNumber,blob_id:blobId,chunk_size:R2Limits.CHUNK_SIZE,chunk_count:Math.max(1,Math.ceil(size/R2Limits.CHUNK_SIZE)),size,etag,checksum_md5:digests.get("MD5")!.toString("hex")});
+   await this.#scheduleGc();
+   return {etag};
+  } catch(error) {this.#queueAttempted(attempted);await this.#scheduleGc();throw error;}
+ }
+ async #completeMultipartUpload(key: string, uploadId: string, parts: R2PublishedPart[]) {
+  validate.key(key);
+  const row = this.#multipart.completeMultipartUpload(key,uploadId,parts,R2Limits.MIN_MULTIPART_PART_SIZE);
+  await this.#scheduleGc();
+  return new InternalR2Object(row);
+ }
+ async #abortMultipartUpload(key: string, uploadId: string) {
+  validate.key(key);
+  this.#multipart.abortMultipartUpload(key,uploadId);
+  await this.#scheduleGc();
  }
  async #delete(keys: string | string[]) {
   if (!Array.isArray(keys)) keys = [keys];
@@ -302,8 +373,10 @@ export class R2BucketObject {
 		}
 
 		// Run appropriate query depending on options
+		const prefixEnd = prefixSuccessor(prefix);
 		const params = {
 			prefix,
+			...(prefixEnd === null ? {} : {prefix_end:prefixEnd}),
 			start_after: startAfter ?? null,
 			// Increase the queried limit by 1, if we return this many results, we
 			// know there are more rows. We'll truncate to the original limit before
@@ -316,7 +389,7 @@ export class R2BucketObject {
 		let nextCursorStartAfter: string | undefined;
 
 		if (delimiter !== undefined) {
-			const rows = all(this.#stmts.listMetadata({ ...params, delimiter }));
+			const rows = all(this.#stmts.listMetadata[params.prefix_end === undefined ? 0 : 1]({ ...params, delimiter }));
 
 			// If there are more results, we'll be returning a cursor
 			const hasMoreRows = rows.length === limit + 1;
@@ -337,7 +410,7 @@ export class R2BucketObject {
 		} else {
 			// If we don't have a delimiter, we can use a more efficient query
 			const query = this.#listWithoutDelimiterQuery(excludeHttp, excludeCustom);
-			const rows = all(query(params));
+			const rows = all(query[params.prefix_end === undefined ? 0 : 1](params));
 
 			// If there are more results, we'll be returning a cursor
 			const hasMoreRows = rows.length === limit + 1;
@@ -373,14 +446,18 @@ export class R2BucketObject {
     if (metadata.method === "list") return encodeResult(await this.#list(metadata));
    } else if (req.method === "PUT") {
     const {metadata,metadataSize,value} = await decodeMetadata(req);
-    if (metadata.method === "put") {
+    if (metadata.method === "put" || metadata.method === "uploadPart") {
      const length = req.headers.get("Content-Length");
-     if (length === null) throw new InvalidMetadata();
-     const operation = this.#put(metadata.object,value,Number(length)-metadataSize,metadata);
-     // A producer can abort before fetch() settles; keep the failure cleanup alive.
+     if (length === null) {await discard(value).catch(() => {});throw new InvalidMetadata();}
+     const size = Number(length)-metadataSize;
+     const operation = metadata.method === "put" ? this.#put(metadata.object,value,size,metadata) : this.#uploadPart(metadata.object,metadata.uploadId,metadata.partNumber,value,size);
      this.ctx.waitUntil(operation.then(() => {},() => {}));
-     return encodeResult(await operation);
+     const result = await operation;
+     return metadata.method === "put" ? encodeResult(result as InternalR2Object) : encodeJSONResult(result);
     }
+    if (metadata.method === "createMultipartUpload") return encodeJSONResult(await this.#createMultipartUpload(metadata.object,metadata));
+    if (metadata.method === "completeMultipartUpload") return encodeResult(await this.#completeMultipartUpload(metadata.object,metadata.uploadId,metadata.parts));
+    if (metadata.method === "abortMultipartUpload") {await this.#abortMultipartUpload(metadata.object,metadata.uploadId);return new Response(null);}
     if (metadata.method === "delete") {
      await this.#delete("object" in metadata ? metadata.object : metadata.objects);
      return new Response(null);
