@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 03:21:22 +0800
-Subject: [PATCH] Load tenant and platform roots with explicit prepared
- selections
+Date: Mon, 16 Nov 2026 07:02:31 +0800
+Subject: [PATCH] Load roots with bounded lifecycle cleanup and private
+ per-event preparation
 
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
@@ -50,7 +50,7 @@ index b93462531c985a6f50435d33906d156df352a1da..4b2b90fad3d89ee6756709f43c55a355
  
 diff --git a/src/workerd/server/coworkerd-root-loader.c++ b/src/workerd/server/coworkerd-root-loader.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..051a58c19fe2a0f32ae4b5f03168c55798260899
+index 0000000000000000000000000000000000000000..905c87aea1ecd54c0115976fc0c50c3cb6423e33
 --- /dev/null
 +++ b/src/workerd/server/coworkerd-root-loader.c++
 @@ -0,0 +1,66 @@
@@ -107,7 +107,7 @@ index 0000000000000000000000000000000000000000..051a58c19fe2a0f32ae4b5f03168c557
 +  auto request = context.getIoChannelFactory().getWorkerdDebugPort().getEntrypointRequest();
 +  request.setService(service);
 +  Frankenvalue::fromJson(kj::mv(selectionJson)).toCapnp(request.initProps());
-+  // Resolve the selection before exposing a Fetcher, so refreshing a reclaimed plan never replays an event.
++  // Pin a validated plan before exposing a Fetcher; the object is selected when its event starts.
 +  return context.awaitIo(js, request.send(),
 +      [](jsg::Lock& js, capnp::Response<rpc::WorkerdDebugPort::GetEntrypointResults> response)
 +          -> jsg::Ref<api::Fetcher> {
@@ -292,7 +292,7 @@ index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad4033228
  bool frankenvalue_is_empty(const Frankenvalue& value);
  kj::Own<Frankenvalue> frankenvalue_new();
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb0d2889ed 100644
+index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..006196fb8ab0f0e3109f4666cff796bc1a1154ea 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -21,6 +21,7 @@
@@ -303,7 +303,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
  use std::collections::HashMap;
  use std::collections::hash_map::Entry;
  use std::pin::Pin;
-@@ -97,6 +98,166 @@ const EVICT_TIMEOUT_MESSAGE: &str =
+@@ -97,6 +98,172 @@ const EVICT_TIMEOUT_MESSAGE: &str =
      "jsg.Error: Timed out waiting to evict Durable Object: it still has active references.";
  const RESIDENT_LIMIT_REASON: &str = "broken.dropped; Actor evicted for the resident object limit";
  
@@ -312,6 +312,12 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +#[derive(Default)]
 +pub(crate) struct RootCloseFences {
 +    closing: RefCell<HashMap<(String, String), Shared<LocalBoxFuture<'static, ()>>>>,
++}
++
++impl RootCloseFences {
++    pub(crate) fn pending(&self) -> usize {
++        self.closing.borrow().len()
++    }
 +}
 +
 +/// Bound a caller's wait without cancelling the teardown that owns the storage fence.
@@ -470,7 +476,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
  /// The namespace of one Durable Object class: its actors and their shared storage. The runtime's
  /// `ActorNamespace`.
  pub struct ActorNamespace {
-@@ -119,11 +280,9 @@ pub struct ActorNamespace {
+@@ -119,11 +286,9 @@ pub struct ActorNamespace {
      actors: RefCell<LinkedHashMap<String, Rc<ActorContainer>>>,
      /// The cleanup loop, started by the first request; dropped with the namespace.
      cleanup_task: RefCell<Option<TaskHandle>>,
@@ -484,7 +490,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      /// Set in cluster mode for a namespace on disk: its actors are owned by one instance of
      /// the cluster at a time, and replicated.
      cluster: OnceCell<Rc<ClusterNode>>,
-@@ -137,6 +296,8 @@ pub struct ActorNamespace {
+@@ -137,6 +302,8 @@ pub struct ActorNamespace {
      broken: Cell<bool>,
      /// Actors a stop left as they were at its deadline: they end as the process exits.
      left_behind: RefCell<Vec<Rc<ActorContainer>>>,
@@ -493,7 +499,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
  }
  
  /// The first resolution of an actor: its end, however it ends, wakes the requests that waited.
-@@ -178,16 +339,15 @@ impl ActorNamespace {
+@@ -178,16 +345,15 @@ impl ActorNamespace {
              storage: OnceCell::new(),
              actors: RefCell::new(LinkedHashMap::new()),
              cleanup_task: RefCell::new(None),
@@ -512,7 +518,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          })
      }
  
-@@ -304,10 +464,13 @@ impl ActorNamespace {
+@@ -304,10 +470,13 @@ impl ActorNamespace {
                  if cluster.cluster.is_draining() {
                      return Err(moved(&format!("{key}: this node is draining")));
                  }
@@ -527,7 +533,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
                  drop(replaced);
                  Ok(Resolved::Here(Client(container)))
              }
-@@ -338,6 +501,9 @@ impl ActorNamespace {
+@@ -338,6 +507,9 @@ impl ActorNamespace {
              .is_some_and(|c| std::ptr::eq(Rc::as_ptr(c), container))
          {
              actors.remove(&container.key);
@@ -537,7 +543,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          }
      }
  
-@@ -383,15 +549,15 @@ impl ActorNamespace {
+@@ -383,15 +555,15 @@ impl ActorNamespace {
      }
  
      /// The container of the actor with `id`, created if the namespace has none.
@@ -557,7 +563,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  
      /// Starts the cleanup loop if it is not running. A namespace with `preventEviction` never
-@@ -417,7 +583,13 @@ impl ActorNamespace {
+@@ -417,7 +589,13 @@ impl ActorNamespace {
              })
              .map(|(key, _)| key.clone())
              .collect();
@@ -572,8 +578,16 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  
      /// Counts root trees, not actors: a live facet keeps its root tree resident.
-@@ -433,45 +605,17 @@ impl ActorNamespace {
-             .filter(|container| container.is_resident())
+@@ -430,58 +608,49 @@ impl ActorNamespace {
+             .actors
+             .borrow()
+             .values()
+-            .filter(|container| container.is_resident())
++            .filter(|container| {
++                let resident = container.is_resident();
++                container.resident_counted.set(resident);
++                resident
++            })
              .count() as u64;
          self.residency.set(report);
 -        let reported = self.reported_residency.get();
@@ -599,30 +613,58 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          }
      }
  
++    /// Update only the root whose actor changed, rather than scanning all dormant containers.
++    fn refresh_resident_root(&self, container: &ActorContainer) {
++        if !self.actor_class.runtime_root() { self.count_resident(); return; }
++        let Some(root) = container.this.upgrade().map(|container| container.root()) else { return; };
++        let present = self.actors.borrow().get(&root.key).is_some_and(|current| Rc::ptr_eq(current, &root));
++        if !present { root.resident_counted.set(false); return; }
++        let resident = root.is_resident();
++        let previous = root.resident_counted.replace(resident);
++        let mut report = self.residency.get();
++        if resident && !previous { report.resident += 1; }
++        if !resident && previous { report.resident = report.resident.saturating_sub(1); }
++        self.residency.set(report);
++        if let Some(id) = self.residency_id.get() { self.factory.residency().update(id, report); }
++    }
++
      fn object_resident(&self, container: &ActorContainer) {
 -        if !self.shipped.get() || !container.is_root() {
-+        if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
-             return;
-         }
-         self.count_resident();
+-            return;
+-        }
+-        self.count_resident();
 -        let report = self.residency.get();
 -        if report.limit == 0
 -            || report.resident <= report.limit
 -            || !self.is_evictable()
 -            || self.enforcing.replace(true)
 -        {
--            return;
--        }
++        if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
+             return;
+         }
 -        // Replacing a completed handle is safe; the pass never clears its own handle.
 -        let task = self
 -            .factory
 -            .spawn(enforce_resident_limit(Weak::clone(&self.this)));
 -        *self.resident_task.borrow_mut() = Some(task);
++        self.refresh_resident_root(container);
 +        self.factory.residency().enforce(&self.factory);
      }
  
-     fn object_evicted(&self) {
-@@ -501,41 +645,47 @@ impl ActorNamespace {
+-    fn object_evicted(&self) {
++    fn object_evicted(&self, container: &ActorContainer) {
+         if !self.shipped.get() {
+             return;
+         }
+         let mut report = self.residency.get();
+         report.evicted += 1;
+         self.residency.set(report);
+-        self.count_resident();
++        self.refresh_resident_root(container);
+     }
+ 
+     fn object_woken(&self, took: Duration) {
+@@ -501,41 +670,47 @@ impl ActorNamespace {
  }
  
  /// Clears the pass flag on completion, error or cancellation without owning its namespace.
@@ -691,7 +733,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          if let Err(error) = root.evict_for_resident_limit().await {
              tracing::error!(
                  "the resident object limit could not be enforced: {}",
-@@ -544,8 +694,8 @@ async fn enforce_resident_limit(namespace: Weak<ActorNamespace>) {
+@@ -544,8 +719,8 @@ async fn enforce_resident_limit(namespace: Weak<ActorNamespace>) {
              break;
          }
      }
@@ -702,16 +744,16 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  }
  
-@@ -571,6 +721,50 @@ impl ActorNamespace {
+@@ -571,6 +746,55 @@ impl ActorNamespace {
          self.channel_for(id, persistent, false)
      }
  
 +    /// A selected runtime root must report constructor rejection before publishing its record.
-+    pub(crate) fn root_channel(&self, id: KjOwn<ActorIdHandle>) -> Result<Rc<dyn Channel>> {
++    pub(crate) fn root_channel(&self, id: KjOwn<ActorIdHandle>, nonce: String) -> Result<Rc<dyn Channel>> {
 +        assert!(self.actor_class.runtime_root() && self.cluster().is_none());
-+        Ok(Rc::new(ActorChannel {
++        Ok(Rc::new(RootActorChannel {
 +            container: Client(self.container_for(id)?),
-+            persistent: false,
++            nonce,
 +        }))
 +    }
 +
@@ -719,11 +761,16 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +        self.actors.borrow().contains_key(key)
 +    }
 +
++    pub(crate) fn has_resident_root(&self, key: &str) -> bool {
++        self.actors.borrow().get(key).is_some_and(|container| container.is_resident())
++    }
++
 +    /// A node-selected alarm of a root or an already registered facet of that root.
 +    pub(crate) fn root_alarm_channel(
 +        &self,
 +        id: KjOwn<ActorIdHandle>,
 +        facet: u32,
++        nonce: String,
 +    ) -> Result<Rc<dyn Channel>> {
 +        assert!(self.actor_class.runtime_root() && self.cluster().is_none());
 +        let root = self.container_for(id)?;
@@ -744,16 +791,16 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +        .ok_or_else(|| {
 +            kj::disconnected!("the root alarm facet is not registered in this process")
 +        })?;
-+        Ok(Rc::new(ActorChannel {
++        Ok(Rc::new(RootActorChannel {
 +            container: Client(target),
-+            persistent: false,
++            nonce,
 +        }))
 +    }
 +
      /// The channel of the actor with `id` for a peer's or the debug port's request.
      pub fn peer_channel(&self, id: KjOwn<ActorIdHandle>) -> Rc<dyn Channel> {
          self.channel_for(id, false, true)
-@@ -591,10 +785,13 @@ impl ActorNamespace {
+@@ -591,10 +815,13 @@ impl ActorNamespace {
                  bound: Rc::default(),
              });
          }
@@ -771,7 +818,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  
      /// The channel of the ephemeral actor named `name`.
-@@ -617,7 +814,179 @@ impl ActorNamespace {
+@@ -617,7 +844,180 @@ impl ActorNamespace {
          let actors = std::mem::take(&mut *self.actors.borrow_mut());
          for container in actors.values() {
              container.abort(reason.cloned());
@@ -825,7 +872,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +            if let Some(closing) = closing {
 +                closing.await;
 +            }
-+        }
+         }
 +        .boxed_local()
 +    }
 +
@@ -911,7 +958,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +        let actor = self.actors.borrow().get(key).cloned();
 +        if let Some(actor) = actor {
 +            actor.evict_tree_if_running(true).await?;
-         }
++        }
 +        Ok(())
 +    }
 +
@@ -942,6 +989,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +            .map(|(key, _)| key.clone())
 +            .collect();
 +        let removed: Vec<_> = keys.iter().filter_map(|key| actors.remove(key)).collect();
++        if actors.is_empty() { actors.shrink_to_fit(); }
 +        drop(actors);
 +        for root in &removed {
 +            root.namespace_removed();
@@ -951,7 +999,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  
      /// Stops every actor that is left as this instance's handoff ends; peers take them over
-@@ -639,6 +1008,10 @@ impl ActorNamespace {
+@@ -639,6 +1039,10 @@ impl ActorNamespace {
      /// are left as they are, for the process's exit to end.
      async fn stop_all(&self, until: Option<Instant>, stop: impl Fn(&str, &ActorContainer)) {
          let actors = std::mem::take(&mut *self.actors.borrow_mut());
@@ -962,7 +1010,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          let mut actors = actors.into_iter().collect::<Vec<_>>().into_iter();
          while actors.len() > 0 {
              if until.is_some_and(|until| Instant::now() >= until) {
-@@ -695,7 +1068,7 @@ impl ActorNamespace {
+@@ -695,7 +1099,7 @@ impl ActorNamespace {
          let containers: Vec<Rc<ActorContainer>> = self.actors.borrow().values().cloned().collect();
          let evictions = containers
              .iter()
@@ -971,7 +1019,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          futures::future::join_all(evictions)
              .await
              .into_iter()
-@@ -759,6 +1132,13 @@ impl ActorNamespace {
+@@ -759,6 +1163,13 @@ impl ActorNamespace {
          }
          // Checked above; nothing else sets it.
          let _ = self.storage.set(storage);
@@ -985,7 +1033,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          Ok(())
      }
  
-@@ -812,6 +1192,17 @@ impl ActorNamespace {
+@@ -812,6 +1223,17 @@ impl ActorNamespace {
      }
  }
  
@@ -1003,7 +1051,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
  /// Marks a namespace's `directory` as the cluster's. The cluster replaces an
  /// object's database with the bucket's copy, so a directory holding Durable
  /// Objects from before cluster mode is refused rather than deleted.
-@@ -839,10 +1230,6 @@ fn claim_directory(directory: &str) -> Result<()> {
+@@ -839,10 +1261,6 @@ fn claim_directory(directory: &str) -> Result<()> {
  }
  
  impl ActorNamespaceHandle {
@@ -1014,7 +1062,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      pub(crate) fn actor_for_alarm(
          &self,
          id: KjOwn<ActorIdHandle>,
-@@ -860,7 +1247,7 @@ impl ActorNamespaceHandle {
+@@ -860,7 +1278,7 @@ impl ActorNamespaceHandle {
          }
          let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
          let Some(node) = namespace.cluster().map(Rc::clone) else {
@@ -1023,7 +1071,15 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          };
          // A draining instance starts nothing: the alarm runs where the object goes, once peers
          // adopt this instance's alarms as it leaves, or the next owner opens the object.
-@@ -1259,10 +1646,45 @@ pub struct ActorContainer {
+@@ -1230,6 +1648,7 @@ pub struct ActorContainer {
+     actor: RefCell<Option<Rc<KjOwn<ffi::ActorHandle>>>>,
+     /// Only a real actor-to-empty eviction makes the next successful start a wake.
+     was_evicted: Cell<bool>,
++    resident_counted: Cell<bool>,
+     /// The hibernation manager of the evicted actor, for the actor that replaces it.
+     manager: RefCell<Option<KjRc<ffi::HibernationManager>>>,
+     /// Set once the actor broke or was aborted; every later use of the container fails with it.
+@@ -1259,10 +1678,45 @@ pub struct ActorContainer {
  }
  
  impl ActorContainer {
@@ -1072,7 +1128,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              Self::init(
                  Weak::clone(this),
                  key.clone(),
-@@ -1273,7 +1695,7 @@ impl ActorContainer {
+@@ -1273,7 +1727,7 @@ impl ActorContainer {
                  Rc::new(Cell::new(ns.factory.now())),
                  ClassState::Ready { class, id },
              )
@@ -1081,7 +1137,15 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  
      /// A facet of `parent`, whose class and id `start` resolves.
-@@ -1364,6 +1786,12 @@ impl ActorContainer {
+@@ -1316,6 +1770,7 @@ impl ActorContainer {
+             class_and_id: RefCell::new(class_and_id),
+             actor: RefCell::new(None),
+             was_evicted: Cell::new(false),
++            resident_counted: Cell::new(false),
+             manager: RefCell::new(None),
+             broken_reason: RefCell::new(None),
+             facets: RefCell::new(LinkedHashMap::new()),
+@@ -1364,6 +1819,12 @@ impl ActorContainer {
                  .any(|child| child.is_resident())
      }
  
@@ -1094,11 +1158,28 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      fn tree_has_requests(&self) -> bool {
          self.active.get()
              || self
-@@ -1535,20 +1963,41 @@ impl ActorContainer {
+@@ -1532,23 +1993,58 @@ impl ActorContainer {
+         drop(self.shutdown_task.borrow_mut().take());
+     }
+ 
++    fn require_root_not_retiring(&self) -> Result<()> {
++        if self.namespace()?.actor_class.runtime_root() {
++            let mut parent = self.parent.as_ref().and_then(Weak::upgrade);
++            while let Some(container) = parent {
++                if container.retirement.borrow().is_some() {
++                    return Err(kj::failed!("jsg.Error: Child facets cannot be called while their root is running onHibernate"));
++                }
++                parent = container.parent.as_ref().and_then(Weak::upgrade);
++            }
++        }
++        Ok(())
++    }
++
      /// The running actor, started first if it is not running.
      async fn get_actor(&self) -> Result<Rc<KjOwn<ffi::ActorHandle>>> {
          loop {
 +            let ns = self.namespace()?;
++            self.require_root_not_retiring()?;
              let retirement = self.retirement.borrow().clone();
              if let Some(retirement) = retirement {
                  // A request that the onHibernate handler makes to its own object waits here too,
@@ -1139,7 +1220,13 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              if let Some(pending) = self.pending_class() {
                  pending.await?;
                  self.require_not_broken()?;
-@@ -1682,7 +2131,10 @@ impl ActorContainer {
+@@ -1677,12 +2173,16 @@ impl ActorContainer {
+         self: &Rc<Self>,
+         metadata: KjOwn<RequestMetadata>,
+     ) -> Result<KjOwn<WorkerInterface>> {
++        self.require_root_not_retiring()?;
+         self.require_not_broken()?;
+         if let Some(ns) = self.namespace.upgrade() {
              ns.ensure_cleanup_loop();
          }
          let client = Client(Rc::clone(self));
@@ -1151,7 +1238,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              self.actor.borrow().clone()
          } else {
              None
-@@ -1789,6 +2241,18 @@ impl ActorContainer {
+@@ -1789,6 +2289,18 @@ impl ActorContainer {
      /// the container leaves its map, dropping the hibernation manager (which disconnects the
      /// hibernated WebSockets).
      fn broken(self: &Rc<Self>, reason: &crate::Error) {
@@ -1170,7 +1257,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          *self.broken_reason.borrow_mut() = Some(reason.clone());
          let facets = std::mem::take(&mut *self.facets.borrow_mut());
          for facet in facets.values() {
-@@ -1852,6 +2316,15 @@ impl ActorContainer {
+@@ -1852,6 +2364,15 @@ impl ActorContainer {
          if self.broken_reason.borrow().is_some() {
              return None;
          }
@@ -1186,7 +1273,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          let actor = self.actor.borrow_mut().take();
          if let Some(actor) = &actor {
              // Only an error cancels a committed hook, which must stop before ownership is released.
-@@ -1877,9 +2350,22 @@ impl ActorContainer {
+@@ -1877,9 +2398,22 @@ impl ActorContainer {
          );
          let owned = self.release(actor.as_deref());
          drop(actor);
@@ -1209,7 +1296,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      /// Whether this actor or a facet of it has a request in flight.
      fn tree_active(&self) -> bool {
          self.active.get() || self.facets.borrow().values().any(|f| f.tree_active())
-@@ -1968,7 +2454,7 @@ impl ActorContainer {
+@@ -1968,7 +2502,7 @@ impl ActorContainer {
  
      /// Test hook: evicts the actor and its facets, those that are running; the bulk eviction
      /// must not fail on actors that are not.
@@ -1218,7 +1305,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          self: &Rc<Self>,
          hibernate: bool,
      ) -> LocalBoxFuture<'static, Result<()>> {
-@@ -1978,7 +2464,7 @@ impl ActorContainer {
+@@ -1978,7 +2512,7 @@ impl ActorContainer {
              let facets: Vec<Rc<Self>> = this.facets.borrow().values().cloned().collect();
              let mut evictions: Vec<LocalBoxFuture<'static, Result<()>>> = facets
                  .iter()
@@ -1227,7 +1314,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
                  .collect();
              if this.is_running() {
                  let this = Rc::clone(&this);
-@@ -2001,7 +2487,7 @@ impl ActorContainer {
+@@ -2001,7 +2535,7 @@ impl ActorContainer {
          let deadline = factory.now() + EVICT_TIMEOUT;
          loop {
              if self
@@ -1236,7 +1323,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
                  .await?
              {
                  return Ok(());
-@@ -2037,7 +2523,19 @@ impl ActorContainer {
+@@ -2037,7 +2571,19 @@ impl ActorContainer {
          let resident_pass = resident_root.is_some();
          let retirement = self.retirement.borrow().clone();
          if let Some(retirement) = retirement {
@@ -1257,7 +1344,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              return Ok(!resident_pass || !self.is_running());
          }
          if !resident_tree_idle(resident_root.as_ref()) {
-@@ -2080,7 +2578,18 @@ impl ActorContainer {
+@@ -2080,7 +2626,18 @@ impl ActorContainer {
                  .shared();
              *self.retirement.borrow_mut() = Some(retirement.clone());
              self.cancel_shutdown();
@@ -1277,7 +1364,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              return Ok(!resident_pass || !self.is_running());
          }
          self.finish_eviction(reason, hibernate, resident_root.as_ref())
-@@ -2104,6 +2613,9 @@ impl ActorContainer {
+@@ -2104,6 +2661,9 @@ impl ActorContainer {
          if let Some(actor) = &current {
              if hibernate {
                  self.save_manager();
@@ -1287,7 +1374,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
              }
              let lock = if hibernate && self.manager.borrow().is_some() {
                  Some(ffi::actor_lock(actor).await?)
-@@ -2128,15 +2640,15 @@ impl ActorContainer {
+@@ -2128,15 +2688,15 @@ impl ActorContainer {
          self.cancel_on_broken();
          self.cancel_shutdown();
          *self.actor.borrow_mut() = None;
@@ -1297,7 +1384,8 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          if current.is_some() {
              self.was_evicted.set(true);
              if let Some(ns) = self.namespace.upgrade() {
-                 ns.object_evicted();
+-                ns.object_evicted();
++                ns.object_evicted(self);
              }
          }
 -        if !hibernate {
@@ -1306,7 +1394,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          Ok(true)
      }
  }
-@@ -2305,7 +2817,13 @@ async fn resolve_facet_start(
+@@ -2305,7 +2865,13 @@ async fn resolve_facet_start(
  ) -> Result<()> {
      let ffi::FacetStartInfo { id, actor_class } = ffi::facet_start_resolve(start).await?;
      if let Some(container) = container.upgrade() {
@@ -1321,7 +1409,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          *container.class_and_id.borrow_mut() = ClassState::Ready { class, id };
      }
      Ok(())
-@@ -2313,6 +2831,10 @@ async fn resolve_facet_start(
+@@ -2313,6 +2879,10 @@ async fn resolve_facet_start(
  
  impl Drop for ActorContainer {
      fn drop(&mut self) {
@@ -1332,7 +1420,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
          for facet in self.facets.get_mut().values() {
              facet.abort(None);
          }
-@@ -2321,6 +2843,10 @@ impl Drop for ActorContainer {
+@@ -2321,6 +2891,10 @@ impl Drop for ActorContainer {
              ffi::actor_abort(actor, &AbortReason(None));
          }
          drop(self.release(actor.as_deref()));
@@ -1343,7 +1431,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
      }
  }
  
-@@ -2617,6 +3143,18 @@ impl Drop for Client {
+@@ -2617,6 +3191,39 @@ impl Drop for Client {
  }
  
  /// A stub's channel to an actor.
@@ -1357,6 +1445,27 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb
 +    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
 +        Err(self.0.clone())
 +    }
++}
++
++/// Private runtime-root setup. Errors are marked before an actor event is handed off.
++struct RootActorChannel {
++    container: Client,
++    nonce: String,
++}
++impl Channel for RootActorChannel {
++    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
++        let client = Client(Rc::clone(&self.container.0));
++        let nonce = self.nonce.clone();
++        client.require_not_broken().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
++        Ok(PromisedInterface::new(async move {
++            let actor = client.get_actor().await
++                .map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
++            client.request_on(metadata, &actor)
++                .map_err(|error| crate::root_loader::preparation_error(&nonce, error))
++        }).into_kj())
++    }
++    fn require_allows_transfer(&self) -> Result<()> { self.container.require_transferable() }
++    fn token(&self, usage: TokenUsage) -> Result<KjOwn<PendingToken>> { self.container.token(usage, false) }
 +}
 +
  struct ActorChannel {
@@ -1693,10 +1802,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038a4886e09
+index 0000000000000000000000000000000000000000..24774615763eada4d03a9ab8cca568a9982cbf7c
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,2151 @@
+@@ -0,0 +1,2222 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1705,7 +1814,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +//! Compiled instances and stable namespace/class providers have separate lifetimes.
 +
 +use std::cell::{Cell, RefCell};
-+use std::collections::{BTreeMap, HashMap, HashSet};
++use std::collections::{HashMap, HashSet};
 +use std::pin::Pin;
 +use std::rc::{Rc, Weak};
 +use std::time::{Duration, SystemTime};
@@ -1781,7 +1890,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    #[serde(default)]
 +    alarm_facet_id: Option<u32>,
 +    #[serde(default)]
-+    prepared_ticket: Option<String>,
++    preparation_nonce: String,
 +}
 +
 +#[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -2014,23 +2123,22 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    selection_pins: Cell<usize>,
 +}
 +
-+struct PlanPin(Rc<Plan>);
++struct PlanPin(Rc<Plan>, Weak<RootRegistry>);
 +impl PlanPin {
-+    fn new(plan: Rc<Plan>) -> Self {
++    fn new(plan: Rc<Plan>, registry: Weak<RootRegistry>) -> Self {
 +        plan.selection_pins.set(plan.selection_pins.get() + 1);
-+        Self(plan)
++        Self(plan, registry)
 +    }
 +}
 +impl Drop for PlanPin {
 +    fn drop(&mut self) {
 +        self.0.selection_pins.set(self.0.selection_pins.get() - 1);
++        if self.0.selection_pins.get() == 0 {
++            if let Some(registry) = self.1.upgrade() {
++                registry.schedule_prune();
++            }
++        }
 +    }
-+}
-+
-+struct PreparedRoot {
-+    selection: RootSelection,
-+    channel: Rc<dyn Channel>,
-+    pin: PlanPin,
 +}
 +
 +#[derive(Clone)]
@@ -2043,11 +2151,35 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    removing: Rc<Cell<bool>>,
 +}
 +
++struct InstallFlight {
++    deployment: RefCell<Option<Rc<Deployment>>>,
++    namespaces: Vec<String>,
++    cancelled: Cell<bool>,
++    result: RefCell<Option<Result<String>>>,
++    completed: tokio::sync::Notify,
++}
++
++impl InstallFlight {
++    async fn wait(&self) -> Result<String> {
++        loop {
++            let notified = self.completed.notified();
++            if let Some(result) = self.result.borrow().clone() {
++                return result;
++            }
++            notified.await;
++        }
++    }
++}
++
 +pub struct RootRegistry {
 +    this: Weak<Self>,
 +    factory: Rc<Factory>,
 +    storage: String,
 +    install_lock: tokio::sync::Mutex<()>,
++    installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
++    tenant_compilations: Cell<u64>,
++    removed_namespaces: RefCell<HashSet<String>>,
++    collect_queued: Cell<bool>,
 +    plans: RefCell<HashMap<String, Rc<Plan>>>,
 +    namespaces: RefCell<HashMap<String, NamespaceEntry>>,
 +    closing_roots: Rc<RootCloseFences>,
@@ -2056,8 +2188,6 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    compiled: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
 +    retiring: RefCell<HashMap<WorkerKey, Rc<WorkerService>>>,
 +    ignored_retirements: Cell<u64>,
-+    next_prepared: Cell<u64>,
-+    prepared: RefCell<BTreeMap<u64, PreparedRoot>>,
 +    server: RefCell<Weak<crate::config::Server>>,
 +}
 +
@@ -2073,6 +2203,10 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            factory,
 +            storage,
 +            install_lock: tokio::sync::Mutex::new(()),
++            installing: RefCell::new(HashMap::new()),
++            tenant_compilations: Cell::new(0),
++            removed_namespaces: RefCell::new(HashSet::new()),
++            collect_queued: Cell::new(false),
 +            plans: RefCell::new(HashMap::new()),
 +            namespaces: RefCell::new(HashMap::new()),
 +            closing_roots: Rc::default(),
@@ -2081,8 +2215,6 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            compiled: RefCell::new(HashMap::new()),
 +            retiring: RefCell::new(HashMap::new()),
 +            ignored_retirements: Cell::new(0),
-+            next_prepared: Cell::new(0),
-+            prepared: RefCell::new(BTreeMap::new()),
 +            server: RefCell::new(Weak::new()),
 +        }))
 +    }
@@ -2159,8 +2291,20 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            .is_some_and(|object| Rc::ptr_eq(&object.registration, registration));
 +        if matches {
 +            self.objects.borrow_mut().remove(index);
-+            self.prune_plans();
++            self.schedule_prune();
 +        }
++    }
++
++    fn schedule_prune(&self) {
++        if self.collect_queued.replace(true) { return; }
++        let Some(registry) = self.this.upgrade() else { return; };
++        let factory = Rc::clone(&self.factory);
++        let timer = Rc::clone(&factory);
++        factory.spawn_detached(async move {
++            timer.sleep(Duration::ZERO).await;
++            registry.collect_queued.set(false);
++            registry.prune_plans();
++        });
 +    }
 +
 +    fn prune_plans(&self) {
@@ -2170,6 +2314,13 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            .values()
 +            .map(|entry| entry.source.borrow().clone())
 +            .collect();
++        // The common case has no obsolete plan. Do not scan every remembered object
++        // when the last Fetcher of an ordinary request releases its pin.
++        if self.plans.borrow().iter().all(|(key, plan)| {
++            needed.contains(key) || plan.selection_pins.get() != 0
++        }) {
++            return;
++        }
 +        needed.extend(
 +            self.objects
 +                .borrow()
@@ -2226,6 +2377,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +        for namespace in namespaces {
 +            namespace.prune_idle_roots();
 +        }
++        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
 +        self.prune_plans();
 +    }
 +
@@ -2318,6 +2470,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                );
 +        }
 +        // A binding invocation must yield its calling isolate before compiling another isolate.
++        self.tenant_compilations.set(self.tenant_compilations.get() + 1);
 +        self.factory.sleep(Duration::ZERO).await;
 +        let errors = Rc::new(RefCell::new(Vec::new()));
 +        let found = Rc::clone(&errors);
@@ -2418,7 +2571,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            identity,
 +            &report,
 +        )
-+        .await.map_err(|error| kj::failed!("ROOT_TENANT_CODE: {}", error.description()))?;
++        .await?;
 +        if report.refuses()
 +            || deployment
 +                .namespaces
@@ -2582,15 +2735,67 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +
 +    async fn install(self: &Rc<Self>, deployment: Deployment) -> Result<String> {
 +        deployment.validate()?;
++        self.validate_install(&deployment)?;
 +        let plan_key = deployment.plan_key()?;
-+        let _guard = wait_for_root(
++        if let Some(existing) = self.plans.borrow().get(&plan_key).cloned() {
++            if existing.deployment != deployment {
++                return Err(kj::failed!("a root plan cannot be replaced under its existing key"));
++            }
++            for namespace in &deployment.namespaces {
++                if let Some(entry) = self.namespaces.borrow().get(&namespace.id) {
++                    if entry.removing.get() {
++                        return Err(kj::disconnected!("root namespace removal is still in progress; retry"));
++                    }
++                    *entry.source.borrow_mut() = plan_key.clone();
++                }
++            }
++            return Ok(plan_key);
++        }
++        let existing = self.installing.borrow().get(&plan_key).cloned();
++        let flight = if let Some(flight) = existing {
++            if flight.deployment.borrow().as_ref().is_none_or(|value| **value != deployment) {
++                return Err(kj::failed!("a root plan cannot be replaced under its existing key"));
++            }
++            flight
++        } else {
++            let flight = Rc::new(InstallFlight {
++                namespaces: deployment.namespaces.iter().map(|space| space.id.clone()).collect(),
++                deployment: RefCell::new(Some(Rc::new(deployment))),
++                cancelled: Cell::new(false),
++                result: RefCell::new(None),
++                completed: tokio::sync::Notify::new(),
++            });
++            self.installing.borrow_mut().insert(plan_key.clone(), Rc::clone(&flight));
++            let registry = Rc::clone(self);
++            let task = Rc::clone(&flight);
++            let key = plan_key.clone();
++            // Compilation belongs to the registry; cancellation of a waiting caller cannot
++            // strand its source or cause a second concurrent compilation of the same key.
++            self.factory.spawn_detached(async move {
++                let deployment = task.deployment.borrow().as_ref().cloned().expect("install deployment");
++                let result = registry.install_compiled((*deployment).clone(), &task).await;
++                drop(deployment);
++                task.deployment.borrow_mut().take();
++                *task.result.borrow_mut() = Some(result);
++                registry.installing.borrow_mut().remove(&key);
++                task.completed.notify_waiters();
++            });
++            flight
++        };
++        wait_for_root(
 +            &self.factory,
-+            &deployment.namespaces[0].id,
++            &flight.namespaces[0],
 +            "",
-+            "plan install lock",
-+            self.install_lock.lock(),
++            "plan installation",
++            flight.wait(),
 +        )
-+        .await?;
++        .await?
++    }
++
++    fn validate_install(&self, deployment: &Deployment) -> Result<()> {
++        if deployment.namespaces.iter().any(|space| self.removed_namespaces.borrow().contains(&space.id)) {
++            return Err(kj::disconnected!("the root namespace was deleted by its node"));
++        }
 +        if self.namespaces.borrow().iter().any(|(id, entry)| {
 +            entry.removing.get()
 +                && deployment
@@ -2615,21 +2820,6 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            return Err(kj::failed!(
 +                "a root storage key is already used by a configured namespace"
 +            ));
-+        }
-+        let existing = self.plans.borrow().get(&plan_key).cloned();
-+        if let Some(existing) = existing {
-+            if existing.deployment != deployment {
-+                return Err(kj::failed!(
-+                    "a root plan cannot be replaced under its existing key"
-+                ));
-+            }
-+            for namespace in &deployment.namespaces {
-+                if let Some(entry) = self.namespaces.borrow().get(&namespace.id) {
-+                    *entry.source.borrow_mut() = plan_key.clone();
-+                }
-+            }
-+            self.prune_plans();
-+            return Ok(plan_key);
 +        }
 +        {
 +            let spaces = self.namespaces.borrow();
@@ -2658,6 +2848,12 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                }
 +            }
 +        }
++        Ok(())
++    }
++
++    async fn install_compiled(self: &Rc<Self>, deployment: Deployment, flight: &InstallFlight) -> Result<String> {
++        self.validate_install(&deployment)?;
++        let plan_key = deployment.plan_key()?;
 +        let key = deployment.key(deployment.initial_generation()?)?;
 +        let plan = Rc::new(Plan {
 +            deployment,
@@ -2668,6 +2864,12 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            selection_pins: Cell::new(0),
 +        });
 +        let worker = self.compile(&plan.deployment, &key).await?;
++        let _guard = wait_for_root(&self.factory, &plan.deployment.namespaces[0].id, "",
++            "registry publication", self.install_lock.lock()).await?;
++        if flight.cancelled.get() || self.validate_install(&plan.deployment).is_err() {
++            if !plan.deployment.is_platform() { worker.unlink(); }
++            return Err(kj::disconnected!("root namespace removed while its plan compiled"));
++        }
 +        let spaces = match self.make_spaces(&plan.deployment, &plan_key) {
 +            Ok(spaces) => spaces,
 +            Err(error) => {
@@ -2753,27 +2955,6 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +        );
 +        *plan.loaded.borrow_mut() = Some(key);
 +        Ok(worker)
-+    }
-+
-+    async fn prepare(self: &Rc<Self>, selection: RootSelection) -> Result<u64> {
-+        if selection.prepared_ticket.is_some() {
-+            return Err(kj::failed!("a prepared root cannot be prepared again"));
-+        }
-+        let plan = self.plans.borrow().get(&selection.plan).cloned()
-+            .ok_or_else(|| kj::failed!("unknown root plan"))?;
-+        let pin = PlanPin::new(plan);
-+        // All asynchronous selection and retirement waits finish before the runtime receives a Fetcher.
-+        let channel = self.root(selection.clone()).await?;
-+        let ticket = self.next_prepared.get().checked_add(1)
-+            .ok_or_else(|| kj::failed!("prepared root ticket space exhausted"))?;
-+        self.next_prepared.set(ticket);
-+        let mut prepared = self.prepared.borrow_mut();
-+        // A cancelled management call must not leave an unbounded capability table.
-+        if prepared.len() >= 1024 {
-+            prepared.pop_first();
-+        }
-+        prepared.insert(ticket, PreparedRoot { selection, channel, pin });
-+        Ok(ticket)
 +    }
 +
 +    async fn root(self: &Rc<Self>, selection: RootSelection) -> Result<Rc<dyn Channel>> {
@@ -2934,8 +3115,8 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +            },
 +        );
 +        let result = match selection.alarm_facet_id {
-+            Some(facet) => namespace.root_alarm_channel(id, facet),
-+            None => namespace.root_channel(id),
++            Some(facet) => namespace.root_alarm_channel(id, facet, selection.preparation_nonce),
++            None => namespace.root_channel(id, selection.preparation_nonce),
 +        };
 +        if result.is_err() && !namespace.has_root_container(&key) {
 +            self.remove_object(&index, &registration);
@@ -3060,6 +3241,10 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                    completed = false;
 +                }
 +            }
++            if !completed && roots.iter().all(|(namespace, key)| !namespace.has_resident_root(key)) {
++                futures::future::join_all(roots.iter().map(|(namespace, key)| namespace.root_closed(key))).await;
++                completed = true;
++            }
 +            if completed {
 +                worker.unlink();
 +            } else {
@@ -3120,6 +3305,10 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +        })).collect();
 +        namespaces.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 +        json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
++            "installingNamespaces": self.installing.borrow().values().flat_map(|flight| flight.namespaces.iter().cloned()).collect::<Vec<_>>(),
++            "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
++            "closingFences": self.closing_roots.pending(),
++            "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
 +            "objectEntries": self.objects.borrow().len(),
 +            "objectContainers": self.namespaces.borrow().values().map(|entry| entry.namespace.container_count()).sum::<usize>(),
 +            "selectionLocks": self.selection_locks.borrow().len(),
@@ -3472,33 +3661,16 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +        props: KjOwn<ffi::Frankenvalue>,
 +        _persistent: bool,
 +    ) -> Result<Rc<dyn Channel>> {
-+        let mut selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
++        let selection: RootSelection = serde_json::from_str(&ffi::frankenvalue_plain_json(&props)?)
 +            .map_err(|error| kj::failed!("invalid root selection: {error}"))?;
 +        if !selection.dispatch_checked {
 +            return Err(kj::failed!("jsg.Error: node dispatch checks are required"));
 +        }
-+        if let Some(ticket) = selection.prepared_ticket.take() {
-+            let ticket = ticket.parse::<u64>()
-+                .map_err(|_| kj::failed!("jsg.Error: invalid prepared root ticket"))?;
-+            let prepared = self.prepared.borrow_mut().remove(&ticket)
-+                .ok_or_else(|| kj::failed!("jsg.Error: ROOT_PLAN_MISSING: prepared selection expired"))?;
-+            if prepared.selection != selection {
-+                return Err(kj::failed!("jsg.Error: prepared selection does not match"));
-+            }
-+            return Ok(Rc::new(RootReadyChannel {
-+                registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
-+                selection,
-+                channel: prepared.channel,
-+                _pin: prepared.pin,
-+            }));
-+        }
 +        // Let the trusted runtime refresh a cached key before starting an object event.
 +        if !self.plans.borrow().contains_key(&selection.plan) {
-+            return Err(kj::failed!(
-+                "jsg.Error: ROOT_PLAN_MISSING: the root plan was reclaimed"
-+            ));
++            return Err(preparation_error(&selection.preparation_nonce, kj::failed!("unknown root plan")));
 +        }
-+        let pin = PlanPin::new(Rc::clone(self.plans.borrow().get(&selection.plan).unwrap()));
++        let pin = PlanPin::new(Rc::clone(self.plans.borrow().get(&selection.plan).unwrap()), self.this.clone());
 +        Ok(Rc::new(RootSelectedChannel {
 +            registry: self
 +                .this
@@ -3534,24 +3706,6 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    _pin: PlanPin,
 +}
 +
-+struct RootReadyChannel {
-+    registry: Rc<RootRegistry>,
-+    selection: RootSelection,
-+    channel: Rc<dyn Channel>,
-+    _pin: PlanPin,
-+}
-+impl Channel for RootReadyChannel {
-+    fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
-+        self.registry.stamp_metadata(&self.selection, &mut metadata)?;
-+        self.channel.start_request(metadata)
-+    }
-+    fn require_allows_transfer(&self) -> Result<()> {
-+        Err(not_transferable("Private prepared root"))
-+    }
-+    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
-+        Err(not_transferable("Private prepared root"))
-+    }
-+}
 +impl Channel for RootSelectedChannel {
 +    fn start_request(
 +        &self,
@@ -3559,10 +3713,16 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    ) -> Result<KjOwn<WorkerInterface>> {
 +        let registry = Rc::clone(&self.registry);
 +        let selection = self.selection.clone();
-+        registry.stamp_metadata(&selection, &mut metadata)?;
++        let nonce = selection.preparation_nonce.clone();
++        registry.stamp_metadata(&selection, &mut metadata)
++            .map_err(|error| preparation_error(&nonce, error))?;
++        let pin = PlanPin::new(Rc::clone(&self._pin.0), self.registry.this.clone());
 +        Ok(worker::PromisedInterface::new(async move {
-+            let channel = registry.root(selection).await?;
++            let _pin = pin;
++            let channel = registry.root(selection).await
++                .map_err(|error| preparation_error(&nonce, error))?;
 +            channel.start_request(metadata)
++                .map_err(|error| preparation_error(&nonce, error))
 +        })
 +        .into_kj())
 +    }
@@ -3617,6 +3777,17 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +    serde_json::from_slice(&bytes).map_err(|error| kj::failed!("invalid root description: {error}"))
 +}
 +
++/// Only private selection and actor setup call this, before a tenant event exists.
++/// The nonce belongs to this runtime dispatch and is never included in tenant metadata.
++pub(crate) fn preparation_error(nonce: &str, error: crate::Error) -> crate::Error {
++    if nonce.is_empty() { return error; }
++    let message = error.description();
++    let kind = if message.contains("ROOT_TENANT_CODE: ") { "tenant-code" }
++        else if message.contains("unknown root plan") || message.contains("root selection plan removed") { "plan-missing" }
++        else { "platform" };
++    kj::failed!("jsg.Error: COWORKERD_ROOT_PREPARATION:{nonce}:{kind}: {message}")
++}
++
 +fn preparation_failure(message: &str) -> (u32, Value) {
 +    let code = "ROOT_TENANT_CODE: ";
 +    let (status, kind, reason) = if let Some(index) = message.find(code) {
@@ -3656,18 +3827,7 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                match self.registry.install(deployment).await {
 +                    Ok(plan) => json!({"plan": plan, "state": self.registry.snapshot()}),
 +                    Err(error) => {
-+                        let (code, value) = preparation_failure(error.description());
-+                        status = code;
-+                        value
-+                    }
-+                }
-+            }
-+            (Method::POST, "/prepare") => {
-+                let selection = serde_json::from_value(read_json(body).await?)
-+                    .map_err(|error| kj::failed!("root selection: {error}"))?;
-+                match self.registry.prepare(selection).await {
-+                    Ok(ticket) => json!({"ticket": ticket.to_string()}),
-+                    Err(error) => {
++                        tracing::error!("root installation: {error:?}");
 +                        let (code, value) = preparation_failure(error.description());
 +                        status = code;
 +                        value
@@ -3684,6 +3844,13 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                let id = value["namespaceId"]
 +                    .as_str()
 +                    .ok_or_else(|| kj::failed!("remove-namespace needs a namespaceId"))?;
++                if value["permanent"].as_bool() == Some(true) {
++                    self.registry.removed_namespaces.borrow_mut().insert(id.to_owned());
++                }
++                let compiling: Vec<_> = self.registry.installing.borrow().values()
++                    .filter(|flight| flight.namespaces.iter().any(|namespace| namespace == id))
++                    .cloned().collect();
++                for flight in &compiling { flight.cancelled.set(true); }
 +                let entry = self.registry.namespaces.borrow().get(id).cloned();
 +                let removed = entry.is_some();
 +                if let Some(entry) = entry {
@@ -3706,16 +3873,29 @@ index 0000000000000000000000000000000000000000..ee1b486ec351dd46dbdf49b53e1f9038
 +                            registry.prune_plans();
 +                        });
 +                    }
-+                    wait_for_root(
++                    if let Err(error) = wait_for_root(
 +                        &self.registry.factory,
 +                        id,
 +                        "",
 +                        "namespace removal",
 +                        entry.namespace.roots_closed(),
 +                    )
-+                    .await?;
++                    .await {
++                        let bytes = serde_json::to_vec(&json!({"error":{"kind":"namespace-closing","message":error.description()}}))
++                            .map_err(|error| kj::failed!("root reply: {error}"))?;
++                        let headers = Headers::new(header_table(&self.registry.factory));
++                        return response.send(503, "Namespace still closing", &headers, Some(bytes.len() as u64))?.write(&bytes).await;
++                    }
 +                    // Let the cancellation-independent removal task publish its completion.
 +                    self.registry.factory.sleep(Duration::ZERO).await;
++                }
++                for flight in compiling {
++                    if let Err(error) = wait_for_root(&self.registry.factory, id, "", "cancelled namespace compilation", flight.wait()).await {
++                        let bytes = serde_json::to_vec(&json!({"error":{"kind":"namespace-closing","message":error.description()}}))
++                            .map_err(|error| kj::failed!("root reply: {error}"))?;
++                        let headers = Headers::new(header_table(&self.registry.factory));
++                        return response.send(503, "Namespace still closing", &headers, Some(bytes.len() as u64))?.write(&bytes).await;
++                    }
 +                }
 +                self.registry.prune_plans();
 +                json!({"removed": removed, "state": self.registry.snapshot()})
