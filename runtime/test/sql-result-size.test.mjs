@@ -68,13 +68,13 @@ test('the complete array envelope is limited and every write in a rejected batch
  }finally{f.close()}
 });
 
-test('oversized INSERT RETURNING drains to completion and the same database remains usable',async()=>{
+test('oversized INSERT RETURNING rolls back and the same database remains usable',async()=>{
  const f=fixture();
  try{
   await f.query({sql:'CREATE TABLE written(v)'});
   const answer=await f.query({sql:"WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<128) INSERT INTO written SELECT printf('%0*d',65536,0) FROM n RETURNING v"});
   assert.equal(answer.success,false);assert.match(answer.error,/D1_RESULT_TOO_LARGE/);
-  assert.deepEqual((await f.query({sql:'SELECT count(*) AS n FROM written'})).results,[{n:128}]);
+  assert.deepEqual((await f.query({sql:'SELECT count(*) AS n FROM written'})).results,[{n:0}]);
   assert.equal((await f.query({sql:"INSERT INTO written VALUES('after')"})).success,true);
  }finally{f.close()}
 });
@@ -89,7 +89,7 @@ test('after overflow the cursor is exhausted without encoding subsequent rows',a
   }else yield[1];
  }})}};
  const C=vm.runInNewContext(classSource+'; SqlDatabase',{DurableObject:class{constructor(ctx){this.ctx=ctx}},ArrayBuffer,Uint8Array,Request,Response,URL,TextEncoder,DO_ALARM_HEADER:'x-test-alarm'});
- const worker=new C({storage:{sql:sqlite}});
+ const worker=new C({storage:{sql:sqlite,transactionSync:fn=>fn()}});
  const request=sql=>new Request('http://sql/query',{method:'POST',body:JSON.stringify({sql})});
  const response=await worker.fetch(request('oversized')),answer=await response.json();
  assert.equal(response.status,200);assert.match(answer.error,/D1_RESULT_TOO_LARGE/);assert.equal(drained,4);assert.equal(encodedAfter,false);

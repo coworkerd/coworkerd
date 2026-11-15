@@ -127,8 +127,9 @@ rejected with HTTP 413 `REQUEST_TOO_LARGE` at the control-plane body limit. SQL 
 64 KiB and 200 KiB arrays containing the full byte range were verified end to end.
 
 A single object request may contain multiple SQL statements in its `sql` string. SQLite handles statement boundaries,
-including trigger bodies, comments and semicolons inside strings. That object request is **not a transaction**: if a later
-statement fails, earlier effects remain. Use an array of statement objects for a transaction that rolls back as a whole.
+including trigger bodies, comments and semicolons inside strings. Each `/query` object request runs **one transaction**:
+if any statement fails, all effects of that object roll back. An array of statement objects is also one transaction.
+`env.DB.exec()` uses `/execute` and keeps earlier successful lines when a later line fails.
 
 ### Result size
 
@@ -142,9 +143,9 @@ failure. `env.DB` rejects with `D1_ERROR: D1_RESULT_TOO_LARGE: ...`; `exec()` us
 `D1_EXEC_ERROR: Error in line N: ...` wrapper. No partial rows are returned.
 
 The SQL Worker stops encoding rows after detecting overflow and consumes the remaining cursor before returning the
-error. The database remains usable without resetting the object. A single object statement such as
-`INSERT ... RETURNING` has **already committed its writes** when its result is rejected; do not repeat the write just
-to retrieve its results. An array `/query` request, including `batch()`, rolls back all its writes on this error.
+error. The database remains usable without resetting the object. A single `/query` object such as
+`INSERT ... RETURNING` rolls back its writes when its result is rejected. An array `/query` request, including
+`batch()`, also rolls back all its writes on this error.
 `exec()` keeps its earlier successful lines, as with other statement errors.
 
 This is a reply-size limit, not a process-memory limit or an execution deadline. Consuming the remaining cursor still

@@ -1191,8 +1191,14 @@ export class SqlDatabase extends DurableObject {
       }
     };
     if (!Array.isArray(body)) {
-      try { return this.resultResponse(one(body), budget); }
-      catch (error) { return Response.json(failure(error)); }
+      try {
+        // ingest already owns its transaction; execute keeps its sequential semantics.
+        if (query && !(body && Object.hasOwn(body, "ingest"))) {
+          return this.ctx.storage.transactionSync(() =>
+            this.resultResponse(this.runStatement(body, resultsFormat, budget), budget));
+        }
+        return this.resultResponse(one(body), budget);
+      } catch (error) { return Response.json(failure(error)); }
     }
     if (query) {
       // Include final serialization in the transaction: every quota error must roll the batch back.
