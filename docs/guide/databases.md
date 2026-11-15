@@ -130,6 +130,26 @@ A single object request may contain multiple SQL statements in its `sql` string.
 including trigger bodies, comments and semicolons inside strings. That object request is **not a transaction**: if a later
 statement fails, earlier effects remain. Use an array of statement objects for a transaction that rolls back as a whole.
 
+### Result size
+
+HTTP SQL and `env.DB` share a **7 MiB (7,340,032-byte) limit on the complete UTF-8 JSON reply**. It includes column
+names, `meta`, every statement's result in an array request, and all JSON framing. BLOB cells count as their expanded
+number arrays. Exactly 7,340,032 bytes are accepted; use `LIMIT` and pagination to keep each reply within the limit.
+
+An oversized result returns HTTP 200 with `{"success":false,"error":"D1_RESULT_TOO_LARGE: query response exceeds
+7340032 bytes; use LIMIT to fetch results in smaller batches"}`. An array request returns an array containing that
+failure. `env.DB` rejects with `D1_ERROR: D1_RESULT_TOO_LARGE: ...`; `exec()` uses its existing
+`D1_EXEC_ERROR: Error in line N: ...` wrapper. No partial rows are returned.
+
+The SQL Worker stops encoding rows after detecting overflow and consumes the remaining cursor before returning the
+error. The database remains usable without resetting the object. A single object statement such as
+`INSERT ... RETURNING` has **already committed its writes** when its result is rejected; do not repeat the write just
+to retrieve its results. An array `/query` request, including `batch()`, rolls back all its writes on this error.
+`exec()` keeps its earlier successful lines, as with other statement errors.
+
+This is a reply-size limit, not a process-memory limit or an execution deadline. Consuming the remaining cursor still
+has no separate time limit. A large row and JSON serialization can use more memory than the reply size.
+
 ## 6. Versioned migrations
 
 ```bash

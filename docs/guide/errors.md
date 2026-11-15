@@ -159,6 +159,7 @@ A `d1_databases` Binding speaks D1's protocol, so its errors are D1's: statement
 | `message` | Meaning | What to do |
 | --- | --- | --- |
 | `D1_ERROR: <SQLite's message>` | The statement itself failed: a table that does not exist, a constraint, a type | Fix the statement |
+| `D1_ERROR: D1_RESULT_TOO_LARGE: query response exceeds 7340032 bytes; use LIMIT to fetch results in smaller batches` | The complete UTF-8 JSON reply exceeds 7 MiB, including columns, `meta`, all array entries and framing, and expanded BLOB number arrays | Fetch smaller batches with `LIMIT`; a single object `INSERT ... RETURNING` keeps its committed writes, while an array `/query` or `batch()` rolls back |
 | `D1_ERROR: DO_OBJECT_TOO_LARGE: ...` | The write would take the database past 10 GiB (section 1); the statement is not durable, and reads go on | Delete rows, or ask the administrator to raise the object limit; transactions that do not grow the database remain permitted |
 | `D1_ERROR: QUOTA_EXCEEDED: ...` | The tenant's Durable Objects already hold more than `durableObjectBytes` (section 1) | Delete data, or ask for a larger quota; transactions that do not grow the database remain permitted |
 | `D1_ERROR: STORAGE_UNAVAILABLE: ...` | The write could not be made durable: no peer confirmed it in time, or the object store is out of reach. The statement may have changed local state; confirmation failure isolates it and triggers recovery | Check state or use an application operation ID before retrying |
@@ -171,6 +172,13 @@ The HTTP SQL interface (`POST /v1/tenants/{t}/databases/{d}/query`) sends the co
 `{"success":true,"results":[...],"meta":{...}}`, or `{"success":false,"error":"..."}` for a statement that failed, and
 the control plane's own `{"code","reason"}` when the database does not exist (`404 NOT_FOUND`) or no node serves it
 (`503 STORAGE_UNAVAILABLE`). Node statuses and bodies pass through, including 200 with `success:false`, 413, 422 and 503. A dispatch refusal returns its original code and body without waiting for the rejected request body to be consumed. Another member is tried only if connection establishment failed, or a node refused with `PEER_UNAVAILABLE`, `SERVER_DRAINING`, `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_OWNER_DRAINING` or `DO_SHARD_EPOCH_MISMATCH` before execution. A lost reply after connecting returns `503 RESULT_UNCERTAIN` without replay. The JavaScript binding preserves the platform error prefix.
+
+For `D1_RESULT_TOO_LARGE`, HTTP SQL returns **200** with `success:false` and the error text starting at
+`D1_RESULT_TOO_LARGE:`; an array request contains one failure object. No partial result is returned. The SQL Worker
+stops encoding later rows, consumes the remaining cursor and leaves the object usable without a reset. Draining has
+no separate time limit, and the 7 MiB reply cap is not a process-memory limit. Single object writes remain committed;
+array `/query` requests roll back. `env.DB.exec()` wraps a failure as `D1_EXEC_ERROR: Error in line N: ...` and keeps
+earlier successful lines, as with its other statement errors. See [result size](databases.md#result-size).
 
 ## 4b. Method calls on a Binding (errors `env.SVC.method()` and `stub.method()` throw)
 

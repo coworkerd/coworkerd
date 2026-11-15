@@ -1153,6 +1153,7 @@ export class Host extends DurableObject {
 // d1_databases Binding and from the HTTP SQL interface of /v1. Its storage is the object's own SQLite, which the
 // node replicates and rebuilds like any other object's.
 export class SqlDatabase extends DurableObject {
+  static MAX_RESULT_BYTES = 7340032;
   async fetch(request) {
     // The node's own alarm request: a database has no alarm handler, so the alarm goes rather than being retried.
     const scheduled = request.headers.get(DO_ALARM_HEADER);
@@ -1174,33 +1175,62 @@ export class SqlDatabase extends DurableObject {
     }
     const asked = searchParams.get("resultsFormat");
     const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
+    const encoder = new TextEncoder();
+    const budget = { bytes: Array.isArray(body) ? 2 : 0, size: text => encoder.encode(text).byteLength };
+    const failure = error => ({ success: false, error: String(error instanceof Error ? error.message : error) });
     const one = (statement) => {
       try {
-        return query && statement && Object.hasOwn(statement, "ingest")
-          ? this.runIngest(statement) : this.runStatement(statement, resultsFormat);
+        if (query && statement && Object.hasOwn(statement, "ingest")) {
+          const answer = this.runIngest(statement);
+          this.addResultBytes(budget, budget.size(JSON.stringify(answer)));
+          return answer;
+        }
+        return this.runStatement(statement, resultsFormat, budget);
       } catch (error) {
-        // What D1 does with a failing statement: the answer says so, it is not an exception of the object.
-        return { success: false, error: String(error instanceof Error ? error.message : error) };
+        return failure(error);
       }
     };
-    if (!Array.isArray(body)) return Response.json(one(body));
-    if (query) {
-      // batch() is atomic: let the failing statement escape transactionSync so SQLite rolls the whole batch back.
-      // Report that statement's D1 error only after the rollback has completed.
-      try {
-        return Response.json(this.ctx.storage.transactionSync(() => body.map(statement => this.runStatement(statement, resultsFormat))));
-      } catch (error) {
-        return Response.json([{ success: false, error: String(error instanceof Error ? error.message : error) }]);
-      }
+    if (!Array.isArray(body)) {
+      try { return this.resultResponse(one(body), budget); }
+      catch (error) { return Response.json(failure(error)); }
     }
-    // exec() commits each line, keeps earlier successes and stops at the first failure.
+    if (query) {
+      // Include final serialization in the transaction: every quota error must roll the batch back.
+      try {
+        return this.ctx.storage.transactionSync(() => {
+          const answers = body.map((statement, index) => {
+            if (index) budget.bytes++;
+            return this.runStatement(statement, resultsFormat, budget);
+          });
+          return this.resultResponse(answers, budget);
+        });
+      } catch (error) { return Response.json([failure(error)]); }
+    }
+    // exec() keeps earlier writes. If its whole answer exceeds the cap, return only the error.
     const answers = [];
     for (const statement of body) {
+      if (answers.length) budget.bytes++;
       const answer = one(statement);
       answers.push(answer);
       if (!answer.success) break;
     }
-    return Response.json(answers);
+    try { return this.resultResponse(answers, budget); }
+    catch (error) { return Response.json([failure(error)]); }
+  }
+
+  resultTooLarge() {
+    return new Error("D1_RESULT_TOO_LARGE: query response exceeds 7340032 bytes; use LIMIT to fetch results in smaller batches");
+  }
+
+  addResultBytes(budget, bytes) {
+    if (budget.bytes + bytes > SqlDatabase.MAX_RESULT_BYTES) throw this.resultTooLarge();
+    budget.bytes += bytes;
+  }
+
+  resultResponse(answer, budget) {
+    const json = JSON.stringify(answer);
+    if (budget.size(json) > SqlDatabase.MAX_RESULT_BYTES) throw this.resultTooLarge();
+    return new Response(json, { headers: { "content-type": "application/json" } });
   }
 
   runIngest(statement) {
@@ -1220,7 +1250,7 @@ export class SqlDatabase extends DurableObject {
     });
   }
 
-  runStatement(statement, resultsFormat) {
+  runStatement(statement, resultsFormat, budget) {
     if (statement && Object.hasOwn(statement, "ingest"))
       throw new Error("ingest is only accepted as a standalone /query object");
     const { sql, params = [] } = statement ?? {};
@@ -1245,16 +1275,30 @@ export class SqlDatabase extends DurableObject {
     const [[changesBefore, lastRowBefore]] = Array.from(counters().raw());
     const cursor = sqlite.prepare(sql)(...bindings);
     const columns = cursor.columnNames;
-    const rows = Array.from(cursor.raw(), row => row.map(value =>
-      value instanceof ArrayBuffer ? Array.from(new Uint8Array(value)) :
-      ArrayBuffer.isView(value) ? Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : value));
-    const results = resultsFormat === "ROWS_AND_COLUMNS"
-      ? { columns, rows }
-      : rows.map((row) => Object.fromEntries(columns.map((column, i) => [column, row[i]])));
+    const columnsFormat = resultsFormat === "ROWS_AND_COLUMNS";
+    const rows = [];
+    // Empty results include columns and framing. Meta is counted exactly once the cursor is drained.
+    let resultBytes = budget.size(JSON.stringify(columnsFormat ? { columns, rows: [] } : []));
+    const minimumEnvelope = budget.size(JSON.stringify({ success: true, results: null, meta: {} })) - 4;
+    let overflow = budget.bytes + minimumEnvelope + resultBytes > SqlDatabase.MAX_RESULT_BYTES;
+    for (const row of cursor.raw()) {
+      // A fully consumed cursor releases its statement. Stop encoding, but keep stepping it to completion.
+      if (overflow) continue;
+      const values = row.map(value => value instanceof ArrayBuffer ? Array.from(new Uint8Array(value)) :
+        ArrayBuffer.isView(value) ? Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : value);
+      const result = columnsFormat ? values : Object.fromEntries(columns.map((column, i) => [column, values[i]]));
+      resultBytes += budget.size(JSON.stringify(result)) + (rows.length ? 1 : 0);
+      if (budget.bytes + minimumEnvelope + resultBytes > SqlDatabase.MAX_RESULT_BYTES) {
+        overflow = true;
+        rows.length = 0;
+      } else rows.push(result);
+    }
+    if (overflow) throw this.resultTooLarge();
+    const results = columnsFormat ? { columns, rows } : rows;
     const [[changesAfter, lastRowAfter]] = Array.from(counters().raw());
     const sizeAfter = sqlite.databaseSize;
     const changes = changesAfter - changesBefore;
-    return {
+    const answer = {
       success: true,
       results,
       meta: {
@@ -1267,6 +1311,9 @@ export class SqlDatabase extends DurableObject {
         rows_written: cursor.rowsWritten,
       },
     };
+    const envelopeBytes = budget.size(JSON.stringify({ ...answer, results: null })) - 4;
+    this.addResultBytes(budget, envelopeBytes + resultBytes);
+    return answer;
   }
 }
 

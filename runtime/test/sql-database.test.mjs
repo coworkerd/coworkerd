@@ -29,7 +29,7 @@ function fixture() {
   } };
   const C = vm.runInNewContext(classSource + '; SqlDatabase', {
     DurableObject: class { constructor(ctx) { this.ctx = ctx; } },
-    ArrayBuffer, Uint8Array, Request, Response, URL, DO_ALARM_HEADER: 'x-test-alarm',
+    ArrayBuffer, Uint8Array, Request, Response, URL, TextEncoder, DO_ALARM_HEADER: 'x-test-alarm',
   });
   const worker = new C({ storage });
   return { db, close: () => db.close(), async query(body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') {
