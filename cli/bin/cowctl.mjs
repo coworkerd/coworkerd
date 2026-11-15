@@ -57,6 +57,9 @@ usage: cowctl <command> [options]              (in the project's directory)
      execute <name> --sql SQL [--param V]... [--json]
                               the tenant's databases; execute sends one statement to the database. A created database
                               is waited for until every node serves it (at most 15 s)
+     migrations create <database> <description> | list <database> | apply <database> [--yes]
+                              versioned SQL files; --dir DIR and --table TABLE override Wrangler configuration;
+                              one file and its ledger row in one transaction (--json for structured results)
 
   administrator (the administrator's credential):
   tenant create <name> [--hostname HOST]... [--quota NAME=N]... [--default-cpu-ms N] [--default-memory-mib N]
@@ -204,14 +207,16 @@ const tenantPath = (tenant) => `/v1/tenants/${tenant}`;
 const workerPath = (tenant, worker) => `${tenantPath(tenant)}/workers/${worker}`;
 
 // ---- the control plane ------------------------------------------------------------------------------------
-async function call(config, method, path, { body, headers = {}, expect = [200] } = {}) {
+async function call(config, method, path, { body, headers = {}, expect = [200], signal } = {}) {
   const token = tokenOf(config);
   let response;
   try {
-    response = await fetch(config.controlPlane + path, { method, body, headers: { authorization: `Bearer ${token}`, ...headers } });
+    response = await fetch(config.controlPlane + path, { method, body, signal, headers: { authorization: `Bearer ${token}`, ...headers } });
   } catch (error) {
-    throw new Failure(`cannot reach the control plane at ${config.controlPlane} (${error.cause?.code ?? error.message}); ` +
+    const failure = new Failure(`cannot reach the control plane at ${config.controlPlane} (${error.cause?.code ?? error.message}); ` +
       `is the cluster running? (docker compose up -d --wait)`);
+    failure.cause = error;
+    throw failure;
   }
   const text = await response.text();
   let json = null;
@@ -596,6 +601,7 @@ function bytesText(value) {
 // takes D1's own request and gives D1's own answer.
 async function d1(args) {
   const [operation, ...rest] = args;
+  if (operation === "migrations") return databaseMigrations(rest);
   if (!["create", "list", "delete", "execute"].includes(operation ?? ""))
     throw usage("d1 create <name> | d1 list | d1 delete <name> | d1 execute <name> --sql SQL");
   const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", param: "list",
@@ -663,6 +669,46 @@ async function d1(args) {
     `${one.meta?.rows_written ?? 0} written, ${one.meta?.changes ?? 0} change${one.meta?.changes === 1 ? "" : "s"}`);
   for (const row of rows.slice(0, 100)) console.log(`  ${JSON.stringify(row)}`);
   if (rows.length > 100) console.log(`  ... ${rows.length - 100} more (--json for all of them)`);
+}
+
+async function databaseMigrations(args) {
+  const [operation, ...rest] = args;
+  if (!["create", "list", "apply"].includes(operation)) throw usage("d1 migrations create <database> <description> | list <database> | apply <database> [--yes]");
+  const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", dir: "value", table: "value" });
+  if (positional.length !== (operation === "create" ? 2 : 1) || !NAME.test(positional[0]))
+    throw usage(`d1 migrations ${operation} takes the database's name${operation === "create" ? " and a description" : ""}`);
+  const [name, description] = positional;
+  try {
+    const migrations = await import(ADAPTER);
+    const settings = await migrations.migrationSettings({ database: name, configPath: wranglerConfig(), dir: options.dir, table: options.table });
+    const result = { database: name, ...settings };
+    if (operation === "create") {
+      result.created = await migrations.createMigration(settings.directory, description);
+      console.log(options.json ? JSON.stringify(result, null, 2) : `created ${join(settings.directory, result.created)}`);
+      return;
+    }
+    const config = loadConfig(), tenant = tenantOf(options, config);
+    const query = async body => (await call(config, "POST", `${tenantPath(tenant)}/databases/${name}/query`,
+      { body, headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(20000) })).json;
+    const pending = await migrations.pendingMigrations({ ...settings, query, initialize: operation === "apply" });
+    result.pending = pending;
+    if (operation === "list") {
+      if (options.json) console.log(JSON.stringify(result, null, 2));
+      else if (!pending.length) console.log("no pending migrations");
+      else for (const file of pending) console.log(file);
+      return;
+    }
+    if (pending.length && !options.yes && process.stdin.isTTY && !process.env.CI) {
+      console.log(pending.join("\n"));
+      const reply = await prompt(`apply ${pending.length} migration(s) to ${tenant}/${name}? [y/N] `);
+      if (!/^y(es)?$/i.test(reply.trim())) throw new Error("migrations not applied");
+    }
+    result.applied = await migrations.applyMigrations({ ...settings, query, files: pending,
+      onApplied: (file, { recovered }) => { if (!options.json) console.log(`applied ${file}${recovered ? " (confirmed in the ledger after an uncertain reply)" : ""}`); } });
+    result.pending = [];
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else if (!pending.length) console.log("no pending migrations");
+  } catch (error) { if (error instanceof Failure) throw error; throw new Failure(error.message); }
 }
 
 async function status(args) {

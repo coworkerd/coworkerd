@@ -82,7 +82,7 @@ export function unsupportedKeys(raw) {
   // database is named within its tenant, so the name is what counts and an id is ignored).
   for (const [index, binding] of (Array.isArray(raw.d1_databases) ? raw.d1_databases : []).entries()) {
     for (const key of Object.keys(binding ?? {}))
-      if (!["binding", "database_name", "database_id", "preview_database_id"].includes(key))
+      if (!["binding", "database_name", "database_id", "preview_database_id", "migrations_dir", "migrations_table", "migrations_pattern"].includes(key))
         found.push(`d1_databases[${index}].${key}`);
   }
   for (const [index, binding] of (raw.durable_objects?.bindings ?? []).entries()) {
@@ -433,6 +433,130 @@ export async function adapt({ config: userConfigPath, output, workerId, versionI
     return { deployment, record };
   } finally { await rm(temporary, { recursive: true, force: true }); }
 }
+// D1 files and their ledger, over the existing atomic /query array protocol.
+
+export const MAX_QUERY_BYTES = 1024 * 1024;
+const identifier = value => `"${value.replaceAll('"', '""')}"`;
+const number = name => Number.parseInt(name.split("_")[0], 10);
+export function compareMigrations(a, b) {
+  const left = number(a), right = number(b);
+  if (left !== right) {
+    if (Number.isFinite(left) && Number.isFinite(right)) return left - right;
+    if (Number.isFinite(left)) return -1;
+    if (Number.isFinite(right)) return 1;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export async function migrationSettings({ database, configPath, dir, table, cwd = process.cwd() }) {
+  let entry;
+  if (configPath) {
+    const config = unstable_readConfig({ config: configPath });
+    entry = config.d1_databases?.find(item => item.database_name === database);
+  }
+  if (entry?.migrations_pattern !== undefined)
+    throw new Error("migrations_pattern is not supported by cowctl d1 migrations; use top-level .sql files");
+  const directory = dir !== undefined ? resolve(cwd, dir)
+    : resolve(configPath ? dirname(configPath) : cwd, entry?.migrations_dir ?? "migrations");
+  const ledger = table ?? entry?.migrations_table ?? "d1_migrations";
+  if (typeof ledger !== "string" || !ledger.length || ledger.includes("\0"))
+    throw new Error("the migration table must be a non-empty SQL identifier");
+  return { directory, table: ledger };
+}
+
+export async function migrationFiles(directory) {
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  if (entries.some(item => item.isDirectory()))
+    throw new Error(`subdirectory migration layouts are not supported: ${directory}; use top-level .sql files`);
+  return entries.filter(item => item.isFile() && item.name.endsWith(".sql")).map(item => item.name).sort(compareMigrations);
+}
+
+export async function createMigration(directory, description) {
+  if (!description?.trim() || /[\\/\0]/.test(description))
+    throw new Error("the migration description must be non-empty and contain no path separators");
+  const files = await migrationFiles(directory);
+  const next = Math.max(0, ...files.map(number).filter(Number.isFinite)) + 1;
+  if (!Number.isSafeInteger(next)) throw new Error("the migration number exceeds the safe integer range");
+  const name = `${String(next).padStart(4, "0")}_${description.replaceAll(" ", "_")}.sql`;
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, name), `-- Migration number: ${String(next).padStart(4, "0")} \t ${new Date().toISOString()}\n`, { flag: "wx" });
+  return name;
+}
+
+function checked(answer) {
+  const rows = Array.isArray(answer) ? answer : [answer];
+  if (!rows.length || rows.some(row => !row?.success))
+    throw new Error(rows.find(row => !row?.success)?.error ?? "the SQL query returned no successful answer");
+  return rows;
+}
+async function sql(query, statement, params) {
+  return checked(await query(JSON.stringify({ sql: statement, ...(params ? { params } : {}) })))[0];
+}
+export async function appliedMigrations(query, table, { initialize = false } = {}) {
+  const escaped = identifier(table);
+  if (initialize) await sql(query, `CREATE TABLE IF NOT EXISTS ${escaped} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)`);
+  else {
+    const exists = await sql(query, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [table]);
+    if (!exists.results?.length) return new Set();
+  }
+  const result = await sql(query, `SELECT name FROM ${escaped} ORDER BY id`);
+  return new Set((result.results ?? []).map(row => row.name));
+}
+export async function pendingMigrations({ directory, table, query, initialize = false }) {
+  const files = await migrationFiles(directory);
+  const applied = await appliedMigrations(query, table, { initialize });
+  return files.filter(name => !applied.has(name));
+}
+
+// Recognize a file with no statements. Actual SQL is neither split nor rewritten: SQLite handles it.
+function hasStatement(text) {
+  let rest = text.trimStart();
+  while (rest) {
+    if (rest.startsWith("--")) { const end = rest.indexOf("\n"); rest = end < 0 ? "" : rest.slice(end + 1).trimStart(); }
+    else if (rest.startsWith("/*")) { const end = rest.indexOf("*/", 2); rest = end < 0 ? "" : rest.slice(end + 2).trimStart(); }
+    else return true;
+  }
+  return false;
+}
+export function migrationBody(text, name, table) {
+  // Separate items handle missing semicolons and trailing comments. Empty files are ledgered no-ops.
+  return JSON.stringify([{ sql: hasStatement(text) ? text : "SELECT 1" },
+    { sql: `INSERT INTO ${identifier(table)} (name) VALUES (?)`, params: [name] }]);
+}
+function uncertain(error) {
+  return (error.status === 503 && error.code === "RESULT_UNCERTAIN") ||
+    [error.name, error.code, error.cause?.name, error.cause?.code].some(value => ["TimeoutError", "ETIMEDOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(value));
+}
+export async function applyMigrations({ directory, table, query, files, onApplied = () => {} }) {
+  const applied = [];
+  for (const name of files) {
+    try {
+      const body = migrationBody(await readFile(join(directory, name), "utf8"), name, table);
+      if (Buffer.byteLength(body, "utf8") > MAX_QUERY_BYTES)
+        throw new Error("file is too large: the JSON request including the ledger exceeds 1 MiB; split the file");
+      let recovered = false;
+      try { checked(await query(body)); }
+      catch (error) {
+        if (!uncertain(error)) throw error;
+        let ledger;
+        try { ledger = await appliedMigrations(query, table); }
+        catch (readError) { throw new Error(`result uncertain and the ledger could not be read (${readError.message}); run apply again; the write was not resent`); }
+        if (!ledger.has(name)) throw new Error("result uncertain and the file is not in the ledger; run apply again; the write was not resent");
+        recovered = true;
+      }
+      applied.push(name);
+      onApplied(name, { recovered });
+    } catch (error) {
+      const failure = new Error(`${name}: ${error.message}`, { cause: error });
+      failure.file = name; failure.applied = applied;
+      throw failure;
+    }
+  }
+  return applied;
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   // Positional CONFIG OUTPUT [WORKER_ID] [VERSION_ID]; --secret NAME (repeatable) declares a secret by name.
   const positional = [], secrets = [];
