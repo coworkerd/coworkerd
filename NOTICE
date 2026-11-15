@@ -16,3 +16,9 @@ patches/kj-http-abort.diff to it.
 examples/email-routing-template/ and examples/x402-proxy-template/ are official Cloudflare
 templates (https://github.com/cloudflare/templates), included as they are under the MIT License;
 each directory has its LICENSE file.
+
+runtime/r2/ includes an adaptation of Miniflare's R2 implementation and shared helpers
+from cloudflare/workers-sdk commit 264fb4408b40f6847b6f0eaaac4c190bea46ecbd,
+Copyright (c) 2020 Cloudflare, Inc. <wrangler@cloudflare.com>, under the MIT License.
+See runtime/r2/LICENSE-MIT and runtime/r2/UPSTREAM.md. Its build uses Zod (MIT);
+Zod's license is distributed by its pinned npm package and recorded in UPSTREAM.md.
