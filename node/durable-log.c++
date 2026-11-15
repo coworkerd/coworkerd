@@ -1838,6 +1838,12 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         log("open-refused", "\"object\":" + quote(objectName) + ",\"reason\":\"storage identity mismatch\"");
         return;
       }
+      if (settings.rootObjects) {
+        log("root-storage-verified", "\"namespaceId\":" + quote(object->namespaceId) +
+            ",\"objectId\":" + quote(object->objectId) + ",\"dataEpoch\":\"" + std::to_string(object->dataEpoch) +
+            "\",\"uniqueKey\":" + quote(object->uniqueKey) + ",\"storageId\":" + quote(object->storageId) +
+            ",\"reportedStorageId\":" + quote(storageId) + ",\"facetId\":" + std::to_string(facetId));
+      }
       object->dispatchPending = false;
       auto& facet = object->facets[facetId];
       facet.open = true;facet.processId = channel.processId;
