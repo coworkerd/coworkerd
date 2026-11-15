@@ -21,17 +21,17 @@ series; Coworkerd adds what a shared, multi-tenant cluster needs around it:
 
 Accounts, billing and user interfaces are left to the platform on top. [Components and boundaries](docs/components.md) describes how the pieces fit together.
 
-## Status: preparing 0.5.6
+## Status: 0.5.6 released
 
-0.5.6 updates the node daemon and workerd kernel. Durable Object files are rebuilt from replicated history
-at the first open after every daemon restart, with a configurable limit on concurrent rebuilds. It also
-protects objects held by requests or WebSocket connections, rechecks dispatch and replication channels,
-and removes the workerd SQLite parser's regression for repeated `WITH` references.
+[0.5.6](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.6) (2026-11-15) is the current release. It updates
+the node daemon and workerd kernel. Durable Object files are rebuilt from replicated history at the first open
+after every daemon restart, with a configurable limit on concurrent rebuilds. It also protects objects held by
+requests or WebSocket connections, rechecks dispatch and replication channels, and removes the workerd SQLite
+parser's regression for repeated `WITH` references.
 There is no in-place upgrade for clusters that use Durable Objects or D1; install with new data directories
 and a new bucket, then move data at the application level. Read the
 [upgrade procedure and known issues](docs/guide/install.md#upgrading-to-056).
-[0.5.5](https://github.com/coworkerd/coworkerd/releases/tag/v0.5.5) remains the current stable release while
-0.5.6 is prepared. See the [CHANGELOG](CHANGELOG.md).
+Development continues on `main`. See the [CHANGELOG](CHANGELOG.md).
 
 0.5 runs stateless and stateful Workers. The 0.5.6 stateful installation requires new storage; stateless
 clusters can replace packages one node at a time. 0.3.x installations also require rebuilding their control
@@ -66,12 +66,12 @@ Boundaries to know about:
 ## Trying it
 
 With Docker Engine 28 or newer, Docker Compose v2 and Node.js 22.5 or newer, a cluster, a tenant and a first deployed
-Worker from the current stable 0.5.5 release take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
+Worker from the current 0.5.6 release take about ten minutes; [docs/guide/quickstart.md](docs/guide/quickstart.md) walks through it:
 
 ```bash
-tar -xzf coworkerd-0.5.5-linux-arm64.tar.gz
-docker load -i coworkerd-0.5.5-linux-arm64-image.tar.gz
-cd coworkerd-0.5.5-linux-arm64 && export PATH="$PWD/bin:$PATH"
+tar -xzf coworkerd-0.5.6-linux-arm64.tar.gz
+docker load -i coworkerd-0.5.6-linux-arm64-image.tar.gz
+cd coworkerd-0.5.6-linux-arm64 && export PATH="$PWD/bin:$PATH"
 (cd docker && docker compose --profile cluster up -d --wait)
 ```
 
