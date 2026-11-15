@@ -199,7 +199,8 @@ private:
 //                                          database (SQLite's _cf_METADATA), replicated and recovered with it, so
 //                                          this object is only ever a hint -- it is never read for correctness.
 std::string shardAlarmPrefix(const std::string& namespaceId, uint32_t shard);
-std::string shardAlarmKey(const std::string& namespaceId, uint32_t shard, const std::string& objectId);
+std::string shardAlarmKey(const std::string& namespaceId, uint32_t shard, const std::string& objectId,
+    uint32_t facetId = 1);
 // What one node's objects hold, by tenant (nodes/<id>/durable-usage, overwritable): every node publishes its own
 // every hour and reads the others' for the durableObjectBytes quota.
 std::string nodeDurableUsageKey(const std::string& nodeId);
