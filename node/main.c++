@@ -5884,8 +5884,9 @@ private:
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
+    // Recovery brings files up to date; the selected dispatch writes its open marker only after catalog checks.
     auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
-        coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard});
+        coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false);
     if (!ready.ready) {
       line.recovered = ready.elapsedMs;
       co_return refused(server.refusal(ready.code, ready.reason, ready.status));

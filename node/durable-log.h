@@ -351,7 +351,8 @@ public:
   // Before a request reaches a durable process: the object's files are brought up to date with its replicated
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
   // says what to tell the caller when they cannot be.
-  kj::Promise<ObjectReady> openObject(ObjectIdentity identity);
+  // A dispatch caller may defer the open marker to checkObjectDispatch(), after catalog/admission checks.
+  kj::Promise<ObjectReady> openObject(ObjectIdentity identity, bool prepareDispatch = true);
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // Called synchronously after dispatch, before another request can prepare these files again.
