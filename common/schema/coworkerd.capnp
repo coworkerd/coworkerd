@@ -208,7 +208,7 @@ struct ObjectInvocation {
   # The firing of the object's alarm: the time it was scheduled for and how many times the handler has been tried.
   alarmAtUnixMs @20 :UInt64;
   alarmRetryCount @21 :UInt32;
-  # Internal alarm routing; ordinary Host/app alarms target facet 1, native roots target 0.
+  # Internal alarm routing; only the root object schedules alarms, always at facet 0.
   alarmFacetId @22 :UInt32 = 1;
 }
 

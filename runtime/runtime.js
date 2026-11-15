@@ -860,6 +860,7 @@ ${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""
 ${RPC_SOURCE}
 ${DURABLE_SOURCE}
 ${root ? classes.map(name => `const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\nexport { ${DURABLE_EXPORT_PREFIX}${name}, ${DURABLE_EXPORT_PREFIX}${name} as ${name} };\n`).join("") : ""}
+${root ? `const __coworkerdRootTrialNamespace = { ...tenant, ${classes.map(name => `${JSON.stringify(name)}: ${DURABLE_EXPORT_PREFIX}${name}`).join(", ")} };` : ""}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
   return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
@@ -867,7 +868,7 @@ function __coworkerdEnvOf(variables, props) {
 export default class extends WorkerEntrypoint {
   fetch(request) {
     const variables = this.env, ctx = this.ctx;
-    if (ctx.props.trial === true) return __coworkerdTrial(tenant, true, ctx.props.entrypoint, ctx.props.classes);
+    if (ctx.props.trial === true) return __coworkerdTrial(${root ? "__coworkerdRootTrialNamespace" : "tenant"}, true, ctx.props.entrypoint, ctx.props.classes);
     const entrypoint = ctx.props.entrypoint;
     const env = __coworkerdEnvOf(variables, ctx.props);
     return withEnv(env, () => {
@@ -1361,6 +1362,17 @@ async function trialLoad(descriptor, env, ctx) {
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
       invocationId: descriptor.invocationId, treeId: descriptor.treeId };
     report = await (await worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch("http://coworkerd-trial/", { cf })).json();
+    if (report.ok && descriptor.format === "v2" && (descriptor.durableObjectClasses ?? []).length) {
+      const rootWorker = env.LOADER.get(loaderKey(descriptor) + "#root-trial", async () => {
+        coldLoad = true;
+        try { return await makeWorkerCode(descriptor, env, ctx, true); }
+        catch (error) { stage = "code"; codeStage = stageOf(error); throw error; }
+      }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0,
+        cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
+      report = await (await rootWorker.getEntrypoint(undefined, invocationOptions(descriptor, props))
+        .fetch("http://coworkerd-root-trial/", { cf })).json();
+      report.rootBridgeChecked = true;
+    }
   } catch (error) {
     report = { ok: false, stage, codeStage, name: typeof error?.name === "string" ? error.name : typeof error,
       message: typeof error?.message === "string" ? error.message : String(error) };
@@ -1413,14 +1425,17 @@ function rootModule(name, value) {
 }
 
 const rootPreparationErrors = new WeakSet();
+const rootMissingPlans = new WeakSet();
+function rootManagementFailure(error, missing = false) {
+  const value = error && typeof error === "object" ? error : new Error(String(error));
+  rootPreparationErrors.add(value);
+  if (missing) rootMissingPlans.add(value);
+  return value;
+}
 const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
 async function selectedRoot(descriptor, env, ctx) {
-  try { return await prepareSelectedRoot(descriptor, env, ctx); }
-  catch (error) {
-    if (error && typeof error === "object") rootPreparationErrors.add(error);
-    throw error;
-  }
+  return prepareSelectedRoot(descriptor, env, ctx);
 }
 
 async function prepareSelectedRoot(descriptor, env, ctx) {
@@ -1428,11 +1443,17 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
     throw new Error("Missing trusted root dispatch");
   const base = descriptor.rootPlan;
   const manage = async (path, value) => {
-    const response = await env.ROOTS.fetch("http://roots/" + path, {
-      method: "POST", body: JSON.stringify(value),
-    });
-    if (!response.ok) throw new Error("Root plan " + path + " failed: " + (await response.text()).slice(0, 400));
-    return response.json();
+    let response, reply;
+    try {
+      response = await env.ROOTS.fetch("http://roots/" + path, { method: "POST", body: JSON.stringify(value) });
+      reply = await response.json();
+    } catch (error) { throw rootManagementFailure(error); }
+    if (!response.ok) {
+      const error = new Error(reply?.error?.message ?? "Root plan " + path + " failed: HTTP " + response.status);
+      if (reply?.error?.kind === "tenant-code") throw error;
+      throw rootManagementFailure(error, reply?.error?.kind === "plan-missing");
+    }
+    return reply;
   };
   const cacheKey = JSON.stringify(base);
   const install = async () => {
@@ -1447,7 +1468,7 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
     const plan = installed.plan;
     console.log("[root-plan] " + JSON.stringify({ plan, kind: base.kind, tenant: base.tenant, workerId: base.workerId,
       versionId: base.versionId, creationRecord: base.creationRecord?.present === true,
-      platformClasses: installed.state.plans.filter(value => value.kind === "platform")
+      platformClasses: installed.state.plans.filter(value => value.kind === "platform" && value.plan === plan)
         .map(({ tenant, workerId, configuredWorker, platformClass }) => ({ tenant, workerId, configuredWorker, platformClass })) }));
     return plan;
   };
@@ -1463,11 +1484,19 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
     ({ plan } = await manage("lookup", base));
     plan = remember(plan === null ? await install() : plan);
   } else remember(plan);
-  const select = () => env.ROOTS.getRoot(JSON.stringify({ ...descriptor.rootSelection, plan,
-    tenantCf: tenantCf(descriptor, env) }));
+  const select = async () => {
+    const selection = { ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env) };
+    const prepared = await manage("prepare", selection);
+    try {
+      return await env.ROOTS.getRoot(JSON.stringify({ ...selection, preparedTicket: prepared.ticket }));
+    } catch (error) {
+      // This private binding call never delivers a tenant event; its missing-ticket reply is safe to refresh.
+      throw rootManagementFailure(error, String(error?.message ?? error).includes("ROOT_PLAN_MISSING:"));
+    }
+  };
   try { return await select(); }
   catch (error) {
-    if (!String(error?.message ?? error).includes("ROOT_PLAN_MISSING:")) throw error;
+    if (!error || typeof error !== "object" || !rootMissingPlans.has(error)) throw error;
     rootPlanKeys.delete(cacheKey);
     plan = remember(await install());
     return await select();
@@ -1475,8 +1504,7 @@ async function prepareSelectedRoot(descriptor, env, ctx) {
 }
 
 function rootPreparationFailed(error) {
-  return (error && typeof error === "object" && rootPreparationErrors.has(error)) ||
-    String(error?.message ?? error).includes("ROOT_PREPARATION_FAILED:");
+  return error && typeof error === "object" && rootPreparationErrors.has(error);
 }
 
 async function serveRoot(request, descriptor, env, ctx) {

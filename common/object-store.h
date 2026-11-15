@@ -118,6 +118,8 @@ public:
   // Every object whose key starts with `prefix` (ListObjectsV2, page after page until the store says that was the
   // last one); `maxKeys` bounds one page.
   kj::Promise<ObjectListing> list(std::string prefix, uint32_t maxKeys = 1000);
+  // One LIST page with max-keys=1; does not follow continuation tokens.
+  kj::Promise<bool> hasAny(std::string prefix);
   // DELETE. A key that does not exist is removed as well (S3 answers 204 either way).
   kj::Promise<ObjectResponse> remove(std::string key);
   // Also used by the independent authentication probe (bucket creation and

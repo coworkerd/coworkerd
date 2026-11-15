@@ -2087,7 +2087,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
-  // The durable process names the object by its Host's name, which carries the data epoch; the history is the
+  // The durable process names the root by its namespace/object/data-epoch identity; the history is the
   // object's, whichever copy of its files the frames came from.
   auto* object = objectOf(record.objectName);
   if (object != nullptr && record.storageId != object->storageId) {

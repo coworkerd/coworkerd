@@ -496,6 +496,27 @@ kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes
   }
 }
 
+kj::Promise<bool> ObjectStore::hasAny(std::string prefix) {
+  KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
+  KJ_REQUIRE(!prefix.empty() && stateKey(prefix, true), "an existence listing needs an explicit valid prefix");
+  Call call{kj::HttpMethod::GET, "", "", true,
+      {{"list-type", "2"}, {"max-keys", "1"}, {"prefix", prefix}}};
+  const auto response = co_await send(std::move(call));
+  requireStorage(response.status == 200, "object existence listing failed: HTTP " + std::to_string(response.status));
+  const std::string_view xml(response.bytes);
+  requireStorage(xml.find("<ListBucketResult") != std::string_view::npos, "object listing answer is not a listing");
+  const auto contents = xml.find("<Contents>");
+  if (contents != std::string_view::npos) {
+    const auto end = xml.find("</Contents>", contents);
+    requireStorage(end != std::string_view::npos, "object listing answer is cut short");
+    const auto key = element(xml.substr(contents, end - contents), "Key");
+    requireStorage(!key.empty() && key.starts_with(prefix), "object listing entry is outside its prefix");
+    co_return true;
+  }
+  requireStorage(element(xml, "IsTruncated") == "false", "empty existence listing is incomplete");
+  co_return false;
+}
+
 kj::Promise<ObjectListing> ObjectStore::list(std::string prefix, uint32_t maxKeys) {
   KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
   KJ_REQUIRE(stateKey(prefix, true), "invalid object prefix");

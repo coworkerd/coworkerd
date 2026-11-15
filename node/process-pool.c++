@@ -1412,7 +1412,7 @@ public:
     std::filesystem::create_directories(this->directory + "/processes");
     std::filesystem::create_directories(runDirectory);
     std::filesystem::permissions(runDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
-    // The durable processes' objects: one SQLite database per object (and its facets), below the Host namespace's
+    // The durable processes' objects: one SQLite database per object (and its facets), below each root namespace's
     // unique key -- in the stack, so that a stack's objects go with it.
     if (this->config.durableProcesses) {
       std::filesystem::create_directories(durableDirectory());

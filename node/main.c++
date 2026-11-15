@@ -1967,6 +1967,17 @@ public:
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
+    // These catalog checks must not leave an open marker when no facet will be started.
+    if (!target.isDatabase()) {
+      if (auto missing = secretRefusal(*version, false))
+        throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
+    }
+    const auto limits = namedLimits(version->workerId);
+    auto root = coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
+        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
+        target.alarmFacetId);
+    if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
+        "the Durable Object namespace is unavailable or being deleted"}};
     auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
     if (!checked.ready) {
@@ -1983,18 +1994,6 @@ public:
       }
       throw DurableDispatchRefused{std::move(checked)};
     }
-    // Prepare from the current catalog before registering this event or its lease. A
-    // namespace removed while admission/recovery waited is an ordinary refusal.
-    if (!target.isDatabase()) {
-      if (auto missing = secretRefusal(*version, false))
-        throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
-    }
-    const auto limits = namedLimits(version->workerId);
-    auto root = coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
-        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
-        target.alarmFacetId);
-    if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
-        "the Durable Object namespace is unavailable or being deleted"}};
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     const auto sequence = nextSequence++;
@@ -6053,9 +6052,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   if (answer.overflowed)
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, CollectedResponse::OVERFLOW_REASON};
-  // The runtime answers {"outcome":"fired"|"notDue"|"failed","atUnixMs":N,"reason":...}; anything else is a refusal
-  // of the dispatch (no owner, the object being rebuilt, a limit) and counts against nothing.
-  std::string outcome, reason;
+  // Tenant code that cannot load is a handler failure too; platform refusals count against nothing.
+  std::string outcome, reason, code;
   uint64_t atUnixMs = 0;
   try {
     capnp::MallocMessageBuilder message;
@@ -6064,6 +6062,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     auto reader = value.asReader();
     if (auto field = coworkerd::json::field(reader, "outcome"); field.isString()) outcome = field.getString().cStr();
     if (auto field = coworkerd::json::field(reader, "reason"); field.isString()) reason = field.getString().cStr();
+    if (auto field = coworkerd::json::field(reader, "code"); field.isString()) code = field.getString().cStr();
     if (auto field = coworkerd::json::field(reader, "atUnixMs"); field.isNumber() && field.getNumber() > 0)
       atUnixMs = uint64_t(field.getNumber());
   } catch (const kj::Exception&) {
@@ -6072,6 +6071,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
   if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
   if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
+  if (answer.status == 500 && code == "EXECUTION_FAILED")
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
       reason.empty() ? "the object answered " + std::to_string(answer.status) : reason};
 }
