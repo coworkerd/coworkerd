@@ -30,6 +30,8 @@ RootStorageRef makeRootStorageRef(const std::string& namespaceId, const std::str
     uint64_t dataEpoch);
 bool isObjectStorageDirectory(const std::string& name);
 std::string rootNamespaceUniqueKey(const std::string& namespaceId);
+// Empty local data is initialized once; existing unmarked data is never changed.
+void checkRootStorageFormat(const std::filesystem::path& stack, bool initialize);
 
 std::string rootLoaderBinding(bool durable);
 std::string rootLoaderService(bool durable, const std::string& storageDirectory);

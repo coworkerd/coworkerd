@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 01:07:40 +0800
+Date: Mon, 16 Nov 2026 02:34:11 +0800
 Subject: [PATCH] Load tenant and platform roots with explicit node selection
 
 
@@ -154,10 +154,10 @@ index 0000000000000000000000000000000000000000..6d0f07748f0fa68afb26da6791f85bed
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
-index 02ed18e82698580f71b414103f6b0e3ad15afdfe..291c9dae7624aff4056e16f6df2bb4053fa38daf 100644
+index 7a55fe69b6a0272691c76dd02170a41f265b4ae2..3c607e13c0d2a8d9b2b00d00184f75343c627cb4 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
 +++ b/src/workerd/server/factory/worker-factory-actor.c++
-@@ -898,6 +898,10 @@ kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandl
+@@ -894,6 +894,10 @@ kj::Maybe<kj::Rc<HibernationManager>> actor_hibernation_manager(const ActorHandl
        [](HibernationManager& m) { return kj::Rc<HibernationManager>(m.addRef()); });
  }
  

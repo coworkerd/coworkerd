@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 15 Nov 2026 19:44:05 +0800
-Subject: [PATCH] Schedule every shipped database alarm on the node
+Date: Mon, 16 Nov 2026 02:34:11 +0800
+Subject: [PATCH] Schedule shipped root alarms on the node
 
 
 diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
@@ -137,7 +137,7 @@ index b19f85a4c1cfed6ad0dbbc94556d1e7979277e5a..51307d71925763619bbd990da483eb72
  // "<namespace>/<object>/<data epoch>" -- so the node needs no map from a path to an object; `storageId` is the
  // hexadecimal actor id its files are named after. `facetId` is 0 for the object itself, and a facet also carries its
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
-index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3ad15afdfe 100644
+index d3d0e717cc460e34d90454d523b7143af99b1645..7a55fe69b6a0272691c76dd02170a41f265b4ae2 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
 +++ b/src/workerd/server/factory/worker-factory-actor.c++
 @@ -2,8 +2,8 @@
@@ -203,55 +203,42 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3a
  // The actor's hooks into the server: the requests it raises for itself (alarms, hibernated
  // WebSocket events, which restart the actor if needed), its facets, and its transitions between
  // idle and active. The actor owns a reference as its loopback, so the hooks it borrows as its
-@@ -529,14 +555,29 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
-   ActorKey actor;
+@@ -539,6 +565,20 @@ class FacetAlarmHooks final: public ActorSqlite::Hooks {
+   }
  };
  
--// Facets have their own storage but no alarms: the scheduler delivers only to root actors.
-+// The node schedules every shipped database; only non-shipped roots use the local scheduler.
- class FacetAlarmHooks final: public ActorSqlite::Hooks {
-  public:
-+  FacetAlarmHooks() = default;
-+  FacetAlarmHooks(kj::String objectName, uint facetId)
-+      : shipped(ShippedFacet{kj::mv(objectName), facetId}) {}
-+
-   kj::Promise<void> scheduleRun(
-       kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
-+    KJ_IF_SOME(facet, shipped) {
-+      durableLogAlarm(facet.objectName, facet.facetId, newAlarmTime);
-+      return kj::READY_NOW;
-+    }
-     // The same message as the production storage factory's.
-     JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
-   }
++// Shipped roots report only to the node; they never arm the local scheduler.
++class ShippedRootAlarmHooks final: public ActorSqlite::Hooks {
++ public:
++  explicit ShippedRootAlarmHooks(kj::String objectName): objectName(kj::mv(objectName)) {}
++  kj::Promise<void> scheduleRun(
++      kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
++    durableLogAlarm(objectName, 0, newAlarmTime);
++    return kj::READY_NOW;
++  }
 +
 + private:
-+  struct ShippedFacet {
-+    kj::String objectName;
-+    uint facetId;
-+  };
-+  kj::Maybe<ShippedFacet> shipped;
- };
- 
++  kj::String objectName;
++};
++
  // The actor's storage: SQLite in the namespace's directory, or an in-memory cache over empty
-@@ -564,7 +605,15 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+ // storage when the namespace has no directory. None for an ephemeral actor.
+ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl> storage,
+@@ -564,7 +604,12 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Own<ActorSqlite::Hooks> sqliteHooks;
      kj::Maybe<ActorSqliteHooks&> rootHooks;
      uint selfId = facetId.orDefault(0);
 -    if (facetId == kj::none) {
 +    auto shippedName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr());
-+    if (shipped) {
-+      if (facetId == kj::none) {
-+        // An older build may have persisted a local schedule. The database's value is now
-+        // reported to the node, so remove that obsolete second scheduler's entry on open.
-+        storage->alarmScheduler->deleteAlarm(ActorKey(rootKey.asPtr(), actorName));
-+      }
-+      sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
++    if (shipped && facetId == kj::none) {
++      // A shipped root's database is authoritative; remove any local scheduler entry.
++      storage->alarmScheduler->deleteAlarm(ActorKey(rootKey.asPtr(), actorName));
++      sqliteHooks = kj::heap<ShippedRootAlarmHooks>(kj::str(shippedName));
 +    } else if (facetId == kj::none) {
        auto root =
            kj::heap<ActorSqliteHooks>(kj::addRef(*storage), ActorKey(rootKey.asPtr(), actorName));
        rootHooks = *root;
-@@ -582,7 +631,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -582,7 +627,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Maybe<kj::Own<DurableLogShipper>> shipper;
      if (shipped) {
        DurableObjectName name{
@@ -260,7 +247,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3a
          .storageId = kj::str(rootKey),
          .facetId = selfId,
          .parentFacetId = parentFacetId.orDefault(0),
-@@ -596,8 +645,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -596,8 +641,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      KJ_IF_SOME(s, shipper) {
        shipperPtr = s.get();
      }
@@ -271,7 +258,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3a
        // Close descendant actors before deleting their files; preserve cluster reset handling.
        storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
        db.run("PRAGMA journal_mode=WAL;");
-@@ -614,9 +663,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -614,9 +659,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
        committer = kj::none;
      }
      KJ_IF_SOME(s, shipper) {
@@ -281,8 +268,8 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3a
 +      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> { return s->onCommit(); };
 +    }
 +    // Every open reports the persisted value, including none, before ActorSqlite owns the database.
-+    if (shipped) {
-+      durableLogAlarm(shippedName, selfId, alarmOf(*db));
++    if (shipped && facetId == kj::none) {
++      durableLogAlarm(shippedName, 0, alarmOf(*db));
      }
      auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
      KJ_IF_SOME(root, rootHooks) {

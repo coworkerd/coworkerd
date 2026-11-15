@@ -1595,9 +1595,27 @@ int runDeploymentTool(int argc, char** argv) {
   ManifestStore state(storage, timer, loadKey(arguments.keyFile), std::cerr);
   options.memberStore = &storage;
   if (operation == "init") {
+    // Decide compatibility before creating either marker or any index. Old DO data is never migrated.
+    auto rootFormat = storage.get(DO_ROOT_FORMAT_KEY).wait(io.waitScope);
+    KJ_REQUIRE(rootFormat.status == 200 || rootFormat.status == 404, "cannot read the Durable Object format marker", rootFormat.status);
+    if (rootFormat.status == 404) {
+      const auto objects = storage.list("do/", 1).wait(io.waitScope);
+      KJ_REQUIRE(objects.objects.empty(),
+          "this bucket contains old-format Durable Object data; this version does not read it; use a new bucket; nothing written");
+    } else {
+      KJ_REQUIRE(rootFormat.bytes == DO_ROOT_FORMAT_BYTES, "the bucket has an incompatible Durable Object format marker; use a new bucket");
+    }
     // A new cluster's bucket: its marker, and empty indexes so that the nodes' first reads find their hints.
     const bool present = storage.get(CLUSTER_FORMAT_KEY).wait(io.waitScope).status == 200;
     state.load(true, true).wait(io.waitScope);
+    if (rootFormat.status == 404) {
+      const auto created = storage.create(DO_ROOT_FORMAT_KEY, DO_ROOT_FORMAT_BYTES).wait(io.waitScope);
+      if (!created.created) {
+        rootFormat = storage.get(DO_ROOT_FORMAT_KEY).wait(io.waitScope);
+        KJ_REQUIRE(rootFormat.status == 200 && rootFormat.bytes == DO_ROOT_FORMAT_BYTES,
+            "the bucket has an incompatible Durable Object format marker; use a new bucket");
+      }
+    }
     std::string written;
     auto empty = [&](const char* prefix, const std::string& bytes) {
       if (readLatestRevision(storage, prefix, indexHintKey(prefix), 0, true).wait(io.waitScope).revision) return;

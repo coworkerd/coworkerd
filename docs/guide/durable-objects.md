@@ -141,3 +141,5 @@ upgrade: use new data directories and a new bucket, and move data at the applica
 ## 8. Checked differences from Cloudflare
 
 Coworkerd runs the Worker's own SQLite classes, with different ID derivation, no jurisdiction or cross-Worker classes, and no facet clone. `locationHint` is ignored. Class env has no Service Bindings. A limit resets the shared version isolate's objects in that durable process, rather than only the offending object. Fetch exceptions return the platform's HTTP error shape; method exceptions use workerd's RPC exception transport. DO-to-DO calls start independent trees bounded by eight hops. Durability, takeover and alarm discovery have the limits above, including the loss of an unuploaded tail when no surviving copy remains (section 7). The [compatibility table](../compatibility.md), section 7, records the verified differences; [databases](databases.md) describes D1's supported subset.
+
+Only root objects can set alarms; calling `setAlarm()` in a child facet throws `Facets currently cannot set alarms.`

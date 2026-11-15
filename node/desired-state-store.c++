@@ -478,6 +478,14 @@ private:
           KJ_FAIL_REQUIRE(refusal.c_str());
         }
         requireStorage(marker.status == 200, "object store read failed: HTTP " + std::to_string(marker.status));
+        const auto rootFormat = co_await storage.get(DO_ROOT_FORMAT_KEY);
+        if (rootFormat.status == 404 || (rootFormat.status == 200 && rootFormat.bytes != DO_ROOT_FORMAT_BYTES)) {
+          refusal = "the bucket has no compatible " + std::string(DO_ROOT_FORMAT_KEY) +
+              "; coworkerd-apiserver tool init must write it before this node starts; old Durable Object data requires a new bucket";
+          KJ_FAIL_REQUIRE(refusal.c_str());
+        }
+        requireStorage(rootFormat.status == 200, "object store read failed for the Durable Object format marker: HTTP " +
+            std::to_string(rootFormat.status));
         break;
       } catch (const kj::Exception& error) {
         if (!refusal.empty()) throw;
