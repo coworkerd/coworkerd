@@ -827,17 +827,36 @@ void DurableLog::log(const std::string& event, const std::string& fields) const 
             << nodeEpoch << "\"" << (fields.empty() ? "" : "," + fields) << "}" << std::endl;
 }
 
-std::filesystem::path DurableLog::durableDirectory() const {
-  return settings.stackDirectory / "do" / settings.hostUniqueKey;
+std::vector<std::filesystem::path> DurableLog::objectDirectories(std::error_code& code) const {
+  std::vector<std::filesystem::path> directories;
+  for (std::filesystem::directory_iterator it(settings.stackDirectory / "do", code), end;
+      !code && it != end; it.increment(code)) {
+    const auto status = it->symlink_status(code);
+    if (code) break;
+    if (std::filesystem::is_directory(status) &&
+        isObjectStorageDirectory(it->path().filename().string(), settings.hostUniqueKey))
+      directories.push_back(it->path());
+  }
+  std::sort(directories.begin(), directories.end());
+  return directories;
+}
+
+void DurableLog::locate(Object& object, const std::string& namespaceId, const std::string& objectId,
+    uint64_t dataEpoch) {
+  if (!object.storageId.empty()) {
+    KJ_REQUIRE(object.namespaceId == namespaceId && object.objectId == objectId && object.dataEpoch == dataEpoch,
+        "an object's storage identity cannot change");
+    return;
+  }
+  static_cast<RootStorageRef&>(object) = makeRootStorageRef(namespaceId, objectId, dataEpoch,
+      settings.rootObjects, settings.hostUniqueKey);
 }
 std::filesystem::path DurableLog::logDirectory() const {
   return settings.stackDirectory / "do" / "log";
 }
-std::filesystem::path DurableLog::databasePath(const std::string& storageId, uint32_t facetId,
-    const char* suffix) const {
-  const auto name = facetId == 0 ? storageId + ".sqlite" + suffix
-                                 : storageId + "." + std::to_string(facetId) + ".sqlite" + suffix;
-  return durableDirectory() / name;
+std::filesystem::path DurableLog::databasePath(const RootStorageRef& ref, uint32_t facetId,
+    const char* suffix, const std::string& staging) const {
+  return ref.databasePath(settings.stackDirectory, facetId, suffix, staging);
 }
 
 void DurableLog::setNodeEpoch(uint64_t epoch) {
@@ -1112,7 +1131,7 @@ void DurableLog::readRecovery() {
       object.objectName = event.objectName;object.namespaceId = identity->namespaceId;object.objectId = identity->objectId;
       object.dataEpoch = identity->dataEpoch;object.shard = event.shard;
       object.shardEpoch = std::max(object.shardEpoch, event.shardEpoch);
-      if (object.storageId.empty()) object.storageId = durableHostId(settings.hostUniqueKey, event.objectName);
+      locate(object, identity->namespaceId, identity->objectId, identity->dataEpoch);
       if (event.generation.first == nodeEpoch) recoverySerial = std::max(recoverySerial, event.generation.second);
     }
     info.complete = info.complete && header;
@@ -1146,7 +1165,8 @@ kj::Promise<void> DurableLog::start() {
     co_return;
   }
   if (recoveryWriteFailed) co_return;
-  std::filesystem::create_directories(durableDirectory(), code);
+  std::filesystem::create_directories(settings.rootObjects ? settings.stackDirectory / "do"
+      : settings.stackDirectory / "do" / settings.hostUniqueKey, code);
   KJ_REQUIRE(!code, "the Durable Object cache directory could not be created");
   const auto readingStarted = monotonicTimeMs();
   co_await readOwnLog();
@@ -1160,16 +1180,21 @@ kj::Promise<void> DurableLog::start() {
       info.complete = false;
     }
     uint64_t removed = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(durableDirectory(), code)) {
-      std::filesystem::remove_all(entry.path(), code);
-      if (code) {
-        ++startupCleanupFailures;startupRetryAfterMs = monotonicTimeMs() + 1000;
-        log("cache-cleanup-failed", "\"reason\":\"untrusted files remain; the previous boot marker is retained\"");
-        co_return;
+    const auto directories = objectDirectories(code);
+    for (const auto& directory : directories) {
+      if (code) break;
+      for (std::filesystem::directory_iterator entry(directory, code), end;
+          !code && entry != end; entry.increment(code)) {
+        std::filesystem::remove_all(entry->path(), code);
+        if (code) break;
+        ++removed;
       }
-      ++removed;
     }
-    if (code) { ++startupCleanupFailures;startupRetryAfterMs = monotonicTimeMs() + 1000;co_return; }
+    if (code) {
+      ++startupCleanupFailures;startupRetryAfterMs = monotonicTimeMs() + 1000;
+      log("cache-cleanup-failed", "\"reason\":\"untrusted files remain; the previous boot marker is retained\"");
+      co_return;
+    }
     // Raw log and exclusion prefixes survive power loss. They may contain the
     // only copy of an ACK and can never prove absence after crossing a boot.
     filesDropped += removed;
@@ -1251,7 +1276,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
         object.positionNodeEpoch = std::max(object.positionNodeEpoch, epoch);
         object.objectId = identity->objectId;object.dataEpoch = identity->dataEpoch;
         object.shard = uint32_t(numberField(saved, "shard"));object.shardEpoch = std::max(object.shardEpoch, sourceEpoch);
-        if (object.storageId.empty()) object.storageId = durableHostId(settings.hostUniqueKey, name);
+        locate(object, identity->namespaceId, identity->objectId, identity->dataEpoch);
       }
     } catch (const kj::Exception&) {
       predecessorLogs[summaryEpoch].complete = false;
@@ -1265,7 +1290,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
   struct Position {
     uint64_t nodeEpoch = 0, nodeSeq = 0, generation = 0;
     uint32_t salt1 = 0, salt2 = 0, pageSize = 0, lastFrame = 0;
-    std::string storageId, objectName;
+    std::string objectName;
     uint32_t facetId = 0, parentFacetId = 0;
     std::string facetName;
     uint64_t txn = 0, shardEpoch = 0, dataEpoch = 0;
@@ -1317,7 +1342,6 @@ kj::Promise<void> DurableLog::readOwnLog() {
       position.nodeSeq = record->nodeSeq;
       position.objectName = record->objectName;
       position.dataEpoch = record->dataEpoch;
-      position.storageId = record->storageId;
       position.facetId = record->facetId;
       position.parentFacetId = record->parentFacetId;
       position.facetName = record->facetName;
@@ -1376,7 +1400,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
     object.objectId = reference->objectId;
     object.dataEpoch = reference->dataEpoch;
     object.objectName = name;
-    object.storageId = position.storageId;
+    locate(object, reference->namespaceId, reference->objectId, reference->dataEpoch);
     object.shard = position.shard;
     object.shardEpoch = std::max(object.shardEpoch, position.shardEpoch);
     object.positionNodeEpoch = std::max(object.positionNodeEpoch, position.nodeEpoch);
@@ -1541,7 +1565,7 @@ kj::Promise<void> DurableLog::classifyEarlier() {
 std::optional<std::string> DurableLog::cutBackWal(const Object& object, uint32_t facetId, uint32_t salt1, uint32_t salt2,
     uint32_t pageSize, uint32_t lastFrame) {
   const auto& storageId = object.storageId;
-  const auto wal = databasePath(storageId, facetId, "-wal");
+  const auto wal = databasePath(object, facetId, "-wal");
   std::error_code code;
   if (!std::filesystem::exists(wal, code)) return std::nullopt;
   const auto size = std::filesystem::file_size(wal, code);
@@ -1571,7 +1595,7 @@ std::optional<std::string> DurableLog::cutBackWal(const Object& object, uint32_t
     }
   }
   if (want && want >= size) {
-    std::filesystem::remove(databasePath(storageId, facetId, "-shm"), code);
+    std::filesystem::remove(databasePath(object, facetId, "-shm"), code);
     return std::nullopt;
   }
   // Either a generation this node has no record of (its frames were never handed on) or a tail past the last record.
@@ -1593,7 +1617,7 @@ std::optional<std::string> DurableLog::cutBackWal(const Object& object, uint32_t
     std::filesystem::remove(wal, code);
     if (code) return failed("remove", "remove", code.value());
   }
-  std::filesystem::remove(databasePath(storageId, facetId, "-shm"), code);
+  std::filesystem::remove(databasePath(object, facetId, "-shm"), code);
   ++walCutBacks;
   log("wal-cut-back", "\"storageId\":" + quote(storageId) + ",\"facet\":" + std::to_string(facetId) + ",\"was\":\"" +
           std::to_string(size) + "\",\"now\":\"" + std::to_string(want) + "\"");
@@ -1809,6 +1833,11 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         log("open-unknown", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId));
         return;
       }
+      if (storageId != object->storageId) {
+        tellBreak(key, "Durable Object storage is unavailable: storage identity mismatch (STORAGE_UNAVAILABLE)");
+        log("open-refused", "\"object\":" + quote(objectName) + ",\"reason\":\"storage identity mismatch\"");
+        return;
+      }
       object->dispatchPending = false;
       auto& facet = object->facets[facetId];
       facet.open = true;facet.processId = channel.processId;
@@ -1907,6 +1936,10 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       if (!in.ok) return;
       record.kind = LogRecordKind::RESET;
       auto* object = objectOf(record.objectName);
+      if (object != nullptr && record.storageId != object->storageId) {
+        log("record-refused", "\"object\":" + quote(record.objectName) + ",\"reason\":\"storage identity mismatch\"");
+        return;
+      }
       if (object != nullptr) {
         auto& facet = object->facets[record.facetId];
         facet.lastFrame = 0;
@@ -2055,6 +2088,11 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   // The durable process names the object by its Host's name, which carries the data epoch; the history is the
   // object's, whichever copy of its files the frames came from.
   auto* object = objectOf(record.objectName);
+  if (object != nullptr && record.storageId != object->storageId) {
+    log("record-refused", "\"object\":" + quote(record.objectName) + ",\"reason\":\"storage identity mismatch\"");
+    if (request) answer(channel, request, ACK_UNAVAILABLE);
+    return;
+  }
   if (object != nullptr) {
     record.dataEpoch = object->dataEpoch;
     record.objectName = object->namespaceId + "/" + object->objectId;
@@ -3422,7 +3460,7 @@ kj::Promise<void> DurableLog::resealEarlier() {
       KJ_REQUIRE(identity.has_value(), "an earlier record has no object identity");
       auto& held = objects[objectName];
       held.objectName = objectName;held.namespaceId = identity->namespaceId;held.objectId = identity->objectId;
-      held.dataEpoch = identity->dataEpoch;held.storageId = durableHostId(settings.hostUniqueKey, objectName);
+      locate(held, identity->namespaceId, identity->objectId, identity->dataEpoch);
       held.shardEpoch = sourceEpochs[objectName];
       if (auto pending = earlier.find(epoch); pending != earlier.end())
         for (const auto& [sequence, record] : pending->second)
@@ -3502,9 +3540,9 @@ kj::Promise<void> DurableLog::dropColdFiles() {
   for (const auto& [name, object] : objects) {
     uint64_t bytes = 0;
     for (const auto& [facetId, facet] : object.facets) {
-      const auto size = std::filesystem::file_size(databasePath(object.storageId, facetId), code);
+      const auto size = std::filesystem::file_size(databasePath(object, facetId), code);
       if (!code) bytes += size;
-      const auto wal = std::filesystem::file_size(databasePath(object.storageId, facetId, "-wal"), code);
+      const auto wal = std::filesystem::file_size(databasePath(object, facetId, "-wal"), code);
       if (!code) bytes += wal;
     }
     total += bytes;
@@ -3531,13 +3569,13 @@ kj::Promise<void> DurableLog::dropColdFiles() {
     uint64_t freed = 0;
     for (const auto& [facetId, facet] : object->facets) {
       for (const char* suffix : {"", "-wal", "-shm"}) {
-        const auto path = databasePath(object->storageId, facetId, suffix);
+        const auto path = databasePath(*object, facetId, suffix);
         const auto size = std::filesystem::file_size(path, code);
         if (!code) freed += size;
         std::filesystem::remove(path, code);
       }
     }
-    std::filesystem::remove(durableDirectory() / (object->storageId + ".facets"), code);
+    std::filesystem::remove(object->facetIndexPath(settings.stackDirectory), code);
     ++object->snapshotVersion;
     object->state = ObjectState::UNKNOWN;
     object->facets.clear();
@@ -3645,7 +3683,7 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     object.namespaceId = identity.namespaceId;
     object.objectId = identity.objectId;
     object.dataEpoch = identity.dataEpoch;
-    object.storageId = durableHostId(settings.hostUniqueKey, objectName);
+    locate(object, identity.namespaceId, identity.objectId, identity.dataEpoch);
   }
   object.shard = identity.shard;
   if (!identity.tenant.empty()) object.tenant = identity.tenant;
@@ -3852,13 +3890,17 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
         !ownerFenced(object->namespaceId, object->shard, targetEpoch) && !recoveryWriteFailed,
         "ownership changed during object recovery");
   };
-  const auto stagingId = object->storageId + ".rebuild-" + std::to_string(nodeEpoch) + "-" + std::to_string(targetEpoch);
+  std::error_code directoryError;
+  std::filesystem::create_directories(object->directory(settings.stackDirectory), directoryError);
+  KJ_REQUIRE(!directoryError, "the object's recovery directory could not be created");
+  const RootStorageRef storage = *object;
+  const auto staging = ".rebuild-" + std::to_string(nodeEpoch) + "-" + std::to_string(targetEpoch);
   std::set<uint32_t> stagingFacets;
-  const auto cleanupStaging = kj::defer([this, stagingId, &stagingFacets]() noexcept {
+  const auto cleanupStaging = kj::defer([this, storage, staging, &stagingFacets]() noexcept {
     for (auto facetId : stagingFacets) {
       try {
         std::error_code ignored;
-        std::filesystem::remove(databasePath(stagingId, facetId), ignored);
+        std::filesystem::remove(databasePath(storage, facetId, "", staging), ignored);
       } catch (...) {}
     }
   });
@@ -3886,7 +3928,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
       for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
-      co_await downloadSnapshot(*manifest, stagingId);
+      co_await downloadSnapshot(*manifest, storage, staging);
       check();
       facets = manifest->facets;
       for (const auto& facet : facets) fromSeq = std::max(fromSeq, facet.upToSeq);
@@ -3936,7 +3978,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
       for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
-      co_await downloadSnapshot(*manifest, stagingId);
+      co_await downloadSnapshot(*manifest, storage, staging);
       check();
       facets = manifest->facets;
     }
@@ -3998,7 +4040,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   }
   // Finish and synchronize the new image before touching any original file or facet entry.
   for (const auto& record : history) stagingFacets.insert(record.facetId);
-  auto rebuilt = applyRecords(*object, stagingId, std::move(history), facets, snapshotShardEpoch, drop);
+  auto rebuilt = applyRecords(*object, staging, std::move(history), facets, snapshotShardEpoch, drop);
   check();
   KJ_REQUIRE(!recoveryWriteFailed, "a held or unfenced local image cannot be deleted");
   object->facets.clear();
@@ -4013,21 +4055,21 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   for (const auto& [id, facet] : rebuilt) sidecars.insert(id);
   // No new database moves until every old WAL and shared-memory file is gone.
   for (auto id : sidecars)
-    for (const char* suffix : {"-wal", "-shm"}) removeFile(databasePath(object->storageId, id, suffix));
+    for (const char* suffix : {"-wal", "-shm"}) removeFile(databasePath(*object, id, suffix));
   for (const auto& [id, facet] : rebuilt) {
     std::error_code code;
-    std::filesystem::rename(databasePath(stagingId, id), databasePath(object->storageId, id), code);
+    std::filesystem::rename(databasePath(storage, id, "", staging), databasePath(*object, id), code);
     KJ_REQUIRE(!code, "a completed recovery image could not replace the cache", id, code.message().c_str());
   }
   for (uint32_t id = 0; id < 64; ++id)
-    if (!rebuilt.contains(id)) removeFile(databasePath(object->storageId, id));
+    if (!rebuilt.contains(id)) removeFile(databasePath(*object, id));
   std::vector<ManifestFacet> index;
   for (const auto& [id, facet] : rebuilt) {
     ManifestFacet entry;
     entry.facetId = id; entry.parentFacetId = facet.parentFacetId; entry.name = facet.facetName;
     index.push_back(std::move(entry));
   }
-  writeFacetIndex(object->storageId, index);
+  writeFacetIndex(*object, index);
   object->facets = std::move(rebuilt);
   const auto publishingStarted = monotonicTimeMs();
   if (tails.cut) co_await forceRecoverySnapshot(objectName);
@@ -4083,10 +4125,11 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
 
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
-kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const std::string& storageId) {
+kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
+    const std::string& staging) {
   const auto partBytes = settings.config.snapshotPartBytes;
   for (const auto& facet : manifest.facets) {
-    const auto path = databasePath(storageId, facet.facetId);
+    const auto path = databasePath(ref, facet.facetId, "", staging);
     std::error_code code;
     std::filesystem::create_directories(path.parent_path(), code);
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -4766,7 +4809,7 @@ kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool
   const auto publishingEpoch = nodeEpoch;
   const auto namespaceId = object->namespaceId;
   const auto objectId = object->objectId;
-  const auto storageId = object->storageId;
+  const RootStorageRef storage = *object;
   const auto selected = object->facets;
   object->snapshotting = true;
   const auto release = kj::defer([this, objectName]() {
@@ -4812,7 +4855,7 @@ kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool
     bool conflict = false;
     for (const auto& [facetId, facet] : selected) {
       if (facet.deleted) continue;
-      const auto path = databasePath(storageId, facetId);
+      const auto path = databasePath(storage, facetId);
       const int fd = ::open(path.c_str(), O_RDONLY);
       KJ_REQUIRE(fd >= 0, "a facet required by the recovery snapshot cannot be opened", path.string().c_str());
       const auto close = kj::defer([fd]() { ::close(fd); });
@@ -4925,7 +4968,7 @@ kj::Promise<void> DurableLog::healLoop() {
 // sequence -- replayed into each of its databases. A gap in one owner's sequence ends that owner's part there: a
 // peer holds a prefix, so what follows a gap was never answered to anybody.
 std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
-    const Object& object, const std::string& storageId, std::vector<LogRecord> history,
+    const Object& object, const std::string& staging, std::vector<LogRecord> history,
     const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
     const std::set<std::pair<uint64_t, uint64_t>>& drop) {
   // A shard's epoch belongs to one owner and grows with every takeover, so (shard epoch, node sequence) is both the
@@ -4954,7 +4997,7 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
     auto& replay = replays[record.facetId];
     if (!replay) {
       // A facet the snapshot brought goes on from its file; one it did not starts from nothing.
-      replay = std::make_unique<DatabaseReplay>(databasePath(storageId, record.facetId),
+      replay = std::make_unique<DatabaseReplay>(databasePath(object, record.facetId, "", staging),
           covered.find(record.facetId) == covered.end());
     }
     std::string error;
@@ -4986,7 +5029,7 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
   }
   for (auto& [facetId, replay] : replays) {
     if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
-        databasePath(storageId, facetId).string().c_str());
+        databasePath(object, facetId, "", staging).string().c_str());
   }
   for (const auto& facet : facets) {
     auto& entry = rebuilt[facet.facetId];
@@ -5009,8 +5052,8 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
 
 // The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a
 // rebuild writes the names and parents the records carry (experiment 25, D.6).
-void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector<ManifestFacet>& facets) {
-  const auto path = durableDirectory() / (storageId + ".facets");
+void DurableLog::writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets) {
+  const auto path = ref.facetIndexPath(settings.stackDirectory);
   auto removeIndex = [&]() {
     std::error_code code;
     std::filesystem::remove(path, code);
@@ -5031,7 +5074,7 @@ void DurableLog::writeFacetIndex(const std::string& storageId, const std::vector
   for (const auto& facet : entries) {
     // The ids are the positions of the entries: a gap would give the next facet another id than it had.
     if (facet.facetId != expected) {
-      log("facet-index-gap", "\"storageId\":" + quote(storageId) + ",\"facet\":" + std::to_string(facet.facetId));
+      log("facet-index-gap", "\"storageId\":" + quote(ref.storageId) + ",\"facet\":" + std::to_string(facet.facetId));
       removeIndex();
       return;
     }
@@ -5358,10 +5401,6 @@ void DurableLog::shardTaken(const std::string& namespaceId, uint32_t shard, uint
 // from its whole history (a gibibyte took 19.5 s). The position beside the files says how far they are confirmed, so
 // a same-boot start can reuse a closed, admitted cache. A clean exit alone never
 // authorizes reuse after a machine reboot.
-std::filesystem::path DurableLog::positionPath(const std::string& storageId) const {
-  return durableDirectory() / (storageId + ".position");
-}
-
 bool DurableLog::writePosition(const Object& object) {
   if (object.state != ObjectState::LOCAL || object.storageId.empty()) return false;
   std::ostringstream out;
@@ -5391,7 +5430,7 @@ bool DurableLog::writePosition(const Object& object) {
     first = false;
   }
   out << "]}\n";
-  const auto path = positionPath(object.storageId);
+  const auto path = object.positionPath(settings.stackDirectory);
   const auto bytes = out.str();
   if (!atomicLocalFile(path, bytes, false)) return false;
   ++positionWrites;
@@ -5502,54 +5541,58 @@ void DurableLog::channelEnded(Channel& channel, const std::string& reason) {
 
 void DurableLog::readPositions() {
   std::error_code code;
-  uint64_t restored = 0;
-  for (const auto& entry : std::filesystem::directory_iterator(durableDirectory(), code)) {
-    if (entry.path().extension() != ".position") continue;
-    std::string bytes;
-    try {
-      bytes = readFile(entry.path());
-    } catch (const kj::Exception&) {
-      continue;
-    }
-    try {
-      capnp::MallocMessageBuilder message;
-      auto value = message.initRoot<capnp::JsonValue>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
-      auto reader = value.asReader();
-      const auto objectName = json::text(reader, "objectName");
-      const auto namespaceId = json::text(reader, "namespaceId");
-      const auto objectId = json::text(reader, "objectId");
-      if (objectName.empty() || namespaceId.size() != 64 || objectId.size() != 64) continue;
-      auto& object = objects[objectName];
-      // Positions retain identity and pre-open usage, never a reusable image.
-      object.objectName = objectName;
-      object.namespaceId = namespaceId;
-      object.objectId = objectId;
-      object.tenant = json::text(reader, "tenant");
-      object.dataEpoch = decimal(json::text(reader, "dataEpoch"));
-      object.shardEpoch = std::max(object.shardEpoch, decimal(json::text(reader, "shardEpoch")));
-      object.shard = uint32_t(numberField(reader, "shard"));
-      object.storageId = durableHostId(settings.hostUniqueKey, objectName);
-      object.bytes = decimal(json::text(reader, "bytes"));
-      if (auto state = recoveryStates.find(objectName); state != recoveryStates.end() && state->second.repairPending)
-        object.repairGeneration = state->second.repair;
-      ++restored;
-    } catch (const kj::Exception&) {
-      continue;
+  const auto directories = objectDirectories(code);
+  uint64_t restored = 0, removed = 0;
+  for (const auto& directory : directories) {
+    if (code) break;
+    for (std::filesystem::directory_iterator it(directory, code), end;
+        !code && it != end; it.increment(code)) {
+      if (it->path().extension() != ".position") continue;
+      if (!std::filesystem::is_regular_file(it->symlink_status(code))) continue;
+      try {
+        const auto bytes = readFile(it->path());
+        capnp::MallocMessageBuilder message;
+        auto value = message.initRoot<capnp::JsonValue>();
+        capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
+        auto reader = value.asReader();
+        const auto objectName = json::text(reader, "objectName");
+        const auto namespaceId = json::text(reader, "namespaceId");
+        const auto objectId = json::text(reader, "objectId");
+        const auto dataEpoch = decimal(json::text(reader, "dataEpoch"));
+        if (namespaceId.size() != 64 || objectId.size() != 64 ||
+            objectName != durableHostName(namespaceId, objectId, dataEpoch)) continue;
+        auto ref = makeRootStorageRef(namespaceId, objectId, dataEpoch, settings.rootObjects, settings.hostUniqueKey);
+        if (it->path() != ref.positionPath(settings.stackDirectory)) continue;
+        auto& object = objects[objectName];
+        // Positions retain identity and pre-open usage, never a reusable image.
+        static_cast<RootStorageRef&>(object) = std::move(ref);
+        object.objectName = objectName;
+        object.tenant = json::text(reader, "tenant");
+        object.shardEpoch = std::max(object.shardEpoch, decimal(json::text(reader, "shardEpoch")));
+        object.shard = uint32_t(numberField(reader, "shard"));
+        object.bytes = decimal(json::text(reader, "bytes"));
+        if (auto state = recoveryStates.find(objectName); state != recoveryStates.end() && state->second.repairPending)
+          object.repairGeneration = state->second.repair;
+        ++restored;
+      } catch (const kj::Exception&) {
+        continue;
+      }
     }
   }
   if (restored) log("positions-read", "\"objects\":" + std::to_string(restored));
-  uint64_t removed = 0;
-  for (std::filesystem::directory_iterator entry(durableDirectory(), code), end;
-      !code && entry != end; entry.increment(code)) {
-    if (entry->path().filename().string().ends_with(".position")) continue;
-    std::error_code removal;
-    std::filesystem::remove_all(entry->path(), removal);
-    if (removal) {
-      ++startupCleanupFailures;
-      log("cache-cleanup-failed", "\"file\":" + quote(entry->path().filename().string()) +
-          ",\"reason\":" + quote(removal.message()));
-    } else ++removed;
+  for (const auto& directory : directories) {
+    if (code) break;
+    for (std::filesystem::directory_iterator it(directory, code), end;
+        !code && it != end; it.increment(code)) {
+      if (it->path().filename().string().ends_with(".position")) continue;
+      std::error_code removal;
+      std::filesystem::remove_all(it->path(), removal);
+      if (removal) {
+        ++startupCleanupFailures;
+        log("cache-cleanup-failed", "\"file\":" + quote(it->path().filename().string()) +
+            ",\"reason\":" + quote(removal.message()));
+      } else ++removed;
+    }
   }
   if (code) {
     ++startupCleanupFailures;

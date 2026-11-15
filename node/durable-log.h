@@ -4,6 +4,7 @@
 #include "coworkerd.capnp.h"
 #include "membership.h"
 #include "object-store.h"
+#include "root-objects.h"
 
 #include <kj/async-io.h>
 #include <kj/refcount.h>
@@ -31,9 +32,6 @@
 // reused after a restart of the daemon or a durable process, and thrown away when the machine itself restarted
 // unclean.
 namespace coworkerd {
-
-// The unique key of the durable processes' Host namespace (process-pool.h keeps the same value).
-constexpr const char* DURABLE_HOST_UNIQUE_KEY = "coworkerd-do-host-v1";
 
 // ---- The objects of the store ----
 //   nodes/<nodeId>/wal/<nodeEpoch>/<segment>           a segment of the node's log (immutable, 20 digits wide)
@@ -276,6 +274,7 @@ public:
     std::string nodeId, instance;
     std::filesystem::path stackDirectory;
     std::string hostUniqueKey = DURABLE_HOST_UNIQUE_KEY;
+    bool rootObjects = false;
     DurableLogConfig config;
     bool objectStore = true;
     uint32_t tailWaitMs = 25000, peerTimeoutMs = 2000;
@@ -429,9 +428,9 @@ private:
     bool loggedCheckpointCovered = false;
   };
   enum class ObjectState { UNKNOWN, REBUILDING, LOCAL, REPAIR, GONE };
-  struct Object {
-    std::string namespaceId, objectId, storageId, objectName, tenant;
-    uint64_t dataEpoch = 0, shardEpoch = 0;
+  struct Object: RootStorageRef {
+    std::string objectName, tenant;
+    uint64_t shardEpoch = 0;
     uint32_t shard = 0;
     ObjectState state = ObjectState::UNKNOWN;
     std::map<uint32_t, Facet> facets;
@@ -552,9 +551,11 @@ private:
 
   void taskFailed(kj::Exception&& error) override;
   void log(const std::string& event, const std::string& fields) const;
-  std::filesystem::path durableDirectory() const;   // <stack>/do/<host unique key>
+  std::vector<std::filesystem::path> objectDirectories(std::error_code& code) const;
   std::filesystem::path logDirectory() const;       // <stack>/do/log
-  std::filesystem::path databasePath(const std::string& storageId, uint32_t facetId, const char* suffix = "") const;
+  std::filesystem::path databasePath(const RootStorageRef& ref, uint32_t facetId,
+      const char* suffix = "", const std::string& staging = "") const;
+  void locate(Object& object, const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch);
   // The boot id of this machine ("" where it cannot be read) and the marker a clean exit leaves.
   std::string bootId() const;
   bool readCacheMarker(std::string& reason);
@@ -662,7 +663,6 @@ private:
   kj::Promise<void> fireAlarm(std::string key);
 
   // ---- what this machine's files are at, so the same boot reuses them ----
-  std::filesystem::path positionPath(const std::string& storageId) const;
   bool writePosition(const Object& object);
   void readPositions();
   std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
@@ -684,7 +684,8 @@ private:
   kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
-  kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const std::string& storageId);
+  kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
+      const std::string& staging);
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
       off_t offset);
   kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName);
@@ -699,10 +700,10 @@ private:
   kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false);
   kj::Promise<void> healLoop();
   kj::Promise<void> retireFencedTails(Object& object, const ObjectManifest& manifest);
-  std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& storageId,
+  std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& staging,
       std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
       uint64_t snapshotShardEpoch, const std::set<std::pair<uint64_t, uint64_t>>& drop);
-  void writeFacetIndex(const std::string& storageId, const std::vector<ManifestFacet>& facets);
+  void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;
   std::optional<ObjectStore> store;
