@@ -834,7 +834,7 @@ std::vector<std::filesystem::path> DurableLog::objectDirectories(std::error_code
     const auto status = it->symlink_status(code);
     if (code) break;
     if (std::filesystem::is_directory(status) &&
-        isObjectStorageDirectory(it->path().filename().string(), settings.hostUniqueKey))
+        isObjectStorageDirectory(it->path().filename().string()))
       directories.push_back(it->path());
   }
   std::sort(directories.begin(), directories.end());
@@ -848,8 +848,7 @@ void DurableLog::locate(Object& object, const std::string& namespaceId, const st
         "an object's storage identity cannot change");
     return;
   }
-  static_cast<RootStorageRef&>(object) = makeRootStorageRef(namespaceId, objectId, dataEpoch,
-      settings.rootObjects, settings.hostUniqueKey);
+  static_cast<RootStorageRef&>(object) = makeRootStorageRef(namespaceId, objectId, dataEpoch);
 }
 std::filesystem::path DurableLog::logDirectory() const {
   return settings.stackDirectory / "do" / "log";
@@ -1165,8 +1164,7 @@ kj::Promise<void> DurableLog::start() {
     co_return;
   }
   if (recoveryWriteFailed) co_return;
-  std::filesystem::create_directories(settings.rootObjects ? settings.stackDirectory / "do"
-      : settings.stackDirectory / "do" / settings.hostUniqueKey, code);
+  std::filesystem::create_directories(settings.stackDirectory / "do", code);
   KJ_REQUIRE(!code, "the Durable Object cache directory could not be created");
   const auto readingStarted = monotonicTimeMs();
   co_await readOwnLog();
@@ -1838,12 +1836,10 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         log("open-refused", "\"object\":" + quote(objectName) + ",\"reason\":\"storage identity mismatch\"");
         return;
       }
-      if (settings.rootObjects) {
-        log("root-storage-verified", "\"namespaceId\":" + quote(object->namespaceId) +
+      log("root-storage-verified", "\"namespaceId\":" + quote(object->namespaceId) +
             ",\"objectId\":" + quote(object->objectId) + ",\"dataEpoch\":\"" + std::to_string(object->dataEpoch) +
             "\",\"uniqueKey\":" + quote(object->uniqueKey) + ",\"storageId\":" + quote(object->storageId) +
             ",\"reportedStorageId\":" + quote(storageId) + ",\"facetId\":" + std::to_string(facetId));
-      }
       object->dispatchPending = false;
       auto& facet = object->facets[facetId];
       facet.open = true;facet.processId = channel.processId;
@@ -5567,7 +5563,7 @@ void DurableLog::readPositions() {
         const auto dataEpoch = decimal(json::text(reader, "dataEpoch"));
         if (namespaceId.size() != 64 || objectId.size() != 64 ||
             objectName != durableHostName(namespaceId, objectId, dataEpoch)) continue;
-        auto ref = makeRootStorageRef(namespaceId, objectId, dataEpoch, settings.rootObjects, settings.hostUniqueKey);
+        auto ref = makeRootStorageRef(namespaceId, objectId, dataEpoch);
         if (it->path() != ref.positionPath(settings.stackDirectory)) continue;
         auto& object = objects[objectName];
         // Positions retain identity and pre-open usage, never a reusable image.

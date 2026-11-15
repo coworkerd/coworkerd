@@ -273,11 +273,9 @@ public:
   struct Settings {
     std::string nodeId, instance;
     std::filesystem::path stackDirectory;
-    std::string hostUniqueKey = DURABLE_HOST_UNIQUE_KEY;
     DurableLogConfig config;
     bool objectStore = true;
     uint32_t tailWaitMs = 25000, peerTimeoutMs = 2000;
-    bool rootObjects = false;
   };
   // `openStream` opens a log stream to one peer; `fetchTail` asks a node for what it holds of a previous owner's log
   // for a shard; `knownShardEpoch` is this node's view of who owns a shard, for the fencing of the records it takes

@@ -33,6 +33,8 @@ export default {
 
 `ctx.storage.sql` exposes workerd's SQLite API. Key-value methods such as `get`, `put`, `delete` and `list`, and storage transactions, use the same database and durability path. The object's env contains the version's variables, secrets, Durable Object bindings and D1 bindings; Service Bindings are not installed in it. Facets have separate databases but belong to the root object's storage, eviction and recovery tree; `ctx.facets.clone()` is refused.
 
+After a declared secret or binding changes, the object reopens on its next request, as it does after a version change; that object's in-flight requests and connections end at that point. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
+
 ## 2. Declare the namespace
 
 Add to the Worker project's Wrangler configuration:

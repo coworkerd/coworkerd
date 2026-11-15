@@ -231,7 +231,7 @@ function __coworkerdTrial(namespace, classes, requested, durableClasses) {
 const DO_OBJECT_HEADER = "x-coworkerd-do-object";
 const DO_HOPS_HEADER = "x-coworkerd-do-hops";
 // The object's alarm: the time the node scheduled and how many times the handler has been tried. The node sets them
-// on a request of its own; a tenant cannot reach the Host, and the Host sets them from the descriptor alone.
+// on a request of its own; the runtime sets them from the trusted descriptor alone.
 const DO_ALARM_HEADER = "x-coworkerd-do-alarm";
 const DO_ALARM_RETRY_HEADER = "x-coworkerd-do-alarm-retry";
 const DURABLE_EXPORT_PREFIX = "__coworkerd_do_";
@@ -525,7 +525,7 @@ async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
   if ((await storage.getAlarm()) === held) await storage.deleteAlarm();
   return Response.json({ outcome: "fired", atUnixMs: 0 });
 }
-function __coworkerdDurableClass(namespace, name, root = false) {
+function __coworkerdDurableClass(namespace, name) {
   const base = Object.prototype.hasOwnProperty.call(namespace, name) ? namespace[name] : undefined;
   const missing = class { constructor() { throw new Error("Durable Object class " + name + " is not a class of this version"); } };
   if (typeof base !== "function") return missing;
@@ -540,30 +540,22 @@ function __coworkerdDurableClass(namespace, name, root = false) {
     const fetch = base.prototype?.fetch;
     Object.defineProperty(wrapped.prototype, "fetch", { configurable: true, writable: true, value: function (...args) {
       const env = __coworkerdObjectEnvs.get(this);
-      let scheduled = null, retry = 0;
-      if (!root) {
-        try {
-          scheduled = args[0]?.headers?.get(${JSON.stringify(DO_ALARM_HEADER)}) ?? null;
-          retry = Number(args[0]?.headers?.get(${JSON.stringify(DO_ALARM_RETRY_HEADER)}) ?? 0) || 0;
-        } catch {}
-      }
-      if (scheduled !== null) return withEnv(env, () => __coworkerdAlarm(this, Number(scheduled), retry));
       if (typeof fetch !== "function")
         throw new Error("Durable Object class " + name + " has no fetch handler");
       return withEnv(env, () => fetch.apply(this, args));
     } });
-    if (root) Object.defineProperty(wrapped.prototype, "__coworkerdAlarm", {
+    Object.defineProperty(wrapped.prototype, "__coworkerdAlarm", {
       configurable: true,
       value: function (scheduledAtUnixMs, retryCount) {
         const env = __coworkerdObjectEnvs.get(this);
         return withEnv(env, async () => (await __coworkerdAlarm(this, Number(scheduledAtUnixMs), Number(retryCount))).json());
       },
     });
-    // The object as a capability, for a method call on its stub: the Host asks the facet for it and the node hands it
-    // to the caller, so the call is delivered to this instance by workerd's own RPC.
+    // The object as a capability for a method call on its stub. The node hands it to the caller, so workerd's
+    // own RPC delivers the call to this instance.
     Object.defineProperty(wrapped.prototype, "__coworkerdRpcTarget", { configurable: true, get: function () {
       const env = __coworkerdObjectEnvs.get(this);
-      return withEnv(env, () => __coworkerdRpcFacade(this, env, root ? ["__coworkerdAlarm"] : []));
+      return withEnv(env, () => __coworkerdRpcFacade(this, env, ["__coworkerdAlarm"]));
     } });
     Object.defineProperty(wrapped, "name", { value: name });
     return wrapped;
@@ -867,7 +859,7 @@ import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""}${TRIAL_SOURCE}
 ${RPC_SOURCE}
 ${DURABLE_SOURCE}
-${classes.map(name => `export const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)}${root ? ", true" : ""});\n`).join("")}${root ? classes.map(name => `export const ${name} = ${DURABLE_EXPORT_PREFIX}${name};\n`).join("") : ""}
+${root ? classes.map(name => `const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\nexport { ${DURABLE_EXPORT_PREFIX}${name}, ${DURABLE_EXPORT_PREFIX}${name} as ${name} };\n`).join("") : ""}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
   return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
@@ -956,7 +948,7 @@ function tenantCf(descriptor, env) {
 
 // A Durable Object namespace Binding's channel to the node: the bridge's stub hands its request here with the object's id
 // in DO_OBJECT_HEADER, and this sends it to the node with the calling version, the namespace and class (the props come
-// from this runtime: a stateless call's Bindings, or an object's Host) and the caller -- a stateless Worker's call tree,
+// from this runtime: a stateless call's Bindings, or an object's plan) and the caller -- a stateless Worker's call tree,
 // or the calling object.
 export class DurableNamespace extends WorkerEntrypoint {
   // A method call on a stub of this namespace: the same envelope its `fetch` puts in cf, with the object the stub
@@ -1051,7 +1043,7 @@ function cleanDurableReason(error, secrets = []) {
   return new TextDecoder().decode(bytes.subarray(0, end)) + "…";
 }
 
-function facetCode(error) {
+function durableCode(error) {
   const reason = String(error?.message ?? error);
   if (reason.includes("STORAGE_UNAVAILABLE")) return "STORAGE_UNAVAILABLE";
   if (reason.includes("DO_OBJECT_TOO_LARGE")) return "DO_OBJECT_TOO_LARGE";
@@ -1059,104 +1051,6 @@ function facetCode(error) {
   if (error?.remote === true) return "EXECUTION_FAILED";
   return reason.includes("CPU_LIMIT_EXCEEDED") ? "CPU_LIMIT_EXCEEDED"
     : reason.includes("MEMORY_LIMIT_EXCEEDED") ? "MEMORY_LIMIT_EXCEEDED" : "EXECUTION_FAILED";
-}
-
-// A Durable Object (docs/compatibility.md, section 7) on a durable process. Each object is a Host -- this runtime's own
-// SQLite-backed class, its id HOST.idFromName(<namespace id>/<object id>/<data epoch>) -- that runs the Worker's class as its facet
-// "app", with the facet's own SQLite. The class comes from the Worker Loader's isolate of the version, under the same
-// loader key as the version's stateless calls, so the tenant's code runs in that dynamic isolate with its limits: CPU
-// topped up at every event, memory per isolate. The Host remembers the key its facet started with: a request of another
-// version (a version activated since, or other limits) aborts the facet and starts the new class on the same storage. A
-// request over a limit aborts it too and answers 503 with the limit's code; the next request starts it again, from a
-// new isolate (the old one was revoked, which ends every object of the version in this process). An exception the
-// class throws leaves the object as it is: 500 EXECUTION_FAILED with its message. Requests reach the facet with the
-// tenant's cf and DO_HOPS_HEADER, how many Durable Object calls led to them.
-export class Host extends DurableObject {
-  async fetch(request) {
-    const descriptor = descriptorFrom(request);
-    const target = descriptor.durableObject;
-    if (!target) throw new Error("Missing Durable Object target");
-    // A database's object runs this runtime's own SQL Worker class, so its facet does not depend on a version; a
-    // Worker's class does, and a version activated since starts the new class on the same storage.
-    const key = target.database ? "database#" + target.database : loaderKey(descriptor) + "#" + target.className;
-    if (this.facetKey !== undefined && this.facetKey !== key) this.abortFacet("the Worker's active version changed");
-    this.facetKey = key;
-    try {
-      const facet = this.ctx.facets.get("app", () => this.start(descriptor));
-      const headers = new Headers(request.headers);
-      headers.set(DO_HOPS_HEADER, String(target.hops ?? 0));
-      // The node's own request: the object's alarm. Only the node can send one (a tenant never reaches the Host),
-      // and the headers come from the descriptor, never from the request the node relayed.
-      // A 64-bit field comes through as a string of decimal digits (Cap'n Proto's JSON).
-      const alarmAtUnixMs = Number(target.alarmAtUnixMs ?? 0);
-      if (alarmAtUnixMs > 0) {
-        headers.set(DO_ALARM_HEADER, String(alarmAtUnixMs));
-        headers.set(DO_ALARM_RETRY_HEADER, String(Number(target.alarmRetryCount ?? 0)));
-      } else {
-        headers.delete(DO_ALARM_HEADER);
-        headers.delete(DO_ALARM_RETRY_HEADER);
-      }
-      return await facet.fetch(new Request(request, { headers, cf: tenantCf(descriptor, this.env) }));
-    } catch (error) {
-      const reason = cleanDurableReason(error, descriptor.secrets);
-      const code = facetCode(error);
-      // A limit ended the class's isolate, or workerd reset the object: the facet goes, and the next request starts it
-      // again -- from a new isolate when the old one was revoked, which ends every object of the version here.
-      if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true) {
-        this.abortFacet("the Durable Object's class failed: " + reason.slice(0, 200));
-        return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
-          code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
-          code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
-          code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" :
-          code === "QUOTA_EXCEEDED" ? "the tenant's Durable Object storage quota is exhausted" : "Durable Object reset",
-          code, reason },
-          { status: code === "DO_OBJECT_TOO_LARGE" ? 413 : code === "QUOTA_EXCEEDED" ? 422 : 503 });
-      }
-      // The class threw: the object stays, as on Cloudflare -- the same instance takes the next request -- and the
-      // caller gets the exception's message.
-      return Response.json({ error: "Durable Object execution failed", code: "EXECUTION_FAILED", reason },
-        { status: 500 });
-    }
-  }
-  // The object as a capability, for a method call on its stub: the facet is started exactly as a request starts it
-  // (the same loader key, the same class, a version activated since aborting the old facet), and the capability is
-  // the object's own, from the facet's isolate -- so a method call is delivered there and its arguments are decoded
-  // there. A method call is an event of the object like a request: workerd tops up its CPU and its lines are the
-  // event's.
-  async rpcTarget(envelope) {
-    const descriptor = descriptorFrom({ cf: JSON.parse(envelope), headers: new Headers() });
-    const target = descriptor.durableObject;
-    if (!target) throw new Error("Missing Durable Object target");
-    if (target.database) throw new Error("a database has no methods");
-    const key = loaderKey(descriptor) + "#" + target.className;
-    if (this.facetKey !== undefined && this.facetKey !== key) this.abortFacet("the Worker's active version changed");
-    this.facetKey = key;
-    try {
-      const facet = this.ctx.facets.get("app", () => this.start(descriptor));
-      return await facet.__coworkerdRpcTarget;
-    } catch (error) {
-      const reason = String(error?.message ?? error);
-      const code = facetCode(error);
-      if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true) {
-        this.abortFacet("the Durable Object's class failed: " + reason.slice(0, 200));
-      }
-      throw new Error(code + ": " + reason.slice(0, 300));
-    }
-  }
-
-  abortFacet(reason) {
-    try { this.ctx.facets.abort("app", new Error(reason)); } catch {}
-  }
-  start(descriptor) {
-    const target = descriptor.durableObject, env = this.env, ctx = this.ctx;
-    // A database: this runtime's own SQL Worker class, taken from the SQL_CLASS Binding (a Durable Object class
-    // Binding without a namespace of its own, which is what a facet's class may be). No tenant code is loaded.
-    if (target.database) return { class: env.SQL_CLASS, id: target.objectId };
-    const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx), { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
-    const durableObjects = durableBindings(descriptor, ctx, { caller: { namespaceId: target.namespaceId, objectId: target.objectId } });
-    return { class: worker.getDurableObjectClass(DURABLE_EXPORT_PREFIX + target.className, { props: { durableObjects } }),
-      id: target.objectId };
-  }
 }
 
 // The platform's own SQL Worker class: a tenant's database is one object of it (docs/compatibility.md, section 7).
@@ -1504,7 +1398,7 @@ function rpcBind(env, ctx) {
   });
 }
 
-// The capability a method call is delivered to: the object's own, from its Host, or the version's entrypoint, from the
+// The capability a method call is delivered to: the selected object's own, or the version's entrypoint, from the
 // isolate the Worker Loader keeps under this version's loader key -- the same isolate its requests run in.
 function rootModule(name, value) {
   if (typeof value === "string") return { name, source: value };
@@ -1518,7 +1412,18 @@ function rootModule(name, value) {
   return { name, type, source };
 }
 
+const rootPreparationErrors = new WeakSet();
+const rootPlanKeys = new Map();
+const MAX_ROOT_PLAN_KEYS = 256;
 async function selectedRoot(descriptor, env, ctx) {
+  try { return await prepareSelectedRoot(descriptor, env, ctx); }
+  catch (error) {
+    if (error && typeof error === "object") rootPreparationErrors.add(error);
+    throw error;
+  }
+}
+
+async function prepareSelectedRoot(descriptor, env, ctx) {
   if (!descriptor.rootPlan || !descriptor.rootSelection || descriptor.rootSelection.dispatchChecked !== true)
     throw new Error("Missing trusted root dispatch");
   const base = descriptor.rootPlan;
@@ -1529,8 +1434,8 @@ async function selectedRoot(descriptor, env, ctx) {
     if (!response.ok) throw new Error("Root plan " + path + " failed: " + (await response.text()).slice(0, 400));
     return response.json();
   };
-  let { plan } = await manage("lookup", base);
-  if (plan === null) {
+  const cacheKey = JSON.stringify(base);
+  const install = async () => {
     let deployment = base;
     if (base.kind === "tenant") {
       const code = await makeWorkerCode(descriptor, env, ctx, true);
@@ -1539,14 +1444,39 @@ async function selectedRoot(descriptor, env, ctx) {
         environment: code.env, modules: names.map(name => rootModule(name, code.modules[name])) };
     }
     const installed = await manage("install", deployment);
-    plan = installed.plan;
-    console.log("[root-plan] " + JSON.stringify({ kind: base.kind, tenant: base.tenant, workerId: base.workerId,
+    const plan = installed.plan;
+    console.log("[root-plan] " + JSON.stringify({ plan, kind: base.kind, tenant: base.tenant, workerId: base.workerId,
       versionId: base.versionId, creationRecord: base.creationRecord?.present === true,
       platformClasses: installed.state.plans.filter(value => value.kind === "platform")
         .map(({ tenant, workerId, configuredWorker, platformClass }) => ({ tenant, workerId, configuredWorker, platformClass })) }));
+    return plan;
+  };
+  const remember = plan => {
+    if (typeof plan !== "string") throw new Error("Invalid root plan reply");
+    rootPlanKeys.delete(cacheKey);
+    rootPlanKeys.set(cacheKey, plan);
+    if (rootPlanKeys.size > MAX_ROOT_PLAN_KEYS) rootPlanKeys.delete(rootPlanKeys.keys().next().value);
+    return plan;
+  };
+  let plan = rootPlanKeys.get(cacheKey);
+  if (plan === undefined) {
+    ({ plan } = await manage("lookup", base));
+    plan = remember(plan === null ? await install() : plan);
+  } else remember(plan);
+  const select = () => env.ROOTS.getRoot(JSON.stringify({ ...descriptor.rootSelection, plan,
+    tenantCf: tenantCf(descriptor, env) }));
+  try { return await select(); }
+  catch (error) {
+    if (!String(error?.message ?? error).includes("ROOT_PLAN_MISSING:")) throw error;
+    rootPlanKeys.delete(cacheKey);
+    plan = remember(await install());
+    return await select();
   }
-  if (typeof plan !== "string") throw new Error("Invalid root plan reply");
-  return env.ROOTS.getRoot(JSON.stringify({ ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env) }));
+}
+
+function rootPreparationFailed(error) {
+  return (error && typeof error === "object" && rootPreparationErrors.has(error)) ||
+    String(error?.message ?? error).includes("ROOT_PREPARATION_FAILED:");
 }
 
 async function serveRoot(request, descriptor, env, ctx) {
@@ -1566,7 +1496,10 @@ async function serveRoot(request, descriptor, env, ctx) {
     }
     return await root.fetch(new Request(request, { headers, cf: tenantCf(descriptor, env) }));
   } catch (error) {
-    const reason = cleanDurableReason(error, descriptor.secrets), code = facetCode(error);
+    const reason = cleanDurableReason(error, descriptor.secrets), code = durableCode(error);
+    if (code === "EXECUTION_FAILED" && rootPreparationFailed(error))
+      return Response.json({ error: "Durable Object is unavailable", code: "DO_UNAVAILABLE", reason, retryable: true },
+        { status: 503 });
     if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true)
       return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
         code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
@@ -1582,19 +1515,13 @@ async function rpcEntrypoint(value, env, ctx) {
   const descriptor = descriptorFrom({ cf: value, headers: new Headers() });
   const target = descriptor.durableObject;
   if (target) {
-    if (env.ROOTS) {
-      if (target.database) throw new Error("a database has no methods");
-      try { return await (await selectedRoot(descriptor, env, ctx)).__coworkerdRpcTarget; }
-      catch (error) {
-        const reason = String(error?.message ?? error), code = facetCode(error);
-        throw new Error(code + ": " + reason.slice(0, 300));
-      }
+    if (target.database) throw new Error("a database has no methods");
+    try { return await (await selectedRoot(descriptor, env, ctx)).__coworkerdRpcTarget; }
+    catch (error) {
+      const reason = String(error?.message ?? error), code = durableCode(error);
+      throw new Error((code === "EXECUTION_FAILED" && rootPreparationFailed(error) ? "DO_UNAVAILABLE" : code) +
+        ": " + reason.slice(0, 300));
     }
-    if (!env.HOST) throw new Error("A Durable Object method call reached a process without Durable Objects");
-    const dataEpoch = String(target.dataEpoch ?? "0");
-    const host = env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
-      (dataEpoch === "0" ? "" : "/" + dataEpoch)));
-    return host.rpcTarget(JSON.stringify(value));
   }
   const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx), { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
   return worker.getEntrypoint(undefined, invocationOptions(descriptor, callProps(descriptor, ctx))).__coworkerdRpcTarget;
@@ -1606,17 +1533,8 @@ async function serve(request, env, ctx) {
   }
   const descriptor = descriptorFrom(request);
   if (descriptor.trial === true) return trialLoad(descriptor, env, ctx);
-  // A request to an object: its Host, on this durable process. The Host is named by the object and the epoch since which
-  // this node's copy of the object's shard is the one (the node's data epoch for it): a shard this node took over from
-  // another node starts its objects from empty, one it took back from itself keeps them.
-  if (descriptor.durableObject) {
-    if (env.ROOTS) return serveRoot(request, descriptor, env, ctx);
-    if (!env.HOST) throw new Error("A Durable Object request reached a process without Durable Objects");
-    const target = descriptor.durableObject;
-    const dataEpoch = String(target.dataEpoch ?? "0");
-    return env.HOST.get(env.HOST.idFromName(target.namespaceId + "/" + target.objectId +
-      (dataEpoch === "0" ? "" : "/" + dataEpoch))).fetch(request);
-  }
+  // A request to an object uses its namespace, public id and data epoch on the shard owner's durable process.
+  if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
   const key = loaderKey(descriptor);
   let coldStart = false;
