@@ -218,10 +218,13 @@ supply this record when their integration is ported.
 ### 0020: private runtime root loader
 
 A trusted process configuration can declare a `coworkerdRootLoader` service with an absolute
-`storagePath` and bind it as `ROOTS` to its runtime. It uses the existing service binding `fetch`
-capability; no additional descriptor, public node endpoint or Fetcher method is introduced.
-The loader never adds this binding to a loaded Worker's environment, and its capability cannot
-be transferred. The existing node entry path continues to use Host/app.
+`storagePath` and give its runtime a private `coworkerdRootLoader` binding. Its inherited `fetch`
+manages plans; `getRoot(selectionJson)` selects an explicit `{namespaceId, objectId, dataEpoch,
+plan, dispatchChecked}` target for HTTP or RPC. It uses the existing process-local bootstrap
+capability protocol and adds no method to ordinary Fetchers. Node dispatch checks must complete
+before obtaining an instance. Tenant configurations contain neither this binding nor native
+namespace declarations, including through `ctx.exports`. These capabilities cannot transfer.
+The existing user entry path continues to use Host/app until the later integration stage.
 
 The private service accepts `POST /install` with an owned deployment description: Worker and
 version ids, compatibility date/flags, ES modules, namespace ids, class names, binding names,
@@ -231,25 +234,36 @@ Missing records are rejected. The owned Cap'n Proto Worker config survives with 
 script. Limits continue to read only `WorkerSpec.load_identity`; loader keys and class names
 are never parsed for identity.
 
-`RootRegistry` indexes compiled Workers by Worker id, version, limits and load generation.
-Namespace entries retain their own storage and a mutable class-source reference. All root
-classes in one deployment share its compiled isolate and creation record. The initial
-generation is supplied by the trusted caller; reloads increment that plan's private generation.
-After link, the existing ready hook attaches idle, watermark and GC lifecycle machinery.
-Retirement aborts that generation's actors, unlinks its Worker and releases the compiled
-instance. Its generation and weak instance identity are checked after awaits, so an old abort
-cannot remove a replacement. Namespace storage remains available for the next load.
+`RootRegistry` indexes compiled Workers by immutable plan key and load generation, asserting
+that an insertion cannot replace another instance. Namespace entries keep their storage while
+each object retains its own source plan. The native index and SQLite file use storage id S;
+the actor bridge presents public O as the same string used by Host/app, retaining the internal
+R name for storage reporting only. A Node-dispatched request or RPC with a different version
+or limit plan aborts only that object, then reopens the same storage with the selected class.
+Direct WebSocket messages retain the instance's existing plan.
+
+Own-worker facet class credentials retain a weak registry reference, immutable plan and props;
+they survive unload without retaining the isolate. Variable/secret values stay in the compiled
+environment. DO/D1 wrappers receive platform channels in props; outbound and streaming tails
+are platform entrypoints. Event metadata is stamped from the explicit selection and deployment.
+
+The existing ready hook attaches idle, watermark and GC lifecycle machinery. Idle retirement
+synchronously detaches the old plan, then evicts its actor trees while retaining containers and
+hibernation managers. Incoming requests wait for teardown before reload; stale generation and
+instance callbacks cannot remove a replacement. Limit retirement aborts that plan's roots.
+The initial generation comes from the trusted caller; reloads temporarily increment it in the
+kernel until the later Node record-provider integration.
 
 `GET /state` inspects the private registry, `/invoke?plan=...` forwards an event to a plan's
 default entrypoint, and `POST /retire` conditionally retires a specified plan generation.
 Install publishes its namespaces only after compilation, exported-class validation and link
-succeed. Public object identity, transferable facet classes, deployment bindings/logging and
-changing a namespace's class source are later integration work.
+succeed. `POST /hibernate` is the private component-test control for the existing actor-tree
+eviction implementation; it retains WebSocket managers. No public Node endpoint is added.
 
-The exact Rust paths permitted for this patch are `server/server/bridge.rs`, `config.rs`,
-`lib.rs`, `root_loader.rs` and `worker.rs` below `src/workerd/`. Its other changes are the
-server configuration schema and the factory's owned-config compile hook. The preceding patch
-files retain their original bytes and behavior.
+The exact Rust paths permitted for this patch are `actor.rs`, `bindings.rs`, `bridge.rs`,
+`channels.rs`, `config.rs`, `lib.rs`, `loader.rs`, `root_loader.rs` and `worker.rs` below
+`src/workerd/server/server/`. Its C++ and schema changes remain in the server package. The
+preceding patch files retain their original bytes.
 
 ### Upstream pin history
 
