@@ -510,6 +510,7 @@ async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
   if (!storage) return Response.json({ outcome: "notDue", atUnixMs: 0, reason: "the object has no storage" });
   const held = await storage.getAlarm();
   if (held === null || held === undefined) return Response.json({ outcome: "notDue", atUnixMs: 0 });
+  if (held !== scheduledAtUnixMs) return Response.json({ outcome: "notDue", atUnixMs: held });
   if (held > Date.now()) return Response.json({ outcome: "notDue", atUnixMs: held });
   if (typeof object.alarm !== "function") {
     // Nothing can ever run it: the alarm goes rather than being retried for ever.
@@ -524,7 +525,7 @@ async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
   if ((await storage.getAlarm()) === held) await storage.deleteAlarm();
   return Response.json({ outcome: "fired", atUnixMs: 0 });
 }
-function __coworkerdDurableClass(namespace, name) {
+function __coworkerdDurableClass(namespace, name, root = false) {
   const base = Object.prototype.hasOwnProperty.call(namespace, name) ? namespace[name] : undefined;
   const missing = class { constructor() { throw new Error("Durable Object class " + name + " is not a class of this version"); } };
   if (typeof base !== "function") return missing;
@@ -540,20 +541,29 @@ function __coworkerdDurableClass(namespace, name) {
     Object.defineProperty(wrapped.prototype, "fetch", { configurable: true, writable: true, value: function (...args) {
       const env = __coworkerdObjectEnvs.get(this);
       let scheduled = null, retry = 0;
-      try {
-        scheduled = args[0]?.headers?.get(${JSON.stringify(DO_ALARM_HEADER)}) ?? null;
-        retry = Number(args[0]?.headers?.get(${JSON.stringify(DO_ALARM_RETRY_HEADER)}) ?? 0) || 0;
-      } catch {}
+      if (!root) {
+        try {
+          scheduled = args[0]?.headers?.get(${JSON.stringify(DO_ALARM_HEADER)}) ?? null;
+          retry = Number(args[0]?.headers?.get(${JSON.stringify(DO_ALARM_RETRY_HEADER)}) ?? 0) || 0;
+        } catch {}
+      }
       if (scheduled !== null) return withEnv(env, () => __coworkerdAlarm(this, Number(scheduled), retry));
       if (typeof fetch !== "function")
         throw new Error("Durable Object class " + name + " has no fetch handler");
       return withEnv(env, () => fetch.apply(this, args));
     } });
+    if (root) Object.defineProperty(wrapped.prototype, "__coworkerdAlarm", {
+      configurable: true,
+      value: function (scheduledAtUnixMs, retryCount) {
+        const env = __coworkerdObjectEnvs.get(this);
+        return withEnv(env, async () => (await __coworkerdAlarm(this, Number(scheduledAtUnixMs), Number(retryCount))).json());
+      },
+    });
     // The object as a capability, for a method call on its stub: the Host asks the facet for it and the node hands it
     // to the caller, so the call is delivered to this instance by workerd's own RPC.
     Object.defineProperty(wrapped.prototype, "__coworkerdRpcTarget", { configurable: true, get: function () {
       const env = __coworkerdObjectEnvs.get(this);
-      return withEnv(env, () => __coworkerdRpcFacade(this, env));
+      return withEnv(env, () => __coworkerdRpcFacade(this, env, root ? ["__coworkerdAlarm"] : []));
     } });
     Object.defineProperty(wrapped, "name", { value: name });
     return wrapped;
@@ -584,9 +594,10 @@ function __coworkerdMemberNames(instance) {
   }
   return names;
 }
-function __coworkerdRpcFacade(instance, env) {
+function __coworkerdRpcFacade(instance, env, hidden = []) {
   class Facade extends RpcTarget {}
   for (const name of __coworkerdMemberNames(instance)) {
+    if (hidden.includes(name)) continue;
     const described = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(instance), name) ??
       { value: instance[name] };
     if (typeof described.get === "function") {
@@ -668,7 +679,8 @@ function durableFieldsValid(value) {
       Number.isInteger(target.shard ?? 0) && DECIMAL.test(String(target.shardEpoch ?? "0")) &&
       DECIMAL.test(String(target.dataEpoch ?? "0")) &&
       (target.database === undefined || target.database === "" || RESOURCE_NAME.test(target.database)) &&
-      (target.alarmAtUnixMs === undefined || DECIMAL.test(String(target.alarmAtUnixMs))))) return false;
+      (target.alarmAtUnixMs === undefined || DECIMAL.test(String(target.alarmAtUnixMs))) &&
+      limit(target.alarmFacetId) && limit(target.alarmRetryCount))) return false;
   if (classes !== undefined && !(Array.isArray(classes) && classes.every(name => typeof name === "string" && CLASS_NAME.test(name)))) return false;
   return true;
 }

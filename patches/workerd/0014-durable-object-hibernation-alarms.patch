@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 8 Nov 2026 22:51:48 +0800
-Subject: [PATCH] Port facet alarms and resident-object hibernation to the Rust
- actor factory
+Date: Sun, 15 Nov 2026 19:33:16 +0800
+Subject: [PATCH] Schedule every shipped database alarm on the node
 
 
 diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
@@ -138,7 +137,7 @@ index b19f85a4c1cfed6ad0dbbc94556d1e7979277e5a..51307d71925763619bbd990da483eb72
  // "<namespace>/<object>/<data epoch>" -- so the node needs no map from a path to an object; `storageId` is the
  // hexadecimal actor id its files are named after. `facetId` is 0 for the object itself, and a facet also carries its
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
-index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4f651afc5 100644
+index d3d0e717cc460e34d90454d523b7143af99b1645..02ed18e82698580f71b414103f6b0e3ad15afdfe 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
 +++ b/src/workerd/server/factory/worker-factory-actor.c++
 @@ -2,8 +2,8 @@
@@ -209,7 +208,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4
  };
  
 -// Facets have their own storage but no alarms: the scheduler delivers only to root actors.
-+// The node schedules shipped facets; the local scheduler delivers only to root actors.
++// The node schedules every shipped database; only non-shipped roots use the local scheduler.
  class FacetAlarmHooks final: public ActorSqlite::Hooks {
   public:
 +  FacetAlarmHooks() = default;
@@ -235,22 +234,24 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4
  };
  
  // The actor's storage: SQLite in the namespace's directory, or an in-memory cache over empty
-@@ -564,11 +605,14 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -564,7 +605,15 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Own<ActorSqlite::Hooks> sqliteHooks;
      kj::Maybe<ActorSqliteHooks&> rootHooks;
      uint selfId = facetId.orDefault(0);
+-    if (facetId == kj::none) {
 +    auto shippedName = kj::str(rootName.size() == 0 ? rootKey.asPtr() : rootName.asPtr());
-     if (facetId == kj::none) {
++    if (shipped) {
++      if (facetId == kj::none) {
++        // An older build may have persisted a local schedule. The database's value is now
++        // reported to the node, so remove that obsolete second scheduler's entry on open.
++        storage->alarmScheduler->deleteAlarm(ActorKey(rootKey.asPtr(), actorName));
++      }
++      sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
++    } else if (facetId == kj::none) {
        auto root =
            kj::heap<ActorSqliteHooks>(kj::addRef(*storage), ActorKey(rootKey.asPtr(), actorName));
        rootHooks = *root;
-       sqliteHooks = kj::mv(root);
-+    } else if (shipped) {
-+      sqliteHooks = kj::heap<FacetAlarmHooks>(kj::str(shippedName), selfId);
-     } else {
-       sqliteHooks = kj::heap<FacetAlarmHooks>();
-     }
-@@ -582,7 +626,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -582,7 +631,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      kj::Maybe<kj::Own<DurableLogShipper>> shipper;
      if (shipped) {
        DurableObjectName name{
@@ -259,7 +260,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4
          .storageId = kj::str(rootKey),
          .facetId = selfId,
          .parentFacetId = parentFacetId.orDefault(0),
-@@ -596,8 +640,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -596,8 +645,8 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
      KJ_IF_SOME(s, shipper) {
        shipperPtr = s.get();
      }
@@ -270,7 +271,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4
        // Close descendant actors before deleting their files; preserve cluster reset handling.
        storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
        db.run("PRAGMA journal_mode=WAL;");
-@@ -614,9 +658,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
+@@ -614,9 +663,11 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
        committer = kj::none;
      }
      KJ_IF_SOME(s, shipper) {
@@ -280,7 +281,7 @@ index d3d0e717cc460e34d90454d523b7143af99b1645..a6921675c1012269c9a5307c67fa62b4
 +      commit = [s = kj::mv(s)](SpanParent) mutable -> kj::Promise<void> { return s->onCommit(); };
 +    }
 +    // Every open reports the persisted value, including none, before ActorSqlite owns the database.
-+    if (shipped && facetId != kj::none) {
++    if (shipped) {
 +      durableLogAlarm(shippedName, selfId, alarmOf(*db));
      }
      auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
@@ -301,7 +302,7 @@ index a05ef8bbfd777fd2b5390a234f9d6c5b15f11791..9bd0cd5c7de6f0336e4e027d6550e76f
  kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex);
  
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb263b07b7e 100644
+index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -95,6 +95,7 @@ const STOPS_AT_ONCE: usize = 64;
@@ -493,7 +494,21 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
      pub(crate) fn actor_for_alarm(
          &self,
          id: KjOwn<ActorIdHandle>,
-@@ -1074,6 +1221,8 @@ pub struct ActorContainer {
+@@ -704,6 +851,13 @@ impl ActorNamespaceHandle {
+             .0
+             .upgrade()
+             .ok_or_else(|| kj::disconnected!("the Durable Object namespace is gone"))?;
++        if namespace.shipped.get() {
++            // Persisted entries from an older build can wake before the database is opened
++            // and removes them. They must never execute a second alarm beside the node's.
++            return Err(kj::disconnected!(
++                "the node schedules this shipped database's alarm"
++            ));
++        }
+         let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
+         let Some(node) = namespace.cluster().map(Rc::clone) else {
+             return namespace.container_for(id).start_request(metadata);
+@@ -1074,6 +1228,8 @@ pub struct ActorContainer {
      /// is for the on-broken monitor and a request being started, which borrow the handle; it
      /// counts no request, so it does not block the actor's shutdown.
      actor: RefCell<Option<Rc<KjOwn<ffi::ActorHandle>>>>,
@@ -502,7 +517,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
      /// The hibernation manager of the evicted actor, for the actor that replaces it.
      manager: RefCell<Option<KjRc<ffi::HibernationManager>>>,
      /// Set once the actor broke or was aborted; every later use of the container fails with it.
-@@ -1159,6 +1308,7 @@ impl ActorContainer {
+@@ -1159,6 +1315,7 @@ impl ActorContainer {
              last_access,
              class_and_id: RefCell::new(class_and_id),
              actor: RefCell::new(None),
@@ -510,7 +525,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
              manager: RefCell::new(None),
              broken_reason: RefCell::new(None),
              facets: RefCell::new(LinkedHashMap::new()),
-@@ -1198,6 +1348,53 @@ impl ActorContainer {
+@@ -1198,6 +1355,53 @@ impl ActorContainer {
          self.parent.is_none()
      }
  
@@ -564,7 +579,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
      /// The root of the facet tree; a facet whose parent is gone stands for it.
      fn root(self: &Rc<Self>) -> Rc<Self> {
          let mut container = Rc::clone(self);
-@@ -1343,6 +1540,8 @@ impl ActorContainer {
+@@ -1343,6 +1547,8 @@ impl ActorContainer {
              if let Some(actor) = self.actor.borrow().clone() {
                  return Ok(actor);
              }
@@ -573,7 +588,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
              if let Some(pending) = self.pending_class() {
                  pending.await?;
                  self.require_not_broken()?;
-@@ -1358,6 +1557,11 @@ impl ActorContainer {
+@@ -1358,6 +1564,11 @@ impl ActorContainer {
              // A concurrent request may have started the actor meanwhile.
              if !self.is_running() {
                  self.start(&class)?;
@@ -585,7 +600,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
              }
              return self
                  .actor
-@@ -1814,10 +2018,23 @@ impl ActorContainer {
+@@ -1814,10 +2025,23 @@ impl ActorContainer {
      /// Starts a root's hook only once it has no requests. Once committed, retirement belongs to
      /// the container, so canceling a test eviction or the idle timer cannot interrupt it.
      async fn try_evict(&self, reason: &str, hibernate: bool) -> Result<bool> {
@@ -610,7 +625,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
          }
          let current = self.actor.borrow().clone();
          // The handler may be read only while the actor is idle.
-@@ -1842,15 +2059,25 @@ impl ActorContainer {
+@@ -1842,15 +2066,25 @@ impl ActorContainer {
              let retirement = ns
                  .factory
                  .spawn(async move {
@@ -639,7 +654,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
      }
  
      /// Shuts the actor down, keeping its storage. Returns false without evicting if the actor
-@@ -1860,7 +2087,12 @@ impl ActorContainer {
+@@ -1860,7 +2094,12 @@ impl ActorContainer {
      /// the shutdown and the clearing of the slot after it are one step, so no request finds a
      /// shut-down actor in the slot. The on-broken monitor is cancelled only once the shutdown
      /// is committed, so that an early `false` leaves the actor watched.
@@ -653,7 +668,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
          let current = self.actor.borrow().clone();
          if let Some(actor) = &current {
              if hibernate {
-@@ -1877,6 +2109,11 @@ impl ActorContainer {
+@@ -1877,6 +2116,11 @@ impl ActorContainer {
                  Some(_) => return Ok(false),
                  None => return Ok(true),
              }
@@ -665,7 +680,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
              if !ffi::actor_shutdown(actor, reason, lock.into())? {
                  return Ok(false);
              }
-@@ -1884,6 +2121,12 @@ impl ActorContainer {
+@@ -1884,6 +2128,12 @@ impl ActorContainer {
          self.cancel_on_broken();
          self.cancel_shutdown();
          *self.actor.borrow_mut() = None;
@@ -678,7 +693,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
          if !hibernate {
              *self.manager.borrow_mut() = None;
          }
-@@ -1891,6 +2134,16 @@ impl ActorContainer {
+@@ -1891,6 +2141,16 @@ impl ActorContainer {
      }
  }
  
@@ -695,7 +710,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
  async fn retire_actor(
      container: Weak<ActorContainer>,
      actor: Rc<KjOwn<ffi::ActorHandle>>,
-@@ -1898,6 +2151,7 @@ async fn retire_actor(
+@@ -1898,6 +2158,7 @@ async fn retire_actor(
      metadata: KjOwn<RequestMetadata>,
      reason: String,
      hibernate: bool,
@@ -703,7 +718,7 @@ index c40b92c8ed7217dafe712b82f094ffe0a7fcc9c0..83d4bb9483d86221ffb95c6cd10abbb2
  ) -> Result<()> {
      let hook = class.run_on_hibernate(metadata, &actor).await;
      let container = container
-@@ -1906,7 +2160,16 @@ async fn retire_actor(
+@@ -1906,7 +2167,16 @@ async fn retire_actor(
      let result = async {
          hook?;
          container.require_not_broken()?;

@@ -367,6 +367,7 @@ struct DurableTarget {
   // times its handler has already been tried.
   uint64_t alarmAtUnixMs = 0;
   uint32_t alarmRetryCount = 0;
+  uint32_t alarmFacetId = 1;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
@@ -2789,6 +2790,7 @@ private:
       target.setDatabase(durable->database.c_str());
       target.setAlarmAtUnixMs(durable->alarmAtUnixMs);
       target.setAlarmRetryCount(durable->alarmRetryCount);
+      target.setAlarmFacetId(durable->alarmFacetId);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       return json.encode(descriptor.asReader());
@@ -4263,6 +4265,7 @@ public:
     remote.setDatabase(target.database.c_str());
     remote.setAlarmAtUnixMs(target.alarmAtUnixMs);
     remote.setAlarmRetryCount(target.alarmRetryCount);
+    remote.setAlarmFacetId(target.alarmFacetId);
     const auto remaining = std::max(0.0, deadline - monotonicTimeMs());
     if (remaining == 0) {
       server.rejectExpiredLease("lease expired before forwarding");
@@ -6021,6 +6024,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   request.target.database = owner->database;
   request.target.alarmAtUnixMs = alarm.atUnixMs;
   request.target.alarmRetryCount = alarm.retryCount;
+  request.target.alarmFacetId = alarm.facetId;
   CollectedResponse answer;
   try {
     answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
@@ -6091,6 +6095,7 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   request.target.database = remote.getDatabase().cStr();
   request.target.alarmAtUnixMs = remote.getAlarmAtUnixMs();
   request.target.alarmRetryCount = remote.getAlarmRetryCount();
+  request.target.alarmFacetId = remote.getAlarmFacetId();
   if (!request.target.database.empty()) {
     request.target.tenant = coworkerd::tenantOf(request.workerId);
     KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&
