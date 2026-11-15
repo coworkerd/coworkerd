@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 15 Nov 2026 19:33:16 +0800
+Date: Sun, 15 Nov 2026 19:44:05 +0800
 Subject: [PATCH] Load private roots with bounded storage fences and node alarm
  targets
 
@@ -285,7 +285,7 @@ index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad4033228
  bool frankenvalue_is_empty(const Frankenvalue& value);
  kj::Own<Frankenvalue> frankenvalue_new();
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d224726638 100644
+index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..822ae4cb1d74a524d12da1a1bd5150eb0d2889ed 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -21,6 +21,7 @@
@@ -1087,7 +1087,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
      fn tree_has_requests(&self) -> bool {
          self.active.get()
              || self
-@@ -1535,19 +1963,39 @@ impl ActorContainer {
+@@ -1535,20 +1963,41 @@ impl ActorContainer {
      /// The running actor, started first if it is not running.
      async fn get_actor(&self) -> Result<Rc<KjOwn<ffi::ActorHandle>>> {
          loop {
@@ -1113,6 +1113,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
                  continue;
              }
              self.require_not_broken()?;
++            let wake_started = ns.factory.now();
 +            if self.pending_class().is_none() {
 +                let class = self.class()?;
 +                if !class.request_ready() {
@@ -1124,12 +1125,14 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
                  return Ok(actor);
              }
 -            let ns = self.namespace()?;
+-            let woke_from = self.was_evicted.get().then(|| ns.factory.now());
 +            ns.wait_root_closed(&self.root_key).await?;
 +            self.require_not_broken()?;
-             let woke_from = self.was_evicted.get().then(|| ns.factory.now());
++            let woke_from = self.was_evicted.get().then_some(wake_started);
              if let Some(pending) = self.pending_class() {
                  pending.await?;
-@@ -1682,7 +2130,10 @@ impl ActorContainer {
+                 self.require_not_broken()?;
+@@ -1682,7 +2131,10 @@ impl ActorContainer {
              ns.ensure_cleanup_loop();
          }
          let client = Client(Rc::clone(self));
@@ -1141,7 +1144,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
              self.actor.borrow().clone()
          } else {
              None
-@@ -1789,6 +2240,18 @@ impl ActorContainer {
+@@ -1789,6 +2241,18 @@ impl ActorContainer {
      /// the container leaves its map, dropping the hibernation manager (which disconnects the
      /// hibernated WebSockets).
      fn broken(self: &Rc<Self>, reason: &crate::Error) {
@@ -1160,7 +1163,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          *self.broken_reason.borrow_mut() = Some(reason.clone());
          let facets = std::mem::take(&mut *self.facets.borrow_mut());
          for facet in facets.values() {
-@@ -1852,6 +2315,15 @@ impl ActorContainer {
+@@ -1852,6 +2316,15 @@ impl ActorContainer {
          if self.broken_reason.borrow().is_some() {
              return None;
          }
@@ -1176,7 +1179,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          let actor = self.actor.borrow_mut().take();
          if let Some(actor) = &actor {
              // Only an error cancels a committed hook, which must stop before ownership is released.
-@@ -1877,9 +2349,22 @@ impl ActorContainer {
+@@ -1877,9 +2350,22 @@ impl ActorContainer {
          );
          let owned = self.release(actor.as_deref());
          drop(actor);
@@ -1199,7 +1202,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
      /// Whether this actor or a facet of it has a request in flight.
      fn tree_active(&self) -> bool {
          self.active.get() || self.facets.borrow().values().any(|f| f.tree_active())
-@@ -1968,7 +2453,7 @@ impl ActorContainer {
+@@ -1968,7 +2454,7 @@ impl ActorContainer {
  
      /// Test hook: evicts the actor and its facets, those that are running; the bulk eviction
      /// must not fail on actors that are not.
@@ -1208,7 +1211,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          self: &Rc<Self>,
          hibernate: bool,
      ) -> LocalBoxFuture<'static, Result<()>> {
-@@ -1978,7 +2463,7 @@ impl ActorContainer {
+@@ -1978,7 +2464,7 @@ impl ActorContainer {
              let facets: Vec<Rc<Self>> = this.facets.borrow().values().cloned().collect();
              let mut evictions: Vec<LocalBoxFuture<'static, Result<()>>> = facets
                  .iter()
@@ -1217,7 +1220,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
                  .collect();
              if this.is_running() {
                  let this = Rc::clone(&this);
-@@ -2001,7 +2486,7 @@ impl ActorContainer {
+@@ -2001,7 +2487,7 @@ impl ActorContainer {
          let deadline = factory.now() + EVICT_TIMEOUT;
          loop {
              if self
@@ -1226,7 +1229,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
                  .await?
              {
                  return Ok(());
-@@ -2037,7 +2522,19 @@ impl ActorContainer {
+@@ -2037,7 +2523,19 @@ impl ActorContainer {
          let resident_pass = resident_root.is_some();
          let retirement = self.retirement.borrow().clone();
          if let Some(retirement) = retirement {
@@ -1247,7 +1250,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
              return Ok(!resident_pass || !self.is_running());
          }
          if !resident_tree_idle(resident_root.as_ref()) {
-@@ -2080,7 +2577,18 @@ impl ActorContainer {
+@@ -2080,7 +2578,18 @@ impl ActorContainer {
                  .shared();
              *self.retirement.borrow_mut() = Some(retirement.clone());
              self.cancel_shutdown();
@@ -1267,7 +1270,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
              return Ok(!resident_pass || !self.is_running());
          }
          self.finish_eviction(reason, hibernate, resident_root.as_ref())
-@@ -2104,6 +2612,9 @@ impl ActorContainer {
+@@ -2104,6 +2613,9 @@ impl ActorContainer {
          if let Some(actor) = &current {
              if hibernate {
                  self.save_manager();
@@ -1277,7 +1280,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
              }
              let lock = if hibernate && self.manager.borrow().is_some() {
                  Some(ffi::actor_lock(actor).await?)
-@@ -2128,15 +2639,15 @@ impl ActorContainer {
+@@ -2128,15 +2640,15 @@ impl ActorContainer {
          self.cancel_on_broken();
          self.cancel_shutdown();
          *self.actor.borrow_mut() = None;
@@ -1296,7 +1299,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          Ok(true)
      }
  }
-@@ -2305,7 +2816,13 @@ async fn resolve_facet_start(
+@@ -2305,7 +2817,13 @@ async fn resolve_facet_start(
  ) -> Result<()> {
      let ffi::FacetStartInfo { id, actor_class } = ffi::facet_start_resolve(start).await?;
      if let Some(container) = container.upgrade() {
@@ -1311,7 +1314,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          *container.class_and_id.borrow_mut() = ClassState::Ready { class, id };
      }
      Ok(())
-@@ -2313,6 +2830,10 @@ async fn resolve_facet_start(
+@@ -2313,6 +2831,10 @@ async fn resolve_facet_start(
  
  impl Drop for ActorContainer {
      fn drop(&mut self) {
@@ -1322,7 +1325,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
          for facet in self.facets.get_mut().values() {
              facet.abort(None);
          }
-@@ -2321,6 +2842,10 @@ impl Drop for ActorContainer {
+@@ -2321,6 +2843,10 @@ impl Drop for ActorContainer {
              ffi::actor_abort(actor, &AbortReason(None));
          }
          drop(self.release(actor.as_deref()));
@@ -1333,7 +1336,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..87e688278089edd3cc69e3d352d978d2
      }
  }
  
-@@ -2617,6 +3142,18 @@ impl Drop for Client {
+@@ -2617,6 +3143,18 @@ impl Drop for Client {
  }
  
  /// A stub's channel to an actor.
