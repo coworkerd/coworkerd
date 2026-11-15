@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 07:37:30 +0800
+Date: Mon, 16 Nov 2026 07:53:45 +0800
 Subject: [PATCH] Load roots with bounded lifecycle cleanup and private
  per-event preparation
 
@@ -154,6 +154,121 @@ index 0000000000000000000000000000000000000000..6d0f07748f0fa68afb26da6791f85bed
 +};
 +
 +}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 26c8c7daffe28caae120f0fac9e5112b9626ebde..00c12e4f371aaf239fcbe0e3279e03ac68e41225 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -16,11 +16,13 @@
+ #include <kj/function.h>
+ #include <kj/mutex.h>
+ #include <kj/thread.h>
++#include <kj/timer.h>
+ #include <kj/time.h>
+ #include <kj/vector.h>
+ #include <atomic>
+ #include <cstdio>
+ #include <pthread.h>
++#include <unordered_map>
+ #include <unistd.h>
+ #if __APPLE__
+ #include <mach/mach.h>
+@@ -104,11 +106,51 @@ class LimitWatchdog {
+ };
+ 
+ // CPU accounting stays on the isolate thread; only termination and event writes cross threads.
++// Root plans can have thousands of live actor contexts. A single fork rejection would
++// put every context's teardown on the event loop at once, ahead of health-probe I/O.
++class RootLimitFailures final: public kj::Refcounted {
++ public:
++  RootLimitFailures(kj::Timer& timer, kj::TaskSet& tasks): timer(timer), tasks(tasks) {}
++  kj::Promise<void> subscribe() {
++    KJ_IF_SOME(error, published) { return kj::Promise<void>(error.clone()); }
++    const auto id = ++nextId;
++    auto paf = kj::newPromiseAndFulfiller<void>();
++    subscribers.emplace(id, kj::mv(paf.fulfiller));
++    return paf.promise.attach(kj::defer([self = kj::addRef(*this), id]() mutable {
++      self->subscribers.erase(id);
++    }));
++  }
++  void publish(kj::Exception error) {
++    if (published != kj::none) return;
++    published = kj::mv(error);
++    tasks.add(kj::evalLater([self = kj::addRef(*this)]() mutable {
++      auto promise = self->drain();
++      return promise.attach(kj::mv(self));
++    }));
++  }
++ private:
++  kj::Promise<void> drain() {
++    for (unsigned i = 0; i < 8 && !subscribers.empty(); ++i) {
++      auto at = subscribers.begin();
++      auto fulfiller = kj::mv(at->second);
++      subscribers.erase(at);
++      KJ_IF_SOME(error, published) { fulfiller->reject(error.clone()); }
++    }
++    if (subscribers.empty()) return kj::READY_NOW;
++    return timer.afterDelay(1 * kj::MILLISECONDS).then([this]() { return drain(); });
++  }
++  kj::Timer& timer;
++  kj::TaskSet& tasks;
++  uint64_t nextId = 0;
++  kj::Maybe<kj::Exception> published;
++  std::unordered_map<uint64_t, kj::Own<kj::PromiseFulfiller<void>>> subscribers;
++};
++
+ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+   CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
+       const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "",
+-      IdleWorkerRef idleWorker = {})
++      IdleWorkerRef idleWorker = {}, kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
+       : fallback(kj::mv(fallback)), name(kj::str(name)),
+         cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)), idleWorker(kj::mv(idleWorker)) {
+     KJ_IF_SOME(record, identity) {
+@@ -123,9 +165,14 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     }
+     if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
+     recordPlatformFacts(name, tenantWorker);
+-    auto paf = kj::newPromiseAndFulfiller<void>();
+-    failure = paf.promise.fork();
+-    fulfiller = kj::mv(paf.fulfiller);
++    if (rootTimer != nullptr) {
++      KJ_REQUIRE(rootTasks != nullptr);
++      rootFailures = kj::refcounted<RootLimitFailures>(*rootTimer, *rootTasks);
++    } else {
++      auto paf = kj::newPromiseAndFulfiller<void>();
++      failure = paf.promise.fork();
++      fulfiller = kj::mv(paf.fulfiller);
++    }
+     if (cpuNs) record("created", "", 0);
+     if (memory) record("memory-created", "", 0);
+   }
+@@ -202,11 +249,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   void requireNotExceeded() {
+     if (exceeded->load() != IsolateLimitCause::NONE) kj::throwFatalException(exception());
+   }
+-  kj::Promise<void> onExceeded() { return failure.addBranch(); }
++  kj::Promise<void> onExceeded() {
++    KJ_IF_SOME(roots, rootFailures) { return roots->subscribe(); }
++    return failure.addBranch();
++  }
+   bool publish() {
+     if (exceeded->load() == IsolateLimitCause::NONE || published) return false;
+     published = true;
+-    fulfiller->reject(exception());
++    KJ_IF_SOME(roots, rootFailures) { roots->publish(exception()); }
++    else { fulfiller->reject(exception()); }
+     return true;
+   }
+ 
+@@ -419,6 +470,7 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   bool published = false;
+   kj::ForkedPromise<void> failure = nullptr;
+   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
++  kj::Maybe<kj::Own<RootLimitFailures>> rootFailures;
+ };
+ 
+ kj::Own<LimitEnforcer> wrapCpuRequestLimits(kj::Own<LimitEnforcer> fallback,
 diff --git a/src/workerd/server/factory/worker-factory-actor.c++ b/src/workerd/server/factory/worker-factory-actor.c++
 index 7a55fe69b6a0272691c76dd02170a41f265b4ae2..3c607e13c0d2a8d9b2b00d00184f75343c627cb4 100644
 --- a/src/workerd/server/factory/worker-factory-actor.c++
@@ -170,7 +285,7 @@ index 7a55fe69b6a0272691c76dd02170a41f265b4ae2..3c607e13c0d2a8d9b2b00d00184f7534
    auto info = co_await (*start)();
    co_await info.ensureAllResolved();
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index bcd603003a4440a8cb5da97b5a683449b6b641af..2248906c9825b31eaa5abe1085694d6f2da5b407 100644
+index bcd603003a4440a8cb5da97b5a683449b6b641af..0b377fe8ebc7ef43535757b6b56bd3fce51f123a 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -1276,6 +1276,9 @@ kj::Own<RequestMetadata> new_request_metadata(
@@ -244,7 +359,18 @@ index bcd603003a4440a8cb5da97b5a683449b6b641af..2248906c9825b31eaa5abe1085694d6f
      extensions = factory.config.getExtensions();
      impl->flagsArena = kj::heap<capnp::MallocMessageBuilder>();
      featureFlags = compileFlags(options, conf, *impl->flagsArena, errorReporter);
-@@ -1891,6 +1920,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+@@ -1753,7 +1782,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+         kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
+-        kj::str(spec.load_identity.startup_identity), impl->idleWorker);
++        kj::str(spec.load_identity.startup_identity), impl->idleWorker,
++        spec.runtime_config.size() != 0 ? &factory.timer : nullptr,
++        spec.runtime_config.size() != 0 ? &factory.tasks : nullptr);
+     auto limitEnforcer = kj::addRef(*impl->cpuLimits);
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+@@ -1891,6 +1922,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    }
  
    kj::Maybe<kj::Own<void>> ownContent;
@@ -292,7 +418,7 @@ index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad4033228
  bool frankenvalue_is_empty(const Frankenvalue& value);
  kj::Own<Frankenvalue> frankenvalue_new();
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..632efc0a73032e8c77c9356cd905a8377ef3eae6 100644
+index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211efdb019aa 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -21,6 +21,7 @@
@@ -850,7 +976,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..632efc0a73032e8c77c9356cd905a837
 +            for (index, (_, container)) in actors.into_iter().enumerate() {
 +                container.abort(Some(reason.clone()));
 +                container.namespace_removed();
-+                if (index + 1) % 64 == 0 {
++                if (index + 1) % 16 == 0 {
 +                    namespace.factory.sleep(Duration::from_millis(1)).await;
 +                }
 +            }
@@ -1834,7 +1960,7 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e32cea5d449507f9ca033ab38390992805fbbe21
+index 0000000000000000000000000000000000000000..c1bb96dc853abe225ce6cf465685965b48e02ee2
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
 @@ -0,0 +1,2236 @@
@@ -3226,7 +3352,7 @@ index 0000000000000000000000000000000000000000..e32cea5d449507f9ca033ab383909928
 +                        storage_key,
 +                        &kj::disconnected!("root worker limit exceeded"),
 +                    );
-+                    if (index + 1) % 64 == 0 {
++                    if (index + 1) % 16 == 0 {
 +                        registry.factory.sleep(Duration::from_millis(1)).await;
 +                    }
 +                }
