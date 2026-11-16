@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 07:34:23 +0800
+Subject: [PATCH] Read the factory background observer through its mutable
+ callback
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 1e5b85c8ea1d0606dbb4d8f5b917c047c54d2049..b1d141cb8b420ea40b5db2f2fd1690382f8b584c 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -171,10 +171,12 @@ class IdleReaper {
+     kj::Vector<kj::String> entries;
+     for (auto it = workers.begin(); it != workers.end();) {
+       if (auto worker = it->lock()) {
++        bool backgroundActive = false;
++        KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
+         if (worker->created && !worker->destroyed) entries.add(kj::str(
+             "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
+             labelFields(worker->labels), ",\"active\":", worker->active,
+-            ",\"backgroundActive\":", worker->backgroundDone.map([](auto& done) { return !done(); }).orDefault(false) ? "true" : "false", "}"));
++            ",\"backgroundActive\":", backgroundActive ? "true" : "false", "}"));
+         ++it;
+       } else {
+         it = workers.erase(it);

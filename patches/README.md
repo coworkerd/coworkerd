@@ -78,7 +78,7 @@ operations validate the series before mutating a checkout or exporting files.
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024, 0025, 0026 and 0027, in that order.
+0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027 and 0028, in that order.
 0014 completes the Durable Object port; 0020 adds the private runtime root loader;
 0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
@@ -357,3 +357,5 @@ generation draining continue to use the original isolate-name decisions in this 
 The private selection carries resolved service versions and object namespace references separately from the immutable ordinary plan. Only declared names and their declared Worker may be resolved. The selected default bridge owns existing idle activity through its channel lifetime, covering the interval before the first request. Ordinary and supersession teardown have separate pending markers.
 
 The factory lifecycle snapshot observes the existing wait-until task set and reports activity without changing IoContext. Ordinary compile attribution uses an owned, validated invocation identity supplied for that compilation, outside the plan and its fingerprint. Lookup/install cold state is observed without consuming it; the first request consumes it. Actor class providers reject namespace-free plans. All new Native changes remain within server factory and Rust server files; IoContext, V8 and general RPC semantics are unchanged.
+
+0028 reads the background observer through the existing mutable KJ callback.
