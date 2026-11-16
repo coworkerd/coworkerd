@@ -663,8 +663,9 @@ async function d1TimeTravel(args) {
     if (answer.known === false) answer = await submit();
   }
   answer.elapsedSeconds = Number(((Date.now() - started) / 1000).toFixed(3));
-  if (options.json) return show(answer);
-  console.log(`database ${tenant}/${answer.database}: restored revision ${answer.point.revision}, ${new Date(Number(answer.point.writtenAtUnixMs)).toISOString()}, ${answer.elapsedSeconds}s`);
+  if (options.json) show(answer);
+  else console.log(`database ${tenant}/${answer.database}: restored revision ${answer.point.revision}, ${new Date(Number(answer.point.writtenAtUnixMs)).toISOString()}, ${answer.elapsedSeconds}s`);
+  await rm(file, { force: true });
 }
 
 // cowctl d1 create|list|delete|execute: the tenant's databases. `execute` goes through the HTTP SQL interface, which

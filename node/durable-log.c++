@@ -705,6 +705,12 @@ bool DatabaseReplay::finish() {
   }
   return synced;
 }
+kj::Promise<bool> DatabaseReplay::finishAsync() {
+  if (fd < 0) co_return true;
+  const bool synced = co_await synchronizeRecoveryFile(fd);
+  ::close(fd); fd = -1;
+  co_return synced;
+}
 
 // ---- The replicator ----
 
@@ -3855,6 +3861,8 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
 
 kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason) {
   const auto start = monotonicTimeMs();
+  auto loopDelay = std::make_shared<double>(0);
+  auto measuring = measureRecoveryLoop(loopDelay).eagerlyEvaluate(nullptr);
   double tailStart = start;
   {
     auto* object = objectOf(objectName);
@@ -3937,7 +3945,9 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
       for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
-      co_await downloadSnapshot(*manifest, storage, staging, check);
+      co_await downloadSnapshot(*manifest, storage, staging, check, [this, objectName](double ms) {
+        log("recovery-fsync", "\"object\":" + quote(objectName) + ",\"stage\":\"download\",\"ms\":" + std::to_string(ms));
+      });
       check();
       facets = manifest->facets;
       for (const auto& facet : facets) fromSeq = std::max(fromSeq, facet.upToSeq);
@@ -4049,7 +4059,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   }
   // Finish and synchronize the new image before touching any original file or facet entry.
   for (const auto& record : history) stagingFacets.insert(record.facetId);
-  auto rebuilt = applyRecords(*object, staging, std::move(history), facets, snapshotShardEpoch, drop);
+  auto rebuilt = co_await replayToAsync(storage, objectName, targetEpoch, staging, std::move(history), facets,
+      snapshotShardEpoch, drop, {}, check, [this, objectName](double ms) {
+        log("recovery-fsync", "\"object\":" + quote(objectName) + ",\"stage\":\"replay\",\"ms\":" + std::to_string(ms));
+      });
   check();
   KJ_REQUIRE(!recoveryWriteFailed, "a held or unfenced local image cannot be deleted");
   object->facets.clear();
@@ -4125,6 +4138,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   ++rebuilds;
   ++object->rebuilds;
   lastRebuildMs = monotonicTimeMs() - start;
+  lastRebuildLoopDelayMs = *loopDelay;
   object->lastRebuildMs = lastRebuildMs;
   writePosition(*object);
   log("rebuilt", "\"object\":" + quote(objectName) + ",\"ms\":" + std::to_string(lastRebuildMs) + ",\"manifest\":\"" +
@@ -4135,10 +4149,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
 kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
-    const std::string& staging, std::function<void()> check) {
+    const std::string& staging, std::function<void()> check, std::function<void(double)> observeFsync) {
   return downloadRecoverySnapshot([this](std::string key) { return store->get(std::move(key)); }, manifest,
       ref, settings.stackDirectory, staging, settings.config.snapshotPartBytes, settings.config.recoverParallelism,
-      std::move(check), [this]() { return timer.afterDelay(1 * kj::MILLISECONDS); });
+      std::move(check), []() { return kj::yieldUntilWouldSleep(); }, std::move(observeFsync));
 }
 
 kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part,
@@ -4950,9 +4964,8 @@ public:
               std::to_string(record.facetId) + ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) +
               "\",\"nodeSeq\":\"" + std::to_string(record.nodeSeq) + "\",\"applied\":" + std::to_string(applied) +
               ",\"records\":" + std::to_string(ordered.size()) + ",\"reason\":" + quote(error));
-      for (auto& [facetId, entry] : replays) {
-        if (entry) entry->finish();
-      }
+      // Invalid staging is never used. Destruction closes it and the caller
+      // removes it; synchronizing an image that is about to be discarded is unnecessary.
       KJ_FAIL_REQUIRE("the replicated history of a Durable Object is not whole", historyName.c_str(),
           record.nodeSeq, error.c_str());
     }
@@ -4972,6 +4985,22 @@ public:
       if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
           log.databasePath(destination, facetId, "", staging).string().c_str());
     }
+    return finishMetadata();
+  }
+  kj::Promise<std::map<uint32_t, Facet>> finishAsync(std::function<void()> check,
+      std::function<void(double)> observeFsync) {
+    for (auto& [facetId, replay] : replays) {
+      if (!replay) continue;
+      const auto began = monotonicTimeMs();
+      const bool synced = co_await replay->finishAsync();
+      if (observeFsync) observeFsync(monotonicTimeMs() - began);
+      check();
+      KJ_REQUIRE(synced, "cannot synchronize a rebuilt Durable Object database",
+          log.databasePath(destination, facetId, "", staging).string().c_str());
+    }
+    co_return finishMetadata();
+  }
+  std::map<uint32_t, Facet> finishMetadata() {
     for (const auto& facet : facets) {
       auto& entry = rebuilt[facet.facetId];
       entry.facetId = facet.facetId;
@@ -5019,24 +5048,32 @@ kj::Promise<std::map<uint32_t, DurableLog::Facet>> DurableLog::replayToAsync(Roo
     std::string historyName, uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
     std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
     std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
-    std::function<void()> check) {
+    std::function<void()> check, std::function<void(double)> observeFsync) {
   ReplayState state(*this, std::move(destination), std::move(historyName), bookkeepingEpoch,
       std::move(staging), std::move(facets), snapshotShardEpoch, std::move(drop), std::move(beforeWrite));
-  size_t batch = 0; auto began = monotonicTimeMs();
+  auto began = monotonicTimeMs();
   for (auto& record : history) {
     state.add(std::move(record));
-    if (++batch >= 128 || monotonicTimeMs() - began >= 5) {
-      co_await timer.afterDelay(1 * kj::MILLISECONDS); check(); batch = 0; began = monotonicTimeMs();
+    if (monotonicTimeMs() - began >= 2) {
+      co_await kj::yieldUntilWouldSleep(); check(); began = monotonicTimeMs();
     }
   }
   history.clear();
   for (const auto& [position, record] : state.ordered) {
     state.apply(record);
-    if (++batch >= 128 || monotonicTimeMs() - began >= 5) {
-      co_await timer.afterDelay(1 * kj::MILLISECONDS); check(); batch = 0; began = monotonicTimeMs();
+    if (monotonicTimeMs() - began >= 2) {
+      co_await kj::yieldUntilWouldSleep(); check(); began = monotonicTimeMs();
     }
   }
-  check(); co_return state.finish();
+  check(); co_return co_await state.finishAsync(std::move(check), std::move(observeFsync));
+}
+
+kj::Promise<void> DurableLog::measureRecoveryLoop(std::shared_ptr<double> maximum) {
+  for (;;) {
+    const auto began = monotonicTimeMs();
+    co_await timer.afterDelay(5 * kj::MILLISECONDS);
+    *maximum = std::max(*maximum, monotonicTimeMs() - began - 5);
+  }
 }
 
 // The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a
@@ -6144,7 +6181,8 @@ std::string DurableLog::json() const {
       << ",\"openCache\":" << openCaches
       << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
-      << ",\"recoverTimeouts\":" << recoverTimeouts << ",\"lastRebuildMs\":" << lastRebuildMs << ",\"lastError\":"
+      << ",\"recoverTimeouts\":" << recoverTimeouts << ",\"lastRebuildMs\":" << lastRebuildMs
+      << ",\"lastRebuildLoopDelayMs\":" << lastRebuildLoopDelayMs << ",\"lastError\":"
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"
       << (diskTrusted ? "true" : "false") << ",\"note\":" << quote(startupNote) << ",\"limitBytes\":\""
       << diskLimitBytes << "\",\"usedBytes\":\"" << diskUsedBytes << "\",\"filesDropped\":" << filesDropped

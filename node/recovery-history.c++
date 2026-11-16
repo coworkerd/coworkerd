@@ -11,8 +11,24 @@
 #include <cerrno>
 #include <memory>
 #include <tuple>
+#include <thread>
+#include <system_error>
 namespace coworkerd {
 using json::quote;
+kj::Promise<bool> synchronizeRecoveryFile(int fd) {
+  const int copy = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+  if (copy < 0) co_return false;
+  auto file = std::shared_ptr<int>(new int(copy), [](int* fd) { ::close(*fd); delete fd; });
+  auto pair = kj::newPromiseAndCrossThreadFulfiller<bool>();
+  auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<bool>>>(kj::mv(pair.fulfiller));
+  try {
+    std::thread([file, fulfiller]() {
+      const bool synced = ::fsync(*file) == 0;
+      (*fulfiller)->fulfill(bool(synced));
+    }).detach();
+  } catch (const std::system_error&) { co_return false; }
+  co_return co_await kj::mv(pair.promise);
+}
 void HistoryBudget::memory(uint64_t required) {
   memoryHighWater = std::max(memoryHighWater, required);
   if (required > memoryLimit) { if (refuse) refuse(required, memoryLimit, "memoryBytes"); KJ_FAIL_REQUIRE("recovery memory budget exceeded", required, memoryLimit); }
@@ -86,9 +102,9 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
       std::string error;
       auto contents = decodeSegment(bodies[i], &error);
       KJ_REQUIRE(contents.has_value(), "a segment of a Durable Object's log does not add up", error.c_str());
-      size_t batch = 0;
+      auto began = monotonicTimeMs();
       for (auto& record : contents->records) {
-        if (yield && ++batch >= 128) { co_await yield(); if (check) check(); batch = 0; }
+        if (yield && monotonicTimeMs() - began >= 2) { co_await yield(); if (check) check(); began = monotonicTimeMs(); }
         if (record.objectName != objectName) continue;
         const auto& header = contents->header;
         const auto& ref = wanted[at + i];
@@ -140,8 +156,10 @@ kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest&
     if (running.size() > 0) co_await kj::joinPromises(running.releaseAsArray());
         if (check) check();
     const auto syncStarted = monotonicTimeMs();
-    KJ_REQUIRE(::fsync(fd) == 0, "cannot synchronize a Durable Object snapshot", path.string().c_str());
+    const auto synced = co_await synchronizeRecoveryFile(fd);
     if (observeFsync) observeFsync(monotonicTimeMs() - syncStarted);
+    if (check) check();
+    KJ_REQUIRE(synced, "cannot synchronize a Durable Object snapshot", path.string().c_str());
     // The file must be the one the snapshot names: a wrong digest would be read as the object's state.
     const auto bytes = co_await recoveryFileDigestAsync(path, yield, check);
     KJ_REQUIRE(bytes.bytes == facet.bytes && bytes.sha256 == facet.sha256,

@@ -354,10 +354,14 @@ that have not been published can also be absent: the default segment interval is
 one exact immutable revision; a bookmark from another database is rejected. A time before all matching history fails;
 a time after the latest publication selects that latest revision. Clocks can differ at an owner takeover: revision
 order wins. The lookup searches revision numbers with exact GETs, splitting owner epochs before searching their times.
+A lookup is limited to 128 history reads (up to 256 HTTP attempts if each read retries once). Exceeding this returns
+422 `HISTORY_READ_LIMIT`; choose a bookmark or a later time. A bookmark needs one history read.
 
 The CLI saves its random operation id and **resolved bookmark**, without a credential, under
 `~/.cowctl/restore-operations/`. If interrupted, rerun the same command to resume; `--operation-id ID` can specify a
 stable id explicitly (16–128 letters/digits/hyphens). Keep the saved state when moving a retry to another machine.
+After showing a completed result, the CLI removes that command's local operation record. Running the same command
+again without an explicit id creates a new operation and is refused because the destination name already exists.
 The control plane and nodes keep progress only in memory; after a restart they may answer unknown. Resubmission
 recognizes the already published first snapshot, and registration returns the same database if it already happened,
 provided the source database still exists and is active. Resubmitting after deleting the source is refused because

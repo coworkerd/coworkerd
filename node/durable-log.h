@@ -177,6 +177,7 @@ public:
   // Applies one record; false (with the reason) when its frames do not check out, which ends the replay there.
   bool apply(const LogRecord& record, std::string* error);
   bool finish();
+  kj::Promise<bool> finishAsync();
   uint64_t appliedRecords() const { return records; }
   uint64_t appliedFrames() const { return framesApplied; }
 
@@ -686,7 +687,7 @@ private:
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
-      const std::string& staging, std::function<void()> check = {});
+      const std::string& staging, std::function<void()> check = {}, std::function<void(double)> observeFsync = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
       off_t offset);
   kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName);
@@ -714,7 +715,8 @@ private:
       uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
       std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
       std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
-      std::function<void()> check);
+      std::function<void()> check, std::function<void(double)> observeFsync = {});
+  kj::Promise<void> measureRecoveryLoop(std::shared_ptr<double> maximum);
   void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;
@@ -844,6 +846,7 @@ private:
   uint32_t recoveryPublishWaiters = 0;
   kj::Canceler uploadRetryCanceler;
   double confirmMsTotal = 0, lastSegmentAtMs = 0, lastUploadAtMs = 0, lastRebuildMs = 0;
+  double lastRebuildLoopDelayMs = 0;
   std::vector<double> confirmSamples;
   std::string lastUploadError, lastManifestError, lastRebuildError, startupNote;
   bool diskTrusted = true;
