@@ -63,10 +63,11 @@ private:
     bool operator<(const Deadline& b) const { return std::tie(at, kind, key) < std::tie(b.at, b.kind, b.key); }
   };
   struct Gate {
-    uint32_t failures = 0;bool open = false, probing = false, disabled = false;double next = 0;
+    uint32_t failures = 0;bool open = false, probing = false, disabled = false, diverse = false;double next = 0;
+    std::string firstFailure, lastProbe;
     bool available(double now) const;
-    bool enter(double now);
-    void result(bool success, bool probe, double now);
+    bool enter(double now, const std::string& key);
+    void result(bool success, bool probe, double now, const std::string& key);
     void cancel(bool probe);
   };
   struct Metric {
@@ -139,6 +140,7 @@ private:
   uint64_t threadCpuNs = 0, threadCpuStarted = 0, tickMaxItems = 0;
   unsigned cpuDepth = 0;
   double hintRoundMs = 3600000, nextMarkerScan = 0, nextMarkerProbe = 0, nextFailureLog = 0;
+  bool measureThreadCpu = false;
   bool markerDenied = false, stopping = false, globalScanRunning = false, initialMarkerScan = true, drainingDeadlines = false, permissionProbeActive = false;
   Metric reportMetric, completionMetric, tickMetric, deadlineMetric, markerLatencyMetric;
   kj::TaskSet tasks;
