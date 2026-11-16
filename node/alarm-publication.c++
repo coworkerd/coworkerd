@@ -12,9 +12,15 @@
 #include <cstdlib>
 #include <limits>
 #include <sstream>
+#include <time.h>
+#include <charconv>
+#include <optional>
+#include <vector>
 
 namespace coworkerd {
 namespace {
+uint64_t threadTime() { timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec; }
+bool canceled(const kj::Exception& e) { return std::string_view(e.getDescription().cStr()).find("alarm publication ownership changed") != std::string_view::npos; }
 uint64_t nanoTime() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 std::string wide(uint64_t n) { auto s = std::to_string(n);return s.size() >= 20 ? s : std::string(20 - s.size(), '0') + s; }
 std::string markerPrefix(const std::string& node, uint64_t member, const std::string& ns, uint32_t shard, uint64_t epoch) {
@@ -51,14 +57,26 @@ double AlarmPublication::Metric::percentile(unsigned percent) const {
   return 0;
 }
 AlarmPublication::Scope::Scope(AlarmPublication& owner, Metric* metric): owner(owner), metric(metric), started(nanoTime()) {
-  if (!owner.cpuDepth++) owner.cpuStarted = started;
+  if (!owner.cpuDepth++) { owner.cpuStarted = started;owner.threadCpuStarted = threadTime(); }
 }
 AlarmPublication::Scope::~Scope() {
-  const auto now = nanoTime();if (metric) metric->add(now - started);if (!--owner.cpuDepth) owner.cpuNs += now - owner.cpuStarted;
+  const auto now = nanoTime();if (metric) metric->add(now - started);if (!--owner.cpuDepth) { owner.cpuNs += now - owner.cpuStarted;owner.threadCpuNs += threadTime() - owner.threadCpuStarted; }
 }
 
-// Fixed histograms and nested scopes measure running publisher code, never suspended I/O.
-// Metric storage is declared in the header so component tests can inspect the same production counters.
+bool AlarmPublication::Gate::available(double now) const { return disabled || !open || (!probing && now >= next); }
+bool AlarmPublication::Gate::enter(double now) {
+  if (disabled || !open) return false;
+  KJ_REQUIRE(!probing && now >= next);probing = true;return true;
+}
+void AlarmPublication::Gate::result(bool success, bool probe, double now) {
+  if (probe) probing = false;
+  if (success) { failures = 0;open = false;next = 0;return; }
+  if (disabled) return;
+  if (!open && ++failures >= 8) { open = true;next = now + 5000; }
+  else if (open && probe) next = now + 5000;
+}
+void AlarmPublication::Gate::cancel(bool probe) { if (probe) probing = false; }
+
 AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::string nodeId, Current current, Adopt adopt, Log log)
     : store(store), timer(timer), nodeId(std::move(nodeId)), current(std::move(current)), adopt(std::move(adopt)), log(std::move(log)), tasks(*this) {
   KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&retryRandom), sizeof(retryRandom)) == 1);
@@ -74,9 +92,14 @@ bool AlarmPublication::valid(const Shard& s) const { return !stopping && nodeEpo
 bool AlarmPublication::valid(const Write& w) const {
   auto s = shards.find(shardKey(w.ns, w.shard));return s != shards.end() && s->second.generation == w.generation && valid(s->second);
 }
+bool AlarmPublication::deleting(const std::string& key) const {
+  auto w = writes.find(key);return inFlightDeletes.contains(key) || (w != writes.end() && w->second.marker && !w->second.at);
+}
 double AlarmPublication::hintCheckInterval() const { return hintRoundMs / std::max<uint64_t>(1, nonemptyShards); }
 void AlarmPublication::setNodeEpoch(uint64_t epoch) {
-  if (epoch == nodeEpoch) return;nodeEpoch = epoch;shards.clear();writes.clear();readyHints.clear();readyMarkers.clear();nonemptyShards = 0;nextHintCheck = 0;
+  if (epoch == nodeEpoch) return;nodeEpoch = epoch;shards.clear();writes.clear();writeSweep.clear();sweepCursor = writeSweep.end();
+  deadlines.clear();readyHints.clear();readyMarkers.clear();readyScans.clear();ownMarkers.clear();observedOwn.clear();
+  markerPuts.clear();markerRemoves.clear();cleanupReady.clear();nonemptyShards = 0;initialMarkerScan = true;nextMarkerScan = 0;
 }
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
   if (!nodeEpoch || !epoch) return;const auto key = shardKey(ns, shard);auto it = shards.find(key);
@@ -94,34 +117,77 @@ void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenan
   auto [held, inserted] = shards.emplace(key, std::move(s));offerRead(held->second);pump();
 }
 void AlarmPublication::gone(const std::string& ns, uint32_t shard) {
-  auto it = shards.find(shardKey(ns, shard));if (it == shards.end()) return;auto& s = it->second;
-  readyHints.erase({s.tenant, s.order, it->first, 0});readyMarkers.erase({s.tenant, s.markerOrder, it->first, 2});
-  if (s.nonempty) --nonemptyShards;shards.erase(it);
-  // Retire stale write rows in tick. In-flight keys remain reserved independently of these rows.
+  const auto key = shardKey(ns, shard);auto it = shards.find(key);if (it == shards.end()) return;auto& s = it->second;
+  readyHints.erase({s.tenant, s.order, key, 0});readyScans.erase({s.tenant, s.repairOrder, key, 2});readyScans.erase({s.tenant, s.previousOrder, key, 4});
+  if (s.readTimed) deadlines.erase({s.next, 0, key, s.generation});
+  if (s.hintTimed) deadlines.erase({s.hintAt, 2, key, s.generation});
+  if (s.previousTimed) deadlines.erase({s.previousNext, 3, key, s.generation});
+  if (s.repairTimed) deadlines.erase({s.repairNext, 4, key, s.generation});
+  if (s.nonempty) --nonemptyShards;ownMarkers.erase(s.marker);cleanupReady.erase(key);shards.erase(it);
+  // Retire old write rows in bounded sweep slices; requests retain their key reservations.
 }
-void AlarmPublication::unqueue(Write& w) { (w.marker ? readyMarkers : readyHints).erase({w.tenant, w.order, w.key, w.marker ? 3u : 1u}); }
+void AlarmPublication::ownershipChanged(const std::string& key, uint64_t generation) {
+  ++ownerChanges;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) gone(it->second.ns, it->second.shard);
+}
+void AlarmPublication::unqueue(Write& w) {
+  (w.marker ? readyMarkers : readyHints).erase({w.tenant, w.order, w.key, w.marker ? 3u : 1u});
+  if (w.timed) { deadlines.erase({w.next, 1, w.key, w.generation});w.timed = false; }
+}
+void AlarmPublication::eraseWrite(std::unordered_map<std::string, Write>::iterator it) {
+  auto& w = it->second;unqueue(w);markerPuts.erase(w.key);markerRemoves.erase(w.key);
+  if (auto s = shards.find(shardKey(w.ns, w.shard));s != shards.end() && s->second.generation == w.generation) s->second.writeKeys.erase(w.key);
+  if (sweepCursor == w.sweep) ++sweepCursor;writeSweep.erase(w.sweep);writes.erase(it);
+}
 void AlarmPublication::refresh(Write& w, double now) {
-  unqueue(w);if (!valid(w) || w.next > now || inFlightKeys.contains(w.key)) return;
-  const auto& s = shards.at(shardKey(w.ns, w.shard));if (!s.adopted || s.reading || (w.marker && markerDenied)) return;
+  unqueue(w);if (!valid(w) || inFlightKeys.contains(w.key)) return;
+  if (w.next > now) { deadlines.insert({w.next, 1, w.key, w.generation});w.timed = true;return; }
+  const auto& s = shards.at(shardKey(w.ns, w.shard));if (!s.adopted || s.reading) return;
   (w.marker ? readyMarkers : readyHints).insert({w.tenant, w.order, w.key, w.marker ? 3u : 1u});
 }
 void AlarmPublication::offerRead(Shard& s) {
   const auto key = shardKey(s.ns, s.shard);readyHints.erase({s.tenant, s.order, key, 0});
-  if (valid(s) && !s.adopted && !s.reading && s.next <= monotonicTimeMs() && !inFlightHints.contains(key)) readyHints.insert({s.tenant, s.order, key, 0});
+  if (s.readTimed) { deadlines.erase({s.next, 0, key, s.generation});s.readTimed = false; }
+  if (!valid(s) || s.adopted || s.reading || inFlightHints.contains(key)) return;
+  if (s.next > monotonicTimeMs()) { deadlines.insert({s.next, 0, key, s.generation});s.readTimed = true; }
+  else readyHints.insert({s.tenant, s.order, key, 0});
+}
+void AlarmPublication::offerScan(Shard& s, bool repair) {
+  const auto key = shardKey(s.ns, s.shard);auto& timed = repair ? s.repairTimed : s.previousTimed;
+  auto& next = repair ? s.repairNext : s.previousNext;auto& order = repair ? s.repairOrder : s.previousOrder;
+  const unsigned kind = repair ? 2 : 4, deadlineKind = repair ? 4 : 3;
+  readyScans.erase({s.tenant, order, key, kind});
+  if (timed) { deadlines.erase({next, deadlineKind, key, s.generation});timed = false; }
+  if (!valid(s) || !s.adopted || s.reading || s.scanning || !(repair ? s.repairPending : s.previousPending)) return;
+  if (!order) order = ++serial;
+  if (next > monotonicTimeMs()) { deadlines.insert({next, deadlineKind, key, s.generation});timed = true; }
+  else readyScans.insert({s.tenant, order, key, kind});
+}
+void AlarmPublication::refreshActivity(Shard& s) {
+  const bool nonempty = !s.hints.empty() || !s.desired.empty() || !s.marker.empty();const auto key = shardKey(s.ns, s.shard);
+  if (nonempty != s.nonempty) { if (nonempty) ++nonemptyShards;else --nonemptyShards;s.nonempty = nonempty; }
+  if (s.hintTimed && (!nonempty || !s.adopted || s.reading)) { deadlines.erase({s.hintAt, 2, key, s.generation});s.hintTimed = false; }
+  if (nonempty && s.adopted && !s.reading && !s.hintTimed) {
+    s.hintAt = std::max(monotonicTimeMs(), s.checked + hintRoundMs);s.hintTimed = true;deadlines.insert({s.hintAt, 2, key, s.generation});
+  }
+}
+void AlarmPublication::wakeWrites(Shard& s) {
+  for (const auto& key: s.writeKeys) if (auto it = writes.find(key);it != writes.end() && it->second.generation == s.generation) refresh(it->second, monotonicTimeMs());
 }
 void AlarmPublication::queueHint(Shard& s, const std::string& object, uint64_t at) {
-  const auto key = hintPrefix(s.ns, s.shard) + object + "/0";auto it = writes.find(key);
-  if (it != writes.end() && it->second.generation == s.generation && it->second.at == at) return;
-  auto& w = writes[key];unqueue(w);w.key = key;w.ns = s.ns;w.object = object;w.tenant = s.tenant;
-  w.shard = s.shard;w.generation = s.generation;w.at = at;w.marker = false;w.version = ++serial;
-  w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;peakPending = std::max<uint64_t>(peakPending, writes.size());refresh(w, monotonicTimeMs());
+  const auto key = hintPrefix(s.ns, s.shard) + object + "/0";auto [it, inserted] = writes.try_emplace(key);auto& w = it->second;
+  if (inserted) { writeSweep.push_back(key);w.sweep = std::prev(writeSweep.end()); }
+  unqueue(w);w.key = key;w.ns = s.ns;w.object = object;w.tenant = s.tenant;w.shard = s.shard;
+  w.generation = s.generation;w.at = at;w.marker = false;w.version = ++serial;w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;
+  s.writeKeys.insert(key);peakPending = std::max<uint64_t>(peakPending, writes.size());refresh(w, monotonicTimeMs());
 }
 void AlarmPublication::queueMarker(Shard& s, const std::string& key, bool present, bool mayExist) {
-  if (markerDenied && present) return;auto it = writes.find(key);
+  auto it = writes.find(key);
   if (it != writes.end() && it->second.generation == s.generation && it->second.at == uint64_t(present)) return;
-  auto& w = writes[key];unqueue(w);w.key = key;w.ns = s.ns;w.tenant = s.tenant;w.shard = s.shard;
-  w.generation = s.generation;w.marker = true;w.at = present;w.mayExist = w.mayExist || mayExist;
-  w.version = ++serial;w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;
+  const bool inserted = it == writes.end();auto& w = writes[key];
+  if (inserted) { writeSweep.push_back(key);w.sweep = std::prev(writeSweep.end()); }
+  unqueue(w);markerPuts.erase(key);markerRemoves.erase(key);w.key = key;w.ns = s.ns;w.object.clear();w.tenant = s.tenant;w.shard = s.shard;
+  w.generation = s.generation;w.marker = true;w.at = present;w.mayExist = w.mayExist || mayExist;w.version = ++serial;
+  w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;s.writeKeys.insert(key);(present ? markerPuts : markerRemoves).insert(key);
   peakPending = std::max<uint64_t>(peakPending, writes.size());refresh(w, monotonicTimeMs());
 }
 void AlarmPublication::report(std::string ns, std::string object, uint32_t shard, uint64_t epoch, std::string tenant, uint64_t at) {
@@ -131,115 +197,181 @@ void AlarmPublication::report(std::string ns, std::string object, uint32_t shard
   auto& s = it->second;if (at) s.desired[object] = at;else s.desired.erase(object);
   if (!s.adopted || s.reading) s.duringRead[object] = at;queueHint(s, object, at);reconcile(s);pump();
 }
+void AlarmPublication::cleanup(Shard& s) {
+  if (!s.previousMarkers.empty() && s.adopted && !s.reading && (s.markerWritten || (s.hints.empty() && s.desired.empty()))) cleanupReady.insert(shardKey(s.ns, s.shard));
+}
 void AlarmPublication::reconcile(Shard& s) {
-  const bool nonempty = !s.hints.empty() || !s.desired.empty() || !s.marker.empty();
-  if (nonempty != s.nonempty) { if (nonempty) ++nonemptyShards;else --nonemptyShards;s.nonempty = nonempty; }
-  const auto next = monotonicTimeMs() + hintCheckInterval();nextHintCheck = nextHintCheck ? std::min(nextHintCheck, next) : next;
-  if (!valid(s) || !s.adopted || s.reading || !s.markerGeneration || s.markerGeneration != markerGeneration) return;
+  if (!valid(s) || !s.adopted || s.reading) { refreshActivity(s);return; }
   if (!s.hints.empty()) {
-    if (s.marker.empty()) { s.marker = markerPrefix(nodeId, s.markerMemberEpoch, s.ns, s.shard, s.epoch) + presence();s.markerWritten = s.markerMayExist = false; }
+    if (s.marker.empty()) {
+      s.marker = markerPrefix(nodeId, s.markerMemberEpoch, s.ns, s.shard, s.epoch) + presence();s.markerWritten = s.markerMayExist = false;
+      ownMarkers[s.marker] = {shardKey(s.ns, s.shard), s.generation};
+    }
     if (!s.markerWritten) queueMarker(s, s.marker, true, s.markerMayExist);
   } else if (s.desired.empty() && !s.marker.empty()) {
-    const auto old = s.marker;auto w = writes.find(old);
-    const bool mayExist = s.markerWritten || s.markerMayExist || (w != writes.end() && w->second.mayExist);
+    const auto old = s.marker;auto w = writes.find(old);const bool mayExist = s.markerWritten || s.markerMayExist || (w != writes.end() && w->second.mayExist);
     if (mayExist || inFlightKeys.contains(old)) queueMarker(s, old, false, mayExist);
-    else if (w != writes.end()) { unqueue(w->second);writes.erase(w); }
-    s.marker.clear();s.markerWritten = s.markerMayExist = false;
-    if (s.nonempty) { --nonemptyShards;s.nonempty = false; }
+    else if (w != writes.end()) eraseWrite(w);
+    ownMarkers.erase(old);s.marker.clear();s.markerWritten = s.markerMayExist = false;s.hintCommittedNs = 0;
   }
+  refreshActivity(s);cleanup(s);
+}
+void AlarmPublication::acceptOwnMarker(Shard& s, const std::string& key) {
+  if (!valid(s) || !s.adopted || s.reading || deleting(key) || deletedDuringScan.contains(key)) return;
+  if (s.marker.empty() && !s.hints.empty()) {
+    s.marker = key;s.markerWritten = s.markerMayExist = true;s.markerConfirmedAt = monotonicTimeMs();ownMarkers[key] = {shardKey(s.ns, s.shard), s.generation};
+  }
+  if (s.marker == key) { s.previousMarkers.erase(key);s.markerWritten = s.markerMayExist = true; }
+  else s.previousMarkers.insert(key);
+  cleanup(s);
 }
 uint32_t AlarmPublication::retry(uint32_t& failures) {
-  failures = std::min<uint32_t>(failures + 1, 32);++retries;
-  const auto base = std::min<uint32_t>(5000, 250u << std::min<uint32_t>(failures - 1, 5));
-  // Retry jitter is not a token: seed once, then avoid a crypto call on each failed completion.
+  failures = std::min<uint32_t>(failures + 1, 32);++retries;const auto base = std::min<uint32_t>(5000, 250u << std::min<uint32_t>(failures - 1, 5));
   retryRandom ^= retryRandom << 13;retryRandom ^= retryRandom >> 7;retryRandom ^= retryRandom << 17;
   return std::min<uint32_t>(5000, base + retryRandom % std::max<uint32_t>(1, base / 4));
 }
-void AlarmPublication::failure(const char* operation, bool denied) {
-  if (denied) {
-    ++markerDenials;if (markerDenied) return;
-    markerDenied = true;nextMarkerProbe = monotonicTimeMs() + 30000;
-  }
-  if (operation) ++failuresToLog;
-  if (!failuresToLog || monotonicTimeMs() < nextFailureLog) return;
+void AlarmPublication::failure(const char* operation) {
+  if (operation) ++failuresToLog;if (!failuresToLog || monotonicTimeMs() < nextFailureLog) return;
   const auto count = failuresToLog;failuresToLog = 0;nextFailureLog = monotonicTimeMs() + 1000;++failureLogLines;
   log("alarm-publication-failures", "\"count\":" + std::to_string(count) + ",\"operation\":" + json::quote(operation ? operation : "merged") + ",\"markerAccessDenied\":" + (markerDenied ? "true" : "false"));
+}
+void AlarmPublication::denied(Probe operation, std::string prefix) {
+  ++markerDenials;if (markerDenied) { if (operation != Probe::LIST) deniedOperation = operation;return; }markerDenied = true;deniedOperation = operation;deniedPrefix = std::move(prefix);nextMarkerProbe = monotonicTimeMs() + 30000;failure("marker-access");
+}
+void AlarmPublication::markerRestored() {
+  if (!markerDenied) return;markerDenied = false;markerGate.result(true, false, monotonicTimeMs());
+  log("alarm-marker-access-restored", "\"denials\":" + std::to_string(markerDenials));
 }
 void AlarmPublication::pump(unsigned limit) {
   Scope measured(*this);if (stopping) return;
   for (unsigned attempt = 0; attempt < limit && active < 8; ++attempt) {
-    auto* queue = activeHints < 7 && !readyHints.empty() ? &readyHints : !markerDenied && !activeMarkers && !readyMarkers.empty() ? &readyMarkers : nullptr;
-    if (!queue) return;
-    auto choice = queue->upper_bound({lastTenant, UINT64_MAX, "", 4});if (choice == queue->end()) choice = queue->begin();
-    auto work = *choice;queue->erase(choice);lastTenant = work.tenant;
-    if (work.kind == 0 || work.kind == 2) {
-      auto it = shards.find(work.key);if (it == shards.end() || !valid(it->second)) continue;auto& s = it->second;
+    const auto now = monotonicTimeMs();Ready work{};bool have = false, permissionProbe = false, gateProbe = false;
+    auto choose = [this](std::set<Ready>& queue) {
+      auto it = queue.upper_bound({lastTenant, UINT64_MAX, "", 5});if (it == queue.end()) it = queue.begin();auto value = *it;queue.erase(it);return value;
+    };
+    // Reserve one H slot even if marker requests hang. M writes precede every scan.
+    if (activeMarkers + activeScans < 7 && markerDenied && !permissionProbeActive && now >= nextMarkerProbe) {
+      auto& candidates = deniedOperation == Probe::DELETE ? markerRemoves : markerPuts;
+      if (deniedOperation != Probe::LIST) {
+        unsigned n = 0;
+        for (auto it = candidates.begin();it != candidates.end() && n++ < 16;++it) {
+          auto w = writes.find(*it);if (w == writes.end() || !valid(w->second) || inFlightKeys.contains(*it)) continue;
+          auto& s = shards.at(shardKey(w->second.ns, w->second.shard));if (!s.adopted || s.reading) continue;
+          work = {w->second.tenant, w->second.order, w->first, 3};unqueue(w->second);have = permissionProbe = true;break;
+        }
+      }
+      nextMarkerProbe = now + 30000;permissionProbeActive = true;++markerProbes;
+      if (!have) { ++active;++activeScans;tasks.add(kj::evalLater([this]() { return probeMarkers(); }));continue; }
+    }
+    if (!have && activeMarkers + activeScans < 7 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers);have = true; }
+    if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints);have = true; }
+    if (!have && activeMarkers + activeScans < 7 && !activeScans && !markerDenied && markerGate.available(now)) {
+      if (!readyScans.empty()) { work = choose(readyScans);have = true; }
+      else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
+        gateProbe = markerGate.enter(now);globalScanRunning = true;++active;++activeScans;
+        tasks.add(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); }));continue;
+      }
+    }
+    if (!have) return;lastTenant = work.tenant;
+    if (work.kind == 0 || work.kind == 2 || work.kind == 4) {
+      auto it = shards.find(work.key);if (it == shards.end()) continue;
+      if (!valid(it->second)) { ownershipChanged(work.key, it->second.generation);continue; }auto& s = it->second;const auto generation = s.generation;
       if (work.kind == 0) {
-        if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;s.reading = true;++active;++activeHints;
-        const auto generation = s.generation;
-        tasks.add(kj::evalLater([this, key = work.key, generation]() -> kj::Promise<void> {
+        if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;
+        gateProbe = hintGate.enter(now);s.reading = true;refreshActivity(s);++active;++activeHints;
+        tasks.add(kj::evalLater([this, key = work.key, generation, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
-          if (it == shards.end() || it->second.generation != generation) { --active;--activeHints;pump();return kj::READY_NOW; }
-          return readHints(key);
+          if (it == shards.end() || it->second.generation != generation) { hintGate.cancel(gateProbe);--active;--activeHints;pump();return kj::READY_NOW; }
+          return readHints(key, gateProbe);
         }));
       } else {
-        if (s.markerReading || !s.adopted || s.reading) continue;s.markerReading = true;++active;++activeMarkers;
-        const auto generation = s.generation;
-        tasks.add(kj::evalLater([this, key = work.key, generation]() -> kj::Promise<void> {
+        if (s.scanning || !s.adopted || s.reading) continue;
+        gateProbe = markerGate.enter(now);s.scanning = true;++active;++activeScans;
+        tasks.add(kj::evalLater([this, key = work.key, generation, repair = work.kind == 2, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
-          if (it == shards.end() || it->second.generation != generation) { --active;--activeMarkers;pump();return kj::READY_NOW; }
-          return scanMarkers(key);
+          if (it == shards.end() || it->second.generation != generation) { markerGate.cancel(gateProbe);--active;--activeScans;pump();return kj::READY_NOW; }
+          return scanPrevious(key, repair, gateProbe);
         }));
       }
     } else {
-      auto it = writes.find(work.key);if (it == writes.end() || !valid(it->second) || inFlightKeys.contains(work.key)) continue;
-      const auto& s = shards.at(shardKey(it->second.ns, it->second.shard));if (!s.adopted || s.reading) continue;
-      inFlightKeys.insert(work.key);++active;if (it->second.marker) ++activeMarkers;else { ++activeHints;++inFlightHints[shardKey(it->second.ns, it->second.shard)]; }
-      tasks.add(kj::evalLater([this, sent = it->second]() mutable { return write(std::move(sent)); }));
+      auto it = writes.find(work.key);
+      if (it == writes.end() || !valid(it->second) || inFlightKeys.contains(work.key)) {
+        if (permissionProbe) permissionProbeActive = false;
+        if (it != writes.end() && !inFlightKeys.contains(work.key) && !valid(it->second)) eraseWrite(it);continue;
+      }
+      const auto& s = shards.at(shardKey(it->second.ns, it->second.shard));
+      if (!s.adopted || s.reading) { if (permissionProbe) permissionProbeActive = false;continue; }
+      if (!permissionProbe) gateProbe = (it->second.marker ? markerGate : hintGate).enter(now);
+      inFlightKeys.insert(work.key);if (it->second.marker && !it->second.at) inFlightDeletes.insert(work.key);
+      ++active;if (it->second.marker) ++activeMarkers;else { ++activeHints;++inFlightHints[shardKey(it->second.ns, it->second.shard)]; }
+      tasks.add(kj::evalLater([this, sent = it->second, gateProbe, permissionProbe]() mutable { return write(std::move(sent), gateProbe, permissionProbe); }));
     }
   }
 }
-kj::Promise<void> AlarmPublication::write(Write sent) {
+kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissionProbe) {
   const auto key = sent.key;
   if (auto it = writes.find(key);it != writes.end() && it->second.generation == sent.generation) sent = it->second;
-  bool success = false, denied = false;
+  auto release = kj::defer([this, &key, &sent, permissionProbe]() {
+    inFlightKeys.erase(key);inFlightDeletes.erase(key);--active;
+    if (permissionProbe) permissionProbeActive = false;
+    if (sent.marker) --activeMarkers;
+    else {
+      --activeHints;const auto sk = shardKey(sent.ns, sent.shard);auto it = inFlightHints.find(sk);
+      if (it != inFlightHints.end() && !--it->second) { inFlightHints.erase(it);if (auto s = shards.find(sk);s != shards.end()) offerRead(s->second); }
+    }
+    if (auto it = writes.find(key);it != writes.end()) refresh(it->second, monotonicTimeMs());pump();
+  });
+  auto& gate = sent.marker ? markerGate : hintGate;
+  if (sent.marker && !sent.at) inFlightDeletes.insert(key);
+  if (permissionProbe && ((deniedOperation == Probe::PUT && !sent.at) || (deniedOperation == Probe::DELETE && sent.at))) { nextMarkerProbe = monotonicTimeMs();co_return; }
+  if (!valid(sent)) { gate.cancel(probe);ownershipChanged(shardKey(sent.ns, sent.shard), sent.generation);co_return; }
+  bool success = false, rejected = false;
   try {
-    KJ_REQUIRE(valid(sent), "alarm publication owner changed");
     kj::Promise<ObjectResponse> operation = nullptr;
     {
       Scope measured(*this);
-      if (sent.marker && sent.at) { writes.at(key).mayExist = true;auto& s = shards.at(shardKey(sent.ns, sent.shard));if (s.marker == key) s.markerMayExist = true; }
+      if (sent.marker && sent.at) {
+        writes.at(key).mayExist = true;auto& s = shards.at(shardKey(sent.ns, sent.shard));
+        if (s.marker == key) { s.markerMayExist = true;if (s.hintCommittedNs) { markerLatencyMetric.add(nanoTime() - s.hintCommittedNs);s.hintCommittedNs = 0; } }
+      }
       if (!sent.at) operation = store.remove(key);
       else if (sent.marker) operation = store.put(key, "");
       else operation = store.put(key, "{\"atUnixMs\":" + std::to_string(sent.at) + ",\"facetId\":0,\"nodeId\":" + json::quote(nodeId) + ",\"writtenAtUnixMs\":" + std::to_string(unixMs()) + "}\n");
     }
     co_await operation;success = true;
-  } catch (const kj::Exception& error) { denied = sent.marker && accessDenied(error); }
+  } catch (const kj::Exception& error) { rejected = sent.marker && accessDenied(error); }
   Scope measured(*this, &completionMetric);
-  auto release = kj::defer([this, &key, &sent]() {
-    inFlightKeys.erase(key);--active;
-    if (sent.marker) --activeMarkers;
-    else { --activeHints;auto it = inFlightHints.find(shardKey(sent.ns, sent.shard));if (it != inFlightHints.end() && !--it->second) inFlightHints.erase(it); }
-    if (auto it = writes.find(key);it != writes.end()) refresh(it->second, monotonicTimeMs());pump();
-  });
-  if (!success) { if (!sent.marker) ++hintFailures;failure(sent.marker ? "marker-write" : "hint-write", denied); }
-  else if (sent.marker) { if (sent.at) ++markerWrites;else ++markerDeletes; } else ++hintWrites;
-  auto found = writes.find(key);if (found == writes.end() || found->second.generation != sent.generation || !valid(sent)) co_return;
+  if (!valid(sent)) { gate.cancel(probe);ownershipChanged(shardKey(sent.ns, sent.shard), sent.generation);co_return; }
+  gate.result(success, probe, monotonicTimeMs());if (permissionProbe && success) markerRestored();
+  if (!success) { if (!sent.marker) ++hintFailures;if (rejected) denied(sent.at ? Probe::PUT : Probe::DELETE);else failure(sent.marker ? "marker-write" : "hint-write"); }
+  else if (sent.marker) { if (sent.at) ++markerWrites;else ++markerDeletes;if (permissionProbe) markerRestored(); }
+  else ++hintWrites;
+  auto found = writes.find(key);if (found == writes.end() || found->second.generation != sent.generation) co_return;
   auto& w = found->second;auto& s = shards.at(shardKey(sent.ns, sent.shard));
-  if (sent.marker && denied && sent.at) { w.mayExist = sent.mayExist;if (s.marker == key) s.markerMayExist = sent.mayExist; }
+  if (sent.marker && rejected && sent.at) { w.mayExist = sent.mayExist;if (s.marker == key) s.markerMayExist = sent.mayExist; }
   if (success) {
-    if (sent.marker) { w.mayExist = sent.at;if (s.marker == key && sent.at) s.markerWritten = s.markerMayExist = true; }
-    else { if (sent.at) s.hints[sent.object] = sent.at;else s.hints.erase(sent.object); }
-    if (w.version == sent.version) { unqueue(w);writes.erase(found); }
-    else { w.next = 0;w.failures = 0; }
-  } else if (denied && !w.mayExist) { unqueue(w);writes.erase(found); }
-  else if (w.version == sent.version) w.next = monotonicTimeMs() + retry(w.failures);
+    if (sent.marker) {
+      w.mayExist = sent.at;
+      if (s.marker == key && sent.at) { s.markerWritten = s.markerMayExist = true;s.markerConfirmedAt = monotonicTimeMs(); }
+      if (!sent.at) {
+        if (globalScanRunning) deletedDuringScan.insert(key);
+        const auto prefix = key.substr(0, key.rfind('/') + 1);auto cached = observedOwn.find(prefix);
+        if (cached != observedOwn.end()) { cached->second.erase(key);if (cached->second.empty()) observedOwn.erase(cached); }
+      }
+    } else {
+      if (sent.at) { if (s.hints.empty() && s.marker.empty()) s.hintCommittedNs = nanoTime();s.hints[sent.object] = sent.at; }
+      else s.hints.erase(sent.object);
+    }
+    if (w.version == sent.version) eraseWrite(found);else { w.next = 0;w.failures = 0; }
+  } else if (w.version == sent.version) w.next = monotonicTimeMs() + retry(w.failures);
   else w.next = 0;
+  if (rejected && sent.at && w.at == 0 && !w.mayExist) { eraseWrite(found); }
+  // A rejected PUT that never existed has a cancellable PUT row, never a ghost DELETE.
   reconcile(s);
 }
 kj::Promise<bool> AlarmPublication::verifyOwner(std::string key, uint64_t generation) {
   auto held = [this, &key, generation]() -> Shard& {
-    auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm owner changed during verification");return it->second;
+    auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm publication ownership changed");return it->second;
   };
   const auto ns = held().ns;const auto shard = held().shard;std::string token, latest;
   do {
@@ -250,22 +382,22 @@ kj::Promise<bool> AlarmPublication::verifyOwner(std::string key, uint64_t genera
     }
     token = std::move(page.nextToken);
   } while (!token.empty());
-  if (latest.empty()) { gone(ns, shard);co_return false; }
+  if (latest.empty()) { ownershipChanged(key, generation);co_return false; }
   auto response = co_await store.get(latest);held();requireStorage(response.status == 200, "alarm owner read failed: HTTP " + std::to_string(response.status));
   auto owner = parseShardEpoch(response.bytes);requireStorage(owner.has_value() && owner->namespaceId == ns && owner->shard == shard, "invalid alarm owner record");
-  if (owner->nodeId != nodeId || (held().epoch && (owner->epoch != held().epoch || owner->nodeEpoch != held().markerMemberEpoch))) { gone(ns, shard);co_return false; }
+  if (owner->nodeId != nodeId || (held().epoch && (owner->epoch != held().epoch || owner->nodeEpoch != held().markerMemberEpoch))) { ownershipChanged(key, generation);co_return false; }
   auto released = co_await store.get(shardReleasedKey(ns, shard, owner->epoch));held();requireStorage(released.status == 200 || released.status == 404, "alarm release read failed: HTTP " + std::to_string(released.status));
-  if (released.status == 200) { gone(ns, shard);co_return false; }
+  if (released.status == 200) { ownershipChanged(key, generation);co_return false; }
   auto& s = held();s.epoch = owner->epoch;s.markerMemberEpoch = owner->nodeEpoch;
   if (owner->previousEpoch) s.previousPrefix = markerPrefix(owner->previousNodeId, owner->previousNodeEpoch, ns, shard, owner->previousEpoch);
   co_return true;
 }
-kj::Promise<void> AlarmPublication::readHints(std::string key) {
-  const auto generation = shards.at(key).generation;
-  auto release = kj::defer([this, &key, generation]() {
-    --active;--activeHints;if (auto it = shards.find(key);it != shards.end() && it->second.generation == generation) it->second.reading = false;pump();
+kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
+  const auto generation = shards.at(key).generation;bool finished = false;
+  auto release = kj::defer([this, &key, generation, &finished, probe]() {
+    if (!finished) hintGate.cancel(probe);--active;--activeHints;if (auto it = shards.find(key);it != shards.end() && it->second.generation == generation) it->second.reading = false;if (auto it = shards.find(key);it != shards.end() && it->second.generation == generation) { offerRead(it->second);offerScan(it->second, false);offerScan(it->second, true); }pump();
   });
-  auto held = [this, &key, generation]() -> Shard& { auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm adoption owner changed");return it->second; };
+  auto held = [this, &key, generation]() -> Shard& { auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm publication ownership changed");return it->second; };
   try {
     if (!co_await verifyOwner(key, generation)) co_return;
     const auto ns = held().ns;const auto shard = held().shard;const auto epoch = held().epoch;
@@ -297,86 +429,192 @@ kj::Promise<void> AlarmPublication::readHints(std::string key) {
     }
     s.duringRead.clear();s.reading = false;s.adopted = true;s.failures = 0;s.checked = monotonicTimeMs();
     for (const auto& [object, at]: s.desired) if (!s.hints.contains(object) || s.hints.at(object) != at) queueHint(s, object, at);
-    reconcile(s);s.markerNext = 0;
-  } catch (const kj::Exception&) {
-    Scope measured(*this);auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }failure("hint-scan");
+    if (s.initial) {
+      const auto ownPrefix = markerPrefix(nodeId, s.markerMemberEpoch, ns, shard, epoch);
+      if (auto own = observedOwn.find(ownPrefix);own != observedOwn.end()) for (const auto& marker: own->second) acceptOwnMarker(s, marker);
+      s.initial = false;
+    }
+    reconcile(s);wakeWrites(s);
+    if (!s.previousDone && !s.previousPrefix.empty()) { s.previousPending = true;s.previousNext = 0;offerScan(s, false); }
+    hintGate.result(true, probe, monotonicTimeMs());finished = true;
+  } catch (const kj::Exception& error) {
+    Scope measured(*this);if (canceled(error)) { ownershipChanged(key, generation);co_return; }
+    hintGate.result(false, probe, monotonicTimeMs());finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }failure("hint-scan");
   }
 }
-kj::Promise<void> AlarmPublication::scanMarkers(std::string key) {
-  const auto generation = shards.at(key).generation;
-  auto release = kj::defer([this, &key, generation]() {
-    --active;--activeMarkers;if (auto it = shards.find(key);it != shards.end() && it->second.generation == generation) it->second.markerReading = false;pump();
+kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, bool probe) {
+  const auto generation = shards.at(key).generation;bool finished = false;
+  auto release = kj::defer([this, &key, generation, probe, &finished]() {
+    if (!finished) markerGate.cancel(probe);--active;--activeScans;
+    if (auto it = shards.find(key);it != shards.end() && it->second.generation == generation) {
+      it->second.scanning = false;offerScan(it->second, false);offerScan(it->second, true);
+    }
+    pump();
   });
-  auto held = [this, &key, generation]() -> Shard& { auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm marker owner changed");return it->second; };
-  bool markerRequest = false;
+  auto held = [this, &key, generation]() -> Shard& { auto it = shards.find(key);KJ_REQUIRE(it != shards.end() && it->second.generation == generation && valid(it->second), "alarm publication ownership changed");return it->second; };
+  bool listing = false;
   try {
-    if (!co_await verifyOwner(key, generation)) co_return;
-    const auto prefix = markerPrefix(nodeId, held().markerMemberEpoch, held().ns, held().shard, held().epoch);
-    std::set<std::string> own, previous;std::string token;
-    for (const auto& scan: {prefix, held().previousPrefix}) {
-      if (scan.empty()) continue;token.clear();
-      do {
-        markerRequest = true;auto page = co_await store.listPage(scan, 1000, token);markerRequest = false;held();
-        for (const auto& row: page.objects) if (row.size == 0 && markerName(row.key.substr(scan.size()))) (scan == prefix ? own : previous).insert(row.key);
+    if (repair) {
+      const auto marker = held().marker;
+      if (!co_await verifyOwner(key, generation)) co_return;
+      auto& s = held();s.repairPending = false;s.repairNext = 0;
+      if (s.marker == marker && !marker.empty() && !deleting(marker) && !s.hints.empty()) { s.markerWritten = s.markerMayExist = false;reconcile(s); }
+    } else {
+      const auto prefix = held().previousPrefix;std::string token;std::set<std::string> previous;
+      if (!prefix.empty()) do {
+        listing = true;auto page = co_await store.listPage(prefix, 1000, token);listing = false;held();++markerPages;
+        for (const auto& row: page.objects) if (row.size == 0 && markerName(row.key.substr(prefix.size()))) previous.insert(row.key);
         token = std::move(page.nextToken);
       } while (!token.empty());
+      auto& s = held();s.previousMarkers.insert(previous.begin(), previous.end());s.previousMarkers.erase(s.marker);s.previousDone = true;s.previousPending = false;s.previousNext = 0;cleanup(s);
     }
-    Scope measured(*this);auto& s = held();s.previousMarkers.insert(previous.begin(), previous.end());
-    if (!s.marker.empty() && !own.contains(s.marker)) { s.markerWritten = s.markerMayExist = false; }
-    if (s.marker.empty() && !s.hints.empty() && !own.empty()) { s.marker = *own.begin();s.markerWritten = s.markerMayExist = true; }
-    for (const auto& old: own) if (old != s.marker) s.previousMarkers.insert(old);
-    s.markerNext = monotonicTimeMs() + 60000;s.markerGeneration = markerGeneration;reconcile(s);
+    markerGate.result(true, probe, monotonicTimeMs());finished = true;
   } catch (const kj::Exception& error) {
-    Scope measured(*this);auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) it->second.markerNext = monotonicTimeMs() + 5000;failure("marker-scan", markerRequest && accessDenied(error));
+    Scope measured(*this);
+    if (canceled(error)) { ownershipChanged(key, generation);co_return; }
+    markerGate.result(false, probe, monotonicTimeMs());finished = true;
+    auto it = shards.find(key);
+    if (it != shards.end() && it->second.generation == generation) {
+      (repair ? it->second.repairNext : it->second.previousNext) = monotonicTimeMs() + 5000;
+      if (listing && accessDenied(error)) denied(Probe::LIST, it->second.previousPrefix);else failure(repair ? "marker-owner-check" : "predecessor-marker-scan");
+    }
+  }
+}
+namespace {
+struct MarkerAddress { std::string ns, prefix;uint32_t shard;uint64_t member, epoch; };
+std::optional<MarkerAddress> markerAddress(const std::string& key, const std::string& root) {
+  if (!key.starts_with(root)) return {};
+  std::string_view rest(key.data() + root.size(), key.size() - root.size());std::vector<std::string_view> part;
+  for (;;) { auto slash = rest.find('/');part.push_back(rest.substr(0, slash));if (slash == rest.npos) break;rest.remove_prefix(slash + 1); }
+  if (part.size() != 5 || part[0].size() != 20 || part[1].size() != 64 || part[3].size() != 20 || !markerName(std::string(part[4]))) return {};
+  uint64_t member = 0, epoch = 0;uint32_t shard = 0;
+  auto decimal = [](auto text, auto& number) { const auto result = std::from_chars(text.data(), text.data() + text.size(), number);return result.ec == std::errc() && result.ptr == text.data() + text.size(); };
+  if (!decimal(part[0], member) || !decimal(part[2], shard) || !decimal(part[3], epoch) || !member || !epoch) return {};
+  return MarkerAddress{std::string(part[1]), key.substr(0, key.rfind('/') + 1), shard, member, epoch};
+}
+}
+kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
+  const auto epoch = nodeEpoch;const auto started = monotonicTimeMs();const auto root = "alarm-wake/by-owner/" + nodeId + "/";bool finished = false;
+  deletedDuringScan.clear();
+  auto release = kj::defer([this, probe, &finished]() {
+    if (!finished) markerGate.cancel(probe);globalScanRunning = false;deletedDuringScan.clear();--active;--activeScans;pump();
+  });
+  auto currentEpoch = [this, epoch]() { KJ_REQUIRE(!stopping && nodeEpoch == epoch, "alarm publication ownership changed"); };
+  try {
+    std::map<std::string, std::set<std::string>> observed;std::string token;
+    do {
+      auto page = co_await store.listPage(root, 1000, token);currentEpoch();++markerPages;
+      for (const auto& row: page.objects) if (row.size == 0) if (auto a = markerAddress(row.key, root)) observed[a->prefix].insert(row.key);
+      token = std::move(page.nextToken);
+    } while (!token.empty());
+    // Streaming applies only listed markers. Empty held shards are never enumerated.
+    unsigned slice = 0;
+    for (auto& [prefix, keys]: observed) for (auto it = keys.begin();it != keys.end();) {
+      const auto marker = *it;
+      if (deletedDuringScan.contains(marker) || deleting(marker)) { it = keys.erase(it);continue; }
+      auto a = markerAddress(marker, root);KJ_REQUIRE(a.has_value());auto s = shards.find(shardKey(a->ns, a->shard));
+      if (s != shards.end() && s->second.epoch == a->epoch && s->second.markerMemberEpoch == a->member) acceptOwnMarker(s->second, marker);
+      ++it;
+      if (++slice == 32) { slice = 0;co_await kj::evalLater([]() {});currentEpoch(); }
+    }
+    // No iterator into publisher state survives a yield. Concurrent marker changes are allowed.
+    std::string cursor;
+    for (;;) {
+      auto entry = ownMarkers.upper_bound(cursor);if (entry == ownMarkers.end()) break;
+      const auto marker = entry->first;const auto ref = entry->second;cursor = marker;
+      auto s = shards.find(ref.shard);
+      if (s != shards.end() && s->second.generation == ref.generation && !valid(s->second)) ownershipChanged(ref.shard, ref.generation);
+      else if (s != shards.end() && s->second.generation == ref.generation) {
+        auto& held = s->second;const auto prefix = marker.substr(0, marker.rfind('/') + 1);const auto found = observed.find(prefix);
+        const bool seen = found != observed.end() && found->second.contains(marker) && !deletedDuringScan.contains(marker);
+        if (!seen && held.markerWritten && held.markerConfirmedAt < started && !inFlightKeys.contains(marker) && !deleting(marker)) {
+          held.repairPending = true;held.repairNext = 0;offerScan(held, true);
+        }
+      }
+      if (++slice == 32) { slice = 0;co_await kj::evalLater([]() {});currentEpoch(); }
+    }
+    for (const auto& marker: deletedDuringScan) { const auto prefix = marker.substr(0, marker.rfind('/') + 1);if (auto it = observed.find(prefix);it != observed.end()) it->second.erase(marker); }
+    observedOwn = std::move(observed);initialMarkerScan = false;nextMarkerScan = monotonicTimeMs() + 60000;
+    markerGate.result(true, probe, monotonicTimeMs());finished = true;
+  } catch (const kj::Exception& error) {
+    Scope measured(*this);if (canceled(error)) { ++ownerChanges;co_return; }
+    markerGate.result(false, probe, monotonicTimeMs());finished = true;nextMarkerScan = monotonicTimeMs() + 5000;
+    if (accessDenied(error)) denied(Probe::LIST, root);else failure("marker-scan");
   }
 }
 kj::Promise<void> AlarmPublication::probeMarkers() {
-  auto release = kj::defer([this]() { --active;--activeMarkers;pump(); });++markerProbes;
+  const auto epoch = nodeEpoch;
+  auto release = kj::defer([this]() { permissionProbeActive = false;--active;--activeScans;pump(); });
   try {
-    co_await store.listPage("alarm-wake/by-owner/" + nodeId + "/", 1);Scope measured(*this);markerDenied = false;++markerGeneration;
-    log("alarm-marker-access-restored", "\"denials\":" + std::to_string(markerDenials));
+    // Prefer a live marker write in pump(). With no applicable row, use one bounded
+    // own-prefix check object; a PUT is not called restored until its DELETE succeeds.
+    const auto check = "alarm-wake/by-owner/" + nodeId + "/check/" + wide(epoch);
+    if (deniedOperation == Probe::LIST) co_await store.listPage(deniedPrefix.empty() ? "alarm-wake/by-owner/" + nodeId + "/" : deniedPrefix, 1);
+    else if (deniedOperation == Probe::DELETE) co_await store.remove(check);
+    else {
+      co_await store.put(check, "");
+      try { co_await store.remove(check); }
+      catch (const kj::Exception& error) { if (accessDenied(error)) deniedOperation = Probe::DELETE;throw; }
+    }
+    if (!stopping && nodeEpoch == epoch) markerRestored();
+  } catch (const kj::Exception& error) { Scope measured(*this);if (accessDenied(error)) ++markerDenials;else failure("marker-probe"); }
+}
+unsigned AlarmPublication::drainDeadlines(unsigned limit) {
+  Scope measured(*this, &deadlineMetric);const auto now = monotonicTimeMs();
+  unsigned done = 0;for (;done < limit && !deadlines.empty() && deadlines.begin()->at <= now;++done) {
+    const auto due = *deadlines.begin();deadlines.erase(deadlines.begin());
+    if (due.kind == 1) {
+      auto it = writes.find(due.key);if (it != writes.end() && it->second.generation == due.generation && it->second.timed && it->second.next == due.at) { it->second.timed = false;refresh(it->second, now); }
+    } else {
+      auto it = shards.find(due.key);if (it == shards.end() || it->second.generation != due.generation) continue;auto& s = it->second;
+      if (!valid(s)) { ownershipChanged(due.key, due.generation);continue; }
+      if (due.kind == 0 && s.readTimed && s.next == due.at) { s.readTimed = false;offerRead(s); }
+      else if (due.kind == 2 && s.hintTimed && s.hintAt == due.at) { s.hintTimed = false;s.adopted = false;s.next = 0;offerRead(s); }
+      else if (due.kind == 3 && s.previousTimed && s.previousNext == due.at) { s.previousTimed = false;offerScan(s, false); }
+      else if (due.kind == 4 && s.repairTimed && s.repairNext == due.at) { s.repairTimed = false;offerScan(s, true); }
+    }
   }
-  catch (const kj::Exception& error) { Scope measured(*this);failure("marker-probe", accessDenied(error)); }
-  nextMarkerProbe = monotonicTimeMs() + 30000;
+  pump(8);return done;
+}
+void AlarmPublication::scheduleDeadlineDrain() {
+  if (drainingDeadlines || deadlines.empty() || deadlines.begin()->at > monotonicTimeMs()) return;
+  drainingDeadlines = true;tasks.add(kj::evalLater([this]() {
+    drainingDeadlines = false;if (!stopping) { drainDeadlines(64);scheduleDeadlineDrain(); }
+  }));
 }
 void AlarmPublication::tick() {
-  Scope measured(*this, &tickMetric);const auto now = monotonicTimeMs();readyHints.clear();readyMarkers.clear();
-  for (auto it = shards.begin(); it != shards.end();) {
-    if (!valid(it->second)) { const auto ns = it->second.ns;const auto shard = it->second.shard;++it;gone(ns, shard); } else ++it;
+  Scope measured(*this, &tickMetric);const auto dueItems = drainDeadlines(64);unsigned work = 0;
+  // Stable list cursors survive unordered_map rehash; no pass over the table.
+  for (unsigned n = 0;n < 16 && !writeSweep.empty();++n) {
+    if (sweepCursor == writeSweep.end()) sweepCursor = writeSweep.begin();const auto key = *sweepCursor++;++work;
+    auto it = writes.find(key);if (it != writes.end() && !valid(it->second) && !inFlightKeys.contains(key)) eraseWrite(it);
   }
-  if (now >= nextHintCheck) {
-    Shard* oldest = nullptr;for (auto& [key, s]: shards) if (s.adopted && !s.reading && s.nonempty && (!oldest || s.checked < oldest->checked)) oldest = &s;
-    if (oldest) { oldest->adopted = false;oldest->next = 0;oldest->order = ++serial; }
-    nextHintCheck = now + std::max(200.0, hintCheckInterval());
+  for (unsigned n = 0;n < 16 && !cleanupReady.empty();++n) {
+    const auto key = *cleanupReady.begin();auto it = shards.find(key);++work;
+    if (it == shards.end()) { cleanupReady.erase(key);continue; }auto& s = it->second;
+    if (!valid(s)) { ownershipChanged(key, s.generation);continue; }
+    if (!s.adopted || s.reading || !(s.markerWritten || (s.hints.empty() && s.desired.empty())) || s.previousMarkers.empty()) { cleanupReady.erase(key);continue; }
+    const auto old = *s.previousMarkers.begin();s.previousMarkers.erase(s.previousMarkers.begin());
+    if (old != s.marker) queueMarker(s, old, false, true);
+    if (s.previousMarkers.empty()) cleanupReady.erase(key);
   }
-  for (auto& [key, s]: shards) {
-    offerRead(s);reconcile(s);
-    if (!markerDenied && s.adopted && !s.reading && !s.markerReading && (now >= s.markerNext || s.markerGeneration != markerGeneration)) {
-      if (!s.markerOrder) s.markerOrder = ++serial;readyMarkers.insert({s.tenant, s.markerOrder, key, 2});
-    }
-    if (!markerDenied && s.adopted && !s.reading && s.markerGeneration == markerGeneration && (s.markerWritten || (s.hints.empty() && s.desired.empty()))) {
-      for (const auto& old: s.previousMarkers) queueMarker(s, old, false, true);s.previousMarkers.clear();
-    }
-  }
-  for (auto it = writes.begin(); it != writes.end();) {
-    if (!valid(it->second) && !inFlightKeys.contains(it->first)) { it = writes.erase(it);continue; }refresh(it->second, now);++it;
-  }
-  if (markerDenied && !activeMarkers && now >= nextMarkerProbe) { ++active;++activeMarkers;tasks.add(probeMarkers()); }
-  pump(8);failure(nullptr);
+  tickMaxItems = std::max<uint64_t>(tickMaxItems, work + dueItems);scheduleDeadlineDrain();pump(8);failure(nullptr);
 }
-void AlarmPublication::taskFailed(kj::Exception&&) { failure("task"); }
+void AlarmPublication::taskFailed(kj::Exception&& error) { if (canceled(error)) ++ownerChanges;else failure("task"); }
 std::string AlarmPublication::json() const {
-  uint64_t bytes = 0, markerPending = 0;double oldest = 0;
+  uint64_t bytes = 0, markerPending = 0, desired = 0;double oldest = 0;
   for (const auto& [key, w]: writes) { bytes += sizeof(Write) + key.capacity() + w.key.capacity() + w.ns.capacity() + w.object.capacity() + w.tenant.capacity();markerPending += w.marker; }
-  for (const auto& [key, s]: shards) if (s.nonempty) oldest = std::max(oldest, monotonicTimeMs() - s.checked);
+  for (const auto& [key, s]: shards) { if (s.nonempty) oldest = std::max(oldest, monotonicTimeMs() - s.checked);desired += s.desired.size(); }
   std::ostringstream out;
   out << "\"publicationPending\":" << writes.size() << ",\"publicationInFlight\":" << active << ",\"publicationPeakPending\":" << peakPending << ",\"publicationBytes\":" << bytes
       << ",\"publicationRetries\":" << retries << ",\"markerWrites\":" << markerWrites << ",\"markerDeletes\":" << markerDeletes << ",\"adoptionPages\":" << pages << ",\"adoptionMaxPage\":" << maxPage
-      << ",\"oldestHintCheckMs\":" << oldest << ",\"hintCheckIntervalMs\":" << hintCheckInterval() << ",\"publicationShards\":" << shards.size() << ",\"publicationDesired\":";
-  uint64_t desired = 0;for (const auto& [key, s]: shards) desired += s.desired.size();out << desired;
-  out << ",\"invalidAlarmHints\":" << badHints << ",\"markerAccessDenied\":" << (markerDenied ? "true" : "false") << ",\"markerDenials\":" << markerDenials << ",\"markerProbes\":" << markerProbes << ",\"markerPending\":" << markerPending
-      << ",\"publicationFailureLogLines\":" << failureLogLines << ",\"publicationCpuNs\":" << cpuNs;
+      << ",\"oldestHintCheckMs\":" << oldest << ",\"hintCheckIntervalMs\":" << hintCheckInterval() << ",\"publicationShards\":" << shards.size() << ",\"publicationDesired\":" << desired
+      << ",\"invalidAlarmHints\":" << badHints << ",\"markerAccessDenied\":" << (markerDenied ? "true" : "false") << ",\"markerDenials\":" << markerDenials << ",\"markerProbes\":" << markerProbes << ",\"markerPending\":" << markerPending
+      << ",\"publicationHintPending\":" << writes.size() - markerPending << ",\"publicationOwnerChanges\":" << ownerChanges << ",\"markerScanPages\":" << markerPages
+      << ",\"hintPublicationBackoff\":" << (hintGate.open ? "true" : "false") << ",\"markerPublicationBackoff\":" << (markerGate.open ? "true" : "false")
+      << ",\"publicationTickMaxItems\":" << tickMaxItems << ",\"publicationDeadlineRows\":" << deadlines.size()
+      << ",\"publicationFailureLogLines\":" << failureLogLines << ",\"publicationCpuNs\":" << cpuNs << ",\"publicationThreadCpuNs\":" << threadCpuNs;
   auto metric = [&out](const char* name, const Metric& m) { out << ",\"" << name << "Samples\":" << m.count << ",\"" << name << "P50Us\":" << m.percentile(50) << ",\"" << name << "P99Us\":" << m.percentile(99) << ",\"" << name << "MaxUs\":" << m.maximum / 1000.0; };
-  metric("publicationReport", reportMetric);metric("publicationCompletion", completionMetric);metric("publicationTick", tickMetric);return out.str();
+  metric("publicationReport", reportMetric);metric("publicationCompletion", completionMetric);metric("publicationTick", tickMetric);metric("publicationDeadlineSlice", deadlineMetric);metric("hintToMarker", markerLatencyMetric);return out.str();
 }
 }  // namespace coworkerd

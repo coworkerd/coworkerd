@@ -37,7 +37,9 @@
 #                               s3.configure) at each of its starts and whenever the file appears or changes, so that
 #                               any of them can be withdrawn without a restart: it reads what a node reads (the
 #                               cluster's marker, the tenant index and the manifests, definitions and code, the members)
-#                               and writes only its own prefixes members/<id>/ and nodes/<id>/ -- never another node's,
+#                               and writes its own members/<id>/ and nodes/<id>/ prefixes, shared DO metadata and
+#                               alarm-wake/by-owner/* across owners (successor marker cleanup) -- never another node's
+#                               members/ or nodes/ prefix,
 #                               never cluster/, the code or the credentials index (SeaweedFS's prefix actions, bucket
 #                               COWORKERD_STORAGE_BUCKET, default coworkerd)
 #                  apiserver/   deploy.json (the deploy identity), secrets-key.json, management-token, admin-credential;
@@ -288,7 +290,8 @@ secrets() {
   # epochs) -- and reads, writes and lists only its own members/<id>/ and nodes/<id>/ (heartbeats, epochs, the drain
   # marker, its suspects; its usage); it also writes the shards' epochs, release markers and owner hints
   # (do/<namespace>/shards/<shard>/...): any node may take a shard over. It never reads the credentials index or writes
-  # another node's prefixes, cluster/, tenants/ or the code.
+  # another node's members/ or nodes/ prefixes, cluster/, tenants/ or the code. It lists and writes
+  # alarm-wake/by-owner/* across owners so a successor can remove predecessor markers; it never reads their bodies.
   node_actions() {
     local b=$bucket id=$1 action out="" prefix
     # nodes/*: a node reads and lists every node's Durable Object log, because it rebuilds an object from the
