@@ -180,7 +180,9 @@ void AlarmPublication::wakeWrites(Shard& s) {
 void AlarmPublication::queueHint(Shard& s, const std::string& object, uint64_t at) {
   const auto key = hintPrefix(s.ns, s.shard) + object + "/0";auto [it, inserted] = writes.try_emplace(key);auto& w = it->second;
   if (inserted) { writeSweep.push_back(key);w.sweep = std::prev(writeSweep.end()); }
-  unqueue(w);w.key = key;w.ns = s.ns;w.object = object;w.tenant = s.tenant;w.shard = s.shard;
+  // refresh() replaces an unchanged ready identity once; retire old timers/identities before resetting fields.
+  if (w.timed || w.generation != s.generation || w.tenant != s.tenant) unqueue(w);
+  w.key = key;w.ns = s.ns;w.object = object;w.tenant = s.tenant;w.shard = s.shard;
   w.generation = s.generation;w.at = at;w.marker = false;w.version = ++serial;w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;
   s.writeKeys.insert(key);peakPending = std::max<uint64_t>(peakPending, writes.size());refresh(w, monotonicTimeMs());
 }
