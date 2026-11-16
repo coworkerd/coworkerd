@@ -78,7 +78,7 @@ operations validate the series before mutating a checkout or exporting files.
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024 and 0025, in that order.
+0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024, 0025 and 0026, in that order.
 0014 completes the Durable Object port; 0020 adds the private runtime root loader;
 0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
@@ -334,3 +334,19 @@ for reporting; it does not replace the JavaScript conversion hook.
 `api/sql.{h,c++}` obtains the current owned event budget and supplies the native error code. Its abort helper validates that this native budget was exhausted and is registered only under the experimental flag used by the platform runtime; tenant deployments cannot request that flag. `io/limit-enforcer.h` adds only the budget getter with a default implementation; `server/factory/coworkerd-cpu-limit.c++` owns and replaces the budget at the existing `topUpActor()` calls. The SQL-only wrapper for platform objects delegates the previous CPU, memory and reporting behavior, including hibernation limits, without parsing a creation identity. No `io-context`, V8, 0013 confirmation or 0020 root-loader file changes belong to this patch.
 
 SQLite's existing critical-error condition remains: an interrupted write can automatically roll back and break the output gate; an interrupted read need not do so. Exhausted budgets reject compilation and row steps before execution without setting the connection-wide interrupt flag, allowing trusted rollback, release and implicit transaction cleanup while other cursors remain open. The sampling seed uses the existing buffered entropy source. A failed connection close during reset restores the progress callback. The runtime rolls a failed database batch or ingest segment back before converting its failure and ending that database object. A function or blocking operation without progress callbacks can outlast the SQL budget; the process watchdog remains the fallback. See the [database](../docs/guide/databases.md) and [Durable Object](../docs/guide/durable-objects.md) guides for transaction behavior and the process configuration keys.
+
+### 0026: Ordinary entry review corrections
+
+Ordinary supersession requires a strictly newer trusted catalog generation. The private `/invoke`
+control rejects ordinary plans; their events require the selection bridge and fresh props.
+The install reply reports a cold generation once, so independent callers do not share request-owned
+JavaScript preparation promises. Lookup/install retain `info.loaded` and `info.generation`.
+
+`factory/coworkerd-idle-eviction.{h,c++}` polls only a separate queue of superseded instances.
+`worker-factory.c++` supplies the existing wait-until TaskSet's emptiness as an additional retirement
+condition. Foreground activity, streams and WebSockets keep the existing activity tokens. Ordinary
+idle collection remains separate. Only `server/root_loader.rs` is added to this patch's Rust whitelist;
+IoContext, V8 and general RPC semantics are unchanged.
+
+The Node reads typed lifecycle labels for comparison counters only. Production tenant usage and
+generation draining continue to use the original isolate-name decisions in this stage.

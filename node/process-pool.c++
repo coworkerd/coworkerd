@@ -2978,25 +2978,8 @@ public:
     // in this generation (its load failed, or it was evicted) has no context left to wait for.
     auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
-    std::set<std::pair<std::string, std::string>> labeledResidents;
-    try {
-      capnp::MallocMessageBuilder message;
-      auto value = message.initRoot<capnp::JsonValue>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
-      auto residents = json::field(value, "residentWorkers");
-      if (!residents.isArray()) return false;
-      for (auto resident : residents.getArray()) {
-        auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
-        auto revision = json::field(resident, "planRevision");
-        if (!worker.isString() || worker.getString().size() == 0 || !version.isString() ||
-            version.getString().size() == 0 || !revision.isString() || revision.getString().size() == 0 ||
-            !json::field(resident, "loadGeneration").isNumber() || !json::field(resident, "instance").isNumber()) return false;
-        labeledResidents.emplace(worker.getString().cStr(), version.getString().cStr());
-      }
-    } catch (const kj::Exception&) {return false;}
     std::erase_if(old.openContexts, [&](const auto& entry) {
       if (entry.second.finishedAt == 0) return false;
-      if (labeledResidents.contains({entry.second.workerId, entry.second.versionId})) return false;
       const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
       if (lifecycle.find(marker) != std::string::npos) return false;
       ++old.contextsCleared; ++cleared;
@@ -3479,7 +3462,7 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
         const bool typed = worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
             && revision.isString() && revision.getString().size() && json::field(entry, "loadGeneration").isNumber()
             && json::field(entry, "instance").isNumber();
-        if (typed) {++impl->lifecycleLabels.typed; ++counts[tenantOf(worker.getString().cStr())];}
+        if (typed) ++impl->lifecycleLabels.typed;
         else ++impl->lifecycleLabels.missing;
         const auto at = isolate.find('@');
         if (at == std::string::npos) continue;
@@ -3491,10 +3474,9 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
           if (legacyWorker == worker.getString().cStr() && isolate.substr(at + 1, hash - at - 1) == version.getString().cStr())
             ++impl->lifecycleLabels.matches;
           else ++impl->lifecycleLabels.mismatches;
-        } else {
-          const auto tenant = tenantOf(legacyWorker);
-          if (!tenant.empty()) ++counts[tenant];
         }
+        const auto tenant = tenantOf(legacyWorker);
+        if (!tenant.empty()) ++counts[tenant];
       }
     } catch (const kj::Exception&) {}
   });

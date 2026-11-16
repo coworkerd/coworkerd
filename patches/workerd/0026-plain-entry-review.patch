@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 05:13:47 +0800
+Subject: [PATCH] Preserve plain Worker work across supersession and caller
+ cancellation
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 3a8fa53ecb8b04699bc557eb0471fbc0b801e07e..514d4da4190b4595444c47fa3795dd4d25969f5e 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -95,6 +95,7 @@ struct IdleWorker {
+   uint32_t active = 0;
+   bool ready = false, removed = false, created = false, destroyed = false, eligible = true;
+   bool retireWhenIdle = false;
++  kj::Maybe<kj::Function<bool()>> backgroundDone;
+   IdleWorkerLabels labels;
+   double lastEnd = monotonicMs(), loadStart = lastEnd, teardownStart = 0;
+   uint64_t loadCpu = cpuNs();
+@@ -129,10 +130,16 @@ class IdleReaper {
+     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
+   }
+   kj::Timer& timer;
+-  bool loopStarted = false, retirementRequested = false;
++  bool loopStarted = false, retirementLoopStarted = false;
+   void startLoop() {
+     if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
+   }
++  void startRetirementLoop() {
++    if (!retirementLoopStarted) {
++      retirementLoopStarted = true;
++      retirementTask = retirementLoop().eagerlyEvaluate(nullptr);
++    }
++  }
+   uint32_t threshold, interval;
+   uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
+   uint64_t watermarkEvicted = 0, bandReads = 0, bandReadNs = 0;
+@@ -142,7 +149,8 @@ class IdleReaper {
+   uint32_t effectiveThreshold() const { return band == 2 ? 1000 : band == 1 ? 5000 : threshold; }
+   double lastDestroy = 0;
+   std::list<std::weak_ptr<IdleWorker>> workers;
+-  kj::Promise<void> task = nullptr, collectTask = nullptr;
++  std::list<std::weak_ptr<IdleWorker>> retiringWorkers;
++  kj::Promise<void> task = nullptr, collectTask = nullptr, retirementTask = nullptr;
+   uint64_t publishedGc = 0;
+ 
+   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
+@@ -268,17 +276,15 @@ class IdleReaper {
+         lastPublish = monotonicMs();
+       }
+       auto minimum = effectiveThreshold();
+-      if ((!minimum && !retirementRequested) || pending || monotonicMs() - lastDestroy < interval) continue;
++      if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
+       IdleWorkerRef oldest;
+       auto now = monotonicMs();
+-      retirementRequested = false;
+       for (auto it = workers.begin(); it != workers.end();) {
+         auto worker = it->lock();
+         if (!worker) { it = workers.erase(it); continue; }
+         ++it;
+-        if (worker->retireWhenIdle && !worker->removed) retirementRequested = true;
+         if (!worker->eligible || !worker->ready || !worker->created || worker->removed || worker->active ||
+-            (!worker->retireWhenIdle && (!minimum || now - worker->lastEnd <= minimum))) continue;
++            worker->retireWhenIdle || now - worker->lastEnd <= minimum) continue;
+         if (!oldest || worker->lastEnd < oldest->lastEnd) oldest = kj::mv(worker);
+       }
+       if (oldest) {
+@@ -287,13 +293,42 @@ class IdleReaper {
+         KJ_IF_SOME(cb, oldest->remove) {
+           auto remove = kj::mv(cb);
+           oldest->remove = kj::none;
+-          idleWorkerRemoved(oldest, oldest->retireWhenIdle ? "superseded" :
++          idleWorkerRemoved(oldest,
+               threshold && now - oldest->lastEnd > threshold ? "idle" : "watermark");
+           remove();
+         }
+       }
+     }
+   }
++  kj::Promise<void> retirementLoop() {
++    while (!retiringWorkers.empty()) {
++      co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
++      if (pending || monotonicMs() - lastDestroy < interval) continue;
++      IdleWorkerRef oldest;
++      // A pending supersession never turns on a scan of unrelated resident instances.
++      for (auto it = retiringWorkers.begin(); it != retiringWorkers.end();) {
++        auto worker = it->lock();
++        if (!worker || worker->removed || worker->destroyed || worker->remove == kj::none) {
++          it = retiringWorkers.erase(it);
++          continue;
++        }
++        ++it;
++        if (!worker->eligible || !worker->ready || !worker->created || worker->active) continue;
++        KJ_IF_SOME(done, worker->backgroundDone) { if (!done()) continue; }
++        if (!oldest || worker->lastEnd < oldest->lastEnd) oldest = kj::mv(worker);
++      }
++      if (oldest) {
++        pending = oldest->id;
++        KJ_IF_SOME(cb, oldest->remove) {
++          auto remove = kj::mv(cb);
++          oldest->remove = kj::none;
++          idleWorkerRemoved(oldest, "superseded");
++          remove();
++        }
++      }
++    }
++    retirementLoopStarted = false;
++  }
+ };
+ 
+ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer) {
+@@ -307,10 +342,14 @@ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+   worker->labels = std::move(labels);
+   return worker;
+ }
+-void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker) {
+-  if (!worker || worker->removed) return;
++void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone) {
++  if (!worker || worker->removed || worker->retireWhenIdle) return;
+   worker->retireWhenIdle = true;
+-  if (auto owner = worker->owner.lock()) {owner->retirementRequested = true; owner->startLoop();}
++  worker->backgroundDone = kj::mv(backgroundDone);
++  if (auto owner = worker->owner.lock()) {
++    owner->retiringWorkers.push_back(worker);
++    owner->startRetirementLoop();
++  }
+ }
+ void idleWorkerReady(const IdleWorkerRef& worker) {
+   if (worker) { worker->ready = true; worker->lastEnd = monotonicMs(); }
+@@ -335,7 +374,7 @@ void idleWorkerFailed(const IdleWorkerRef& worker) {
+   }
+ }
+ void detachIdleWorker(const IdleWorkerRef& worker) {
+-  if (worker) { worker->remove = kj::none; worker->collect = kj::none; }
++  if (worker) { worker->remove = kj::none; worker->collect = kj::none; worker->backgroundDone = kj::none; }
+ }
+ void idleWorkerSetGc(const IdleWorkerRef& worker, std::shared_ptr<IsolateGc> gc) { if (worker) worker->gc = kj::mv(gc); }
+ void idleWorkerSetCollector(const IdleWorkerRef& worker, IdleCollector collect) {
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.h b/src/workerd/server/factory/coworkerd-idle-eviction.h
+index 5ddd62c31b619e020e5af37fef647316bee868fd..3d3358a82e9de7ca440c7e4071ba19cd1f2367a1 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.h
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.h
+@@ -21,7 +21,7 @@ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
+ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+     kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
+     IdleWorkerLabels labels = {});
+-void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker);
++void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone);
+ void idleWorkerReady(const IdleWorkerRef& worker);
+ void idleWorkerFailed(const IdleWorkerRef& worker);
+ void idleWorkerRemoved(const IdleWorkerRef& worker, kj::StringPtr reason);
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 83f2ca2aa5c27e4708b4954ce800d40aa49c718e..a0b9ef566979c3abb16ce37312b2fc9a5fc2a92e 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -2071,7 +2071,10 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
+ }
+ 
+ void worker_retire_when_idle(const CompiledWorker& worker) {
+-  idleWorkerRetireWhenIdle(worker.getImpl().idleWorker);
++  auto& impl = worker.getImpl();
++  idleWorkerRetireWhenIdle(impl.idleWorker, [target = &impl]() {
++    return target->waitUntilTasks.isEmpty();
++  });
+ }
+ 
+ void worker_unlink(const CompiledWorker& worker) {
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index 521b207e6068cae644b64aaf71c179c654f5cac3..1f25f754dd9bc345b16d87a215220170f7ff9d70 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -350,6 +350,7 @@ struct Plan {
+     deployment: Deployment,
+     lock: tokio::sync::Mutex<()>,
+     generation: Cell<Option<u64>>,
++    reported_plain_generation: Cell<Option<u64>>,
+     loaded: RefCell<Option<WorkerKey>>,
+     retiring: RefCell<Option<Shared<LocalBoxFuture<'static, ()>>>>,
+     selection_pins: Cell<usize>,
+@@ -746,7 +747,7 @@ impl RootRegistry {
+         let previous = if selection.active_plan {
+             let mut latest = self.latest_plain.borrow_mut();
+             let previous = latest.get(&plan.deployment.worker_id);
+-            if previous.is_none_or(|(generation, _)| selection.catalog_generation >= *generation) {
++            if previous.is_none_or(|(generation, _)| selection.catalog_generation > *generation) {
+                 let changed = previous.is_none_or(|(_, key)| key != &selection.plan);
+                 if changed || previous.is_some_and(|(generation, _)| *generation != selection.catalog_generation) {
+                     latest.insert(plan.deployment.worker_id.clone(), (selection.catalog_generation, selection.plan.clone()))
+@@ -1261,6 +1262,7 @@ impl RootRegistry {
+             deployment,
+             lock: tokio::sync::Mutex::new(()),
+             generation: Cell::new(Some(key.generation)),
++            reported_plain_generation: Cell::new(None),
+             loaded: RefCell::new(None),
+             retiring: RefCell::new(None),
+             selection_pins: Cell::new(0),
+@@ -2324,8 +2326,11 @@ impl Service for RootRequest {
+                     Ok(plan) => {
+                         let plans = self.registry.plans.borrow();
+                         if let Some(installed) = plans.get(&plan) {
++                        let cold = installed.deployment.is_plain() &&
++                            installed.reported_plain_generation.replace(installed.generation.get()) != installed.generation.get();
+                         json!({"plan": plan, "info": {"kind": installed.deployment.kind,
+                             "loaded": installed.loaded.borrow().is_some(), "generation": installed.generation.get(),
++                            "cold": cold,
+                             "tenant": installed.deployment.owner_tenant().ok(), "workerId": installed.deployment.worker_id,
+                             "configuredWorker": if installed.deployment.is_platform() {
+                                 self.registry.loaded(installed).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
+@@ -2470,6 +2475,10 @@ impl Service for RootRequest {
+                     .find(|(key, _)| key == "plan")
+                     .map(|(_, value)| value.into_owned())
+                     .ok_or_else(|| kj::failed!("invoke needs a plan"))?;
++                if self.registry.plans.borrow().get(&plan)
++                    .is_some_and(|plan| plan.deployment.is_plain()) {
++                    return Err(kj::failed!("ordinary worker plans require the private selection entry"));
++                }
+                 let worker = self.registry.worker(&plan).await?;
+                 let metadata = self
+                     .metadata
