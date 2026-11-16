@@ -61,6 +61,8 @@ AlarmPublication::Scope::~Scope() {
 // Metric storage is declared in the header so component tests can inspect the same production counters.
 AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::string nodeId, Current current, Adopt adopt, Log log)
     : store(store), timer(timer), nodeId(std::move(nodeId)), current(std::move(current)), adopt(std::move(adopt)), log(std::move(log)), tasks(*this) {
+  KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&retryRandom), sizeof(retryRandom)) == 1);
+  if (!retryRandom) retryRandom = 0x9e3779b97f4a7c15ull;
   if (const auto* value = std::getenv("COWORKERD_ALARM_HINT_CHECK_MS_FOR_TEST")) {
     char* end = nullptr;const auto n = std::strtoull(value, &end, 10);
     if (end && !*end && n >= 200 && n <= 3600000) hintRoundMs = n;
@@ -148,9 +150,10 @@ void AlarmPublication::reconcile(Shard& s) {
 }
 uint32_t AlarmPublication::retry(uint32_t& failures) {
   failures = std::min<uint32_t>(failures + 1, 32);++retries;
-  const auto base = std::min<uint32_t>(5000, 250u << std::min<uint32_t>(failures - 1, 5));uint32_t random = 0;
-  KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&random), sizeof(random)) == 1);
-  return std::min<uint32_t>(5000, base + random % std::max<uint32_t>(1, base / 4));
+  const auto base = std::min<uint32_t>(5000, 250u << std::min<uint32_t>(failures - 1, 5));
+  // Retry jitter is not a token: seed once, then avoid a crypto call on each failed completion.
+  retryRandom ^= retryRandom << 13;retryRandom ^= retryRandom >> 7;retryRandom ^= retryRandom << 17;
+  return std::min<uint32_t>(5000, base + retryRandom % std::max<uint32_t>(1, base / 4));
 }
 void AlarmPublication::failure(const char* operation, bool denied) {
   if (denied) {
