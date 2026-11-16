@@ -1,13 +1,5 @@
 # Databases (D1's shape)
 
-Each database event has a cumulative native SQL CPU budget of 200 ms by default and an 800 ms active SQL wall-time fallback. Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md). Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any excess at its actual value. Segments invoking the progress callback are measured directly.
-
-Reaching a limit ends the current database object and returns `503 SQL_LIMIT_EXCEEDED`, naming the cause and configured limit. A D1 binding receives `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A batch, one ingest segment, or one migration file including its `d1_migrations` row fails as a whole even if the interrupted statement is a read. Earlier confirmed segments and files remain. Concurrent `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their confirmation meaning and priority. Other database objects and the shared durable process remain available.
-
-For a tenant's own `ctx.storage.sql`, an interrupted write rolls back the transaction even if caught. A read error escaping `transactionSync` rolls back; if caught, earlier complete statements may commit, while later SQL in the event is refused. See [Durable Objects](durable-objects.md). A smaller Worker CPU allowance does not replace the SQL budget inside a native statement. With a 50 ms Worker CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms; the Worker allowance took effect when native execution returned.
-
-Interruption is cooperative. A single costly function or blocking I/O without SQLite progress callbacks can exceed the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog (3000 ms by default) remains the fallback.
-
 > For release 0.5.6. A database is a Durable Object: it gets the same replication, the same rebuild
 > after its owner changes and the same limits ([compatibility scope](compat.md), [durable objects](durable-objects.md)).
 > The API is D1's, so an application written for D1 runs unchanged within the subset below.
@@ -156,8 +148,8 @@ error. The database remains usable without resetting the object. A single `/quer
 `batch()`, also rolls back all its writes on this error.
 `exec()` keeps its earlier successful lines, as with other statement errors.
 
-This is a reply-size limit, not a process-memory limit or an execution deadline. Consuming the remaining cursor still
-has no separate time limit. A large row and JSON serialization can use more memory than the reply size.
+This is a reply-size limit, not a process-memory limit or an execution deadline. Consuming the remaining cursor remains
+subject to the SQL execution budget described below. A large row and JSON serialization can use more memory than the reply size.
 
 ## 6. Versioned migrations
 
@@ -329,6 +321,14 @@ the tenant's storage. Its data stays in the object store (there is no data recla
 be used again in this release.
 
 ## 10. Failure and consistency
+
+Each database event has a cumulative native SQL CPU budget of 200 ms by default and an 800 ms active SQL wall-time fallback. A request, alarm, delivered WebSocket message, call into an RPC target handed out by the object, or message on an outbound WebSocket accepted by the object starts a fresh budget. Statements share that budget across awaits; uninterrupted synchronous execution does not replace it. Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md). Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any excess at its actual value. Segments invoking the progress callback are measured directly.
+
+Reaching a limit ends the current database object and returns `503 SQL_LIMIT_EXCEEDED`, naming the cause and configured limit. A D1 binding receives `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A batch, one ingest segment, or one migration file including its `d1_migrations` row fails as a whole even if the interrupted statement is a read. Earlier confirmed segments and files remain. Concurrent `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their confirmation meaning and priority. Other database objects and the shared durable process remain available.
+
+For a tenant's own `ctx.storage.sql`, an interrupted write rolls back the transaction even if caught. A read error escaping `transactionSync` rolls back; if caught, earlier complete statements may commit, while later SQL in the event is refused. See [Durable Objects](durable-objects.md). A smaller Worker CPU allowance does not replace the SQL budget inside a native statement. With a 50 ms Worker CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms; the Worker allowance took effect when native execution returned.
+
+Interruption is cooperative. A single costly function or blocking I/O without SQLite progress callbacks can exceed the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog (3000 ms by default) remains the fallback.
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
