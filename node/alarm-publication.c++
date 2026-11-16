@@ -57,23 +57,26 @@ double AlarmPublication::Metric::percentile(unsigned percent) const {
   return 0;
 }
 AlarmPublication::Scope::Scope(AlarmPublication& owner, Metric* metric): owner(owner), metric(metric), started(nanoTime()) {
-  if (!owner.cpuDepth++) { owner.cpuStarted = started;owner.threadCpuStarted = threadTime(); }
+  if (!owner.cpuDepth++) { owner.cpuStarted = started;if (owner.measureThreadCpu) owner.threadCpuStarted = threadTime(); }
 }
 AlarmPublication::Scope::~Scope() {
-  const auto now = nanoTime();if (metric) metric->add(now - started);if (!--owner.cpuDepth) { owner.cpuNs += now - owner.cpuStarted;owner.threadCpuNs += threadTime() - owner.threadCpuStarted; }
+  const auto now = nanoTime();if (metric) metric->add(now - started);if (!--owner.cpuDepth) { owner.cpuNs += now - owner.cpuStarted;if (owner.measureThreadCpu) owner.threadCpuNs += threadTime() - owner.threadCpuStarted; }
 }
 
 bool AlarmPublication::Gate::available(double now) const { return disabled || !open || (!probing && now >= next); }
-bool AlarmPublication::Gate::enter(double now) {
+bool AlarmPublication::Gate::enter(double now, const std::string& key) {
   if (disabled || !open) return false;
-  KJ_REQUIRE(!probing && now >= next);probing = true;return true;
+  KJ_REQUIRE(!probing && now >= next);probing = true;lastProbe = key;return true;
 }
-void AlarmPublication::Gate::result(bool success, bool probe, double now) {
+void AlarmPublication::Gate::result(bool success, bool probe, double now, const std::string& key) {
   if (probe) probing = false;
-  if (success) { failures = 0;open = false;next = 0;return; }
+  if (success) { failures = 0;diverse = false;firstFailure.clear();lastProbe.clear();open = false;next = 0;return; }
   if (disabled) return;
-  if (!open && ++failures >= 8) { open = true;next = now + 5000; }
-  else if (open && probe) next = now + 5000;
+  if (!open) {
+    if (!failures) firstFailure = key;else if (firstFailure != key) diverse = true;
+    if (failures < 8) ++failures;
+    if (failures >= 8 && diverse) { open = true;next = now + 5000; }
+  } else if (probe) next = now + 5000;
 }
 void AlarmPublication::Gate::cancel(bool probe) { if (probe) probing = false; }
 
@@ -81,6 +84,7 @@ AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::st
     : store(store), timer(timer), nodeId(std::move(nodeId)), current(std::move(current)), adopt(std::move(adopt)), log(std::move(log)), tasks(*this) {
   KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&retryRandom), sizeof(retryRandom)) == 1);
   if (!retryRandom) retryRandom = 0x9e3779b97f4a7c15ull;
+  if (const auto* value = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureThreadCpu = std::string_view(value) == "1";
   if (const auto* value = std::getenv("COWORKERD_ALARM_HINT_CHECK_MS_FOR_TEST")) {
     char* end = nullptr;const auto n = std::strtoull(value, &end, 10);
     if (end && !*end && n >= 200 && n <= 3600000) hintRoundMs = n;
@@ -239,15 +243,18 @@ void AlarmPublication::denied(Probe operation, std::string prefix) {
   ++markerDenials;if (markerDenied) { if (operation != Probe::LIST) deniedOperation = operation;return; }markerDenied = true;deniedOperation = operation;deniedPrefix = std::move(prefix);nextMarkerProbe = monotonicTimeMs() + 30000;failure("marker-access");
 }
 void AlarmPublication::markerRestored() {
-  if (!markerDenied) return;markerDenied = false;markerGate.result(true, false, monotonicTimeMs());
+  if (!markerDenied) return;markerDenied = false;markerGate.result(true, false, monotonicTimeMs(), nodeId);
   log("alarm-marker-access-restored", "\"denials\":" + std::to_string(markerDenials));
 }
 void AlarmPublication::pump(unsigned limit) {
   Scope measured(*this);if (stopping) return;
   for (unsigned attempt = 0; attempt < limit && active < 16; ++attempt) {
     const auto now = monotonicTimeMs();Ready work{};bool have = false, permissionProbe = false, gateProbe = false;
-    auto choose = [this](std::set<Ready>& queue) {
-      auto it = queue.upper_bound({lastTenant, UINT64_MAX, "", 5});if (it == queue.end()) it = queue.begin();auto value = *it;queue.erase(it);return value;
+    auto choose = [this](std::set<Ready>& queue, const Gate& gate) {
+      auto it = queue.upper_bound({lastTenant, UINT64_MAX, "", 5});if (it == queue.end()) it = queue.begin();
+      // A bounded skip prevents a permanently failing item from monopolizing probes within one tenant.
+      if (gate.open && it->key == gate.lastProbe && queue.size() > 1) { if (++it == queue.end()) it = queue.begin(); }
+      auto value = *it;queue.erase(it);return value;
     };
     // Separate capacities preserve seven H slots even if all eight marker writes and one scan hang.
     // M writes precede every scan; the total is bounded by sixteen.
@@ -265,12 +272,12 @@ void AlarmPublication::pump(unsigned limit) {
       if (!have && activeScans) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
       if (!have) { ++active;++activeScans;tasks.add(kj::evalLater([this]() { return probeMarkers(); }));continue; }
     }
-    if (!have && activeMarkers < 8 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers);have = true; }
-    if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints);have = true; }
+    if (!have && activeMarkers < 8 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers, markerGate);have = true; }
+    if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints, hintGate);have = true; }
     if (!have && !activeScans && !markerDenied && markerGate.available(now)) {
-      if (!readyScans.empty()) { work = choose(readyScans);have = true; }
+      if (!readyScans.empty()) { work = choose(readyScans, markerGate);have = true; }
       else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
-        gateProbe = markerGate.enter(now);globalScanRunning = true;++active;++activeScans;
+        gateProbe = markerGate.enter(now, nodeId);globalScanRunning = true;++active;++activeScans;
         tasks.add(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); }));continue;
       }
     }
@@ -280,7 +287,7 @@ void AlarmPublication::pump(unsigned limit) {
       if (!valid(it->second)) { ownershipChanged(work.key, it->second.generation);continue; }auto& s = it->second;const auto generation = s.generation;
       if (work.kind == 0) {
         if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;
-        gateProbe = hintGate.enter(now);s.reading = true;refreshActivity(s);++active;++activeHints;
+        gateProbe = hintGate.enter(now, work.key);s.reading = true;refreshActivity(s);++active;++activeHints;
         tasks.add(kj::evalLater([this, key = work.key, generation, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
           if (it == shards.end() || it->second.generation != generation) { hintGate.cancel(gateProbe);--active;--activeHints;pump();return kj::READY_NOW; }
@@ -288,7 +295,7 @@ void AlarmPublication::pump(unsigned limit) {
         }));
       } else {
         if (s.scanning || !s.adopted || s.reading) continue;
-        gateProbe = markerGate.enter(now);s.scanning = true;++active;++activeScans;
+        gateProbe = markerGate.enter(now, work.key);s.scanning = true;++active;++activeScans;
         tasks.add(kj::evalLater([this, key = work.key, generation, repair = work.kind == 2, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
           if (it == shards.end() || it->second.generation != generation) { markerGate.cancel(gateProbe);--active;--activeScans;pump();return kj::READY_NOW; }
@@ -303,7 +310,7 @@ void AlarmPublication::pump(unsigned limit) {
       }
       const auto& s = shards.at(shardKey(it->second.ns, it->second.shard));
       if (!s.adopted || s.reading) { if (permissionProbe) permissionProbeActive = false;continue; }
-      if (!permissionProbe) gateProbe = (it->second.marker ? markerGate : hintGate).enter(now);
+      if (!permissionProbe) gateProbe = (it->second.marker ? markerGate : hintGate).enter(now, work.key);
       inFlightKeys.insert(work.key);if (it->second.marker && !it->second.at) inFlightDeletes.insert(work.key);
       ++active;if (it->second.marker) ++activeMarkers;else { ++activeHints;++inFlightHints[shardKey(it->second.ns, it->second.shard)]; }
       tasks.add(kj::evalLater([this, sent = it->second, gateProbe, permissionProbe]() mutable { return write(std::move(sent), gateProbe, permissionProbe); }));
@@ -344,7 +351,7 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
   } catch (const kj::Exception& error) { rejected = sent.marker && accessDenied(error); }
   Scope measured(*this, &completionMetric);
   if (!valid(sent)) { gate.cancel(probe);ownershipChanged(shardKey(sent.ns, sent.shard), sent.generation);co_return; }
-  gate.result(success, probe, monotonicTimeMs());if (permissionProbe && success) markerRestored();
+  gate.result(success, probe, monotonicTimeMs(), key);if (permissionProbe && success) markerRestored();
   // The initial outage is logged; repeated circuit probes retain failure/retry counters without synchronous log I/O.
   if (!success) { if (!sent.marker) ++hintFailures;if (rejected) denied(sent.at ? Probe::PUT : Probe::DELETE);else if (!probe) failure(sent.marker ? "marker-write" : "hint-write"); }
   else if (sent.marker) { if (sent.at) ++markerWrites;else ++markerDeletes;if (permissionProbe) markerRestored(); }
@@ -439,10 +446,10 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
     }
     reconcile(s);wakeWrites(s);
     if (!s.previousDone && !s.previousPrefix.empty()) { s.previousPending = true;s.previousNext = 0;offerScan(s, false); }
-    hintGate.result(true, probe, monotonicTimeMs());finished = true;
+    hintGate.result(true, probe, monotonicTimeMs(), key);finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ownershipChanged(key, generation);co_return; }
-    hintGate.result(false, probe, monotonicTimeMs());finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }if (!probe) failure("hint-scan");
+    hintGate.result(false, probe, monotonicTimeMs(), key);finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }if (!probe) failure("hint-scan");
   }
 }
 kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, bool probe) {
@@ -471,11 +478,11 @@ kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, b
       } while (!token.empty());
       auto& s = held();s.previousMarkers.insert(previous.begin(), previous.end());s.previousMarkers.erase(s.marker);s.previousDone = true;s.previousPending = false;s.previousNext = 0;cleanup(s);
     }
-    markerGate.result(true, probe, monotonicTimeMs());finished = true;
+    markerGate.result(true, probe, monotonicTimeMs(), key);finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);
     if (canceled(error)) { ownershipChanged(key, generation);co_return; }
-    markerGate.result(false, probe, monotonicTimeMs());finished = true;
+    markerGate.result(false, probe, monotonicTimeMs(), key);finished = true;
     auto it = shards.find(key);
     if (it != shards.end() && it->second.generation == generation) {
       (repair ? it->second.repairNext : it->second.previousNext) = monotonicTimeMs() + 5000;
@@ -538,10 +545,10 @@ kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
     }
     for (const auto& marker: deletedDuringScan) { const auto prefix = marker.substr(0, marker.rfind('/') + 1);if (auto it = observed.find(prefix);it != observed.end()) it->second.erase(marker); }
     observedOwn = std::move(observed);initialMarkerScan = false;nextMarkerScan = monotonicTimeMs() + 60000;
-    markerGate.result(true, probe, monotonicTimeMs());finished = true;
+    markerGate.result(true, probe, monotonicTimeMs(), nodeId);finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ++ownerChanges;co_return; }
-    markerGate.result(false, probe, monotonicTimeMs());finished = true;nextMarkerScan = monotonicTimeMs() + 5000;
+    markerGate.result(false, probe, monotonicTimeMs(), nodeId);finished = true;nextMarkerScan = monotonicTimeMs() + 5000;
     if (accessDenied(error)) denied(Probe::LIST, root);else if (!probe) failure("marker-scan");
   }
 }
