@@ -32,10 +32,22 @@ bool accessDenied(const kj::Exception& e) {
   const std::string_view text(e.getDescription().cStr());return text.find("HTTP 403") != text.npos || text.find("AccessDenied") != text.npos;
 }
 }
-void AlarmPublication::Metric::add(uint64_t ns) { ++bins[std::min<uint64_t>(bins.size() - 1, ns / 100)];++count;maximum = std::max(maximum, ns); }
+void AlarmPublication::Metric::add(uint64_t ns) {
+  uint64_t index = ns / 100;
+  if (ns >= 51200) {
+    uint64_t base = 51200;unsigned group = 0;
+    while (ns >= base * 2 && group < 31) { base *= 2;++group; }
+    index = 512 + group * 16 + std::min<uint64_t>(15, (ns - base) * 16 / base);
+  }
+  ++bins[index];++count;maximum = std::max(maximum, ns);
+}
 double AlarmPublication::Metric::percentile(unsigned percent) const {
   if (!count) return 0;uint64_t n = 0, target = (count * percent + 99) / 100;
-  for (size_t i = 0; i < bins.size(); ++i) if ((n += bins[i]) >= target) return (i == bins.size() - 1 ? maximum : (i + 1) * 100) / 1000.0;
+  for (size_t i = 0; i < bins.size(); ++i) if ((n += bins[i]) >= target) {
+    if (i < 512) return (i + 1) / 10.0;
+    const uint64_t base = 51200ull << ((i - 512) / 16);
+    return (i == bins.size() - 1 ? maximum : base + base * ((i - 512) % 16 + 1) / 16) / 1000.0;
+  }
   return 0;
 }
 AlarmPublication::Scope::Scope(AlarmPublication& owner, Metric* metric): owner(owner), metric(metric), started(nanoTime()) {
@@ -160,20 +172,34 @@ void AlarmPublication::pump(unsigned limit) {
     if (work.kind == 0 || work.kind == 2) {
       auto it = shards.find(work.key);if (it == shards.end() || !valid(it->second)) continue;auto& s = it->second;
       if (work.kind == 0) {
-        if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;s.reading = true;++active;++activeHints;tasks.add(readHints(work.key));
+        if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;s.reading = true;++active;++activeHints;
+        const auto generation = s.generation;
+        tasks.add(kj::evalLater([this, key = work.key, generation]() -> kj::Promise<void> {
+          auto it = shards.find(key);
+          if (it == shards.end() || it->second.generation != generation) { --active;--activeHints;pump();return kj::READY_NOW; }
+          return readHints(key);
+        }));
       } else {
-        if (s.markerReading || !s.adopted || s.reading) continue;s.markerReading = true;++active;++activeMarkers;tasks.add(scanMarkers(work.key));
+        if (s.markerReading || !s.adopted || s.reading) continue;s.markerReading = true;++active;++activeMarkers;
+        const auto generation = s.generation;
+        tasks.add(kj::evalLater([this, key = work.key, generation]() -> kj::Promise<void> {
+          auto it = shards.find(key);
+          if (it == shards.end() || it->second.generation != generation) { --active;--activeMarkers;pump();return kj::READY_NOW; }
+          return scanMarkers(key);
+        }));
       }
     } else {
       auto it = writes.find(work.key);if (it == writes.end() || !valid(it->second) || inFlightKeys.contains(work.key)) continue;
       const auto& s = shards.at(shardKey(it->second.ns, it->second.shard));if (!s.adopted || s.reading) continue;
       inFlightKeys.insert(work.key);++active;if (it->second.marker) ++activeMarkers;else { ++activeHints;++inFlightHints[shardKey(it->second.ns, it->second.shard)]; }
-      tasks.add(write(work.key));
+      tasks.add(kj::evalLater([this, sent = it->second]() mutable { return write(std::move(sent)); }));
     }
   }
 }
-kj::Promise<void> AlarmPublication::write(std::string key) {
-  const auto sent = writes.at(key);bool success = false, denied = false;
+kj::Promise<void> AlarmPublication::write(Write sent) {
+  const auto key = sent.key;
+  if (auto it = writes.find(key);it != writes.end() && it->second.generation == sent.generation) sent = it->second;
+  bool success = false, denied = false;
   try {
     KJ_REQUIRE(valid(sent), "alarm publication owner changed");
     kj::Promise<ObjectResponse> operation = nullptr;
