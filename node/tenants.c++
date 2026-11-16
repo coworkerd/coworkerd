@@ -8,6 +8,7 @@ namespace coworkerd {
 void TenantView::onQuota(std::function<void(const std::string&, uint64_t, uint64_t)> callback) { quota = std::move(callback); }
 
 void TenantView::update(const std::map<std::string, std::optional<TenantRecord>>& named, uint64_t at, bool records) {
+  if (records && hasRecords && at <= revision) return;
   ++epochValue;
   if (records && hasRecords && at != 0 && at > revision) {
     for (const auto& name : catalogTenants) if (!named.contains(name)) removedTenants.insert(name);

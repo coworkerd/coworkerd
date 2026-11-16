@@ -609,9 +609,9 @@ private:
     } else {
       auto [read, bytes] = co_await readIndex(hinted);
       if (started && current.revision() != 0 && (read == 0 || read < current.revision())) {
-        std::cerr << "[deployment] ignoring stale tenant index revision=" << read
-                  << " applied=" << current.revision() << std::endl;
-        co_return;
+        // pollGuarded keeps the applied state, marks the poll unhealthy and rate-limits its log.
+        auto reason = kj::str("ignoring stale tenant index revision=", read, " applied=", current.revision());
+        KJ_FAIL_REQUIRE(reason);
       }
       if (read) {
         index = decodeTenantIndex(bytes);

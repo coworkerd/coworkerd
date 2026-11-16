@@ -83,6 +83,15 @@ It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
 0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
 
+### 0022: Registry failure cache and plan object index
+
+Failed tenant installation and reloads share a 256-entry LRU with a fixed 30-second
+lifetime per entry. Metadata lookups return a cached failure before the runtime
+loads and serializes modules. Each plan indexes its own registered objects, so
+retirement enumerates that plan's roots. Object registration checks, close fences,
+acknowledged writes and ownership remain unchanged. The only Rust path is
+`src/workerd/server/server/root_loader.rs`.
+
 The SQLite CTE backout is part of this upstream tag (`0d01fe9f6850d038d80e6debb54c683a51a9ac65`).
 It requires no local patch or extra permitted path; the former 0019 is removed.
 

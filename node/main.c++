@@ -2355,33 +2355,39 @@ public:
     if (rootNamespaces.insert(id).second) {
       ++rootNamespaceEpoch;
       if (const auto owner = desiredState.state().namespaceOwner(id)) rootNamespaceTenants[id] = owner->tenant;
+      considerRootCleanup(id);
+    }
+  }
+  void considerRootCleanup(const std::string& id) {
+    const auto owner = desiredState.state().namespaceOwner(id);
+    const auto remembered = rootNamespaceTenants.find(id);
+    const auto tenant = owner ? owner->tenant : remembered != rootNamespaceTenants.end() ? remembered->second : std::string();
+    if ((owner && owner->status == "deleting") || (!tenant.empty() &&
+        (tenantDeleting(tenant) || (tenants && tenants->removedFromCatalog(tenant))))) {
+      if (rootCleanupPending.insert(id).second) rootMaintenanceListDirty = true;
     }
   }
   std::shared_ptr<const std::vector<std::string>> rootMaintenanceRequest() {
     const auto catalog = desiredState.state().namespaceEpoch();
-    const auto revision = desiredState.state().revision();
     const auto tenantEpoch = tenants ? tenants->epoch() : 0;
-    if (!rootMaintenanceList || rootMaintenanceCatalog != catalog || rootMaintenanceRevision != revision ||
-        rootMaintenanceTenants != tenantEpoch || rootMaintenanceTracked != rootNamespaceEpoch) {
-      auto ids = std::make_shared<std::vector<std::string>>();
-      for (const auto& id : rootNamespaces) {
-        const auto owner = desiredState.state().namespaceOwner(id);
-        const auto remembered = rootNamespaceTenants.find(id);
-        const auto tenant = owner ? owner->tenant : remembered != rootNamespaceTenants.end() ? remembered->second : std::string();
-        if ((owner && owner->status == "deleting") || (!tenant.empty() &&
-            (tenantDeleting(tenant) || (tenants && tenants->removedFromCatalog(tenant))))) rootCleanupPending.insert(id);
-        if (rootCleanupPending.contains(id)) ids->push_back(id);
-      }
-      rootMaintenanceList = std::move(ids);
+    if (!rootMaintenanceDiscoveryReady || rootMaintenanceCatalog != catalog || rootMaintenanceTenants != tenantEpoch) {
+      for (const auto& id : rootNamespaces) considerRootCleanup(id);
       rootMaintenanceCatalog = catalog;rootMaintenanceTenants = tenantEpoch;
-      rootMaintenanceRevision = revision;
-      rootMaintenanceTracked = rootNamespaceEpoch;
+      rootMaintenanceDiscoveryReady = true;
+    }
+    if (!rootMaintenanceList || rootMaintenanceListDirty) {
+      rootMaintenanceList = std::make_shared<const std::vector<std::string>>(
+          rootCleanupPending.begin(), rootCleanupPending.end());
+      rootMaintenanceListDirty = false;
     }
     return rootMaintenanceList;
   }
   void rootsMaintained(const std::vector<std::string>& ids) {
-    for (const auto& id : ids) if (rootNamespaces.erase(id)) {
-      rootNamespaceTenants.erase(id);rootCleanupPending.erase(id);++rootNamespaceEpoch;
+    for (const auto& id : ids) {
+      if (rootNamespaces.erase(id)) {
+        rootNamespaceTenants.erase(id);++rootNamespaceEpoch;
+      }
+      if (rootCleanupPending.erase(id)) rootMaintenanceListDirty = true;
     }
   }
 
@@ -2931,8 +2937,8 @@ private:
   std::set<std::string> rootNamespaces;
   std::set<std::string> rootCleanupPending;
   std::unordered_map<std::string, std::string> rootNamespaceTenants;
-  uint64_t rootNamespaceEpoch = 0, rootMaintenanceCatalog = 0, rootMaintenanceRevision = 0,
-      rootMaintenanceTenants = 0, rootMaintenanceTracked = 0;
+  uint64_t rootNamespaceEpoch = 0, rootMaintenanceCatalog = 0, rootMaintenanceTenants = 0;
+  bool rootMaintenanceDiscoveryReady = false, rootMaintenanceListDirty = true;
   std::shared_ptr<const std::vector<std::string>> rootMaintenanceList;
   double lastObjectPrune = 0;
   uint64_t nextLoadCheckSequence = 1, loadChecks = 0, loadCheckColdLoads = 0, loadFailureReroutes = 0, lateBackendFailures = 0;

@@ -1588,7 +1588,8 @@ async function rpcEntrypoint(value, env, ctx) {
     try { return await (await selectedRoot(descriptor, env, ctx, preparationNonce)).__coworkerdRpcTarget; }
     catch (error) {
       const preparation = rootPreparationKind(error, preparationNonce);
-      const reason = rootFailureReason(error), code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
+      const reason = cleanDurableReason({ message: rootFailureReason(error) }, descriptor.secrets);
+      const code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
       throw new Error((preparation && preparation !== "tenant-code" ? "DO_UNAVAILABLE" : code) +
         ": " + reason.slice(0, 300));
     }

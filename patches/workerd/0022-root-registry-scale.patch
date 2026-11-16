@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 00:38:33 +0800
+Subject: [PATCH] Bound root failure caching and index objects by plan
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index ce52b6a9da81f1d314a1816b54b8eb9906966960..1fbaef96c920d21555b86fc610930f6738fbea6e 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
+ use std::collections::{HashMap, HashSet};
+ use std::pin::Pin;
+ use std::rc::{Rc, Weak};
+-use std::time::{Duration, SystemTime};
++use std::time::{Duration, Instant, SystemTime};
+ 
+ use base64::Engine as _;
+ use futures::FutureExt;
+@@ -316,9 +316,19 @@ struct Plan {
+     selection_pins: Cell<usize>,
+     namespace_refs: Cell<usize>,
+     object_refs: Cell<usize>,
++    objects: RefCell<HashSet<(String, String)>>,
+     retiring_refs: Cell<usize>,
+ }
+ 
++const FAILED_INSTALL_CAPACITY: usize = 256;
++const FAILED_INSTALL_TTL: Duration = Duration::from_secs(30);
++
++struct FailedInstall {
++    error: crate::Error,
++    expires_at: Instant,
++    last_used: u64,
++}
++
+ impl Plan {
+     fn unused(&self) -> bool {
+         self.selection_pins.get() == 0 && self.namespace_refs.get() == 0
+@@ -380,7 +390,8 @@ pub struct RootRegistry {
+     storage: String,
+     install_lock: tokio::sync::Mutex<()>,
+     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
+-    failed_installs: RefCell<HashMap<String, Result<String>>>,
++    failed_installs: RefCell<HashMap<String, FailedInstall>>,
++    failure_use: Cell<u64>,
+     tenant_compilations: Cell<u64>,
+     removed_namespaces: RefCell<HashSet<String>>,
+     collect_queued: Cell<bool>,
+@@ -410,6 +421,7 @@ impl RootRegistry {
+             install_lock: tokio::sync::Mutex::new(()),
+             installing: RefCell::new(HashMap::new()),
+             failed_installs: RefCell::new(HashMap::new()),
++            failure_use: Cell::new(0),
+             tenant_compilations: Cell::new(0),
+             removed_namespaces: RefCell::new(HashSet::new()),
+             collect_queued: Cell::new(false),
+@@ -426,6 +438,40 @@ impl RootRegistry {
+         }))
+     }
+ 
++    fn cached_failure(&self, key: &str) -> Option<crate::Error> {
++        let mut failures = self.failed_installs.borrow_mut();
++        let expires_at = failures.get(key)?.expires_at;
++        // Successful hot plans do not read the clock for an unrelated failed plan.
++        if Instant::now() >= expires_at {
++            failures.remove(key);
++            return None;
++        }
++        let used = self.failure_use.get().saturating_add(1);
++        self.failure_use.set(used);
++        let failure = failures.get_mut(key).expect("unexpired failed install");
++        failure.last_used = used;
++        Some(failure.error.clone())
++    }
++
++    fn remember_failure(&self, key: &str, error: &crate::Error) {
++        if !error.description().contains("ROOT_TENANT_CODE: ") {
++            return;
++        }
++        let now = Instant::now();
++        let mut failures = self.failed_installs.borrow_mut();
++        failures.retain(|_, failure| failure.expires_at > now);
++        if failures.len() >= FAILED_INSTALL_CAPACITY && !failures.contains_key(key) {
++            let oldest = failures.iter().min_by_key(|(_, failure)| failure.last_used)
++                .map(|(key, _)| key.clone()).expect("full failed install cache");
++            failures.remove(&oldest);
++        }
++        let used = self.failure_use.get().saturating_add(1);
++        self.failure_use.set(used);
++        failures.insert(key.to_owned(), FailedInstall {
++            error: error.clone(), expires_at: now + FAILED_INSTALL_TTL, last_used: used,
++        });
++    }
++
+     fn loaded(&self, plan: &Plan) -> Option<Rc<WorkerService>> {
+         plan.loaded
+             .borrow()
+@@ -500,6 +546,7 @@ impl RootRegistry {
+             let object = self.objects.borrow_mut().remove(index).unwrap();
+             if let Some(plan) = self.plans.borrow().get(&object.origin.plan) {
+                 plan.object_refs.set(plan.object_refs.get() - 1);
++                plan.objects.borrow_mut().remove(index);
+             }
+             self.schedule_prune(&object.origin.plan);
+         }
+@@ -932,8 +979,8 @@ impl RootRegistry {
+         deployment.validate()?;
+         self.validate_install(&deployment)?;
+         let plan_key = deployment.plan_key()?;
+-        if let Some(result) = self.failed_installs.borrow().get(&plan_key) {
+-            return result.clone();
++        if let Some(error) = self.cached_failure(&plan_key) {
++            return Err(error);
+         }
+         if let Some(existing) = self.plans.borrow().get(&plan_key).cloned() {
+             if existing.deployment != deployment {
+@@ -972,10 +1019,10 @@ impl RootRegistry {
+             self.factory.spawn_detached(async move {
+                 let deployment = task.deployment.borrow().as_ref().cloned().expect("install deployment");
+                 let result = registry.install_compiled((*deployment).clone(), &task).await;
+-                if result.as_ref().is_err_and(|error| error.description().contains("ROOT_TENANT_CODE: ")) {
+-                    let mut failures = registry.failed_installs.borrow_mut();
+-                    if failures.len() >= 256 { failures.clear(); }
+-                    failures.insert(key.clone(), result.clone());
++                if let Err(error) = &result {
++                    registry.remember_failure(&key, error);
++                } else {
++                    registry.failed_installs.borrow_mut().remove(&key);
+                 }
+                 drop(deployment);
+                 task.deployment.borrow_mut().take();
+@@ -1068,6 +1115,7 @@ impl RootRegistry {
+             selection_pins: Cell::new(0),
+             namespace_refs: Cell::new(0),
+             object_refs: Cell::new(0),
++            objects: RefCell::new(HashSet::new()),
+             retiring_refs: Cell::new(0),
+         });
+         let worker = self.compile(&plan.deployment, &key).await?;
+@@ -1142,6 +1190,9 @@ impl RootRegistry {
+         if let Some(worker) = self.loaded(&plan) {
+             return Ok(worker);
+         }
++        if let Some(error) = self.cached_failure(plan_key) {
++            return Err(error);
++        }
+         let generation = plan
+             .generation
+             .get()
+@@ -1149,7 +1200,14 @@ impl RootRegistry {
+             .ok_or_else(|| kj::failed!("root load generation exhausted"))?;
+         plan.generation.set(Some(generation));
+         let key = plan.deployment.key(generation)?;
+-        let worker = self.compile(&plan.deployment, &key).await?;
++        let worker = match self.compile(&plan.deployment, &key).await {
++            Ok(worker) => worker,
++            Err(error) => {
++                self.remember_failure(plan_key, &error);
++                return Err(error);
++            }
++        };
++        self.failed_installs.borrow_mut().remove(plan_key);
+         let linked = self.link(plan_key, &plan, &key, &worker, &self.namespaces.borrow());
+         if let Err(error) = linked {
+             if !plan.deployment.is_platform() {
+@@ -1328,10 +1386,12 @@ impl RootRegistry {
+         if old.as_ref().is_none_or(|old| old.origin.plan != selection.plan) {
+             if let Some(plan) = self.plans.borrow().get(&selection.plan) {
+                 plan.object_refs.set(plan.object_refs.get() + 1);
++                plan.objects.borrow_mut().insert(index.clone());
+             }
+             if let Some(old) = old {
+                 if let Some(plan) = self.plans.borrow().get(&old.origin.plan) {
+                     plan.object_refs.set(plan.object_refs.get() - 1);
++                    plan.objects.borrow_mut().remove(&index);
+                 }
+                 self.schedule_prune(&old.origin.plan);
+             }
+@@ -1392,12 +1452,11 @@ impl RootRegistry {
+             .boxed_local()
+             .shared(),
+         );
+-        let roots: Vec<_> = self
++        let roots: Vec<_> = plan
+             .objects
+             .borrow()
+             .iter()
+-            .filter(|(_, object)| object.origin.plan == plan_key)
+-            .filter_map(|((namespace, storage_key), _)| {
++            .filter_map(|(namespace, storage_key)| {
+                 self.namespaces
+                     .borrow()
+                     .get(namespace)
+@@ -1541,6 +1600,7 @@ impl RootRegistry {
+         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
+             "installingNamespaces": self.installing.borrow().values().flat_map(|flight| flight.namespaces.iter().cloned()).collect::<Vec<_>>(),
+             "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
++            "failedInstalls": self.failed_installs.borrow().len(),
+             "closingFences": self.closing_roots.pending(),
+             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
+             "objectEntries": self.objects.borrow().len(),
+@@ -2052,8 +2112,14 @@ impl Service for RootRequest {
+                 let deployment: Deployment = serde_json::from_value(read_json(body).await?)
+                     .map_err(|error| kj::failed!("root lookup: {error}"))?;
+                 let key = deployment.plan_key()?;
+-                let present = self.registry.plans.borrow().contains_key(&key);
+-                json!({"plan": if present { Some(key) } else { None }})
++                if let Some(error) = self.registry.cached_failure(&key) {
++                    let (code, value) = preparation_failure(error.description());
++                    status = code;
++                    value
++                } else {
++                    let present = self.registry.plans.borrow().contains_key(&key);
++                    json!({"plan": if present { Some(key) } else { None }})
++                }
+             }
+             (Method::POST, "/install") => {
+                 let deployment = serde_json::from_value(read_json(body).await?)

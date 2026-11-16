@@ -17,3 +17,4 @@
 0014-durable-object-hibernation-alarms.patch
 0020-root-loader.patch
 0021-sql-execution-limit.patch
+0022-root-registry-scale.patch
