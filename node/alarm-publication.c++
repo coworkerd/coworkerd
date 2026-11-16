@@ -245,6 +245,9 @@ kj::Promise<void> AlarmPublication::readHints(std::string key) {
       requireStorage(owner.has_value(), "startup alarm owner record is invalid");
       requireStorage(owner->namespaceId == ns && owner->shard == shard, "startup alarm owner names another shard");
       if (owner->nodeId != nodeId) { gone(ns, shard);co_return; }
+      auto released = co_await store.get(shardReleasedKey(ns, shard, owner->epoch));held();
+      requireStorage(released.status == 200 || released.status == 404, "startup alarm release read failed");
+      if (released.status == 200) { gone(ns, shard);co_return; }
       auto& s = held();s.epoch = owner->epoch;s.markerMemberEpoch = owner->nodeEpoch;
     }
     const auto epoch = held().epoch;
