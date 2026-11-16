@@ -954,6 +954,8 @@ std::string SetDigest::hex() const {
 }
 
 DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& changes, bool full, uint64_t revision) {
+  const auto nextNamespaceEpoch = namespaceEpochValue + 1;
+  namespaceOwnerIndex.reset();
   ApplyStats stats;
   stats.keys = changes.size();
   // Served definition of each Worker before this batch, recorded before its
@@ -970,6 +972,7 @@ DeploymentState::ApplyStats DeploymentState::apply(const std::vector<Change>& ch
     *this = DeploymentState();
     requireSecretValues = require;
   }
+  namespaceEpochValue = nextNamespaceEpoch;
   std::set<std::string> touched, routeKeys;
   bool sawGeneration = false;
   for (const auto& change : changes) {
@@ -1521,19 +1524,23 @@ const DurableObjectNamespace* DeploymentState::database(const std::string& tenan
 }
 
 std::optional<DeploymentState::NamespaceOwner> DeploymentState::namespaceOwner(const std::string& namespaceId) const {
-  for (const auto& [workerId, spaces] : namespaceMap) {
-    for (const auto& [className, space] : spaces) {
-      if (space.id != namespaceId) continue;
-      return NamespaceOwner{tenantOf(workerId), workerId, className, {}, space.status, space.shards};
+  if (!namespaceOwnerIndex) {
+    namespaceOwnerIndex.emplace();
+    for (const auto& [workerId, spaces] : namespaceMap) {
+      for (const auto& [className, space] : spaces) {
+        namespaceOwnerIndex->emplace(space.id,
+            NamespaceOwner{tenantOf(workerId), workerId, className, {}, space.status, space.shards});
+      }
+    }
+    for (const auto& [tenant, names] : databaseMap) {
+      for (const auto& [name, space] : names) {
+        namespaceOwnerIndex->emplace(space.id,
+            NamespaceOwner{tenant, {}, DATABASE_CLASS_NAME, name, space.status, space.shards});
+      }
     }
   }
-  for (const auto& [tenant, names] : databaseMap) {
-    for (const auto& [name, space] : names) {
-      if (space.id != namespaceId) continue;
-      return NamespaceOwner{tenant, {}, DATABASE_CLASS_NAME, name, space.status, space.shards};
-    }
-  }
-  return std::nullopt;
+  auto found = namespaceOwnerIndex->find(namespaceId);
+  return found == namespaceOwnerIndex->end() ? std::nullopt : std::optional(found->second);
 }
 
 const SecretValue* DeploymentState::secret(const std::string& workerId, const std::string& name) const {

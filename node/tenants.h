@@ -27,6 +27,7 @@ public:
   void update(const std::map<std::string, std::optional<TenantRecord>>& tenants, uint64_t revision, bool records);
   const TenantRecord* tenant(const std::string& name) const;
   bool deleting(const std::string& name) const;
+  uint64_t epoch() const { return epochValue; }
   // Why the tenant's Workers are not served here ("" when they are): its record says deleting, or it has none.
   std::string unavailable(const std::string& name) const;
   // The tenant a hostname (as requestHost() gives it) is registered to, or null. A hostname that several records
@@ -42,6 +43,7 @@ private:
   std::map<std::string, std::pair<uint64_t, uint64_t>> quotas;  // tenant -> (lines per second, buffer bytes) handed over
   std::function<void(const std::string&, uint64_t, uint64_t)> quota;
   uint64_t revision = 0, withoutRecord = 0;
+  uint64_t epochValue = 0;
 };
 
 }  // namespace coworkerd

@@ -1262,7 +1262,12 @@ public:
   // process writes -- each row carries the limit it was measured against -- and the largest memory limit to
   // size a new generation's process-wide WebAssembly memory cap.
   ProcessPool::WorkerLimitsView workerLimits;
-  std::function<std::string()> rootMaintenance;
+  std::function<std::shared_ptr<const std::vector<std::string>>()> rootMaintenance;
+  std::function<void(const std::vector<std::string>&)> rootMaintenanceCompleted;
+  std::shared_ptr<const std::vector<std::string>> rootMaintenanceBatch;
+  std::vector<std::weak_ptr<ProcessGeneration>> rootMaintenanceTargets;
+  std::string rootMaintenanceBody;
+  uint64_t nextRootMaintenance = 0;
   BinarySignature configuredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
@@ -2456,15 +2461,36 @@ public:
       ++p->rootMaintenanceFailures;
     }
   }
-  void maybeMaintainRoots(const std::shared_ptr<ProcessGeneration>& p) {
-    if (!rootMaintenance || !p || !p->durable || p->rootMaintenancePending ||
-        p->closing || (p->state != "ready" && p->state != "draining") ||
-        !p->probeAddress || mono() < p->nextRootMaintenance) return;
-    p->nextRootMaintenance = mono() + 1000;
-    auto body = rootMaintenance();
-    if (body.empty() || body == p->rootMaintenanceApplied) return;
-    p->rootMaintenancePending = true;
-    tasks.add(maintainRoots(p, std::move(body)));
+  void maybeMaintainRoots() {
+    if (!rootMaintenance || mono() < nextRootMaintenance) return;
+    nextRootMaintenance = mono() + 1000;
+    if (rootMaintenanceBatch && std::all_of(rootMaintenanceTargets.begin(), rootMaintenanceTargets.end(),
+        [&](const auto& target) {
+          auto p = target.lock();
+          return !p || p->pid == 0 || p->rootMaintenanceApplied == rootMaintenanceBody;
+        })) {
+      if (rootMaintenanceCompleted) rootMaintenanceCompleted(*rootMaintenanceBatch);
+      rootMaintenanceBatch.reset();rootMaintenanceTargets.clear();rootMaintenanceBody.clear();
+    }
+    const auto wanted = rootMaintenance();
+    if (!wanted || wanted->empty()) return;
+    if (!rootMaintenanceBatch || (wanted != rootMaintenanceBatch && *wanted != *rootMaintenanceBatch)) {
+      rootMaintenanceBatch = wanted;rootMaintenanceTargets.clear();
+      std::ostringstream body;body << "{\"namespaces\":[";
+      for (size_t i = 0; i < wanted->size(); ++i) body << (i ? ",\"" : "\"") << (*wanted)[i] << '"';
+      body << "]}";rootMaintenanceBody = body.str();
+      for (auto& slot : slots) if (slot.durable) eachGeneration(slot, [&](const auto& p) {
+        if (p->pid > 0) rootMaintenanceTargets.push_back(p);
+      });
+    }
+    for (const auto& target : rootMaintenanceTargets) {
+      auto p = target.lock();
+      if (!p || p->pid == 0 || p->rootMaintenancePending || p->closing ||
+          (p->state != "ready" && p->state != "draining") || !p->probeAddress ||
+          p->rootMaintenanceApplied == rootMaintenanceBody) continue;
+      p->rootMaintenancePending = true;
+      tasks.add(maintainRoots(p, rootMaintenanceBody));
+    }
   }
   // Applies the generation's newly read limit events to the counters.
   void applyEvents(Slot& s, ProcessGeneration& p) {
@@ -3185,9 +3211,9 @@ kj::Promise<void> ProcessPool::run() {
       if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
           && !(s.durable && impl->durableClosed) && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
-      Impl::eachGeneration(s, [&](const auto& p) { impl->maybeMaintainRoots(p); });
       for (const auto& p : s.retiring) impl->maybeProbe(p);
     }
+    impl->maybeMaintainRoots();
     co_await impl->provider.getTimer().afterDelay(10 * kj::MILLISECONDS);
   }
 }
@@ -3317,7 +3343,10 @@ std::string ProcessPool::quarantineReadinessJson() const {
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
 void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = std::move(view); }
-void ProcessPool::setRootMaintenance(std::function<std::string()> request) { impl->rootMaintenance = std::move(request); }
+void ProcessPool::setRootMaintenance(std::function<std::shared_ptr<const std::vector<std::string>>()> request,
+    std::function<void(const std::vector<std::string>&)> applied) {
+  impl->rootMaintenance = std::move(request);impl->rootMaintenanceCompleted = std::move(applied);
+}
 void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId) const { return impl->limitsOf(workerId); }
 bool ProcessPool::hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const {

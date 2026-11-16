@@ -1426,6 +1426,7 @@ function rootModule(name, value) {
 }
 
 const rootPreparationErrors = new WeakSet();
+const rootTenantCodeErrors = new WeakSet();
 const rootMissingPlans = new WeakSet();
 function rootManagementFailure(error, missing = false) {
   const value = error && typeof error === "object" ? error : new Error(String(error));
@@ -1451,13 +1452,15 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
     } catch (error) { throw rootManagementFailure(error); }
     if (!response.ok) {
       const error = new Error(reply?.error?.message ?? "Root plan " + path + " failed: HTTP " + response.status);
-      if (reply?.error?.kind === "tenant-code") throw error;
+      if (reply?.error?.kind === "tenant-code") {
+        rootTenantCodeErrors.add(error);
+        throw error;
+      }
       throw rootManagementFailure(error, reply?.error?.kind === "plan-missing");
     }
     if (!reply || typeof reply !== "object" ||
         (path === "lookup" && reply.plan !== null && typeof reply.plan !== "string") ||
-        (path === "install" && (typeof reply.plan !== "string" || !Array.isArray(reply.state?.plans) ||
-          reply.state.plans.some(value => !value || typeof value !== "object"))))
+        (path === "install" && (typeof reply.plan !== "string" || !reply.info || typeof reply.info !== "object")))
       throw rootManagementFailure(new Error("Invalid root plan " + path + " reply"));
     return reply;
   };
@@ -1476,7 +1479,7 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
     const plan = installed.plan;
     console.log("[root-plan] " + JSON.stringify({ plan, kind: base.kind, tenant: base.tenant, workerId: base.workerId,
       versionId: base.versionId, creationRecord: base.creationRecord?.present === true,
-      platformClasses: installed.state.plans.filter(value => value.kind === "platform" && value.plan === plan)
+      platformClasses: [installed.info].filter(value => value.kind === "platform")
         .map(({ tenant, workerId, configuredWorker, platformClass }) => ({ tenant, workerId, configuredWorker, platformClass })) }));
     return plan;
   };
@@ -1511,11 +1514,17 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
 }
 
 function rootPreparationKind(error, nonce) {
+  if (error && typeof error === "object" && rootTenantCodeErrors.has(error)) return "tenant-code";
   if (error && typeof error === "object" && rootPreparationErrors.has(error)) return "platform";
   const message = String(error?.message ?? error);
   for (const kind of ["platform", "plan-missing", "tenant-code"])
     if (nonce && message.includes("COWORKERD_ROOT_PREPARATION:" + nonce + ":" + kind + ":")) return kind;
   return null;
+}
+
+function rootFailureReason(error) {
+  return String(error?.message ?? error).replace(
+    /COWORKERD_ROOT_PREPARATION:[^:\s]+:(?:platform|plan-missing|tenant-code):\s*/g, "");
 }
 
 async function serveRoot(request, descriptor, env, ctx) {
@@ -1537,7 +1546,7 @@ async function serveRoot(request, descriptor, env, ctx) {
     return await root.fetch(new Request(request, { headers, cf: tenantCf(descriptor, env) }));
   } catch (error) {
     const preparation = rootPreparationKind(error, preparationNonce);
-    const reason = cleanDurableReason(error, descriptor.secrets);
+    const reason = cleanDurableReason({ message: rootFailureReason(error) }, descriptor.secrets);
     const code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
     if (preparation && preparation !== "tenant-code")
       return Response.json({ error: "Durable Object is unavailable", code: "DO_UNAVAILABLE", reason, retryable: true },
@@ -1562,7 +1571,7 @@ async function rpcEntrypoint(value, env, ctx) {
     try { return await (await selectedRoot(descriptor, env, ctx, preparationNonce)).__coworkerdRpcTarget; }
     catch (error) {
       const preparation = rootPreparationKind(error, preparationNonce);
-      const reason = String(error?.message ?? error), code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
+      const reason = rootFailureReason(error), code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
       throw new Error((preparation && preparation !== "tenant-code" ? "DO_UNAVAILABLE" : code) +
         ": " + reason.slice(0, 300));
     }

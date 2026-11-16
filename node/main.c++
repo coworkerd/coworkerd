@@ -1979,12 +1979,12 @@ public:
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
-    rootNamespaces.insert(target.namespaceId);
+    trackRootNamespace(target.namespaceId);
     if (!target.isDatabase()) {
       // One installation registers every declared class, including classes never opened here.
       for (const auto& name : version->declaredClasses)
         if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
-            space != nullptr && space->status == "active") rootNamespaces.insert(space->id);
+            space != nullptr && space->status == "active") trackRootNamespace(space->id);
     }
     auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
@@ -2351,15 +2351,29 @@ public:
   void reload() {
     desiredState.reload();
   }
-  std::string rootMaintenanceRequest() const {
-    std::ostringstream out;out << "{\"namespaces\":[";
-    bool first = true;
-    for (const auto& id : rootNamespaces) {
-      const auto owner = desiredState.state().namespaceOwner(id);
-      if (owner && owner->active() && !tenantDeleting(owner->tenant)) continue;
-      out << (first ? "" : ",") << '"' << id << '"';first = false;
+  void trackRootNamespace(const std::string& id) {
+    if (rootNamespaces.insert(id).second) ++rootNamespaceEpoch;
+  }
+  std::shared_ptr<const std::vector<std::string>> rootMaintenanceRequest() {
+    const auto catalog = desiredState.state().namespaceEpoch();
+    const auto revision = desiredState.state().revision();
+    const auto tenantEpoch = tenants ? tenants->epoch() : 0;
+    if (!rootMaintenanceList || rootMaintenanceCatalog != catalog || rootMaintenanceRevision != revision ||
+        rootMaintenanceTenants != tenantEpoch || rootMaintenanceTracked != rootNamespaceEpoch) {
+      auto ids = std::make_shared<std::vector<std::string>>();
+      for (const auto& id : rootNamespaces) {
+        const auto owner = desiredState.state().namespaceOwner(id);
+        if (owner && (owner->status == "deleting" || tenantDeleting(owner->tenant))) ids->push_back(id);
+      }
+      rootMaintenanceList = std::move(ids);
+      rootMaintenanceCatalog = catalog;rootMaintenanceTenants = tenantEpoch;
+      rootMaintenanceRevision = revision;
+      rootMaintenanceTracked = rootNamespaceEpoch;
     }
-    return out.str() + "]}";
+    return rootMaintenanceList;
+  }
+  void rootsMaintained(const std::vector<std::string>& ids) {
+    for (const auto& id : ids) if (rootNamespaces.erase(id)) ++rootNamespaceEpoch;
   }
 
   std::string deploymentJson() const {
@@ -2906,6 +2920,9 @@ private:
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
   std::set<std::string> rootNamespaces;
+  uint64_t rootNamespaceEpoch = 0, rootMaintenanceCatalog = 0, rootMaintenanceRevision = 0,
+      rootMaintenanceTenants = 0, rootMaintenanceTracked = 0;
+  std::shared_ptr<const std::vector<std::string>> rootMaintenanceList;
   double lastObjectPrune = 0;
   uint64_t nextLoadCheckSequence = 1, loadChecks = 0, loadCheckColdLoads = 0, loadFailureReroutes = 0, lateBackendFailures = 0;
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
@@ -8527,7 +8544,8 @@ int run(Launch launch) {
   runtime.setRetiring([&server](const std::string& processId, uint64_t generation) {
     return server.webSockets().goAwayGeneration(processId, generation, "rotation");
   });
-  runtime.setRootMaintenance([&server]() { return server.rootMaintenanceRequest(); });
+  runtime.setRootMaintenance([&server]() { return server.rootMaintenanceRequest(); },
+      [&server](const auto& ids) { server.rootsMaintained(ids); });
   server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {
     return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +
