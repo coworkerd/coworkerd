@@ -12,10 +12,13 @@
 #include <memory>
 #include <tuple>
 #include <thread>
+#include <atomic>
 #include <system_error>
 namespace coworkerd {
 using json::quote;
 namespace {
+constexpr uint32_t RECOVERY_SYNC_THREADS = 8;
+auto recoverySyncThreads = std::make_shared<std::atomic<uint32_t>>(0);
 struct SegmentDecodeResult { std::optional<SegmentContents> contents; std::string error; };
 kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {
   auto pair = kj::newPromiseAndCrossThreadFulfiller<SegmentDecodeResult>();
@@ -33,17 +36,21 @@ kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {
 }
 } // namespace
 kj::Promise<bool> synchronizeRecoveryFile(int fd) {
+  auto counter = recoverySyncThreads;
+  if (counter->fetch_add(1) >= RECOVERY_SYNC_THREADS) { counter->fetch_sub(1); co_return false; }
+  auto permit = std::shared_ptr<int>(new int(0), [counter](int* value) { delete value; counter->fetch_sub(1); });
   const int copy = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
   if (copy < 0) co_return false;
   auto file = std::shared_ptr<int>(new int(copy), [](int* fd) { ::close(*fd); delete fd; });
   auto pair = kj::newPromiseAndCrossThreadFulfiller<bool>();
   auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<bool>>>(kj::mv(pair.fulfiller));
   try {
-    std::thread([file, fulfiller]() {
+    std::thread([file, fulfiller, permit]() {
       const bool synced = ::fsync(*file) == 0;
       (*fulfiller)->fulfill(bool(synced));
     }).detach();
   } catch (const std::system_error&) { co_return false; }
+  permit.reset();
   co_return co_await kj::mv(pair.promise);
 }
 void HistoryBudget::memory(uint64_t required) {

@@ -176,7 +176,6 @@ public:
   ~DatabaseReplay();
   // Applies one record; false (with the reason) when its frames do not check out, which ends the replay there.
   bool apply(const LogRecord& record, std::string* error);
-  bool finish();
   kj::Promise<bool> finishAsync();
   uint64_t appliedRecords() const { return records; }
   uint64_t appliedFrames() const { return framesApplied; }
@@ -703,20 +702,13 @@ private:
       std::string staging = {}, std::function<void()> validate = {});
   kj::Promise<void> healLoop();
   kj::Promise<void> retireFencedTails(Object& object, const ObjectManifest& manifest);
-  std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& staging,
-      std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
-      uint64_t snapshotShardEpoch, const std::set<std::pair<uint64_t, uint64_t>>& drop);
-  std::map<uint32_t, Facet> replayTo(const RootStorageRef& destination, const std::string& historyName,
-      uint64_t bookkeepingEpoch, const std::string& staging, std::vector<LogRecord> history,
-      const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
-      const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite);
   class ReplayState;
   kj::Promise<std::map<uint32_t, Facet>> replayToAsync(RootStorageRef destination, std::string historyName,
       uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
       std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
       std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
       std::function<void()> check, std::function<void(double)> observeFsync = {});
-  kj::Promise<void> measureRecoveryLoop(std::shared_ptr<double> maximum);
+  kj::Promise<void> measureRecoveryLoop();
   void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;
@@ -847,6 +839,8 @@ private:
   kj::Canceler uploadRetryCanceler;
   double confirmMsTotal = 0, lastSegmentAtMs = 0, lastUploadAtMs = 0, lastRebuildMs = 0;
   double lastRebuildLoopDelayMs = 0;
+  std::set<std::shared_ptr<double>> recoveryLoopObservers;
+  bool measuringRecovery = false;
   std::vector<double> confirmSamples;
   std::string lastUploadError, lastManifestError, lastRebuildError, startupNote;
   bool diskTrusted = true;

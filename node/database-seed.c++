@@ -181,7 +181,7 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
   if (used.status == 200) { job->errorCode = "SEED_TARGET_IN_USE"; KJ_FAIL_REQUIRE("destination already exists and is in use"); }
   job->phase = "reading-segments";
   auto records = co_await readRecoverySegments(get, source, input.sourceNamespace + "/" + input.sourceObject,
-      1, checkOwner, {}, &job->budget, []() { return kj::yieldUntilWouldSleep(); }); checkOwner();
+      1, checkOwner, {}, &job->budget, [this]() { return log.timer.afterDelay(0 * kj::MILLISECONDS); }); checkOwner();
   uint64_t imageBytes = source.snapshotBytes;
   for (const auto& record : records) KJ_REQUIRE(record.facetId == 0, "source history is not a root database");
   // Reserve before writing. The base is the cleaner's accounting (logs plus
@@ -212,7 +212,7 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
   if (source.hasSnapshot) {
     auto index = co_await get(objectSnapshotIndexKey(source.namespaceId, source.objectId, source.snapshotSequence));
     KJ_REQUIRE(index.status == 200, "frozen source snapshot index is missing"); const auto partBytes = sourcePartBytes(index.bytes, source);
-    job->phase = "downloading"; co_await downloadRecoverySnapshot(get, source, destination, log.settings.stackDirectory, staging, partBytes, 1, checkOwner, []() { return kj::yieldUntilWouldSleep(); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
+    job->phase = "downloading"; co_await downloadRecoverySnapshot(get, source, destination, log.settings.stackDirectory, staging, partBytes, 1, checkOwner, [this]() { return log.timer.afterDelay(0 * kj::MILLISECONDS); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
   }
   job->phase = "replaying";
   auto replayed = co_await log.replayToAsync(destination, input.sourceNamespace + "/" + input.sourceObject, source.shardEpoch,
@@ -220,7 +220,7 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
       [job](double ms) { job->replayFsyncMs.push_back(ms); });
   const auto path = destination.databasePath(log.settings.stackDirectory, 0, "", staging);
   if (!std::filesystem::exists(path)) { const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600); KJ_REQUIRE(fd >= 0, "cannot create empty seed image"); ::close(fd); }
-  const auto expected = co_await recoveryFileDigestAsync(path, []() { return kj::yieldUntilWouldSleep(); }, checkOwner); job->imageBytes = expected.bytes; disk(*job, expected.bytes); checkOwner();
+  const auto expected = co_await recoveryFileDigestAsync(path, [this]() { return log.timer.afterDelay(0 * kj::MILLISECONDS); }, checkOwner); job->imageBytes = expected.bytes; disk(*job, expected.bytes); checkOwner();
   auto existing = co_await get(objectManifestKey(input.namespaceId, input.objectId, 1));
   if (existing.status == 404) {
     KJ_REQUIRE(!registered(input.namespaceId), "destination namespace is already in the catalog");
@@ -250,8 +250,8 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
       "destination manifest 1 conflicts with the frozen source image");
   auto index = co_await get(objectSnapshotIndexKey(input.namespaceId, input.objectId, manifest->snapshotSequence));
   KJ_REQUIRE(index.status == 200, "published destination snapshot index is absent"); const auto partBytes = sourcePartBytes(index.bytes, *manifest);
-  co_await downloadRecoverySnapshot(get, *manifest, destination, log.settings.stackDirectory, verifying, partBytes, 1, checkOwner, []() { return kj::yieldUntilWouldSleep(); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
-  const auto verified = co_await recoveryFileDigestAsync(destination.databasePath(log.settings.stackDirectory, 0, "", verifying), []() { return kj::yieldUntilWouldSleep(); }, checkOwner);
+  co_await downloadRecoverySnapshot(get, *manifest, destination, log.settings.stackDirectory, verifying, partBytes, 1, checkOwner, [this]() { return log.timer.afterDelay(0 * kj::MILLISECONDS); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
+  const auto verified = co_await recoveryFileDigestAsync(destination.databasePath(log.settings.stackDirectory, 0, "", verifying), [this]() { return log.timer.afterDelay(0 * kj::MILLISECONDS); }, checkOwner);
   KJ_REQUIRE(verified.sha256 == expected.sha256 && verified.bytes == expected.bytes, "published destination image differs");
   job->result = "{\"namespaceId\":" + quote(input.namespaceId) + ",\"objectId\":" + quote(input.objectId) + ",\"revision\":\"1\",\"manifestSha256\":" +
       quote(objectSha256(existing.bytes)) + ",\"bytes\":\"" + std::to_string(expected.bytes) + "\",\"sha256\":" + quote(expected.sha256) + "}"; job->phase = "completed";

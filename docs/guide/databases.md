@@ -355,7 +355,10 @@ one exact immutable revision; a bookmark from another database is rejected. A ti
 a time after the latest publication selects that latest revision. Clocks can differ at an owner takeover: revision
 order wins. The lookup searches revision numbers with exact GETs, splitting owner epochs before searching their times.
 A lookup is limited to 128 history reads (up to 256 HTTP attempts if each read retries once). Exceeding this returns
-422 `HISTORY_READ_LIMIT`; choose a bookmark or a later time. A bookmark needs one history read.
+422 `HISTORY_READ_LIMIT`; retry the same request to continue from the cached owner intervals. A bookmark needs at
+most one history read. The control plane retains up to 64 library caches, each with 256 revision records, 128 owner
+boundaries and 16 unfinished timestamp searches. Deleting or recreating a library invalidates its cache; restarting
+the control plane or cache eviction starts the search afresh.
 
 The CLI saves its random operation id and **resolved bookmark**, without a credential, under
 `~/.cowctl/restore-operations/`. If interrupted, rerun the same command to resume; `--operation-id ID` can specify a
