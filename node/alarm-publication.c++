@@ -55,6 +55,12 @@ bool AlarmPublication::valid(const Write& w) const {
   auto s = shards.find(shardKey(w.ns, w.shard));
   return s != shards.end() && s->second.epoch == w.epoch && s->second.memberEpoch == w.memberEpoch && valid(s->second);
 }
+double AlarmPublication::hintCheckInterval() const {
+  size_t nonempty = 0;
+  for (const auto& [key, s]: shards)
+    if (valid(s) && (!s.hints.empty() || !s.desired.empty() || !s.marker.empty())) ++nonempty;
+  return 3600000.0 / std::max<size_t>(1, nonempty);
+}
 void AlarmPublication::setNodeEpoch(uint64_t epoch) {
   if (epoch == nodeEpoch) return;
   nodeEpoch = epoch;shards.clear();writes.clear();nextHintCheck = nextMarkerCheck = 0;
@@ -71,7 +77,7 @@ void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std:
   Shard s;s.ns = std::move(ns);s.shard = shard;s.epoch = epoch;s.tenant = std::move(tenant);
   s.memberEpoch = s.markerMemberEpoch = nodeEpoch;s.generation = s.order = ++serial;
   s.checked = monotonicTimeMs();shards.emplace(key, std::move(s));
-  const auto next = monotonicTimeMs() + 3600000.0 / std::max<size_t>(1, shards.size());
+  const auto next = monotonicTimeMs() + hintCheckInterval();
   nextHintCheck = nextHintCheck ? std::min(nextHintCheck, next) : next;pump();
 }
 void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenant) {
@@ -80,7 +86,7 @@ void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenan
   s.startupOnly = true;
   s.memberEpoch = s.markerMemberEpoch = nodeEpoch;s.generation = s.order = ++serial;s.checked = monotonicTimeMs();
   auto key = shardKey(s.ns, s.shard);shards.emplace(std::move(key), std::move(s));
-  const auto next = monotonicTimeMs() + 3600000.0 / shards.size();
+  const auto next = monotonicTimeMs() + hintCheckInterval();
   nextHintCheck = nextHintCheck ? std::min(nextHintCheck, next) : next;pump();
 }
 void AlarmPublication::gone(const std::string& ns, uint32_t shard) {
@@ -117,6 +123,8 @@ void AlarmPublication::report(std::string ns, std::string object, uint32_t shard
 }
 void AlarmPublication::reconcile(Shard& s) {
   if (!valid(s) || !s.adopted || s.reading) return;
+  const auto next = monotonicTimeMs() + hintCheckInterval();
+  nextHintCheck = nextHintCheck ? std::min(nextHintCheck, next) : next;
   if (!s.hints.empty()) {
     if (s.marker.empty()) {
       s.marker = markerPrefix(nodeId, s.markerMemberEpoch, s.ns, s.shard, s.epoch) + presence();
@@ -364,7 +372,7 @@ void AlarmPublication::tick() {
       if (s.adopted && !s.reading && (!s.hints.empty() || !s.desired.empty() || !s.marker.empty()) &&
           (!oldest || s.checked < oldest->checked)) oldest = &s;
     if (oldest) { oldest->adopted = false;oldest->next = 0;oldest->order = ++serial; }
-    nextHintCheck = now + std::max(200.0, 3600000.0 / shards.size());
+    nextHintCheck = now + std::max(200.0, hintCheckInterval());
   }
   pump();
   if (nodeEpoch && active < 8 && !shards.empty() && !checkingMarkers && now >= nextMarkerCheck) {
@@ -386,6 +394,7 @@ std::string AlarmPublication::json() const {
       << ",\"publicationRetries\":" << retries << ",\"markerWrites\":" << markerWrites
       << ",\"markerDeletes\":" << markerDeletes << ",\"adoptionPages\":" << pages
       << ",\"adoptionMaxPage\":" << maxPage << ",\"oldestHintCheckMs\":" << oldest;
+  out << ",\"hintCheckIntervalMs\":" << hintCheckInterval();
   return out.str();
 }
 }  // namespace coworkerd
