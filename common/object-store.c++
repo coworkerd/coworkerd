@@ -570,7 +570,8 @@ kj::Promise<ObjectListingPage> ObjectStore::listPage(std::string prefix, uint32_
   if (!token.empty()) call.query.emplace_back("continuation-token", token);
   if (!delimiter.empty()) call.query.emplace_back("delimiter", delimiter);
   auto response = co_await send(std::move(call));
-  requireStorage(response.status == 200, "object page listing failed: HTTP " + std::to_string(response.status));
+  requireStorage(response.status == 200, "object page listing failed: HTTP " + std::to_string(response.status) +
+      (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
   const std::string_view xml(response.bytes);
   requireStorage(xml.find("<ListBucketResult") != std::string_view::npos, "object page answer is not a listing");
   ObjectListingPage page;page.dateUnixMs = response.dateUnixMs;
