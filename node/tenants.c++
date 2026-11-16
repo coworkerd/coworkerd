@@ -9,7 +9,7 @@ void TenantView::onQuota(std::function<void(const std::string&, uint64_t, uint64
 
 void TenantView::update(const std::map<std::string, std::optional<TenantRecord>>& named, uint64_t at, bool records) {
   ++epochValue;
-  if (records && hasRecords) {
+  if (records && hasRecords && at != 0 && at > revision) {
     for (const auto& name : catalogTenants) if (!named.contains(name)) removedTenants.insert(name);
   }
   catalogTenants.clear();

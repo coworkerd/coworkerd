@@ -1475,7 +1475,12 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
       deployment = { ...base, compatibilityDate: code.compatibilityDate, compatibilityFlags: code.compatibilityFlags,
         environment: code.env, modules: names.map(name => rootModule(name, code.modules[name])) };
     }
-    const installed = await manage("install", deployment);
+    let installed;
+    try { installed = await manage("install", deployment); }
+    catch (error) {
+      if (!error || typeof error !== "object" || !rootMissingPlans.has(error)) throw error;
+      installed = await manage("install", deployment);
+    }
     const plan = installed.plan;
     console.log("[root-plan] " + JSON.stringify({ plan, kind: base.kind, tenant: base.tenant, workerId: base.workerId,
       versionId: base.versionId, creationRecord: base.creationRecord?.present === true,

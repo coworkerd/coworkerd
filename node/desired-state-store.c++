@@ -608,6 +608,11 @@ private:
       for (const auto& [tenant, manifest] : next) recompute.insert(tenant);
     } else {
       auto [read, bytes] = co_await readIndex(hinted);
+      if (started && current.revision() != 0 && (read == 0 || read < current.revision())) {
+        std::cerr << "[deployment] ignoring stale tenant index revision=" << read
+                  << " applied=" << current.revision() << std::endl;
+        co_return;
+      }
       if (read) {
         index = decodeTenantIndex(bytes);
         KJ_REQUIRE(index.revision == read, "the tenant index names another revision than its key", read);
