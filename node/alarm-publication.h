@@ -55,7 +55,7 @@ private:
     }
   };
   struct Metric {
-    std::array<uint64_t, 512> bins{};
+    std::array<uint64_t, 1024> bins{};
     uint64_t count = 0, maximum = 0;
     void add(uint64_t ns);
     double percentile(unsigned p) const;
@@ -76,7 +76,7 @@ private:
   void reconcile(Shard&);
   void pump(unsigned limit = 1);
   void failure(const char* operation, bool denied = false);
-  kj::Promise<void> write(std::string key);
+  kj::Promise<void> write(Write sent);
   kj::Promise<bool> verifyOwner(std::string key, uint64_t generation);
   kj::Promise<void> readHints(std::string key);
   kj::Promise<void> scanMarkers(std::string key);
