@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 08:14:43 +0800
+Date: Mon, 16 Nov 2026 08:48:49 +0800
 Subject: [PATCH] Load roots with bounded lifecycle cleanup and private
  per-event preparation
 
@@ -418,7 +418,7 @@ index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad4033228
  bool frankenvalue_is_empty(const Frankenvalue& value);
  kj::Own<Frankenvalue> frankenvalue_new();
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211efdb019aa 100644
+index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eecca461cb0 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -21,6 +21,7 @@
@@ -766,9 +766,8 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
 +
      fn object_resident(&self, container: &ActorContainer) {
 -        if !self.shipped.get() || !container.is_root() {
-+        if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
-             return;
-         }
+-            return;
+-        }
 -        self.count_resident();
 -        let report = self.residency.get();
 -        if report.limit == 0
@@ -776,8 +775,9 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
 -            || !self.is_evictable()
 -            || self.enforcing.replace(true)
 -        {
--            return;
--        }
++        if !self.shipped.get() || (!container.is_root() && !self.actor_class.runtime_root()) {
+             return;
+         }
 -        // Replacing a completed handle is safe; the pass never clears its own handle.
 -        let task = self
 -            .factory
@@ -954,7 +954,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      }
  
      /// The channel of the ephemeral actor named `name`.
-@@ -615,11 +852,202 @@ impl ActorNamespace {
+@@ -615,9 +852,225 @@ impl ActorNamespace {
      /// `reason` becomes the error of the actors' in-flight requests.
      pub fn abort_all(&self, reason: Option<&crate::Error>) {
          let actors = std::mem::take(&mut *self.actors.borrow_mut());
@@ -990,9 +990,9 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
 +            self.forget_resident_root(&actor);
 +            actor.abort(Some(reason.clone()));
 +            actor.namespace_removed();
-         }
-     }
- 
++        }
++    }
++
 +    /// No replacement may open this root's files before its old ActorSqlites and shippers die.
 +    pub(crate) fn set_root_close_fences(&self, fences: Rc<RootCloseFences>) {
 +        assert!(self.closing_roots.set(fences).is_ok());
@@ -1048,7 +1048,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
 +            .unwrap_or_default();
 +        async move {
 +            futures::future::join_all(closing).await;
-+        }
+         }
 +        .boxed_local()
 +    }
 +
@@ -1154,10 +1154,33 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
 +        self.count_resident();
 +    }
 +
++    /// Releasing many containers also cancels their background tasks. Bound that fanout.
++    pub(crate) async fn prune_idle_roots_in_batches(&self) {
++        if !self.actor_class.runtime_root() { return; }
++        let keys: Vec<_> = self.actors.borrow().iter().filter(|(_, root)| {
++            !root.is_resident() && !root.tree_has_managers() && !root.has_clients()
++        }).map(|(key, _)| key.clone()).collect();
++        for chunk in keys.chunks(64) {
++            let mut actors = self.actors.borrow_mut();
++            let mut removed = Vec::new();
++            for key in chunk {
++                if actors.get(key).is_some_and(|root| {
++                    !root.is_resident() && !root.tree_has_managers() && !root.has_clients()
++                }) {
++                    if let Some(root) = actors.remove(key) { removed.push(root); }
++                }
++            }
++            drop(actors);
++            for root in &removed { root.namespace_removed(); }
++            drop(removed);
++            self.factory.sleep(Duration::from_millis(1)).await;
++        }
++        if self.actors.borrow().is_empty() { self.actors.borrow_mut().shrink_to_fit(); }
++        self.count_resident();
+     }
+ 
      /// Stops every actor that is left as this instance's handoff ends; peers take them over
-     /// once it left the cluster. Any request still in flight is cancelled, as it could not
-     /// commit once a peer owns the object. A later request that still reaches one here, through
-@@ -639,6 +1067,10 @@ impl ActorNamespace {
+@@ -639,6 +1092,10 @@ impl ActorNamespace {
      /// are left as they are, for the process's exit to end.
      async fn stop_all(&self, until: Option<Instant>, stop: impl Fn(&str, &ActorContainer)) {
          let actors = std::mem::take(&mut *self.actors.borrow_mut());
@@ -1168,7 +1191,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          let mut actors = actors.into_iter().collect::<Vec<_>>().into_iter();
          while actors.len() > 0 {
              if until.is_some_and(|until| Instant::now() >= until) {
-@@ -695,7 +1127,7 @@ impl ActorNamespace {
+@@ -695,7 +1152,7 @@ impl ActorNamespace {
          let containers: Vec<Rc<ActorContainer>> = self.actors.borrow().values().cloned().collect();
          let evictions = containers
              .iter()
@@ -1177,7 +1200,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          futures::future::join_all(evictions)
              .await
              .into_iter()
-@@ -759,6 +1191,13 @@ impl ActorNamespace {
+@@ -759,6 +1216,13 @@ impl ActorNamespace {
          }
          // Checked above; nothing else sets it.
          let _ = self.storage.set(storage);
@@ -1191,7 +1214,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          Ok(())
      }
  
-@@ -812,6 +1251,17 @@ impl ActorNamespace {
+@@ -812,6 +1276,17 @@ impl ActorNamespace {
      }
  }
  
@@ -1209,7 +1232,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
  /// Marks a namespace's `directory` as the cluster's. The cluster replaces an
  /// object's database with the bucket's copy, so a directory holding Durable
  /// Objects from before cluster mode is refused rather than deleted.
-@@ -839,10 +1289,6 @@ fn claim_directory(directory: &str) -> Result<()> {
+@@ -839,10 +1314,6 @@ fn claim_directory(directory: &str) -> Result<()> {
  }
  
  impl ActorNamespaceHandle {
@@ -1220,7 +1243,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      pub(crate) fn actor_for_alarm(
          &self,
          id: KjOwn<ActorIdHandle>,
-@@ -860,7 +1306,7 @@ impl ActorNamespaceHandle {
+@@ -860,7 +1331,7 @@ impl ActorNamespaceHandle {
          }
          let metadata = ffi::new_request_metadata(KjMaybe::None, KjMaybe::None);
          let Some(node) = namespace.cluster().map(Rc::clone) else {
@@ -1229,7 +1252,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          };
          // A draining instance starts nothing: the alarm runs where the object goes, once peers
          // adopt this instance's alarms as it leaves, or the next owner opens the object.
-@@ -1230,6 +1676,7 @@ pub struct ActorContainer {
+@@ -1230,6 +1701,7 @@ pub struct ActorContainer {
      actor: RefCell<Option<Rc<KjOwn<ffi::ActorHandle>>>>,
      /// Only a real actor-to-empty eviction makes the next successful start a wake.
      was_evicted: Cell<bool>,
@@ -1237,7 +1260,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      /// The hibernation manager of the evicted actor, for the actor that replaces it.
      manager: RefCell<Option<KjRc<ffi::HibernationManager>>>,
      /// Set once the actor broke or was aborted; every later use of the container fails with it.
-@@ -1259,10 +1706,45 @@ pub struct ActorContainer {
+@@ -1259,10 +1731,45 @@ pub struct ActorContainer {
  }
  
  impl ActorContainer {
@@ -1286,7 +1309,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              Self::init(
                  Weak::clone(this),
                  key.clone(),
-@@ -1273,7 +1755,7 @@ impl ActorContainer {
+@@ -1273,7 +1780,7 @@ impl ActorContainer {
                  Rc::new(Cell::new(ns.factory.now())),
                  ClassState::Ready { class, id },
              )
@@ -1295,7 +1318,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      }
  
      /// A facet of `parent`, whose class and id `start` resolves.
-@@ -1316,6 +1798,7 @@ impl ActorContainer {
+@@ -1316,6 +1823,7 @@ impl ActorContainer {
              class_and_id: RefCell::new(class_and_id),
              actor: RefCell::new(None),
              was_evicted: Cell::new(false),
@@ -1303,7 +1326,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              manager: RefCell::new(None),
              broken_reason: RefCell::new(None),
              facets: RefCell::new(LinkedHashMap::new()),
-@@ -1364,6 +1847,12 @@ impl ActorContainer {
+@@ -1364,6 +1872,12 @@ impl ActorContainer {
                  .any(|child| child.is_resident())
      }
  
@@ -1316,7 +1339,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      fn tree_has_requests(&self) -> bool {
          self.active.get()
              || self
-@@ -1532,23 +2021,58 @@ impl ActorContainer {
+@@ -1532,23 +2046,58 @@ impl ActorContainer {
          drop(self.shutdown_task.borrow_mut().take());
      }
  
@@ -1378,7 +1401,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              if let Some(pending) = self.pending_class() {
                  pending.await?;
                  self.require_not_broken()?;
-@@ -1677,12 +2201,16 @@ impl ActorContainer {
+@@ -1677,12 +2226,16 @@ impl ActorContainer {
          self: &Rc<Self>,
          metadata: KjOwn<RequestMetadata>,
      ) -> Result<KjOwn<WorkerInterface>> {
@@ -1396,7 +1419,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              self.actor.borrow().clone()
          } else {
              None
-@@ -1789,6 +2317,18 @@ impl ActorContainer {
+@@ -1789,6 +2342,18 @@ impl ActorContainer {
      /// the container leaves its map, dropping the hibernation manager (which disconnects the
      /// hibernated WebSockets).
      fn broken(self: &Rc<Self>, reason: &crate::Error) {
@@ -1415,7 +1438,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          *self.broken_reason.borrow_mut() = Some(reason.clone());
          let facets = std::mem::take(&mut *self.facets.borrow_mut());
          for facet in facets.values() {
-@@ -1852,6 +2392,15 @@ impl ActorContainer {
+@@ -1852,6 +2417,15 @@ impl ActorContainer {
          if self.broken_reason.borrow().is_some() {
              return None;
          }
@@ -1431,7 +1454,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          let actor = self.actor.borrow_mut().take();
          if let Some(actor) = &actor {
              // Only an error cancels a committed hook, which must stop before ownership is released.
-@@ -1877,9 +2426,22 @@ impl ActorContainer {
+@@ -1877,9 +2451,22 @@ impl ActorContainer {
          );
          let owned = self.release(actor.as_deref());
          drop(actor);
@@ -1454,7 +1477,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      /// Whether this actor or a facet of it has a request in flight.
      fn tree_active(&self) -> bool {
          self.active.get() || self.facets.borrow().values().any(|f| f.tree_active())
-@@ -1968,7 +2530,7 @@ impl ActorContainer {
+@@ -1968,7 +2555,7 @@ impl ActorContainer {
  
      /// Test hook: evicts the actor and its facets, those that are running; the bulk eviction
      /// must not fail on actors that are not.
@@ -1463,7 +1486,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          self: &Rc<Self>,
          hibernate: bool,
      ) -> LocalBoxFuture<'static, Result<()>> {
-@@ -1978,7 +2540,7 @@ impl ActorContainer {
+@@ -1978,7 +2565,7 @@ impl ActorContainer {
              let facets: Vec<Rc<Self>> = this.facets.borrow().values().cloned().collect();
              let mut evictions: Vec<LocalBoxFuture<'static, Result<()>>> = facets
                  .iter()
@@ -1472,7 +1495,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
                  .collect();
              if this.is_running() {
                  let this = Rc::clone(&this);
-@@ -2001,7 +2563,7 @@ impl ActorContainer {
+@@ -2001,7 +2588,7 @@ impl ActorContainer {
          let deadline = factory.now() + EVICT_TIMEOUT;
          loop {
              if self
@@ -1481,7 +1504,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
                  .await?
              {
                  return Ok(());
-@@ -2037,7 +2599,19 @@ impl ActorContainer {
+@@ -2037,7 +2624,19 @@ impl ActorContainer {
          let resident_pass = resident_root.is_some();
          let retirement = self.retirement.borrow().clone();
          if let Some(retirement) = retirement {
@@ -1502,7 +1525,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              return Ok(!resident_pass || !self.is_running());
          }
          if !resident_tree_idle(resident_root.as_ref()) {
-@@ -2080,7 +2654,18 @@ impl ActorContainer {
+@@ -2080,7 +2679,18 @@ impl ActorContainer {
                  .shared();
              *self.retirement.borrow_mut() = Some(retirement.clone());
              self.cancel_shutdown();
@@ -1522,7 +1545,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              return Ok(!resident_pass || !self.is_running());
          }
          self.finish_eviction(reason, hibernate, resident_root.as_ref())
-@@ -2104,6 +2689,9 @@ impl ActorContainer {
+@@ -2104,6 +2714,9 @@ impl ActorContainer {
          if let Some(actor) = &current {
              if hibernate {
                  self.save_manager();
@@ -1532,7 +1555,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
              }
              let lock = if hibernate && self.manager.borrow().is_some() {
                  Some(ffi::actor_lock(actor).await?)
-@@ -2128,15 +2716,15 @@ impl ActorContainer {
+@@ -2128,15 +2741,15 @@ impl ActorContainer {
          self.cancel_on_broken();
          self.cancel_shutdown();
          *self.actor.borrow_mut() = None;
@@ -1552,7 +1575,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          Ok(true)
      }
  }
-@@ -2305,7 +2893,13 @@ async fn resolve_facet_start(
+@@ -2305,7 +2918,13 @@ async fn resolve_facet_start(
  ) -> Result<()> {
      let ffi::FacetStartInfo { id, actor_class } = ffi::facet_start_resolve(start).await?;
      if let Some(container) = container.upgrade() {
@@ -1567,7 +1590,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          *container.class_and_id.borrow_mut() = ClassState::Ready { class, id };
      }
      Ok(())
-@@ -2313,6 +2907,10 @@ async fn resolve_facet_start(
+@@ -2313,6 +2932,10 @@ async fn resolve_facet_start(
  
  impl Drop for ActorContainer {
      fn drop(&mut self) {
@@ -1578,7 +1601,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
          for facet in self.facets.get_mut().values() {
              facet.abort(None);
          }
-@@ -2321,6 +2919,10 @@ impl Drop for ActorContainer {
+@@ -2321,6 +2944,10 @@ impl Drop for ActorContainer {
              ffi::actor_abort(actor, &AbortReason(None));
          }
          drop(self.release(actor.as_deref()));
@@ -1589,7 +1612,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..8122272ec98845ee5b2e779b7123211e
      }
  }
  
-@@ -2617,6 +3219,39 @@ impl Drop for Client {
+@@ -2617,6 +3244,39 @@ impl Drop for Client {
  }
  
  /// A stub's channel to an actor.
@@ -1960,10 +1983,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94fb05c256b
+index 0000000000000000000000000000000000000000..cc4913365a15683650d448575c98c19e44cfcb20
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,2242 @@
+@@ -0,0 +1,2250 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2535,6 +2558,14 @@ index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94f
 +        for namespace in namespaces {
 +            namespace.prune_idle_roots();
 +        }
++        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
++        self.prune_plans();
++    }
++
++    async fn collect_inactive_in_batches(&self) {
++        let namespaces: Vec<_> = self.namespaces.borrow().values()
++            .map(|entry| Rc::clone(&entry.namespace)).collect();
++        for namespace in namespaces { namespace.prune_idle_roots_in_batches().await; }
 +        if self.objects.borrow().is_empty() { self.objects.borrow_mut().shrink_to_fit(); }
 +        self.prune_plans();
 +    }
@@ -3397,7 +3428,7 @@ index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94f
 +                        result
 +                }));
 +                // Start independent closes gradually; one slow hook does not hold later roots.
-+                if (index + 1) % 16 == 0 {
++                if (index + 1) % 64 == 0 {
 +                    registry.factory.sleep(Duration::from_millis(1)).await;
 +                }
 +            }
@@ -3428,7 +3459,7 @@ index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94f
 +            }
 +            registry.retiring.borrow_mut().remove(&key);
 +            plan.retiring.borrow_mut().take();
-+            registry.collect_inactive();
++            registry.collect_inactive_in_batches().await;
 +            let _ = done.send(());
 +        });
 +        true
@@ -4003,7 +4034,7 @@ index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94f
 +            }
 +            (Method::GET, "/state") => self.registry.snapshot(),
 +            (Method::POST, "/collect") => {
-+                self.registry.collect_inactive();
++                self.registry.collect_inactive_in_batches().await;
 +                self.registry.snapshot()
 +            }
 +            (Method::POST, "/remove-namespace") => {
