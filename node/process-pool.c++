@@ -1358,6 +1358,7 @@ public:
   // The durable processes were closed for the node's exit (closeDurable()): none starts again.
   bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
+  struct {uint64_t typed = 0, missing = 0, comparable = 0, matches = 0, mismatches = 0;} lifecycleLabels;
 
   Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
@@ -2977,8 +2978,25 @@ public:
     // in this generation (its load failed, or it was evicted) has no context left to wait for.
     auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
+    std::set<std::pair<std::string, std::string>> labeledResidents;
+    try {
+      capnp::MallocMessageBuilder message;
+      auto value = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
+      auto residents = json::field(value, "residentWorkers");
+      if (!residents.isArray()) return false;
+      for (auto resident : residents.getArray()) {
+        auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
+        auto revision = json::field(resident, "planRevision");
+        if (!worker.isString() || worker.getString().size() == 0 || !version.isString() ||
+            version.getString().size() == 0 || !revision.isString() || revision.getString().size() == 0 ||
+            !json::field(resident, "loadGeneration").isNumber() || !json::field(resident, "instance").isNumber()) return false;
+        labeledResidents.emplace(worker.getString().cStr(), version.getString().cStr());
+      }
+    } catch (const kj::Exception&) {return false;}
     std::erase_if(old.openContexts, [&](const auto& entry) {
       if (entry.second.finishedAt == 0) return false;
+      if (labeledResidents.contains({entry.second.workerId, entry.second.versionId})) return false;
       const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
       if (lifecycle.find(marker) != std::string::npos) return false;
       ++old.contextsCleared; ++cleared;
@@ -3441,6 +3459,7 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
   // Each generation's lifecycle snapshot: its resident isolates, named "<namespace>:<loader key>"; a dynamic
   // Worker's loader key starts with its full name (runtime/runtime.js: <workerId>@<versionId>#...).
   std::map<std::string, uint64_t> counts;
+  impl->lifecycleLabels = {};
   for (const auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
     if (p->pid <= 0) return;
     auto row = p->lifecycle.read();
@@ -3455,11 +3474,27 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
         auto name = json::field(entry, "isolate");
         if (!name.isString()) continue;
         std::string isolate = name.getString().cStr();
+        const auto worker = json::field(entry, "workerId"), version = json::field(entry, "versionId");
+        const auto revision = json::field(entry, "planRevision");
+        const bool typed = worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
+            && revision.isString() && revision.getString().size() && json::field(entry, "loadGeneration").isNumber()
+            && json::field(entry, "instance").isNumber();
+        if (typed) {++impl->lifecycleLabels.typed; ++counts[tenantOf(worker.getString().cStr())];}
+        else ++impl->lifecycleLabels.missing;
         const auto at = isolate.find('@');
         if (at == std::string::npos) continue;
         const auto colon = isolate.rfind(':', at);
-        const auto tenant = tenantOf(isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1)));
-        if (!tenant.empty()) ++counts[tenant];
+        const auto legacyWorker = isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1));
+        if (typed) {
+          const auto hash = isolate.find('#', at);
+          ++impl->lifecycleLabels.comparable;
+          if (legacyWorker == worker.getString().cStr() && isolate.substr(at + 1, hash - at - 1) == version.getString().cStr())
+            ++impl->lifecycleLabels.matches;
+          else ++impl->lifecycleLabels.mismatches;
+        } else {
+          const auto tenant = tenantOf(legacyWorker);
+          if (!tenant.empty()) ++counts[tenant];
+        }
       }
     } catch (const kj::Exception&) {}
   });
@@ -3489,6 +3524,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
 std::string ProcessPool::json(uint32_t idleMs) const {
   impl->refresh();
   impl->syncEvents();
+  (void)residentIsolatesByTenant();
   std::ostringstream out; out << std::setprecision(17) << "{\"configuration\":{\"count\":" << impl->config.count
       << ",\"cpuLimitMs\":" << impl->config.cpuLimitMs
       << ",\"memoryLimitMiB\":" << impl->config.memoryLimitMiB
@@ -3558,7 +3594,10 @@ std::string ProcessPool::json(uint32_t idleMs) const {
     if (p) for (size_t j = 0; j < p->probeDelays.size(); ++j) { if (j) out << ','; out << p->probeDelays[j]; }
     out << "]}";
   }
-  out << "],\"recentKills\":[";
+  out << "],\"lifecycleLabels\":{\"typed\":" << impl->lifecycleLabels.typed
+      << ",\"missing\":" << impl->lifecycleLabels.missing << ",\"comparable\":" << impl->lifecycleLabels.comparable
+      << ",\"matches\":" << impl->lifecycleLabels.matches << ",\"mismatches\":" << impl->lifecycleLabels.mismatches
+      << "},\"recentKills\":[";
   for (size_t j = 0; j < impl->kills.size(); ++j) { if (j) out << ','; out << impl->kills[j]; }
   out << "],\"recentGcPauses\":[";
   for (size_t j = 0; j < impl->recentGcPauses.size(); ++j) { if (j) out << ','; out << impl->recentGcPauses[j]; }

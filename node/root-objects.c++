@@ -95,13 +95,71 @@ std::string rootNamespaceUniqueKey(const std::string& namespaceId) {
   return std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId;
 }
 
-std::string rootLoaderBinding(bool durable) {
-  return durable ? "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n" : "";
+std::string rootLoaderBinding(bool) {
+  return "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n";
 }
 
 std::string rootLoaderService(bool durable, const std::string& storageDirectory) {
-  return durable ? "(name = \"roots\", coworkerdRootLoader = (storagePath = " +
-      json::quote(storageDirectory) + ")),\n" : "";
+  return "(name = \"roots\", coworkerdRootLoader = (plainOnly = " +
+      std::string(durable ? "false" : "true") + ", storagePath = " +
+      json::quote(durable ? storageDirectory : "") + ")),\n";
+}
+
+RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
+    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib) {
+  using json::quote;
+  const auto tenant = tenantOf(version.workerId);
+  const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
+  auto target = [&](const std::string& entrypoint, const std::string& props) {
+    return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
+  };
+  std::ostringstream plan;
+  plan << "{\"kind\":\"tenant\",\"tenant\":" << quote(tenant)
+      << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
+      << ",\"compatibilityDate\":" << quote(version.compatibilityDate)
+      << ",\"compatibilityFlags\":[],\"modules\":[],\"namespaces\":[],\"structuredProps\":"
+      << (version.format == "v2" ? "true" : "false")
+      << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)
+      << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
+      << ",\"cpuLimitMs\":" << cpuLimitMs << ",\"memoryLimitMib\":" << memoryLimitMib << '}'
+      << ",\"globalOutbound\":" << target("Egress", identity)
+      << ",\"streamingTail\":" << target("TenantLog", identity) << ",\"serviceBindings\":[";
+  bool first = true;
+  for (const auto& binding : version.bindings) {
+    const auto resolved = binding.assets ? versionPin(version) : pins.at(binding.workerId);
+    const auto props = "{\"workerId\":"+quote(resolved.workerId)+",\"versionId\":"+quote(resolved.versionId)+
+        ",\"contentHash\":"+quote(resolved.contentHash)+",\"definitionHash\":"+quote(resolved.definitionHash)+
+        ",\"entrypoint\":"+quote(binding.entrypoint)+(binding.assets ? ",\"assets\":true}" : "}");
+    plan << (first ? "" : ",") << "{\"metadata\":{\"name\":" << quote(binding.name)
+        << "},\"target\":" << target("BoundWorker", props) << '}';
+    first = false;
+  }
+  plan << "],\"durableObjects\":[";first = true;
+  for (const auto& binding : version.durableObjects) {
+    const auto* value = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
+        : catalog.database(tenant, binding.database);
+    const auto ns = value && value->status == "active" ? value->id : "";
+    const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
+    const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
+        ",\"namespaceId\":"+quote(ns)+",\"database\":"+quote(binding.database)+",\"objectId\":"+quote(id)+'}';
+    const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
+        ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
+        ",\"namespaceId\":"+quote(ns)+",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
+    plan << (first ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":" << target("DurableNamespace", props) << '}';
+    first = false;
+  }
+  plan << ']';
+  std::ostringstream revisions;
+  for (const auto& value : version.variables) revisions << quote(value.name) << ':' << quote(value.type) << ':' << quote(value.value) << ',';
+  for (const auto& name : version.secrets) {
+    const auto* value = catalog.secret(version.workerId, name);
+    revisions << quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
+  }
+  plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+sha256Hex(plan.str()+revisions.str())) << '}';
+  const auto* active = catalog.worker(version.workerId);
+  const bool current = active && active->valid && active->versionId == version.versionId && active->definitionHash == version.definitionHash;
+  return RootDispatch{plan.str(), "{\"kind\":\"plain\",\"dispatchChecked\":true,\"catalogGeneration\":"+
+      std::to_string(catalog.generation())+",\"activePlan\":"+(current ? "true}" : "false}")};
 }
 
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
