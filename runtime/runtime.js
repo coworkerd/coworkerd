@@ -1445,7 +1445,6 @@ function rootManagementFailure(error, missing = false) {
 const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
 const plainPlanKeys = new Map();
-const plainPreparations = new Map();
 
 // Private preparation only. Production fetch/RPC/trial dispatch keeps its Loader call sites.
 async function selectedPlain(descriptor, env, ctx) {
@@ -1473,39 +1472,28 @@ async function selectedPlain(descriptor, env, ctx) {
       plainPlanKeys.delete(cacheKey);
     }
   }
-  let flight = plainPreparations.get(cacheKey), leader = false;
-  if (!flight) {
-    leader = true;
-    flight = (async () => {
-      const manage = async (path, deployment) => {
-        const response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
-        const reply = await response.json();
-        if (!response.ok) throw new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
-        if (typeof reply?.plan !== "string" && !(path === "lookup" && reply?.plan === null))
-          throw new Error("Invalid ordinary plan reply");
-        return reply;
-      };
-      let reply = await manage("lookup", base), compiled = false;
-      if (reply.plan === null || reply.info?.loaded !== true) {
-        const code = await makeWorkerCode(descriptor, env, ctx);
-        const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
-        reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
-          compatibilityFlags: code.compatibilityFlags, environment: code.env,
-          modules: names.map(name => rootModule(name, code.modules[name]))});
-        compiled = true;
-      }
-      if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
-        throw new Error("Ordinary instance is not ready");
-      return {...remember({plan: reply.plan, generation: reply.info.generation}), compiled};
-    })();
-    plainPreparations.set(cacheKey, flight);
+  const manage = async (path, deployment) => {
+    const response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
+    const reply = await response.json();
+    if (!response.ok) throw new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
+    if (typeof reply?.plan !== "string" && !(path === "lookup" && reply?.plan === null))
+      throw new Error("Invalid ordinary plan reply");
+    return reply;
+  };
+  // Every caller owns its I/O. Native install coalesces compilation independently of caller cancellation.
+  let reply = await manage("lookup", base), compiled = false;
+  if (reply.plan === null || reply.info?.loaded !== true) {
+    const code = await makeWorkerCode(descriptor, env, ctx);
+    const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+    reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
+      compatibilityFlags: code.compatibilityFlags, environment: code.env,
+      modules: names.map(name => rootModule(name, code.modules[name]))});
+    compiled = reply.info?.cold === true;
   }
-  try {
-    item = await flight;
-    return {fetcher: await select(item), generation: item.generation, cold: leader && item.compiled};
-  } finally {
-    if (leader && plainPreparations.get(cacheKey) === flight) plainPreparations.delete(cacheKey);
-  }
+  if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
+    throw new Error("Ordinary instance is not ready");
+  item = remember({plan: reply.plan, generation: reply.info.generation});
+  return {fetcher: await select(item), generation: item.generation, cold: compiled};
 }
 
 async function selectedRoot(descriptor, env, ctx, preparationNonce) {
