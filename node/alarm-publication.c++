@@ -373,8 +373,10 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
       else s.hints.erase(sent.object);
     }
     if (w.version == sent.version) eraseWrite(found);else { w.next = 0;w.failures = 0; }
-  } else if (w.version == sent.version) w.next = monotonicTimeMs() + retry(w.failures);
-  else w.next = 0;
+  } else {
+    w.order = ++serial;
+    if (w.version == sent.version) w.next = monotonicTimeMs() + retry(w.failures);else w.next = 0;
+  }
   if (rejected && sent.at && w.at == 0 && !w.mayExist) { eraseWrite(found); }
   // A rejected PUT that never existed has a cancellable PUT row, never a ghost DELETE.
   reconcile(s);
@@ -449,7 +451,7 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
     hintGate.result(true, probe, monotonicTimeMs(), key);finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ownershipChanged(key, generation);co_return; }
-    hintGate.result(false, probe, monotonicTimeMs(), key);finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }if (!probe) failure("hint-scan");
+    hintGate.result(false, probe, monotonicTimeMs(), key);finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.order = ++serial;it->second.next = monotonicTimeMs() + retry(it->second.failures); }if (!probe) failure("hint-scan");
   }
 }
 kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, bool probe) {
@@ -485,6 +487,7 @@ kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, b
     markerGate.result(false, probe, monotonicTimeMs(), key);finished = true;
     auto it = shards.find(key);
     if (it != shards.end() && it->second.generation == generation) {
+      (repair ? it->second.repairOrder : it->second.previousOrder) = ++serial;
       (repair ? it->second.repairNext : it->second.previousNext) = monotonicTimeMs() + 5000;
       if (listing && accessDenied(error)) denied(Probe::LIST, it->second.previousPrefix);else if (!probe) failure(repair ? "marker-owner-check" : "predecessor-marker-scan");
     }
