@@ -605,6 +605,8 @@ function bytesText(value) {
 
 // Resolve once, save the exact bookmark and operation id before starting. A
 // restarted CLI never re-resolves a timestamp against a later publication.
+function show(answer) { console.log(JSON.stringify(answer, null, 2)); }
+
 async function d1TimeTravel(args) {
   const [action, ...rest] = args;
   if (!["info", "restore"].includes(action)) throw usage("d1 time-travel info <database> | restore <database> (--bookmark B | --timestamp T) --to NAME");
@@ -680,7 +682,6 @@ async function d1(args) {
   const { options, positional } = parse(rest, { tenant: "value", json: "flag", yes: "flag", sql: "value", file: "value", param: "list",
     "no-wait": "flag" });
   const config = loadConfig(), tenant = tenantOf(options, config);
-  const show = (answer) => { console.log(JSON.stringify(answer, null, 2)); };
   if (operation === "list") {
     if (positional.length) throw usage("d1 list takes no arguments");
     const answer = (await call(config, "GET", `${tenantPath(tenant)}/databases`)).json;

@@ -695,16 +695,6 @@ bool DatabaseReplay::apply(const LogRecord& record, std::string* error) {
   return true;
 }
 
-bool DatabaseReplay::finish() {
-  bool synced = true;
-  if (fd >= 0) {
-    // Finish synchronizing the replayed image before it can be used by recovery.
-    synced = ::fsync(fd) == 0;
-    ::close(fd);
-    fd = -1;
-  }
-  return synced;
-}
 kj::Promise<bool> DatabaseReplay::finishAsync() {
   if (fd < 0) co_return true;
   const bool synced = co_await synchronizeRecoveryFile(fd);
@@ -3862,7 +3852,9 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
 kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason) {
   const auto start = monotonicTimeMs();
   auto loopDelay = std::make_shared<double>(0);
-  auto measuring = measureRecoveryLoop(loopDelay).eagerlyEvaluate(nullptr);
+  recoveryLoopObservers.insert(loopDelay);
+  auto stopMeasuring = kj::defer([this, loopDelay]() { recoveryLoopObservers.erase(loopDelay); });
+  if (!measuringRecovery) { measuringRecovery = true; tasks.add(measureRecoveryLoop()); }
   double tailStart = start;
   {
     auto* object = objectOf(objectName);
@@ -4152,7 +4144,7 @@ kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, c
     const std::string& staging, std::function<void()> check, std::function<void(double)> observeFsync) {
   return downloadRecoverySnapshot([this](std::string key) { return store->get(std::move(key)); }, manifest,
       ref, settings.stackDirectory, staging, settings.config.snapshotPartBytes, settings.config.recoverParallelism,
-      std::move(check), []() { return kj::yieldUntilWouldSleep(); }, std::move(observeFsync));
+      std::move(check), [this]() { return timer.afterDelay(0 * kj::MILLISECONDS); }, std::move(observeFsync));
 }
 
 kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part,
@@ -4913,14 +4905,6 @@ kj::Promise<void> DurableLog::healLoop() {
 // The records of an object, in the order they were written -- by the shard's epoch, then the owner's epoch, then its
 // sequence -- replayed into each of its databases. A gap in one owner's sequence ends that owner's part there: a
 // peer holds a prefix, so what follows a gap was never answered to anybody.
-std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
-    const Object& object, const std::string& staging, std::vector<LogRecord> history,
-    const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
-    const std::set<std::pair<uint64_t, uint64_t>>& drop) {
-  return replayTo(object, object.objectName, object.shardEpoch, staging, std::move(history), facets,
-      snapshotShardEpoch, drop, {});
-}
-
 // Both drivers keep one replay state across batches: WAL headers, salts and running
 // checksums never reset when the seed yields to membership and tenant requests.
 class DurableLog::ReplayState {
@@ -4980,13 +4964,6 @@ public:
     }
     facet.txn = record.txn + (record.commits ? record.commits - 1 : 0);
   }
-  std::map<uint32_t, Facet> finish() {
-    for (auto& [facetId, replay] : replays) {
-      if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
-          log.databasePath(destination, facetId, "", staging).string().c_str());
-    }
-    return finishMetadata();
-  }
   kj::Promise<std::map<uint32_t, Facet>> finishAsync(std::function<void()> check,
       std::function<void(double)> observeFsync) {
     for (auto& [facetId, replay] : replays) {
@@ -5035,15 +5012,6 @@ private:
   std::map<uint32_t, Facet> rebuilt;
   uint64_t applied = 0, skipped = 0;
 };
-std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef& destination,
-    const std::string& historyName, uint64_t bookkeepingEpoch, const std::string& staging,
-    std::vector<LogRecord> history, const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
-    const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite) {
-  ReplayState state(*this, destination, historyName, bookkeepingEpoch, staging, facets, snapshotShardEpoch, drop, std::move(beforeWrite));
-  for (auto& record : history) state.add(std::move(record));
-  for (const auto& [position, record] : state.ordered) state.apply(record);
-  return state.finish();
-}
 kj::Promise<std::map<uint32_t, DurableLog::Facet>> DurableLog::replayToAsync(RootStorageRef destination,
     std::string historyName, uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
     std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
@@ -5055,25 +5023,27 @@ kj::Promise<std::map<uint32_t, DurableLog::Facet>> DurableLog::replayToAsync(Roo
   for (auto& record : history) {
     state.add(std::move(record));
     if (monotonicTimeMs() - began >= 2) {
-      co_await kj::yieldUntilWouldSleep(); check(); began = monotonicTimeMs();
+      co_await timer.afterDelay(0 * kj::MILLISECONDS); check(); began = monotonicTimeMs();
     }
   }
   history.clear();
   for (const auto& [position, record] : state.ordered) {
     state.apply(record);
     if (monotonicTimeMs() - began >= 2) {
-      co_await kj::yieldUntilWouldSleep(); check(); began = monotonicTimeMs();
+      co_await timer.afterDelay(0 * kj::MILLISECONDS); check(); began = monotonicTimeMs();
     }
   }
   check(); co_return co_await state.finishAsync(std::move(check), std::move(observeFsync));
 }
 
-kj::Promise<void> DurableLog::measureRecoveryLoop(std::shared_ptr<double> maximum) {
-  for (;;) {
+kj::Promise<void> DurableLog::measureRecoveryLoop() {
+  while (!recoveryLoopObservers.empty()) {
     const auto began = monotonicTimeMs();
     co_await timer.afterDelay(5 * kj::MILLISECONDS);
-    *maximum = std::max(*maximum, monotonicTimeMs() - began - 5);
+    const auto delay = monotonicTimeMs() - began - 5;
+    for (const auto& maximum : recoveryLoopObservers) *maximum = std::max(*maximum, delay);
   }
+  measuringRecovery = false;
 }
 
 // The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a

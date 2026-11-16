@@ -114,7 +114,7 @@ std::string DatabaseTimeTravel::source(const std::string& tenant, const std::str
   return found->second.id;
 }
 kj::Promise<std::optional<DatabaseTimeTravel::Point>> DatabaseTimeTravel::read(std::string ns, uint64_t revision, uint32_t& reads) {
-  if (reads >= 128) refuse(422, "HISTORY_READ_LIMIT", "recovery point lookup exceeds 128 history reads; choose a bookmark or a later time");
+  if (reads >= 128) refuse(422, "HISTORY_READ_LIMIT", "recovery point lookup reached 128 history reads; retry the same request to continue from cached owner intervals");
   ++reads;
   auto response = co_await context.storage.get(manifestKey(ns, revision));
   if (response.status == 404) co_return std::nullopt;
@@ -127,8 +127,48 @@ kj::Promise<std::optional<DatabaseTimeTravel::Point>> DatabaseTimeTravel::read(s
   if (!point.writtenAtUnixMs) refuse(409, "HISTORY_TIME_UNAVAILABLE", "this published revision has no generation time");
   co_return point;
 }
-kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string ns, const std::map<std::string, std::string>& selector) {
+void DatabaseTimeTravel::pruneHistoryCaches() {
+  for (auto it = histories.begin(); it != histories.end();) {
+    const auto& cache = *it->second;
+    const auto* tenant = context.state.tenant(cache.tenant);
+    bool current = tenant && tenant->record && tenant->record->status == "active";
+    if (current) { auto db = tenant->databases.find(cache.database); current = db != tenant->databases.end() && db->second.status == "active" && db->second.id == cache.namespaceId; }
+    if (!current) it = histories.erase(it); else ++it;
+  }
+}
+std::shared_ptr<DatabaseTimeTravel::HistoryCache> DatabaseTimeTravel::historyCache(
+    const std::string& tenant, const std::string& database, const std::string& ns) {
+  const auto key = tenant + "/" + database;
+  if (auto found = histories.find(key); found != histories.end() && found->second->namespaceId == ns) {
+    found->second->touched = ++historyClock; return found->second;
+  }
+  histories.erase(key);
+  if (histories.size() >= 64) {
+    auto oldest = std::min_element(histories.begin(), histories.end(), [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
+    histories.erase(oldest);
+  }
+  auto entry = std::make_shared<HistoryCache>(); entry->tenant = tenant; entry->database = database;
+  entry->namespaceId = ns; entry->touched = ++historyClock; histories[key] = entry; return entry;
+}
+kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string ns, const std::map<std::string, std::string>& selector,
+    const std::string& tenant, const std::string& database) {
   uint32_t reads = 0;
+  auto cache = historyCache(tenant, database, ns);
+  std::map<uint64_t, std::optional<Point>> seen;
+  auto readPoint = [this, &ns, &reads, &seen, cache](uint64_t revision) -> kj::Promise<std::optional<Point>> {
+    if (auto it = seen.find(revision); it != seen.end()) co_return it->second;
+    if (auto it = cache->points.find(revision); it != cache->points.end()) {
+      seen.emplace(revision, it->second); co_return it->second;
+    }
+    auto point = co_await read(ns, revision, reads);
+    seen.emplace(revision, point);
+    if (point) {
+      if (!cache->lastKnown || point->revision > cache->lastKnown->revision) cache->lastKnown = *point;
+      if (cache->points.emplace(revision, *point).second) cache->pointOrder.push_back(revision);
+      while (cache->pointOrder.size() > 256) { cache->points.erase(cache->pointOrder.front()); cache->pointOrder.pop_front(); }
+    }
+    co_return point;
+  };
   auto bookmark = selector.find("bookmark"), timestamp = selector.find("timestamp");
   if (bookmark != selector.end() && timestamp != selector.end()) refuse(400, "INVALID_REQUEST", "choose bookmark or timestamp");
   if (bookmark != selector.end()) {
@@ -143,24 +183,27 @@ kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string n
     if (first == std::string::npos || second == std::string::npos || value.substr(0, first) != ns)
       refuse(400, "INVALID_BOOKMARK", "bookmark belongs to another database");
     const auto rev = decimal(value.substr(first + 1, second - first - 1));
-    auto point = co_await read(ns, rev, reads);
+    auto point = co_await readPoint(rev);
     if (!point || point->sha256 != value.substr(second + 1)) refuse(400, "INVALID_BOOKMARK", "bookmark differs from published history");
     co_return *point;
   }
   // Revision objects are contiguous and immutable. Find the latest by existence,
   // using exact GETs (exponential bound, then binary search), never a listing.
-  auto first = co_await read(ns, 1, reads);
+  auto first = cache->lastKnown;
+  if (!first) first = co_await readPoint(1);
   if (!first) refuse(404, "NO_PUBLISHED_HISTORY", "this database has no published recovery point yet");
-  uint64_t lo = 1, hi = 2; Point latest = *first;
+  uint64_t lo = first->revision;
+  if (lo == UINT64_MAX) refuse(409, "HISTORY_LIMIT", "history revision bound exceeded");
+  uint64_t hi = lo + 1; Point latest = *first;
   for (;;) {
-    auto probe = co_await read(ns, hi, reads);
+    auto probe = co_await readPoint(hi);
     if (!probe) break;
     lo = hi; latest = *probe;
     if (hi > UINT64_MAX / 2) refuse(409, "HISTORY_LIMIT", "history revision bound exceeded");
     hi *= 2;
   }
   while (hi - lo > 1) {
-    const auto mid = lo + (hi - lo) / 2; auto probe = co_await read(ns, mid, reads);
+    const auto mid = lo + (hi - lo) / 2; auto probe = co_await readPoint(mid);
     if (probe) { lo = mid; latest = *probe; } else hi = mid;
   }
   if (timestamp == selector.end()) co_return latest;
@@ -168,26 +211,48 @@ kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string n
   // Clock offsets can change at an owner takeover. Shard epochs are monotone
   // (the publisher fences lower epochs), so binary-search each owner interval
   // backwards. Revision order, rather than wall-clock order across owners, wins.
-  uint64_t end = latest.revision;
-  while (end) {
-    auto last = co_await read(ns, end, reads); KJ_REQUIRE(last.has_value(), "history has a revision gap");
-    if (last->writtenAtUnixMs <= at) co_return *last;
-    uint64_t left = 1, right = end;
-    while (left < right) {
-      const auto mid = left + (right - left) / 2; auto probe = co_await read(ns, mid, reads); KJ_REQUIRE(probe.has_value(), "history has a revision gap");
-      if (probe->shardEpoch < last->shardEpoch) left = mid + 1; else right = mid;
+  std::shared_ptr<LookupProgress> progress;
+  auto found = cache->searches.find(at);
+  if (found != cache->searches.end() && found->second->latestEpoch == latest.shardEpoch) progress = found->second;
+  else {
+    if (cache->searches.size() >= 16) {
+      auto oldest = std::min_element(cache->searches.begin(), cache->searches.end(),
+          [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
+      cache->searches.erase(oldest);
     }
-    const auto start = left; auto begin = co_await read(ns, start, reads); KJ_REQUIRE(begin.has_value(), "history has a revision gap");
+    progress = std::make_shared<LookupProgress>(); progress->nextEnd = latest.revision;
+    progress->latestEpoch = latest.shardEpoch; cache->searches[at] = progress;
+  }
+  progress->touched = ++historyClock;
+  auto finished = [&]() { auto it = cache->searches.find(at); if (it != cache->searches.end() && it->second == progress) cache->searches.erase(it); };
+  uint64_t end = progress->nextEnd;
+  while (end) {
+    auto last = co_await readPoint(end); KJ_REQUIRE(last.has_value(), "history has a revision gap");
+    if (last->writtenAtUnixMs <= at) { finished(); co_return *last; }
+    uint64_t start;
+    if (auto known = cache->ownerStarts.find(last->shardEpoch); known != cache->ownerStarts.end()) start = known->second;
+    else {
+      uint64_t left = 1, right = end;
+      while (left < right) {
+        const auto mid = left + (right - left) / 2; auto probe = co_await readPoint(mid); KJ_REQUIRE(probe.has_value(), "history has a revision gap");
+        if (probe->shardEpoch < last->shardEpoch) left = mid + 1; else right = mid;
+      }
+      start = left;
+      if (cache->ownerStarts.emplace(last->shardEpoch, start).second) cache->ownerOrder.push_back(last->shardEpoch);
+      while (cache->ownerOrder.size() > 128) { cache->ownerStarts.erase(cache->ownerOrder.front()); cache->ownerOrder.pop_front(); }
+    }
+    auto begin = co_await readPoint(start); KJ_REQUIRE(begin.has_value(), "history has a revision gap");
     if (begin->writtenAtUnixMs <= at) {
       uint64_t low = start, high = end; Point chosen = *begin;
       while (high - low > 1) {
-        const auto mid = low + (high - low) / 2; auto probe = co_await read(ns, mid, reads); KJ_REQUIRE(probe.has_value(), "history has a revision gap");
+        const auto mid = low + (high - low) / 2; auto probe = co_await readPoint(mid); KJ_REQUIRE(probe.has_value(), "history has a revision gap");
         if (probe->writtenAtUnixMs <= at) { low = mid; chosen = *probe; } else high = mid;
       }
-      co_return chosen;
+      finished(); co_return chosen;
     }
-    end = start - 1;
+    end = start - 1; progress->nextEnd = std::min(progress->nextEnd, end);
   }
+  finished();
   refuse(422, "HISTORY_BEFORE_FIRST", "the requested time precedes the first matching published revision");
 }
 kj::Promise<uint64_t> DatabaseTimeTravel::usage(std::string tenant) {
@@ -255,7 +320,8 @@ kj::Promise<std::optional<std::string>> DatabaseTimeTravel::recognize(std::share
 }
 kj::Promise<ApiAnswer> DatabaseTimeTravel::info(std::string tenant, std::string database, const std::map<std::string, std::string>& selector) {
   try {
-    auto point = co_await resolve(source(tenant, database), selector);
+    pruneHistoryCaches();
+    auto point = co_await resolve(source(tenant, database), selector, tenant, database);
     co_return ApiAnswer::ok("{\"database\":" + quote(database) + ",\"point\":" + point.json() + "}");
   } catch (const kj::Exception& error) { co_return failure(error); }
 }
@@ -316,7 +382,8 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string
       // Refresh and pin the existing entry before the first storage wait.
       hold(old->second);
     }
-    intent->point = co_await resolve(source(tenant, database), selector);
+    pruneHistoryCaches();
+    intent->point = co_await resolve(source(tenant, database), selector, tenant, database);
     intent->namespaceId = destination(*intent);
     expireJobs();
     if (auto old = jobs.find(key); old != jobs.end()) {
@@ -333,7 +400,7 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string
       // The tenant-scoped operation MAC identifies this immutable receipt.
       // finish checks manifest 2, all metadata and quotas before registration.
       intent->registering = true; auto done = kj::defer([intent]() { intent->registering = false; });
-      co_return co_await finish(intent, objectSha256(receipt.bytes));
+      co_return co_await finish(intent, objectSha256(receipt.bytes), true);
     }
     const auto reported = co_await usage(tenant);
     // No mirror pointer survives an await. Deletion/recreation may replace the
@@ -357,9 +424,9 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string
     refuse(503, "RESTORE_UNAVAILABLE", "no target owner accepted the restore; retry with the same operationId and bookmark");
   } catch (const kj::Exception& error) { co_return failure(error); }
 }
-kj::Promise<ApiAnswer> DatabaseTimeTravel::finish(std::shared_ptr<Intent> intent, std::string manifestSha256) {
+kj::Promise<ApiAnswer> DatabaseTimeTravel::finish(std::shared_ptr<Intent> intent, std::string manifestSha256, bool verifyContent) {
   if (destination(*intent) != intent->namespaceId) refuse(409, "CONFLICT", "restore namespace provenance differs");
-  const auto bytes = co_await verifySeedFirstManifest(context.storage, intent->namespaceId, manifestSha256);
+  const auto bytes = co_await verifySeedFirstManifest(context.storage, intent->namespaceId, manifestSha256, verifyContent);
   const auto reported = co_await usage(intent->tenant);
   co_await context.state.writeTenant(intent->tenant, [&](TenantManifest& next) -> kj::Promise<void> {
     // Recompute inside this tenant conditional update. The tenant in the MAC

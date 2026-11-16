@@ -5,6 +5,7 @@
 #include <capnp/message.h>
 #include <kj/debug.h>
 #include <algorithm>
+#include <openssl/evp.h>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -31,7 +32,7 @@ std::string databaseObject(const std::string& ns) {
   return objectSha256(bytes + "name" + DATABASE_OBJECT_NAME);
 }
 } // namespace
-kj::Promise<uint64_t> verifySeedFirstManifest(ObjectStore& store, const std::string& ns, const std::string& expectedSha256) {
+kj::Promise<uint64_t> verifySeedFirstManifest(ObjectStore& store, const std::string& ns, const std::string& expectedSha256, bool verifyContent) {
   const auto objectId = databaseObject(ns); const auto prefix = "do/" + ns + "/objects/" + objectId + "/";
   auto response = co_await store.get(prefix + "manifest/" + wide(1));
   KJ_REQUIRE(response.status == 200 && response.bytes.size() <= (4u << 20), "destination manifest 1 is not published");
@@ -73,12 +74,28 @@ kj::Promise<uint64_t> verifySeedFirstManifest(ObjectStore& store, const std::str
       integer(indexedFacets[0], "facet") == 0 && integer(indexedFacets[0], "parent") == 0 &&
       integer(indexedFacets[0], "upToSeq") == 0 && json::text(indexedFacets[0], "name").empty(),
       "destination snapshot index differs from manifest 1");
+  auto* digest = verifyContent ? EVP_MD_CTX_new() : nullptr;
+  auto release = kj::defer([&]() { if (digest) EVP_MD_CTX_free(digest); });
+  if (verifyContent) KJ_REQUIRE(digest && EVP_DigestInit_ex(digest, EVP_sha256(), nullptr) == 1, "cannot verify seed image");
   uint64_t read = 0;
   for (uint64_t part = 0; part < parts; ++part) {
-    auto size = co_await store.headSize(key + wide(0) + "-" + wide(part));
     const auto expected = std::min(partBytes, bytes - read);
-    KJ_REQUIRE(size.has_value() && *size == expected, "destination snapshot part is absent or has wrong length");
+    if (verifyContent) {
+      auto body = co_await store.get(key + wide(0) + "-" + wide(part));
+      KJ_REQUIRE(body.status == 200 && body.bytes.size() == expected, "destination snapshot part is absent or has wrong length");
+      KJ_REQUIRE(EVP_DigestUpdate(digest, body.bytes.data(), body.bytes.size()) == 1, "cannot hash destination part");
+    } else {
+      auto size = co_await store.headSize(key + wide(0) + "-" + wide(part));
+      KJ_REQUIRE(size.has_value() && *size == expected, "destination snapshot part is absent or has wrong length");
+    }
     read += expected;
+  }
+  if (verifyContent) {
+    unsigned char value[32]; unsigned int length;
+    KJ_REQUIRE(EVP_DigestFinal_ex(digest, value, &length) == 1 && length == 32, "cannot finish destination digest");
+    constexpr char HEX[] = "0123456789abcdef"; std::string actual;
+    for (auto byte : value) { actual += HEX[byte >> 4]; actual += HEX[byte & 15]; }
+    KJ_REQUIRE(actual == hash, "destination image differs from first manifest");
   }
   KJ_REQUIRE(read == bytes, "destination image differs from first manifest"); co_return bytes;
 }

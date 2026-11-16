@@ -151,11 +151,14 @@ All operations use the existing tenant authorization. The source must be an acti
   returns `{database,point:{revision,writtenAtUnixMs,bookmark}}`; numbers in `point` are decimal strings.
   Without a selector, `point` is the latest published revision. Timestamp resolution uses exact revision GETs, no listing.
   Each lookup has at most 128 history GETs (256 HTTP attempts including one retry per GET), including latest lookup.
-  Exceeding this returns 422 `HISTORY_READ_LIMIT`; use a bookmark or a later timestamp. A bookmark needs one GET.
+  Exceeding this returns 422 `HISTORY_READ_LIMIT`; retry the same request to continue from cached owner intervals.
+  A revision is fetched at most once per request. The control plane retains up to 64 library caches, each with 256
+  immutable revision records, 128 owner boundaries and 16 unfinished timestamp searches. Deletion/recreation invalidates
+  the cache; restart or eviction starts afresh. A bookmark needs at most one GET.
 - `POST /v1/tenants/{tenant}/databases/{database}/time-travel/restore` takes
   `{name,operationId,bookmark}` or `{name,operationId,timestamp:"<Unix-ms>"}`.
   It prechecks name/quota and starts the target owner. An existing manifest 1 with no manifest 2 goes directly to
-  verification and registration without restarting node materialization. It returns `{known:true,operationId,phase:"started",point}`
+  full content verification and registration without restarting node materialization. It returns `{known:true,operationId,phase:"started",point}`
   or the completed answer below. `operationId` is a client-generated random 16–128-character alphanumeric/hyphen id.
   Additional caller-supplied namespace ids are never used.
 - `GET /v1/tenants/{tenant}/database-restores/{operationId}` returns `{known:false}` after memory state is lost,
@@ -163,7 +166,8 @@ All operations use the existing tenant authorization. The source must be an acti
   `node.errorCode`, `node.error`, `node.resource`, `node.required` and `node.limit`. Completion is
   `{known:true,phase:"completed",operationId,database,namespaceId,point}` after exact R1 verification and conditional
   registration. Verification checks manifest identity/digest, the complete snapshot index and HEAD lengths for every
-  part; the control plane does not download image parts again. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
+  part after the node reports completion. When a repeated start discovers manifest 1 itself, it also downloads and hashes
+  all parts before registration. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
 
 Target N is HMAC-SHA256 of the canonical tuple tenant, source N, revision, raw-manifest SHA-256 and operation id.
 Each UTF-8 field is encoded as decimal byte-length, `:`, and bytes; revision is canonical decimal. The subkey is
