@@ -78,7 +78,7 @@ operations validate the series before mutating a checkout or exporting files.
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023 and 0024, in that order.
+0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024 and 0025, in that order.
 0014 completes the Durable Object port; 0020 adds the private runtime root loader;
 0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
@@ -120,6 +120,13 @@ Installation and reload failures share a per-key backoff of 1, 2, 4, 8, 16 and
 compilation, resets the sequence. Expired errors retain only their bounded LRU
 history until that reset, so a retry can increase the next delay. The only Rust
 path is `src/workerd/server/server/root_loader.rs`.
+
+### 0025: Plain load accounting fields
+
+Plain startup identity uses the existing accounting field-fragment format, with
+escaped Worker/version ids and a load-specific invocation token. Startup CPU and
+memory rows remain valid JSON and describe the load rather than its first caller.
+The only Rust path is `src/workerd/server/server/root_loader.rs`.
 
 The SQLite CTE backout is part of this upstream tag (`0d01fe9f6850d038d80e6debb54c683a51a9ac65`).
 It requires no local patch or extra permitted path; the former 0019 is removed.
