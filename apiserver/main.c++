@@ -2,7 +2,7 @@
 // API and, as its internal subcommand `tool`, the deployment tool.
 #include "config.h"
 #include "control.h"
-#include "database-seed-tool.h"
+#include "database-time-travel.h"
 #include "deployment.h"
 #include "json.h"
 #include "log-cleaning.h"
@@ -375,7 +375,7 @@ public:
       coworkerd::ManifestStore& state, kj::Timer& timer, kj::Network& network, const kj::HttpHeaderTable& headerTable)
       : settings(settings), storage(storage), state(state), timer(timer), network(network), headerTable(headerTable),
         context{storage, state, timer, network, headerTable, settings.token, settings.memberTtlSeconds, settings.memberGraceMs,
-            settings.cleanupGraceMs} {}
+            settings.cleanupGraceMs}, timeTravel(context) {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body, Response& response) override {
@@ -518,6 +518,10 @@ private:
       if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
       co_return co_await usage(tenant, query, response);
     }
+    if (area == "database-restores" && n == 5) {
+      if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
+      co_return co_await send(response, co_await timeTravel.progress(tenant, segments[4]));
+    }
     // The tenant's databases (the D1 shape): the record, and one SQL statement on the database's object.
     if (area == "databases") {
       if (n == 4) {
@@ -532,6 +536,15 @@ private:
         if (is(kj::HttpMethod::GET)) co_return co_await send(response, coworkerd::readDatabaseRecord(state, tenant, database));
         if (is(kj::HttpMethod::DELETE)) co_return co_await send(response, co_await coworkerd::deleteDatabase(state, tenant, database));
         co_return co_await methodNotAllowed(response, "POST, GET, DELETE");
+      }
+      if (n == 7 && segments[5] == "time-travel") {
+        if (segments[6] == "info" && is(kj::HttpMethod::GET))
+          co_return co_await send(response, co_await timeTravel.info(tenant, database, query));
+        if (segments[6] == "restore" && is(kj::HttpMethod::POST)) {
+          auto text = co_await readBody(body, response, 16384, "a restore request is at most 16 KiB");
+          if (text) co_await send(response, co_await timeTravel.start(tenant, database, *text));
+          co_return;
+        }
       }
       if (n == 6 && segments[5] == "query") {
         if (!is(kj::HttpMethod::POST)) co_return co_await methodNotAllowed(response, "POST");
@@ -1456,6 +1469,7 @@ private:
   kj::Network& network;
   const kj::HttpHeaderTable& headerTable;
   coworkerd::ControlContext context;
+  coworkerd::DatabaseTimeTravel timeTravel;
 };
 
 // What this control plane announces as its own addresses (ControlService::announce): its listen address's host, or
@@ -1708,7 +1722,6 @@ int main(int argc, char** argv) {
     // The deployment tool (`tool`), kept for the tests and for this daemon.
     kj::UnixEventPort::captureSignal(SIGTERM);
     kj::UnixEventPort::captureSignal(SIGINT);
-    if (args.size() >= 2 && args[1] == "database-register") return coworkerd::runDatabaseSeedRegister(argc - 3, argv + 3);
     if (args.size() >= 2 && args[1] == "rotate") return coworkerd::runRotationTool(argc - 3, argv + 3);
     if (args.size() >= 2 && args[1] == "drain") return runDrainTool(argc - 3, argv + 3);
     if (args.size() >= 2) return coworkerd::runDeploymentTool(argc - 2, argv + 2);

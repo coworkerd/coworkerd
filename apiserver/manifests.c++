@@ -478,6 +478,27 @@ kj::Promise<uint64_t> ManifestStore::syncIndex() {
         }
         if (!taken.empty()) break;
       }
+      // Namespace ownership is decided by this same global conditional update,
+      // not a preflight read of this process's mirror. After a CAS conflict the
+      // next attempt checks the exact manifests the newly adopted index names.
+      auto namespaces = [](const TenantManifest& value) {
+        std::set<std::string> ids;
+        for (const auto& [database, entry] : value.databases) ids.insert(entry.id);
+        for (const auto& [worker, entry] : value.workers)
+          for (const auto& [className, space] : entry.namespaces) ids.insert(space.id);
+        return ids;
+      };
+      const auto ours = namespaces(manifest->second);
+      if (taken.empty() && !ours.empty()) for (const auto& [other, otherEntry] : next.tenants) {
+        if (other == name) continue;
+        auto raw = co_await store.get(revisionKey(tenantManifestPrefix(other), otherEntry.manifestRev));
+        requireStorage(raw.status == 200, "the indexed tenant manifest could not be checked for namespace ownership");
+        auto theirs = namespaces(decodeTenantManifest(raw.bytes));
+        for (const auto& id : ours) if (theirs.contains(id)) {
+          taken = "namespace " + id + " belongs to tenant " + other; break;
+        }
+        if (!taken.empty()) break;
+      }
       if (!taken.empty()) {
         settled.insert(name);
         if (auto refused = indexRefusals.find(name); refused == indexRefusals.end() || refused->second.first != manifest->second.revision) {

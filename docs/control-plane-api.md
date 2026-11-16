@@ -141,3 +141,28 @@ Class namespaces are created by deploying migrations, not by a separate create e
 | Confirmation / storage failure | 503 `STORAGE_UNAVAILABLE` | A failed call can have changed local state; inspect before retrying non-idempotent operations |
 
 A SQL statement error is a D1 `{success:false,error}` answer, not necessarily an HTTP error. The public SQL route only forwards status-200 node answers; after a non-200 answer or transport error it tries other members, then answers `503 STORAGE_UNAVAILABLE` if none succeeds. This collapses platform codes and can repeat a non-idempotent statement after an uncertain result. HTTP SQL uses the caller's admin or tenant credential and cannot cross the tenant boundary. `/v1` retains its existing fields and adds these endpoints / fields for 0.5.
+
+
+## Database time travel
+
+All operations use the existing tenant authorization. The source must be an active database of the path's tenant.
+
+- `GET /v1/tenants/{tenant}/databases/{database}/time-travel/info[?timestamp=<Unix-ms>|bookmark=<opaque-token>]`
+  returns `{database,point:{revision,writtenAtUnixMs,bookmark}}`; numbers in `point` are decimal strings.
+  Without a selector, `point` is the latest published revision. Timestamp resolution uses exact revision GETs, no listing.
+- `POST /v1/tenants/{tenant}/databases/{database}/time-travel/restore` takes
+  `{name,operationId,bookmark}` or `{name,operationId,timestamp:"<Unix-ms>"}`.
+  It prechecks name/quota and starts the target owner. It returns `{known:true,operationId,phase:"started",point}`
+  or the completed answer below. `operationId` is a client-generated random 16–128-character alphanumeric/hyphen id.
+  Additional caller-supplied namespace ids are never used.
+- `GET /v1/tenants/{tenant}/database-restores/{operationId}` returns `{known:false}` after memory state is lost,
+  or `{known:true,operationId,phase,point,node}` while working. A node failure has `phase:"failed"`, with
+  `node.errorCode`, `node.error`, `node.resource`, `node.required` and `node.limit`. Completion is
+  `{known:true,phase:"completed",operationId,database,namespaceId,point}` after exact R1 verification and conditional
+  registration. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
+
+Target N is HMAC-SHA256 of the canonical tuple tenant, source N, revision, raw-manifest SHA-256 and operation id.
+Each UTF-8 field is encoded as decimal byte-length, `:`, and bytes; revision is canonical decimal. The subkey is
+HMAC-SHA256 of the existing secrets master key with domain `coworkerd/d1-time-travel/namespace/v1`; it never leaves
+control-plane computation. Registration recomputes N and checks ownership inside the existing tenant-index CAS.
+The old arbitrary-N `tool database-register` has been removed. No persistent job table or directory state is added.

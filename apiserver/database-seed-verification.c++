@@ -1,4 +1,4 @@
-#include "database-seed-tool.h"
+#include "database-time-travel.h"
 #include "manifests.h"
 #include "deployment.h"
 #include "json.h"
@@ -23,10 +23,15 @@ std::string databaseObject(const std::string& ns) {
   for (size_t at = 0; at < ns.size(); at += 2) bytes += char(digit(ns[at]) * 16 + digit(ns[at + 1]));
   return objectSha256(bytes + "name" + DATABASE_OBJECT_NAME);
 }
-kj::Promise<uint64_t> verifyFirstManifest(ObjectStore& store, const std::string& ns) {
+} // namespace
+kj::Promise<uint64_t> verifySeedFirstManifest(ObjectStore& store, const std::string& ns, const std::string& expectedSha256) {
   const auto objectId = databaseObject(ns); const auto prefix = "do/" + ns + "/objects/" + objectId + "/";
   auto response = co_await store.get(prefix + "manifest/" + wide(1));
   KJ_REQUIRE(response.status == 200 && response.bytes.size() <= (4u << 20), "destination manifest 1 is not published");
+  if (!expectedSha256.empty()) KJ_REQUIRE(objectSha256(response.bytes) == expectedSha256, "destination manifest 1 digest differs");
+  auto later = co_await store.get(prefix + "manifest/" + wide(2));
+  requireStorage(later.status == 200 || later.status == 404, "cannot check target use");
+  KJ_REQUIRE(later.status == 404, "destination already exists and is in use");
   capnp::MallocMessageBuilder message; auto root = message.initRoot<capnp::JsonValue>();
   capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.bytes.data(), response.bytes.size()), root);
   KJ_REQUIRE(json::text(root, "namespaceId") == ns && json::text(root, "objectId") == objectId && json::integer(root, "revision") == 1,
@@ -58,47 +63,5 @@ kj::Promise<uint64_t> verifyFirstManifest(ObjectStore& store, const std::string&
   unsigned char value[32]; unsigned int length; KJ_REQUIRE(EVP_DigestFinal_ex(digest, value, &length) == 1 && length == 32, "cannot finish destination digest");
   constexpr char HEX[] = "0123456789abcdef"; std::string actual; for (auto byte : value) { actual += HEX[byte >> 4]; actual += HEX[byte & 15]; }
   KJ_REQUIRE(read == bytes && actual == hash && json::integer(root, "databaseBytes") == bytes, "destination image differs from first manifest"); co_return bytes;
-}
-kj::Promise<uint64_t> reportedTenantBytes(ObjectStore& objects, const std::string& tenant) {
-  uint64_t total = 0; auto listing = co_await objects.list("nodes/");
-  for (const auto& entry : listing.objects) if (entry.key.ends_with("/durable-usage")) {
-    auto response = co_await objects.get(entry.key); if (response.status != 200) continue;
-    capnp::MallocMessageBuilder message; auto value = message.initRoot<capnp::JsonValue>(); capnp::JsonCodec().decodeRaw(kj::arrayPtr(response.bytes.data(), response.bytes.size()), value);
-    auto tenants = json::field(value, "tenants"); if (tenants.isObject()) total += json::integer(tenants, tenant.c_str());
-  }
-  co_return total;
-}
-}
-int runDatabaseSeedRegister(int argc, char** argv) {
-  ObjectStoreConfig config; std::string tenant, name, ns;
-  if (auto value = std::getenv("COWORKERD_STORAGE_ENDPOINT")) config.endpoint = value;
-  if (auto value = std::getenv("COWORKERD_STORAGE_BUCKET")) config.bucket = value;
-  for (int at = 0; at < argc; at += 2) {
-    KJ_REQUIRE(at + 1 < argc, "missing database-register option value"); const std::string option = argv[at], value = argv[at + 1];
-    if (option == "--tenant") tenant = value; else if (option == "--name") name = value; else if (option == "--namespace") ns = value;
-    else if (option == "--storage-endpoint") config.endpoint = value; else if (option == "--storage-bucket") config.bucket = value;
-    else if (option == "--storage-region") config.region = value; else KJ_FAIL_REQUIRE("unknown database-register option", option.c_str());
-  }
-  KJ_REQUIRE(tenantName(tenant) && tenantName(name) && identifier(ns), "database-register requires --tenant, --name, and --namespace");
-  auto io = kj::setupAsyncIo(); ObjectStore objects(config, io.provider->getNetwork(), io.provider->getTimer());
-  ManifestStore state(objects, io.provider->getTimer(), std::nullopt, std::cerr); state.load(false, false).wait(io.waitScope);
-  const auto bytes = verifyFirstManifest(objects, ns).wait(io.waitScope); const auto reported = reportedTenantBytes(objects, tenant).wait(io.waitScope);
-  for (const auto& [owner, manifest] : state.tenants()) {
-    for (const auto& [database, entry] : manifest.databases) KJ_REQUIRE(entry.id != ns, "namespace is already registered");
-    for (const auto& [worker, entry] : manifest.workers) for (const auto& [className, space] : entry.namespaces) KJ_REQUIRE(space.id != ns, "namespace belongs to a Worker");
-  }
-  auto written = state.writeTenant(tenant, [&](TenantManifest& next) -> kj::Promise<void> {
-    KJ_REQUIRE(next.record.has_value() && next.record->status == "active", "tenant is not active");
-    KJ_REQUIRE(!next.databases.contains(name), "database name already exists");
-    for (const auto& [existing, space] : next.databases) KJ_REQUIRE(space.id != ns, "namespace is already registered");
-    size_t namespaces = next.databases.size() + 1;
-    for (const auto& [worker, entry] : next.workers) namespaces += entry.namespaces.size();
-    KJ_REQUIRE(namespaces <= next.record->quotas.durableObjectNamespaces, "durableObjectNamespaces quota exceeded");
-    KJ_REQUIRE(!next.record->quotas.durableObjectBytes || (reported <= next.record->quotas.durableObjectBytes && bytes <= next.record->quotas.durableObjectBytes - reported),
-        "durableObjectBytes quota exceeded");
-    next.databases.emplace(name, ManifestNamespace{ns, next.revision + 1, "active", 1}); co_return;
-  }, false).wait(io.waitScope);
-  std::cout << "{\"ok\":true,\"tenant\":" << quote(tenant) << ",\"database\":" << quote(name) << ",\"namespaceId\":" << quote(ns)
-      << ",\"revision\":" << written.manifest.revision << ",\"bytes\":\"" << bytes << "\"}" << std::endl; return 0;
 }
 } // namespace coworkerd

@@ -22,19 +22,22 @@ public:
   DatabaseSeed(DurableLog& log, DurableShards& shards, std::function<bool(const std::string&)> registered);
   kj::Promise<ShardRoute> route(const std::string& namespaceId);
   std::string start(DatabaseSeedInput input, const ShardRoute& route);
-  std::string progress(const std::string& namespaceId) const;
+  kj::Promise<std::string> progress(std::string namespaceId);
 private:
   struct Job {
     DatabaseSeedInput input;
     ShardRoute owner;
     std::string phase = "starting", errorCode, error, result;
     uint64_t nodeEpoch = 0, bytes = 0, required = 0, limit = 0, imageBytes = 0;
+    uint64_t diskBase = 0, availableBytes = 0;
+    double maxLoopDelayMs = 0;
     std::string resource;
     HistoryBudget budget;
     bool finished = false;
     std::string json() const;
   };
   kj::Promise<void> run(std::shared_ptr<Job> job);
+  kj::Promise<void> measureLoop(std::shared_ptr<Job> job);
   void check(const Job& job) const;
   void disk(Job& job, uint64_t imageBytes) const;
   void taskFailed(kj::Exception&& error) override;

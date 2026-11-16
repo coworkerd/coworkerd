@@ -3526,7 +3526,8 @@ kj::Promise<void> DurableLog::resealEarlier() {
 // This machine's files are a cache: when they take more than their share, the objects nothing has asked for in the
 // longest time and whose changes are all in a segment lose theirs. The object is rebuilt from its history when it
 // is asked for again.
-kj::Promise<void> DurableLog::dropColdFiles() {
+kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
+  const auto target = diskLimitBytes - std::min(diskLimitBytes, std::max(reservedBytes, seedReservedBytes));
   coldFilesSkippedLive = 0;
   if (recoveryWriteFailed || (startupAttempted && !startupReady)) co_return;
   std::error_code code;
@@ -3559,10 +3560,10 @@ kj::Promise<void> DurableLog::dropColdFiles() {
       cold.emplace_back(object.lastAccessMs, name);
   }
   diskUsedBytes = total;
-  if (total <= diskLimitBytes || cold.empty()) co_return;
+  if (total <= target || cold.empty()) co_return;
   std::sort(cold.begin(), cold.end());
   for (const auto& [access, name] : cold) {
-    if (total <= diskLimitBytes) break;
+    if (total <= target) break;
     auto* object = objectOf(name);
     if (object == nullptr) continue;
     if (hasLiveOpenFacets(*object) || hasLiveHolders(*object)) {
@@ -3587,6 +3588,7 @@ kj::Promise<void> DurableLog::dropColdFiles() {
     log("files-dropped", "\"object\":" + quote(name) + ",\"bytes\":\"" + std::to_string(freed) +
             "\",\"reason\":\"this machine's share of Durable Object files is full\"");
   }
+  diskUsedBytes = total;
   if (coldFilesSkippedLive != 0) {
     const auto now = monotonicTimeMs();
     if (lastColdFilesSkippedLogMs == 0 || now - lastColdFilesSkippedLogMs >= 60000) {
@@ -4904,37 +4906,36 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
       snapshotShardEpoch, drop, {});
 }
 
-std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef& destination,
-    const std::string& historyName, uint64_t bookkeepingEpoch, const std::string& staging,
-    std::vector<LogRecord> history, const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
-    const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite) {
-  // A shard's epoch belongs to one owner and grows with every takeover, so (shard epoch, node sequence) is both the
-  // order the transactions were written in and the identity of a record: a record that came from a segment and from
-  // a peer is applied once.
-  std::map<std::pair<uint64_t, uint64_t>, LogRecord> ordered;
-  for (auto& record : history) {
-    if (!record.ownerSealed && drop.contains({record.shardEpoch, record.nodeSeq})) continue;
+// Both drivers keep one replay state across batches: WAL headers, salts and running
+// checksums never reset when the seed yields to membership and tenant requests.
+class DurableLog::ReplayState {
+public:
+  ReplayState(DurableLog& log, RootStorageRef destination, std::string historyName,
+      uint64_t bookkeepingEpoch, std::string staging, std::vector<ManifestFacet> facets,
+      uint64_t snapshotShardEpoch, std::set<std::pair<uint64_t, uint64_t>> drop,
+      std::function<void(const LogRecord&)> beforeWrite)
+      : log(log), destination(std::move(destination)), historyName(std::move(historyName)),
+        bookkeepingEpoch(bookkeepingEpoch), staging(std::move(staging)), facets(std::move(facets)),
+        snapshotShardEpoch(snapshotShardEpoch), drop(std::move(drop)), beforeWrite(std::move(beforeWrite)) {
+    for (const auto& facet : this->facets) covered[facet.facetId] = facet.upToSeq;
+    if (snapshotShardEpoch == bookkeepingEpoch) rebuiltUpTo = covered;
+  }
+  void add(LogRecord record) {
+    if (!record.ownerSealed && drop.contains({record.shardEpoch, record.nodeSeq})) return;
     ordered.insert({{record.shardEpoch, record.nodeSeq}, std::move(record)});
   }
-  std::map<uint32_t, uint64_t> covered;  // facet -> the sequence of the snapshot's shard epoch it already holds
-  for (const auto& facet : facets) covered[facet.facetId] = facet.upToSeq;
-  std::map<uint32_t, uint64_t> rebuiltUpTo;
-  if (snapshotShardEpoch == bookkeepingEpoch) rebuiltUpTo = covered;
-  std::map<uint32_t, std::unique_ptr<DatabaseReplay>> replays;
-  std::map<uint32_t, Facet> rebuilt;
-  uint64_t applied = 0, skipped = 0;
-  for (const auto& [position, record] : ordered) {
+  void apply(const LogRecord& record) {
     auto found = covered.find(record.facetId);
     const bool inSnapshot = record.shardEpoch < snapshotShardEpoch ||
         (found != covered.end() && record.shardEpoch == snapshotShardEpoch && record.nodeSeq <= found->second);
     if (inSnapshot) {
       ++skipped;
-      continue;
+      return;
     }
     auto& replay = replays[record.facetId];
     if (!replay) {
       // A facet the snapshot brought goes on from its file; one it did not starts from nothing.
-      replay = std::make_unique<DatabaseReplay>(databasePath(destination, record.facetId, "", staging),
+      replay = std::make_unique<DatabaseReplay>(log.databasePath(destination, record.facetId, "", staging),
           covered.find(record.facetId) == covered.end());
     }
     if (beforeWrite) beforeWrite(record);
@@ -4943,8 +4944,8 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef&
       // The records of an object are a chain: one that does not follow the last means the history is not whole, and
       // an object is never served with less of it than it had. The rebuild fails and the request gets an answer it
       // can act on.
-      ++replayStops;
-      log("replay-stopped", "\"object\":" + quote(historyName) + ",\"facet\":" +
+      ++log.replayStops;
+      log.log("replay-stopped", "\"object\":" + quote(historyName) + ",\"facet\":" +
               std::to_string(record.facetId) + ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) +
               "\",\"nodeSeq\":\"" + std::to_string(record.nodeSeq) + "\",\"applied\":" + std::to_string(applied) +
               ",\"records\":" + std::to_string(ordered.size()) + ",\"reason\":" + quote(error));
@@ -4965,27 +4966,76 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef&
     }
     facet.txn = record.txn + (record.commits ? record.commits - 1 : 0);
   }
-  for (auto& [facetId, replay] : replays) {
-    if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
-        databasePath(destination, facetId, "", staging).string().c_str());
+  std::map<uint32_t, Facet> finish() {
+    for (auto& [facetId, replay] : replays) {
+      if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
+          log.databasePath(destination, facetId, "", staging).string().c_str());
+    }
+    for (const auto& facet : facets) {
+      auto& entry = rebuilt[facet.facetId];
+      entry.facetId = facet.facetId;
+      entry.parentFacetId = facet.parentFacetId;
+      if (!facet.name.empty()) entry.facetName = facet.name;
+    }
+    for (auto& [facetId, facet] : rebuilt) {
+      facet.lastFrame = 0;
+      facet.salt1 = 0;
+      facet.salt2 = 0;
+      facet.checkpointedSeq = rebuiltUpTo[facetId];
+      facet.lastSeq = 0;
+      facet.open = false;
+    }
+    log.log("replayed", "\"object\":" + quote(historyName) + ",\"records\":" + std::to_string(applied) +
+            ",\"skipped\":" + std::to_string(skipped) + ",\"facets\":" + std::to_string(rebuilt.size()));
+    return std::move(rebuilt);
   }
-  for (const auto& facet : facets) {
-    auto& entry = rebuilt[facet.facetId];
-    entry.facetId = facet.facetId;
-    entry.parentFacetId = facet.parentFacetId;
-    if (!facet.name.empty()) entry.facetName = facet.name;
+  std::map<std::pair<uint64_t, uint64_t>, LogRecord> ordered;
+private:
+  DurableLog& log;
+  RootStorageRef destination;
+  std::string historyName;
+  uint64_t bookkeepingEpoch;
+  std::string staging;
+  std::vector<ManifestFacet> facets;
+  uint64_t snapshotShardEpoch;
+  std::set<std::pair<uint64_t, uint64_t>> drop;
+  std::function<void(const LogRecord&)> beforeWrite;
+  std::map<uint32_t, uint64_t> covered, rebuiltUpTo;
+  std::map<uint32_t, std::unique_ptr<DatabaseReplay>> replays;
+  std::map<uint32_t, Facet> rebuilt;
+  uint64_t applied = 0, skipped = 0;
+};
+std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef& destination,
+    const std::string& historyName, uint64_t bookkeepingEpoch, const std::string& staging,
+    std::vector<LogRecord> history, const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
+    const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite) {
+  ReplayState state(*this, destination, historyName, bookkeepingEpoch, staging, facets, snapshotShardEpoch, drop, std::move(beforeWrite));
+  for (auto& record : history) state.add(std::move(record));
+  for (const auto& [position, record] : state.ordered) state.apply(record);
+  return state.finish();
+}
+kj::Promise<std::map<uint32_t, DurableLog::Facet>> DurableLog::replayToAsync(RootStorageRef destination,
+    std::string historyName, uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
+    std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
+    std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
+    std::function<void()> check) {
+  ReplayState state(*this, std::move(destination), std::move(historyName), bookkeepingEpoch,
+      std::move(staging), std::move(facets), snapshotShardEpoch, std::move(drop), std::move(beforeWrite));
+  size_t batch = 0; auto began = monotonicTimeMs();
+  for (auto& record : history) {
+    state.add(std::move(record));
+    if (++batch >= 128 || monotonicTimeMs() - began >= 5) {
+      co_await timer.afterDelay(1 * kj::MILLISECONDS); check(); batch = 0; began = monotonicTimeMs();
+    }
   }
-  for (auto& [facetId, facet] : rebuilt) {
-    facet.lastFrame = 0;
-    facet.salt1 = 0;
-    facet.salt2 = 0;
-    facet.checkpointedSeq = rebuiltUpTo[facetId];
-    facet.lastSeq = 0;
-    facet.open = false;
+  history.clear();
+  for (const auto& [position, record] : state.ordered) {
+    state.apply(record);
+    if (++batch >= 128 || monotonicTimeMs() - began >= 5) {
+      co_await timer.afterDelay(1 * kj::MILLISECONDS); check(); batch = 0; began = monotonicTimeMs();
+    }
   }
-  log("replayed", "\"object\":" + quote(historyName) + ",\"records\":" + std::to_string(applied) +
-          ",\"skipped\":" + std::to_string(skipped) + ",\"facets\":" + std::to_string(rebuilt.size()));
-  return rebuilt;
+  check(); co_return state.finish();
 }
 
 // The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a

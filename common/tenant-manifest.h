@@ -159,6 +159,9 @@ public:
   ManifestSecret seal(const std::string& aad, const std::string& plaintext, uint64_t setAtUnixMs) const;
   // The plaintext, or none when the record does not open with this key (another key, damaged, or not one).
   std::optional<std::string> open(const std::string& aad, const ManifestSecret& sealed) const;
+  // Only the control plane calls this. Derive a domain-specific subkey and
+  // return its MAC; neither the master key nor the subkey leaves this object.
+  std::string restoreNamespaceId(const std::string& tuple) const;
   // The first 12 hexadecimal digits of SHA-256("coworkerd-secrets-key" || key): which key, never the key.
   const std::string& fingerprint() const { return print; }
 private:

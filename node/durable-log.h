@@ -648,7 +648,8 @@ private:
   void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
   void persistEarlierSeals();
   void cleanupClosedEpoch();
-  kj::Promise<void> dropColdFiles();
+  kj::Promise<void> dropColdFiles(uint64_t reservedBytes = 0);
+  uint64_t seedReservedBytes = 0;
 
   // The object's size from its databases, and the single-object limit judged on it.
   void sized(Object& object);
@@ -708,6 +709,12 @@ private:
       uint64_t bookkeepingEpoch, const std::string& staging, std::vector<LogRecord> history,
       const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
       const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite);
+  class ReplayState;
+  kj::Promise<std::map<uint32_t, Facet>> replayToAsync(RootStorageRef destination, std::string historyName,
+      uint64_t bookkeepingEpoch, std::string staging, std::vector<LogRecord> history,
+      std::vector<ManifestFacet> facets, uint64_t snapshotShardEpoch,
+      std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
+      std::function<void()> check);
   void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;

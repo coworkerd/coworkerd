@@ -8,7 +8,8 @@
 // or the file cowctl.json names (tokenFile), never from the command line. A failure prints one sentence and the control
 // plane's reason (already cleaned there).
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +54,9 @@ usage: cowctl <command> [options]              (in the project's directory)
                               the Worker's console output from every node, merged by time
   do list [--json]            the Worker's Durable Object namespaces
   do inspect <class> [--json] one namespace: its shards, the owner of each shard taken, objects and bytes
+  d1 time-travel info <database> [--timestamp T] [--json]
+     time-travel restore <database> (--bookmark B | --timestamp T) --to NAME [--yes] [--operation-id ID]
+                              preview a published revision, then restore into a new database; the source is unchanged
   d1 create <name> [--no-wait] | list | delete <name> [--yes] [--no-wait]
      execute <name> (--sql SQL [--param V]... | --file FILE [--yes]) [--json]
                               the tenant's databases; execute sends SQL or imports a UTF-8 file in atomic chunks. A created database
@@ -599,9 +603,74 @@ function bytesText(value) {
   return `${scaled.toFixed(scaled < 10 ? 2 : 1)} ${units[unit]}`;
 }
 
+// Resolve once, save the exact bookmark and operation id before starting. A
+// restarted CLI never re-resolves a timestamp against a later publication.
+async function d1TimeTravel(args) {
+  const [action, ...rest] = args;
+  if (!["info", "restore"].includes(action)) throw usage("d1 time-travel info <database> | restore <database> (--bookmark B | --timestamp T) --to NAME");
+  const { options, positional } = parse(rest, { tenant: "value", json: "flag", timestamp: "value", bookmark: "value", to: "value", yes: "flag", "operation-id": "value", "timeout-ms": "value" });
+  if (positional.length !== 1 || !NAME.test(positional[0])) throw usage("time-travel requires one database name");
+  const config = loadConfig(), tenant = tenantOf(options, config), database = positional[0];
+  const path = `${tenantPath(tenant)}/databases/${database}/time-travel`;
+  if (options.timestamp !== undefined) {
+    if (!/^[0-9]+$/.test(options.timestamp) && !/(Z|[+-][0-9]{2}:[0-9]{2})$/i.test(options.timestamp)) throw usage("--timestamp ISO time must include a timezone");
+    const at = /^[0-9]+$/.test(options.timestamp) ? Number(options.timestamp) : Date.parse(options.timestamp);
+    if (!Number.isSafeInteger(at) || at < 0) throw usage("--timestamp must be an ISO time with timezone or Unix milliseconds");
+    options.timestamp = String(at);
+  }
+  if (action === "info") {
+    if (options.bookmark !== undefined || options.to !== undefined || options["operation-id"] !== undefined) throw usage("time-travel info accepts --timestamp");
+    const answer = (await call(config, "GET", `${path}/info${options.timestamp === undefined ? "" : `?timestamp=${options.timestamp}`}`)).json;
+    if (options.json) return show(answer);
+    console.log(`${tenant}/${database}: published revision ${answer.point.revision}, ${new Date(Number(answer.point.writtenAtUnixMs)).toISOString()}`);
+    console.log(`bookmark: ${answer.point.bookmark}`); return;
+  }
+  if (!NAME.test(options.to ?? "") || (options.bookmark === undefined) === (options.timestamp === undefined))
+    throw usage("restore requires --to NAME and exactly one of --bookmark or --timestamp");
+  if (options["operation-id"] !== undefined && !/^[a-zA-Z0-9-]{16,128}$/.test(options["operation-id"])) throw usage("--operation-id must have 16-128 alphanumeric/hyphen characters");
+  const selector = options.bookmark === undefined ? { timestamp: options.timestamp } : { bookmark: options.bookmark };
+  const command = { controlPlane: config.controlPlane, tenant, database, name: options.to, selector, operationId: options["operation-id"] ?? null };
+  const digest = createHash("sha256").update(JSON.stringify(command)).digest("hex");
+  const directory = join(homedir(), ".cowctl", "restore-operations"), file = join(directory, `${digest}.json`);
+  let saved;
+  try { saved = JSON.parse(await readFile(file, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw new Failure(`cannot read restore retry state: ${error.message}`); }
+  if (saved && JSON.stringify(saved.command) !== JSON.stringify(command)) throw new Failure("restore retry state does not match this command");
+  const point = saved?.point ?? (await call(config, "GET", `${path}/info?${options.bookmark === undefined ? `timestamp=${options.timestamp}` : `bookmark=${encodeURIComponent(options.bookmark)}`}`)).json.point;
+  // Human preview always precedes confirmation and the POST, also with --yes.
+  const preview = `restore ${tenant}/${database} to new database ${options.to}: revision ${point.revision}, ${new Date(Number(point.writtenAtUnixMs)).toISOString()}`;
+  if (options.json) console.error(preview); else console.log(preview);
+  if (!options.yes) {
+    if (!process.stdin.isTTY) throw new Failure("confirm this restore with --yes in a non-interactive command");
+    const reply = await prompt("create this restored database? [y/N] ");
+    if (!/^y(es)?$/i.test(reply.trim())) throw new Failure("not restored");
+  }
+  if (!saved) {
+    saved = { command, point, operationId: options["operation-id"] ?? randomUUID() };
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    try { await writeFile(file, JSON.stringify(saved) + "\n", { flag: "wx", mode: 0o600 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; saved = JSON.parse(await readFile(file, "utf8")); }
+  }
+  console.error(`operation id: ${saved.operationId}`);
+  const started = Date.now(), limit = Number(options["timeout-ms"] ?? 600000);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw usage("--timeout-ms must be a positive integer");
+  const submit = async () => (await call(config, "POST", `${path}/restore`, { body: JSON.stringify({ name: options.to, bookmark: saved.point.bookmark, operationId: saved.operationId }), headers: { "content-type": "application/json" } })).json;
+  let answer = await submit();
+  while (answer.phase !== "completed") {
+    if (answer.phase === "failed") throw new Failure(`restore failed: ${answer.node?.errorCode ?? "RESTORE_FAILED"}: ${answer.node?.error ?? "unknown reason"}`);
+    if (Date.now() - started >= limit) throw new Failure(`restore is still pending; rerun this command (operation ${saved.operationId})`);
+    await new Promise(done => setTimeout(done, 200));
+    answer = (await call(config, "GET", `${tenantPath(tenant)}/database-restores/${saved.operationId}`)).json;
+    if (answer.known === false) answer = await submit();
+  }
+  answer.elapsedSeconds = Number(((Date.now() - started) / 1000).toFixed(3));
+  if (options.json) return show(answer);
+  console.log(`database ${tenant}/${answer.database}: restored revision ${answer.point.revision}, ${new Date(Number(answer.point.writtenAtUnixMs)).toISOString()}, ${answer.elapsedSeconds}s`);
+}
+
 // cowctl d1 create|list|delete|execute: the tenant's databases. `execute` goes through the HTTP SQL interface, which
 // takes D1's own request and gives D1's own answer.
 async function d1(args) {
+  if (args[0] === "time-travel") return d1TimeTravel(args.slice(1));
   const [operation, ...rest] = args;
   if (operation === "migrations") return databaseMigrations(rest);
   if (operation === "export") return databaseExport(rest);

@@ -283,7 +283,7 @@ A paginated export compares `total_changes()` and the complete schema at the beg
 the export by default, with instructions to stop writes and retry. This check is **best effort**: an object restart
 resets the connection's counter, and matching endpoints do not prove no writes occurred between them. For a reliable
 backup, stop all writes for the entire export and prevent database-object restarts. `--allow-writes` provides no
-snapshot guarantee. Export does not block writers or offer point-in-time recovery.
+snapshot guarantee. Export does not block writers. For a consistent historical export, first restore into an unbound new database as described below.
 
 An INSERT exceeding **100,000 UTF-8 bytes** is written normally, but the final result and warning count such
 statements by table. Those statements cannot be imported by `cowctl d1 execute --file`; splitting the export into
@@ -325,3 +325,54 @@ be used again in this release.
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
 Database names follow `[a-z0-9][a-z0-9-]{0,62}`: hyphens and a leading digit are supported. A malformed entry in the deployment's database or namespace table is skipped independently; `deployment.invalidNamespaceEntryCount` at the node's state endpoint counts skipped entries.
+
+
+## 11. Restore to a published point
+
+Time travel creates a **new database**. It does not change the source or switch its Bindings; the source can continue
+serving writes. Cloudflare D1 restores in place; Coworkerd deliberately restores under a new name.
+
+```bash
+cowctl d1 time-travel info books
+cowctl d1 time-travel info books --timestamp 2026-11-16T04:00:00Z
+cowctl d1 time-travel restore books --timestamp 2026-11-16T04:00:00Z --to books-restored --yes
+cowctl d1 time-travel restore books --bookmark BOOKMARK --to books-restored --yes
+```
+
+The command displays the resolved revision and its publication time **before** asking for confirmation or starting
+(`--yes` skips the question). `--timestamp` accepts ISO time with timezone or Unix milliseconds. It selects the highest
+published revision whose generation time is no later than T. Writes after that point are absent. Writes before T
+that have not been published can also be absent: the default segment interval is about 30 seconds. A bookmark names
+one exact immutable revision; a bookmark from another database is rejected. A time before all matching history fails;
+a time after the latest publication selects that latest revision. Clocks can differ at an owner takeover: revision
+order wins. The lookup searches revision numbers with exact GETs, splitting owner epochs before searching their times.
+
+The CLI saves its random operation id and **resolved bookmark**, without a credential, under
+`~/.cowctl/restore-operations/`. If interrupted, rerun the same command to resume; `--operation-id ID` can specify a
+stable id explicitly (16–128 letters/digits/hyphens). Keep the saved state when moving a retry to another machine.
+The control plane and nodes keep progress only in memory; after a restart they may answer unknown. Resubmission
+recognizes the already published first snapshot, and registration returns the same database if it already happened.
+A different new operation can use a new `--operation-id`. Reusing an operation with changed parameters is refused while
+its request is cached. If the destination name is taken at the final registration, the restore fails; its unreferenced
+history remains and no database is registered. Deleted database records still count against namespace quota.
+
+History currently never expires. Future reclamation will retain at least the latest **7 days**. This feature is for
+D1 databases only; KV and R2 time travel are unsupported. A target is registered only after its complete first snapshot
+has been verified. Do not bind a database intended as a stable export source:
+
+```bash
+cowctl d1 time-travel restore books --bookmark BOOKMARK --to books-export --yes
+cowctl d1 export books-export --output books-at-bookmark.sql
+```
+
+Leave that new database unbound and do not write to it during export. This uses the existing exporter; there is no
+`export --bookmark` mode.
+
+Each node runs one restore at a time. Retained records for the selected object are limited to **128 MiB of payload**
+and **100,000 records**; other objects in a shared segment do not count. A shared segment's transient decode is
+separately bounded at **384 MiB**, with a total incremental memory budget of **512 MiB**. Snapshot hashing streams data.
+Disk admission first evicts eligible cold cache files, then reserves two images under the node's existing disk limit.
+A resource refusal reports the resource, required amount and limit as `SEED_RESOURCE_LIMIT`; it never truncates
+history or silently chooses a newer point. Name and tenant quotas are checked before work and again at registration.
+`RESTORE_UNAVAILABLE` can be retried with the saved operation and bookmark; a used target returns `SEED_TARGET_IN_USE`
+at the node. A lost SQL reply is still `RESULT_UNCERTAIN` and must not be blindly replayed.

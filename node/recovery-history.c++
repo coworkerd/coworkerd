@@ -16,12 +16,17 @@ void HistoryBudget::memory(uint64_t required) {
   memoryHighWater = std::max(memoryHighWater, required);
   if (required > memoryLimit) { if (refuse) refuse(required, memoryLimit, "memoryBytes"); KJ_FAIL_REQUIRE("recovery memory budget exceeded", required, memoryLimit); }
 }
+void HistoryBudget::transient(uint64_t required) {
+  transientHighWater = std::max(transientHighWater, required);
+  if (required > transientLimit) { if (refuse) refuse(required, transientLimit, "segmentDecodeBytes"); KJ_FAIL_REQUIRE("shared segment decode budget exceeded", required, transientLimit); }
+  memory(payloadBytes + records * (sizeof(LogRecord) * 2 + 192) + required + (16ull << 20));
+}
 void HistoryBudget::add(const LogRecord& record) {
   const uint64_t bytes = record.frameBytes.size() + record.header.size() + record.objectName.size() + record.storageId.size() + record.facetName.size();
   if (++records > recordLimit) { if (refuse) refuse(records, recordLimit, "records"); KJ_FAIL_REQUIRE("recovery record limit exceeded", records, recordLimit); }
   payloadBytes += bytes;
   if (payloadBytes > payloadLimit) { if (refuse) refuse(payloadBytes, payloadLimit, "payloadBytes"); KJ_FAIL_REQUIRE("recovery payload limit exceeded", payloadBytes, payloadLimit); }
-  memory(payloadBytes + records * (sizeof(LogRecord) * 2 + 192) + (256ull << 20));
+  memory(payloadBytes + records * (sizeof(LogRecord) * 2 + 192) + transientHighWater + (16ull << 20));
 }
 FileDigest recoveryFileDigest(const std::filesystem::path& path) {
   const int fd = ::open(path.c_str(), O_RDONLY); KJ_REQUIRE(fd >= 0, "cannot read recovery image");
@@ -35,7 +40,8 @@ FileDigest recoveryFileDigest(const std::filesystem::path& path) {
   constexpr char HEX[] = "0123456789abcdef"; for (auto byte : bytes) { result.sha256 += HEX[byte >> 4]; result.sha256 += HEX[byte & 15]; } return result;
 }
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
-    const std::string& objectName, uint32_t parallelism, HistoryCheck check, HistoryLog log, HistoryBudget* budget) {
+    const std::string& objectName, uint32_t parallelism, HistoryCheck check, HistoryLog log, HistoryBudget* budget, HistoryYield yield) {
+  if (budget) parallelism = 1;
   std::vector<LogRecord> out;
   std::map<uint64_t, std::optional<ShardEpoch>> owners;
   const std::set<std::pair<uint64_t, uint64_t>> exclusions(manifest.isolated.begin(), manifest.isolated.end());
@@ -57,12 +63,13 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
     auto bodies = co_await kj::joinPromises(running.releaseAsArray());
     if (check) check();
     for (size_t i = 0; i < bodies.size(); ++i) {
-      if (budget) budget->memory(budget->payloadBytes + budget->records * (sizeof(LogRecord) + 128) + bodies[i].size() * 4 + (64ull << 20));
+      if (budget) budget->transient(bodies[i].size() * 6);
       std::string error;
       auto contents = decodeSegment(bodies[i], &error);
       KJ_REQUIRE(contents.has_value(), "a segment of a Durable Object's log does not add up", error.c_str());
+      size_t batch = 0;
       for (auto& record : contents->records) {
-        if (budget) budget->add(record);
+        if (yield && ++batch >= 128) { co_await yield(); if (check) check(); batch = 0; }
         if (record.objectName != objectName) continue;
         const auto& header = contents->header;
         const auto& ref = wanted[at + i];
@@ -85,6 +92,7 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
               ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) + "\",\"nodeSeq\":\"" +
               std::to_string(record.nodeSeq) + "\"");
         }
+        if (budget) budget->add(record);
         out.push_back(std::move(record));
       }
     }

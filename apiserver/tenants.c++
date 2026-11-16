@@ -213,6 +213,7 @@ kj::Promise<ApiAnswer> createTenant(ManifestStore& state, std::string text) {
       }
       tenant.createdAtUnixMs = tenant.updatedAtUnixMs = nowMs();
       next.workers.clear();
+      next.databases.clear();
       next.record = tenant;
       co_return;
     }, false);

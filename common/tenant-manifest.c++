@@ -8,6 +8,8 @@
 #include <kj/encoding.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h>
+#include <openssl/crypto.h>
 
 #include <sys/stat.h>
 
@@ -389,6 +391,19 @@ SecretsKey SecretsKey::load(const std::filesystem::path& file) {
   text.assign(text.size(), '0');
   key.print = sha256Hex(std::string("coworkerd-secrets-key") + std::string(reinterpret_cast<const char*>(key.key.data()), 32)).substr(0, 12);
   return key;
+}
+
+std::string SecretsKey::restoreNamespaceId(const std::string& tuple) const {
+  constexpr char RESTORE_DOMAIN[] = "coworkerd/d1-time-travel/namespace/v1";
+  unsigned char child[32], result[32]; unsigned int length = 0;
+  KJ_REQUIRE(HMAC(EVP_sha256(), key.data(), key.size(), reinterpret_cast<const unsigned char*>(RESTORE_DOMAIN),
+      sizeof(RESTORE_DOMAIN) - 1, child, &length) && length == 32, "cannot derive restore namespace key");
+  auto erase = kj::defer([&]() { OPENSSL_cleanse(child, sizeof(child)); });
+  KJ_REQUIRE(HMAC(EVP_sha256(), child, sizeof(child), reinterpret_cast<const unsigned char*>(tuple.data()),
+      tuple.size(), result, &length) && length == 32, "cannot derive restore namespace");
+  std::string out;
+  for (auto byte : result) { out += "0123456789abcdef"[byte >> 4]; out += "0123456789abcdef"[byte & 15]; }
+  return out;
 }
 
 std::string SecretsKey::generateJson() {

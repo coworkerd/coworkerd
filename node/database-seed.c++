@@ -19,12 +19,6 @@ bool identifier(const std::string& text) {
   return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
-uint64_t totalBytes(const std::filesystem::path& root) {
-  uint64_t total = 0; std::error_code error;
-  for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, error), end;
-       !error && it != end; it.increment(error)) if (it->is_regular_file(error)) total += it->file_size(error);
-  KJ_REQUIRE(!error, "cannot account recovery disk bytes"); return total;
-}
 uint64_t indexInteger(capnp::JsonValue::Reader object, const char* field) {
   auto value = json::field(object, field);
   if (!value.isNumber()) return json::integer(object, field);
@@ -74,7 +68,7 @@ std::string DatabaseSeed::Job::json() const {
   return "{\"known\":true,\"input\":" + input.json() + ",\"phase\":" + quote(phase) + ",\"finished\":" +
       (finished ? "true" : "false") + ",\"bytes\":\"" + std::to_string(bytes) + "\",\"records\":\"" + std::to_string(budget.records) +
       "\",\"payloadBytes\":\"" + std::to_string(budget.payloadBytes) + "\",\"memoryBoundBytes\":\"" + std::to_string(budget.memoryHighWater) +
-      "\",\"errorCode\":" + quote(errorCode) + ",\"error\":" + quote(error) + ",\"resource\":" + quote(resource) +
+      "\",\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + ",\"errorCode\":" + quote(errorCode) + ",\"error\":" + quote(error) + ",\"resource\":" + quote(resource) +
       ",\"required\":\"" + std::to_string(required) + "\",\"limit\":\"" + std::to_string(limit) + "\",\"result\":" + (result.empty() ? "null" : result) + "}";
 }
 DatabaseSeed::DatabaseSeed(DurableLog& log, DurableShards& shards, std::function<bool(const std::string&)> registered)
@@ -92,8 +86,12 @@ kj::Promise<ShardRoute> DatabaseSeed::route(const std::string& namespaceId) {
 std::string DatabaseSeed::start(DatabaseSeedInput input, const ShardRoute& owner) {
   KJ_REQUIRE(owner.kind == ShardRoute::Kind::LOCAL && log.enabled(), "database seed requires the current target owner and object store");
   if (auto found = jobs.find(input.namespaceId); found != jobs.end()) {
-    KJ_REQUIRE(found->second->input.json() == input.json(), "destination already has a different seed request");
-    if (!found->second->finished || found->second->phase == "completed") return found->second->json();
+    if (!found->second->finished) {
+      KJ_REQUIRE(found->second->input.json() == input.json(), "destination already has a different seed request");
+      return found->second->json();
+    }
+    // Even a cached success must check immutable history again: the database
+    // may have been used since it was seeded. A failed job may use a new B.
     jobs.erase(found);
   }
   KJ_REQUIRE(!running, "another database seed is in progress on this node");
@@ -106,14 +104,33 @@ std::string DatabaseSeed::start(DatabaseSeedInput input, const ShardRoute& owner
     job->required = required; job->limit = limit; job->resource = resource; job->errorCode = "SEED_RESOURCE_LIMIT";
   };
   jobs[job->input.namespaceId] = job; running = job;
+  tasks.add(measureLoop(job));
   tasks.add(run(job).then([this, job]() { job->finished = true; running.reset(); }, [this, job](kj::Exception&& error) {
     job->phase = "failed"; job->finished = true; if (job->errorCode.empty()) job->errorCode = isStorageFailure(error) ? "STORAGE_UNAVAILABLE" : "SEED_FAILED";
     job->error = error.getDescription().cStr(); running.reset();
   }));
   return job->json();
 }
-std::string DatabaseSeed::progress(const std::string& namespaceId) const {
-  auto found = jobs.find(namespaceId); return found == jobs.end() ? "{\"known\":false}" : found->second->json();
+kj::Promise<std::string> DatabaseSeed::progress(std::string namespaceId) {
+  KJ_REQUIRE(identifier(namespaceId), "invalid destination namespace");
+  auto found = jobs.find(namespaceId);
+  if (found == jobs.end()) co_return "{\"known\":false}";
+  auto job = found->second;
+  if (job->phase == "completed") {
+    auto next = co_await log.store->get(objectManifestKey(namespaceId, job->input.objectId, 2));
+    requireStorage(next.status == 200 || next.status == 404, "cannot check whether the target is already in use");
+    if (next.status == 200) {
+      job->phase = "failed"; job->errorCode = "SEED_TARGET_IN_USE"; job->error = "destination already exists and is in use";
+    }
+  }
+  co_return job->json();
+}
+kj::Promise<void> DatabaseSeed::measureLoop(std::shared_ptr<Job> job) {
+  while (!job->finished) {
+    const auto began = monotonicTimeMs();
+    co_await log.timer.afterDelay(5 * kj::MILLISECONDS);
+    job->maxLoopDelayMs = std::max(job->maxLoopDelayMs, monotonicTimeMs() - began - 5);
+  }
 }
 void DatabaseSeed::taskFailed(kj::Exception&&) {}
 void DatabaseSeed::check(const Job& job) const {
@@ -123,25 +140,18 @@ void DatabaseSeed::check(const Job& job) const {
       "destination ownership changed during database seed");
 }
 void DatabaseSeed::disk(Job& job, uint64_t imageBytes) const {
-  auto used = totalBytes(log.settings.stackDirectory / "do");
-  const auto ref = makeRootStorageRef(job.input.namespaceId, job.input.objectId, job.owner.dataEpoch);
-  const auto staging = ".seed-" + std::to_string(job.nodeEpoch) + "-" + std::to_string(job.owner.epoch);
-  uint64_t temporary = 0;
-  for (const auto& suffix : {staging, staging + "-verify"}) {
-    auto path = ref.databasePath(log.settings.stackDirectory, 0, "", suffix);
-    if (std::filesystem::exists(path)) temporary += std::filesystem::file_size(path);
-  }
-  used -= std::min(used, temporary);
   const uint64_t reservation = imageBytes > UINT64_MAX / 2 ? UINT64_MAX : imageBytes * 2;
-  const auto available = std::filesystem::space(log.settings.stackDirectory).available;
-  if (reservation > log.diskLimitBytes || used > log.diskLimitBytes - reservation || reservation - std::min(reservation, temporary) > available) {
-    job.errorCode = "SEED_RESOURCE_LIMIT"; job.resource = "diskBytes"; job.required = used + reservation;
-    job.limit = std::min(log.diskLimitBytes, used + available); KJ_FAIL_REQUIRE("database seed disk budget exceeded", job.required, job.limit);
+  if (reservation > log.diskLimitBytes || job.diskBase > log.diskLimitBytes - reservation || reservation > job.availableBytes) {
+    job.errorCode = "SEED_RESOURCE_LIMIT"; job.resource = "diskBytes";
+    job.required = job.diskBase > UINT64_MAX - reservation ? UINT64_MAX : job.diskBase + reservation;
+    job.limit = std::min(log.diskLimitBytes, job.diskBase + job.availableBytes);
+    KJ_FAIL_REQUIRE("database seed disk budget exceeded", job.required, job.limit);
   }
+
 }
 
 kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
-  const auto input = job->input; auto checkOwner = [this, job]() { check(*job); if (job->imageBytes) disk(*job, job->imageBytes); }; checkOwner();
+  const auto input = job->input; auto checkOwner = [this, job]() { check(*job); }; checkOwner();
   HistoryGet get = [this, job, checkOwner](std::string key) -> kj::Promise<ObjectResponse> {
     checkOwner(); auto response = co_await log.store->get(std::move(key)); checkOwner(); job->bytes += response.bytes.size(); co_return response;
   };
@@ -159,28 +169,43 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
     std::filesystem::remove(destination.databasePath(log.settings.stackDirectory, 0, "", staging), ignored);
     std::filesystem::remove(destination.databasePath(log.settings.stackDirectory, 0, "", verifying), ignored);
   });
-  uint64_t imageBytes = source.snapshotBytes; job->imageBytes = imageBytes; disk(*job, imageBytes);
+  auto used = co_await get(objectManifestKey(input.namespaceId, input.objectId, 2));
+  requireStorage(used.status == 200 || used.status == 404, "cannot check target use");
+  if (used.status == 200) { job->errorCode = "SEED_TARGET_IN_USE"; KJ_FAIL_REQUIRE("destination already exists and is in use"); }
+  job->phase = "reading-segments";
+  auto records = co_await readRecoverySegments(get, source, input.sourceNamespace + "/" + input.sourceObject,
+      1, checkOwner, {}, &job->budget, [this]() { return log.timer.afterDelay(1 * kj::MILLISECONDS); }); checkOwner();
+  uint64_t imageBytes = source.snapshotBytes;
+  for (const auto& record : records) KJ_REQUIRE(record.facetId == 0, "source history is not a root database");
+  // Reserve before writing. The base is the cleaner's accounting (logs plus
+  // tracked database/WAL files), sampled once after evicting eligible cold files.
+  for (const auto& record : records) {
+    const auto page = record.pageSize;
+    if (record.kind != LogRecordKind::FRAMES || !page) continue;
+    for (size_t at = 0; at + 8 <= record.frameBytes.size(); at += uint64_t(page) + 24) {
+      const auto* bytes = reinterpret_cast<const unsigned char*>(record.frameBytes.data() + at);
+      auto big = [](const unsigned char* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; };
+      imageBytes = std::max(imageBytes, uint64_t(std::max(big(bytes), big(bytes + 4))) * page);
+    }
+  }
+  // A previous interrupted attempt may have left these two exact staging paths.
+  for (const auto& suffix : {staging, verifying}) {
+    std::error_code error; std::filesystem::remove(destination.databasePath(log.settings.stackDirectory, 0, "", suffix), error);
+    KJ_REQUIRE(!error, "cannot remove prior seed staging");
+  }
+  const auto reservation = imageBytes > UINT64_MAX / 2 ? UINT64_MAX : imageBytes * 2;
+  co_await log.dropColdFiles(reservation); checkOwner();
+  job->diskBase = log.diskUsedBytes; job->availableBytes = std::filesystem::space(log.settings.stackDirectory).available;
+  job->imageBytes = imageBytes; disk(*job, imageBytes);
+  log.seedReservedBytes = reservation; auto releaseDisk = kj::defer([&]() { log.seedReservedBytes = 0; });
   if (source.hasSnapshot) {
     auto index = co_await get(objectSnapshotIndexKey(source.namespaceId, source.objectId, source.snapshotSequence));
     KJ_REQUIRE(index.status == 200, "frozen source snapshot index is missing"); const auto partBytes = sourcePartBytes(index.bytes, source);
     job->phase = "downloading"; co_await downloadRecoverySnapshot(get, source, destination, log.settings.stackDirectory, staging, partBytes, 1, checkOwner); checkOwner();
   }
-  job->phase = "reading-segments"; auto records = co_await readRecoverySegments(get, source, input.sourceNamespace + "/" + input.sourceObject,
-      1, checkOwner, {}, &job->budget); checkOwner();
-  for (const auto& record : records) KJ_REQUIRE(record.facetId == 0, "source history is not a root database");
-  auto beforeWrite = [&](const LogRecord& record) {
-    const auto page = record.pageSize;
-    if (record.kind == LogRecordKind::FRAMES && page) {
-      for (size_t at = 0; at + 8 <= record.frameBytes.size(); at += uint64_t(page) + 24) {
-        const auto* bytes = reinterpret_cast<const unsigned char*>(record.frameBytes.data() + at);
-        auto big = [](const unsigned char* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; };
-        imageBytes = std::max(imageBytes, uint64_t(std::max(big(bytes), big(bytes + 4))) * page);
-      }
-    }
-    job->imageBytes = imageBytes; disk(*job, imageBytes);
-  };
-  job->phase = "replaying"; auto replayed = log.replayTo(destination, input.sourceNamespace + "/" + input.sourceObject, source.shardEpoch,
-      staging, std::move(records), source.facets, source.snapshotShardEpoch, {source.isolated.begin(), source.isolated.end()}, beforeWrite);
+  job->phase = "replaying";
+  auto replayed = co_await log.replayToAsync(destination, input.sourceNamespace + "/" + input.sourceObject, source.shardEpoch,
+      staging, std::move(records), source.facets, source.snapshotShardEpoch, {source.isolated.begin(), source.isolated.end()}, {}, checkOwner);
   const auto path = destination.databasePath(log.settings.stackDirectory, 0, "", staging);
   if (!std::filesystem::exists(path)) { const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600); KJ_REQUIRE(fd >= 0, "cannot create empty seed image"); ::close(fd); }
   const auto expected = recoveryFileDigest(path); job->imageBytes = expected.bytes; disk(*job, expected.bytes); checkOwner();
@@ -240,6 +265,7 @@ kj::Promise<void> DatabaseSeedService::request(kj::HttpMethod method, kj::String
       payload.assign(bytes.cStr(), bytes.size()); input = DatabaseSeedInput::parse(payload); namespaceId = input.namespaceId;
     } else if (method == kj::HttpMethod::GET && path.starts_with(std::string(PREFIX) + "progress/")) namespaceId = path.substr(std::string(PREFIX).size() + 9);
     else { co_await answer(response, 404, "{\"code\":\"NOT_FOUND\"}"); co_return; }
+    if (method == kj::HttpMethod::GET) { co_await answer(response, 200, co_await seed.progress(namespaceId)); co_return; }
     auto owner = co_await seed.route(namespaceId);
     if (owner.kind == ShardRoute::Kind::REFUSE) { co_await answer(response, owner.status, "{\"code\":" + quote(owner.code) + ",\"reason\":" + quote(owner.reason) + "}"); co_return; }
     if (owner.kind == ShardRoute::Kind::FORWARD) {
@@ -251,7 +277,7 @@ kj::Promise<void> DatabaseSeedService::request(kj::HttpMethod method, kj::String
       if (!payload.empty()) co_await call.body->write(kj::arrayPtr(reinterpret_cast<const kj::byte*>(payload.data()), payload.size()));
       call.body = nullptr; auto back = co_await call.response; auto text = co_await back.body->readAllText(65537); co_await answer(response, back.statusCode, std::string(text.cStr(), text.size())); co_return;
     }
-    co_await answer(response, method == kj::HttpMethod::POST ? 202 : 200, method == kj::HttpMethod::POST ? seed.start(std::move(input), owner) : seed.progress(namespaceId)); co_return;
+    co_await answer(response, method == kj::HttpMethod::POST ? 202 : 200, seed.start(std::move(input), owner)); co_return;
   } catch (const kj::Exception& failure) { error = failure.getDescription().cStr(); }
   co_await answer(response, 409, "{\"code\":\"SEED_REFUSED\",\"reason\":" + quote(error) + "}");
 }
