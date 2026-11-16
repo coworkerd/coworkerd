@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 08:48:49 +0800
+Date: Mon, 16 Nov 2026 09:29:24 +0800
 Subject: [PATCH] Load roots with bounded lifecycle cleanup and private
  per-event preparation
 
@@ -418,7 +418,7 @@ index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad4033228
  bool frankenvalue_is_empty(const Frankenvalue& value);
  kj::Own<Frankenvalue> frankenvalue_new();
 diff --git a/src/workerd/server/server/actor.rs b/src/workerd/server/server/actor.rs
-index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eecca461cb0 100644
+index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..fc9336a6317362f517d05a7e528e4336bec78f75 100644
 --- a/src/workerd/server/server/actor.rs
 +++ b/src/workerd/server/server/actor.rs
 @@ -21,6 +21,7 @@
@@ -1048,7 +1048,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eec
 +            .unwrap_or_default();
 +        async move {
 +            futures::future::join_all(closing).await;
-         }
++        }
 +        .boxed_local()
 +    }
 +
@@ -1114,7 +1114,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eec
 +        let actor = self.actors.borrow().get(key).cloned();
 +        if let Some(actor) = actor {
 +            actor.evict_tree_if_running(true).await?;
-+        }
+         }
 +        Ok(())
 +    }
 +
@@ -1612,7 +1612,7 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eec
      }
  }
  
-@@ -2617,6 +3244,39 @@ impl Drop for Client {
+@@ -2617,6 +3244,51 @@ impl Drop for Client {
  }
  
  /// A stub's channel to an actor.
@@ -1637,7 +1637,19 @@ index 99cf8c776f8dd70cfcf5b9ab255ff41b56e8f17d..4543d92b30d7cad789eb371b2f568eec
 +    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
 +        let client = Client(Rc::clone(&self.container.0));
 +        let nonce = self.nonce.clone();
++        client.require_root_not_retiring().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
 +        client.require_not_broken().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
++        if let Some(ns) = client.namespace.upgrade() { ns.ensure_cleanup_loop(); }
++        let running = if client.retirement.borrow().is_none()
++            && client.pending_class().is_none()
++            && client.class().map_err(|error| crate::root_loader::preparation_error(&nonce, error))?.request_ready()
++        {
++            client.actor.borrow().clone()
++        } else { None };
++        if let Some(actor) = running {
++            return client.request_on(metadata, &actor)
++                .map_err(|error| crate::root_loader::preparation_error(&nonce, error));
++        }
 +        Ok(PromisedInterface::new(async move {
 +            let actor = client.get_actor().await
 +                .map_err(|error| crate::root_loader::preparation_error(&nonce, error))?;
