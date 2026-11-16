@@ -872,7 +872,11 @@ function __coworkerdEnvOf(variables, props) {
 export default class extends WorkerEntrypoint {
   fetch(request) {
     const variables = this.env, ctx = this.ctx;
-    if (ctx.props.trial === true) return __coworkerdTrial(${root ? "__coworkerdRootTrialNamespace" : "tenant"}, true, ctx.props.entrypoint, ctx.props.classes);
+    if (ctx.props.trial === true) {
+      const namespace = ctx.props.rootTrial === true ? { ...tenant,
+        ...Object.fromEntries(${JSON.stringify(classes)}.map(name => [name, __coworkerdDurableClass(tenant, name)])) } : tenant;
+      return __coworkerdTrial(namespace, true, ctx.props.entrypoint, ctx.props.classes);
+    }
     const entrypoint = ctx.props.entrypoint;
     const env = __coworkerdEnvOf(variables, ctx.props);
     return withEnv(env, () => {
@@ -1452,7 +1456,6 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   if (base?.kind !== "tenant" || !Array.isArray(base.namespaces) || base.namespaces.length ||
       descriptor.rootSelection?.kind !== "plain" || descriptor.rootSelection.dispatchChecked !== true)
     throw new Error("Missing trusted ordinary worker plan");
-  if (options.rootTrial) base = {...base, versionFingerprint: base.versionFingerprint + ":root-trial"};
   const cacheKey = JSON.stringify([base.workerId, base.versionId, base.versionFingerprint,
     base.creationRecord?.generation ?? 0, base.creationRecord?.cpuLimitMs, base.creationRecord?.memoryLimitMib]);
   const nonce = crypto.randomUUID();
@@ -1460,7 +1463,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     plan: item.plan, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
     activePlan: !options.rootTrial && descriptor.rootSelection.activePlan === true,
-    trial: options.trial === true, classes: descriptor.durableObjectClasses ?? []}));
+    trial: options.trial === true, rootTrial: options.rootTrial === true, classes: descriptor.durableObjectClasses ?? []}));
   const remember = item => {
     plainPlanKeys.delete(cacheKey); plainPlanKeys.set(cacheKey, item);
     if (plainPlanKeys.size > MAX_ROOT_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
@@ -1494,7 +1497,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     let reply = await manage("lookup", base);
     if (reply.plan === null || reply.info?.loaded !== true) {
       let code;
-      try {code = await makeWorkerCode(descriptor, env, ctx, options.rootTrial === true);}
+      try {code = await makeWorkerCode(descriptor, env, ctx);}
       catch (error) {throw staged(stageOf(error), error);}
       const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
       reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
