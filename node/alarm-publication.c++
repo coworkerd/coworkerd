@@ -141,8 +141,11 @@ uint32_t AlarmPublication::retry(uint32_t& failures) {
   return std::min<uint32_t>(5000, base + random % std::max<uint32_t>(1, base / 4));
 }
 void AlarmPublication::failure(const char* operation, bool denied) {
+  if (denied) {
+    ++markerDenials;if (markerDenied) return;
+    markerDenied = true;nextMarkerProbe = monotonicTimeMs() + 30000;
+  }
   if (operation) ++failuresToLog;
-  if (denied) { ++markerDenials;markerDenied = true;nextMarkerProbe = monotonicTimeMs() + 30000; }
   if (!failuresToLog || monotonicTimeMs() < nextFailureLog) return;
   const auto count = failuresToLog;failuresToLog = 0;nextFailureLog = monotonicTimeMs() + 1000;++failureLogLines;
   log("alarm-publication-failures", "\"count\":" + std::to_string(count) + ",\"operation\":" + json::quote(operation ? operation : "merged") + ",\"markerAccessDenied\":" + (markerDenied ? "true" : "false"));
@@ -300,7 +303,10 @@ kj::Promise<void> AlarmPublication::scanMarkers(std::string key) {
 }
 kj::Promise<void> AlarmPublication::probeMarkers() {
   auto release = kj::defer([this]() { --active;--activeMarkers;pump(); });++markerProbes;
-  try { co_await store.listPage("alarm-wake/by-owner/" + nodeId + "/", 1);Scope measured(*this);markerDenied = false;++markerGeneration; }
+  try {
+    co_await store.listPage("alarm-wake/by-owner/" + nodeId + "/", 1);Scope measured(*this);markerDenied = false;++markerGeneration;
+    log("alarm-marker-access-restored", "\"denials\":" + std::to_string(markerDenials));
+  }
   catch (const kj::Exception& error) { Scope measured(*this);failure("marker-probe", accessDenied(error)); }
   nextMarkerProbe = monotonicTimeMs() + 30000;
 }
