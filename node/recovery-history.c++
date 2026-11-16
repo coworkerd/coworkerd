@@ -47,12 +47,11 @@ kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& pat
   auto* digest = EVP_MD_CTX_new(); KJ_REQUIRE(digest && EVP_DigestInit_ex(digest, EVP_sha256(), nullptr) == 1, "cannot hash recovery image");
   auto release = kj::defer([&]() { EVP_MD_CTX_free(digest); });
   std::array<unsigned char, 65536> block; FileDigest result;
-  uint64_t batch = 0; auto began = monotonicTimeMs();
+  auto began = monotonicTimeMs();
   for (;;) { auto n = ::read(fd, block.data(), block.size()); if (n < 0 && errno == EINTR) continue; KJ_REQUIRE(n >= 0, "cannot read recovery image"); if (!n) break;
     result.bytes += n; KJ_REQUIRE(EVP_DigestUpdate(digest, block.data(), size_t(n)) == 1, "cannot hash recovery image");
-    batch += n;
-    if (yield && (batch >= (1u << 20) || monotonicTimeMs() - began >= 2)) {
-      co_await yield(); if (check) check(); batch = 0; began = monotonicTimeMs();
+    if (yield && monotonicTimeMs() - began >= 2) {
+      co_await yield(); if (check) check(); began = monotonicTimeMs();
     }
   }
   if (check) check();
