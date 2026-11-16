@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 10:36:08 +0800
+Date: Mon, 16 Nov 2026 11:36:31 +0800
 Subject: [PATCH] Load roots with counted plan references and bounded
  management replies
 
@@ -285,7 +285,7 @@ index 7a55fe69b6a0272691c76dd02170a41f265b4ae2..3c607e13c0d2a8d9b2b00d00184f7534
    auto info = co_await (*start)();
    co_await info.ensureAllResolved();
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index bcd603003a4440a8cb5da97b5a683449b6b641af..248a05149e2c71e580d47bdd06a5ea7398d3ffd1 100644
+index bcd603003a4440a8cb5da97b5a683449b6b641af..1522b2038e382322bfc4847214fad78236e02529 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -1276,6 +1276,9 @@ kj::Own<RequestMetadata> new_request_metadata(
@@ -408,7 +408,7 @@ index bcd603003a4440a8cb5da97b5a683449b6b641af..248a05149e2c71e580d47bdd06a5ea73
        [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
            v8::Local<v8::Object> ctxExports) {
      impl->ctxExportsHandle = lock.v8Ref(ctxExports);
-@@ -1912,7 +1960,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+@@ -1912,11 +1960,13 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
      }
    },
        IsolateObserver::StartType::COLD, SpanParent(nullptr),
@@ -416,7 +416,15 @@ index bcd603003a4440a8cb5da97b5a683449b6b641af..248a05149e2c71e580d47bdd06a5ea73
 +      Worker::Lock::TakeSynchronously(kj::none), errorReporter); });
    timing.worker = api::BenchTiming::now() - workerStart;
  
-   worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
+-  worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
+-      [&](Worker::Lock& lock) { lock.validateHandlers(errorReporter); });
++  rootStartup([&]() {
++    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
++        [&](Worker::Lock& lock) { lock.validateHandlers(errorReporter); });
++  });
+   timing.total = api::BenchTiming::now() - startTime;
+ 
+   impl->info = WorkerInfo{
 diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
 index 9bd0cd5c7de6f0336e4e027d6550e76fb014da18..2455067e59c8529bbdd1f47ad40332287b9983fb 100644
 --- a/src/workerd/server/factory/worker-factory.h

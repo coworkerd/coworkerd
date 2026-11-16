@@ -2351,7 +2351,10 @@ public:
     desiredState.reload();
   }
   void trackRootNamespace(const std::string& id) {
-    if (rootNamespaces.insert(id).second) ++rootNamespaceEpoch;
+    if (rootNamespaces.insert(id).second) {
+      ++rootNamespaceEpoch;
+      if (const auto owner = desiredState.state().namespaceOwner(id)) rootNamespaceTenants[id] = owner->tenant;
+    }
   }
   std::shared_ptr<const std::vector<std::string>> rootMaintenanceRequest() {
     const auto catalog = desiredState.state().namespaceEpoch();
@@ -2362,7 +2365,9 @@ public:
       auto ids = std::make_shared<std::vector<std::string>>();
       for (const auto& id : rootNamespaces) {
         const auto owner = desiredState.state().namespaceOwner(id);
-        if (owner && (owner->status == "deleting" || tenantDeleting(owner->tenant))) ids->push_back(id);
+        const auto remembered = rootNamespaceTenants.find(id);
+        const auto tenant = owner ? owner->tenant : remembered != rootNamespaceTenants.end() ? remembered->second : std::string();
+        if ((owner && owner->status == "deleting") || (!tenant.empty() && tenantDeleting(tenant))) ids->push_back(id);
       }
       rootMaintenanceList = std::move(ids);
       rootMaintenanceCatalog = catalog;rootMaintenanceTenants = tenantEpoch;
@@ -2372,7 +2377,9 @@ public:
     return rootMaintenanceList;
   }
   void rootsMaintained(const std::vector<std::string>& ids) {
-    for (const auto& id : ids) if (rootNamespaces.erase(id)) ++rootNamespaceEpoch;
+    for (const auto& id : ids) if (rootNamespaces.erase(id)) {
+      rootNamespaceTenants.erase(id);++rootNamespaceEpoch;
+    }
   }
 
   std::string deploymentJson() const {
@@ -2919,6 +2926,7 @@ private:
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
   std::set<std::string> rootNamespaces;
+  std::unordered_map<std::string, std::string> rootNamespaceTenants;
   uint64_t rootNamespaceEpoch = 0, rootMaintenanceCatalog = 0, rootMaintenanceRevision = 0,
       rootMaintenanceTenants = 0, rootMaintenanceTracked = 0;
   std::shared_ptr<const std::vector<std::string>> rootMaintenanceList;
