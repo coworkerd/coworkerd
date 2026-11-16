@@ -358,7 +358,8 @@ void AlarmPublication::tick() {
   if (!shards.empty() && now >= nextHintCheck) {
     Shard* oldest = nullptr;
     for (auto& [key, s]: shards)
-      if (s.adopted && !s.reading && (!oldest || s.checked < oldest->checked)) oldest = &s;
+      if (s.adopted && !s.reading && (!s.hints.empty() || !s.desired.empty() || !s.marker.empty()) &&
+          (!oldest || s.checked < oldest->checked)) oldest = &s;
     if (oldest) { oldest->adopted = false;oldest->next = 0;oldest->order = ++serial; }
     nextHintCheck = now + std::max(200.0, 3600000.0 / shards.size());
   }
@@ -374,7 +375,8 @@ std::string AlarmPublication::json() const {
   uint64_t bytes = 0;double oldest = 0;
   for (const auto& [key, w]: writes)
     bytes += sizeof(Write) + key.capacity() + w.key.capacity() + w.ns.capacity() + w.object.capacity() + w.tenant.capacity();
-  for (const auto& [key, s]: shards) oldest = std::max(oldest, monotonicTimeMs() - s.checked);
+  for (const auto& [key, s]: shards)
+    if (!s.hints.empty() || !s.desired.empty() || !s.marker.empty()) oldest = std::max(oldest, monotonicTimeMs() - s.checked);
   std::ostringstream out;
   out << "\"publicationPending\":" << writes.size() << ",\"publicationInFlight\":" << active
       << ",\"publicationPeakPending\":" << peakPending << ",\"publicationBytes\":" << bytes
