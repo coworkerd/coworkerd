@@ -56,11 +56,11 @@ double AlarmPublication::Metric::percentile(unsigned percent) const {
   }
   return 0;
 }
-AlarmPublication::Scope::Scope(AlarmPublication& owner, Metric* metric): owner(owner), metric(metric), started(nanoTime()) {
+AlarmPublication::Scope::Scope(AlarmPublication& owner, Metric* metric): owner(owner), metric(metric), started(metric || !owner.cpuDepth ? nanoTime() : 0) {
   if (!owner.cpuDepth++) { owner.cpuStarted = started;if (owner.measureThreadCpu) owner.threadCpuStarted = threadTime(); }
 }
 AlarmPublication::Scope::~Scope() {
-  const auto now = nanoTime();if (metric) metric->add(now - started);if (!--owner.cpuDepth) { owner.cpuNs += now - owner.cpuStarted;if (owner.measureThreadCpu) owner.threadCpuNs += threadTime() - owner.threadCpuStarted; }
+  const auto now = metric || owner.cpuDepth == 1 ? nanoTime() : 0;if (metric) metric->add(now - started);if (!--owner.cpuDepth) { owner.cpuNs += now - owner.cpuStarted;if (owner.measureThreadCpu) owner.threadCpuNs += threadTime() - owner.threadCpuStarted; }
 }
 
 bool AlarmPublication::Gate::available(double now) const { return disabled || !open || (!probing && now >= next); }
