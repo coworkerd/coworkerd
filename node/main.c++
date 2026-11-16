@@ -2367,7 +2367,8 @@ public:
         const auto owner = desiredState.state().namespaceOwner(id);
         const auto remembered = rootNamespaceTenants.find(id);
         const auto tenant = owner ? owner->tenant : remembered != rootNamespaceTenants.end() ? remembered->second : std::string();
-        if ((owner && owner->status == "deleting") || (!tenant.empty() && tenantDeleting(tenant))) ids->push_back(id);
+        if ((owner && owner->status == "deleting") || (!tenant.empty() &&
+            (tenantDeleting(tenant) || (tenants && tenants->removedFromCatalog(tenant))))) ids->push_back(id);
       }
       rootMaintenanceList = std::move(ids);
       rootMaintenanceCatalog = catalog;rootMaintenanceTenants = tenantEpoch;
