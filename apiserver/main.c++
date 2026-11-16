@@ -2,6 +2,7 @@
 // API and, as its internal subcommand `tool`, the deployment tool.
 #include "config.h"
 #include "control.h"
+#include "database-seed-tool.h"
 #include "deployment.h"
 #include "json.h"
 #include "log-cleaning.h"
@@ -1707,6 +1708,7 @@ int main(int argc, char** argv) {
     // The deployment tool (`tool`), kept for the tests and for this daemon.
     kj::UnixEventPort::captureSignal(SIGTERM);
     kj::UnixEventPort::captureSignal(SIGINT);
+    if (args.size() >= 2 && args[1] == "database-register") return coworkerd::runDatabaseSeedRegister(argc - 3, argv + 3);
     if (args.size() >= 2 && args[1] == "rotate") return coworkerd::runRotationTool(argc - 3, argv + 3);
     if (args.size() >= 2 && args[1] == "drain") return runDrainTool(argc - 3, argv + 3);
     if (args.size() >= 2) return coworkerd::runDeploymentTool(argc - 2, argv + 2);

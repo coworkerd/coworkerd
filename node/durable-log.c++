@@ -1,4 +1,5 @@
 #include "durable-log.h"
+#include "recovery-history.h"
 #include "durable-shards.h"
 
 #include "memory-observation.h"
@@ -4133,104 +4134,22 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
 kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
     const std::string& staging) {
-  const auto partBytes = settings.config.snapshotPartBytes;
-  for (const auto& facet : manifest.facets) {
-    const auto path = databasePath(ref, facet.facetId, "", staging);
-    std::error_code code;
-    std::filesystem::create_directories(path.parent_path(), code);
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    KJ_REQUIRE(fd >= 0, "cannot write a Durable Object database", path.string().c_str());
-    const auto close = kj::defer([fd]() { ::close(fd); });
-    kj::Vector<kj::Promise<void>> running;
-    for (uint64_t part = 0; part < facet.parts; ++part) {
-      running.add(downloadSnapshotPart(manifest, facet.facetId, part, fd, off_t(part * partBytes)));
-      if (running.size() >= settings.config.recoverParallelism) {
-        co_await kj::joinPromises(running.releaseAsArray());
-        running.clear();
-      }
-    }
-    if (running.size() > 0) co_await kj::joinPromises(running.releaseAsArray());
-    KJ_REQUIRE(::fsync(fd) == 0, "cannot synchronize a Durable Object snapshot", path.string().c_str());
-    // The file must be the one the snapshot names: a wrong digest would be read as the object's state.
-    const auto bytes = readFile(path);
-    KJ_REQUIRE(bytes.size() == facet.bytes && sha256Hex(bytes) == facet.sha256,
-        "a snapshot of a Durable Object does not add up", path.string().c_str(), facet.bytes, bytes.size());
-  }
-  co_return;
+  return downloadRecoverySnapshot([this](std::string key) { return store->get(std::move(key)); }, manifest,
+      ref, settings.stackDirectory, staging, settings.config.snapshotPartBytes, settings.config.recoverParallelism);
 }
 
 kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part,
     int fd, off_t offset) {
-  const auto key = objectSnapshotPartKey(manifest.namespaceId, manifest.objectId, manifest.snapshotSequence, facetId,
-      part);
-  auto object = co_await store->get(key);
-  KJ_REQUIRE(object.status == 200, "a part of a Durable Object's snapshot is not on the store", key.c_str(),
-      object.status);
-  size_t written = 0;
-  while (written < object.bytes.size()) {
-    auto wrote = ::pwrite(fd, object.bytes.data() + written, object.bytes.size() - written, offset + off_t(written));
-    if (wrote < 0 && errno == EINTR) continue;
-    KJ_REQUIRE(wrote > 0, "cannot write a part of a Durable Object's snapshot");
-    written += size_t(wrote);
-  }
-  co_return;
+  return downloadRecoveryPart([this](std::string key) { return store->get(std::move(key)); }, manifest, facetId,
+      part, fd, offset);
 }
 
 // The segments a manifest names, in order, at most recoverParallelism downloads at a time; only the records of this
 // object are kept.
 kj::Promise<std::vector<LogRecord>> DurableLog::readSegments(const ObjectManifest& manifest,
-    const std::string& objectName) {  // the object in the history: "<namespace>/<object>" 
-  std::vector<LogRecord> out;
-  std::map<uint64_t, std::optional<ShardEpoch>> owners;
-  const std::set<std::pair<uint64_t, uint64_t>> exclusions(manifest.isolated.begin(), manifest.isolated.end());
-  std::vector<ManifestSegment> wanted = manifest.segments;
-  std::sort(wanted.begin(), wanted.end(), [](const ManifestSegment& a, const ManifestSegment& b) {
-    return std::tie(a.shardEpoch, a.nodeEpoch, a.segment) < std::tie(b.shardEpoch, b.nodeEpoch, b.segment);
-  });
-  for (size_t at = 0; at < wanted.size();) {
-    kj::Vector<kj::Promise<std::string>> running;
-    const size_t until = std::min<size_t>(wanted.size(), at + settings.config.recoverParallelism);
-    for (size_t i = at; i < until; ++i) {
-      const auto key = nodeSegmentKey(wanted[i].nodeId, wanted[i].nodeEpoch, wanted[i].segment);
-      running.add(store->get(key).then([key](ObjectResponse response) {
-        KJ_REQUIRE(response.status == 200, "a segment of a Durable Object's log is not on the store", key.c_str(),
-            response.status);
-        return std::move(response.bytes);
-      }));
-    }
-    auto bodies = co_await kj::joinPromises(running.releaseAsArray());
-    for (size_t i = 0; i < bodies.size(); ++i) {
-      std::string error;
-      auto contents = decodeSegment(bodies[i], &error);
-      KJ_REQUIRE(contents.has_value(), "a segment of a Durable Object's log does not add up", error.c_str());
-      for (auto& record : contents->records) {
-        if (record.objectName != objectName) continue;
-        const auto& header = contents->header;
-        const auto& ref = wanted[at + i];
-        if (exclusions.contains({record.shardEpoch, record.nodeSeq}) && header.reason != "earlier-epoch" &&
-            header.reason != "recovery-tail" && header.nodeId == ref.nodeId &&
-            header.nodeEpoch == ref.nodeEpoch && header.segment == ref.segment) {
-          auto [owner, fresh] = owners.try_emplace(record.shardEpoch);
-          if (fresh) {
-            auto response = co_await store->get(shardEpochKey(manifest.namespaceId, record.shard, record.shardEpoch));
-            requireStorage(response.status == 200, "an excluded record's original shard owner is unavailable");
-            owner->second = parseShardEpoch(response.bytes);
-            requireStorage(owner->second && owner->second->namespaceId == manifest.namespaceId &&
-                owner->second->shard == record.shard && owner->second->epoch == record.shardEpoch,
-                "an excluded record's original shard owner is invalid");
-          }
-          record.ownerSealed = owner->second && owner->second->nodeId == header.nodeId &&
-              owner->second->nodeEpoch == header.nodeEpoch && record.nodeEpoch == header.nodeEpoch;
-          if (record.ownerSealed) log("foreign-isolation-ignored", "\"object\":" + quote(objectName) +
-              ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) + "\",\"nodeSeq\":\"" +
-              std::to_string(record.nodeSeq) + "\"");
-        }
-        out.push_back(std::move(record));
-      }
-    }
-    at = until;
-  }
-  co_return out;
+    const std::string& objectName) {
+  return readRecoverySegments([this](std::string key) { return store->get(std::move(key)); }, manifest, objectName,
+      settings.config.recoverParallelism, {}, [this](const std::string& event, const std::string& fields) { log(event, fields); });
 }
 
 void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch) {
@@ -4803,7 +4722,7 @@ kj::Promise<void> DurableLog::publishRecovery(std::string objectName, const std:
 
 // A bounded recovery fixes the exact history the object will serve. The
 // existing snapshot shard epoch is its durable cut; no recovery field is added.
-kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool healing, bool local) {
+kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool healing, bool local, std::string staging, std::function<void()> validate) {
   auto* object = objectOf(objectName);
   const auto state = local ? ObjectState::LOCAL : ObjectState::REBUILDING;
   KJ_REQUIRE(object != nullptr && object->state == state && !object->snapshotting,
@@ -4823,6 +4742,7 @@ kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool
     if (entry != nullptr) entry->snapshotting = false;
   });
   auto check = [&]() {
+    if (validate) validate();
     auto* entry = objectOf(objectName);
     KJ_REQUIRE(entry != nullptr && entry->state == state && entry->dataEpoch == dataEpoch &&
         entry->shardEpoch == targetEpoch && nodeEpoch == publishingEpoch && entry->snapshotVersion == version,
@@ -4836,14 +4756,17 @@ kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool
   auto exact = [&](std::string key, std::string bytes) -> kj::Promise<bool> {
     check();
     auto result = co_await store->create(key, bytes);
+    check();
     if (result.created) co_return true;
     auto back = co_await store->get(key);
+    check();
     requireStorage(back.status == 200, "an existing recovery snapshot object could not be verified");
     co_return back.bytes == bytes;
   };
   // Orphaned parts from interrupted attempts also reserve their sequence.
   const auto prefix = objectPrefix(namespaceId, objectId) + "snapshot/";
   auto listing = co_await store->list(prefix);
+  check();
   uint64_t sequence = object->snapshotSequence;
   for (const auto& listed : listing.objects) {
     const auto rest = listed.key.substr(prefix.size());
@@ -4861,7 +4784,7 @@ kj::Promise<void> DurableLog::forceRecoverySnapshot(std::string objectName, bool
     bool conflict = false;
     for (const auto& [facetId, facet] : selected) {
       if (facet.deleted) continue;
-      const auto path = databasePath(storage, facetId);
+      const auto path = databasePath(storage, facetId, "", staging);
       const int fd = ::open(path.c_str(), O_RDONLY);
       KJ_REQUIRE(fd >= 0, "a facet required by the recovery snapshot cannot be opened", path.string().c_str());
       const auto close = kj::defer([fd]() { ::close(fd); });
@@ -4977,6 +4900,14 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
     const Object& object, const std::string& staging, std::vector<LogRecord> history,
     const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
     const std::set<std::pair<uint64_t, uint64_t>>& drop) {
+  return replayTo(object, object.objectName, object.shardEpoch, staging, std::move(history), facets,
+      snapshotShardEpoch, drop, {});
+}
+
+std::map<uint32_t, DurableLog::Facet> DurableLog::replayTo(const RootStorageRef& destination,
+    const std::string& historyName, uint64_t bookkeepingEpoch, const std::string& staging,
+    std::vector<LogRecord> history, const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
+    const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite) {
   // A shard's epoch belongs to one owner and grows with every takeover, so (shard epoch, node sequence) is both the
   // order the transactions were written in and the identity of a record: a record that came from a segment and from
   // a peer is applied once.
@@ -4988,7 +4919,7 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
   std::map<uint32_t, uint64_t> covered;  // facet -> the sequence of the snapshot's shard epoch it already holds
   for (const auto& facet : facets) covered[facet.facetId] = facet.upToSeq;
   std::map<uint32_t, uint64_t> rebuiltUpTo;
-  if (snapshotShardEpoch == object.shardEpoch) rebuiltUpTo = covered;
+  if (snapshotShardEpoch == bookkeepingEpoch) rebuiltUpTo = covered;
   std::map<uint32_t, std::unique_ptr<DatabaseReplay>> replays;
   std::map<uint32_t, Facet> rebuilt;
   uint64_t applied = 0, skipped = 0;
@@ -5003,27 +4934,28 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
     auto& replay = replays[record.facetId];
     if (!replay) {
       // A facet the snapshot brought goes on from its file; one it did not starts from nothing.
-      replay = std::make_unique<DatabaseReplay>(databasePath(object, record.facetId, "", staging),
+      replay = std::make_unique<DatabaseReplay>(databasePath(destination, record.facetId, "", staging),
           covered.find(record.facetId) == covered.end());
     }
+    if (beforeWrite) beforeWrite(record);
     std::string error;
     if (!replay->apply(record, &error)) {
       // The records of an object are a chain: one that does not follow the last means the history is not whole, and
       // an object is never served with less of it than it had. The rebuild fails and the request gets an answer it
       // can act on.
       ++replayStops;
-      log("replay-stopped", "\"object\":" + quote(object.objectName) + ",\"facet\":" +
+      log("replay-stopped", "\"object\":" + quote(historyName) + ",\"facet\":" +
               std::to_string(record.facetId) + ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) +
               "\",\"nodeSeq\":\"" + std::to_string(record.nodeSeq) + "\",\"applied\":" + std::to_string(applied) +
               ",\"records\":" + std::to_string(ordered.size()) + ",\"reason\":" + quote(error));
       for (auto& [facetId, entry] : replays) {
         if (entry) entry->finish();
       }
-      KJ_FAIL_REQUIRE("the replicated history of a Durable Object is not whole", object.objectName.c_str(),
+      KJ_FAIL_REQUIRE("the replicated history of a Durable Object is not whole", historyName.c_str(),
           record.nodeSeq, error.c_str());
     }
     ++applied;
-    if (record.shardEpoch == object.shardEpoch)
+    if (record.shardEpoch == bookkeepingEpoch)
       rebuiltUpTo[record.facetId] = std::max(rebuiltUpTo[record.facetId], record.nodeSeq);
     auto& facet = rebuilt[record.facetId];
     facet.facetId = record.facetId;
@@ -5035,7 +4967,7 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
   }
   for (auto& [facetId, replay] : replays) {
     if (replay) KJ_REQUIRE(replay->finish(), "cannot synchronize a rebuilt Durable Object database",
-        databasePath(object, facetId, "", staging).string().c_str());
+        databasePath(destination, facetId, "", staging).string().c_str());
   }
   for (const auto& facet : facets) {
     auto& entry = rebuilt[facet.facetId];
@@ -5051,7 +4983,7 @@ std::map<uint32_t, DurableLog::Facet> DurableLog::applyRecords(
     facet.lastSeq = 0;
     facet.open = false;
   }
-  log("replayed", "\"object\":" + quote(object.objectName) + ",\"records\":" + std::to_string(applied) +
+  log("replayed", "\"object\":" + quote(historyName) + ",\"records\":" + std::to_string(applied) +
           ",\"skipped\":" + std::to_string(skipped) + ",\"facets\":" + std::to_string(rebuilt.size()));
   return rebuilt;
 }

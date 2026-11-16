@@ -108,6 +108,8 @@ add_executable(coworkerd
   node/membership.c++
   node/durable-shards.c++
   node/durable-log.c++
+  node/recovery-history.c++
+  node/database-seed.c++
   node/root-objects.c++
   node/bundle-cache.c++
   node/desired-state.c++
@@ -124,6 +126,7 @@ target_link_libraries(coworkerd PRIVATE common kj-tls-local)
 
 add_executable(coworkerd-apiserver
   apiserver/main.c++
+  apiserver/database-seed-tool.c++
   apiserver/deployment-tool.c++
   apiserver/manifests.c++
   apiserver/tenants.c++

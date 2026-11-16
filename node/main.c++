@@ -7,6 +7,7 @@
 #include "support.h"
 #include "membership.h"
 #include "durable-log.h"
+#include "database-seed.h"
 #include "durable-shards.h"
 #include "object-state.h"
 #include "deployment.h"
@@ -8545,11 +8546,17 @@ int run(Launch launch) {
       },
       workerLogs, [&server, &peerForwarder]() { return server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()); },
       peerAuth, controlPlane);
+  coworkerd::DatabaseSeed databaseSeed(durableLog, shards,
+      [&server](const std::string& ns) { return server.namespaceOwner(ns).has_value(); });
+  coworkerd::DatabaseSeedService seedPeer(peerRpc, databaseSeed, io.provider->getNetwork(), timer, *headerTable,
+      [&server](kj::StringPtr path, const kj::HttpHeaders& headers) {
+        return server.managementTokenSet() && server.managementRefusal(path, headers).empty();
+      });
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
   kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
-  kj::HttpServer peerServer(timer, *headerTable, peerRpc);
+  kj::HttpServer peerServer(timer, *headerTable, seedPeer);
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
   kj::HttpServer egressServer(timer, *headerTable, egress);
 
