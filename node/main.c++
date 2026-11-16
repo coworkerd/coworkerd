@@ -1676,6 +1676,9 @@ public:
     const auto evict = serverConfig.processPool.idleEvictMs;
     return evict > 0 ? std::min<double>(evict, serverConfig.idleMs) : serverConfig.idleMs;
   }
+  std::string loadRevision(const VersionDefinition& version) const {
+    return version.definitionHash + ":" + coworkerd::plainEnvironmentRevision(desiredState.state(), version);
+  }
   static std::string loadKey(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
     return process.processId + ":" + std::to_string(process.generation) + ":" + hash + "#" + (entrypoint.empty() ? "default" : entrypoint);
   }
@@ -1741,7 +1744,7 @@ public:
     // dispatch refuses.
     auto process = runtime.select(version->workerId);
     if (!process) co_return LoadCheck{};
-    auto key = loadKey(*process, version->definitionHash, entrypoint);
+    auto key = loadKey(*process, loadRevision(*version), entrypoint);
     if (auto found = loadConfirmed.find(key); found != loadConfirmed.end() && monotonicTimeMs() - found->second <= loadCheckFreshMs())
       co_return LoadCheck{};
     LoadCheck result;
@@ -1803,7 +1806,7 @@ public:
       if (!limitWithoutEvidence || attempt > 0) break;
       process = runtime.select(version->workerId);
       if (!process) break;
-      key = loadKey(*process, version->definitionHash, entrypoint);
+      key = loadKey(*process, loadRevision(*version), entrypoint);
     }
     if (!category.empty()) {
       auto [secrets, variables] = trialRedactions(*version);
@@ -2805,7 +2808,9 @@ private:
         for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
       }
       capnp::JsonCodec json;
-      return json.encode(descriptor.asReader());
+      const coworkerd::VersionPins emptyPins;
+      const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB);
+      return kj::str(plain.descriptor(json.encode(descriptor.asReader()).cStr()).c_str());
     }
     // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
     // isolate first), and its Durable Object namespace Bindings, with this node's view of each class's namespace: a
@@ -2885,7 +2890,10 @@ private:
       bindings[index].setEntrypoint(version.bindings[index].entrypoint.c_str());
     }
     capnp::JsonCodec json;
-    return json.encode(descriptor.asReader());
+    const coworkerd::VersionPins emptyPins;
+    const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
+        bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB);
+    return kj::str(plain.descriptor(json.encode(descriptor.asReader()).cStr()).c_str());
   }
 
   void addLease(std::string invocationId, InvocationLeaseState state) {
@@ -7357,7 +7365,7 @@ private:
             if (kind == "class" || kind == "object") {
               verdict.message = "the default export serves fetch (" + kind + ")";
               // The isolate stays for the next call; the load check before it need not load again.
-              server.confirmLoaded(*process, version->definitionHash, "");
+              server.confirmLoaded(*process, server.loadRevision(*version), "");
             }
             else if (flag("hasDefault")) verdict = {"ENTRYPOINT_MISSING", "", "the default export has no fetch handler"};
             else if (request.routed) verdict = {"ENTRYPOINT_MISSING", "", "there is no default export, and the Worker has routes"};

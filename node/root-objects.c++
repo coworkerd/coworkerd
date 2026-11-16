@@ -105,6 +105,17 @@ std::string rootLoaderService(bool durable, const std::string& storageDirectory)
       json::quote(durable ? storageDirectory : "") + ")),\n";
 }
 
+std::string plainEnvironmentRevision(const DeploymentState& catalog, const VersionDefinition& version) {
+  std::ostringstream revisions;
+  for (const auto& value : version.variables)
+    revisions << json::quote(value.name) << ':' << json::quote(value.type) << ':' << json::quote(value.value) << ',';
+  for (const auto& name : version.secrets) {
+    const auto* value = catalog.secret(version.workerId, name);
+    revisions << json::quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
+  }
+  return sha256Hex(revisions.str());
+}
+
 RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
     const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib) {
   using json::quote;
@@ -113,7 +124,7 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
   auto target = [&](const std::string& entrypoint, const std::string& props) {
     return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
   };
-  std::ostringstream plan;
+  std::ostringstream plan, services, objects;
   plan << "{\"kind\":\"tenant\",\"tenant\":" << quote(tenant)
       << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
       << ",\"compatibilityDate\":" << quote(version.compatibilityDate)
@@ -126,40 +137,45 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
       << ",\"streamingTail\":" << target("TenantLog", identity) << ",\"serviceBindings\":[";
   bool first = true;
   for (const auto& binding : version.bindings) {
-    const auto resolved = binding.assets ? versionPin(version) : pins.at(binding.workerId);
-    const auto props = "{\"workerId\":"+quote(resolved.workerId)+",\"versionId\":"+quote(resolved.versionId)+
-        ",\"contentHash\":"+quote(resolved.contentHash)+",\"definitionHash\":"+quote(resolved.definitionHash)+
+    const auto props = "{\"workerId\":"+quote(binding.assets ? version.workerId : binding.workerId)+
         ",\"entrypoint\":"+quote(binding.entrypoint)+(binding.assets ? ",\"assets\":true}" : "}");
     plan << (first ? "" : ",") << "{\"metadata\":{\"name\":" << quote(binding.name)
         << "},\"target\":" << target("BoundWorker", props) << '}';
+    // Trials do not dispatch bindings and may not have acquired a call-tree lease yet.
+    auto resolved = binding.assets ? std::optional<VersionPin>(versionPin(version)) :
+        pins.contains(binding.workerId) ? std::optional<VersionPin>(pins.at(binding.workerId)) : std::nullopt;
+    if (resolved) {
+      if (services.tellp() > 0) services << ',';
+      services << quote(binding.name) << ":{\"workerId\":" << quote(resolved->workerId)
+          << ",\"versionId\":" << quote(resolved->versionId) << ",\"contentHash\":" << quote(resolved->contentHash)
+          << ",\"definitionHash\":" << quote(resolved->definitionHash) << '}';
+    }
     first = false;
   }
   plan << "],\"durableObjects\":[";first = true;
   for (const auto& binding : version.durableObjects) {
+    const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
+        ",\"database\":"+quote(binding.database)+'}';
+    const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
+        ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
+        ",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
+    plan << (first ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":" << target("DurableNamespace", props) << '}';
     const auto* value = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
         : catalog.database(tenant, binding.database);
     const auto ns = value && value->status == "active" ? value->id : "";
     const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
-    const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
-        ",\"namespaceId\":"+quote(ns)+",\"database\":"+quote(binding.database)+",\"objectId\":"+quote(id)+'}';
-    const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
-        ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
-        ",\"namespaceId\":"+quote(ns)+",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
-    plan << (first ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":" << target("DurableNamespace", props) << '}';
+    objects << (first ? "" : ",") << quote(binding.binding) << ":{\"namespaceId\":" << quote(ns)
+        << ",\"objectId\":" << quote(id) << '}';
     first = false;
   }
   plan << ']';
-  std::ostringstream revisions;
-  for (const auto& value : version.variables) revisions << quote(value.name) << ':' << quote(value.type) << ':' << quote(value.value) << ',';
-  for (const auto& name : version.secrets) {
-    const auto* value = catalog.secret(version.workerId, name);
-    revisions << quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
-  }
-  plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+sha256Hex(plan.str()+revisions.str())) << '}';
+  plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
+      sha256Hex(plan.str()+plainEnvironmentRevision(catalog, version))) << '}';
   const auto* active = catalog.worker(version.workerId);
   const bool current = active && active->valid && active->versionId == version.versionId && active->definitionHash == version.definitionHash;
   return RootDispatch{plan.str(), "{\"kind\":\"plain\",\"dispatchChecked\":true,\"catalogGeneration\":"+
-      std::to_string(catalog.generation())+",\"activePlan\":"+(current ? "true}" : "false}")};
+      std::to_string(catalog.generation())+",\"activePlan\":"+(current ? "true" : "false")+
+      ",\"serviceVersions\":{"+services.str()+"},\"durableObjectBindings\":{"+objects.str()+"}}"};
 }
 
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,

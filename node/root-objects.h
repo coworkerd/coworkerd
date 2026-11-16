@@ -41,6 +41,8 @@ struct RootDispatch {
   std::string descriptor(std::string encoded) const;
 };
 
+std::string plainEnvironmentRevision(const DeploymentState& catalog, const VersionDefinition& version);
+
 RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
     const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib);
 

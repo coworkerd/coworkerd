@@ -1355,34 +1355,26 @@ const loaderKey = (descriptor) =>
 async function trialLoad(descriptor, env, ctx) {
   const started = performance.now();
   let coldLoad = false, stage = "load", codeStage = null;
-  const worker = env.LOADER.get(loaderKey(descriptor), async () => {
-    coldLoad = true;
-    try { return await makeWorkerCode(descriptor, env, ctx); } catch (error) { stage = "code"; codeStage = stageOf(error); throw error; }
-  }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
   let report;
   try {
-    const props = descriptor.format === "v2" ? { trial: true, entrypoint: descriptor.entrypoint || "default",
-      classes: descriptor.durableObjectClasses ?? [] } : { [TRIAL_PROP]: true };
     // The identity the CPU and memory limits attribute this entry to, as for a call.
     const cf = { nodeId: descriptor.serverId, serverId: descriptor.serverId, processId: env.PROCESS_ID,
       processGeneration: Number(env.PROCESS_GENERATION),
       workerId: descriptor.workerId, versionId: descriptor.versionId, contentHash: descriptor.contentHash,
       invocationId: descriptor.invocationId, treeId: descriptor.treeId };
-    report = await (await worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch("http://coworkerd-trial/", { cf })).json();
+    const selected = await selectedPlain(descriptor, env, ctx, {trial: true});
+    coldLoad = selected.claimCold();
+    report = await (await selected.fetcher.fetch("http://coworkerd-trial/", {cf})).json();
     if (report.ok && descriptor.loadCheck !== true && descriptor.format === "v2" &&
         (descriptor.durableObjectClasses ?? []).length && report.durableObjectClasses?.every(value => value.usable)) {
-      const rootWorker = env.LOADER.get(loaderKey(descriptor) + "#root-trial", async () => {
-        coldLoad = true;
-        try { return await makeWorkerCode(descriptor, env, ctx, true); }
-        catch (error) { stage = "code"; codeStage = stageOf(error); throw error; }
-      }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0,
-        cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
-      const rootReport = await (await rootWorker.getEntrypoint(undefined, invocationOptions(descriptor, props))
-        .fetch("http://coworkerd-root-trial/", { cf })).json();
+      const selectedRootTrial = await selectedPlain(descriptor, env, ctx, {trial: true, rootTrial: true});
+      coldLoad = selectedRootTrial.claimCold() || coldLoad;
+      const rootReport = await (await selectedRootTrial.fetcher.fetch("http://coworkerd-root-trial/", {cf})).json();
       if (!rootReport.ok) report = { ...rootReport, durableObjectClasses: report.durableObjectClasses };
       report.rootBridgeChecked = true;
     }
   } catch (error) {
+    if (typeof error?.coworkerdStage === "string") {stage = "code"; codeStage = stageOf(error);}
     report = { ok: false, stage, codeStage, name: typeof error?.name === "string" ? error.name : typeof error,
       message: typeof error?.message === "string" ? error.message : String(error) };
   }
@@ -1446,54 +1438,77 @@ const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
 const plainPlanKeys = new Map();
 
-// Private preparation only. Production fetch/RPC/trial dispatch keeps its Loader call sites.
-async function selectedPlain(descriptor, env, ctx) {
-  const base = descriptor.rootPlan;
+const plainColdLoads = new Map();
+// Preparation may be cancelled. Claim the cold observation only at actual dispatch.
+function claimPlainCold(item) {
+  if (plainColdLoads.get(item.plan) === item.generation) return false;
+  plainColdLoads.delete(item.plan); plainColdLoads.set(item.plan, item.generation);
+  if (plainColdLoads.size > MAX_ROOT_PLAN_KEYS) plainColdLoads.delete(plainColdLoads.keys().next().value);
+  return item.cold === true;
+}
+
+async function selectedPlain(descriptor, env, ctx, options = {}) {
+  let base = descriptor.rootPlan;
   if (base?.kind !== "tenant" || !Array.isArray(base.namespaces) || base.namespaces.length ||
       descriptor.rootSelection?.kind !== "plain" || descriptor.rootSelection.dispatchChecked !== true)
     throw new Error("Missing trusted ordinary worker plan");
+  if (options.rootTrial) base = {...base, versionFingerprint: base.versionFingerprint + ":root-trial"};
   const cacheKey = JSON.stringify([base.workerId, base.versionId, base.versionFingerprint,
     base.creationRecord?.generation ?? 0, base.creationRecord?.cpuLimitMs, base.creationRecord?.memoryLimitMib]);
   const nonce = crypto.randomUUID();
-  const select = item => env.ROOTS.getPlain(JSON.stringify({kind: "plain", plan: item.plan,
-    dispatchChecked: true, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
+  const select = item => env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
+    plan: item.plan, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
-    catalogGeneration: descriptor.rootSelection.catalogGeneration ?? 0, activePlan: descriptor.rootSelection.activePlan === true}));
+    activePlan: !options.rootTrial && descriptor.rootSelection.activePlan === true,
+    trial: options.trial === true, classes: descriptor.durableObjectClasses ?? []}));
   const remember = item => {
     plainPlanKeys.delete(cacheKey); plainPlanKeys.set(cacheKey, item);
     if (plainPlanKeys.size > MAX_ROOT_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
     return item;
   };
+  const chosen = async item => ({fetcher: await select(item), generation: item.generation,
+    cold: item.cold === true, claimCold: () => claimPlainCold(item)});
+  const missing = error => rootPreparationKind(error, nonce) === "plan-missing";
   let item = plainPlanKeys.get(cacheKey);
   if (item) {
-    try {return {fetcher: await select(remember(item)), generation: item.generation, cold: false};}
-    catch (error) {
-      if (rootPreparationKind(error, nonce) !== "plan-missing") throw error;
-      plainPlanKeys.delete(cacheKey);
-    }
+    try {return await chosen(remember(item));}
+    catch (error) {if (!missing(error)) throw error; plainPlanKeys.delete(cacheKey);}
   }
   const manage = async (path, deployment) => {
-    const response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
-    const reply = await response.json();
-    if (!response.ok) throw new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
+    let response, reply;
+    try {
+      response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
+      reply = await response.json();
+    } catch (error) {throw staged("package", rootManagementFailure(error));}
+    if (!response.ok) {
+      const error = new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
+      if (reply?.error?.kind === "tenant-code") {rootTenantCodeErrors.add(error); throw error;}
+      throw staged("package", rootManagementFailure(error, reply?.error?.kind === "plan-missing"));
+    }
     if (typeof reply?.plan !== "string" && !(path === "lookup" && reply?.plan === null))
-      throw new Error("Invalid ordinary plan reply");
+      throw staged("package", rootManagementFailure(new Error("Invalid ordinary plan reply")));
     return reply;
   };
-  // Every caller owns its I/O. Native install coalesces compilation independently of caller cancellation.
-  let reply = await manage("lookup", base), compiled = false;
-  if (reply.plan === null || reply.info?.loaded !== true) {
-    const code = await makeWorkerCode(descriptor, env, ctx);
-    const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
-    reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
-      compatibilityFlags: code.compatibilityFlags, environment: code.env,
-      modules: names.map(name => rootModule(name, code.modules[name]))});
-    compiled = reply.info?.cold === true;
+  // Only preparation is repeated. No event has been delivered on either attempt.
+  for (let attempt = 0; attempt < 2; ++attempt) {
+    let reply = await manage("lookup", base);
+    if (reply.plan === null || reply.info?.loaded !== true) {
+      let code;
+      try {code = await makeWorkerCode(descriptor, env, ctx, options.rootTrial === true);}
+      catch (error) {throw staged(stageOf(error), error);}
+      const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+      reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
+        compatibilityFlags: code.compatibilityFlags, environment: code.env,
+        startupIdentity: JSON.stringify({workerId: descriptor.workerId, versionId: descriptor.versionId,
+          invocationId: descriptor.invocationId}),
+        modules: names.map(name => rootModule(name, code.modules[name]))});
+    }
+    if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
+      throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
+    item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
+    try {return await chosen(item);}
+    catch (error) {plainPlanKeys.delete(cacheKey);if (!missing(error) || attempt) throw error;}
   }
-  if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
-    throw new Error("Ordinary instance is not ready");
-  item = remember({plan: reply.plan, generation: reply.info.generation});
-  return {fetcher: await select(item), generation: item.generation, cold: compiled};
 }
 
 async function selectedRoot(descriptor, env, ctx, preparationNonce) {
@@ -1646,8 +1661,9 @@ async function rpcEntrypoint(value, env, ctx) {
         ": " + reason.slice(0, 300));
     }
   }
-  const worker = env.LOADER.get(loaderKey(descriptor), () => makeWorkerCode(descriptor, env, ctx), { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
-  return worker.getEntrypoint(undefined, invocationOptions(descriptor, callProps(descriptor, ctx))).__coworkerdRpcTarget;
+  const selected = await selectedPlain(descriptor, env, ctx);
+  selected.claimCold();
+  return selected.fetcher.__coworkerdRpcTarget;
 }
 
 async function serve(request, env, ctx) {
@@ -1671,22 +1687,15 @@ async function serve(request, env, ctx) {
   // A request to an object uses its namespace, public id and data epoch on the shard owner's durable process.
   if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
-  const key = loaderKey(descriptor);
-  let coldStart = false;
-  // The load check before this dispatch loaded the version for this call: its cold start.
-  if (descriptor.coldLoaded === true) coldStart = true;
-  const worker = env.LOADER.get(key, async () => {
-    coldStart = true;
-    return makeWorkerCode(descriptor, env, ctx);
-  }, { coworkerdWorker: { workerId: descriptor.workerId, versionId: descriptor.versionId, generation: 0, cpuLimitMs: descriptor.cpuLimitMs ?? 0, memoryLimitMiB: descriptor.memoryLimitMiB ?? 0 } });
-  const props = callProps(descriptor, ctx);
+  const selected = await selectedPlain(descriptor, env, ctx);
+  const coldStart = selected.claimCold() || descriptor.coldLoaded === true;
   if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
-  return worker.getEntrypoint(undefined, invocationOptions(descriptor, props)).fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
+  return selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
     console.log("[runtime-execution] " + JSON.stringify({
       serverId: descriptor.serverId, processId: env.PROCESS_ID,
       processGeneration: Number(env.PROCESS_GENERATION), invocationId: descriptor.invocationId,
       treeId: descriptor.treeId, target: `${descriptor.workerId}@${descriptor.versionId}`,
-      coldStart, observedAtUnixMs: Date.now(),
+      coldStart, loadGeneration: selected.generation, observedAtUnixMs: Date.now(),
       ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
     }));
   });

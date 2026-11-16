@@ -41,6 +41,11 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0027-stateless-dispatch.patch": frozenset({
+        "src/workerd/server/server/root_loader.rs",
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/worker.rs",
+    }),
     "0026-plain-entry-review.patch": frozenset({
         "src/workerd/server/server/root_loader.rs",
     }),
