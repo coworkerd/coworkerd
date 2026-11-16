@@ -401,6 +401,7 @@ public:
   bool enabled() const { return settings.objectStore && store.has_value(); }
 
 private:
+  friend class DatabaseSeed;
   // One database of one object as this node's log knows it.
   struct Facet {
     uint32_t facetId = 0, parentFacetId = 0;
@@ -696,12 +697,17 @@ private:
   kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, uint64_t snapshotShardEpoch, double startedMs);
   void noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch);
   kj::Promise<void> publishRecovery(std::string objectName, const std::vector<LogRecord>& records);
-  kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false);
+  kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false,
+      std::string staging = {}, std::function<void()> validate = {});
   kj::Promise<void> healLoop();
   kj::Promise<void> retireFencedTails(Object& object, const ObjectManifest& manifest);
   std::map<uint32_t, Facet> applyRecords(const Object& object, const std::string& staging,
       std::vector<LogRecord> records, const std::vector<ManifestFacet>& facets,
       uint64_t snapshotShardEpoch, const std::set<std::pair<uint64_t, uint64_t>>& drop);
+  std::map<uint32_t, Facet> replayTo(const RootStorageRef& destination, const std::string& historyName,
+      uint64_t bookkeepingEpoch, const std::string& staging, std::vector<LogRecord> history,
+      const std::vector<ManifestFacet>& facets, uint64_t snapshotShardEpoch,
+      const std::set<std::pair<uint64_t, uint64_t>>& drop, std::function<void(const LogRecord&)> beforeWrite);
   void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;
