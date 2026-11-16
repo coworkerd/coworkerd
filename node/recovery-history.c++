@@ -17,7 +17,7 @@
 namespace coworkerd {
 using json::quote;
 namespace {
-constexpr uint32_t RECOVERY_SYNC_THREADS = 8;
+constexpr uint32_t RECOVERY_SYNC_THREADS = 128;
 auto recoverySyncThreads = std::make_shared<std::atomic<uint32_t>>(0);
 struct SegmentDecodeResult { std::optional<SegmentContents> contents; std::string error; };
 kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {

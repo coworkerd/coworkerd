@@ -154,12 +154,14 @@ All operations use the existing tenant authorization. The source must be an acti
   Exceeding this returns 422 `HISTORY_READ_LIMIT`; retry the same request to continue from cached owner intervals.
   A revision is fetched at most once per request. The control plane retains up to 64 library caches, each with 256
   immutable revision records, 128 owner boundaries and 16 unfinished timestamp searches. Deletion/recreation invalidates
-  the cache; restart or eviction starts afresh. A bookmark needs at most one GET.
+  the cache; restart or eviction starts afresh. Eviction first selects the requesting tenant's own oldest cache.
+  Continuation checkpoints are saved only after an owner interval has been excluded. A bookmark needs at most one GET.
 - `POST /v1/tenants/{tenant}/databases/{database}/time-travel/restore` takes
   `{name,operationId,bookmark}` or `{name,operationId,timestamp:"<Unix-ms>"}`.
   It prechecks name/quota and starts the target owner. An existing manifest 1 with no manifest 2 goes directly to
   full content verification and registration without restarting node materialization. It returns `{known:true,operationId,phase:"started",point}`
-  or the completed answer below. `operationId` is a client-generated random 16–128-character alphanumeric/hyphen id.
+  or the completed answer below. Concurrent starts for an operation already verifying its target return `phase:"registering"`.
+  `operationId` is a client-generated random 16–128-character alphanumeric/hyphen id.
   Additional caller-supplied namespace ids are never used.
 - `GET /v1/tenants/{tenant}/database-restores/{operationId}` returns `{known:false}` after memory state is lost,
   or `{known:true,operationId,phase,point,node}` while working. A node failure has `phase:"failed"`, with

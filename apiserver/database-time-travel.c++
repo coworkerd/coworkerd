@@ -144,7 +144,11 @@ std::shared_ptr<DatabaseTimeTravel::HistoryCache> DatabaseTimeTravel::historyCac
   }
   histories.erase(key);
   if (histories.size() >= 64) {
-    auto oldest = std::min_element(histories.begin(), histories.end(), [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
+    auto oldest = histories.end();
+    for (auto it = histories.begin(); it != histories.end(); ++it) {
+      if (it->second->tenant == tenant && (oldest == histories.end() || it->second->touched < oldest->second->touched)) oldest = it;
+    }
+    if (oldest == histories.end()) oldest = std::min_element(histories.begin(), histories.end(), [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
     histories.erase(oldest);
   }
   auto entry = std::make_shared<HistoryCache>(); entry->tenant = tenant; entry->database = database;
@@ -215,13 +219,9 @@ kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string n
   auto found = cache->searches.find(at);
   if (found != cache->searches.end() && found->second->latestEpoch == latest.shardEpoch) progress = found->second;
   else {
-    if (cache->searches.size() >= 16) {
-      auto oldest = std::min_element(cache->searches.begin(), cache->searches.end(),
-          [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
-      cache->searches.erase(oldest);
-    }
+    if (found != cache->searches.end()) cache->searches.erase(found);
     progress = std::make_shared<LookupProgress>(); progress->nextEnd = latest.revision;
-    progress->latestEpoch = latest.shardEpoch; cache->searches[at] = progress;
+    progress->latestEpoch = latest.shardEpoch;
   }
   progress->touched = ++historyClock;
   auto finished = [&]() { auto it = cache->searches.find(at); if (it != cache->searches.end() && it->second == progress) cache->searches.erase(it); };
@@ -251,6 +251,16 @@ kj::Promise<DatabaseTimeTravel::Point> DatabaseTimeTravel::resolve(std::string n
       finished(); co_return chosen;
     }
     end = start - 1; progress->nextEnd = std::min(progress->nextEnd, end);
+    // Publish a checkpoint only after excluding an entire owner interval.
+    // A failed/cancelled initial read must not hide newer revisions on retry.
+    if (cache->lastKnown && cache->lastKnown->shardEpoch == progress->latestEpoch && !cache->searches.contains(at)) {
+      if (cache->searches.size() >= 16) {
+        auto oldest = std::min_element(cache->searches.begin(), cache->searches.end(),
+            [](const auto& a, const auto& b) { return a.second->touched < b.second->touched; });
+        cache->searches.erase(oldest);
+      }
+      cache->searches[at] = progress;
+    }
   }
   finished();
   refuse(422, "HISTORY_BEFORE_FIRST", "the requested time precedes the first matching published revision");
@@ -393,12 +403,17 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string
       intent = old->second;
       hold(intent);
     }
+    if (intent->registering) co_return ApiAnswer::ok("{\"known\":true,\"operationId\":" + quote(intent->operationId) +
+        ",\"namespaceId\":" + quote(intent->namespaceId) + ",\"phase\":\"registering\",\"point\":" + intent->point.json() + "}");
     if (auto done = co_await recognize(intent)) { intent->result = *done; co_return ApiAnswer::ok(*done); }
     auto receipt = co_await context.storage.get(manifestKey(intent->namespaceId, 1));
     requireStorage(receipt.status == 200 || receipt.status == 404, "cannot check completed restore");
     if (receipt.status == 200) {
       // The tenant-scoped operation MAC identifies this immutable receipt.
       // finish checks manifest 2, all metadata and quotas before registration.
+      remember(key, intent); intent = jobs.at(key); hold(intent);
+      if (intent->registering) co_return ApiAnswer::ok("{\"known\":true,\"operationId\":" + quote(intent->operationId) +
+          ",\"namespaceId\":" + quote(intent->namespaceId) + ",\"phase\":\"registering\",\"point\":" + intent->point.json() + "}");
       intent->registering = true; auto done = kj::defer([intent]() { intent->registering = false; });
       co_return co_await finish(intent, objectSha256(receipt.bytes), true);
     }
