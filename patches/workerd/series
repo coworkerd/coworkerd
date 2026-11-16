@@ -22,3 +22,4 @@
 0024-plain-direct-channel-backoff.patch
 0025-plain-startup-accounting.patch
 0026-plain-entry-review.patch
+0027-stateless-dispatch.patch

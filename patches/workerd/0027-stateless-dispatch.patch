@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 07:29:32 +0800
+Subject: [PATCH] Preserve ordinary selections and resolve bindings per
+ invocation
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 514d4da4190b4595444c47fa3795dd4d25969f5e..1e5b85c8ea1d0606dbb4d8f5b917c047c54d2049 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -130,7 +130,7 @@ class IdleReaper {
+     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
+   }
+   kj::Timer& timer;
+-  bool loopStarted = false, retirementLoopStarted = false;
++  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false;
+   void startLoop() {
+     if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
+   }
+@@ -141,7 +141,7 @@ class IdleReaper {
+     }
+   }
+   uint32_t threshold, interval;
+-  uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0;
++  uint64_t nextId = 1, created = 0, destroyed = 0, evicted = 0, failed = 0, pending = 0, retirementPending = 0;
+   uint64_t watermarkEvicted = 0, bandReads = 0, bandReadNs = 0;
+   const uint32_t* publishedBand = nullptr;
+   uint32_t band = 0;
+@@ -173,7 +173,8 @@ class IdleReaper {
+       if (auto worker = it->lock()) {
+         if (worker->created && !worker->destroyed) entries.add(kj::str(
+             "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
+-            labelFields(worker->labels), "}"));
++            labelFields(worker->labels), ",\"active\":", worker->active,
++            ",\"backgroundActive\":", worker->backgroundDone.map([](auto& done) { return !done(); }).orDefault(false) ? "true" : "false", "}"));
+         ++it;
+       } else {
+         it = workers.erase(it);
+@@ -271,7 +272,7 @@ class IdleReaper {
+       }
+       // At most once a second: for the band, and for the collections when they changed.
+       if (monotonicMs() - lastPublish >= 1000 &&
+-          (publishedBand || (gcSettings().observes() && processGcVersion() != publishedGc))) {
++          (publishedBand || observesBackground || (gcSettings().observes() && processGcVersion() != publishedGc))) {
+         publish();
+         lastPublish = monotonicMs();
+       }
+@@ -303,7 +304,7 @@ class IdleReaper {
+   kj::Promise<void> retirementLoop() {
+     while (!retiringWorkers.empty()) {
+       co_await timer.afterDelay(std::min(interval, 100u) * kj::MILLISECONDS);
+-      if (pending || monotonicMs() - lastDestroy < interval) continue;
++      if (retirementPending || monotonicMs() - lastDestroy < interval) continue;
+       IdleWorkerRef oldest;
+       // A pending supersession never turns on a scan of unrelated resident instances.
+       for (auto it = retiringWorkers.begin(); it != retiringWorkers.end();) {
+@@ -318,7 +319,7 @@ class IdleReaper {
+         if (!oldest || worker->lastEnd < oldest->lastEnd) oldest = kj::mv(worker);
+       }
+       if (oldest) {
+-        pending = oldest->id;
++        retirementPending = oldest->id;
+         KJ_IF_SOME(cb, oldest->remove) {
+           auto remove = kj::mv(cb);
+           oldest->remove = kj::none;
+@@ -342,6 +343,14 @@ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+   worker->labels = std::move(labels);
+   return worker;
+ }
++void idleWorkerObserveBackground(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone) {
++  if (!worker || worker->removed || worker->backgroundDone != kj::none) return;
++  worker->backgroundDone = kj::mv(backgroundDone);
++  if (auto owner = worker->owner.lock()) {
++    owner->observesBackground = true;
++    owner->startLoop();
++  }
++}
+ void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone) {
+   if (!worker || worker->removed || worker->retireWhenIdle) return;
+   worker->retireWhenIdle = true;
+@@ -425,6 +434,7 @@ class IdleObserver final: public IsolateObserver {
+       if (auto owner = worker->owner.lock()) {
+         ++owner->destroyed;
+         if (owner->pending == worker->id) { owner->pending = 0; owner->lastDestroy = monotonicMs(); }
++        if (owner->retirementPending == worker->id) { owner->retirementPending = 0; owner->lastDestroy = monotonicMs(); }
+         owner->event(*worker, "destroyed", elapsed); owner->publish();
+       }
+     }
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.h b/src/workerd/server/factory/coworkerd-idle-eviction.h
+index 3d3358a82e9de7ca440c7e4071ba19cd1f2367a1..9ea364c6461ad24feb83d387d35ea58257e55587 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.h
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.h
+@@ -21,6 +21,7 @@ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
+ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+     kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
+     IdleWorkerLabels labels = {});
++void idleWorkerObserveBackground(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone);
+ void idleWorkerRetireWhenIdle(const IdleWorkerRef& worker, kj::Function<bool()> backgroundDone);
+ void idleWorkerReady(const IdleWorkerRef& worker);
+ void idleWorkerFailed(const IdleWorkerRef& worker);
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index a0b9ef566979c3abb16ce37312b2fc9a5fc2a92e..cd4fd537da9e9ce1cc7e306b784ebe8e5ab153f4 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -1187,6 +1187,7 @@ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+   coworkerdServing();
+   TRACE_EVENT("workerd", "worker_start_request()");
+   auto& impl = worker.getImpl();
++  idleWorkerObserveBackground(impl.idleWorker, [target = &impl]() { return target->waitUntilTasks.isEmpty(); });
+   auto entrypointName = toKj(entrypoint);
+   Frankenvalue propsValue;
+   KJ_IF_SOME(p, props) propsValue = kj::mv(*p);
+@@ -2057,6 +2058,7 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
+   auto& impl = worker.getImpl();
+   impl.idleChannels = kj::mv(channels);
+   impl.idleReady = true;
++  idleWorkerObserveBackground(impl.idleWorker, [target = &impl]() { return target->waitUntilTasks.isEmpty(); });
+   idleWorkerReady(impl.idleWorker);
+   if (impl.idleWorker && gcSettings().idleCollectMs) {
+     // The collector holds the Worker, not the Impl. Its observer holds idleWorker;
+@@ -2070,6 +2072,10 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
+   }
+ }
+ 
++kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker) {
++  return kj::heap<WorkerSelectionActivity>(idleActivity(worker.getImpl().idleWorker));
++}
++
+ void worker_retire_when_idle(const CompiledWorker& worker) {
+   auto& impl = worker.getImpl();
+   idleWorkerRetireWhenIdle(impl.idleWorker, [target = &impl]() {
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 616c0a7461b04f1cb08e96991ac1468bc018dc42..c24e9eb8f7783a4f977702790f34c8a908c4f3f7 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -221,6 +221,14 @@ class CompiledWorker final {
+ WorkerInfo worker_info(const CompiledWorker& worker);
+ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
+ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory> channels);
++// A private selection owns ordinary idle activity until its channel is released.
++class WorkerSelectionActivity final {
++ public:
++  explicit WorkerSelectionActivity(kj::Own<void> activity): activity(kj::mv(activity)) {}
++ private:
++  kj::Own<void> activity;
++};
++kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker);
+ void worker_retire_when_idle(const CompiledWorker& worker);
+ void worker_unlink(const CompiledWorker& worker);
+ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index 355eb1a50fb035ede57b7dec86fa26d5af32d780..fed243c90d4cdcd618652ad85d6c6d736967ca2a 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -425,6 +425,8 @@ pub mod ffi {
+         fn worker_set_ctx_exports(worker: &CompiledWorker, globals: &[u64]) -> Result<()>;
+         /// Gives the C++ idle reaper the linked worker's existing abort path.
+         fn worker_idle_ready(worker: &CompiledWorker, channels: Box<ChannelFactory>) -> Result<()>;
++        type WorkerSelectionActivity;
++        fn worker_selection_activity(worker: &CompiledWorker) -> KjOwn<WorkerSelectionActivity>;
+         fn worker_retire_when_idle(worker: &CompiledWorker) -> Result<()>;
+         /// Cancels the worker's requests still in flight (background work past the response: a
+         /// `waitUntil()`, a tail worker's event), each of which holds the worker and its I/O
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index 1f25f754dd9bc345b16d87a215220170f7ff9d70..a5e8077e6e2d57ed9d362c1139ca1624e893990f 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -96,6 +96,14 @@ struct RootSelection {
+     catalog_generation: u64,
+     #[serde(default)]
+     active_plan: bool,
++    #[serde(default)]
++    service_versions: std::collections::BTreeMap<String, Value>,
++    #[serde(default)]
++    durable_object_bindings: std::collections::BTreeMap<String, Value>,
++    #[serde(default)]
++    trial: bool,
++    #[serde(default)]
++    classes: Vec<String>,
+ }
+ 
+ #[derive(Clone, Default, Deserialize, PartialEq)]
+@@ -410,6 +418,7 @@ struct NamespaceEntry {
+ }
+ 
+ struct InstallFlight {
++    startup_identity: String,
+     deployment: RefCell<Option<Rc<Deployment>>>,
+     namespaces: Vec<String>,
+     cancelled: Cell<bool>,
+@@ -759,42 +768,76 @@ impl RootRegistry {
+             let old = self.plans.borrow().get(&previous).cloned();
+             if let Some(worker) = old.as_ref().and_then(|old| self.loaded(old)) { worker.retire_when_idle()?; }
+         }
+-        let mut services = ffi::frankenvalue_new();
+-        let mut objects = ffi::frankenvalue_from_json("[]");
+-        let call = |target: &RootTarget| -> Value {
+-            let mut props = target.props.clone();
+-            if !props.is_object() { props = json!({}); }
+-            props["treeId"] = selection.tenant_cf["treeId"].clone();
+-            props["parentInvocationId"] = selection.tenant_cf["invocationId"].clone();
+-            props["orderSequence"] = selection.tenant_cf["orderSequence"].clone();
+-            props["expiresAtMonotonicMs"] = selection.tenant_cf["lease"]["expiresAtMonotonicMs"].clone();
+-            props["requiresChildSequence"] = json!(selection.requires_child_sequence);
+-            props
+-        };
+-        for binding in &plan.deployment.service_bindings {
+-            let name = binding.metadata["name"].as_str().ok_or_else(|| kj::failed!("ordinary service name missing"))?;
+-            ffi::frankenvalue_set_service_stub(services.pin_mut(), name,
+-                crate::channels::SubrequestChannel::new(self.target(&binding.target, &call(&binding.target))?));
+-        }
+-        for (index, binding) in plan.deployment.durable_objects.iter().enumerate() {
+-            let mut entry = ffi::frankenvalue_from_json(&binding.metadata.to_string());
+-            let available = binding.metadata["namespaceId"].as_str().is_some_and(|id| !id.is_empty());
+-            if available {
+-                ffi::frankenvalue_set_service_stub(entry.pin_mut(), "fetcher",
+-                    crate::channels::SubrequestChannel::new(self.target(&binding.target, &call(&binding.target))?));
++        let props = if selection.trial {
++            ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
++                json!({"trial": true,
++                    "entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint },
++                    "classes": selection.classes})
++            } else { json!({"coworkerd:trial": true}) }.to_string())
++        } else {
++            if selection.service_versions.keys().any(|name| !plan.deployment.service_bindings.iter()
++                    .any(|binding| binding.metadata["name"].as_str() == Some(name))) ||
++                selection.durable_object_bindings.keys().any(|name| !plan.deployment.durable_objects.iter()
++                    .any(|binding| binding.metadata["binding"].as_str() == Some(name))) {
++                return Err(kj::failed!("ordinary selection contains an undeclared binding"));
+             }
+-            ffi::frankenvalue_set_value(objects.pin_mut(), &index.to_string(), entry);
+-        }
+-        let props = if plan.deployment.structured_props {
+-            let mut props = ffi::frankenvalue_from_json(&json!({"entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint }}).to_string());
+-            ffi::frankenvalue_set_value(props.pin_mut(), "bindings", services);
+-            ffi::frankenvalue_set_value(props.pin_mut(), "durableObjects", objects);
+-            props
+-        } else { services };
++            let mut services = ffi::frankenvalue_new();
++            let mut objects = ffi::frankenvalue_from_json("[]");
++            let call = |target: &RootTarget| -> Value {
++                let mut props = target.props.clone();
++                if !props.is_object() { props = json!({}); }
++                props["treeId"] = selection.tenant_cf["treeId"].clone();
++                props["parentInvocationId"] = selection.tenant_cf["invocationId"].clone();
++                props["orderSequence"] = selection.tenant_cf["orderSequence"].clone();
++                props["expiresAtMonotonicMs"] = selection.tenant_cf["lease"]["expiresAtMonotonicMs"].clone();
++                props["requiresChildSequence"] = json!(selection.requires_child_sequence);
++                props
++            };
++            for binding in &plan.deployment.service_bindings {
++                let name = binding.metadata["name"].as_str().ok_or_else(|| kj::failed!("ordinary service name missing"))?;
++                let version = selection.service_versions.get(name)
++                    .ok_or_else(|| kj::failed!("ordinary service version missing"))?;
++                if version["workerId"] != binding.target.props["workerId"] {
++                    return Err(kj::failed!("ordinary service version belongs to a different Worker"));
++                }
++                let mut props = call(&binding.target);
++                for field in ["versionId", "contentHash", "definitionHash"] {
++                    if !version[field].as_str().is_some_and(|value| !value.is_empty()) {
++                        return Err(kj::failed!("ordinary service version field missing"));
++                    }
++                    props[field] = version[field].clone();
++                }
++                ffi::frankenvalue_set_service_stub(services.pin_mut(), name,
++                    crate::channels::SubrequestChannel::new(self.target(&binding.target, &props)?));
++            }
++            for (index, binding) in plan.deployment.durable_objects.iter().enumerate() {
++                let name = binding.metadata["binding"].as_str().ok_or_else(|| kj::failed!("ordinary object binding missing"))?;
++                let resolved = selection.durable_object_bindings.get(name)
++                    .ok_or_else(|| kj::failed!("ordinary object binding resolution missing"))?;
++                let mut metadata = binding.metadata.clone();
++                metadata["namespaceId"] = resolved["namespaceId"].clone();
++                metadata["objectId"] = resolved["objectId"].clone();
++                let mut entry = ffi::frankenvalue_from_json(&metadata.to_string());
++                if resolved["namespaceId"].as_str().is_some_and(|id| !id.is_empty()) {
++                    let mut props = call(&binding.target);
++                    props["namespaceId"] = resolved["namespaceId"].clone();
++                    ffi::frankenvalue_set_service_stub(entry.pin_mut(), "fetcher",
++                        crate::channels::SubrequestChannel::new(self.target(&binding.target, &props)?));
++                }
++                ffi::frankenvalue_set_value(objects.pin_mut(), &index.to_string(), entry);
++            }
++            if plan.deployment.structured_props {
++                let mut props = ffi::frankenvalue_from_json(&json!({"entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint }}).to_string());
++                ffi::frankenvalue_set_value(props.pin_mut(), "bindings", services);
++                ffi::frankenvalue_set_value(props.pin_mut(), "durableObjects", objects);
++                props
++            } else { services }
++        };
+         let entrypoint = worker.entrypoint(None, Some(props), false)
+             .ok_or_else(|| kj::failed!("ordinary bridge has no default entrypoint"))?;
+         Ok(Rc::new(PlainSelectedChannel {registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
+-            selection, entrypoint, _pin: PlanPin::new(plan, self.this.clone())}))
++            selection, entrypoint, _activity: worker.selection_activity(),
++            _pin: PlanPin::new(plan, self.this.clone())}))
+     }
+ 
+     fn stamp_metadata(
+@@ -834,7 +877,7 @@ impl RootRegistry {
+         Ok(())
+     }
+ 
+-    async fn compile(&self, deployment: &Deployment, key: &WorkerKey) -> Result<Rc<WorkerService>> {
++    async fn compile(&self, deployment: &Deployment, key: &WorkerKey, startup_identity: &str) -> Result<Rc<WorkerService>> {
+         if let Some(class) = &deployment.platform_class {
+             return self
+                 .server
+@@ -931,7 +974,9 @@ impl RootRegistry {
+         };
+         let record = deployment.record()?;
+         let identity = ffi::CoworkerdLoadIdentity {
+-            startup_identity: if deployment.is_plain() {
++            startup_identity: if deployment.is_plain() && !startup_identity.is_empty() {
++                startup_identity.to_owned()
++            } else if deployment.is_plain() {
+                 let identity = json!({"workerId": deployment.worker_id, "versionId": deployment.version_id,
+                     "invocationId": format!("load:{}:{}", deployment.version_fingerprint, key.generation)}).to_string();
+                 // The existing accounting scope takes JSON fields with a trailing comma.
+@@ -1119,7 +1164,7 @@ impl RootRegistry {
+         Ok(result)
+     }
+ 
+-    async fn install(self: &Rc<Self>, deployment: Deployment) -> Result<String> {
++    async fn install(self: &Rc<Self>, deployment: Deployment, startup_identity: String) -> Result<String> {
+         deployment.validate()?;
+         self.validate_install(&deployment)?;
+         let plan_key = deployment.plan_key()?;
+@@ -1139,7 +1184,7 @@ impl RootRegistry {
+                     self.change_source(entry, &plan_key);
+                 }
+             }
+-            if deployment.is_plain() { self.worker(&plan_key).await?; }
++            if deployment.is_plain() { self.worker(&plan_key, &startup_identity).await?; }
+             return Ok(plan_key);
+         }
+         let existing = self.installing.borrow().get(&plan_key).cloned();
+@@ -1150,6 +1195,7 @@ impl RootRegistry {
+             flight
+         } else {
+             let flight = Rc::new(InstallFlight {
++                startup_identity,
+                 namespaces: deployment.namespaces.iter().map(|space| space.id.clone()).collect(),
+                 deployment: RefCell::new(Some(Rc::new(deployment))),
+                 cancelled: Cell::new(false),
+@@ -1271,7 +1317,7 @@ impl RootRegistry {
+             objects: RefCell::new(HashSet::new()),
+             retiring_refs: Cell::new(0),
+         });
+-        let worker = self.compile(&plan.deployment, &key).await?;
++        let worker = self.compile(&plan.deployment, &key, &flight.startup_identity).await?;
+         let _guard = wait_for_root(&self.factory,
+             plan.deployment.namespaces.first().map(|space| space.id.as_str()).unwrap_or(&plan_key), "",
+             "registry publication", self.install_lock.lock()).await?;
+@@ -1315,7 +1361,7 @@ impl RootRegistry {
+         Ok(plan_key)
+     }
+ 
+-    async fn worker(self: &Rc<Self>, plan_key: &str) -> Result<Rc<WorkerService>> {
++    async fn worker(self: &Rc<Self>, plan_key: &str, startup_identity: &str) -> Result<Rc<WorkerService>> {
+         let plan = self
+             .plans
+             .borrow()
+@@ -1354,7 +1400,7 @@ impl RootRegistry {
+         };
+         plan.generation.set(Some(generation));
+         let key = plan.deployment.key(generation)?;
+-        let worker = match self.compile(&plan.deployment, &key).await {
++        let worker = match self.compile(&plan.deployment, &key, startup_identity).await {
+             Ok(worker) => worker,
+             Err(error) => {
+                 self.remember_failure(plan_key, &error);
+@@ -1415,7 +1461,7 @@ impl RootRegistry {
+             .iter()
+             .find(|space| space.id == selection.namespace_id)
+             .ok_or_else(|| kj::failed!("this plan does not own the root namespace"))?;
+-        self.worker(&selection.plan).await?;
++        self.worker(&selection.plan, "").await?;
+         let name = format!(
+             "{}/{}/{}",
+             selection.namespace_id, selection.object_id, selection.data_epoch
+@@ -1947,6 +1993,9 @@ impl ActorClass for RootExportedClass {
+     }
+     fn for_root_plan(&self, root_plan: &str) -> Result<Option<Rc<dyn ActorClass>>> {
+         let registry = self.registry()?;
++        if registry.plans.borrow().get(root_plan).is_some_and(|plan| plan.deployment.is_plain()) {
++            return Err(kj::failed!("an ordinary plan cannot supply an actor class"));
++        }
+         let owner = registry
+             .plans
+             .borrow()
+@@ -1972,7 +2021,10 @@ impl ActorClass for RootExportedClass {
+     fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
+         Box::pin(async move {
+             let registry = self.registry()?;
+-            let worker = registry.worker(&self.plan_key).await?;
++            if registry.plans.borrow().get(&self.plan_key).is_some_and(|plan| plan.deployment.is_plain()) {
++                return Err(kj::failed!("an ordinary plan cannot supply an actor class"));
++            }
++            let worker = registry.worker(&self.plan_key, "").await?;
+             *self.running_worker.borrow_mut() = Rc::downgrade(&worker);
+             self.generation.set(
+                 registry
+@@ -2179,11 +2231,14 @@ struct PlainSelectedChannel {
+     selection: RootSelection,
+     entrypoint: Rc<dyn Channel>,
+     _pin: PlanPin,
++    _activity: KjOwn<ffi::WorkerSelectionActivity>,
+ }
+ impl Channel for PlainSelectedChannel {
+     fn start_request(&self, mut metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+         self.registry.stamp_metadata(&self.selection, &mut metadata)?;
+-        self.entrypoint.start_request(metadata)
++        let request = self.entrypoint.start_request(metadata)?;
++        self._pin.0.reported_plain_generation.set(self._pin.0.generation.get());
++        Ok(request)
+     }
+     fn require_allows_transfer(&self) -> Result<()> { Err(not_transferable("Private ordinary worker")) }
+     fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> { Err(not_transferable("Private ordinary worker")) }
+@@ -2315,19 +2370,31 @@ impl Service for RootRequest {
+                     let plans = self.registry.plans.borrow();
+                     let installed = plans.get(&key);
+                     json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
+-                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get()
++                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
++                        "cold": plan.deployment.is_plain() && plan.reported_plain_generation.get() != plan.generation.get()
+                     }))})
+                 }
+             }
+             (Method::POST, "/install") => {
+-                let deployment = serde_json::from_value(read_json(body).await?)
++                let value = read_json(body).await?;
++                let identity = value.get("startupIdentity").and_then(Value::as_str).unwrap_or("");
++                let startup_identity = if identity.is_empty() { String::new() } else {
++                    let parsed: Value = serde_json::from_str(identity)
++                        .map_err(|error| kj::failed!("ordinary startup identity: {error}"))?;
++                    if !parsed.is_object() || parsed["workerId"] != value["workerId"] ||
++                        parsed["versionId"] != value["versionId"] || !parsed["invocationId"].is_string() {
++                        return Err(kj::failed!("ordinary startup identity does not match its plan"));
++                    }
++                    format!("{},", &identity[1..identity.len() - 1])
++                };
++                let deployment = serde_json::from_value(value)
+                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
+-                match self.registry.install(deployment).await {
++                match self.registry.install(deployment, startup_identity).await {
+                     Ok(plan) => {
+                         let plans = self.registry.plans.borrow();
+                         if let Some(installed) = plans.get(&plan) {
+                         let cold = installed.deployment.is_plain() &&
+-                            installed.reported_plain_generation.replace(installed.generation.get()) != installed.generation.get();
++                            installed.reported_plain_generation.get() != installed.generation.get();
+                         json!({"plan": plan, "info": {"kind": installed.deployment.kind,
+                             "loaded": installed.loaded.borrow().is_some(), "generation": installed.generation.get(),
+                             "cold": cold,
+@@ -2479,7 +2546,7 @@ impl Service for RootRequest {
+                     .is_some_and(|plan| plan.deployment.is_plain()) {
+                     return Err(kj::failed!("ordinary worker plans require the private selection entry"));
+                 }
+-                let worker = self.registry.worker(&plan).await?;
++                let worker = self.registry.worker(&plan, "").await?;
+                 let metadata = self
+                     .metadata
+                     .take()
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index b02d3870e0dc440abf9c6e7201fa3ba169de7098..12a4f03007ffb0fe554caec757122b174738a81d 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -804,6 +804,10 @@ impl WorkerService {
+         Ok(())
+     }
+ 
++    pub fn selection_activity(&self) -> KjOwn<ffi::WorkerSelectionActivity> {
++        ffi::worker_selection_activity(&self.worker)
++    }
++
+     pub fn retire_when_idle(&self) -> Result<()> {
+         ffi::worker_retire_when_idle(&self.worker)?;
+         Ok(())

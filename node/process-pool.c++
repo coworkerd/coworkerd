@@ -2584,6 +2584,24 @@ public:
       p->nextEventSync = now + LIMIT_EVENT_SYNC_MS;
     });
   }
+  bool labelledIsolate(ProcessGeneration& process, const std::string& isolate,
+      const std::string& worker, const std::string& version) {
+    const auto snapshot = process.lifecycle.read();
+    if (snapshot.empty()) return false;
+    try {
+      capnp::MallocMessageBuilder arena;
+      auto value = arena.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
+      auto residents = json::field(value, "residentWorkers");
+      if (!residents.isArray()) return false;
+      for (auto row : residents.getArray()) {
+        const auto name = json::field(row, "isolate"), owner = json::field(row, "workerId"), revision = json::field(row, "versionId");
+        if (name.isString() && owner.isString() && revision.isString() && std::string(name.getString().cStr()) == isolate &&
+            std::string(owner.getString().cStr()) == worker && std::string(revision.getString().cStr()) == version) return true;
+      }
+    } catch (const kj::Exception&) {}
+    return false;
+  }
   // The OOM rows workerd's OOM handler wrote to the event pipe before the process died: the bare
   // OOM row, then the identity of the execution that hit it (when one was executing).
   void memoryExit(Slot& slot, ProcessGeneration& p, int status) {
@@ -2607,9 +2625,8 @@ public:
         if (!dispatched) dispatched = std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& call) {
           return call.invocationId == invocation && call.workerId == worker && call.versionId == version;
         });
-        const auto prefix = "coworkerd-v1:" + worker + "@" + version + "#";
         if (dispatched && !worker.empty() && !version.empty() && !invocation.empty() &&
-            std::string(report.getIsolate().cStr()).starts_with(prefix)) {
+            labelledIsolate(p, report.getIsolate().cStr(), worker, version)) {
           offender = capnp::JsonCodec().encode(report.asReader()).cStr();
           ++workerMemoryStats[worker].culprit;
           suspects.confirm(worker, p.id, p.generation, invocation);
@@ -2656,8 +2673,7 @@ public:
           call == p.calls.end() || !call->second->dispatched ||
           call->second->workerId != value.getWorkerId().cStr() ||
           call->second->versionId != value.getVersionId().cStr()) return "null";
-      const auto prefix = "coworkerd-v1:" + call->second->workerId + "@" + call->second->versionId + "#";
-      if (!std::string(value.getIsolate().cStr()).starts_with(prefix)) return "null";
+      if (!labelledIsolate(p, value.getIsolate().cStr(), call->second->workerId, call->second->versionId)) return "null";
       ++workerCpuStats[call->second->workerId].culprit;
       return capnp::JsonCodec().encode(value.asReader()).cStr();
     } catch (const kj::Exception&) { return "null"; }
@@ -2974,17 +2990,37 @@ public:
     if (old.openContexts.empty()) return true;
     if (now - lastLifecycleCheck < 100) return false;
     lastLifecycleCheck = now;
-    // A request context holds its isolate. An invocation whose version has no resident isolate
-    // in this generation (its load failed, or it was evicted) has no context left to wait for.
-    auto lifecycle = old.lifecycle.read();
+    // Inspect each resident instance separately. A partially tagged instance retains
+    // its own contexts; unrelated tagged instances remain usable for the decision.
+    const auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
-    std::erase_if(old.openContexts, [&](const auto& entry) {
-      if (entry.second.finishedAt == 0) return false;
-      const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
-      if (lifecycle.find(marker) != std::string::npos) return false;
-      ++old.contextsCleared; ++cleared;
-      return true;
-    });
+    try {
+      capnp::MallocMessageBuilder arena;
+      auto value = arena.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
+      const auto workers = json::field(value, "residentWorkers");
+      if (!workers.isArray()) return false;
+      std::erase_if(old.openContexts, [&](const auto& entry) {
+        if (entry.second.finishedAt == 0) return false;
+        for (auto resident : workers.getArray()) {
+          const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
+          const auto active = json::field(resident, "active"), background = json::field(resident, "backgroundActive");
+          const bool busy = (active.isNumber() && active.getNumber() > 0) || (background.isBoolean() && background.getBoolean());
+          if (!worker.isString() || worker.getString().size() == 0 || !version.isString()) {
+            if (busy) return false;
+            continue;
+          }
+          if (std::string(worker.getString().cStr()) != entry.second.workerId || std::string(version.getString().cStr()) != entry.second.versionId) continue;
+          const auto revision = json::field(resident, "planRevision");
+          if (!revision.isString() || revision.getString().size() == 0 ||
+              !json::field(resident, "loadGeneration").isNumber() || !json::field(resident, "instance").isNumber()) return false;
+          if (!old.durable || !background.isBoolean() || background.getBoolean()) return false;
+        }
+        ++old.contextsCleared; ++cleared;
+        return true;
+      });
+    } catch (const kj::Exception&) {return false;}
+
     return old.openContexts.empty();
   }
   void closeConnections(ProcessGeneration& p) {
@@ -3465,6 +3501,11 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
         if (typed) ++impl->lifecycleLabels.typed;
         else ++impl->lifecycleLabels.missing;
         const auto at = isolate.find('@');
+        if (typed) {
+          const auto owner = json::field(entry, "tenant");
+          const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) : tenantOf(worker.getString().cStr());
+          if (!tenant.empty()) ++counts[tenant];
+        }
         if (at == std::string::npos) continue;
         const auto colon = isolate.rfind(':', at);
         const auto legacyWorker = isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1));
@@ -3475,8 +3516,7 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
             ++impl->lifecycleLabels.matches;
           else ++impl->lifecycleLabels.mismatches;
         }
-        const auto tenant = tenantOf(legacyWorker);
-        if (!tenant.empty()) ++counts[tenant];
+
       }
     } catch (const kj::Exception&) {}
   });
@@ -3487,9 +3527,9 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat[hash] = mono();
   ++p->dispatched;
-  // An object's requests share its context in workerd, whose completed row comes when the object leaves memory: a durable
-  // process is drained once its requests in flight are done (a WebSocket connection is told to go away).
-  if (p->contextsVisible && !p->durable) {
+  // Object contexts outlive replies. Their instance labels and observed background
+  // activity let rotation wait for remaining work without waiting for idle actors.
+  if (p->contextsVisible) {
     const auto ticket = p->quarantine && call->invocationId.find("-invocation-") != std::string::npos
         ? impl->suspects.probationTicket(tenantOf(call->workerId)) : 0;
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
