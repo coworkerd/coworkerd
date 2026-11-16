@@ -9,6 +9,14 @@ void TenantView::onQuota(std::function<void(const std::string&, uint64_t, uint64
 
 void TenantView::update(const std::map<std::string, std::optional<TenantRecord>>& named, uint64_t at, bool records) {
   ++epochValue;
+  if (records && hasRecords) {
+    for (const auto& name : catalogTenants) if (!named.contains(name)) removedTenants.insert(name);
+  }
+  catalogTenants.clear();
+  if (records) for (const auto& [name, record] : named) {
+    catalogTenants.insert(name);removedTenants.erase(name);
+  }
+  else removedTenants.clear();
   hasRecords = records;
   std::map<std::string, TenantRecord> next;
   uint64_t bare = 0;

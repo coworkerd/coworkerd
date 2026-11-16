@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 
 namespace coworkerd {
@@ -28,6 +29,7 @@ public:
   const TenantRecord* tenant(const std::string& name) const;
   bool deleting(const std::string& name) const;
   uint64_t epoch() const { return epochValue; }
+  bool removedFromCatalog(const std::string& name) const { return removedTenants.contains(name); }
   // Why the tenant's Workers are not served here ("" when they are): its record says deleting, or it has none.
   std::string unavailable(const std::string& name) const;
   // The tenant a hostname (as requestHost() gives it) is registered to, or null. A hostname that several records
@@ -44,6 +46,7 @@ private:
   std::function<void(const std::string&, uint64_t, uint64_t)> quota;
   uint64_t revision = 0, withoutRecord = 0;
   uint64_t epochValue = 0;
+  std::set<std::string> catalogTenants, removedTenants;
 };
 
 }  // namespace coworkerd
