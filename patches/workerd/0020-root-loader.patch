@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 07:53:45 +0800
+Date: Mon, 16 Nov 2026 08:14:43 +0800
 Subject: [PATCH] Load roots with bounded lifecycle cleanup and private
  per-event preparation
 
@@ -1960,10 +1960,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c1bb96dc853abe225ce6cf465685965b48e02ee2
+index 0000000000000000000000000000000000000000..0064472ec1a155f1578c89f588aef94fb05c256b
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,2236 @@
+@@ -0,0 +1,2242 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -3373,16 +3373,18 @@ index 0000000000000000000000000000000000000000..c1bb96dc853abe225ce6cf465685965b
 +        // Graceful evictions run concurrently. Caller deadlines do not cancel this task.
 +        self.factory.spawn_detached(async move {
 +            let mut completed = true;
-+            let results =
-+                futures::future::join_all(roots.iter().map(|(namespace, storage_key)| {
-+                    let factory = Rc::clone(&registry.factory);
-+                    async move {
++            let mut closing = Vec::with_capacity(roots.len());
++            for (index, (namespace, storage_key)) in roots.iter().enumerate() {
++                let factory = Rc::clone(&registry.factory);
++                let namespace = Rc::clone(namespace);
++                let storage_key = storage_key.clone();
++                closing.push(registry.factory.spawn(async move {
 +                        let result = wait_for_root(
 +                            &factory,
 +                            namespace.unique_key().unwrap_or_default(),
-+                            storage_key,
++                            &storage_key,
 +                            "idle tree retirement",
-+                            namespace.evict_root_for_unload(storage_key),
++                            namespace.evict_root_for_unload(&storage_key),
 +                        )
 +                        .await?;
 +                        if let Err(error) = &result {
@@ -3393,9 +3395,13 @@ index 0000000000000000000000000000000000000000..c1bb96dc853abe225ce6cf465685965b
 +                            );
 +                        }
 +                        result
-+                    }
-+                }))
-+                .await;
++                }));
++                // Start independent closes gradually; one slow hook does not hold later roots.
++                if (index + 1) % 16 == 0 {
++                    registry.factory.sleep(Duration::from_millis(1)).await;
++                }
++            }
++            let results = futures::future::join_all(closing).await;
 +            for result in results {
 +                if let Err(error) = result {
 +                    tracing::error!("retiring idle root: {error:?}");
