@@ -351,7 +351,9 @@ The CLI saves its random operation id and **resolved bookmark**, without a crede
 `~/.cowctl/restore-operations/`. If interrupted, rerun the same command to resume; `--operation-id ID` can specify a
 stable id explicitly (16–128 letters/digits/hyphens). Keep the saved state when moving a retry to another machine.
 The control plane and nodes keep progress only in memory; after a restart they may answer unknown. Resubmission
-recognizes the already published first snapshot, and registration returns the same database if it already happened.
+recognizes the already published first snapshot, and registration returns the same database if it already happened,
+provided the source database still exists and is active. Resubmitting after deleting the source is refused because
+the source is resolved first; this does not affect the already restored database.
 A different new operation can use a new `--operation-id`. Reusing an operation with changed parameters is refused while
 its request is cached. If the destination name is taken at the final registration, the restore fails; its unreferenced
 history remains and no database is registered. Deleted database records still count against namespace quota.
@@ -371,8 +373,14 @@ Leave that new database unbound and do not write to it during export. This uses 
 Each node runs one restore at a time. Retained records for the selected object are limited to **128 MiB of payload**
 and **100,000 records**; other objects in a shared segment do not count. A shared segment's transient decode is
 separately bounded at **384 MiB**, with a total incremental memory budget of **512 MiB**. Snapshot hashing streams data.
-Disk admission first evicts eligible cold cache files, then reserves two images under the node's existing disk limit.
+Disk admission refuses a reservation larger than the node limit before evicting cache files; otherwise it first
+evicts eligible cold cache files, then reserves two images under the node's existing disk limit.
 A resource refusal reports the resource, required amount and limit as `SEED_RESOURCE_LIMIT`; it never truncates
 history or silently chooses a newer point. Name and tenant quotas are checked before work and again at registration.
 `RESTORE_UNAVAILABLE` can be retried with the saved operation and bookmark; a used target returns `SEED_TARGET_IN_USE`
 at the node. A lost SQL reply is still `RESULT_UNCERTAIN` and must not be blindly replayed.
+
+The control plane caches at most 16 pending restore requests per tenant and 1024 requests overall. Idle unfinished
+requests expire after 60 seconds; completed/failed receipts expire after 10 minutes and can be evicted sooner.
+Requests accepted by no node are removed immediately. Polling refreshes the idle timeout. An expired request can
+be resubmitted with the saved bookmark and operation id; the immutable snapshot remains its receipt.

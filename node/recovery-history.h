@@ -23,6 +23,7 @@ struct HistoryBudget {
 
 struct FileDigest { uint64_t bytes = 0; std::string sha256; };
 FileDigest recoveryFileDigest(const std::filesystem::path& path);
+kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& path, HistoryYield yield, HistoryCheck check = {});
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
     const std::string& objectName, uint32_t parallelism, HistoryCheck check = {}, HistoryLog log = {},
     HistoryBudget* budget = nullptr, HistoryYield yield = {});
@@ -30,6 +31,7 @@ kj::Promise<void> downloadRecoveryPart(HistoryGet get, const ObjectManifest& man
     uint32_t facetId, uint64_t part, int fd, off_t offset, HistoryCheck check = {});
 kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest& manifest,
     const RootStorageRef& destination, const std::filesystem::path& stack, const std::string& staging,
-    uint64_t partBytes, uint32_t parallelism, HistoryCheck check = {});
+    uint64_t partBytes, uint32_t parallelism, HistoryCheck check = {}, HistoryYield yield = {},
+    std::function<void(double)> observeFsync = {});
 
 }  // namespace coworkerd

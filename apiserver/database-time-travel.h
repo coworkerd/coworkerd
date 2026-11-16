@@ -23,8 +23,11 @@ private:
   struct Intent {
     std::string tenant, sourceDatabase, name, operationId, namespaceId, result;
     Point point;
-    bool registering = false;
+    bool registering = false, accepted = false;
+    double touchedAtMs = 0;
   };
+  void expireJobs();
+  void remember(const std::string& key, std::shared_ptr<Intent> intent);
   std::string source(const std::string& tenant, const std::string& database) const;
   kj::Promise<std::optional<Point>> read(std::string ns, uint64_t revision);
   kj::Promise<Point> resolve(std::string ns, const std::map<std::string, std::string>& selector);

@@ -1,6 +1,7 @@
 #include "recovery-history.h"
 #include "durable-shards.h"
 #include "json.h"
+#include "support.h"
 #include <kj/debug.h>
 #include <openssl/evp.h>
 #include <algorithm>
@@ -38,6 +39,25 @@ FileDigest recoveryFileDigest(const std::filesystem::path& path) {
     result.bytes += n; KJ_REQUIRE(EVP_DigestUpdate(digest, block.data(), size_t(n)) == 1, "cannot hash recovery image"); }
   unsigned char bytes[32]; unsigned int length; KJ_REQUIRE(EVP_DigestFinal_ex(digest, bytes, &length) == 1 && length == 32, "cannot finish image digest");
   constexpr char HEX[] = "0123456789abcdef"; for (auto byte : bytes) { result.sha256 += HEX[byte >> 4]; result.sha256 += HEX[byte & 15]; } return result;
+}
+kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& path, HistoryYield yield, HistoryCheck check) {
+  if (check) check();
+  const int fd = ::open(path.c_str(), O_RDONLY); KJ_REQUIRE(fd >= 0, "cannot read recovery image");
+  auto close = kj::defer([&]() { ::close(fd); });
+  auto* digest = EVP_MD_CTX_new(); KJ_REQUIRE(digest && EVP_DigestInit_ex(digest, EVP_sha256(), nullptr) == 1, "cannot hash recovery image");
+  auto release = kj::defer([&]() { EVP_MD_CTX_free(digest); });
+  std::array<unsigned char, 65536> block; FileDigest result;
+  uint64_t batch = 0; auto began = monotonicTimeMs();
+  for (;;) { auto n = ::read(fd, block.data(), block.size()); if (n < 0 && errno == EINTR) continue; KJ_REQUIRE(n >= 0, "cannot read recovery image"); if (!n) break;
+    result.bytes += n; KJ_REQUIRE(EVP_DigestUpdate(digest, block.data(), size_t(n)) == 1, "cannot hash recovery image");
+    batch += n;
+    if (yield && (batch >= (1u << 20) || monotonicTimeMs() - began >= 2)) {
+      co_await yield(); if (check) check(); batch = 0; began = monotonicTimeMs();
+    }
+  }
+  if (check) check();
+  unsigned char bytes[32]; unsigned int length; KJ_REQUIRE(EVP_DigestFinal_ex(digest, bytes, &length) == 1 && length == 32, "cannot finish image digest");
+  constexpr char HEX[] = "0123456789abcdef"; for (auto byte : bytes) { result.sha256 += HEX[byte >> 4]; result.sha256 += HEX[byte & 15]; } co_return result;
 }
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
     const std::string& objectName, uint32_t parallelism, HistoryCheck check, HistoryLog log, HistoryBudget* budget, HistoryYield yield) {
@@ -101,7 +121,7 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
   co_return out;
 }
 kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest& manifest, const RootStorageRef& ref, const std::filesystem::path& stack,
-    const std::string& staging, uint64_t partBytes, uint32_t parallelism, HistoryCheck check) {
+    const std::string& staging, uint64_t partBytes, uint32_t parallelism, HistoryCheck check, HistoryYield yield, std::function<void(double)> observeFsync) {
   for (const auto& facet : manifest.facets) {
     const auto path = ref.databasePath(stack, facet.facetId, "", staging);
     std::error_code code;
@@ -120,9 +140,11 @@ kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest&
     }
     if (running.size() > 0) co_await kj::joinPromises(running.releaseAsArray());
         if (check) check();
+    const auto syncStarted = monotonicTimeMs();
     KJ_REQUIRE(::fsync(fd) == 0, "cannot synchronize a Durable Object snapshot", path.string().c_str());
+    if (observeFsync) observeFsync(monotonicTimeMs() - syncStarted);
     // The file must be the one the snapshot names: a wrong digest would be read as the object's state.
-    const auto bytes = recoveryFileDigest(path);
+    const auto bytes = co_await recoveryFileDigestAsync(path, yield, check);
     KJ_REQUIRE(bytes.bytes == facet.bytes && bytes.sha256 == facet.sha256,
         "a snapshot of a Durable Object does not add up", path.string().c_str(), facet.bytes, bytes.bytes);
   }

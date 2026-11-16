@@ -164,5 +164,11 @@ All operations use the existing tenant authorization. The source must be an acti
 Target N is HMAC-SHA256 of the canonical tuple tenant, source N, revision, raw-manifest SHA-256 and operation id.
 Each UTF-8 field is encoded as decimal byte-length, `:`, and bytes; revision is canonical decimal. The subkey is
 HMAC-SHA256 of the existing secrets master key with domain `coworkerd/d1-time-travel/namespace/v1`; it never leaves
-control-plane computation. Registration recomputes N and checks ownership inside the existing tenant-index CAS.
+control-plane computation. Registration recomputes N and checks the tenant-scoped namespace inside the tenant conditional update; the index does not scan unrelated tenants.
 The old arbitrary-N `tool database-register` has been removed. No persistent job table or directory state is added.
+
+Restore intents are bounded to 16 pending requests per tenant and 1024 overall. Unfinished idle entries expire
+after 60 seconds, terminal receipts after 10 minutes (or earlier eviction); progress polling refreshes activity.
+A request accepted by no node is not cached. Per-tenant saturation returns 429 RESTORE_BUSY; a full global cache
+returns 503 RESTORE_BUSY. Malformed restore JSON or non-string/missing required fields return 400 INVALID_REQUEST;
+unsupported methods on info/restore return 405. Repeating a registered operation still requires an active source.

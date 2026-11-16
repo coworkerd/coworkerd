@@ -3937,7 +3937,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
       for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
-      co_await downloadSnapshot(*manifest, storage, staging);
+      co_await downloadSnapshot(*manifest, storage, staging, check);
       check();
       facets = manifest->facets;
       for (const auto& facet : facets) fromSeq = std::max(fromSeq, facet.upToSeq);
@@ -3987,7 +3987,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     object->snapshotAtUnixMs = manifest->snapshotAtUnixMs;
     if (manifest->hasSnapshot) {
       for (const auto& facet : manifest->facets) stagingFacets.insert(facet.facetId);
-      co_await downloadSnapshot(*manifest, storage, staging);
+      co_await downloadSnapshot(*manifest, storage, staging, check);
       check();
       facets = manifest->facets;
     }
@@ -4135,9 +4135,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
 kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
-    const std::string& staging) {
+    const std::string& staging, std::function<void()> check) {
   return downloadRecoverySnapshot([this](std::string key) { return store->get(std::move(key)); }, manifest,
-      ref, settings.stackDirectory, staging, settings.config.snapshotPartBytes, settings.config.recoverParallelism);
+      ref, settings.stackDirectory, staging, settings.config.snapshotPartBytes, settings.config.recoverParallelism,
+      std::move(check), [this]() { return timer.afterDelay(1 * kj::MILLISECONDS); });
 }
 
 kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part,

@@ -65,10 +65,13 @@ DatabaseSeedInput DatabaseSeedInput::parse(const std::string& bytes) {
   return input;
 }
 std::string DatabaseSeed::Job::json() const {
+  std::string fsync = "[";
+  for (size_t i = 0; i < downloadFsyncMs.size(); ++i) fsync += (i ? "," : "") + std::to_string(downloadFsyncMs[i]);
+  fsync += "]";
   return "{\"known\":true,\"input\":" + input.json() + ",\"phase\":" + quote(phase) + ",\"finished\":" +
       (finished ? "true" : "false") + ",\"bytes\":\"" + std::to_string(bytes) + "\",\"records\":\"" + std::to_string(budget.records) +
       "\",\"payloadBytes\":\"" + std::to_string(budget.payloadBytes) + "\",\"memoryBoundBytes\":\"" + std::to_string(budget.memoryHighWater) +
-      "\",\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + ",\"errorCode\":" + quote(errorCode) + ",\"error\":" + quote(error) + ",\"resource\":" + quote(resource) +
+      "\",\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + ",\"downloadFsyncMs\":" + fsync + ",\"errorCode\":" + quote(errorCode) + ",\"error\":" + quote(error) + ",\"resource\":" + quote(resource) +
       ",\"required\":\"" + std::to_string(required) + "\",\"limit\":\"" + std::to_string(limit) + "\",\"result\":" + (result.empty() ? "null" : result) + "}";
 }
 DatabaseSeed::DatabaseSeed(DurableLog& log, DurableShards& shards, std::function<bool(const std::string&)> registered)
@@ -92,9 +95,10 @@ std::string DatabaseSeed::start(DatabaseSeedInput input, const ShardRoute& owner
     }
     // Even a cached success must check immutable history again: the database
     // may have been used since it was seeded. A failed job may use a new B.
-    jobs.erase(found);
+    // Retain this result if a different target prevents accepting the retry.
   }
   KJ_REQUIRE(!running, "another database seed is in progress on this node");
+  jobs.erase(input.namespaceId);
   if (jobs.size() >= 128) {
     auto old = std::find_if(jobs.begin(), jobs.end(), [](const auto& entry) { return entry.second->finished; });
     if (old != jobs.end()) jobs.erase(old);
@@ -194,6 +198,10 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
     KJ_REQUIRE(!error, "cannot remove prior seed staging");
   }
   const auto reservation = imageBytes > UINT64_MAX / 2 ? UINT64_MAX : imageBytes * 2;
+  if (reservation > log.diskLimitBytes) {
+    job->errorCode = "SEED_RESOURCE_LIMIT"; job->resource = "diskBytes"; job->required = reservation; job->limit = log.diskLimitBytes;
+    KJ_FAIL_REQUIRE("database seed disk budget exceeded", job->required, job->limit);
+  }
   co_await log.dropColdFiles(reservation); checkOwner();
   job->diskBase = log.diskUsedBytes; job->availableBytes = std::filesystem::space(log.settings.stackDirectory).available;
   job->imageBytes = imageBytes; disk(*job, imageBytes);
@@ -201,14 +209,14 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
   if (source.hasSnapshot) {
     auto index = co_await get(objectSnapshotIndexKey(source.namespaceId, source.objectId, source.snapshotSequence));
     KJ_REQUIRE(index.status == 200, "frozen source snapshot index is missing"); const auto partBytes = sourcePartBytes(index.bytes, source);
-    job->phase = "downloading"; co_await downloadRecoverySnapshot(get, source, destination, log.settings.stackDirectory, staging, partBytes, 1, checkOwner); checkOwner();
+    job->phase = "downloading"; co_await downloadRecoverySnapshot(get, source, destination, log.settings.stackDirectory, staging, partBytes, 1, checkOwner, [this]() { return log.timer.afterDelay(1 * kj::MILLISECONDS); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
   }
   job->phase = "replaying";
   auto replayed = co_await log.replayToAsync(destination, input.sourceNamespace + "/" + input.sourceObject, source.shardEpoch,
       staging, std::move(records), source.facets, source.snapshotShardEpoch, {source.isolated.begin(), source.isolated.end()}, {}, checkOwner);
   const auto path = destination.databasePath(log.settings.stackDirectory, 0, "", staging);
   if (!std::filesystem::exists(path)) { const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600); KJ_REQUIRE(fd >= 0, "cannot create empty seed image"); ::close(fd); }
-  const auto expected = recoveryFileDigest(path); job->imageBytes = expected.bytes; disk(*job, expected.bytes); checkOwner();
+  const auto expected = co_await recoveryFileDigestAsync(path, [this]() { return log.timer.afterDelay(1 * kj::MILLISECONDS); }, checkOwner); job->imageBytes = expected.bytes; disk(*job, expected.bytes); checkOwner();
   auto existing = co_await get(objectManifestKey(input.namespaceId, input.objectId, 1));
   if (existing.status == 404) {
     KJ_REQUIRE(!registered(input.namespaceId), "destination namespace is already in the catalog");
@@ -238,8 +246,8 @@ kj::Promise<void> DatabaseSeed::run(std::shared_ptr<Job> job) {
       "destination manifest 1 conflicts with the frozen source image");
   auto index = co_await get(objectSnapshotIndexKey(input.namespaceId, input.objectId, manifest->snapshotSequence));
   KJ_REQUIRE(index.status == 200, "published destination snapshot index is absent"); const auto partBytes = sourcePartBytes(index.bytes, *manifest);
-  co_await downloadRecoverySnapshot(get, *manifest, destination, log.settings.stackDirectory, verifying, partBytes, 1, checkOwner); checkOwner();
-  const auto verified = recoveryFileDigest(destination.databasePath(log.settings.stackDirectory, 0, "", verifying));
+  co_await downloadRecoverySnapshot(get, *manifest, destination, log.settings.stackDirectory, verifying, partBytes, 1, checkOwner, [this]() { return log.timer.afterDelay(1 * kj::MILLISECONDS); }, [job](double ms) { job->downloadFsyncMs.push_back(ms); }); checkOwner();
+  const auto verified = co_await recoveryFileDigestAsync(destination.databasePath(log.settings.stackDirectory, 0, "", verifying), [this]() { return log.timer.afterDelay(1 * kj::MILLISECONDS); }, checkOwner);
   KJ_REQUIRE(verified.sha256 == expected.sha256 && verified.bytes == expected.bytes, "published destination image differs");
   job->result = "{\"namespaceId\":" + quote(input.namespaceId) + ",\"objectId\":" + quote(input.objectId) + ",\"revision\":\"1\",\"manifestSha256\":" +
       quote(objectSha256(existing.bytes)) + ",\"bytes\":\"" + std::to_string(expected.bytes) + "\",\"sha256\":" + quote(expected.sha256) + "}"; job->phase = "completed";

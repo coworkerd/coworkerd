@@ -73,6 +73,38 @@ std::string DatabaseTimeTravel::Point::json() const {
   return "{\"revision\":\"" + std::to_string(revision) + "\",\"writtenAtUnixMs\":\"" + std::to_string(writtenAtUnixMs) +
       "\",\"bookmark\":" + quote(bookmark()) + "}";
 }
+// Idle requests cannot permanently reserve another tenant's capacity. In-flight
+// callers retain shared ownership even if an idle cache entry expires.
+void DatabaseTimeTravel::expireJobs() {
+  const auto now = monotonicTimeMs();
+  for (auto it = jobs.begin(); it != jobs.end();) {
+    const auto& job = *it->second;
+    if (!job.registering && now - job.touchedAtMs >= (job.result.empty() ? 60000 : 600000)) it = jobs.erase(it);
+    else ++it;
+  }
+}
+void DatabaseTimeTravel::remember(const std::string& key, std::shared_ptr<Intent> intent) {
+  expireJobs();
+  if (auto found = jobs.find(key); found != jobs.end()) {
+    const auto& prior = *found->second;
+    if (prior.namespaceId != intent->namespaceId || prior.name != intent->name || prior.sourceDatabase != intent->sourceDatabase)
+      refuse(409, "CONFLICT", "operationId already has different restore parameters");
+    return;
+  }
+  size_t tenantCount = 0;
+  for (const auto& [id, job] : jobs) if (job->tenant == intent->tenant) ++tenantCount;
+  auto evictCompleted = [&](bool sameTenant) {
+    auto oldest = jobs.end();
+    for (auto it = jobs.begin(); it != jobs.end(); ++it)
+      if (!it->second->registering && !it->second->result.empty() && (!sameTenant || it->second->tenant == intent->tenant) &&
+          (oldest == jobs.end() || it->second->touchedAtMs < oldest->second->touchedAtMs)) oldest = it;
+    if (oldest == jobs.end()) return false;
+    jobs.erase(oldest); return true;
+  };
+  if (tenantCount >= 16 && !evictCompleted(true)) refuse(429, "RESTORE_BUSY", "this tenant has 16 pending restore requests; retry after idle requests expire");
+  if (jobs.size() >= 1024 && !evictCompleted(false)) refuse(503, "RESTORE_BUSY", "this control plane has 1024 cached restore requests; retry later");
+  intent->touchedAtMs = monotonicTimeMs(); jobs[key] = std::move(intent);
+}
 std::string DatabaseTimeTravel::source(const std::string& tenant, const std::string& database) const {
   const auto* manifest = context.state.tenant(tenant);
   if (!manifest || !manifest->record || manifest->record->status != "active") refuse(409, "CONFLICT", "the source tenant must be active");
@@ -200,12 +232,14 @@ std::optional<std::string> DatabaseTimeTravel::registered(const Intent& intent) 
       ",\"database\":" + quote(intent.name) + ",\"namespaceId\":" + quote(intent.namespaceId) + ",\"point\":" + intent.point.json() + "}";
 }
 kj::Promise<std::optional<std::string>> DatabaseTimeTravel::recognize(std::shared_ptr<Intent> intent) {
-  const auto* current = context.state.tenant(intent->tenant);
-  if (!current) co_return std::nullopt;
-  auto entry = current->databases.find(intent->name);
-  if (entry == current->databases.end() || entry->second.id != intent->namespaceId) co_return std::nullopt;
+  {
+    const auto* current = context.state.tenant(intent->tenant);
+    if (!current) co_return std::nullopt;
+    auto entry = current->databases.find(intent->name);
+    if (entry == current->databases.end() || entry->second.id != intent->namespaceId) co_return std::nullopt;
+  }
   // A lost reply may have left a created tenant revision before its index CAS.
-  // Complete the normal conditional write, including its global ownership check,
+  // Complete the normal conditional write and index visibility,
   // before interpreting the in-memory catalog entry as a successful receipt.
   co_await context.state.writeTenant(intent->tenant, [&](TenantManifest& next) -> kj::Promise<void> {
     if (destination(*intent) != intent->namespaceId) refuse(409, "CONFLICT", "restore namespace provenance differs");
@@ -243,15 +277,23 @@ kj::Promise<DatabaseTimeTravel::NodeAnswer> DatabaseTimeTravel::node(std::string
 kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string database, std::string body) {
   try {
     capnp::MallocMessageBuilder message; auto root = message.initRoot<capnp::JsonValue>();
-    capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), root);
+    try { capnp::JsonCodec().decodeRaw(kj::arrayPtr(body.data(), body.size()), root); }
+    catch (const kj::Exception&) { refuse(400, "INVALID_REQUEST", "invalid restore JSON"); }
+    if (!root.isObject()) refuse(400, "INVALID_REQUEST", "restore JSON must be an object");
+    auto text = [&](const char* name) {
+      auto field = json::field(root, name);
+      if (!field.isString()) refuse(400, "INVALID_REQUEST", std::string(name) + " must be a string");
+      return std::string(field.getString().cStr());
+    };
     auto intent = std::make_shared<Intent>(); intent->tenant = tenant; intent->sourceDatabase = database;
-    intent->name = json::text(root, "name"); intent->operationId = json::text(root, "operationId");
+    intent->name = text("name"); intent->operationId = text("operationId");
     if (!tenantName(intent->name) || !operation(intent->operationId)) refuse(400, "INVALID_REQUEST", "invalid destination name or operationId (16-128 alphanumeric/hyphen characters)");
     std::map<std::string, std::string> selector;
-    for (const auto* name : {"bookmark", "timestamp"}) if (!json::field(root, name).isNull()) selector[name] = json::text(root, name);
+    for (const auto* name : {"bookmark", "timestamp"}) if (!json::field(root, name).isNull()) selector[name] = text(name);
     if (selector.size() != 1) refuse(400, "INVALID_REQUEST", "restore requires exactly one bookmark or timestamp");
     intent->point = co_await resolve(source(tenant, database), selector);
     intent->namespaceId = destination(*intent);
+    expireJobs();
     const auto key = tenant + "/" + intent->operationId;
     if (auto old = jobs.find(key); old != jobs.end()) {
       const auto& prior = *old->second;
@@ -261,21 +303,27 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::start(std::string tenant, std::string
     }
     if (auto done = co_await recognize(intent)) { intent->result = *done; co_return ApiAnswer::ok(*done); }
     const auto reported = co_await usage(tenant);
-    precheck(*context.state.tenant(tenant), intent->name, intent->namespaceId, intent->point.bytes, reported);
-    if (!jobs.contains(key) && jobs.size() >= 128) {
-      auto old = std::find_if(jobs.begin(), jobs.end(), [](const auto& e) { return !e.second->result.empty(); });
-      if (old != jobs.end()) jobs.erase(old);
-      else refuse(503, "RESTORE_BUSY", "this control plane has 128 in-memory restore requests; retry later");
+    // No mirror pointer survives an await. Deletion/recreation may replace the
+    // tenant while history and usage are being read.
+    if (source(tenant, database) != intent->point.namespaceId) refuse(409, "CONFLICT", "the source database changed while starting restore");
+    {
+      const auto* current = context.state.tenant(tenant);
+      if (!current) refuse(409, "CONFLICT", "the source tenant disappeared while starting restore");
+      precheck(*current, intent->name, intent->namespaceId, intent->point.bytes, reported);
     }
-    jobs[key] = intent;
+    remember(key, intent); intent = jobs.at(key); intent->touchedAtMs = monotonicTimeMs();
+    auto removeUnaccepted = kj::defer([this, key, intent]() {
+      auto found = jobs.find(key);
+      if (!intent->accepted && found != jobs.end() && found->second == intent) jobs.erase(found);
+    });
     const auto& p = intent->point;
     const auto input = "{\"source\":{\"namespaceId\":" + quote(p.namespaceId) + ",\"objectId\":" + quote(p.objectId) +
         ",\"revision\":\"" + std::to_string(p.revision) + "\",\"sha256\":" + quote(p.sha256) + "},\"destination\":{\"namespaceId\":" +
         quote(intent->namespaceId) + ",\"objectId\":" + quote(objectId(intent->namespaceId)) + ",\"tenant\":" + quote(tenant) + "}}";
     for (const auto& member : co_await readStoreMembers(context.storage, context.memberTtlSeconds, context.memberGraceMs)) {
       auto answer = co_await node(member.address, true, input);
-      if (answer.status == 202) co_return ApiAnswer::ok("{\"known\":true,\"operationId\":" + quote(intent->operationId) +
-          ",\"namespaceId\":" + quote(intent->namespaceId) + ",\"phase\":\"started\",\"point\":" + p.json() + "}");
+      if (answer.status == 202) { intent->accepted = true; intent->touchedAtMs = monotonicTimeMs(); co_return ApiAnswer::ok("{\"known\":true,\"operationId\":" + quote(intent->operationId) +
+          ",\"namespaceId\":" + quote(intent->namespaceId) + ",\"phase\":\"started\",\"point\":" + p.json() + "}"); }
     }
     refuse(503, "RESTORE_UNAVAILABLE", "no target owner accepted the restore; retry with the same operationId and bookmark");
   } catch (const kj::Exception& error) { co_return failure(error); }
@@ -285,8 +333,8 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::finish(std::shared_ptr<Intent> intent
   const auto bytes = co_await verifySeedFirstManifest(context.storage, intent->namespaceId, manifestSha256);
   const auto reported = co_await usage(intent->tenant);
   co_await context.state.writeTenant(intent->tenant, [&](TenantManifest& next) -> kj::Promise<void> {
-    // Recompute inside the tenant conditional update. The global tenant-index
-    // CAS then checks this N against every indexed tenant before making it visible.
+    // Recompute inside this tenant conditional update. The tenant in the MAC
+    // prevents cross-tenant collisions; no scan of unrelated tenants is needed.
     if (destination(*intent) != intent->namespaceId) refuse(409, "CONFLICT", "restore namespace provenance differs");
     if (auto found = next.databases.find(intent->name); found != next.databases.end() && found->second.id == intent->namespaceId && found->second.status == "active") co_return;
     auto source = next.databases.find(intent->sourceDatabase);
@@ -302,9 +350,10 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::finish(std::shared_ptr<Intent> intent
 kj::Promise<ApiAnswer> DatabaseTimeTravel::progress(std::string tenant, std::string operationId) {
   try {
     if (!operation(operationId)) refuse(400, "INVALID_REQUEST", "invalid operationId");
+    expireJobs();
     auto found = jobs.find(tenant + "/" + operationId);
     if (found == jobs.end()) co_return ApiAnswer::ok("{\"known\":false}");
-    auto intent = found->second;
+    auto intent = found->second; intent->touchedAtMs = monotonicTimeMs();
     if (auto done = co_await recognize(intent)) co_return ApiAnswer::ok(*done);
     if (intent->registering) co_return ApiAnswer::ok("{\"known\":true,\"phase\":\"registering\"}");
     std::optional<std::pair<std::string, std::string>> pending, failed;

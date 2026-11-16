@@ -538,9 +538,12 @@ private:
         co_return co_await methodNotAllowed(response, "POST, GET, DELETE");
       }
       if (n == 7 && segments[5] == "time-travel") {
-        if (segments[6] == "info" && is(kj::HttpMethod::GET))
+        if (segments[6] == "info") {
+          if (!is(kj::HttpMethod::GET)) co_return co_await methodNotAllowed(response, "GET");
           co_return co_await send(response, co_await timeTravel.info(tenant, database, query));
-        if (segments[6] == "restore" && is(kj::HttpMethod::POST)) {
+        }
+        if (segments[6] == "restore") {
+          if (!is(kj::HttpMethod::POST)) co_return co_await methodNotAllowed(response, "POST");
           auto text = co_await readBody(body, response, 16384, "a restore request is at most 16 KiB");
           if (text) co_await send(response, co_await timeTravel.start(tenant, database, *text));
           co_return;

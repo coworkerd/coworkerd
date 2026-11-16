@@ -31,6 +31,7 @@ private:
     uint64_t nodeEpoch = 0, bytes = 0, required = 0, limit = 0, imageBytes = 0;
     uint64_t diskBase = 0, availableBytes = 0;
     double maxLoopDelayMs = 0;
+    std::vector<double> downloadFsyncMs;
     std::string resource;
     HistoryBudget budget;
     bool finished = false;

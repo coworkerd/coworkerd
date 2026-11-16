@@ -686,7 +686,7 @@ private:
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
-      const std::string& staging);
+      const std::string& staging, std::function<void()> check = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
       off_t offset);
   kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName);
