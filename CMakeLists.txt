@@ -108,6 +108,7 @@ add_executable(coworkerd
   node/membership.c++
   node/durable-shards.c++
   node/durable-log.c++
+  node/alarm-publication.c++
   node/recovery-history.c++
   node/database-seed.c++
   node/root-objects.c++

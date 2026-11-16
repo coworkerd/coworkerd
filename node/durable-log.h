@@ -1,5 +1,7 @@
 #pragma once
 
+#include "alarm-publication.h"
+
 #include "config.h"
 #include "coworkerd.capnp.h"
 #include "membership.h"
@@ -657,8 +659,8 @@ private:
 
   // ---- alarms ----
   void alarmReported(const std::string& objectName, uint32_t facetId, uint64_t atUnixMs);
-  kj::Promise<void> writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard, uint64_t atUnixMs,
-      uint32_t facetId);
+  void writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard, uint64_t atUnixMs,
+      uint32_t facetId, uint64_t shardEpoch, std::string tenant);
   kj::Promise<void> readAlarmHints(std::string namespaceId, uint32_t shard, uint64_t shardEpoch, std::string tenant);
   kj::Promise<void> alarmLoop();
   kj::Promise<void> fireAlarm(std::string key);
@@ -832,6 +834,7 @@ private:
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
+  std::unique_ptr<AlarmPublication> alarmPublication;
   uint64_t positionWrites = 0, quotaRefusals = 0;
   bool sealing = false, noPeerWarned = false;
   bool sealingForRecovery = false;

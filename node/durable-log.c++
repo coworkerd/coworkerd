@@ -807,10 +807,30 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
       membership(membershipParam),
       hooks(std::move(hooksParam)) {
   settings.config.validate();
-  if (settings.objectStore && !storeConfig.endpoint.empty()) store.emplace(storeConfig, network, timer);
+  if (settings.objectStore && !storeConfig.endpoint.empty()) {
+    store.emplace(storeConfig, network, timer);
+    alarmPublication = std::make_unique<AlarmPublication>(*store, timer, this->settings.nodeId,
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch, uint64_t memberEpoch) {
+          if (stopped || memberEpoch != nodeEpoch || membership.selfExpired || membership.identityTaken) return false;
+          auto fence = ownerFenceThrough.find({ns, shard});
+          if (epoch && fence != ownerFenceThrough.end() && fence->second >= epoch) return false;
+          const auto known = hooks.knownShardEpoch ? hooks.knownShardEpoch(ns, shard) : 0;
+          return !epoch || !known || known == epoch;
+        },
+        [this](const std::string& ns, const std::string& object, uint32_t shard, uint64_t epoch,
+            const std::string& tenant, uint64_t at) {
+          const auto key = ns + "/" + object + "/0";
+          auto found = alarms.find(key);
+          if (found != alarms.end() && !found->second.fromHint) return;
+          auto& state = alarms[key];state.namespaceId = ns;state.objectId = object;state.tenant = tenant;
+          state.shard = shard;state.shardEpoch = epoch;state.atUnixMs = at;state.fromHint = true;
+          ++alarmsAdopted;
+        }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
+  }
 }
 
 DurableLog::~DurableLog() noexcept(false) {
+  alarmPublication.reset();
   if (logFd >= 0) ::close(logFd);
   if (recoveryFd >= 0) ::close(recoveryFd);
 }
@@ -898,6 +918,7 @@ void DurableLog::setNodeEpoch(uint64_t epoch) {
   }
   if (recoveryFd >= 0) { ::close(recoveryFd); recoveryFd = -1; }
   nodeEpoch = epoch;
+  if (alarmPublication) alarmPublication->setNodeEpoch(epoch);
   recoverySerial = 0;
   carriedRecoveryObjects.clear();
   logAppendFailed = false;
@@ -1212,6 +1233,13 @@ kj::Promise<void> DurableLog::start() {
     }
   }
   startupReady = true;
+  if (alarmPublication) {
+    std::map<std::pair<std::string, uint32_t>, std::string> known;
+    for (const auto& [name, object]: objects) known[{object.namespaceId, object.shard}] = object.tenant;
+    for (const auto& [epoch, predecessor]: predecessorLogs)
+      for (const auto& shard: predecessor.shards) known.try_emplace(shard, "");
+    for (const auto& [shard, tenant]: known) alarmPublication->restore(shard.first, shard.second, tenant);
+  }
   diskLimitBytes = settings.config.diskBytes;
   if (!diskLimitBytes) {
     auto space = std::filesystem::space(settings.stackDirectory, code);
@@ -5138,7 +5166,7 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
     if (previous || had) {
       log("alarm-cleared", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
               ",\"was\":" + std::to_string(previous));
-      tasks.add(writeAlarmHint(object->namespaceId, object->objectId, object->shard, 0, facetId));
+      writeAlarmHint(object->namespaceId, object->objectId, object->shard, 0, facetId, object->shardEpoch, object->tenant);
     }
     return;
   }
@@ -5162,95 +5190,27 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
     state.notBeforeMs = 0;
     log("alarm-set", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
             ",\"atUnixMs\":" + std::to_string(atUnixMs));
-    tasks.add(writeAlarmHint(object->namespaceId, object->objectId, object->shard, atUnixMs, facetId));
+    writeAlarmHint(object->namespaceId, object->objectId, object->shard, atUnixMs, facetId, object->shardEpoch, object->tenant);
   }
 }
 
-// The hint: written when an object's alarm changes, removed when it is cleared. It is overwritable and carries no
-// correctness -- a stale one costs one wake, a missing one costs a delay until the object is next opened.
-kj::Promise<void> DurableLog::writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard,
-    uint64_t atUnixMs, uint32_t facetId) {
-  if (!enabled()) co_return;
-  const auto key = shardAlarmKey(namespaceId, shard, objectId, facetId);
-  try {
-    if (atUnixMs == 0) {
-      co_await store->remove(key);
-    } else {
-      co_await store->put(key, "{\"atUnixMs\":" + std::to_string(atUnixMs) + ",\"facetId\":" +
-              std::to_string(facetId) + ",\"nodeId\":" + quote(settings.nodeId) + ",\"writtenAtUnixMs\":" +
-              std::to_string(realClockUnixMs()) + "}\n");
-    }
-    ++alarmHintWrites;
-  } catch (const kj::Exception& error) {
-    ++alarmHintFailures;
-    log("alarm-hint-failed", "\"key\":" + quote(key) + ",\"error\":" +
-            quote(std::string(error.getDescription().cStr())));
-  }
+// Publication is auxiliary and never joins a storage confirmation. The latest desired state is coalesced.
+void DurableLog::writeAlarmHint(std::string namespaceId, std::string objectId, uint32_t shard,
+    uint64_t atUnixMs, uint32_t facetId, uint64_t shardEpoch, std::string tenant) {
+  if (!enabled() || facetId != 0 || !alarmPublication) return;
+  alarmPublication->report(std::move(namespaceId), std::move(objectId), shard, shardEpoch, std::move(tenant), atUnixMs);
 }
 
-// The hints of a shard this node has just taken: each becomes an alarm to fire, marked as coming from a hint. The
-// first firing opens the object, which reports what its own database holds -- a hint for an alarm that already ran
-// is dropped then, so an alarm is never fired twice for one scheduled time.
 kj::Promise<void> DurableLog::readAlarmHints(std::string namespaceId, uint32_t shard, uint64_t shardEpoch,
     std::string tenant) {
-  if (!enabled()) co_return;
-  ObjectListing listing;
-  try {
-    listing = co_await store->list(shardAlarmPrefix(namespaceId, shard), 1000);
-  } catch (const kj::Exception& error) {
-    log("alarm-hints-failed", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
-            ",\"error\":" + quote(std::string(error.getDescription().cStr())));
-    co_return;
-  }
-  uint32_t adopted = 0;
-  const auto prefix = shardAlarmPrefix(namespaceId, shard);
-  for (const auto& listed : listing.objects) {
-    if (!listed.key.starts_with(prefix)) continue;
-    const auto relative = listed.key.substr(prefix.size());
-    if (relative.size() != 66 || !relative.ends_with("/0")) continue;
-    const auto objectId = relative.substr(0, 64);
-    if (objectId.size() != 64) continue;
-    uint64_t atUnixMs = 0;
-    constexpr uint32_t facetId = 0;
-    try {
-      auto answer = co_await store->get(listed.key);
-      if (answer.status != 200) continue;
-      capnp::MallocMessageBuilder message;
-      auto value = message.initRoot<capnp::JsonValue>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.bytes.data(), answer.bytes.size()), value);
-      auto reader = value.asReader();
-      atUnixMs = uint64_t(numberField(reader, "atUnixMs"));
-      const auto facetValue = json::field(reader, "facetId");
-      if (facetValue.which() != capnp::JsonValue::NUMBER || facetValue.getNumber() != 0) continue;
-    } catch (const kj::Exception&) {
-      continue;
-    }
-    if (!atUnixMs) continue;
-    const auto key = namespaceId + "/" + objectId + "/" + std::to_string(facetId);
-    auto found = alarms.find(key);
-    // An alarm the objects here already reported is the truth: a hint never replaces it.
-    if (found != alarms.end() && !found->second.fromHint) continue;
-    auto& state = alarms[key];
-    state.namespaceId = namespaceId;
-    state.objectId = objectId;
-    state.tenant = tenant;
-    state.shard = shard;
-    state.facetId = facetId;
-    state.shardEpoch = shardEpoch;
-    state.atUnixMs = atUnixMs;
-    state.fromHint = true;
-    state.notBeforeMs = 0;
-    ++adopted;
-  }
-  alarmsAdopted += adopted;
-  if (adopted) log("alarms-adopted", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" +
-          std::to_string(shard) + ",\"shardEpoch\":\"" + std::to_string(shardEpoch) + "\",\"alarms\":" +
-          std::to_string(adopted));
+  if (enabled() && alarmPublication) alarmPublication->take(std::move(namespaceId), shard, shardEpoch, std::move(tenant));
+  co_return;
 }
 
 kj::Promise<void> DurableLog::alarmLoop() {
   for (;;) {
     co_await timer.afterDelay(200 * kj::MILLISECONDS);
+    if (alarmPublication) alarmPublication->tick();
     if (!hooks.fireAlarm) continue;
     const auto now = realClockUnixMs();
     const auto mono = monotonicTimeMs();
@@ -5294,11 +5254,15 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
     // Its schedule is gone (the object reported the clearing, or the shard left this node): the hint goes with it.
     log(result.outcome == AlarmOutcome::FIRED ? "alarm-fired" : "alarm-done", fields + ",\"scheduled\":false");
     if (result.outcome == AlarmOutcome::FIRED)
-      tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+      writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
     co_return;
   }
   auto& state = again->second;
   state.firing = false;
+  if (state.atUnixMs != ask.atUnixMs || state.shardEpoch != ask.shardEpoch) {
+    log("alarm-completion-superseded", fields);
+    co_return;
+  }
   switch (result.outcome) {
     case AlarmOutcome::FIRED: {
       log("alarm-fired", fields + ",\"retries\":" + std::to_string(state.retries));
@@ -5307,7 +5271,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
       // object's database is still the truth and reports again at its next open.
       if (state.atUnixMs == ask.atUnixMs) {
         alarms.erase(key);
-        tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
       }
       co_return;
     }
@@ -5316,14 +5280,14 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
       state.fromHint = false;
       if (result.atUnixMs == 0) {
         alarms.erase(key);
-        tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId));
+        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
       } else {
         state.atUnixMs = result.atUnixMs;
         state.retries = 0;
         state.countedRetries = 0;
         state.backoff = 0;
         state.notBeforeMs = 0;
-        tasks.add(writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, result.atUnixMs, ask.facetId));
+        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, result.atUnixMs, ask.facetId, ask.shardEpoch, ask.tenant);
       }
       co_return;
     }
@@ -5725,6 +5689,7 @@ void DurableLog::fenceOwner(const std::string& namespaceId, uint32_t shard, uint
 }
 
 void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const std::string& reason) {
+  if (alarmPublication) alarmPublication->gone(namespaceId, shard);
   uint64_t through = hooks.knownShardEpoch ? hooks.knownShardEpoch(namespaceId, shard) : 0;
   for (const auto& [name, object] : objects)
     if (object.namespaceId == namespaceId && object.shard == shard) through = std::max(through, object.shardEpoch);
@@ -6202,7 +6167,8 @@ std::string DurableLog::json() const {
       << ",\"objectFailures\":" << objectFailures << "},\"alarms\":{\"scheduled\":" << alarms.size() << ",\"set\":" << alarmsSet << ",\"cleared\":"
       << alarmsCleared << ",\"fired\":" << alarmsFired << ",\"failed\":" << alarmFailures << ",\"retries\":"
       << alarmRetries << ",\"notDue\":" << alarmsNotDue << ",\"adopted\":" << alarmsAdopted << ",\"dropped\":"
-      << alarmsDropped << ",\"hintWrites\":" << alarmHintWrites << ",\"hintFailures\":" << alarmHintFailures
+      << alarmsDropped << ",\"hintWrites\":" << (alarmHintWrites + (alarmPublication ? alarmPublication->hintWrites : 0)) << ",\"hintFailures\":" << (alarmHintFailures + (alarmPublication ? alarmPublication->hintFailures : 0))
+      << (alarmPublication ? "," + alarmPublication->json() : "")
       << ",\"next\":[";
   first = true;
   {

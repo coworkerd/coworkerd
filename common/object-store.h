@@ -83,6 +83,14 @@ struct ObjectListing {
   uint32_t pages = 0;
 };
 
+// One ListObjectsV2 page, including delimiter groups. An empty nextToken is the last page.
+struct ObjectListingPage {
+  std::vector<ListedObject> objects;
+  std::vector<std::string> commonPrefixes;
+  std::string nextToken;
+  uint64_t dateUnixMs = 0;
+};
+
 // A create-if-absent write: created, or the key existed already (the store kept the bytes it had).
 struct CreateResult {
   bool created = false;
@@ -118,6 +126,8 @@ public:
   // Every object whose key starts with `prefix` (ListObjectsV2, page after page until the store says that was the
   // last one); `maxKeys` bounds one page.
   kj::Promise<ObjectListing> list(std::string prefix, uint32_t maxKeys = 1000);
+  kj::Promise<ObjectListingPage> listPage(std::string prefix, uint32_t maxKeys = 1000,
+      std::string token = {}, std::string delimiter = {});
   // One LIST page with max-keys=1; does not follow continuation tokens.
   kj::Promise<bool> hasAny(std::string prefix);
   // DELETE. A key that does not exist is removed as well (S3 answers 204 either way).

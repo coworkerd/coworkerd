@@ -559,6 +559,54 @@ kj::Promise<ObjectListing> ObjectStore::list(std::string prefix, uint32_t maxKey
   co_return listing;
 }
 
+kj::Promise<ObjectListingPage> ObjectStore::listPage(std::string prefix, uint32_t maxKeys,
+    std::string token, std::string delimiter) {
+  KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
+  KJ_REQUIRE(!prefix.empty() && stateKey(prefix, true), "a page needs an explicit valid prefix");
+  KJ_REQUIRE(maxKeys >= 1 && maxKeys <= 1000, "a listing page holds 1 to 1000 keys");
+  KJ_REQUIRE(delimiter.empty() || delimiter == "/", "the supported delimiter is a path separator");
+  Call call{kj::HttpMethod::GET, "", "", true,
+      {{"list-type", "2"}, {"max-keys", std::to_string(maxKeys)}, {"prefix", prefix}}};
+  if (!token.empty()) call.query.emplace_back("continuation-token", token);
+  if (!delimiter.empty()) call.query.emplace_back("delimiter", delimiter);
+  auto response = co_await send(std::move(call));
+  requireStorage(response.status == 200, "object page listing failed: HTTP " + std::to_string(response.status));
+  const std::string_view xml(response.bytes);
+  requireStorage(xml.find("<ListBucketResult") != std::string_view::npos, "object page answer is not a listing");
+  ObjectListingPage page;page.dateUnixMs = response.dateUnixMs;
+  for (size_t at = xml.find("<Contents>"); at != std::string_view::npos; at = xml.find("<Contents>", at)) {
+    const auto end = xml.find("</Contents>", at);
+    requireStorage(end != std::string_view::npos, "object page is cut short");
+    const auto block = xml.substr(at, end - at);
+    ListedObject object;
+    object.key = element(block, "Key");object.lastModifiedUnixMs = isoTimeUnixMs(element(block, "LastModified"));
+    object.etag = element(block, "ETag");
+    if (object.etag.size() >= 2 && object.etag.front() == '"' && object.etag.back() == '"')
+      object.etag = object.etag.substr(1, object.etag.size() - 2);
+    const auto size = element(block, "Size");object.size = size.empty() ? 0 : std::strtoull(size.c_str(), nullptr, 10);
+    object.pageDateUnixMs = response.dateUnixMs;
+    requireStorage(object.key.starts_with(prefix) && object.lastModifiedUnixMs > 0,
+        "object page entry is outside its prefix or has no modification time");
+    page.objects.push_back(std::move(object));at = end;
+  }
+  for (size_t at = xml.find("<CommonPrefixes>"); at != std::string_view::npos; at = xml.find("<CommonPrefixes>", at)) {
+    const auto end = xml.find("</CommonPrefixes>", at);
+    requireStorage(end != std::string_view::npos, "object page prefix is cut short");
+    auto group = element(xml.substr(at, end - at), "Prefix");
+    requireStorage(!delimiter.empty() && group.starts_with(prefix) && group.ends_with(delimiter),
+        "object page group is outside its prefix");
+    page.commonPrefixes.push_back(std::move(group));at = end;
+  }
+  const auto truncated = element(xml, "IsTruncated");
+  requireStorage(truncated == "true" || truncated == "false", "object page has no completeness flag");
+  if (truncated == "true") {
+    page.nextToken = element(xml, "NextContinuationToken");
+    requireStorage(!page.nextToken.empty() && page.nextToken != token, "object page has no advancing continuation token");
+  }
+  requireStorage(page.objects.size() + page.commonPrefixes.size() <= maxKeys, "object page exceeds its key limit");
+  co_return page;
+}
+
 kj::Promise<ObjectResponse> ObjectStore::remove(std::string key) {
   KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
   KJ_REQUIRE(!key.empty(), "remove needs a key");
