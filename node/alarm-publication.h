@@ -60,6 +60,7 @@ private:
   kj::Promise<void> readHints(std::string key);
   kj::Promise<void> checkMarkers();
   uint32_t retry(uint32_t& failures);
+  double hintCheckInterval() const;
   void taskFailed(kj::Exception&& error) override;
 
   ObjectStore& store;
