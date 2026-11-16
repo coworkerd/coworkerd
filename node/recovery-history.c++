@@ -15,6 +15,23 @@
 #include <system_error>
 namespace coworkerd {
 using json::quote;
+namespace {
+struct SegmentDecodeResult { std::optional<SegmentContents> contents; std::string error; };
+kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {
+  auto pair = kj::newPromiseAndCrossThreadFulfiller<SegmentDecodeResult>();
+  auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<SegmentDecodeResult>>>(kj::mv(pair.fulfiller));
+  try {
+    std::thread([bytes = std::move(bytes), fulfiller]() {
+      try {
+        SegmentDecodeResult result; result.contents = decodeSegment(bytes, &result.error);
+        (*fulfiller)->fulfill(kj::mv(result));
+      } catch (kj::Exception& error) { (*fulfiller)->reject(kj::mv(error)); }
+      catch (const std::exception&) { (*fulfiller)->reject(KJ_EXCEPTION(FAILED, "cannot decode recovery segment")); }
+    }).detach();
+  } catch (const std::system_error&) { KJ_FAIL_REQUIRE("cannot start recovery segment decoder"); }
+  co_return co_await kj::mv(pair.promise);
+}
+} // namespace
 kj::Promise<bool> synchronizeRecoveryFile(int fd) {
   const int copy = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
   if (copy < 0) co_return false;
@@ -100,7 +117,14 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
     for (size_t i = 0; i < bodies.size(); ++i) {
       if (budget) budget->transient(bodies[i].size() * 6);
       std::string error;
-      auto contents = decodeSegment(bodies[i], &error);
+      std::optional<SegmentContents> contents;
+      if (yield) {
+        // The seed's existing one-segment budget covers the worker's owned input
+        // and decoded records. Ordinary recovery keeps its original reader.
+        auto decoded = co_await decodeRecoverySegmentAsync(std::move(bodies[i]));
+        if (check) check();
+        contents = std::move(decoded.contents); error = std::move(decoded.error);
+      } else contents = decodeSegment(bodies[i], &error);
       KJ_REQUIRE(contents.has_value(), "a segment of a Durable Object's log does not add up", error.c_str());
       auto began = monotonicTimeMs();
       for (auto& record : contents->records) {
