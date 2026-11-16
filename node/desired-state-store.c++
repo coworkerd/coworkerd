@@ -522,9 +522,11 @@ private:
     }
     if (!failure.empty()) {
       // The store cannot be read (or what it holds cannot): the node serves the state it has.
+      const bool reasonChanged = lastPollOk || lastPollError != failure;
       lastPollOk = false;
       lastPollError = failure;
-      if (++polls.failures == 1 || polls.failures % 60 == 0)
+      ++polls.failures;
+      if (reasonChanged || polls.failures % 60 == 0)
         std::cerr << "[deployment] poll failed failures=" << polls.failures << " reason=" << failure << std::endl;
     }
   }

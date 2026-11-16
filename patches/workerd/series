@@ -18,3 +18,4 @@
 0020-root-loader.patch
 0021-sql-execution-limit.patch
 0022-root-registry-scale.patch
+0023-plain-worker-entry.patch

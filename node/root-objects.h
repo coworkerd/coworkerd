@@ -1,5 +1,7 @@
 #pragma once
 
+#include "deployment.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -8,7 +10,6 @@
 namespace coworkerd {
 
 class DeploymentState;
-struct VersionDefinition;
 
 constexpr const char* DURABLE_ROOT_UNIQUE_KEY_PREFIX = "coworkerd-do-root-v1-";
 
@@ -39,6 +40,9 @@ struct RootDispatch {
   std::string plan, selection;
   std::string descriptor(std::string encoded) const;
 };
+
+RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
+    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib);
 
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
