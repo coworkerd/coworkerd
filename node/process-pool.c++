@@ -1359,6 +1359,7 @@ public:
   bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
   struct {uint64_t typed = 0, missing = 0, comparable = 0, matches = 0, mismatches = 0;} lifecycleLabels;
+  uint64_t legacyDrainChecks = 0, legacyDrainDisagreements = 0, legacyLimitChecks = 0, legacyLimitDisagreements = 0;
 
   Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
@@ -2586,6 +2587,8 @@ public:
   }
   bool labelledIsolate(ProcessGeneration& process, const std::string& isolate,
       const std::string& worker, const std::string& version) {
+    const auto legacy = isolate.starts_with("coworkerd-v1:" + worker + "@" + version + "#");
+    ++legacyLimitChecks;
     const auto snapshot = process.lifecycle.read();
     if (snapshot.empty()) return false;
     try {
@@ -2597,7 +2600,10 @@ public:
       for (auto row : residents.getArray()) {
         const auto name = json::field(row, "isolate"), owner = json::field(row, "workerId"), revision = json::field(row, "versionId");
         if (name.isString() && owner.isString() && revision.isString() && std::string(name.getString().cStr()) == isolate &&
-            std::string(owner.getString().cStr()) == worker && std::string(revision.getString().cStr()) == version) return true;
+            std::string(owner.getString().cStr()) == worker && std::string(revision.getString().cStr()) == version) {
+          if (!legacy) ++legacyLimitDisagreements;
+          return true;
+        }
       }
     } catch (const kj::Exception&) {}
     return false;
@@ -3000,6 +3006,11 @@ public:
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
       const auto workers = json::field(value, "residentWorkers");
       if (!workers.isArray()) return false;
+      const bool legacyWouldDrain = std::all_of(old.openContexts.begin(), old.openContexts.end(), [&](const auto& entry) {
+        const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
+        return entry.second.finishedAt != 0 && lifecycle.find(marker) == std::string::npos;
+      });
+      ++legacyDrainChecks;
       std::erase_if(old.openContexts, [&](const auto& entry) {
         if (entry.second.finishedAt == 0) return false;
         for (auto resident : workers.getArray()) {
@@ -3019,6 +3030,7 @@ public:
         ++old.contextsCleared; ++cleared;
         return true;
       });
+      if (legacyWouldDrain != old.openContexts.empty()) ++legacyDrainDisagreements;
     } catch (const kj::Exception&) {return false;}
 
     return old.openContexts.empty();
@@ -3546,7 +3558,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
 std::string ProcessPool::json(uint32_t idleMs) const {
   impl->refresh();
   impl->syncEvents();
-  (void)residentIsolatesByTenant();
+  const auto residentCounts = residentIsolatesByTenant();
   std::ostringstream out; out << std::setprecision(17) << "{\"configuration\":{\"count\":" << impl->config.count
       << ",\"cpuLimitMs\":" << impl->config.cpuLimitMs
       << ",\"memoryLimitMiB\":" << impl->config.memoryLimitMiB
@@ -3616,7 +3628,16 @@ std::string ProcessPool::json(uint32_t idleMs) const {
     if (p) for (size_t j = 0; j < p->probeDelays.size(); ++j) { if (j) out << ','; out << p->probeDelays[j]; }
     out << "]}";
   }
-  out << "],\"lifecycleLabels\":{\"typed\":" << impl->lifecycleLabels.typed
+  out << "],\"residentIsolatesByTenant\":{";
+  bool firstResidentTenant = true;
+  for (const auto& [tenant, count] : residentCounts) {
+    out << (firstResidentTenant ? "" : ",") << "\"" << escape(tenant) << "\":" << count;
+    firstResidentTenant = false;
+  }
+  out << "},\"legacyLifecycleComparison\":{\"drainChecks\":" << impl->legacyDrainChecks
+      << ",\"drainDisagreements\":" << impl->legacyDrainDisagreements
+      << ",\"limitChecks\":" << impl->legacyLimitChecks << ",\"limitDisagreements\":" << impl->legacyLimitDisagreements << "}"
+      << ",\"lifecycleLabels\":{\"typed\":" << impl->lifecycleLabels.typed
       << ",\"missing\":" << impl->lifecycleLabels.missing << ",\"comparable\":" << impl->lifecycleLabels.comparable
       << ",\"matches\":" << impl->lifecycleLabels.matches << ",\"mismatches\":" << impl->lifecycleLabels.mismatches
       << "},\"recentKills\":[";

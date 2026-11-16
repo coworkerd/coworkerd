@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 07:39:04 +0800
+Subject: [PATCH] Probe both ordinary trial views in the same compiled plan
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index a5e8077e6e2d57ed9d362c1139ca1624e893990f..da035ec7a6d5d5957c5501d41e6cd80061e38d8f 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -103,6 +103,8 @@ struct RootSelection {
+     #[serde(default)]
+     trial: bool,
+     #[serde(default)]
++    root_trial: bool,
++    #[serde(default)]
+     classes: Vec<String>,
+ }
+ 
+@@ -770,7 +772,7 @@ impl RootRegistry {
+         }
+         let props = if selection.trial {
+             ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
+-                json!({"trial": true,
++                json!({"trial": true, "rootTrial": selection.root_trial,
+                     "entrypoint": if selection.entrypoint.is_empty() { "default" } else { &selection.entrypoint },
+                     "classes": selection.classes})
+             } else { json!({"coworkerd:trial": true}) }.to_string())
