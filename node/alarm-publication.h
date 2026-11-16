@@ -86,7 +86,7 @@ private:
   void taskFailed(kj::Exception&&) override;
 
   ObjectStore& store;kj::Timer& timer;std::string nodeId;Current current;Adopt adopt;Log log;
-  uint64_t nodeEpoch = 0, serial = 0, nonemptyShards = 0, markerGeneration = 1;
+  uint64_t nodeEpoch = 0, serial = 0, nonemptyShards = 0, markerGeneration = 1, retryRandom = 0;
   std::unordered_map<std::string, Shard> shards;
   std::unordered_map<std::string, Write> writes;
   // These survive gone()/setNodeEpoch(): a physical request owns its key until it returns.
