@@ -244,13 +244,14 @@ void AlarmPublication::markerRestored() {
 }
 void AlarmPublication::pump(unsigned limit) {
   Scope measured(*this);if (stopping) return;
-  for (unsigned attempt = 0; attempt < limit && active < 8; ++attempt) {
+  for (unsigned attempt = 0; attempt < limit && active < 16; ++attempt) {
     const auto now = monotonicTimeMs();Ready work{};bool have = false, permissionProbe = false, gateProbe = false;
     auto choose = [this](std::set<Ready>& queue) {
       auto it = queue.upper_bound({lastTenant, UINT64_MAX, "", 5});if (it == queue.end()) it = queue.begin();auto value = *it;queue.erase(it);return value;
     };
-    // Reserve one H slot even if marker requests hang. M writes precede every scan.
-    if (activeMarkers + activeScans < 7 && markerDenied && !permissionProbeActive && now >= nextMarkerProbe) {
+    // Separate capacities preserve seven H slots even if all eight marker writes and one scan hang.
+    // M writes precede every scan; the total is bounded by sixteen.
+    if (activeMarkers < 8 && markerDenied && !permissionProbeActive && now >= nextMarkerProbe) {
       auto& candidates = deniedOperation == Probe::DELETE ? markerRemoves : markerPuts;
       if (deniedOperation != Probe::LIST) {
         unsigned n = 0;
@@ -261,11 +262,12 @@ void AlarmPublication::pump(unsigned limit) {
         }
       }
       nextMarkerProbe = now + 30000;permissionProbeActive = true;++markerProbes;
+      if (!have && activeScans) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
       if (!have) { ++active;++activeScans;tasks.add(kj::evalLater([this]() { return probeMarkers(); }));continue; }
     }
-    if (!have && activeMarkers + activeScans < 7 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers);have = true; }
+    if (!have && activeMarkers < 8 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers);have = true; }
     if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints);have = true; }
-    if (!have && activeMarkers + activeScans < 7 && !activeScans && !markerDenied && markerGate.available(now)) {
+    if (!have && !activeScans && !markerDenied && markerGate.available(now)) {
       if (!readyScans.empty()) { work = choose(readyScans);have = true; }
       else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
         gateProbe = markerGate.enter(now);globalScanRunning = true;++active;++activeScans;
@@ -610,6 +612,7 @@ std::string AlarmPublication::json() const {
       << ",\"publicationRetries\":" << retries << ",\"markerWrites\":" << markerWrites << ",\"markerDeletes\":" << markerDeletes << ",\"adoptionPages\":" << pages << ",\"adoptionMaxPage\":" << maxPage
       << ",\"oldestHintCheckMs\":" << oldest << ",\"hintCheckIntervalMs\":" << hintCheckInterval() << ",\"publicationShards\":" << shards.size() << ",\"publicationDesired\":" << desired
       << ",\"invalidAlarmHints\":" << badHints << ",\"markerAccessDenied\":" << (markerDenied ? "true" : "false") << ",\"markerDenials\":" << markerDenials << ",\"markerProbes\":" << markerProbes << ",\"markerPending\":" << markerPending
+      << ",\"publicationMaxConcurrency\":16,\"publicationHintCapacity\":7,\"publicationMarkerWriteCapacity\":8,\"publicationMarkerScanCapacity\":1"
       << ",\"publicationHintPending\":" << writes.size() - markerPending << ",\"publicationOwnerChanges\":" << ownerChanges << ",\"markerScanPages\":" << markerPages
       << ",\"hintPublicationBackoff\":" << (hintGate.open ? "true" : "false") << ",\"markerPublicationBackoff\":" << (markerGate.open ? "true" : "false")
       << ",\"publicationTickMaxItems\":" << tickMaxItems << ",\"publicationDeadlineRows\":" << deadlines.size()
