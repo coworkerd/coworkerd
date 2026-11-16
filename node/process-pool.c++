@@ -803,10 +803,8 @@ struct ProcessGeneration {
   bool probePending = false;
   double probeAttemptAt = 0;
   uint64_t probeAttempts = 0, probeFailures = 0;
-  bool rootMaintenancePending = false;
-  double nextRootMaintenance = 0;
-  std::string rootMaintenanceApplied;
-  uint64_t rootMaintenanceAttempts = 0, rootMaintenanceFailures = 0;
+  uint32_t rootMaintenancePending = 0;
+  uint64_t rootMaintenanceAttempts = 0, rootMaintenanceFailures = 0, rootMaintenanceCompleted = 0;
   // Limit event channel: the read end of the pipe whose write end the child
   // inherited. An observer on the event loop moves whatever arrives into `eventTail` (so the pipe
   // never fills and workerd's writes never wait); rows are parsed and applied only when needed --
@@ -1264,10 +1262,21 @@ public:
   ProcessPool::WorkerLimitsView workerLimits;
   std::function<std::shared_ptr<const std::vector<std::string>>()> rootMaintenance;
   std::function<void(const std::vector<std::string>&)> rootMaintenanceCompleted;
-  std::shared_ptr<const std::vector<std::string>> rootMaintenanceBatch;
-  std::vector<std::weak_ptr<ProcessGeneration>> rootMaintenanceTargets;
-  std::string rootMaintenanceBody;
-  uint64_t nextRootMaintenance = 0;
+  static constexpr size_t ROOT_MAINTENANCE_BATCH_SIZE = 64, ROOT_MAINTENANCE_CONCURRENCY = 4;
+  struct RootMaintenanceTarget {
+    std::weak_ptr<ProcessGeneration> process;
+    bool applied = false, pending = false;
+    double retryAt = 0;
+  };
+  struct RootMaintenanceBatch {
+    std::vector<std::string> ids;
+    std::string body;
+    std::vector<RootMaintenanceTarget> targets;
+  };
+  std::deque<std::shared_ptr<RootMaintenanceBatch>> rootMaintenanceBatches;
+  std::set<std::string> rootMaintenanceQueued;
+  std::shared_ptr<const std::vector<std::string>> rootMaintenanceWanted;
+  double nextRootMaintenance = 0;
   BinarySignature configuredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
@@ -2434,8 +2443,13 @@ public:
     if (p->probeStartedAt == 0) p->probeStartedAt = p->probeAttemptAt;
     tasks.add(probe(p));
   }
-  kj::Promise<void> maintainRoots(std::shared_ptr<ProcessGeneration> p, std::string body) {
-    auto completed = kj::defer([p] { p->rootMaintenancePending = false; });
+  kj::Promise<void> maintainRoots(std::shared_ptr<ProcessGeneration> p,
+      std::shared_ptr<RootMaintenanceBatch> batch, size_t targetIndex) {
+    auto completed = kj::defer([p, batch, targetIndex] {
+      --p->rootMaintenancePending;
+      batch->targets[targetIndex].pending = false;
+    });
+    const auto& body = batch->body;
     ++p->rootMaintenanceAttempts;
     try {
       // A separate client keeps a closing namespace from delaying this generation's health probes.
@@ -2458,40 +2472,57 @@ public:
         }
         KJ_FAIL_REQUIRE("root namespace cleanup was refused", response.statusCode);
       }
-      p->rootMaintenanceApplied = std::move(body);
+      batch->targets[targetIndex].applied = true;
+      ++p->rootMaintenanceCompleted;
     } catch (const kj::Exception&) {
       ++p->rootMaintenanceFailures;
+      batch->targets[targetIndex].retryAt = mono() + 1000;
     }
   }
   void maybeMaintainRoots() {
     if (!rootMaintenance || mono() < nextRootMaintenance) return;
-    nextRootMaintenance = mono() + 1000;
-    if (rootMaintenanceBatch && std::all_of(rootMaintenanceTargets.begin(), rootMaintenanceTargets.end(),
-        [&](const auto& target) {
-          auto p = target.lock();
-          return !p || p->pid == 0 || p->rootMaintenanceApplied == rootMaintenanceBody;
-        })) {
-      if (rootMaintenanceCompleted) rootMaintenanceCompleted(*rootMaintenanceBatch);
-      rootMaintenanceBatch.reset();rootMaintenanceTargets.clear();rootMaintenanceBody.clear();
-    }
-    const auto wanted = rootMaintenance();
-    if (!wanted || wanted->empty()) return;
-    if (!rootMaintenanceBatch || (wanted != rootMaintenanceBatch && *wanted != *rootMaintenanceBatch)) {
-      rootMaintenanceBatch = wanted;rootMaintenanceTargets.clear();
-      std::ostringstream body;body << "{\"namespaces\":[";
-      for (size_t i = 0; i < wanted->size(); ++i) body << (i ? ",\"" : "\"") << (*wanted)[i] << '"';
-      body << "]}";rootMaintenanceBody = body.str();
-      for (auto& slot : slots) if (slot.durable) eachGeneration(slot, [&](const auto& p) {
-        if (p->pid > 0) rootMaintenanceTargets.push_back(p);
+    const auto now = mono();
+    nextRootMaintenance = now + 100;
+    std::erase_if(rootMaintenanceBatches, [&](const auto& batch) {
+      const bool applied = std::all_of(batch->targets.begin(), batch->targets.end(), [](const auto& target) {
+        auto p = target.process.lock();
+        return target.applied || !p || p->pid == 0;
       });
+      if (!applied) return false;
+      if (rootMaintenanceCompleted) rootMaintenanceCompleted(batch->ids);
+      for (const auto& id : batch->ids) rootMaintenanceQueued.erase(id);
+      return true;
+    });
+    const auto wanted = rootMaintenance();
+    if (wanted && wanted != rootMaintenanceWanted) {
+      rootMaintenanceWanted = wanted;
+      auto batch = std::make_shared<RootMaintenanceBatch>();
+      auto publish = [&]() {
+        if (batch->ids.empty()) return;
+        std::ostringstream body;body << "{\"namespaces\":[";
+        for (size_t i = 0; i < batch->ids.size(); ++i) body << (i ? ",\"" : "\"") << batch->ids[i] << '"';
+        body << "]}";batch->body = body.str();
+        for (auto& slot : slots) if (slot.durable) eachGeneration(slot, [&](const auto& p) {
+          if (p->pid > 0) batch->targets.push_back({p});
+        });
+        rootMaintenanceBatches.push_back(std::move(batch));
+        batch = std::make_shared<RootMaintenanceBatch>();
+      };
+      for (const auto& id : *wanted) if (rootMaintenanceQueued.insert(id).second) {
+        batch->ids.push_back(id);
+        if (batch->ids.size() == ROOT_MAINTENANCE_BATCH_SIZE) publish();
+      }
+      publish();
     }
-    for (const auto& target : rootMaintenanceTargets) {
-      auto p = target.lock();
-      if (!p || p->pid == 0 || p->rootMaintenancePending || p->closing ||
-          (p->state != "ready" && p->state != "draining") || !p->probeAddress ||
-          p->rootMaintenanceApplied == rootMaintenanceBody) continue;
-      p->rootMaintenancePending = true;
-      tasks.add(maintainRoots(p, rootMaintenanceBody));
+    for (const auto& batch : rootMaintenanceBatches) for (size_t i = 0; i < batch->targets.size(); ++i) {
+      auto& target = batch->targets[i];
+      auto p = target.process.lock();
+      if (target.applied || target.pending || target.retryAt > now || !p || p->pid == 0 ||
+          p->rootMaintenancePending >= ROOT_MAINTENANCE_CONCURRENCY || p->closing ||
+          (p->state != "ready" && p->state != "draining") || !p->probeAddress) continue;
+      target.pending = true;
+      ++p->rootMaintenancePending;
+      tasks.add(maintainRoots(p, batch, i));
     }
   }
   // Applies the generation's newly read limit events to the counters.
@@ -3490,6 +3521,8 @@ std::string ProcessPool::json(uint32_t idleMs) const {
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
         << ",\"rootMaintenanceAttempts\":" << (p ? p->rootMaintenanceAttempts : 0)
         << ",\"rootMaintenanceFailures\":" << (p ? p->rootMaintenanceFailures : 0)
+        << ",\"rootMaintenanceCompleted\":" << (p ? p->rootMaintenanceCompleted : 0)
+        << ",\"rootMaintenancePending\":" << (p ? p->rootMaintenancePending : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
         << ",\"lastReason\":\"" << escape(p && !p->lastReason.empty() ? p->lastReason : s.lastReason) << "\",\"inFlight\":" << (p ? p->inFlight : 0)
         << ",\"lastExitCategory\":\"" << s.lastExitCategory << "\",\"memoryTerminatedRequests\":" << s.memoryTerminatedRequests
