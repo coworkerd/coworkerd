@@ -822,9 +822,9 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           const auto key = ns + "/" + object + "/0";
           auto found = alarms.find(key);
           if (found != alarms.end() && !found->second.fromHint) return;
+          if (found == alarms.end()) ++alarmsAdopted;
           auto& state = alarms[key];state.namespaceId = ns;state.objectId = object;state.tenant = tenant;
           state.shard = shard;state.shardEpoch = epoch;state.atUnixMs = at;state.fromHint = true;
-          ++alarmsAdopted;
         }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
   }
 }

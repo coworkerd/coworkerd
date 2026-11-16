@@ -302,6 +302,9 @@ secrets() {
     done
     out+="\"Write:$b/do/*/shards/*\","
     out+="\"Write:$b/do/*/objects/*\","
+    # Alarm locators are auxiliary. A successor removes its predecessor's marker, so writes span owners.
+    out+="\"List:$b/alarm-wake/by-owner/*\","
+    out+="\"Write:$b/alarm-wake/by-owner/*\","
     printf '%s' "${out%,}"
   }
   local id

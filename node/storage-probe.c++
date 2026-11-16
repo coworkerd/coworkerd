@@ -102,8 +102,8 @@ int runStorageCheck(int argc, char** argv) {
       KJ_REQUIRE(coworkerd::safeName(node), "COWORKERD_READ_NODE_ID is not a node id");
       bool all = true;
       std::string items;
-      auto item = [&](const char* name, kj::HttpMethod method, const std::string& key, bool allowed) {
-        auto response = reader.request(method, key, method == kj::HttpMethod::PUT ? std::string("coworkerd check storage\n") : std::string(),
+      auto item = [&](const char* name, kj::HttpMethod method, const std::string& key, bool allowed, bool empty = false) {
+        auto response = reader.request(method, key, method == kj::HttpMethod::PUT && !empty ? std::string("coworkerd check storage\n") : std::string(),
             true).wait(io.waitScope);
         const auto code = coworkerd::objectErrorCode(response.bytes);
         const bool denied = response.status == 403 && code == "AccessDenied";
@@ -124,6 +124,21 @@ int runStorageCheck(int argc, char** argv) {
       item("remove its own members/", kj::HttpMethod::DELETE, "members/" + node + "/probe/" + stamp, true);
       item("write its own nodes/", kj::HttpMethod::PUT, "nodes/" + node + "/" + stamp, true);
       item("remove its own nodes/", kj::HttpMethod::DELETE, "nodes/" + node + "/" + stamp, true);
+      const auto alarmPrefix = "alarm-wake/by-owner/" + node + "/";
+      item("write its own alarm marker", kj::HttpMethod::PUT, alarmPrefix + stamp, true, true);
+      item("remove its own alarm marker", kj::HttpMethod::DELETE, alarmPrefix + stamp, true);
+      bool markerListed = true;uint32_t markerListStatus = 200;std::string markerListCode;
+      try { reader.listPage(alarmPrefix, 1).wait(io.waitScope); }
+      catch (const kj::Exception& error) {
+        markerListed = false;
+        const std::string description(error.getDescription().cStr());
+        markerListStatus = description.find("HTTP 403") != std::string::npos ? 403 : 0;
+        if (description.find("AccessDenied") != std::string::npos) markerListCode = "AccessDenied";
+      }
+      all = all && markerListed;
+      items += ",{\"item\":\"list its own alarm markers\",\"method\":\"GET\",\"prefix\":\"" + alarmPrefix +
+          "\",\"status\":" + std::to_string(markerListStatus) + ",\"code\":\"" + markerListCode +
+          "\",\"expectedAllowed\":true,\"ok\":" + (markerListed ? "true" : "false") + "}";
       item("read cluster/format/1", kj::HttpMethod::GET, coworkerd::CLUSTER_FORMAT_KEY, true);
       bool listed = true;
       try { reader.list(coworkerd::MEMBERS_PREFIX).wait(io.waitScope); } catch (const kj::Exception&) { listed = false; }

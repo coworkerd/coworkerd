@@ -334,12 +334,12 @@ The launcher installs the startup table, which has to contain the calls used onl
 `processes.sandbox.syscalls.steady` reports the mode and the table's hash, each process's `sandbox.syscalls.steadyMode` its mode and `sandbox.observed.layers.steadySyscalls` whether the second filter is on. Switch it in the same order as the startup table: `observe` first, `enforce` after zero records. Steady `observe` also requires the startup table to be in `enforce`: each process has only one seccomp notification listener, which startup `observe` holds, so the node rejects steady `observe` under startup `observe` with an `EBUSY` reason (`auto` warns and leaves steady off; `launcher` refuses to start); steady `enforce` is unaffected.
 It is part of a workerd upgrade too: workerd reads only the table's call numbers, without a digest check, and the node checks it against the binary only at its own start, so replace it in the same order as the startup table.
 
-**Object storage identities**: only the deploy identity -- the control plane's and the operations tool's -- can write the desired state, and each node writes its own `members/<nodeId>/` and `nodes/<nodeId>/` prefixes plus shared `do/*/shards/*` and `do/*/objects/*`; the store's own policies enforce this, not a convention.
+**Object storage identities**: only the deploy identity -- the control plane's and the operations tool's -- can write the desired state, and each node writes its own `members/<nodeId>/` and `nodes/<nodeId>/` prefixes plus shared `do/*/shards/*`, `do/*/objects/*` and `alarm-wake/by-owner/*`; the store's own policies enforce this, not a convention.
 
 | Identity | Actions | For |
 | --- | --- | --- |
 | `deploy` | Create the bucket (the self-check's first request), and read, write and list it -- compose gives it SeaweedFS's `Admin`, `Read`, `Write` and `List` | The control plane and the operations tool |
-| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/`, `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/`, `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` (the Durable Object shards' epochs, release markers and owner hints: any node may take a shard over) and `do/*/objects/*` (an object's manifests and snapshots, written by whichever node owns its shard). Reading and listing every node's `nodes/` prefix is what lets a node rebuild an object from the segments of the node that owned its shard before (`nodes/<id>/wal/`) | That node |
+| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/`, `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/`, `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` (the Durable Object shards' epochs, release markers and owner hints: any node may take a shard over) and `do/*/objects/*` (an object's manifests and snapshots, written by whichever node owns its shard). List and write `alarm-wake/by-owner/` across owners (empty alarm locators, including predecessor cleanup); no Read action is needed there. Reading and listing every node's `nodes/` prefix is what lets a node rebuild an object from the segments of the node that owned its shard before (`nodes/<id>/wal/`) | That node |
 
 Every prefix ends with `/`, so that `node-1`'s policy does not cover `node-10`; a node's identity cannot read the credentials index `cluster/credentials/`, and cannot write another node's objects, `cluster/`, `tenants/` or the code.
 In the pinned SeaweedFS 4.48 these are the actions of the identity's entry in its identities (`s3.json`, or the filer's, which `s3.configure` writes); for the bucket `coworkerd` and the node `node-1`:
@@ -352,12 +352,13 @@ In the pinned SeaweedFS 4.48 these are the actions of the identity's entry in it
    "List:coworkerd/tenants/*", "List:coworkerd/do/*", "List:coworkerd/nodes/*", "Read:coworkerd/members/node-1/*",
    "Write:coworkerd/members/node-1/*", "List:coworkerd/members/node-1/*", "Read:coworkerd/nodes/node-1/*",
    "Write:coworkerd/nodes/node-1/*", "List:coworkerd/nodes/node-1/*", "Write:coworkerd/do/*/shards/*",
-   "Write:coworkerd/do/*/objects/*"]}
+   "Write:coworkerd/do/*/objects/*", "List:coworkerd/alarm-wake/by-owner/*",
+   "Write:coworkerd/alarm-wake/by-owner/*"]}
 ```
 
 A running SeaweedFS takes a new identity at once with `weed shell`'s `s3.configure -user=... -access_key=... -secret_key=... -actions=... -apply` (what compose's `secrets` hands its store for every node), kept in its filer, and withdraws one the same way with `-delete`; it reads `s3.json` again only when it starts, and an identity read from it stays in force until then -- so compose keeps only the deploy identity there.
 `coworkerd check storage` with `COWORKERD_READ_NODE_ID` reports whether a node's identity is held to the policy: the `policy` part of its last line, where writes below another node's `members/` and `nodes/` and below `cluster/`,
-and a read of `cluster/credentials/current`, must be refused with `AccessDenied`, while the node's own prefixes take a write and a removal, and a read of `cluster/format/1` and a listing of `members/` succeed. The items try no write below `tenants/` or the code's prefixes, so an identity that may write those still reports `policy.ok: true`.
+and a read of `cluster/credentials/current`, must be refused with `AccessDenied`, while the node's own prefixes take a write and a removal, and a read of `cluster/format/1` and a listing of `members/` succeed. It also writes and removes an empty marker under its own `alarm-wake/by-owner/<nodeId>/` prefix and lists that prefix. These three policy items are reported, not required for the storage contract. The items try no write below `tenants/` or the code's prefixes, so an identity that may write those still reports `policy.ok: true`.
 
 **The configuration file** `/etc/coworkerd/config.json` (at minimum the nodeId, the object store and the secrets key; the rest in section 5):
 
@@ -777,3 +778,5 @@ To generate a key: `openssl rand -hex 32`. compose's `secrets` distributes the n
 Keep `secrets-key.json` with the other credentials of the cluster; under compose it is in the `secrets` volume.
 
 **Object storage**: requests are always signed; the deploy identity is only for the control plane and the operations tool, and each node has an identity of its own that writes its own membership / usage and shared Durable Object prefixes (compose's directory layout does exactly that; writing another node's objects with a node's identity gets 403).
+
+Alarm markers are auxiliary: a denied marker prefix is reported as `markerAccessDenied`, while alarm hints continue to publish and adopted alarms continue to run. Update the node identity with the List/Write actions above. The node probes once per 30 seconds and resumes the marker layer after permission is restored. Compose secrets compares the full action string and rewrites changed hotload files; the storage watcher applies those changes.

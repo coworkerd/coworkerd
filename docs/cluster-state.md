@@ -55,7 +55,8 @@ Stateless placement tolerates an inaccurate membership view because rerouting re
 | `do/<namespace>/shards/<shard>/epochs/<epoch>` | A Durable Object shard's ownership, created only if absent: the node and its membership epoch, when, why, the epoch before, the writer's instance and a random value (section 11) | The node that takes the shard |
 | `do/<namespace>/shards/<shard>/epochs/<epoch>.released` | That epoch's release marker: its owner let the shard go | The owner, when it drains |
 | `do/<namespace>/shards/<shard>/owner` | The hint: the latest epoch, its node and whether it was released | The owner, and any node that listed the shard's epochs |
-| `do/<namespace>/shards/<shard>/alarms/<object>` | The hint of an object's next alarm (its time and which of its databases holds it), so the shard's next owner knows which objects to wake; the object's own database decides (section 12) | The shard's owner, whenever one of its objects' alarms changes |
+| `do/<namespace>/shards/<shard>/alarms/<object>/0` | The hint of an object's next alarm (its time and which of its databases holds it), so the shard's next owner knows which objects to wake; the object's own database decides (section 12) | The shard's owner, whenever one of its objects' alarms changes |
+| `alarm-wake/by-owner/<nodeId>/<nodeEpoch>/<namespace>/<shard>/<shardEpoch>/<presence>` | Empty auxiliary locator for a nonempty alarm-hint set; presence changes on each empty-to-nonempty transition. It conveys no ownership authority | The owner publishes it after H, the successor removes it after publishing its replacement |
 | `nodes/<node>/wal/<node epoch>/<segment>` | Immutable segments of that node's confirmed append log | That node |
 | `do/<namespace>/objects/<object>/manifest/<rev>` | Immutable revisions naming the snapshot and ordered log segments needed to rebuild the object; no `current` hint is used | The shard's owner |
 | `do/<namespace>/objects/<object>/snapshot/<sequence>/` | Database parts and the index of their hashes, including the facet tree | The shard's owner |
@@ -69,7 +70,7 @@ A revision `<rev>` and an epoch in a key are decimal numbers 20 digits wide, so 
 
 | Identity | May | For |
 | --- | --- | --- |
-| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/` and `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/` and `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` and `do/*/objects/*` (ownership, alarm hints, manifests and snapshots) | That node |
+| `node-<nodeId>` | Read `cluster/format/`, `cluster/tenants/`, `tenants/`, `definitions/`, `packages/`, `modules/`, `bundles/`, `members/` and `do/` and `nodes/`; list `members/`, `cluster/tenants/`, `tenants/` and `do/` and `nodes/`; read, write and list `members/<nodeId>/` and `nodes/<nodeId>/`; write `do/*/shards/*` and `do/*/objects/*` (ownership, alarm hints, manifests and snapshots); list and write `alarm-wake/by-owner/*` across owners for empty alarm locators and predecessor cleanup, without Read permission | That node |
 | `deploy` | Everything | The control plane and its operations tool |
 
 A node therefore cannot change what is deployed, cannot read the credentials index, and cannot write another node's membership, suspects or usage; the Durable Object shards' objects are every node's to write, since any node may take a shard over, and ownership rests on create-if-absent and data publication on epoch fencing; the policy does not protect Durable Object data against a compromised node. Every prefix in the policy ends with `/`, so that `node-1` cannot write below `node-10`. On bare metal the store's identities are configured by hand to the same effect; `coworkerd check storage` reports whether a node's identity is held to it ([installing and running](guide/install.md), section 4). [Egress and authentication](egress-and-auth.md) describes the identities and how requests are signed.
@@ -565,7 +566,7 @@ and never reads the previous owner's files.
   that is being deleted stop counting.
 - **Alarms.** An object's alarm time is in its own database, so it is replicated and recovered with everything else.
   The shard's owner keeps the schedule and fires the alarm as an event of the object's Worker, and a hint beside the
-  shard's epochs (`do/<namespace>/shards/<shard>/alarms/<object>`) names each object's next alarm so that the shard's
+  shard's epochs (`do/<namespace>/shards/<shard>/alarms/<object>/0`) names each object's next alarm so that the shard's
   next owner knows which objects to wake; every firing then asks the object's own database, which decides -- a stale hint does not authorize a handler whose database no longer has a due alarm. Delivery can be delayed or repeated across failures; handlers should tolerate retries. The hint carries no correctness: a stale one costs
   one wake, a missing one a delay until the object is next opened.
 - **Resident objects.** A durable process targets `durableObjects.residentObjects` (4096) resident object trees (`0` removes the limit), evicting idle trees in least-recently-used order, facets before their root. Active trees are protected, so the count can temporarily exceed the target; an object with hibernatable WebSockets keeps them
