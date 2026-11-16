@@ -345,7 +345,8 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
   Scope measured(*this, &completionMetric);
   if (!valid(sent)) { gate.cancel(probe);ownershipChanged(shardKey(sent.ns, sent.shard), sent.generation);co_return; }
   gate.result(success, probe, monotonicTimeMs());if (permissionProbe && success) markerRestored();
-  if (!success) { if (!sent.marker) ++hintFailures;if (rejected) denied(sent.at ? Probe::PUT : Probe::DELETE);else failure(sent.marker ? "marker-write" : "hint-write"); }
+  // The initial outage is logged; repeated circuit probes retain failure/retry counters without synchronous log I/O.
+  if (!success) { if (!sent.marker) ++hintFailures;if (rejected) denied(sent.at ? Probe::PUT : Probe::DELETE);else if (!probe) failure(sent.marker ? "marker-write" : "hint-write"); }
   else if (sent.marker) { if (sent.at) ++markerWrites;else ++markerDeletes;if (permissionProbe) markerRestored(); }
   else ++hintWrites;
   auto found = writes.find(key);if (found == writes.end() || found->second.generation != sent.generation) co_return;
@@ -441,7 +442,7 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
     hintGate.result(true, probe, monotonicTimeMs());finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ownershipChanged(key, generation);co_return; }
-    hintGate.result(false, probe, monotonicTimeMs());finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }failure("hint-scan");
+    hintGate.result(false, probe, monotonicTimeMs());finished = true;++hintFailures;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) { it->second.adopted = false;it->second.next = monotonicTimeMs() + retry(it->second.failures); }if (!probe) failure("hint-scan");
   }
 }
 kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, bool probe) {
@@ -478,7 +479,7 @@ kj::Promise<void> AlarmPublication::scanPrevious(std::string key, bool repair, b
     auto it = shards.find(key);
     if (it != shards.end() && it->second.generation == generation) {
       (repair ? it->second.repairNext : it->second.previousNext) = monotonicTimeMs() + 5000;
-      if (listing && accessDenied(error)) denied(Probe::LIST, it->second.previousPrefix);else failure(repair ? "marker-owner-check" : "predecessor-marker-scan");
+      if (listing && accessDenied(error)) denied(Probe::LIST, it->second.previousPrefix);else if (!probe) failure(repair ? "marker-owner-check" : "predecessor-marker-scan");
     }
   }
 }
@@ -541,7 +542,7 @@ kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ++ownerChanges;co_return; }
     markerGate.result(false, probe, monotonicTimeMs());finished = true;nextMarkerScan = monotonicTimeMs() + 5000;
-    if (accessDenied(error)) denied(Probe::LIST, root);else failure("marker-scan");
+    if (accessDenied(error)) denied(Probe::LIST, root);else if (!probe) failure("marker-scan");
   }
 }
 kj::Promise<void> AlarmPublication::probeMarkers() {
