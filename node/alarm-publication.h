@@ -48,7 +48,7 @@ private:
     std::string key, ns, object, tenant;
     uint32_t shard = 0, failures = 0;
     uint64_t generation = 0, version = 0, at = 0, order = 0;
-    bool marker = false, mayExist = false, timed = false;
+    bool marker = false, mayExist = false, timed = false, queued = false;
     double next = 0;
     std::list<std::string>::iterator sweep;
   };

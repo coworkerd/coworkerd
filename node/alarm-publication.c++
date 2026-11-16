@@ -134,6 +134,7 @@ void AlarmPublication::ownershipChanged(const std::string& key, uint64_t generat
   ++ownerChanges;auto it = shards.find(key);if (it != shards.end() && it->second.generation == generation) gone(it->second.ns, it->second.shard);
 }
 void AlarmPublication::unqueue(Write& w) {
+  w.queued = false;
   (w.marker ? readyMarkers : readyHints).erase({w.tenant, w.order, w.key, w.marker ? 3u : 1u});
   if (w.timed) { deadlines.erase({w.next, 1, w.key, w.generation});w.timed = false; }
 }
@@ -146,7 +147,7 @@ void AlarmPublication::refresh(Write& w, double now) {
   unqueue(w);if (!valid(w) || inFlightKeys.contains(w.key)) return;
   if (w.next > now) { deadlines.insert({w.next, 1, w.key, w.generation});w.timed = true;return; }
   const auto& s = shards.at(shardKey(w.ns, w.shard));if (!s.adopted || s.reading) return;
-  (w.marker ? readyMarkers : readyHints).insert({w.tenant, w.order, w.key, w.marker ? 3u : 1u});
+  (w.marker ? readyMarkers : readyHints).insert({w.tenant, w.order, w.key, w.marker ? 3u : 1u});w.queued = true;
 }
 void AlarmPublication::offerRead(Shard& s) {
   const auto key = shardKey(s.ns, s.shard);readyHints.erase({s.tenant, s.order, key, 0});
@@ -180,11 +181,12 @@ void AlarmPublication::wakeWrites(Shard& s) {
 void AlarmPublication::queueHint(Shard& s, const std::string& object, uint64_t at) {
   const auto key = hintPrefix(s.ns, s.shard) + object + "/0";auto [it, inserted] = writes.try_emplace(key);auto& w = it->second;
   if (inserted) { writeSweep.push_back(key);w.sweep = std::prev(writeSweep.end()); }
-  // refresh() replaces an unchanged ready identity once; retire old timers/identities before resetting fields.
+  const bool keepReady = w.queued && w.generation == s.generation && w.tenant == s.tenant && s.adopted && !s.reading;
+  // A ready identity is unchanged by a new target/version; keep it indexed until dispatch.
   if (w.timed || w.generation != s.generation || w.tenant != s.tenant) unqueue(w);
   w.key = key;w.ns = s.ns;w.object = object;w.tenant = s.tenant;w.shard = s.shard;
   w.generation = s.generation;w.at = at;w.marker = false;w.version = ++serial;w.order = w.order ? w.order : serial;w.next = 0;w.failures = 0;
-  s.writeKeys.insert(key);peakPending = std::max<uint64_t>(peakPending, writes.size());refresh(w, monotonicTimeMs());
+  s.writeKeys.insert(key);peakPending = std::max<uint64_t>(peakPending, writes.size());if (!keepReady) refresh(w, 0);
 }
 void AlarmPublication::queueMarker(Shard& s, const std::string& key, bool present, bool mayExist) {
   auto it = writes.find(key);
@@ -256,7 +258,7 @@ void AlarmPublication::pump(unsigned limit) {
       auto it = queue.upper_bound({lastTenant, UINT64_MAX, "", 5});if (it == queue.end()) it = queue.begin();
       // A bounded skip prevents a permanently failing item from monopolizing probes within one tenant.
       if (gate.open && it->key == gate.lastProbe && queue.size() > 1) { if (++it == queue.end()) it = queue.begin(); }
-      auto value = *it;queue.erase(it);return value;
+      auto value = *it;queue.erase(it);if (value.kind == 1 || value.kind == 3) if (auto w = writes.find(value.key);w != writes.end()) w->second.queued = false;return value;
     };
     // Separate capacities preserve seven H slots even if all eight marker writes and one scan hang.
     // M writes precede every scan; the total is bounded by sixteen.
