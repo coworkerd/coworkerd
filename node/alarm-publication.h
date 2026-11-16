@@ -99,7 +99,7 @@ private:
   void reconcile(Shard&);
   void cleanup(Shard&);
   void acceptOwnMarker(Shard&, const std::string&);
-  void pump(unsigned limit = 1);
+  void pump(unsigned limit = 8);
   unsigned drainDeadlines(unsigned limit);
   void scheduleDeadlineDrain();
   void failure(const char* operation);
