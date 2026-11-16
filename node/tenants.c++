@@ -8,6 +8,7 @@ namespace coworkerd {
 void TenantView::onQuota(std::function<void(const std::string&, uint64_t, uint64_t)> callback) { quota = std::move(callback); }
 
 void TenantView::update(const std::map<std::string, std::optional<TenantRecord>>& named, uint64_t at, bool records) {
+  ++epochValue;
   hasRecords = records;
   std::map<std::string, TenantRecord> next;
   uint64_t bare = 0;

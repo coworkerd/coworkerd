@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "json.h"
@@ -343,9 +344,12 @@ public:
     bool active() const { return status == "active"; }
   };
   std::optional<NamespaceOwner> namespaceOwner(const std::string& namespaceId) const;
+  uint64_t namespaceEpoch() const { return namespaceEpochValue; }
 
 private:
   uint64_t revisionValue = 0;
+  uint64_t namespaceEpochValue = 0;
+  mutable std::optional<std::unordered_map<std::string, NamespaceOwner>> namespaceOwnerIndex;
   uint64_t generationValue = 0;
   std::string generationError;
   std::map<std::string, Definition> definitionMap;   // label workerId@versionId
