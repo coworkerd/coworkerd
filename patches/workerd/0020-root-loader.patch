@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Mon, 16 Nov 2026 11:36:31 +0800
+Date: Mon, 16 Nov 2026 13:18:15 +0800
 Subject: [PATCH] Load roots with counted plan references and bounded
  management replies
 
@@ -2040,10 +2040,10 @@ index 3504f63d19e78ccb282af9439e26f9255b3c473a..9940627e6f97d3443c88bb975a9c186e
          }
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..03bc05332cfdebe5a9808ae791d5d96e42903766
+index 0000000000000000000000000000000000000000..ce52b6a9da81f1d314a1816b54b8eb9906966960
 --- /dev/null
 +++ b/src/workerd/server/server/root_loader.rs
-@@ -0,0 +1,2283 @@
+@@ -0,0 +1,2287 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -4107,12 +4107,16 @@ index 0000000000000000000000000000000000000000..03bc05332cfdebe5a9808ae791d5d96e
 +                match self.registry.install(deployment).await {
 +                    Ok(plan) => {
 +                        let plans = self.registry.plans.borrow();
-+                        let installed = plans.get(&plan).expect("installed plan");
++                        if let Some(installed) = plans.get(&plan) {
 +                        json!({"plan": plan, "info": {"kind": installed.deployment.kind,
 +                            "tenant": installed.deployment.owner_tenant().ok(), "workerId": installed.deployment.worker_id,
 +                            "configuredWorker": if installed.deployment.is_platform() {
 +                                self.registry.loaded(installed).map(|worker| format!("{:p}", Rc::as_ptr(&worker)))
 +                            } else { None }, "platformClass": installed.deployment.platform_class}})
++                        } else {
++                            status = 503;
++                            json!({"error":{"kind":"plan-missing","message":"root plan is no longer registered"}})
++                        }
 +                    },
 +                    Err(error) => {
 +                        tracing::error!("root installation: {error:?}");

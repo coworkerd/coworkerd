@@ -2368,7 +2368,8 @@ public:
         const auto remembered = rootNamespaceTenants.find(id);
         const auto tenant = owner ? owner->tenant : remembered != rootNamespaceTenants.end() ? remembered->second : std::string();
         if ((owner && owner->status == "deleting") || (!tenant.empty() &&
-            (tenantDeleting(tenant) || (tenants && tenants->removedFromCatalog(tenant))))) ids->push_back(id);
+            (tenantDeleting(tenant) || (tenants && tenants->removedFromCatalog(tenant))))) rootCleanupPending.insert(id);
+        if (rootCleanupPending.contains(id)) ids->push_back(id);
       }
       rootMaintenanceList = std::move(ids);
       rootMaintenanceCatalog = catalog;rootMaintenanceTenants = tenantEpoch;
@@ -2379,7 +2380,7 @@ public:
   }
   void rootsMaintained(const std::vector<std::string>& ids) {
     for (const auto& id : ids) if (rootNamespaces.erase(id)) {
-      rootNamespaceTenants.erase(id);++rootNamespaceEpoch;
+      rootNamespaceTenants.erase(id);rootCleanupPending.erase(id);++rootNamespaceEpoch;
     }
   }
 
@@ -2927,6 +2928,7 @@ private:
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
   std::set<std::string> rootNamespaces;
+  std::set<std::string> rootCleanupPending;
   std::unordered_map<std::string, std::string> rootNamespaceTenants;
   uint64_t rootNamespaceEpoch = 0, rootMaintenanceCatalog = 0, rootMaintenanceRevision = 0,
       rootMaintenanceTenants = 0, rootMaintenanceTracked = 0;
