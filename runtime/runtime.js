@@ -1456,7 +1456,7 @@ async function selectedPlain(descriptor, env, ctx) {
   const cacheKey = JSON.stringify([base.workerId, base.versionId, base.versionFingerprint,
     base.creationRecord?.generation ?? 0, base.creationRecord?.cpuLimitMs, base.creationRecord?.memoryLimitMib]);
   const nonce = crypto.randomUUID();
-  const select = item => env.ROOTS.getRoot(JSON.stringify({kind: "plain", plan: item.plan,
+  const select = item => env.ROOTS.getPlain(JSON.stringify({kind: "plain", plan: item.plan,
     dispatchChecked: true, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
     catalogGeneration: descriptor.rootSelection.catalogGeneration ?? 0, activePlan: descriptor.rootSelection.activePlan === true}));
