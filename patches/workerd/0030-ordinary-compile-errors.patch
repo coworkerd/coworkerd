@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 07:48:24 +0800
+Subject: [PATCH] Preserve ordinary compiler diagnostics for existing failure
+ categories
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index da035ec7a6d5d5957c5501d41e6cd80061e38d8f..f2cb0a3872fc0c1f51dfd66c24ef758d658d4f5d 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -1008,6 +1008,13 @@ impl RootRegistry {
+                 .any(|namespace| !worker.has_actor_class(&namespace.class_name))
+         {
+             worker.unlink();
++            if deployment.is_plain() {
++                let prefix = format!("service {service_name}: ");
++                let errors = errors.borrow().iter()
++                    .map(|error| error.strip_prefix(&prefix).unwrap_or(error).to_owned())
++                    .collect::<Vec<_>>().join("\n");
++                return Err(kj::failed!("ROOT_TENANT_CODE: Failed to start Worker:\n{errors}"));
++            }
+             return Err(kj::failed!(
+                 "ROOT_TENANT_CODE: root worker failed to compile or is missing an exported class: {}",
+                 errors.borrow().join("; ")
