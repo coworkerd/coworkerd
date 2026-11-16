@@ -24,12 +24,13 @@ private:
     std::string tenant, sourceDatabase, name, operationId, namespaceId, result;
     Point point;
     bool registering = false, accepted = false;
+    uint32_t starting = 0;
     double touchedAtMs = 0;
   };
   void expireJobs();
   void remember(const std::string& key, std::shared_ptr<Intent> intent);
   std::string source(const std::string& tenant, const std::string& database) const;
-  kj::Promise<std::optional<Point>> read(std::string ns, uint64_t revision);
+  kj::Promise<std::optional<Point>> read(std::string ns, uint64_t revision, uint32_t& reads);
   kj::Promise<Point> resolve(std::string ns, const std::map<std::string, std::string>& selector);
   kj::Promise<uint64_t> usage(std::string tenant);
   void precheck(const TenantManifest& tenant, const std::string& name, const std::string& ns,

@@ -22,6 +22,8 @@ struct HistoryBudget {
 };
 
 struct FileDigest { uint64_t bytes = 0; std::string sha256; };
+// Owns a duplicate until the worker finishes, even if its waiter is canceled.
+kj::Promise<bool> synchronizeRecoveryFile(int fd);
 FileDigest recoveryFileDigest(const std::filesystem::path& path);
 kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& path, HistoryYield yield, HistoryCheck check = {});
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,

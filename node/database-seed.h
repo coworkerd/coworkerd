@@ -32,6 +32,7 @@ private:
     uint64_t diskBase = 0, availableBytes = 0;
     double maxLoopDelayMs = 0;
     std::vector<double> downloadFsyncMs;
+    std::vector<double> replayFsyncMs;
     std::string resource;
     HistoryBudget budget;
     bool finished = false;

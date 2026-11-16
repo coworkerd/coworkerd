@@ -150,16 +150,20 @@ All operations use the existing tenant authorization. The source must be an acti
 - `GET /v1/tenants/{tenant}/databases/{database}/time-travel/info[?timestamp=<Unix-ms>|bookmark=<opaque-token>]`
   returns `{database,point:{revision,writtenAtUnixMs,bookmark}}`; numbers in `point` are decimal strings.
   Without a selector, `point` is the latest published revision. Timestamp resolution uses exact revision GETs, no listing.
+  Each lookup has at most 128 history GETs (256 HTTP attempts including one retry per GET), including latest lookup.
+  Exceeding this returns 422 `HISTORY_READ_LIMIT`; use a bookmark or a later timestamp. A bookmark needs one GET.
 - `POST /v1/tenants/{tenant}/databases/{database}/time-travel/restore` takes
   `{name,operationId,bookmark}` or `{name,operationId,timestamp:"<Unix-ms>"}`.
-  It prechecks name/quota and starts the target owner. It returns `{known:true,operationId,phase:"started",point}`
+  It prechecks name/quota and starts the target owner. An existing manifest 1 with no manifest 2 goes directly to
+  verification and registration without restarting node materialization. It returns `{known:true,operationId,phase:"started",point}`
   or the completed answer below. `operationId` is a client-generated random 16–128-character alphanumeric/hyphen id.
   Additional caller-supplied namespace ids are never used.
 - `GET /v1/tenants/{tenant}/database-restores/{operationId}` returns `{known:false}` after memory state is lost,
   or `{known:true,operationId,phase,point,node}` while working. A node failure has `phase:"failed"`, with
   `node.errorCode`, `node.error`, `node.resource`, `node.required` and `node.limit`. Completion is
   `{known:true,phase:"completed",operationId,database,namespaceId,point}` after exact R1 verification and conditional
-  registration. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
+  registration. Verification checks manifest identity/digest, the complete snapshot index and HEAD lengths for every
+  part; the control plane does not download image parts again. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
 
 Target N is HMAC-SHA256 of the canonical tuple tenant, source N, revision, raw-manifest SHA-256 and operation id.
 Each UTF-8 field is encoded as decimal byte-length, `:`, and bytes; revision is canonical decimal. The subkey is
@@ -168,7 +172,8 @@ control-plane computation. Registration recomputes N and checks the tenant-scope
 The old arbitrary-N `tool database-register` has been removed. No persistent job table or directory state is added.
 
 Restore intents are bounded to 16 pending requests per tenant and 1024 overall. Unfinished idle entries expire
-after 60 seconds, terminal receipts after 10 minutes (or earlier eviction); progress polling refreshes activity.
+after 60 seconds, terminal receipts after 10 minutes (or earlier eviction); progress polling and the start before its first await refresh activity. Active starts pin their shared entry;
+concurrent unaccepted callers cannot remove one another's entry, and a retry clears the cached failure.
 A request accepted by no node is not cached. Per-tenant saturation returns 429 RESTORE_BUSY; a full global cache
 returns 503 RESTORE_BUSY. Malformed restore JSON or non-string/missing required fields return 400 INVALID_REQUEST;
 unsupported methods on info/restore return 405. Repeating a registered operation still requires an active source.
