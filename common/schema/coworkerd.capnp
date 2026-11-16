@@ -579,6 +579,9 @@ struct ProcessPoolConfig {
   watchdog @8 :Bool = true;
   # Wait only for a live paused process, within the call's lease. 0 keeps immediate refusal.
   pausedAdmissionWaitMs @9 :UInt32 = 1000;
+  # Process-wide cumulative SQL CPU and active-SQL wall limits per event. Independent of tenant CPU limits.
+  sqlCpuLimitMs @10 :UInt32 = 200;
+  sqlWallLimitMs @11 :UInt32 = 800;
 }
 
 struct RotationConfig {

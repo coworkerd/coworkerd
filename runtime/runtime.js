@@ -392,7 +392,12 @@ async function __coworkerdD1Send(entry, endpoint, query, params, resultsFormat) 
   }
   // A statement that failed carries an error alone; a refusal of the platform (the object too large, the tenant's
   // quota, the storage) carries its code as well, which goes into the message the caller sees.
-  const failed = (one) => ({ success: false, error: one.code ? one.code + ": " + (one.reason ?? one.error) : one.error });
+  const failed = (one) => {
+    const message = one.reason ?? one.error;
+    const nativeSqlReason = one.code === "SQL_LIMIT_EXCEEDED" && typeof message === "string"
+      && message.startsWith("SQL_LIMIT_EXCEEDED:");
+    return { success: false, error: nativeSqlReason ? message : one.code ? one.code + ": " + message : one.error };
+  };
   return Array.isArray(answer)
     ? answer.map((one) => (one?.error ? failed(one) : one))
     : answer?.error ? failed(answer) : answer;
@@ -1083,7 +1088,10 @@ export class SqlDatabase extends DurableObject {
     const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
     const encoder = new TextEncoder();
     const budget = { bytes: Array.isArray(body) ? 2 : 0, size: text => encoder.encode(text).byteLength };
-    const failure = error => ({ success: false, error: String(error instanceof Error ? error.message : error) });
+    const failure = error => {
+      if (error?.code === "SQL_LIMIT_EXCEEDED") this.ctx.storage.sql.abortExecutionLimit();
+      return { success: false, error: String(error instanceof Error ? error.message : error) };
+    };
     const one = (statement) => {
       try {
         if (query && statement && Object.hasOwn(statement, "ingest")) {
@@ -1552,12 +1560,16 @@ async function serveRoot(request, descriptor, env, ctx) {
   } catch (error) {
     const preparation = rootPreparationKind(error, preparationNonce);
     const reason = cleanDurableReason({ message: rootFailureReason(error) }, descriptor.secrets);
-    const code = preparation === "tenant-code" ? "EXECUTION_FAILED" : durableCode(error);
+    const sqlLimit = target.database && error?.code === "SQL_LIMIT_EXCEEDED";
+    const code = preparation === "tenant-code" ? "EXECUTION_FAILED" :
+      sqlLimit && !reason.includes("STORAGE_UNAVAILABLE") && !reason.includes("RESULT_UNCERTAIN")
+        ? "SQL_LIMIT_EXCEEDED" : durableCode(error);
     if (preparation && preparation !== "tenant-code")
       return Response.json({ error: "Durable Object is unavailable", code: "DO_UNAVAILABLE", reason, retryable: true },
         { status: 503 });
     if (code !== "EXECUTION_FAILED" || error?.durableObjectReset === true)
       return Response.json({ error: code === "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
+        code === "SQL_LIMIT_EXCEEDED" ? reason :
         code === "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
         code === "STORAGE_UNAVAILABLE" ? "Durable Object storage is unavailable" :
         code === "DO_OBJECT_TOO_LARGE" ? "Durable Object is too large" :

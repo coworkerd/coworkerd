@@ -31,6 +31,8 @@ struct ProcessPoolConfig {
   // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
   // not replaced with age or with requests; a rotation of one drains it before its next generation starts.
   uint32_t durableProcesses = 1;
+  uint32_t sqlCpuLimitMs = 200;
+  uint32_t sqlWallLimitMs = 800;
   uint32_t idleEvictMs = 300000;
   uint32_t idleDestroyIntervalMs = 10;
   uint32_t heatIdleMs = 30000;

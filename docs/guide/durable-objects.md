@@ -33,6 +33,18 @@ export default {
 
 `ctx.storage.sql` exposes workerd's SQLite API. Key-value methods such as `get`, `put`, `delete` and `list`, and storage transactions, use the same database and durability path. The object's env contains the version's variables, secrets, Durable Object bindings and D1 bindings; Service Bindings are not installed in it. Facets have separate databases but belong to the root object's storage, eviction and recovery tree; `ctx.facets.clone()` is refused.
 
+Native SQL has a separate process-wide limit: by default, an object's event may spend 200 ms of cumulative SQL CPU, with an 800 ms active SQL wall-time fallback. Requests, alarms and delivered WebSocket messages receive new budgets at the existing event boundaries. Statements share the budget across timers, subrequests and storage awaits. Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any excess at its actual value. Segments invoking the progress callback are measured directly. Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md).
+
+A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that event is refused. Transaction behavior follows SQLite:
+
+| Interrupted statement | `transactionSync` outcome | Object outcome |
+| --- | --- | --- |
+| A write that has changed pages | SQLite rolls back the transaction; catching the error cannot commit it | The existing storage failure path resets the object |
+| A read whose error leaves the callback | `transactionSync` rolls back | The tenant object remains available |
+| A read whose error is caught inside the callback | Earlier completed statements may commit if the callback returns normally; later SQL in the event is refused | The tenant object remains available; the next event has a fresh budget |
+
+An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
+
 After a declared secret or binding changes, the object reopens on its next request, as it does after a version change; that object's in-flight requests and connections end at that point. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
 ## 2. Declare the namespace

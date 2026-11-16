@@ -43,6 +43,10 @@ void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
   KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
+  KJ_REQUIRE(sqlCpuLimitMs > 0 && sqlCpuLimitMs <= 60000,
+      "processPool.sqlCpuLimitMs is between 1 and 60000");
+  KJ_REQUIRE(sqlWallLimitMs > 0 && sqlWallLimitMs <= 60000,
+      "processPool.sqlWallLimitMs is between 1 and 60000");
   // One spare port beyond the slots: a rotation's next generation listens there while the
   // previous one drains on its own port.
   KJ_REQUIRE(basePort > 0 && uint64_t(basePort) + count + quarantineProcesses + 1 <= 65536, "invalid process port range");
@@ -179,6 +183,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
+  result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
+  result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();
   result.processPool.cpuLimitMs = root.getCpuLimitMs();
   result.processPool.memoryLimitMiB = root.getMemoryLimitMiB();
   // A limit of 0 leaves the isolates of this node without one, and with it the culprit a stuck or exhausted process

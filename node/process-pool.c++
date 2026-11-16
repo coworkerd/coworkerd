@@ -2183,6 +2183,8 @@ public:
     }
     childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(config.cpuLimitMs));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
+    childEnvironment.push_back("COWORKERD_SQL_CPU_LIMIT_MS=" + std::to_string(config.sqlCpuLimitMs));
+    childEnvironment.push_back("COWORKERD_SQL_WALL_LIMIT_MS=" + std::to_string(config.sqlWallLimitMs));
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));
     childEnvironment.push_back("COWORKERD_PARENT_FD=" + std::to_string(PARENT_FD));

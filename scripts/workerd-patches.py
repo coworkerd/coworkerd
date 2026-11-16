@@ -100,7 +100,12 @@ def allowed_path(name, path):
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
-                          name == RPC_CODE_PATCH and path in RPC_CODE_PATHS)
+                          name == RPC_CODE_PATCH and path in RPC_CODE_PATHS or
+                          name == '0021-sql-execution-limit.patch' and path in {
+                              'src/workerd/util/sqlite.h', 'src/workerd/util/sqlite.c++',
+                              'src/workerd/api/sql.h', 'src/workerd/api/sql.c++',
+                              'src/workerd/io/limit-enforcer.h',
+                              'src/workerd/server/factory/coworkerd-cpu-limit.c++'})
 
 def validate_patch(checkout, name, data):
     """Validate Git's parsed paths and literal headers before any checkout mutation."""

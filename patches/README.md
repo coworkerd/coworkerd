@@ -78,9 +78,9 @@ operations validate the series before mutating a checkout or exporting files.
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013, 0014 and 0020, in that order.
-0014 completes the Durable Object port; 0020 adds the private runtime root loader.
-The complete tree has 19 commits above the tag for these 18 files because 0010 also has the v95 follow-up.
+0001, 0003, 0004, 0018, 0013, 0014, 0020 and 0021, in that order.
+0014 completes the Durable Object port; 0020 adds the private runtime root loader;
+0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
 
 The SQLite CTE backout is part of this upstream tag (`0d01fe9f6850d038d80e6debb54c683a51a9ac65`).
@@ -271,7 +271,7 @@ preceding patch files retain their original bytes.
 | --- | --- | --- | --- |
 | `v1.20261031.1` | `8119fd824c29ba4a877824b01ebb0b5dbefe444c` | `15.7.112.5` | 15 patches after the stage 2 lifecycle port |
 | `v1.20261108.1` | `88b5871e8873a833b278f346473eed69a4443855` | `15.8.62.5` | 15 replayed patches, the 0013 and 0014 Durable Object ports, and the 0019 SQLite CTE backout (18 total) |
-| `v1.20261114.1` | `3d3093c8f01b9b53f4d36d20a8e4ea0a39787992` | `15.8.62.5` | 17 patches; SQLite CTE backout upstream; 0002 forwards abandonAlarm and validates the process CPU limit at factory initialization |
+| `v1.20261114.1` | `3d3093c8f01b9b53f4d36d20a8e4ea0a39787992` | `15.8.62.5` | 19 patches including the private root loader and SQL event budget; SQLite CTE backout upstream |
 
 The November 8 replay keeps the upstream handoff metadata accessors alongside the
 Coworkerd invocation-identity setter. The creation-record contract is unchanged;
@@ -281,3 +281,11 @@ features remain inactive.
 The November 14 replay keeps promise-owned resolved props in 0015 and the unconditional
 exception-to-JavaScript `.code` hook in 0016. The new upstream exception description path is used
 for reporting; it does not replace the JavaScript conversion hook.
+
+### 0021: cumulative native SQL execution budget
+
+`util/sqlite.{h,c++}` installs one SQLite progress handler per connection and accounts for each compilation and row-step segment. A per-connection PRNG samples short native segments at 1/16. For a selected segment without a callback, the first 250 microseconds of CPU is multiplied by 16 and any excess counts once. This bounds amplification of an isolated slow segment, while undercounting a sequence of expensive callback-free segments. Segments reaching a progress callback are measured directly. The cached statement's VM counter is reset at the segment boundary so a short run cannot inherit a late callback from earlier runs. CPU clocks are gated by a cheap wall clock in callbacks. Defaults are 200 ms cumulative SQL CPU and 800 ms active SQL wall time.
+
+`api/sql.{h,c++}` obtains the current owned event budget and supplies the native error code. Its abort helper validates that this native budget was exhausted. `io/limit-enforcer.h` adds only the budget getter with a default implementation; `server/factory/coworkerd-cpu-limit.c++` owns and replaces the budget at the existing `topUpActor()` calls. The SQL-only wrapper for platform objects delegates the previous CPU, memory and reporting behavior. No `io-context`, V8, 0013 confirmation or 0020 root-loader file changes belong to this patch.
+
+SQLite's existing critical-error condition remains: an interrupted write can automatically roll back and break the output gate; an interrupted read need not do so. The runtime rolls a failed database batch or ingest segment back before converting its failure and ending that database object. A function or blocking operation without progress callbacks can outlast the SQL budget; the process watchdog remains the fallback. See the [database](../docs/guide/databases.md) and [Durable Object](../docs/guide/durable-objects.md) guides for transaction behavior and the process configuration keys.
