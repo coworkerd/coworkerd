@@ -42,8 +42,6 @@ def git(checkout, *args, env=None, input=None):
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
     "0038-preparation-queue-and-failure-cache.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
-    "0037-preparation-io-turn.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
-    "0036-bounded-preparation-completion.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0035-preparation-failure-recovery.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0033-owned-preparation-and-demand-drain.patch": frozenset({"src/workerd/server/server/root_loader.rs", "src/workerd/server/server/bridge.rs"}),
     "0032-ordinary-preparation-and-drain.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
