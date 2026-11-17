@@ -771,7 +771,9 @@ private:
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
     context.releaseParams();
-    return context.tailCall(kj::mv(request)).attach(kj::defer([slot = slot] { if (auto current = slot.lock()) current->decide(true); }));
+    // Retain admission only while this binding request is outstanding. The
+    // returned target and any tenant capabilities retain only the weak handle.
+    return context.tailCall(kj::mv(request)).attach(kj::defer([current = slot.lock()] { if (current) current->decide(true); }));
   }
 
   capnp::Capability::Client runtimeTarget;
@@ -795,7 +797,7 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot.lock()));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
@@ -803,7 +805,7 @@ public:
 private:
   rpc::EventDispatcher::Client inner;
   kj::String descriptor;
-  std::weak_ptr<AdmissionSlot> slot;
+  std::shared_ptr<AdmissionSlot> slot;
 };
 
 class ServerCore final {
