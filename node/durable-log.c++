@@ -833,9 +833,14 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
         pendingDirectory, this->settings.config.alarmDiscoveryIntervalMs,
         this->settings.config.alarmTakeoverConcurrency, this->settings.config.alarmReadConcurrency},
         *store, timer, membership, alarmReads,
-        [this]() { return startupReady && !stopped && bool(alarmTake); },
-        [this](std::string ns, uint32_t shard) { return alarmTake(std::move(ns), shard); },
-        [this](const std::string& ns) { return alarmTenant ? alarmTenant(ns) : ns; });
+        [this]() { return startupReady && !stopped && bool(alarmTake) && nodeEpoch && membership.epoch == std::to_string(nodeEpoch) && membership.durableProcesses; },
+        [this](std::string ns, uint32_t shard, uint32_t waited) { return alarmTake(std::move(ns), shard, waited); },
+        [this](const std::string& ns) { return alarmTenant ? alarmTenant(ns) : ns; },
+        [this](const std::string& ns, uint32_t shard, const std::string& exclude) { return alarmRank ? alarmRank(ns, shard, exclude) : 0; },
+        [this](const std::string& ns) { return !hooks.namespaceActive || hooks.namespaceActive(ns); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch) {
+          alarmPublication->take(ns, shard, epoch, alarmTenant ? alarmTenant(ns) : ns);
+        }, [this](const std::string& ns, uint32_t shard) { return alarmPublication->forgetPending(ns, shard); });
   }
 }
 

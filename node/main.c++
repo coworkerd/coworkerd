@@ -8505,13 +8505,15 @@ int run(Launch launch) {
     durableLog.shardTaken(namespaceId, shard, shardEpoch, owner ? owner->tenant : std::string());
   });
   DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable, timer);
-  durableLog.setAlarmTakeoverHook([&shards, &server](std::string ns, uint32_t shard) {
+  durableLog.setAlarmTakeoverHook([&shards, &server](std::string ns, uint32_t shard, uint32_t waited) {
     const auto owner = server.namespaceOwner(ns);
     if (!owner || !owner->active() || shard >= owner->shards) return kj::Promise<coworkerd::ShardRoute>(
         coworkerd::ShardRoute::refuse(503, "DO_UNAVAILABLE", "the alarm namespace is not active"));
-    return shards.background(std::move(ns), shard);
+    return shards.background(std::move(ns), shard, waited);
   }, [&server](const std::string& ns) {
     const auto owner = server.namespaceOwner(ns);return owner ? owner->tenant : ns;
+  }, [&shards](const std::string& ns, uint32_t shard, const std::string& exclude) {
+    return shards.backgroundRank(ns, shard, exclude);
   });
   // Firing an alarm is a request to the object, so it needs the dispatcher; the quota is the tenant's record.
   durableLog.setAlarmHook([&durable, &server, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {

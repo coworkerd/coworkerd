@@ -310,8 +310,8 @@ public:
   void setAlarmHook(std::function<kj::Promise<AlarmResult>(DurableAlarm alarm)> hook) {
     hooks.fireAlarm = std::move(hook);
   }
-  void setAlarmTakeoverHook(AlarmDiscovery::Take take, AlarmDiscovery::Tenant tenant) {
-    alarmTake = std::move(take);alarmTenant = std::move(tenant);
+  void setAlarmTakeoverHook(AlarmDiscovery::Take take, AlarmDiscovery::Tenant tenant, AlarmDiscovery::Rank rank) {
+    alarmTake = std::move(take);alarmTenant = std::move(tenant);alarmRank = std::move(rank);
   }
   void setQuotaHook(std::function<uint64_t(const std::string& tenant)> hook) {
     hooks.tenantQuotaBytes = std::move(hook);
@@ -839,10 +839,11 @@ private:
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
   std::unique_ptr<AlarmPublication> alarmPublication;
-  uint32_t alarmReads = 0;
+  AlarmPublication::ReadBudget alarmReads;
   std::unique_ptr<AlarmDiscovery> alarmDiscovery;
   AlarmDiscovery::Take alarmTake;
   AlarmDiscovery::Tenant alarmTenant;
+  AlarmDiscovery::Rank alarmRank;
   uint64_t positionWrites = 0, quotaRefusals = 0;
   bool sealing = false, noPeerWarned = false;
   bool sealingForRecovery = false;

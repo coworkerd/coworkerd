@@ -92,24 +92,56 @@ AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::st
   }
 }
 AlarmPublication::~AlarmPublication() noexcept(false) { stopping = true; }
+AlarmPublication::ReadBudget::Permit::~Permit() noexcept(false) { budget.release(); }
+kj::Own<AlarmPublication::ReadBudget::Permit> AlarmPublication::ReadBudget::acquireNow() {
+  KJ_REQUIRE(active < limit);++active;return kj::heap<Permit>(*this);
+}
+kj::Promise<kj::Own<AlarmPublication::ReadBudget::Permit>> AlarmPublication::ReadBudget::acquire() {
+  if (active < limit) return acquireNow();
+  auto pair = kj::newPromiseAndFulfiller<kj::Own<Permit>>();waiters.push_back(kj::mv(pair.fulfiller));return kj::mv(pair.promise);
+}
+void AlarmPublication::ReadBudget::release() {
+  while (!waiters.empty()) {
+    auto waiter = kj::mv(waiters.front());waiters.pop_front();
+    if (waiter->isWaiting()) { waiter->fulfill(kj::heap<Permit>(*this));return; }
+  }
+  --active;if (available) available();
+}
 kj::Promise<void> AlarmPublication::guardRead(kj::Promise<void> promise) {
-  ++*readActive;
-  return promise.attach(kj::defer([this]() { --*readActive;pump(); }));
+  return promise.attach(readBudget->acquireNow(), kj::defer([this]() { pump(); }));
+}
+void AlarmPublication::pendingFailure() {
+  ++pendingFileFailures;
+  if (monotonicTimeMs() >= nextPendingLog) {
+    nextPendingLog = monotonicTimeMs() + 30000;
+    log("alarm-pending-file-failed", "\"failures\":" + std::to_string(pendingFileFailures));
+  }
 }
 void AlarmPublication::pending(Shard& s, bool value) {
-  if (pendingDirectory.empty() || s.pendingRecorded == value) return;
-  std::error_code error;
-  const auto path = pendingDirectory / (s.ns + "-" + std::to_string(s.shard) + ".pending");
+  if (pendingDirectory.empty() || s.pendingRecorded == value || (value && s.markerWritten)) return;
+  std::error_code error;const auto path = pendingDirectory / (s.ns + "-" + std::to_string(s.shard) + ".pending");
   if (value) {
     std::filesystem::create_directories(pendingDirectory, error);
-    KJ_REQUIRE(!error, "cannot create alarm publication pending directory");
+    if (error) { pendingFailure();return; }
     std::ofstream file(path);file.close();
-    KJ_REQUIRE(file.good(), "cannot record pending alarm publication");
+    if (!file.good()) { pendingFailure();return; }
   } else {
     std::filesystem::remove(path, error);
-    if (error) return;  // An extra candidate after restart is harmless.
+    if (error) { pendingFailure();return; }
   }
   s.pendingRecorded = value;
+}
+bool AlarmPublication::forgetPending(const std::string& ns, uint32_t shard) {
+  const auto key = shardKey(ns, shard);
+  if (inFlightHints.contains(key)) return false;
+  auto it = shards.find(key);
+  if (it != shards.end() && valid(it->second) && !it->second.markerWritten && !it->second.desired.empty()) return false;
+  if (it != shards.end() && it->second.markerWritten && !it->second.pendingRecorded) return true;
+  if (!pendingDirectory.empty()) {
+    std::error_code error;std::filesystem::remove(pendingDirectory / (ns + "-" + std::to_string(shard) + ".pending"), error);
+    if (error) pendingFailure();else if (it != shards.end()) it->second.pendingRecorded = false;
+  }
+  return true;
 }
 std::string AlarmPublication::shardKey(const std::string& ns, uint32_t shard) const { return ns + "/" + std::to_string(shard); }
 bool AlarmPublication::valid(const Shard& s) const { return !stopping && nodeEpoch && s.memberEpoch == nodeEpoch && current(s.ns, s.shard, s.epoch, s.memberEpoch); }
@@ -127,8 +159,8 @@ void AlarmPublication::setNodeEpoch(uint64_t epoch) {
 }
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
   if (!nodeEpoch || !epoch) return;const auto key = shardKey(ns, shard);auto it = shards.find(key);
-  if (it != shards.end() && it->second.epoch == epoch && it->second.memberEpoch == nodeEpoch) {
-    auto& s = it->second;s.startupOnly = false;if (!s.reading) { s.adopted = false;s.next = 0; }offerRead(s);pump();return;
+  if (it != shards.end() && it->second.epoch == epoch && it->second.memberEpoch == nodeEpoch && valid(it->second)) {
+    offerRead(it->second);pump();return;
   }
   gone(ns, shard);Shard s;s.ns = std::move(ns);s.shard = shard;s.epoch = epoch;s.tenant = std::move(tenant);
   s.memberEpoch = s.markerMemberEpoch = nodeEpoch;s.generation = s.order = ++serial;s.checked = monotonicTimeMs();
@@ -294,13 +326,13 @@ void AlarmPublication::pump(unsigned limit) {
         }
       }
       nextMarkerProbe = now + 30000;permissionProbeActive = true;++markerProbes;
-      if (!have && (activeScans || *readActive >= readLimit)) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
+      if (!have && (activeScans || readBudget->active >= readBudget->limit)) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
       if (!have) { ++active;++activeScans;tasks.add(guardRead(kj::evalLater([this]() { return probeMarkers(); })));continue; }
     }
     if (!have && activeMarkers < 8 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers, markerGate);have = true; }
     if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints, hintGate);have = true; }
-    if (!have && activeHints < 7 && *readActive < readLimit && !readyReads.empty() && hintGate.available(now)) { work = choose(readyReads, hintGate);have = true; }
-    if (!have && !activeScans && *readActive < readLimit && !markerDenied && markerGate.available(now)) {
+    if (!have && activeHints < 7 && readBudget->active < readBudget->limit && !readyReads.empty() && hintGate.available(now)) { work = choose(readyReads, hintGate);have = true; }
+    if (!have && !activeScans && readBudget->active < readBudget->limit && !markerDenied && markerGate.available(now)) {
       if (!readyScans.empty()) { work = choose(readyScans, markerGate);have = true; }
       else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
         gateProbe = markerGate.enter(now, nodeId);globalScanRunning = true;++active;++activeScans;
@@ -660,6 +692,6 @@ std::string AlarmPublication::json() const {
       << ",\"publicationTickMaxItems\":" << tickMaxItems << ",\"publicationDeadlineRows\":" << deadlines.size()
       << ",\"publicationFailureLogLines\":" << failureLogLines << ",\"publicationCpuNs\":" << cpuNs << ",\"publicationThreadCpuNs\":" << threadCpuNs;
   auto metric = [&out](const char* name, const Metric& m) { out << ",\"" << name << "Samples\":" << m.count << ",\"" << name << "P50Us\":" << m.percentile(50) << ",\"" << name << "P99Us\":" << m.percentile(99) << ",\"" << name << "MaxUs\":" << m.maximum / 1000.0; };
-  metric("publicationReport", reportMetric);metric("publicationCompletion", completionMetric);metric("publicationTick", tickMetric);metric("publicationDeadlineSlice", deadlineMetric);metric("hintToMarker", markerLatencyMetric);return out.str();
+  metric("publicationReport", reportMetric);metric("publicationCompletion", completionMetric);metric("publicationTick", tickMetric);metric("publicationDeadlineSlice", deadlineMetric);metric("hintToMarker", markerLatencyMetric);return "\"pendingFileFailures\":" + std::to_string(pendingFileFailures) + "," + out.str();
 }
 }  // namespace coworkerd

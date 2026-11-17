@@ -4,15 +4,16 @@
 #include <kj/debug.h>
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <limits>
+#include <time.h>
 
 namespace coworkerd {
 namespace {
 const std::string ROOT = "alarm-wake/by-owner/";
+uint64_t threadTime() { timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec; }
 bool hex(const std::string& s, size_t n) {
-  return s.size() == n && std::all_of(s.begin(), s.end(), [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-  });
+  return s.size() == n && std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 template <typename T> bool number(const std::string& s, T& value, size_t width = 0) {
   if (s.empty() || (width && s.size() != width)) return false;
@@ -21,183 +22,252 @@ template <typename T> bool number(const std::string& s, T& value, size_t width =
 }
 std::string wide(uint64_t n) { auto s = std::to_string(n);return std::string(20 - s.size(), '0') + s; }
 std::string prefix(const ShardRoute& r, const std::string& ns, uint32_t shard) {
-  return ROOT + r.nodeId + "/" + wide(r.nodeEpoch) + "/" + ns + "/" + std::to_string(shard) + "/" + wide(r.epoch) + "/";
+  auto value = ROOT + r.nodeId + "/" + wide(r.nodeEpoch) + "/" + ns + "/" + std::to_string(shard) + "/";
+  return r.epoch ? value + wide(r.epoch) + "/" : value;
 }
 }
+AlarmDiscovery::Scope::Scope(AlarmDiscovery& owner): owner(owner) { if (owner.measureCpu && !owner.cpuDepth++) started = threadTime(); }
+AlarmDiscovery::Scope::~Scope() { if (owner.measureCpu && !--owner.cpuDepth) owner.cpuNs += threadTime() - started; }
 std::optional<AlarmDiscovery::Marker> AlarmDiscovery::parse(const std::string& key) {
   if (!key.starts_with(ROOT)) return std::nullopt;
   std::vector<std::string> parts;size_t at = ROOT.size();
   for (;;) { auto end = key.find('/', at);parts.push_back(key.substr(at, end - at));if (end == key.npos) break;at = end + 1; }
   if (parts.size() != 6 || parts[0].empty() || !hex(parts[2], 64) || !hex(parts[5], 32)) return std::nullopt;
   Marker m;m.node = parts[0];m.ns = parts[2];
-  if (!number(parts[1], m.member, 20) || !m.member || !number(parts[3], m.shard) ||
-      parts[3] != std::to_string(m.shard) || !number(parts[4], m.epoch, 20) || !m.epoch) return std::nullopt;
+  if (!number(parts[1], m.member, 20) || !m.member || !number(parts[3], m.shard) || parts[3] != std::to_string(m.shard) ||
+      !number(parts[4], m.epoch, 20) || !m.epoch) return std::nullopt;
   return m;
 }
-AlarmDiscovery::AlarmDiscovery(Settings settings, ObjectStore& store, kj::Timer& timer,
-    const MembershipView& membership, uint32_t& readActive, std::function<bool()> ready, Take take, Tenant tenant)
-    : settings(std::move(settings)), store(store), timer(timer), membership(membership), readActive(readActive),
-      ready(std::move(ready)), take(std::move(take)), tenant(std::move(tenant)), tasks(*this) {
+AlarmDiscovery::AlarmDiscovery(Settings settings, ObjectStore& store, kj::Timer& timer, const MembershipView& membership,
+    AlarmPublication::ReadBudget& budget, std::function<bool()> ready, Take take, Tenant tenant, Rank rank,
+    std::function<bool(const std::string&)> active,
+    std::function<void(const std::string&, uint32_t, uint64_t)> adopt,
+    std::function<bool(const std::string&, uint32_t)> forgetPending)
+    : settings(std::move(settings)), store(store), timer(timer), membership(membership), readBudget(budget),
+      ready(std::move(ready)), take(std::move(take)), tenant(std::move(tenant)), rank(std::move(rank)),
+      namespaceActive(std::move(active)), adopt(std::move(adopt)), forgetPending(std::move(forgetPending)), tasks(*this) {
+  if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureCpu = std::string_view(v) == "1";
   tasks.add(kj::evalLater([this]() { return loop(); }));
 }
 AlarmDiscovery::~AlarmDiscovery() noexcept(false) { stopping = true; }
 bool AlarmDiscovery::living(const std::string& node, uint64_t epoch) const {
   auto it = membership.members.find(node);
-  return it != membership.members.end() && it->second.epoch == std::to_string(epoch);
+  return it != membership.members.end() && it->second.epoch == std::to_string(epoch) && it->second.state != "draining";
 }
-void AlarmDiscovery::directory(std::string value) {
-  if (queuedDirectories.insert(value).second) directories.push_back(std::move(value));
+void AlarmDiscovery::directory(std::string key, bool urgent) {
+  if (queuedDirectories.insert(key).second) { if (urgent) directories.push_front(std::move(key));else directories.push_back(std::move(key)); }
 }
-void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marker) {
-  const auto key = ns + "/" + std::to_string(shard);auto [it, inserted] = candidates.try_emplace(key);
-  auto& c = it->second;
-  if (inserted) { c.ns = std::move(ns);c.shard = shard;c.tenant = tenant(c.ns);c.order = ++serial;++discovered; }
-  if (!marker.empty() && !c.markers.insert(std::move(marker)).second) return;
+void AlarmDiscovery::erase(const std::string& key) {
+  auto it = candidates.find(key);if (it == candidates.end()) return;auto& c = it->second;
+  runnable.erase({c.priority, c.tenant, c.order, key});if (c.next) delayed.erase({c.next, key});
+  if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) { w->second.erase(key);if (w->second.empty()) ownerWaiters.erase(w); } }
+  candidates.erase(it);
+}
+void AlarmDiscovery::schedule(const std::string& key, double at) {
+  auto& c = candidates.at(key);runnable.erase({c.priority, c.tenant, c.order, key});if (c.next) delayed.erase({c.next, key});
+  c.next = at;c.order = ++serial;
+  if (at > monotonicTimeMs()) delayed.emplace(at, key);else { c.next = 0;runnable.emplace(c.priority, c.tenant, c.order, key); }
+}
+void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marker, bool local) {
+  Scope measured(*this);if (!namespaceActive(ns)) { ++inactiveDropped;return; }
+  const auto key = ns + "/" + std::to_string(shard);
+  if (!candidates.contains(key) && candidates.size() >= 16384) {
+    // Never suspend a directory scan behind stalled candidates. They remain discoverable in the next patrol.
+    if (!delayed.empty()) { const auto victim = delayed.rbegin()->second;erase(victim);++evicted; }
+    else if (!runnable.empty()) { const auto victim = std::get<3>(*runnable.rbegin());erase(victim);++evicted; }
+    else { ++evicted;return; }
+  }
+  auto [it, inserted] = candidates.try_emplace(key);auto& c = it->second;
+  if (inserted) { c.ns = std::move(ns);c.shard = shard;c.tenant = tenant(c.ns);++discovered; }
+  c.localPending |= local;
+  if (!marker.empty() && !c.markers.insert(marker).second) return;
   ++c.version;
-  if (inserted) runnable.emplace(c.tenant, c.order, key);
-  peakPending = std::max<uint64_t>(peakPending, candidates.size());
+  if (inserted) {
+    uint32_t r = 0;if (!marker.empty()) if (auto m = parse(marker)) r = rank(c.ns, c.shard, m->node);
+    if (r != UINT32_MAX && r) { c.priority = 1;c.waitedMs = r * 1000;++deferred;schedule(key, monotonicTimeMs() + c.waitedMs); }
+    else schedule(key, 0);
+  }
+  peakPending = std::max<uint64_t>(peakPending, candidates.size());pump();
+}
+void AlarmDiscovery::cache(const std::string& key, ShardRoute route) {
+  auto& c = candidates.at(key);
+  if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key); }
+  c.owner = std::move(route);ownerWaiters[{c.owner->nodeId, c.owner->nodeEpoch}].insert(key);
 }
 void AlarmDiscovery::loadPending() {
   std::error_code error;
   for (std::filesystem::directory_iterator it(settings.pendingDirectory, error), end; !error && it != end; it.increment(error)) {
     const auto name = it->path().filename().string();
     if (name.size() < 74 || name[64] != '-' || !name.ends_with(".pending") || !hex(name.substr(0, 64), 64)) continue;
-    uint32_t shard = 0;const auto part = name.substr(65, name.size() - 65 - 8);
-    if (number(part, shard) && part == std::to_string(shard)) candidate(name.substr(0, 64), shard);
+    uint32_t shard = 0;const auto part = name.substr(65, name.size() - 73);
+    if (number(part, shard) && part == std::to_string(shard)) candidate(name.substr(0, 64), shard, {}, true);
   }
 }
 void AlarmDiscovery::failed(const kj::Exception& error) {
-  ++failures;const std::string_view text(error.getDescription().cStr());
-  if (text.find("HTTP 403") != text.npos || text.find("AccessDenied") != text.npos) {
-    ++denials;access = false;nextRoot = monotonicTimeMs() + 30000;
-  }
+  Scope measured(*this);++failures;const std::string_view text(error.getDescription().cStr());
+  if (text.find("HTTP 403") != text.npos || text.find("AccessDenied") != text.npos) { ++denials;access = false;nextRoot = monotonicTimeMs() + 30000; }
 }
 void AlarmDiscovery::taskFailed(kj::Exception&& error) { failed(error); }
 kj::Promise<ObjectListingPage> AlarmDiscovery::list(std::string key, uint32_t count, std::string token, std::string delimiter) {
-  while (readActive >= settings.reads) co_await timer.afterDelay(10 * kj::MILLISECONDS);
-  ++readActive;peakReads = std::max(peakReads, readActive);++lists;
-  KJ_DEFER(--readActive);
+  auto permit = co_await readBudget.acquire();peakReads = std::max(peakReads, readBudget.active);++lists;
   co_return co_await store.listPage(key, count, token, delimiter);
 }
 kj::Promise<void> AlarmDiscovery::scan(std::string key) {
   KJ_DEFER(--scans;queuedDirectories.erase(key));
   try {
-    const auto remainder = key.substr(ROOT.size());
-    const bool root = key == ROOT, node = !root && std::count(remainder.begin(), remainder.end(), '/') == 1;
+    const auto remainder = key.substr(ROOT.size());const bool root = key == ROOT;
+    const bool node = !root && std::count(remainder.begin(), remainder.end(), '/') == 1;
     std::string token;
     do {
-      while (candidates.size() >= 4096) co_await timer.afterDelay(20 * kj::MILLISECONDS);
       auto page = co_await list(key, 1000, token, root || node ? "/" : "");
-      if (root) access = true;
-      if (root || node) {
-        for (auto& group: page.commonPrefixes) {
+      std::vector<std::string> garbage;
+      {
+        Scope measured(*this);if (root) access = true;
+        if (root || node) for (auto& group: page.commonPrefixes) {
           if (root) { directory(group);continue; }
-          const auto id = remainder.substr(0, remainder.size() - 1);
-          const auto part = group.substr(key.size(), group.size() - key.size() - 1);uint64_t epoch = 0;
-          if (number(part, epoch, 20) && epoch) {
-            if (!living(id, epoch) || id == settings.nodeId) directory(group);
-          } else if (id == settings.nodeId) directory(group);
+          const auto id = remainder.substr(0, remainder.size() - 1);const auto part = group.substr(key.size(), group.size() - key.size() - 1);uint64_t epoch = 0;
+          if (number(part, epoch, 20) && epoch) { if (!living(id, epoch) || id == settings.nodeId) directory(group); }
+          else if (id == settings.nodeId) directory(group);
         }
-      }
-      for (const auto& object: page.objects) {
-        if (auto m = parse(object.key); m && object.size == 0) {
-          if (!living(m->node, m->member)) candidate(m->ns, m->shard, object.key);
-        } else if (object.key.starts_with(ROOT + settings.nodeId + "/") &&
-            object.lastModifiedUnixMs && page.dateUnixMs > object.lastModifiedUnixMs + 60000) {
-          co_await store.remove(object.key);++removed;
+        for (const auto& object: page.objects) {
+          if (auto m = parse(object.key);m && object.size == 0) { if (!living(m->node, m->member)) candidate(m->ns, m->shard, object.key); }
+          else if (object.key.starts_with(ROOT + settings.nodeId + "/") && object.lastModifiedUnixMs && page.dateUnixMs > object.lastModifiedUnixMs + 60000) garbage.push_back(object.key);
         }
+        token = std::move(page.nextToken);
       }
-      token = std::move(page.nextToken);
+      // A failed auxiliary garbage DELETE must not disable discovery's LIST/acquisition path.
+      for (const auto& object: garbage) try { co_await store.remove(object);++removed; } catch (const kj::Exception&) { ++failures; }
     } while (!token.empty());
   } catch (const kj::Exception& error) { failed(error); }
 }
-void AlarmDiscovery::finish(const std::string& key, uint64_t version, bool done) {
-  auto it = candidates.find(key);if (it == candidates.end()) return;
-  auto& c = it->second;c.active = false;
-  if (done && c.version == version) { candidates.erase(it);return; }
-  delayed.emplace(monotonicTimeMs() + 2000, key);
+kj::Promise<bool> AlarmDiscovery::hints(std::string ns, uint32_t shard) {
+  const auto pre = "do/" + ns + "/shards/" + std::to_string(shard) + "/alarms/";std::string token;
+  do {
+    auto page = co_await list(pre, 1000, token);
+    for (const auto& object: page.objects) {
+      const auto part = object.key.substr(pre.size());
+      if (part.size() == 66 && part.ends_with("/0") && hex(part.substr(0, 64), 64)) co_return true;
+    }
+    token = std::move(page.nextToken);
+  } while (!token.empty());
+  co_return false;
+}
+kj::Promise<bool> AlarmDiscovery::sourcePresent(std::string key) {
+  const auto markers = candidates.at(key).markers;if (markers.empty()) co_return true;
+  std::set<std::string> checked;
+  for (const auto& marker: markers) {
+    const auto pre = marker.substr(0, marker.rfind('/') + 1);if (!checked.insert(pre).second) continue;
+    auto page = co_await list(pre, 1000);
+    for (const auto& object: page.objects) if (object.size == 0 && markers.contains(object.key)) co_return true;
+  }
+  co_return false;
 }
 kj::Promise<void> AlarmDiscovery::process(std::string key) {
-  KJ_DEFER(--active);
+  KJ_DEFER(--active;pump());
   auto& c = candidates.at(key);const auto version = c.version;const auto ns = c.ns;const auto shard = c.shard;
-  const auto markers = c.markers;bool done = false;
+  bool done = false, drop = false;uint32_t delay = 0;
   try {
-    // Empty hints are garbage, and must never cause an otherwise empty shard to acquire an epoch.
-    auto hints = co_await list("do/" + ns + "/shards/" + std::to_string(shard) + "/alarms/", 1);
-    const bool empty = hints.objects.empty();std::string currentPrefix;
-    if (!empty) {
-      auto route = co_await take(ns, shard);
-      if (route.kind == ShardRoute::Kind::LOCAL) ++acquired;
-      else if (route.kind == ShardRoute::Kind::FORWARD) ++forwarded;
-      if ((route.kind == ShardRoute::Kind::LOCAL || route.kind == ShardRoute::Kind::FORWARD) && route.epoch) {
-        currentPrefix = prefix(route, ns, shard);
-        auto own = co_await list(currentPrefix, 1000);
-        done = std::any_of(own.objects.begin(), own.objects.end(), [&](const auto& o) {
-          return o.size == 0 && o.key.starts_with(currentPrefix) && hex(o.key.substr(currentPrefix.size()), 32);
-        });
+    if (!namespaceActive(ns)) { ++inactiveDropped;drop = true; }
+    else if ((c.waitedMs || c.owner || c.failures) && !co_await sourcePresent(key)) done = true;
+    else {
+      bool empty = false;std::string currentPrefix;
+      if (c.owner && !living(c.owner->nodeId, c.owner->nodeEpoch)) {
+        auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key);c.owner.reset();
       }
-    } else done = true;
-    if (done) for (const auto& marker: markers) {
-      if (!empty && marker.starts_with(currentPrefix)) continue;
-      co_await store.remove(marker);++removed;
+      if (!c.owner) {
+        if (!co_await hints(ns, shard)) { empty = true;done = true; }
+        else {
+          const auto started = monotonicTimeMs();auto route = co_await take(ns, shard, c.waitedMs);
+          ++takeCalls;takeNs += uint64_t((monotonicTimeMs() - started) * 1000000);
+          if (route.code == "DO_BACKGROUND_DEFERRED") { delay = route.backgroundDelayMs;c.waitedMs += delay;++deferred; }
+          else if (route.kind == ShardRoute::Kind::LOCAL || route.kind == ShardRoute::Kind::FORWARD) {
+            if (route.kind == ShardRoute::Kind::LOCAL) { ++acquired;c.localPending = true; }else ++forwarded;
+            cache(key, std::move(route));
+          }
+        }
+      }
+      if (c.owner) {
+        const auto owner = *c.owner;currentPrefix = prefix(owner, ns, shard);
+        auto own = co_await list(currentPrefix, 1000);
+        const bool exists = std::any_of(own.objects.begin(), own.objects.end(), [&](const auto& object) {
+          auto m = parse(object.key);return object.size == 0 && m && m->node == owner.nodeId && m->member == owner.nodeEpoch &&
+              m->ns == ns && m->shard == shard && (!owner.epoch || m->epoch == owner.epoch);
+        });
+        if (owner.kind == ShardRoute::Kind::LOCAL && !exists) adopt(ns, shard, owner.epoch);
+        // A restart-forward has no current shard epoch yet. Its winner retires the old marker; never infer ownership
+        // from a marker's epoch. Later retries observe that old marker disappearing, without rewriting an owner hint.
+        done = exists && owner.epoch && living(owner.nodeId, owner.nodeEpoch);
+      }
+      if (done) {
+        const auto markers = c.markers;
+        for (const auto& marker: markers) { if (!empty && marker.starts_with(currentPrefix)) continue;co_await store.remove(marker);++removed; }
+      }
     }
+    if (done && c.localPending) done = forgetPending(ns, shard);
   } catch (const kj::Exception& error) { failed(error); }
-  finish(key, version, done);
+  Scope measured(*this);c.active = false;
+  if (drop || (done && c.version == version)) { erase(key);co_return; }
+  if (!delay) { c.failures = std::min(6u, c.failures + 1);delay = std::min(60000u, 1000u << c.failures); }
+  schedule(key, monotonicTimeMs() + delay);
 }
 kj::Promise<void> AlarmDiscovery::loop() {
   for (;;) {
-    co_await timer.afterDelay(10 * kj::MILLISECONDS);
-    const auto now = monotonicTimeMs();
-    const auto delay = lastLoop ? std::max(0.0, now - lastLoop - 10) : 0;
-    maxLoopDelayMs = std::max(maxLoopDelayMs, delay);lastLoop = now;
-    const auto second = uint64_t(now / 1000);auto& sample = loopSeconds[second % loopSeconds.size()];
-    if (sample.first != second) sample = {second, delay};else sample.second = std::max(sample.second, delay);
-    if (!ready() || membership.backend != "objectStore" || membership.selfExpired || membership.identityTaken || membership.draining) continue;
-    uint64_t epoch = 0;if (!number(membership.epoch, epoch) || !epoch) continue;
+    co_await timer.afterDelay(200 * kj::MILLISECONDS);Scope measured(*this);
+    if (!ready() || membership.backend != "objectStore" || !membership.durableProcesses || membership.selfExpired || membership.identityTaken || membership.draining) continue;
+    const auto now = monotonicTimeMs();uint64_t epoch = 0;if (!number(membership.epoch, epoch) || !epoch) continue;
     if (epoch != memberEpoch) { memberEpoch = epoch;loadPending();nextRoot = 0; }
-    std::map<std::string, std::string> next;
-    for (const auto& [id, member]: membership.members) next[id] = member.epoch;
-    if (next != members) {
+    if (memberChanges != membership.memberChanges) {
+      memberChanges = membership.memberChanges;std::map<std::string, std::string> next;
+      for (const auto& [id, member]: membership.members) if (member.state != "draining") next[id] = member.epoch;
       for (const auto& [id, old]: members) if (!next.contains(id) || next.at(id) != old) {
-        directory(ROOT + id + "/");lastGoneNode = id;lastGoneMs = now;
+        directory(ROOT + id + "/", true);uint64_t oldEpoch = 0;if (number(old, oldEpoch)) invalidOwners.emplace_back(id, oldEpoch);
       }
       members = std::move(next);
     }
-    if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs; }
-    if (!scans && !directories.empty()) {
+    unsigned slice = 0;
+    while (!invalidOwners.empty() && slice++ < 64) {
+      auto w = ownerWaiters.find(invalidOwners.front());
+      if (w == ownerWaiters.end() || w->second.empty()) { if (w != ownerWaiters.end()) ownerWaiters.erase(w);invalidOwners.pop_front();continue; }
+      const auto key = *w->second.begin();w->second.erase(w->second.begin());auto it = candidates.find(key);
+      if (it != candidates.end() && !it->second.active) { it->second.owner.reset();it->second.failures = 0;schedule(key, 0); }
+    }
+    if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
+    if (scans < 2 && !directories.empty()) {
       auto it = access ? directories.begin() : std::find(directories.begin(), directories.end(), ROOT);
       if (it != directories.end()) { auto key = std::move(*it);directories.erase(it);++scans;tasks.add(scan(std::move(key))); }
     }
-    unsigned slice = 0;
-    while (!delayed.empty() && delayed.begin()->first <= now && slice++ < 64) {
-      auto key = std::move(delayed.begin()->second);delayed.erase(delayed.begin());auto it = candidates.find(key);
-      if (it != candidates.end() && !it->second.active) { it->second.order = ++serial;runnable.emplace(it->second.tenant, it->second.order, key); }
+    slice = 0;
+    while (!delayed.empty() && delayed.begin()->first <= now && slice++ < 256) {
+      const auto key = delayed.begin()->second;delayed.erase(delayed.begin());auto it = candidates.find(key);
+      if (it != candidates.end() && !it->second.active) { it->second.next = 0;runnable.emplace(it->second.priority, it->second.tenant, it->second.order, key); }
     }
-    while (access && active < settings.takeovers && !runnable.empty()) {
-      auto it = runnable.upper_bound({lastTenant, std::numeric_limits<uint64_t>::max(), ""});if (it == runnable.end()) it = runnable.begin();
-      auto key = std::get<2>(*it);lastTenant = std::get<0>(*it);runnable.erase(it);
-      auto found = candidates.find(key);if (found == candidates.end() || found->second.active) continue;
-      found->second.active = true;++active;peakActive = std::max<uint64_t>(peakActive, active);tasks.add(process(std::move(key)));
-    }
+    pump();
   }
 }
+void AlarmDiscovery::pump() {
+  if (pumping || stopping || !ready() || membership.selfExpired || membership.identityTaken || membership.draining) return;
+  pumping = true;KJ_DEFER(pumping = false);unsigned slice = 0;
+    while (slice++ < 64 && access && active < settings.takeovers && !runnable.empty()) {
+      const auto priority = std::get<0>(*runnable.begin());
+      auto it = runnable.upper_bound({priority, lastTenant, UINT64_MAX, ""});
+      if (it == runnable.end() || std::get<0>(*it) != priority) it = runnable.begin();
+      const auto key = std::get<3>(*it);lastTenant = std::get<1>(*it);runnable.erase(it);auto found = candidates.find(key);
+      if (found == candidates.end() || found->second.active) continue;
+      found->second.active = true;++active;peakActive = std::max<uint64_t>(peakActive, active);tasks.add(process(key));
+    }
+}
 std::string AlarmDiscovery::json() const {
-  std::string samples = "[";
-  for (const auto& [second, delay]: loopSeconds) if (second) {
-    if (samples.size() > 1) samples += ",";
-    samples += "{\"monotonicSecond\":" + std::to_string(second) + ",\"maxDelayMs\":" + std::to_string(delay) + "}";
-  }
-  samples += "]";
-  return "{\"state\":" + json::quote(access ? "enabled" : denials ? "disabled-access-denied" : "checking") +
-      ",\"scanIntervalMs\":" + std::to_string(settings.intervalMs) + ",\"takeoverLimit\":" + std::to_string(settings.takeovers) +
-      ",\"readLimit\":" + std::to_string(settings.reads) + ",\"active\":" + std::to_string(active) +
-      ",\"peakActive\":" + std::to_string(peakActive) + ",\"sharedPeakReads\":" + std::to_string(peakReads) +
-      ",\"pending\":" + std::to_string(candidates.size()) + ",\"peakPending\":" + std::to_string(peakPending) +
+  const auto state = !membership.durableProcesses ? "disabled-no-durable-processes" : access ? "enabled" : denials ? "disabled-access-denied" : "checking";
+  return "{\"state\":" + json::quote(state) + ",\"scanIntervalMs\":" + std::to_string(settings.intervalMs) +
+      ",\"takeoverLimit\":" + std::to_string(settings.takeovers) + ",\"readLimit\":" + std::to_string(settings.reads) +
+      ",\"active\":" + std::to_string(active) + ",\"peakActive\":" + std::to_string(peakActive) +
+      ",\"sharedPeakReads\":" + std::to_string(peakReads) + ",\"pending\":" + std::to_string(candidates.size()) +
+      ",\"peakPending\":" + std::to_string(peakPending) + ",\"candidateLimit\":16384,\"evicted\":" + std::to_string(evicted) +
       ",\"discovered\":" + std::to_string(discovered) + ",\"localResults\":" + std::to_string(acquired) +
       ",\"forwardedResults\":" + std::to_string(forwarded) + ",\"removed\":" + std::to_string(removed) +
       ",\"listRequests\":" + std::to_string(lists) + ",\"failures\":" + std::to_string(failures) +
-      ",\"denials\":" + std::to_string(denials) + ",\"lastGoneNode\":" + json::quote(lastGoneNode) +
-      ",\"lastGoneMonotonicMs\":" + std::to_string(lastGoneMs) + ",\"probeMonotonicMs\":" + std::to_string(monotonicTimeMs()) +
-      ",\"loopProbeIntervalMs\":10,\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + ",\"loopSeconds\":" + samples + "}";
+      ",\"denials\":" + std::to_string(denials) + ",\"inactiveDropped\":" + std::to_string(inactiveDropped) +
+      ",\"deferred\":" + std::to_string(deferred) + ",\"takeCalls\":" + std::to_string(takeCalls) +
+      ",\"takeNs\":" + std::to_string(takeNs) + ",\"cpuNs\":" + std::to_string(cpuNs) + ",\"tickMs\":200}";
 }
 }  // namespace coworkerd

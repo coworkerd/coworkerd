@@ -4,6 +4,7 @@
 #include <array>
 #include <functional>
 #include <filesystem>
+#include <deque>
 #include <list>
 #include <map>
 #include <set>
@@ -16,6 +17,15 @@ namespace coworkerd {
 // Auxiliary discovery only. SQLite and the ordinary ownership path remain authoritative.
 class AlarmPublication final: private kj::TaskSet::ErrorHandler {
 public:
+  struct ReadBudget {
+    struct Permit { ReadBudget& budget;explicit Permit(ReadBudget& b): budget(b) {} ~Permit() noexcept(false); };
+    uint32_t active = 0, limit = 2;
+    std::function<void()> available;
+    std::deque<kj::Own<kj::PromiseFulfiller<kj::Own<Permit>>>> waiters;
+    kj::Promise<kj::Own<Permit>> acquire();
+    kj::Own<Permit> acquireNow();
+    void release();
+  };
   using Current = std::function<bool(const std::string&, uint32_t, uint64_t, uint64_t)>;
   using Adopt = std::function<void(const std::string&, const std::string&, uint32_t, uint64_t,
       const std::string&, uint64_t)>;
@@ -29,7 +39,8 @@ public:
   void report(std::string ns, std::string object, uint32_t shard, uint64_t epoch,
       std::string tenant, uint64_t at);
   void tick();
-  void setReadBudget(uint32_t& active, uint32_t limit) { readActive = &active;readLimit = limit; }
+  void setReadBudget(ReadBudget& budget, uint32_t limit) { readBudget = &budget;budget.limit = limit;budget.available = [this]() { pump(); }; }
+  bool forgetPending(const std::string& ns, uint32_t shard);
   void setPendingDirectory(std::filesystem::path path) { pendingDirectory = std::move(path); }
   std::string json() const;
   uint64_t hintWrites = 0, hintFailures = 0;
@@ -136,10 +147,12 @@ private:
   std::set<Ready> readyHints, readyMarkers, readyScans;
   std::set<Ready> readyReads;
   std::filesystem::path pendingDirectory;
-  uint32_t privateReadActive = 0, readLimit = 2;
-  uint32_t* readActive = &privateReadActive;
+  ReadBudget privateReadBudget;
+  ReadBudget* readBudget = &privateReadBudget;
+  uint64_t pendingFileFailures = 0;double nextPendingLog = 0;
   kj::Promise<void> guardRead(kj::Promise<void>);
   void pending(Shard&, bool);
+  void pendingFailure();
   std::string lastTenant, deniedPrefix;
   Probe deniedOperation = Probe::LIST;
   Gate hintGate, markerGate;

@@ -378,20 +378,25 @@ kj::Promise<ShardRoute> DurableShards::route(std::string namespaceId, uint32_t s
   }
 }
 
-kj::Promise<ShardRoute> DurableShards::background(std::string namespaceId, uint32_t shard) {
+kj::Promise<ShardRoute> DurableShards::background(std::string namespaceId, uint32_t shard, uint32_t waitedMs) {
   try {
     if (auto atomic = co_await waitForAtomic(); atomic.kind == ShardRoute::Kind::REFUSE) co_return atomic;
     if (membership.selfExpired || membership.identityTaken)
       co_return ShardRoute::refuse(503, "DO_OWNER_EXPIRED", "this node's membership expired");
     // Background callers also use the decision's metadata to retire old clues. Bypass request caches, including the
     // held fast path, so that metadata always comes from a complete latest-epoch read. Acquisition itself is unchanged.
-    auto latest = co_await readLatest(namespaceId, shard, false);
-    co_return co_await decide(namespaceId, shard, std::move(latest), true, {}, true, false);
+    auto latest = co_await readLatest(namespaceId, shard, false, false);
+    co_return co_await decide(namespaceId, shard, std::move(latest), true, {}, true, false, waitedMs);
   } catch (const kj::Exception& error) {
     ++acquireFailures;
     co_return ShardRoute::refuse(503, isStorageFailure(error) ? "STORAGE_UNAVAILABLE" : "DO_UNAVAILABLE",
         error.getDescription().cStr());
   }
+}
+
+uint32_t DurableShards::backgroundRank(const std::string& ns, uint32_t shard, const std::string& exclude) const {
+  const auto order = candidates(ns, shard, exclude);auto it = std::find(order.begin(), order.end(), settings.nodeId);
+  return it == order.end() ? UINT32_MAX : uint32_t(it - order.begin());
 }
 
 kj::Promise<ShardRoute> DurableShards::accept(std::string namespaceId, uint32_t shard, uint64_t expectedEpoch, std::string fromNode) {
@@ -437,7 +442,7 @@ kj::Promise<ShardRoute> DurableShards::accept(std::string namespaceId, uint32_t 
   }
 }
 
-kj::Promise<DurableShards::Latest> DurableShards::readLatest(std::string namespaceId, uint32_t shard, bool viaHint) {
+kj::Promise<DurableShards::Latest> DurableShards::readLatest(std::string namespaceId, uint32_t shard, bool viaHint, bool repairHint) {
   Latest latest;
   std::optional<Hint> hint;
   if (viaHint) {
@@ -493,7 +498,7 @@ kj::Promise<DurableShards::Latest> DurableShards::readLatest(std::string namespa
   record->lastModifiedUnixMs = newestModified;
   latest.released = released.contains(newest);
   // The hint follows what the listing found when it was missing, unreadable or named another epoch.
-  if (!hint || hint->epoch != newest || hint->nodeId != record->nodeId || hint->released != latest.released) {
+  if (repairHint && (!hint || hint->epoch != newest || hint->nodeId != record->nodeId || hint->released != latest.released)) {
     if (viaHint) ++hintsRepaired;
     writeHint(namespaceId, shard, *record, latest.released);
   }
@@ -502,20 +507,20 @@ kj::Promise<DurableShards::Latest> DurableShards::readLatest(std::string namespa
 }
 
 kj::Promise<ShardRoute> DurableShards::decide(std::string namespaceId, uint32_t shard, Latest latest, bool retry,
-    std::string failedNode, bool designated, bool forwardedHere) {
+    std::string failedNode, bool designated, bool forwardedHere, int64_t backgroundWaitedMs) {
   if (auto fence = ownerFenceThrough.find({namespaceId, shard}); fence != ownerFenceThrough.end() &&
       (!latest.record || latest.record->epoch <= fence->second)) {
     if (!latest.listed) {
-      latest = co_await readLatest(namespaceId, shard, false);
-      co_return co_await decide(namespaceId, shard, std::move(latest), retry, failedNode, designated, forwardedHere);
+      latest = co_await readLatest(namespaceId, shard, false, backgroundWaitedMs < 0);
+      co_return co_await decide(namespaceId, shard, std::move(latest), retry, failedNode, designated, forwardedHere, backgroundWaitedMs);
     }
     co_return ShardRoute::refuse(409, "DO_SHARD_EPOCH_MISMATCH", "the owner epoch was fenced by a complete tail proof");
   }
-  if (!latest.record) co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "first", {}, designated, forwardedHere);
+  if (!latest.record) co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "first", {}, designated, forwardedHere, backgroundWaitedMs);
   // Taking a shard over is decided on a listing only: a hint can lag its latest epoch.
   if (!latest.listed && (latest.released || ownerOf(*latest.record) != Owner::ALIVE)) {
-    latest = co_await readLatest(namespaceId, shard, false);
-    co_return co_await decide(namespaceId, shard, std::move(latest), retry, failedNode, designated, forwardedHere);
+    latest = co_await readLatest(namespaceId, shard, false, backgroundWaitedMs < 0);
+    co_return co_await decide(namespaceId, shard, std::move(latest), retry, failedNode, designated, forwardedHere, backgroundWaitedMs);
   }
   const auto record = *latest.record;
   if (latest.released) {
@@ -526,14 +531,14 @@ kj::Promise<ShardRoute> DurableShards::decide(std::string namespaceId, uint32_t 
     // never serve its objects again after a restart (found by v63's same-boot reuse case).
     const bool mine = record.nodeId == settings.nodeId;
     co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "released",
-        mine ? std::string() : record.nodeId, designated, forwardedHere);
+        mine ? std::string() : record.nodeId, designated, forwardedHere, backgroundWaitedMs);
   }
   auto owner = ownerOf(record);
   if (owner == Owner::SELF) {
     // An epoch of this node's id it does not hold (the holdings were checked first): an earlier membership epoch -- this
     // process expired and registered again, or the node started again --, taken back at once with a new epoch.
-    if (forwardedHere || eligible()) co_return co_await acquire(namespaceId, shard, std::move(latest), "restart");
-    co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "restart", record.nodeId, designated, forwardedHere);
+    if (forwardedHere || eligible()) co_return co_await acquire(namespaceId, shard, std::move(latest), "restart", backgroundWaitedMs < 0);
+    co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "restart", record.nodeId, designated, forwardedHere, backgroundWaitedMs);
   }
   // An owner the member table counts live that a request could not reach, or that this node was asked to replace: its
   // liveness from the store now.
@@ -548,12 +553,12 @@ kj::Promise<ShardRoute> DurableShards::decide(std::string namespaceId, uint32_t 
     cache[{namespaceId, shard}] = {record, false, latest.source, timer.now()};
     co_return forwardTo(record, latest.source);
   }
-  co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "timeout", record.nodeId, designated, forwardedHere);
+  co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "timeout", record.nodeId, designated, forwardedHere, backgroundWaitedMs);
 }
 
 kj::Promise<ShardRoute> DurableShards::takeOrForward(std::string namespaceId, uint32_t shard, Latest latest, std::string reason,
-    std::string exclude, bool designated, bool forwardedHere) {
-  if (forwardedHere) co_return co_await acquire(namespaceId, shard, std::move(latest), reason);
+    std::string exclude, bool designated, bool forwardedHere, int64_t backgroundWaitedMs) {
+  if (forwardedHere) co_return co_await acquire(namespaceId, shard, std::move(latest), reason, backgroundWaitedMs < 0);
   auto order = candidates(namespaceId, shard, exclude);
   if (designated) {
     // The default owner could not take the shard: this node's turn, then a read of the shard first.
@@ -563,8 +568,13 @@ kj::Promise<ShardRoute> DurableShards::takeOrForward(std::string namespaceId, ui
           (eligible() ? std::string("not a candidate") : unavailable().empty() ? std::string("draining") : unavailable()) + ")");
     const uint64_t pause = reason == "first" ? 200 + randomBelow(301) : static_cast<uint64_t>(at - order.begin()) * 1000;
     ++waits;
-    co_await timer.afterDelay(pause * kj::MILLISECONDS);
-    latest = co_await readLatest(namespaceId, shard, false);
+    if (backgroundWaitedMs >= 0 && uint64_t(backgroundWaitedMs) < pause) {
+      ShardRoute deferred;deferred.code = "DO_BACKGROUND_DEFERRED";
+      deferred.backgroundDelayMs = uint32_t(pause - uint64_t(backgroundWaitedMs));
+      co_return deferred;
+    }
+    if (backgroundWaitedMs < 0) co_await timer.afterDelay(pause * kj::MILLISECONDS);
+    latest = co_await readLatest(namespaceId, shard, false, backgroundWaitedMs < 0);
     if (latest.record && !latest.released) {
       auto owner = ownerOf(*latest.record);
       if (owner == Owner::GONE) owner = co_await probeOwner(*latest.record);
@@ -576,11 +586,11 @@ kj::Promise<ShardRoute> DurableShards::takeOrForward(std::string namespaceId, ui
     } else if (latest.record) {
       reason = "released";
     }
-    co_return co_await acquire(namespaceId, shard, std::move(latest), reason);
+    co_return co_await acquire(namespaceId, shard, std::move(latest), reason, backgroundWaitedMs < 0);
   }
   if (order.empty())
     co_return ShardRoute::refuse(503, "DO_UNAVAILABLE", "no member that runs durable processes can own the shard");
-  if (order.front() == settings.nodeId) co_return co_await acquire(namespaceId, shard, std::move(latest), reason);
+  if (order.front() == settings.nodeId) co_return co_await acquire(namespaceId, shard, std::move(latest), reason, backgroundWaitedMs < 0);
   // The default owner is asked to take it.
   const auto& member = membership.members.at(order.front());
   ShardRoute route;
@@ -593,21 +603,21 @@ kj::Promise<ShardRoute> DurableShards::takeOrForward(std::string namespaceId, ui
   co_return route;
 }
 
-kj::Promise<ShardRoute> DurableShards::acquire(std::string namespaceId, uint32_t shard, Latest latest, std::string reason) {
+kj::Promise<ShardRoute> DurableShards::acquire(std::string namespaceId, uint32_t shard, Latest latest, std::string reason, bool repairHint) {
   // This node's requests for one shard -- its own callers' and those other nodes asked it to take -- share one acquisition.
   const Key key{namespaceId, shard};
   if (auto running = acquiring.find(key); running != acquiring.end()) {
     ++waits;
     co_return co_await running->second.addBranch();
   }
-  auto forked = acquireNow(namespaceId, shard, std::move(latest), reason).fork();
+  auto forked = acquireNow(namespaceId, shard, std::move(latest), reason, repairHint).fork();
   auto branch = forked.addBranch();
   acquiring.emplace(key, kj::mv(forked));
   KJ_DEFER(acquiring.erase(key));
   co_return co_await branch;
 }
 
-kj::Promise<ShardRoute> DurableShards::acquireNow(std::string namespaceId, uint32_t shard, Latest latest, std::string reason) {
+kj::Promise<ShardRoute> DurableShards::acquireNow(std::string namespaceId, uint32_t shard, Latest latest, std::string reason, bool repairHint) {
   const Key key{namespaceId, shard};
   if (!eligible())
     co_return membership.selfExpired || membership.identityTaken
@@ -679,7 +689,7 @@ kj::Promise<ShardRoute> DurableShards::acquireNow(std::string namespaceId, uint3
     ++acquireConflicts;
     log("lost", namespaceId, shard, "\"epoch\":\"" + std::to_string(record.epoch) + "\",\"reason\":" + quote(reason) +
         ",\"attempt\":" + std::to_string(attempt));
-    latest = co_await readLatest(namespaceId, shard, false);
+    latest = co_await readLatest(namespaceId, shard, false, repairHint);
     if (latest.record && !latest.released) {
       auto owner = ownerOf(*latest.record);
       if (owner == Owner::GONE) owner = co_await probeOwner(*latest.record);

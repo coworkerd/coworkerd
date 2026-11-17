@@ -64,6 +64,7 @@ struct ShardRoute {
   uint64_t nodeEpoch = 0, epoch = 0, dataEpoch = 0;
   // REFUSE: the answer.
   uint status = 503;
+  uint32_t backgroundDelayMs = 0;
   std::string code, reason;
   // How the owner was found: "held", "cache", "hint", "listing", "acquired", "designated".
   std::string source;
@@ -98,7 +99,8 @@ public:
       bool designated = false);
   // Every survivor independently offers marked shards. The existing designated retry waits for its rendezvous rank,
   // reads the latest epoch, probes its owner, and shares the ordinary acquisition. No object request is dispatched.
-  kj::Promise<ShardRoute> background(std::string namespaceId, uint32_t shard);
+  kj::Promise<ShardRoute> background(std::string namespaceId, uint32_t shard, uint32_t waitedMs = 0);
+  uint32_t backgroundRank(const std::string& ns, uint32_t shard, const std::string& exclude) const;
   // The decision at the node another node sent such a request to, expecting it to hold the shard at `expectedEpoch` (0:
   // asked to take it).
   kj::Promise<ShardRoute> accept(std::string namespaceId, uint32_t shard, uint64_t expectedEpoch, std::string fromNode);
@@ -177,13 +179,13 @@ private:
   // The candidates for the shard's ownership, its default owner first: the members with durable processes that are
   // not draining, but `exclude`, in the rendezvous order of <ns>/<s> (Workers' homes are chosen the same way).
   std::vector<std::string> candidates(const std::string& namespaceId, uint32_t shard, const std::string& exclude) const;
-  kj::Promise<Latest> readLatest(std::string namespaceId, uint32_t shard, bool viaHint);
+  kj::Promise<Latest> readLatest(std::string namespaceId, uint32_t shard, bool viaHint, bool repairHint = true);
   kj::Promise<ShardRoute> decide(std::string namespaceId, uint32_t shard, Latest latest, bool retry, std::string failedNode,
-      bool designated, bool forwardedHere);
+      bool designated, bool forwardedHere, int64_t backgroundWaitedMs = -1);
   kj::Promise<ShardRoute> takeOrForward(std::string namespaceId, uint32_t shard, Latest latest, std::string reason,
-      std::string exclude, bool designated, bool forwardedHere);
-  kj::Promise<ShardRoute> acquire(std::string namespaceId, uint32_t shard, Latest latest, std::string reason);
-  kj::Promise<ShardRoute> acquireNow(std::string namespaceId, uint32_t shard, Latest latest, std::string reason);
+      std::string exclude, bool designated, bool forwardedHere, int64_t backgroundWaitedMs = -1);
+  kj::Promise<ShardRoute> acquire(std::string namespaceId, uint32_t shard, Latest latest, std::string reason, bool repairHint = true);
+  kj::Promise<ShardRoute> acquireNow(std::string namespaceId, uint32_t shard, Latest latest, std::string reason, bool repairHint = true);
   kj::Promise<ShardRoute> waitForAtomic();
   void writeHint(const std::string& namespaceId, uint32_t shard, const ShardEpoch& record, bool released);
   ShardRoute forwardTo(const ShardEpoch& record, const std::string& source);
