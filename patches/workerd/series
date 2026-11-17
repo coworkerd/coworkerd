@@ -31,8 +31,6 @@
 0033-owned-preparation-and-demand-drain.patch
 0034-preparation-response-stream.patch
 0035-preparation-failure-recovery.patch
-0036-bounded-preparation-completion.patch
-0037-preparation-io-turn.patch
 0038-preparation-queue-and-failure-cache.patch
 0039-lifecycle-publication-pause.patch
 0040-lifecycle-identity-cache.patch
