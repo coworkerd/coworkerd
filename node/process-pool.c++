@@ -3018,7 +3018,7 @@ public:
     // Ordinary generations retain the original fast path when no context remains.
     if (!old.durable && old.openContexts.empty()) return true;
     if (!old.contextsVisible) return now - since >= periodMs;
-    if (now - lastLifecycleCheck < 100) return false;
+    if (now - lastLifecycleCheck < (old.durable ? 20 : 100)) return false;
     lastLifecycleCheck = now;
     if (old.durable) {
       const auto snapshot = old.lifecycle.readDrain();
