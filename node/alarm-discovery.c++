@@ -42,10 +42,10 @@ AlarmDiscovery::AlarmDiscovery(Settings settings, ObjectStore& store, kj::Timer&
     AlarmPublication::ReadBudget& budget, std::function<bool()> ready, Take take, Tenant tenant, Rank rank,
     Valid active,
     std::function<void(const std::string&, uint32_t, uint64_t)> adopt,
-    std::function<bool(const std::string&, uint32_t)> forgetPending, Held held, Published published, Retire retire)
+    std::function<bool(const std::string&, uint32_t)> forgetPending, Held held, Published published, WaitPublished waitPublished, HintsReady hintsReady, Retire retire)
     : settings(std::move(settings)), store(store), timer(timer), membership(membership), readBudget(budget),
       ready(std::move(ready)), take(std::move(take)), tenant(std::move(tenant)), rank(std::move(rank)),
-      namespaceActive(std::move(active)), held(std::move(held)), published(std::move(published)), retire(std::move(retire)), adopt(std::move(adopt)), forgetPending(std::move(forgetPending)), tasks(*this) {
+      namespaceActive(std::move(active)), held(std::move(held)), published(std::move(published)), waitPublished(std::move(waitPublished)), hintsReady(std::move(hintsReady)), retire(std::move(retire)), adopt(std::move(adopt)), forgetPending(std::move(forgetPending)), tasks(*this) {
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureCpu = std::string_view(v) == "1";
   tasks.add(kj::evalLater([this]() { return loop(); }));
 }
@@ -61,6 +61,7 @@ void AlarmDiscovery::erase(const std::string& key) {
   auto it = candidates.find(key);if (it == candidates.end()) return;auto& c = it->second;
   runnable.erase({c.priority, c.tenant, c.order, key});if (c.next) delayed.erase({c.next, key});
   if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) { w->second.erase(key);if (w->second.empty()) ownerWaiters.erase(w); } }
+  if (c.awaitingHints) --adoptions;
   candidates.erase(it);
 }
 void AlarmDiscovery::schedule(const std::string& key, double at) {
@@ -84,7 +85,7 @@ void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marke
   ++c.version;
   if (inserted) {
     uint32_t r = 0;if (!marker.empty()) if (auto m = parse(marker)) r = rank(c.ns, c.shard, m->node);
-    if (r != UINT32_MAX && r) { c.priority = 1;c.waitedMs = r * 1000;++deferred;schedule(key, monotonicTimeMs() + c.waitedMs); }
+    if (r != UINT32_MAX && r) { c.priority = 2;c.waitedMs = r * 1000;++deferred;schedule(key, monotonicTimeMs() + c.waitedMs); }
     else schedule(key, 0);
   }
   peakPending = std::max<uint64_t>(peakPending, candidates.size());pump();
@@ -92,7 +93,7 @@ void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marke
 void AlarmDiscovery::cache(const std::string& key, ShardRoute route) {
   auto& c = candidates.at(key);
   if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key); }
-  c.owner = std::move(route);ownerWaiters[{c.owner->nodeId, c.owner->nodeEpoch}].insert(key);
+  c.owner = std::move(route);c.forceResolve = false;if (c.owner->kind == ShardRoute::Kind::LOCAL) c.priority = 0;ownerWaiters[{c.owner->nodeId, c.owner->nodeEpoch}].insert(key);
 }
 void AlarmDiscovery::uncache(const std::string& key) {
   auto& c = candidates.at(key);
@@ -100,7 +101,9 @@ void AlarmDiscovery::uncache(const std::string& key) {
     auto it = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});
     if (it != ownerWaiters.end()) { it->second.erase(key);if (it->second.empty()) ownerWaiters.erase(it); }
   }
-  c.owner.reset();c.waitedMs = 0;
+  if (c.owner && c.owner->kind == ShardRoute::Kind::LOCAL) c.forceResolve = true;
+  if (c.awaitingHints) { --adoptions;c.awaitingHints = false; }
+  c.watching = false;++c.watchSerial;c.owner.reset();c.waitedMs = 0;c.priority = 1;
 }
 void AlarmDiscovery::loadPending() {
   std::error_code error;
@@ -185,13 +188,13 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
     pump();
   );
   auto& c = candidates.at(key);const auto version = c.version;const auto ns = c.ns;const auto shard = c.shard;
-  const auto started = monotonicTimeMs();bool done = false, drop = false, tookLocal = false;uint32_t delay = 0;
+  bool done = false, drop = false;uint32_t delay = 0;
   try {
     if (!namespaceActive(ns, shard)) { ++inactiveDropped;drop = true; }
     else {
       if (c.owner && ((c.owner->kind == ShardRoute::Kind::LOCAL && held(ns, shard) != c.owner->epoch) || !living(c.owner->nodeId, c.owner->nodeEpoch))) uncache(key);
       const bool local = c.owner && c.owner->kind == ShardRoute::Kind::LOCAL;
-      if (!local && (c.waitedMs || c.owner || c.failures) && !co_await sourcePresent(key)) done = true;
+      if (!c.forceResolve && !local && (c.waitedMs || c.owner || c.failures) && !co_await sourcePresent(key)) done = true;
       else {
         bool empty = false;std::string currentPrefix;
         if (!c.owner) {
@@ -201,7 +204,7 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
             ++takeCalls;takeNs += uint64_t((monotonicTimeMs() - taking) * 1000000);
             if (route.code == "DO_BACKGROUND_DEFERRED") { delay = route.backgroundDelayMs;c.waitedMs += delay;++deferred; }
             else if (route.kind == ShardRoute::Kind::LOCAL || route.kind == ShardRoute::Kind::FORWARD) {
-              if (route.kind == ShardRoute::Kind::LOCAL) { ++acquired;c.localPending = true;tookLocal = true; }else ++forwarded;
+              if (route.kind == ShardRoute::Kind::LOCAL) { ++acquired;c.localPending = true;c.handoffStarted = taking; }else ++forwarded;
               cache(key, std::move(route));
             }
           }
@@ -211,8 +214,18 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
           if (owner.kind == ShardRoute::Kind::LOCAL) {
             if (held(ns, shard) != owner.epoch) uncache(key);
             else {
-              adopt(ns, shard, owner.epoch);
-              done = co_await published(ns, shard, owner.epoch);
+              auto state = published(ns, shard, owner.epoch);
+              if (state == AlarmPublication::PublicationState::PENDING) {
+                adopt(ns, shard, owner.epoch);state = published(ns, shard, owner.epoch);
+              }
+              if (state == AlarmPublication::PublicationState::PENDING) {
+                const bool adoptionOnly = !hintsReady(ns, shard, owner.epoch);
+                if (adoptionOnly && !c.awaitingHints) { c.awaitingHints = true;++adoptions; }
+                c.watching = true;const auto token = ++c.watchSerial;
+                tasks.add(kj::evalLater([this, key, epoch = owner.epoch, adoptionOnly, token]() { return watch(key, epoch, adoptionOnly, token); }));
+                closed = true;co_return;
+              }
+              done = true;
               if (held(ns, shard) != owner.epoch) { uncache(key);done = false; }
             }
           } else {
@@ -237,10 +250,21 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
   } catch (const kj::Exception& error) { failed(error); }
   catch (const std::exception&) { ++failures; }
   Scope measured(*this);
-  if (tookLocal && done) { ++handoffJobs;handoffNs += uint64_t((monotonicTimeMs() - started) * 1000000); }
+  if (done && c.handoffStarted) { ++handoffJobs;handoffNs += uint64_t((monotonicTimeMs() - c.handoffStarted) * 1000000);c.handoffStarted = 0; }
   if (drop || (done && c.version == version)) { closed = true;erase(key);co_return; }
   if (!delay) { c.failures = std::min(6u, c.failures + 1);delay = std::min(60000u, 1000u << c.failures); }
   schedule(key, monotonicTimeMs() + delay);closed = true;
+}
+kj::Promise<void> AlarmDiscovery::watch(std::string key, uint64_t epoch, bool adoptionOnly, uint64_t serial) {
+  auto it = candidates.find(key);if (it == candidates.end()) co_return;
+  const auto ns = it->second.ns;const auto shard = it->second.shard;
+  auto state = co_await waitPublished(ns, shard, epoch, adoptionOnly);
+  it = candidates.find(key);if (it == candidates.end() || it->second.watchSerial != serial) co_return;
+  auto& c = it->second;c.watching = false;
+  if (c.awaitingHints) { --adoptions;c.awaitingHints = false; }
+  if (state != AlarmPublication::PublicationState::PENDING || (adoptionOnly && hintsReady(ns, shard, epoch))) schedule(key, 0);
+  else { c.failures = std::min(6u, c.failures + 1);schedule(key, monotonicTimeMs() + std::min(60000u, 1000u << c.failures)); }
+  pump();
 }
 kj::Promise<void> AlarmDiscovery::loop() {
   for (;;) {
@@ -261,7 +285,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
       auto w = ownerWaiters.find(invalidOwners.front());
       if (w == ownerWaiters.end() || w->second.empty()) { if (w != ownerWaiters.end()) ownerWaiters.erase(w);invalidOwners.pop_front();continue; }
       const auto key = *w->second.begin();w->second.erase(w->second.begin());auto it = candidates.find(key);
-      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;it->second.priority = 0;schedule(key, 0); }
+      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;it->second.priority = 1;schedule(key, 0); }
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
     if (scans < 2 && !directories.empty()) {
@@ -283,6 +307,8 @@ void AlarmDiscovery::pump() {
       const auto priority = std::get<0>(*runnable.begin());
       auto it = runnable.upper_bound({priority, lastTenant, UINT64_MAX, ""});
       if (it == runnable.end() || std::get<0>(*it) != priority) it = runnable.begin();
+      const auto candidateKey = std::get<3>(*it);auto pending = candidates.find(candidateKey);
+      if (pending != candidates.end() && (!pending->second.owner || pending->second.owner->kind != ShardRoute::Kind::LOCAL) && active + adoptions >= settings.takeovers) return;
       const auto key = std::get<3>(*it);lastTenant = std::get<1>(*it);runnable.erase(it);auto found = candidates.find(key);
       if (found == candidates.end() || found->second.active) continue;
       found->second.active = true;++active;peakActive = std::max<uint64_t>(peakActive, active);tasks.add(process(key));
@@ -292,7 +318,7 @@ std::string AlarmDiscovery::json() const {
   const auto state = !membership.durableProcesses ? "disabled-no-durable-processes" : access ? "enabled" : denials ? "disabled-access-denied" : "checking";
   return "{\"state\":" + json::quote(state) + ",\"scanIntervalMs\":" + std::to_string(settings.intervalMs) +
       ",\"takeoverLimit\":" + std::to_string(settings.takeovers) + ",\"readLimit\":" + std::to_string(settings.reads) +
-      ",\"active\":" + std::to_string(active) + ",\"peakActive\":" + std::to_string(peakActive) +
+      ",\"active\":" + std::to_string(active) + ",\"pendingHintAdoptions\":" + std::to_string(adoptions) + ",\"peakActive\":" + std::to_string(peakActive) +
       ",\"sharedPeakReads\":" + std::to_string(peakReads) + ",\"pending\":" + std::to_string(candidates.size()) +
       ",\"peakPending\":" + std::to_string(peakPending) + ",\"candidateLimit\":16384,\"evicted\":" + std::to_string(evicted) +
       ",\"discovered\":" + std::to_string(discovered) + ",\"localResults\":" + std::to_string(acquired) +

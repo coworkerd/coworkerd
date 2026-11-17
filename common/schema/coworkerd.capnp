@@ -371,6 +371,7 @@ struct ServerConfig {
     # Auxiliary alarm discovery; all ownership still uses the ordinary shard acquisition.
     alarmDiscoveryIntervalMs @20 :UInt32 = 60000;
     alarmTakeoverConcurrency @21 :UInt32 = 4;
+    # Must be 2: discovery and publication each have one guaranteed read; an idle share can be borrowed.
     alarmReadConcurrency @22 :UInt32 = 2;
   }
 

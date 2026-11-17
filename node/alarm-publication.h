@@ -28,6 +28,7 @@ public:
     kj::Promise<kj::Own<Permit>> acquire();
     kj::Own<Permit> acquireNow();
     void release(bool publisher);
+    void wake();
   };
   using Current = std::function<bool(const std::string&, uint32_t, uint64_t, uint64_t)>;
   using Adopt = std::function<void(const std::string&, const std::string&, uint32_t, uint64_t,
@@ -38,13 +39,15 @@ public:
   void setNodeEpoch(uint64_t);
   void take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant);
   void ensureTake(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant);
-  void restore(std::string ns, uint32_t shard, std::string tenant);
   void gone(const std::string& ns, uint32_t shard);
   void report(std::string ns, std::string object, uint32_t shard, uint64_t epoch,
       std::string tenant, uint64_t at);
   void tick();
   void setReadBudget(ReadBudget& budget, uint32_t limit) { readBudget = &budget;budget.limit = limit;budget.available = [this]() { pump(); }; }
-  kj::Promise<bool> waitPublished(const std::string& ns, uint32_t shard, uint64_t epoch);
+  enum class PublicationState { PENDING, READY, EMPTY };
+  PublicationState publicationState(const std::string&, uint32_t, uint64_t) const;
+  bool hintsReady(const std::string&, uint32_t, uint64_t) const;
+  kj::Promise<PublicationState> waitPublished(const std::string&, uint32_t, uint64_t, bool adoptionOnly);
   bool claimRetirement(const std::string& ns, uint32_t shard, uint64_t epoch, const std::string& marker);
   bool forgetPending(const std::string& ns, uint32_t shard);
   void setPendingDirectory(std::filesystem::path path) { pendingDirectory = std::move(path); }
@@ -160,7 +163,9 @@ private:
   void pending(Shard&, bool);
   void pendingFailure();
   void notifyPublished(const Shard&, bool);
-  std::map<std::string, std::vector<std::pair<uint64_t, kj::Own<kj::PromiseFulfiller<bool>>>>> markerWaiters;
+  struct MarkerWaiter { uint64_t epoch;bool adoptionOnly;kj::Own<kj::PromiseFulfiller<PublicationState>> fulfiller; };
+  std::map<std::string, std::map<uint64_t, MarkerWaiter>> markerWaiters;
+  uint64_t markerWaiterSerial = 0, markerWaiterCount = 0;
   std::string lastTenant, deniedPrefix;
   Probe deniedOperation = Probe::LIST;
   Gate hintGate, markerGate;

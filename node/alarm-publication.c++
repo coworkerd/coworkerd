@@ -83,6 +83,7 @@ void AlarmPublication::Gate::cancel(bool probe) { if (probe) probing = false; }
 
 AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::string nodeId, Current current, Adopt adopt, Log log)
     : store(store), timer(timer), nodeId(std::move(nodeId)), current(std::move(current)), adopt(std::move(adopt)), log(std::move(log)), tasks(*this) {
+  privateReadBudget.available = [this]() { pump(); };
   KJ_REQUIRE(RAND_bytes(reinterpret_cast<unsigned char*>(&retryRandom), sizeof(retryRandom)) == 1);
   if (!retryRandom) retryRandom = 0x9e3779b97f4a7c15ull;
   if (const auto* value = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureThreadCpu = std::string_view(value) == "1";
@@ -94,10 +95,10 @@ AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::st
 AlarmPublication::~AlarmPublication() noexcept(false) { stopping = true; }
 AlarmPublication::ReadBudget::Permit::~Permit() noexcept(false) { budget.release(publisher); }
 bool AlarmPublication::ReadBudget::publisherAvailable() const {
-  return !publisherActive && active < limit && !(limit == 1 && preferDiscovery && !waiters.empty());
+  return active < limit && (!publisherActive || waiters.empty());
 }
 bool AlarmPublication::ReadBudget::discoveryAvailable() const {
-  return !discoveryActive && active < limit && !(limit == 1 && publisherDemand && !preferDiscovery);
+  return active < limit && (!publisherDemand || !discoveryActive);
 }
 kj::Own<AlarmPublication::ReadBudget::Permit> AlarmPublication::ReadBudget::acquireNow() {
   KJ_REQUIRE(publisherAvailable());++active;++publisherActive;publisherDemand = false;return kj::heap<Permit>(*this, true);
@@ -106,15 +107,14 @@ kj::Promise<kj::Own<AlarmPublication::ReadBudget::Permit>> AlarmPublication::Rea
   if (discoveryAvailable()) { ++active;++discoveryActive;return kj::heap<Permit>(*this, false); }
   auto pair = kj::newPromiseAndFulfiller<kj::Own<Permit>>();waiters.push_back(kj::mv(pair.fulfiller));return kj::mv(pair.promise);
 }
+void AlarmPublication::ReadBudget::wake() {
+  while (discoveryAvailable() && !waiters.empty()) {
+    auto waiter = kj::mv(waiters.front());waiters.pop_front();if (!waiter->isWaiting()) continue;
+    ++active;++discoveryActive;waiter->fulfill(kj::heap<Permit>(*this, false));
+  }
+}
 void AlarmPublication::ReadBudget::release(bool publisher) {
-  --active;if (publisher) --publisherActive;else --discoveryActive;preferDiscovery = publisher;
-  auto wake = [this]() {
-    while (discoveryAvailable() && !waiters.empty()) {
-      auto waiter = kj::mv(waiters.front());waiters.pop_front();if (!waiter->isWaiting()) continue;
-      ++active;++discoveryActive;waiter->fulfill(kj::heap<Permit>(*this, false));break;
-    }
-  };
-  if (publisher && limit == 1) wake();
+  --active;if (publisher) --publisherActive;else --discoveryActive;
   if (available) available();wake();
 }
 kj::Promise<void> AlarmPublication::guardRead(kj::Promise<void> promise) {
@@ -164,7 +164,7 @@ bool AlarmPublication::deleting(const std::string& key) const {
 double AlarmPublication::hintCheckInterval() const { return hintRoundMs / std::max<uint64_t>(1, nonemptyShards); }
 void AlarmPublication::setNodeEpoch(uint64_t epoch) {
   if (epoch == nodeEpoch) return;nodeEpoch = epoch;shards.clear();writes.clear();writeSweep.clear();sweepCursor = writeSweep.end();
-  for (auto& [key, waiting]: markerWaiters) for (auto& [epoch, waiter]: waiting) if (waiter->isWaiting()) waiter->fulfill(false);markerWaiters.clear();
+  for (auto& [key, waiting]: markerWaiters) for (auto& [id, waiter]: waiting) if (waiter.fulfiller->isWaiting()) waiter.fulfiller->fulfill(PublicationState::PENDING);markerWaiters.clear();markerWaiterCount = 0;
   deadlines.clear();readyHints.clear();readyReads.clear();readyMarkers.clear();readyScans.clear();ownMarkers.clear();observedOwn.clear();
   markerPuts.clear();markerRemoves.clear();cleanupReady.clear();nonemptyShards = 0;initialMarkerScan = true;nextMarkerScan = 0;
 }
@@ -179,21 +179,43 @@ void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std:
   if (!pendingDirectory.empty()) { std::error_code error;s.pendingRecorded = std::filesystem::exists(pendingDirectory / (s.ns + "-" + std::to_string(shard) + ".pending"), error); }
   auto [held, inserted] = shards.emplace(key, std::move(s));offerRead(held->second);pump();
 }
-void AlarmPublication::notifyPublished(const Shard& s, bool value) {
-  auto it = markerWaiters.find(shardKey(s.ns, s.shard));if (it == markerWaiters.end()) return;
-  auto waiting = std::move(it->second);markerWaiters.erase(it);
-  for (auto& [epoch, waiter]: waiting) if (waiter->isWaiting()) waiter->fulfill(value && epoch == s.epoch);
+bool AlarmPublication::hintsReady(const std::string& ns, uint32_t shard, uint64_t epoch) const {
+  auto it = shards.find(shardKey(ns, shard));return it != shards.end() && it->second.epoch == epoch && valid(it->second) && it->second.adopted && !it->second.reading;
 }
-kj::Promise<bool> AlarmPublication::waitPublished(const std::string& ns, uint32_t shard, uint64_t epoch) {
+AlarmPublication::PublicationState AlarmPublication::publicationState(const std::string& ns, uint32_t shard, uint64_t epoch) const {
   auto it = shards.find(shardKey(ns, shard));
-  if (it == shards.end() || it->second.epoch != epoch || !valid(it->second)) return false;
-  if (it->second.markerWritten) return true;
-  if (markerDenied || markerGate.open || hintGate.open || (it->second.failures && it->second.next > monotonicTimeMs())) return false;
-  auto pair = kj::newPromiseAndFulfiller<bool>();markerWaiters[shardKey(ns, shard)].emplace_back(epoch, kj::mv(pair.fulfiller));
-  return pair.promise.exclusiveJoin(timer.afterDelay(5000 * kj::MILLISECONDS).then([]() { return false; }));
+  if (it == shards.end() || it->second.epoch != epoch || !valid(it->second)) return PublicationState::PENDING;
+  const auto& s = it->second;
+  if (s.markerWritten) return PublicationState::READY;
+  if (s.adopted && !s.reading && s.hints.empty() && s.desired.empty() && !inFlightHints.contains(shardKey(ns, shard))) return PublicationState::EMPTY;
+  return PublicationState::PENDING;
+}
+void AlarmPublication::notifyPublished(const Shard& s, bool success) {
+  const auto key = shardKey(s.ns, s.shard);auto it = markerWaiters.find(key);if (it == markerWaiters.end()) return;
+  const auto state = publicationState(s.ns, s.shard, s.epoch);const auto adopted = hintsReady(s.ns, s.shard, s.epoch);
+  for (auto w = it->second.begin();w != it->second.end();) {
+    if (success && state == PublicationState::PENDING && !(w->second.adoptionOnly && adopted)) { ++w;continue; }
+    auto waiter = kj::mv(w->second.fulfiller);const auto epoch = w->second.epoch;w = it->second.erase(w);--markerWaiterCount;
+    if (waiter->isWaiting()) waiter->fulfill(success && epoch == s.epoch ? state : PublicationState::PENDING);
+  }
+  if (it->second.empty()) markerWaiters.erase(it);
+}
+kj::Promise<AlarmPublication::PublicationState> AlarmPublication::waitPublished(const std::string& ns, uint32_t shard, uint64_t epoch, bool adoptionOnly) {
+  const auto state = publicationState(ns, shard, epoch);
+  if (state != PublicationState::PENDING || (adoptionOnly && hintsReady(ns, shard, epoch))) co_return state;
+  auto it = shards.find(shardKey(ns, shard));
+  if (it == shards.end() || it->second.epoch != epoch || !valid(it->second) || hintGate.open ||
+      (!adoptionOnly && (markerDenied || markerGate.open)) || (it->second.failures && it->second.next > monotonicTimeMs())) co_return PublicationState::PENDING;
+  const auto key = shardKey(ns, shard);const auto id = ++markerWaiterSerial;
+  auto pair = kj::newPromiseAndFulfiller<PublicationState>();markerWaiters[key].emplace(id, MarkerWaiter{epoch, adoptionOnly, kj::mv(pair.fulfiller)});++markerWaiterCount;
+  KJ_DEFER(
+    auto waiting = markerWaiters.find(key);
+    if (waiting != markerWaiters.end()) { markerWaiterCount -= waiting->second.erase(id);if (waiting->second.empty()) markerWaiters.erase(waiting); }
+  );
+  co_return co_await kj::mv(pair.promise).exclusiveJoin(timer.afterDelay(5000 * kj::MILLISECONDS).then([]() { return PublicationState::PENDING; }));
 }
 bool AlarmPublication::claimRetirement(const std::string& ns, uint32_t shard, uint64_t epoch, const std::string& marker) {
-  auto it = shards.find(shardKey(ns, shard));if (it == shards.end() || it->second.epoch != epoch || !valid(it->second) || !it->second.markerWritten) return false;
+  auto it = shards.find(shardKey(ns, shard));if (it == shards.end() || it->second.epoch != epoch || !valid(it->second) || publicationState(ns, shard, epoch) == PublicationState::PENDING) return false;
   auto& s = it->second;s.retiredMarkers.insert(marker);s.previousMarkers.erase(marker);
   if (inFlightDeletes.contains(marker)) return false;
   auto w = writes.find(marker);if (w != writes.end() && w->second.marker && !w->second.at && !inFlightKeys.contains(marker)) eraseWrite(w);
@@ -206,12 +228,6 @@ void AlarmPublication::ensureTake(std::string ns, uint32_t shard, uint64_t epoch
     offerRead(it->second);pump();return;
   }
   take(std::move(ns), shard, epoch, std::move(tenant));
-}
-void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenant) {
-  const auto key = shardKey(ns, shard);if (!nodeEpoch || shards.contains(key)) return;
-  Shard s;s.ns = std::move(ns);s.shard = shard;s.tenant = std::move(tenant);s.startupOnly = true;
-  s.memberEpoch = nodeEpoch;s.generation = s.order = ++serial;s.checked = monotonicTimeMs();
-  auto [held, inserted] = shards.emplace(key, std::move(s));offerRead(held->second);pump();
 }
 void AlarmPublication::gone(const std::string& ns, uint32_t shard) {
   const auto key = shardKey(ns, shard);auto it = shards.find(key);if (it == shards.end()) return;auto& s = it->second;notifyPublished(s, false);
@@ -345,6 +361,7 @@ void AlarmPublication::markerRestored() {
 }
 void AlarmPublication::pump(unsigned limit) {
   Scope measured(*this);if (stopping) return;
+  KJ_DEFER(readBudget->publisherDemand = false;readBudget->wake());
   const auto demandNow = monotonicTimeMs();
   readBudget->publisherDemand = active < 16 && ((activeHints < 7 && !readyReads.empty() && hintGate.available(demandNow)) ||
       (!activeScans && !markerDenied && markerGate.available(demandNow) && (!readyScans.empty() || initialMarkerScan || (!ownMarkers.empty() && demandNow >= nextMarkerScan))));
@@ -429,6 +446,7 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
       --activeHints;const auto sk = shardKey(sent.ns, sent.shard);auto it = inFlightHints.find(sk);
       if (it != inFlightHints.end() && !--it->second) { inFlightHints.erase(it);if (auto s = shards.find(sk);s != shards.end()) offerRead(s->second); }
     }
+    if (auto it = shards.find(shardKey(sent.ns, sent.shard));it != shards.end() && it->second.generation == sent.generation) notifyPublished(it->second, true);
     if (auto it = writes.find(key);it != writes.end()) refresh(it->second, monotonicTimeMs());pump();
   });
   auto& gate = sent.marker ? markerGate : hintGate;
@@ -552,7 +570,7 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
       if (auto own = observedOwn.find(ownPrefix);own != observedOwn.end()) for (const auto& marker: own->second) acceptOwnMarker(s, marker);
       s.initial = false;
     }
-    reconcile(s);wakeWrites(s);
+    reconcile(s);wakeWrites(s);notifyPublished(s, true);
     if (!s.previousDone && !s.previousPrefix.empty()) { s.previousPending = true;s.previousNext = 0;offerScan(s, false); }
     hintGate.result(true, probe, monotonicTimeMs(), key);finished = true;
   } catch (const kj::Exception& error) {
@@ -726,7 +744,7 @@ std::string AlarmPublication::json() const {
   for (const auto& [key, w]: writes) { bytes += sizeof(Write) + key.capacity() + w.key.capacity() + w.ns.capacity() + w.object.capacity() + w.tenant.capacity();markerPending += w.marker; }
   for (const auto& [key, s]: shards) { if (s.nonempty) oldest = std::max(oldest, monotonicTimeMs() - s.checked);desired += s.desired.size(); }
   std::ostringstream out;
-  out << "\"publicationPending\":" << writes.size() << ",\"publicationInFlight\":" << active << ",\"publicationPeakPending\":" << peakPending << ",\"publicationBytes\":" << bytes
+  out << "\"publicationWaiters\":" << markerWaiterCount << ",\"publicationPending\":" << writes.size() << ",\"publicationInFlight\":" << active << ",\"publicationPeakPending\":" << peakPending << ",\"publicationBytes\":" << bytes
       << ",\"publicationRetries\":" << retries << ",\"markerWrites\":" << markerWrites << ",\"markerDeletes\":" << markerDeletes << ",\"adoptionPages\":" << pages << ",\"adoptionMaxPage\":" << maxPage
       << ",\"oldestHintCheckMs\":" << oldest << ",\"hintCheckIntervalMs\":" << hintCheckInterval() << ",\"publicationShards\":" << shards.size() << ",\"publicationDesired\":" << desired
       << ",\"invalidAlarmHints\":" << badHints << ",\"markerAccessDenied\":" << (markerDenied ? "true" : "false") << ",\"markerDenials\":" << markerDenials << ",\"markerProbes\":" << markerProbes << ",\"markerPending\":" << markerPending

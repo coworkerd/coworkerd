@@ -21,7 +21,7 @@ namespace fs = std::filesystem;
 void DurableLogConfig::validate() const {
   KJ_REQUIRE(alarmDiscoveryIntervalMs >= 200, "durableObjects.alarmDiscoveryIntervalMs is at least 200");
   KJ_REQUIRE(alarmTakeoverConcurrency > 0 && alarmTakeoverConcurrency <= 4, "durableObjects.alarmTakeoverConcurrency is between 1 and 4");
-  KJ_REQUIRE(alarmReadConcurrency > 0 && alarmReadConcurrency <= 2, "durableObjects.alarmReadConcurrency is between 1 and 2");
+  KJ_REQUIRE(alarmReadConcurrency == 2, "durableObjects.alarmReadConcurrency is 2 (one guaranteed read for each side, with borrowing)");
   KJ_REQUIRE(peers <= 8, "durableObjects.peers is at most 8");
   KJ_REQUIRE(confirmTimeoutMs >= 100 && confirmTimeoutMs <= 29000,
       "durableObjects.confirmTimeoutMs is between 100 and 29000 (workerd resets the object at 30 s)");

@@ -843,7 +843,9 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           alarmPublication->ensureTake(ns, shard, epoch, alarmTenant ? alarmTenant(ns) : ns);
         }, [this](const std::string& ns, uint32_t shard) { return alarmPublication->forgetPending(ns, shard); },
         [this](const std::string& ns, uint32_t shard) { return alarmHeld ? alarmHeld(ns, shard) : uint64_t(0); },
-        [this](const std::string& ns, uint32_t shard, uint64_t epoch) { return alarmPublication->waitPublished(ns, shard, epoch); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch) { return alarmPublication->publicationState(ns, shard, epoch); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch, bool adoptionOnly) { return alarmPublication->waitPublished(ns, shard, epoch, adoptionOnly); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch) { return alarmPublication->hintsReady(ns, shard, epoch); },
         [this](const std::string& ns, uint32_t shard, uint64_t epoch, const std::string& marker) { return alarmPublication->claimRetirement(ns, shard, epoch, marker); });
   }
 }
