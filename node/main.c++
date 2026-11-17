@@ -407,6 +407,8 @@ struct InvocationRejection {
         << "\",\"loadBand\":\"" << loadBand << "\",\"inFlight\":" << inFlight
         << ",\"limit\":" << limit << ",\"avoidMs\":" << avoidMs << ",\"status\":" << status;
     if (!category.empty()) out << ",\"category\":\"" << jsonEscape(category) << "\"";
+    if (code == "LOAD_FAILED" && status == 409 && category == "limit")
+      out << ",\"dispatched\":false,\"retryable\":false";
     out << "}";
     return out.str();
   }
@@ -1838,11 +1840,11 @@ public:
     const auto forInvocation = invocationId(result.sequence);
     const std::string entrypointName = entrypoint.empty() ? "default" : entrypoint;
     std::string category, detail, message;
-    bool coldLoad = false;
+    bool coldLoad = false, preparationLimit = false;
     LoadProbe probe;
     for (int attempt = 0;; ++attempt) {
       probe = co_await loadProbe(*version, std::move(process), entrypoint, deadline, forInvocation);
-      category.clear(); detail.clear(); message.clear(); coldLoad = false; result.refusal.reset();
+      category.clear(); detail.clear(); message.clear(); coldLoad = false; preparationLimit = false; result.refusal.reset();
       bool limitWithoutEvidence = false;
       if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
@@ -1869,6 +1871,8 @@ public:
             message = entrypointName == "default" ? (flag("hasDefault") ? "the default export has no fetch handler" : "there is no default export")
                 : "the entrypoint " + entrypointName + " is missing or has no fetch handler";
           }
+        } else if (flag("preparationLimit")) {
+          category = "limit"; detail = "PREPARATION_LIMIT"; message = string("message"); preparationLimit = true;
         } else if (string("stage") == "code") {
           const auto codeStage = string("codeStage"), text = string("message");
           if (codeStage == "secrets") { category = "secret-missing"; detail = "SECRET_MISSING"; message = text; }
@@ -1896,7 +1900,7 @@ public:
     }
     if (!category.empty()) {
       auto [secrets, variables] = trialRedactions(*version);
-      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), 503, root);
+      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), preparationLimit ? 409 : 503, root);
       value.category = category;
       result.refusal = std::move(value);
       ++loadFailures[category];
@@ -2486,8 +2490,10 @@ public:
     slot->decide(false);
     auto refused = refusal(slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE", slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
     if (slot->preparationLimit) refused.category = "limit";
-    auto body = refusalBody(refused, slot->deadline); body.pop_back();
-    body += std::string(",\"dispatched\":false,\"retryable\":") + (slot->preparationLimit ? "false}" : "true}");
+    auto body = refusalBody(refused, slot->deadline);
+    if (!slot->preparationLimit) {
+      body.pop_back(); body += ",\"dispatched\":false,\"retryable\":true}";
+    }
     return body;
   }
 
@@ -7505,8 +7511,9 @@ private:
             }
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
-            verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
-                applied.cpuMs, applied.memoryMiB);
+            verdict = flag("preparationLimit") ? TrialVerdict{"LOAD_FAILED", "", string("message")}
+                : classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
+                    applied.cpuMs, applied.memoryMiB);
           }
         }
       }
