@@ -787,7 +787,7 @@ private:
       if (slot) pending = pending.exclusiveJoin(slot->onPreparationRejected<capnp::Response<capnp::AnyPointer>>());
       auto reply = co_await pending;
       if (slot) slot->decide(true);
-      context.setResults(reply);
+      context.getResults(reply.targetSize()).set(reply);
     } catch (const kj::Exception&) {
       if (slot && slot->notExecuted) kj::throwFatalException(preparationRefusalError(*slot));
       if (slot) slot->decide(true);
@@ -2406,7 +2406,7 @@ private:
       std::string envelope(descriptor.cStr(), descriptor.size());
       KJ_ASSERT(!envelope.empty() && envelope.back() == '}');
       envelope.pop_back();
-      descriptor = kj::str(envelope, ",\"dispatchReceipt\":\"", slot->dispatchReceipt, "\"}");
+      descriptor = kj::str(envelope.c_str(), ",\"dispatchReceipt\":\"", slot->dispatchReceipt.c_str(), "\"}");
     } else {
       decision(true);
     }
@@ -3337,7 +3337,7 @@ InvocationRejection preparationRefusal(const AdmissionSlot& slot) {
 }
 kj::Exception preparationRefusalError(const AdmissionSlot& slot) {
   const auto text = "jsg.Error: CODE_UNAVAILABLE: " + refusalBody(preparationRefusal(slot), slot.deadline);
-  auto error = tagRpcError(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(text)), "CODE_UNAVAILABLE");
+  auto error = tagRpcError(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(text.c_str())), "CODE_UNAVAILABLE");
   error.setDetail(PREPARATION_REFUSAL_DETAIL, kj::heapArray(kj::arrayPtr(reinterpret_cast<const kj::byte*>("1"), 1)));
   return error;
 }
@@ -4031,7 +4031,7 @@ private:
     auto params = context.getParams();
     try {
       auto call = target.typelessRequest(interfaceId, methodId, params.targetSize(), {}); call.set(params);
-      auto result = co_await call.send(); context.setResults(result); co_return;
+      auto result = co_await call.send(); context.getResults(result.targetSize()).set(result); co_return;
     } catch (const kj::Exception& error) {
       if (error.getDetail(PREPARATION_REFUSAL_DETAIL) == kj::none) throw;
     }
@@ -4042,7 +4042,7 @@ private:
     sessions->sessions.push_back(opened.getSession());
     auto next = opened.getTopLevel();
     auto call = next.typelessRequest(interfaceId, methodId, params.targetSize(), {}); call.set(params);
-    auto result = co_await call.send(); context.setResults(result);
+    auto result = co_await call.send(); context.getResults(result.targetSize()).set(result);
   }
   capnp::Capability::Client target;
   PreparationRetry retry;
