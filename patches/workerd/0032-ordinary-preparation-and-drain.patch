@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 10:20:32 +0800
+Subject: [PATCH] Coalesce source preparation with Native leases and publish
+ bounded drain summaries
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 44cb1b2042cf4c36a247a6838815cabcd3d156c9..90af6c38c3b0fc93a7a83162632dff9c1a459dbb 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -169,10 +169,18 @@ class IdleReaper {
+     auto& channel = lifecycleChannel();
+     if (!channel) return;
+     kj::Vector<kj::String> entries;
++    bool anyBackground = false, unknownBusy = false;
+     for (auto it = workers.begin(); it != workers.end();) {
+       if (auto worker = it->lock()) {
+         bool backgroundActive = false;
+         KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
++        if (worker->created && !worker->destroyed) {
++          anyBackground |= backgroundActive;
++          const auto& labels = worker->labels;
++          const bool tagged = labels.tenant.size() && labels.workerId.size() && labels.versionId.size() &&
++              labels.planRevision.size() && worker->id;
++          unknownBusy |= !tagged && (worker->active || backgroundActive);
++        }
+         if (worker->created && !worker->destroyed) entries.add(kj::str(
+             "{\"isolate\":", escapeCpuJsonString(worker->name), ",\"instance\":", worker->id,
+             labelFields(worker->labels), ",\"active\":", worker->active,
+@@ -182,13 +190,19 @@ class IdleReaper {
+         it = workers.erase(it);
+       }
+     }
+-    auto row = kj::str("{\"pid\":", coworkerdPid(), ",\"observedAtMonotonicMs\":", monotonicMs(), ",\"residentIsolates\":", created - destroyed,
++    const auto observed = monotonicMs();
++    // The small prefix and completion trailer share the full snapshot's atomic publication.
++    // A durable generation needs this aggregate, independently of its historical call count.
++    auto row = kj::str("{\"drain\":{\"observedAtMonotonicMs\":", observed,
++        ",\"residentCount\":", entries.size(), ",\"backgroundActive\":", anyBackground ? "true" : "false",
++        ",\"unknownBusy\":", unknownBusy ? "true" : "false", "},\"pid\":", coworkerdPid(),
++        ",\"observedAtMonotonicMs\":", observed, ",\"residentIsolates\":", created - destroyed,
+         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
+         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
+         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+         gcSettings().observes() ? processGcJson() : kj::str(""),
+-        ",\"residentWorkers\":[", kj::strArray(entries, ","), "]}");
++        ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
+     if (gcSettings().observes()) publishedGc = processGcVersion();
+     if (!channel.publish(row) && !overflowReported) {
+       overflowReported = true;
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index f2cb0a3872fc0c1f51dfd66c24ef758d658d4f5d..92fd30a1b80c6da7e1ff66a7c757c29fb0d15397 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -449,6 +449,7 @@ pub struct RootRegistry {
+     latest_plain: RefCell<HashMap<String, (u64, String)>>,
+     install_lock: tokio::sync::Mutex<()>,
+     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
++    preparations: RefCell<HashMap<String, (String, Instant)>>,
+     failed_installs: RefCell<HashMap<String, FailedInstall>>,
+     failure_use: Cell<u64>,
+     tenant_compilations: Cell<u64>,
+@@ -482,6 +483,7 @@ impl RootRegistry {
+             latest_plain: RefCell::new(HashMap::new()),
+             install_lock: tokio::sync::Mutex::new(()),
+             installing: RefCell::new(HashMap::new()),
++            preparations: RefCell::new(HashMap::new()),
+             failed_installs: RefCell::new(HashMap::new()),
+             failure_use: Cell::new(0),
+             tenant_compilations: Cell::new(0),
+@@ -500,6 +502,27 @@ impl RootRegistry {
+         }))
+     }
+ 
++    fn claim_preparation(&self, key: &str, owner: &str) -> Value {
++        let now = Instant::now();
++        let mut leases = self.preparations.borrow_mut();
++        leases.retain(|_, (_, deadline)| *deadline > now);
++        // An install flight owns its source independently of its original caller.
++        if self.installing.borrow().contains_key(key) {
++            return json!({"owned":false,"retryAfterMs":25});
++        }
++        if let Some((current, _)) = leases.get(key) {
++            return json!({"owned":current == owner,"retryAfterMs":25});
++        }
++        if leases.len() >= 1024 { return json!({"owned":false,"retryAfterMs":25}); }
++        leases.insert(key.to_owned(), (owner.to_owned(), now + Duration::from_secs(5)));
++        json!({"owned":true,"retryAfterMs":25})
++    }
++
++    fn release_preparation(&self, key: &str, owner: &str) {
++        let mut leases = self.preparations.borrow_mut();
++        if leases.get(key).is_some_and(|(current, _)| current == owner) { leases.remove(key); }
++    }
++
+     fn cached_failure(&self, key: &str) -> Option<crate::Error> {
+         let mut failures = self.failed_installs.borrow_mut();
+         let expires_at = failures.get(key)?.expires_at;
+@@ -753,23 +776,6 @@ impl RootRegistry {
+         }
+         // The hot path neither waits on the plan lock nor creates a deferred load.
+         let worker = self.loaded(&plan).ok_or_else(|| kj::failed!("unknown root plan: instance was evicted"))?;
+-        // The node's catalog generation orders publication independently of compilation.
+-        // A delayed call pinned to an older definition cannot supersede the current plan.
+-        let previous = if selection.active_plan {
+-            let mut latest = self.latest_plain.borrow_mut();
+-            let previous = latest.get(&plan.deployment.worker_id);
+-            if previous.is_none_or(|(generation, _)| selection.catalog_generation > *generation) {
+-                let changed = previous.is_none_or(|(_, key)| key != &selection.plan);
+-                if changed || previous.is_some_and(|(generation, _)| *generation != selection.catalog_generation) {
+-                    latest.insert(plan.deployment.worker_id.clone(), (selection.catalog_generation, selection.plan.clone()))
+-                        .filter(|(_, key)| key != &selection.plan).map(|(_, key)| key)
+-                } else { None }
+-            } else { None }
+-        } else { None };
+-        if let Some(previous) = previous {
+-            let old = self.plans.borrow().get(&previous).cloned();
+-            if let Some(worker) = old.as_ref().and_then(|old| self.loaded(old)) { worker.retire_when_idle()?; }
+-        }
+         let props = if selection.trial {
+             ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
+                 json!({"trial": true, "rootTrial": selection.root_trial,
+@@ -837,6 +843,23 @@ impl RootRegistry {
+         };
+         let entrypoint = worker.entrypoint(None, Some(props), false)
+             .ok_or_else(|| kj::failed!("ordinary bridge has no default entrypoint"))?;
++        // The node's catalog generation orders publication independently of compilation.
++        // A delayed call pinned to an older definition cannot supersede the current plan.
++        let previous = if selection.active_plan {
++            let mut latest = self.latest_plain.borrow_mut();
++            let previous = latest.get(&plan.deployment.worker_id);
++            if previous.is_none_or(|(generation, _)| selection.catalog_generation > *generation) {
++                let changed = previous.is_none_or(|(_, key)| key != &selection.plan);
++                if changed || previous.is_some_and(|(generation, _)| *generation != selection.catalog_generation) {
++                    latest.insert(plan.deployment.worker_id.clone(), (selection.catalog_generation, selection.plan.clone()))
++                        .filter(|(_, key)| key != &selection.plan).map(|(_, key)| key)
++                } else { None }
++            } else { None }
++        } else { None };
++        if let Some(previous) = previous {
++            let old = self.plans.borrow().get(&previous).cloned();
++            if let Some(worker) = old.as_ref().and_then(|old| self.loaded(old)) { worker.retire_when_idle()?; }
++        }
+         Ok(Rc::new(PlainSelectedChannel {registry: self.this.upgrade().ok_or_else(|| kj::disconnected!("root registry gone"))?,
+             selection, entrypoint, _activity: worker.selection_activity(),
+             _pin: PlanPin::new(plan, self.this.clone())}))
+@@ -2368,7 +2391,9 @@ impl Service for RootRequest {
+         let mut status = 200;
+         let value = match (method, url.path()) {
+             (Method::POST, "/lookup") => {
+-                let deployment: Deployment = serde_json::from_value(read_json(body).await?)
++                let value = read_json(body).await?;
++                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
++                let deployment: Deployment = serde_json::from_value(value.clone())
+                     .map_err(|error| kj::failed!("root lookup: {error}"))?;
+                 let key = deployment.plan_key()?;
+                 if let Some(error) = self.registry.cached_failure(&key) {
+@@ -2378,10 +2403,17 @@ impl Service for RootRequest {
+                 } else {
+                     let plans = self.registry.plans.borrow();
+                     let installed = plans.get(&key);
+-                    json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
++                    let loaded = installed.is_some_and(|plan| plan.loaded.borrow().is_some());
++                    let mut reply = json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
+                         "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
+                         "cold": plan.deployment.is_plain() && plan.reported_plain_generation.get() != plan.generation.get()
+-                    }))})
++                    }))});
++                    drop(plans);
++                    if deployment.is_plain() && !owner.is_empty() {
++                        if loaded { self.registry.release_preparation(&key, owner); }
++                        else { reply["preparation"] = self.registry.claim_preparation(&key, owner); }
++                    }
++                    reply
+                 }
+             }
+             (Method::POST, "/install") => {
+@@ -2396,9 +2428,17 @@ impl Service for RootRequest {
+                     }
+                     format!("{},", &identity[1..identity.len() - 1])
+                 };
+-                let deployment = serde_json::from_value(value)
++                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("").to_owned();
++                let deployment: Deployment = serde_json::from_value(value)
+                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
+-                match self.registry.install(deployment, startup_identity).await {
++                let key = deployment.plan_key()?;
++                if deployment.is_plain() && !owner.is_empty() && !self.registry.preparations.borrow().get(&key)
++                    .is_some_and(|(current, deadline)| current == &owner && *deadline > Instant::now()) {
++                    return Err(kj::failed!("ordinary preparation reservation expired; no event was delivered"));
++                }
++                let result = self.registry.install(deployment, startup_identity).await;
++                self.registry.release_preparation(&key, &owner);
++                match result {
+                     Ok(plan) => {
+                         let plans = self.registry.plans.borrow();
+                         if let Some(installed) = plans.get(&plan) {
+@@ -2501,6 +2541,14 @@ impl Service for RootRequest {
+                 self.registry.prune_plans();
+                 json!({"removed": removed})
+             }
++            (Method::POST, "/release-preparation") => {
++                let value = read_json(body).await?;
++                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
++                let deployment: Deployment = serde_json::from_value(value.clone())
++                    .map_err(|error| kj::failed!("ordinary preparation release: {error}"))?;
++                self.registry.release_preparation(&deployment.plan_key()?, owner);
++                json!({"released":true})
++            }
+             (Method::POST, "/hibernate") => {
+                 let namespaces: Vec<_> = self
+                     .registry
