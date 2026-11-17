@@ -1449,6 +1449,7 @@ const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
 const MAX_PLAIN_PLAN_KEYS = 16384;
 const plainPlanKeys = new Map();
+const plainPreparers = new Map();
 
 const plainColdLoads = new Map();
 // Preparation may be cancelled. Claim the cold observation only at actual dispatch.
@@ -1511,6 +1512,23 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       throw staged("package", rootManagementFailure(new Error("Invalid ordinary plan reply")));
     return reply;
   };
+  // Pure reservation hints only. Every follower owns its timer and selection;
+  // Native fences the actual reservation and owns any compilation already submitted.
+  for (;;) {
+    const ready = plainPlanKeys.get(cacheKey);
+    if (ready) {
+      try {return await chosen(remember(ready));}
+      catch (error) {if (!missing(error)) throw error; plainPlanKeys.delete(cacheKey);}
+    }
+    const hint = plainPreparers.get(cacheKey), now = Date.now();
+    if (!hint || hint.until <= now) {
+      plainPreparers.delete(cacheKey); plainPreparers.set(cacheKey, {owner:nonce,until:now+5000});
+      if (plainPreparers.size > MAX_PLAIN_PLAN_KEYS) plainPreparers.delete(plainPreparers.keys().next().value);
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  try {
   // Only preparation is repeated. No event has been delivered on either attempt.
   for (let attempt = 0; attempt < 2; ++attempt) {
     let reply;
@@ -1548,6 +1566,9 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       if (!missing(error)) throw error;
       if (attempt) throw staged("package", rootManagementFailure(new Error(rootFailureReason(error)), true));
     }
+  }
+  } finally {
+    if (plainPreparers.get(cacheKey)?.owner === nonce) plainPreparers.delete(cacheKey);
   }
 }
 
