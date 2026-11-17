@@ -3969,10 +3969,10 @@ kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(
       if (c.p->pid == 0) continue;
       exited = false;
       if (c.terminatedAt == 0) {
-        if (c.p->probePending) continue;
         // A generation that never became ready is still in its startup probe, which owns
-        // the probe client: it only gets the signal (its startup then ends with the exit).
-        if (c.p->readyAt > 0) impl->closeConnections(*c.p);
+        // the probe client. Any pending probe keeps its client until exit, but
+        // cannot delay termination beyond the configured grace.
+        if (c.p->readyAt > 0 && !c.p->probePending) impl->closeConnections(*c.p);
         if (c.p->state != "killed") {
           ::kill(c.p->pid, SIGTERM);
           c.signalled = true;
