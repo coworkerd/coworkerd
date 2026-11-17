@@ -866,6 +866,7 @@ struct ProcessGeneration {
   // The CPU a request that lasts -- a WebSocket connection, whose context ends with it -- has already been metered with,
   // from its cpu-progress rows, until its completed row comes.
   std::unordered_map<std::string, uint64_t> meteredCpu;
+  std::unordered_map<std::string, double> notExecutedInvocations;
   uint64_t contextsCompleted = 0, contextsCleared = 0, contextsDropped = 0;
   double lastDurableReplyAt = 0;
   bool drainComparisonRecorded = false;
@@ -1072,6 +1073,7 @@ struct ProcessGeneration {
         // so far in cpu-progress rows (at most once a second, at its events), each counted for what it adds, and its
         // completed row the rest.
         if ((event == "completed" || event == "cpu-progress") && cpuUsage &&
+            !notExecutedInvocations.contains(report.getInvocationId().cStr()) &&
             std::string_view(report.getInvocationId().cStr()).find("-invocation-") != std::string_view::npos) {
           const auto tenant = tenantOf(report.getWorkerId().cStr());
           const uint64_t total = report.getCpuUsedNs() + report.getGcExcludedNs();
@@ -1142,6 +1144,17 @@ void ProcessCall::finish() {
       auto open = process->openContexts.find(invocationId);
       if (open != process->openContexts.end()) open->second.finishedAt = mono();
     }
+  }
+  if (!dispatched && startedAtMonotonicMs > 0) {
+    process->openContexts.erase(invocationId);
+    if (process->dispatched > 0) --process->dispatched;
+    std::erase_if(process->notExecutedInvocations, [](const auto& entry) { return mono() - entry.second > 60000; });
+    if (process->notExecutedInvocations.size() >= 4096) {
+      auto oldest = std::min_element(process->notExecutedInvocations.begin(), process->notExecutedInvocations.end(),
+          [](const auto& a, const auto& b) { return a.second < b.second; });
+      process->notExecutedInvocations.erase(oldest);
+    }
+    process->notExecutedInvocations[invocationId] = mono();
   }
   process->calls.erase(invocationId);
 }
