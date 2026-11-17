@@ -840,8 +840,9 @@ private:
   std::set<std::pair<double, std::string>> alarmRetryDeadlines, alarmNamespaceDeadlines;
   struct AlarmGate { bool open = true, probing = false;uint64_t probeToken = 0;double next = 0, opened = 0;std::set<AlarmBucketKey> blocked; };
   std::map<std::string, AlarmGate> alarmCapacityGates;
-  struct AlarmPausedNamespace { std::set<std::string> keys;uint32_t misses = 0;double next = 0; };
+  struct AlarmPausedNamespace { std::set<std::string> keys;uint32_t misses = 0;double next = 0;bool draining = false; };
   std::map<std::string, AlarmPausedNamespace> alarmPausedNamespaces;
+  std::deque<std::string> alarmActiveNamespaces;
   double alarmNamespaceBatchAt = 0;
   std::map<std::string, std::set<std::pair<uint64_t, std::string>>> alarmPreparationQueue;
   uint64_t alarmPreparationCount = 0;
@@ -852,7 +853,7 @@ private:
   std::function<AlarmNamespace(const std::string&)> alarmNamespace;
   std::function<std::string(const DurableAlarm&)> alarmDestination;
   kj::Promise<void> alarmTimer = nullptr;double alarmTimerAt = 0;
-  std::string lastAlarmTenant;
+  std::string lastAlarmTenant, lastAlarmPreparationTenant;
   uint32_t activeAlarmFires = 0, peakAlarmFires = 0, activeAlarmPreparations = 0, alarmReadyBucketCount = 0;
   std::map<std::string, std::pair<uint32_t, uint32_t>> alarmProcessFires; // active, peak by durable process
   uint64_t alarmFireSerial = 0, alarmDeferred = 0, alarmInactive = 0;
