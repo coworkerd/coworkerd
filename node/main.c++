@@ -1062,7 +1062,7 @@ public:
           if (count) {
             sourceBytes += count;
             escapedBytes += jsonEscape(std::string(chunk.data(), static_cast<size_t>(count))).size();
-            co_await timer.afterDelay(0 * kj::MILLISECONDS);
+            co_await timer.afterDelay(1 * kj::MICROSECONDS);
             if (monotonicTimeMs() >= deadline) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata computation timed out");
           }
         }
