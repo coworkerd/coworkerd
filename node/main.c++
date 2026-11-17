@@ -8024,7 +8024,7 @@ private:
       while (runtime.durableInFlight() > 0 && monotonicTimeMs() < deadline) co_await timer.afterDelay(5 * kj::MILLISECONDS);
       const auto inFlightLeft = runtime.durableInFlight();
       const auto waitedMs = monotonicTimeMs() - startedAt;
-      auto closed = co_await runtime.closeDurable();
+      auto closed = co_await runtime.closeDurable(deadline);
       const auto closedMs = monotonicTimeMs() - startedAt;
       // The records the peers hold go into a segment before the shards are let go, so the next owner finds the
       // whole history on the object store, and the files stay usable for this node's next start.
