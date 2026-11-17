@@ -1453,6 +1453,7 @@ const plainColdLoads = new Map();
 // Preparation may be cancelled. Claim the cold observation only at actual dispatch.
 function claimPlainCold(item, cacheKey) {
   const cold = item.cold === true;
+  if (!cold) return false;
   item.cold = false;
   const remembered = plainPlanKeys.get(cacheKey);
   if (remembered?.plan === item.plan && remembered.generation === item.generation) remembered.cold = false;
@@ -1470,8 +1471,8 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   const cacheKey = JSON.stringify([base.workerId, base.versionId, base.versionFingerprint,
     base.creationRecord?.generation ?? 0, base.creationRecord?.cpuLimitMs, base.creationRecord?.memoryLimitMib]);
   const nonce = crypto.randomUUID();
-  const select = async item => {
-    try {return await env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
+  const select = item => {
+    try {return env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
     plan: item.plan, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
     activePlan: !options.rootTrial && descriptor.rootSelection.activePlan === true,
