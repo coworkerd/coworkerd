@@ -1390,11 +1390,13 @@ async function trialLoad(descriptor, env, ctx) {
     const selected = await selectedPlain(descriptor, env, ctx, {trial: true});
     coldLoad = selected.claimCold();
     report = await (await selected.fetcher.fetch("http://coworkerd-trial/", {cf})).json();
+    if (report && typeof report === "object") delete report.preparationLimit;
     if (report.ok && descriptor.loadCheck !== true && descriptor.format === "v2" &&
         (descriptor.durableObjectClasses ?? []).length && report.durableObjectClasses?.every(value => value.usable)) {
       const selectedRootTrial = await selectedPlain(descriptor, env, ctx, {trial: true, rootTrial: true});
       coldLoad = selectedRootTrial.claimCold() || coldLoad;
       const rootReport = await (await selectedRootTrial.fetcher.fetch("http://coworkerd-root-trial/", {cf})).json();
+      if (rootReport && typeof rootReport === "object") delete rootReport.preparationLimit;
       if (!rootReport.ok) report = { ...rootReport, durableObjectClasses: report.durableObjectClasses };
       report.rootBridgeChecked = true;
     }
