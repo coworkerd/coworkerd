@@ -1004,8 +1004,11 @@ public:
     if (auto known = preparationBytes.find(version.contentHash); known != preparationBytes.end()) {
       known->second.used = ++preparationByteSequence;
       preparationByteFlights.erase(version.contentHash);
-      co_return co_await desiredState.ensureCode(version, deadline - monotonicTimeMs());
+      return desiredState.ensureCode(version, deadline - monotonicTimeMs());
     }
+    return ensurePreparationMemory(version, deadline);
+  }
+  kj::Promise<std::string> ensurePreparationMemory(VersionDefinition version, double deadline) {
     auto found = preparationByteFlights.find(version.contentHash);
     if (found == preparationByteFlights.end()) {
       if (preparationByteFlights.size() >= 16384) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata capacity reached");
