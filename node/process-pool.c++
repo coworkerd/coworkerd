@@ -243,28 +243,25 @@ public:
     }
     return {};
   }
-  // Read only the bounded aggregate prefix, checking the same publication sequence
-  // and the final completion marker. No full snapshot copy/parse is needed for d.
-  std::string readDrain() const {
-    if (!base) return {};
-    constexpr std::string_view trailer = ",\"drainSnapshotComplete\":true}";
+  struct Drain { double observedMs; uint64_t active, background, unknown; };
+  // Ask for an observation on Native's next loop turn, then copy only four words.
+  // The full per-isolate snapshot and its publication frequency are independent.
+  std::optional<Drain> readDrain() const {
+    if (!base) return std::nullopt;
+    __atomic_add_fetch(reinterpret_cast<uint64_t*>(base + 16), uint64_t(1), __ATOMIC_RELEASE);
     for (int attempt = 0; attempt < 8; ++attempt) {
-      const auto published = __atomic_load_n(reinterpret_cast<const uint64_t*>(base), __ATOMIC_ACQUIRE);
-      if (!published) return {};
-      const char* buffer = base + 64 + (published % 2) * (16 + size_t(CAPACITY));
-      const auto before = __atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_ACQUIRE);
+      const auto before = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 24), __ATOMIC_ACQUIRE);
+      if (!before) return std::nullopt;
       if (before & 1) continue;
-      const auto length = __atomic_load_n(reinterpret_cast<const uint32_t*>(buffer + 8), __ATOMIC_RELAXED);
-      if (length > CAPACITY || length < trailer.size()) return {};
-      std::string prefix(buffer + 16, std::min<size_t>(length, 512));
-      const bool complete = std::string_view(buffer + 16 + length - trailer.size(), trailer.size()) == trailer;
+      const auto observed = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 32), __ATOMIC_RELAXED);
+      const auto active = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 40), __ATOMIC_RELAXED);
+      const auto background = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 48), __ATOMIC_RELAXED);
+      const auto unknown = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 56), __ATOMIC_RELAXED);
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
-      if (__atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_RELAXED) != before) continue;
-      const auto end = prefix.find("},\"pid\":");
-      if (!complete || !prefix.starts_with("{\"drain\":{") || end == std::string::npos) return {};
-      prefix.resize(end + 1); prefix += '}'; return prefix;
+      if (__atomic_load_n(reinterpret_cast<const uint64_t*>(base + 24), __ATOMIC_RELAXED) == before)
+        return Drain{double(observed) / 1000000, active, background, unknown};
     }
-    return {};
+    return std::nullopt;
   }
 private:
   char* base = nullptr;
@@ -871,6 +868,7 @@ struct ProcessGeneration {
   std::unordered_map<std::string, uint64_t> meteredCpu;
   uint64_t contextsCompleted = 0, contextsCleared = 0, contextsDropped = 0;
   double lastDurableReplyAt = 0;
+  bool drainComparisonRecorded = false;
   double drainLifecycleCheck = 0;  // the Server drain's lifecycle reads
   // The workerd file the Server opened for this generation: its identity, which becomes the
   // generation's `binary` once the generation is ready (an identity is attached after the probe).
@@ -3024,21 +3022,15 @@ public:
     lastLifecycleCheck = now;
     if (old.durable) {
       const auto snapshot = old.lifecycle.readDrain();
-      if (snapshot.empty()) return false;
-      try {
-        capnp::MallocMessageBuilder arena;
-        auto value = arena.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
-        const auto summary = json::field(value, "drain");
-        const auto observed = json::field(summary, "observedAtMonotonicMs");
-        const auto background = json::field(summary, "backgroundActive"), unknown = json::field(summary, "unknownBusy");
-        const bool result = observed.isNumber() && observed.getNumber() >= old.lastDurableReplyAt &&
-            background.isBoolean() && !background.getBoolean() && unknown.isBoolean() && !unknown.getBoolean();
+      if (!snapshot || snapshot->observedMs < std::max(since, old.lastDurableReplyAt)) return false;
+      const bool result = !snapshot->active && !snapshot->background && !snapshot->unknown;
+      if (!old.drainComparisonRecorded) {
+        old.drainComparisonRecorded = true;
         ++legacyDrainChecks;
         // The old durable path registered no invocation contexts and drained at inFlight == 0.
         if (!result) ++legacyDrainDisagreements;
-        return result;
-      } catch (const kj::Exception&) { return false; }
+      }
+      return result;
     }
     const auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
@@ -3197,6 +3189,7 @@ public:
         << ",\"durationMs\":" << (r.finishedAt > 0 ? r.finishedAt : mono()) - r.startedAt
         << ",\"inFlightAtSwitch\":" << r.inFlightAtSwitch << ",\"contextsAtSwitch\":" << r.contextsAtSwitch
         << ",\"backgroundAtSwitch\":" << r.backgroundAtSwitch << ",\"backgroundVisible\":" << (r.backgroundVisible ? "true" : "false")
+        << ",\"contextAccounting\":\"" << (s.durable ? "not-applicable-to-durable" : "invocation") << '"'
         << ",\"drainOutcome\":\"" << r.drainOutcome << "\",\"killedCalls\":" << r.killedCalls
         << ",\"killedContexts\":" << r.killedContexts << ",\"clearedContexts\":" << r.clearedContexts
         << ",\"sigkill\":" << (r.sigkill ? "true" : "false") << ",\"webSocketsClosed\":" << r.webSocketsClosed
@@ -3650,6 +3643,7 @@ std::string ProcessPool::json(uint32_t idleMs) const {
         << ",\"socket\":\"" << (p ? p->socketName : "") << "\",\"binarySha256\":\"" << (p ? impl->hasher.lookup(p->binary) : "")
         << "\",\"dispatchedCount\":" << (p ? p->dispatched : 0) << ",\"openContexts\":" << (p ? p->openContexts.size() : 0)
         << ",\"contextsVisible\":" << (p && p->contextsVisible ? "true" : "false")
+        << ",\"contextAccounting\":\"" << (s.durable ? "not-applicable-to-durable" : "invocation") << '"'
         << ",\"contextsCompleted\":" << (p ? p->contextsCompleted : 0) << ",\"contextsDropped\":" << (p ? p->contextsDropped : 0)
         << ",\"rotationCount\":" << s.rotations << ",\"sandbox\":" << (p ? impl->generationSandboxJson(*p) : "null")
         << ",\"launchFailures\":" << s.launchFailures << ",\"lastLaunchFailure\":" << s.lastLaunchFailure
@@ -3809,6 +3803,7 @@ ProcessPool::DrainState ProcessPool::drainState(double since, uint32_t periodMs)
     generations << (n++ ? "," : "") << "{\"processId\":\"" << p->id << "\",\"generation\":" << p->generation
         << ",\"pid\":" << p->pid << ",\"state\":\"" << p->state << "\",\"inFlight\":" << p->inFlight
         << ",\"openContexts\":" << p->openContexts.size() << ",\"backgroundContexts\":" << p->backgroundContexts()
+        << ",\"contextAccounting\":\"" << (p->durable ? "not-applicable-to-durable" : "invocation") << '"'
         << ",\"contextsVisible\":" << (p->contextsVisible ? "true" : "false") << ",\"drained\":" << (drained ? "true" : "false") << "}";
   });
   result.idle = idle;
