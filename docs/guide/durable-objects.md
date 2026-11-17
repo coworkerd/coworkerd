@@ -128,6 +128,19 @@ Unknown namespace metadata and temporarily inactive namespaces retain their alar
 
 Loss of a machine has an additional per-object recovery cost: each cold object's first rebuild waits up to membership TTL plus liveness grace, and holds a rebuild slot while waiting. With the defaults this is 25 seconds and four slots per surviving node. A capacity estimate for `S` cold objects and `N` survivors is `ceil(S / (N * 4)) * 25 seconds`, plus detection, discovery, storage and handler work. For two survivors, the recovery portion alone is about 325 seconds for 100 objects and 3,125 seconds for 1,000. These are capacity estimates, not measured end-to-end latency or delivery guarantees.
 
+With `rebuildConcurrency` set to 1 and many objects left by a dead node, a user's first request can wait through the default 30-second `recoverTimeoutMs` and receive `503 DO_RECOVERING`; retry it. Promotion to the foreground queue still leaves that request behind earlier foreground requests, and the two classes alternate use of the single slot.
+
+Measured recovery of 24 small objects whose alarms were already due, with two survivors, four rebuild slots per node, the default 15-second TTL and 10-second grace, and concurrent user traffic:
+
+| Discovery path | Kill-to-fire median | Kill-to-fire p99 | Earlier design example |
+| --- | ---: | ---: | ---: |
+| Membership change | 75.19 s | 100.53 s | about 43 s |
+| Next 60-second patrol | 104.90 s | 130.28 s | about 98 s |
+
+Each node had a 1 CPU cgroup quota and 1,536 MiB memory, with one durable process. Eight clients each made ten hot-object requests per second, and two more continuously read other objects. Every measured alarm fired once and user requests had no failures. The member path took about 24.30 seconds to detect the loss; the patrol path added about 31.10 seconds between detection and its first metadata read. A rebuild occupied a slot for about 25.2 seconds, and the median object waited another 25.4 seconds in the rebuild queue. This per-object wait explains the additional time over the earlier examples. The measured drain rate was about 0.318 objects/second, close to the capacity estimate of `8 / 25 = 0.32`. Adding measured discovery overhead to the formula estimates about 350 / 379 seconds for 100 objects and 3,150 / 3,179 seconds for 1,000, for the member / patrol paths respectively. Those larger counts are projections.
+
+In a separate live-owner test with 2,010 alarms, the same per-node CPU and memory quotas, eight hot clients and two continuously requesting stateless clients, concurrency 2 drained the alarms in 14.73 seconds; concurrency 1 took 17.15 seconds. Hot-request p99 was 57.5 / 79.1 ms in each run's preceding static window and 165.5 / 133.9 ms during drain, respectively. Node 3 was already CPU-quota saturated before firing began, so these measurements include quota contention. Evaluate latency on the deployment's own hardware with fixed-rate traffic and CPU headroom before increasing the setting.
+
 Object-store hints identify which objects the next shard owner should wake, but the database decides whether an alarm is due. A stale hint can cause a harmless wake; a missing hint delays discovery until the object is opened again. Treat delivery as retryable, with no exactly-once side-effect guarantee.
 
 An acknowledged alarm whose hint or owner marker has not published before its node stops can miss background discovery. Alarms set before the hint/marker implementation join background discovery when their shard is next opened. A large backlog, cold rebuilds, unavailable storage, or insufficient resources can delay firing further. Database fencing does not make external side effects exactly once; handlers must make those effects safe to retry.
