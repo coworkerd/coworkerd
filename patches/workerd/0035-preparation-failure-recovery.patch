@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 11:52:40 +0800
+Subject: [PATCH] Share preparation failures with current waiters and allow
+ immediate recovery
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index a5d288bc6f667a523b2a0588789bcb5dcf9913f6..f386f69b45b60613d80115bb5b89cc48c01f21a9 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -578,11 +578,9 @@ impl RootRegistry {
+                     futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                         "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
+                 };
+-                let success=result["ok"]==true;
+                 *task.result.borrow_mut()=Some(result);task.completed.notify_waiters();
+-                // A short shared memory covers pre-install failures for the arriving cohort.
+-                // Completion belongs to this task, never to a cancelled requesting context.
+-                if !success {registry.factory.sleep(Duration::from_millis(100)).await;}
++                // Existing waiters own the same completed result. Remove the rendezvous
++                // immediately so a new request can recover as soon as SOURCE recovers.
+                 let current=registry.preparations.borrow().get(&task_key).is_some_and(|current|Rc::ptr_eq(current,&task));
+                 if current {
+                     registry.preparations.borrow_mut().remove(&task_key);
