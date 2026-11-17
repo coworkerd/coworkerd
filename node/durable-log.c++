@@ -5255,7 +5255,8 @@ void DurableLog::unindexAlarm(const std::string& key, AlarmState& state) {
 void DurableLog::indexAlarm(const std::string& key, AlarmState& state) {
   unindexAlarm(key, state);if (state.firing || !state.atUnixMs) return;
   const auto remaining = std::max(state.notBeforeMs, state.capacityAtMs) - monotonicTimeMs();
-  state.wakeUnixMs = std::max(state.atUnixMs, realClockUnixMs() + (remaining > 0 ? uint64_t(remaining) + 1 : 0));
+  state.wakeUnixMs = state.atUnixMs;
+  if (remaining > 0) state.wakeUnixMs = std::max(state.wakeUnixMs, realClockUnixMs() + uint64_t(remaining) + 1);
   state.indexed = true;alarmTenants[state.tenant].queue.emplace(state.wakeUnixMs, state.atUnixMs, key);
   refreshAlarmTenant(state.tenant);
 }
