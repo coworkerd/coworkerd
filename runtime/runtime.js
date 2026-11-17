@@ -1372,6 +1372,12 @@ const loaderKey = (descriptor) =>
 // dispatch (`loadCheck`) is the same probe, for the entrypoint the call names:
 // "code" failures also say where in our code (`codeStage`).
 async function trialLoad(descriptor, env, ctx) {
+  // WorkerLoader.get rejected malformed platform descriptors before the tenant
+  // load report's catch. Preserve that boundary and its LOAD_FAILED envelope.
+  const plan = descriptor.rootPlan;
+  if (plan?.kind !== "tenant" || !Array.isArray(plan.namespaces) || plan.namespaces.length ||
+      descriptor.rootSelection?.kind !== "plain" || descriptor.rootSelection.dispatchChecked !== true)
+    throw new Error("Missing trusted ordinary worker plan");
   const started = performance.now();
   let coldLoad = false, stage = "load", codeStage = null;
   let report;
