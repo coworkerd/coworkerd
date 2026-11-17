@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 12:51:12 +0800
+Subject: [PATCH] Check cached failures before preparing and serialize active
+ package preparation
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index f6096eaf1b657d6cba723390658b76430c1d4164..e3d23045ef9959231d56afb8cce8563139d32c71 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -465,6 +465,7 @@ pub struct RootRegistry {
+     install_lock: tokio::sync::Mutex<()>,
+     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
+     preparations: RefCell<HashMap<String, Rc<PreparationFlight>>>,
++    preparation_slots: tokio::sync::Semaphore,
+     preparation_wait_cpu_ns: Cell<u64>,
+     preparation_wait_polls: Cell<u64>,
+     preparation_wake_cpu_ns: Cell<u64>,
+@@ -504,6 +505,9 @@ impl RootRegistry {
+             install_lock: tokio::sync::Mutex::new(()),
+             installing: RefCell::new(HashMap::new()),
+             preparations: RefCell::new(HashMap::new()),
++            // Large verified packages share the trusted runtime's bounded heap.
++            // Keep only one in preparation; other plans wait without fetching.
++            preparation_slots: tokio::sync::Semaphore::new(1),
+             preparation_wait_cpu_ns: Cell::new(0),
+             preparation_wait_polls: Cell::new(0),
+             preparation_wake_cpu_ns: Cell::new(0),
+@@ -526,18 +530,23 @@ impl RootRegistry {
+         }))
+     }
+ 
+-    async fn prepare(self: &Rc<Self>, value: Value) -> Result<Value> {
+-        let deployment: Deployment = serde_json::from_value(value.clone())
+-            .map_err(|error| kj::failed!("ordinary preparation: {error}"))?;
++    async fn prepare(self: &Rc<Self>, mut value: Value) -> Result<Value> {
++        let descriptor = value.as_object_mut().and_then(|value| value.remove("descriptor"))
++            .ok_or_else(|| kj::failed!("ordinary preparation descriptor is missing"))?;
++        let deployment: Deployment = serde_json::from_value(value)
++            .map_err(|_| kj::failed!("ordinary preparation descriptor is invalid"))?;
+         if !deployment.is_plain()
+-            || value["descriptor"]["workerId"] != deployment.worker_id
+-            || value["descriptor"]["versionId"] != deployment.version_id
++            || descriptor["workerId"] != deployment.worker_id
++            || descriptor["versionId"] != deployment.version_id
+         {
+             return Err(kj::failed!(
+                 "ordinary preparation needs its trusted descriptor"
+             ));
+         }
+         let key = deployment.plan_key()?;
++        if let Some(error) = self.cached_failure(&key) {
++            return Ok(preparation_failure(error.description()).1);
++        }
+         if let Some(plan) = self.plans.borrow().get(&key) {
+             if self.loaded(plan).is_some() {
+                 return Ok(json!({"ok":true,"result":{"plan":key,"info":{"loaded":true,
+@@ -568,8 +577,10 @@ impl RootRegistry {
+             let task_key = key.clone();
+             self.factory.spawn_detached(async move {
+                 let prepare=async {
++                    let _slot = registry.preparation_slots.acquire().await
++                        .map_err(|_| kj::failed!("ordinary preparation queue stopped"))?;
+                     let target=RootTarget {service:"runtime".to_owned(),entrypoint:Some("PlainPreparer".to_owned()),
+-                        props:json!({"base":deployment,"descriptor":value["descriptor"]})};
++                        props:json!({"base":deployment,"descriptor":descriptor})};
+                     let channel=registry.target(&target,&target.props)?;
+                     let request=channel.start_request(ffi::new_request_metadata(None.into(),None.into()))?;
+                     let bytes=ffi::factory_prepare_plain(registry.factory.raw(),request).await?;
+@@ -1940,6 +1951,8 @@ impl RootRegistry {
+             "preparationWakeCpuNs": self.preparation_wake_cpu_ns.get(),
+             "preparationWakeBatches": self.preparation_wake_batches.get(),
+             "preparations": self.preparations.borrow().len(),
++            "activePreparations": 1-self.preparation_slots.available_permits(),
++            "maxActivePreparations": 1,
+             "failedInstalls": self.failed_installs.borrow().len(),
+             "closingFences": self.closing_roots.pending(),
+             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
+@@ -2492,7 +2505,8 @@ impl Service for RootRequest {
+         if method==Method::POST && url.path()=="/prepare" {
+             let registry=Rc::clone(&self.registry);let meter=Rc::clone(&registry);
+             let future=async move {
+-                let reply=registry.prepare(read_json(body).await?).await?;
++                let value=read_json(body).await.map_err(|_|kj::failed!("ordinary preparation request is invalid"))?;
++                let reply=registry.prepare(value).await?;
+                 let (status,value)=if reply["ok"]==true {(200,reply["result"].clone())} else {
+                     (if reply["error"]["kind"]=="tenant-code" {500} else {503},reply)
+                 };
