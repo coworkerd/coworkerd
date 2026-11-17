@@ -1004,7 +1004,8 @@ public:
       found = preparationByteFlights.emplace(version.contentHash, std::move(shared)).first;
     }
     auto branch = found->second->addBranch();
-    co_await branch;
+    try { co_await branch; }
+    catch (const kj::Exception&) { preparationByteFlights.erase(version.contentHash); throw; }
     preparationByteFlights.erase(version.contentHash);
     co_return std::string();
   }
