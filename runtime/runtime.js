@@ -1496,12 +1496,12 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     if (plainPlanKeys.size > MAX_PLAIN_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
     return item;
   };
-  const chosen = async item => ({fetcher: await select(item), generation: item.generation,
+  const chosen = item => ({fetcher: select(item), generation: item.generation,
     cold: item.cold === true, claimCold: () => claimPlainCold(item, cacheKey)});
   const missing = error => rootPreparationKind(error, nonce) === "plan-missing";
   let item = plainPlanKeys.get(cacheKey);
   if (item) {
-    try {return await chosen(remember(item));}
+    try {return chosen(remember(item));}
     catch (error) {if (!missing(error)) throw error; plainPlanKeys.delete(cacheKey);}
   }
   const manage = async (path, deployment) => {
@@ -1530,7 +1530,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
       throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
     item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
-    try {return await chosen(item);}
+    try {return chosen(item);}
     catch (error) {
       plainPlanKeys.delete(cacheKey);
       if (!missing(error)) throw error;
