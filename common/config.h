@@ -204,8 +204,7 @@ struct DurableLogConfig {
   // How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
   uint32_t usagePublishMs = 3600000;
   uint32_t alarmDiscoveryIntervalMs = 60000;
-  // alarmReadConcurrency is fixed at 2: each side reserves one, and can borrow the other when idle.
-  uint32_t alarmTakeoverConcurrency = 4, alarmReadConcurrency = 2;
+  uint32_t alarmTakeoverConcurrency = 4;
   void validate() const;
 };
 

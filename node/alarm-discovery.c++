@@ -91,19 +91,21 @@ void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marke
   peakPending = std::max<uint64_t>(peakPending, candidates.size());pump();
 }
 void AlarmDiscovery::cache(const std::string& key, ShardRoute route) {
-  auto& c = candidates.at(key);
+  auto& c = candidates.at(key);const bool queued = runnable.erase({c.priority, c.tenant, c.order, key}) != 0;
   if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key); }
   c.owner = std::move(route);c.forceResolve = false;if (c.owner->kind == ShardRoute::Kind::LOCAL) c.priority = 0;ownerWaiters[{c.owner->nodeId, c.owner->nodeEpoch}].insert(key);
+  if (queued) runnable.emplace(c.priority, c.tenant, c.order, key);
 }
 void AlarmDiscovery::uncache(const std::string& key) {
-  auto& c = candidates.at(key);
+  auto& c = candidates.at(key);const bool queued = runnable.erase({c.priority, c.tenant, c.order, key}) != 0;
   if (c.owner) {
     auto it = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});
     if (it != ownerWaiters.end()) { it->second.erase(key);if (it->second.empty()) ownerWaiters.erase(it); }
   }
   if (c.owner && c.owner->kind == ShardRoute::Kind::LOCAL) c.forceResolve = true;
   if (c.awaitingHints) { --adoptions;c.awaitingHints = false; }
-  c.watching = false;++c.watchSerial;c.owner.reset();c.waitedMs = 0;c.priority = 1;
+  c.watching = false;c.watchSerial = ++serial;c.owner.reset();c.waitedMs = 0;c.priority = 1;
+  if (queued) runnable.emplace(c.priority, c.tenant, c.order, key);
 }
 void AlarmDiscovery::loadPending() {
   std::error_code error;
@@ -221,7 +223,7 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
               if (state == AlarmPublication::PublicationState::PENDING) {
                 const bool adoptionOnly = !hintsReady(ns, shard, owner.epoch);
                 if (adoptionOnly && !c.awaitingHints) { c.awaitingHints = true;++adoptions; }
-                c.watching = true;const auto token = ++c.watchSerial;
+                c.watching = true;const auto token = c.watchSerial = ++serial;
                 tasks.add(kj::evalLater([this, key, epoch = owner.epoch, adoptionOnly, token]() { return watch(key, epoch, adoptionOnly, token); }));
                 closed = true;co_return;
               }
@@ -258,7 +260,10 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
 kj::Promise<void> AlarmDiscovery::watch(std::string key, uint64_t epoch, bool adoptionOnly, uint64_t serial) {
   auto it = candidates.find(key);if (it == candidates.end()) co_return;
   const auto ns = it->second.ns;const auto shard = it->second.shard;
-  auto state = co_await waitPublished(ns, shard, epoch, adoptionOnly);
+  auto state = AlarmPublication::PublicationState::PENDING;
+  try { state = co_await waitPublished(ns, shard, epoch, adoptionOnly); }
+  catch (const kj::Exception& error) { failed(error); }
+  catch (const std::exception&) { ++failures; }
   it = candidates.find(key);if (it == candidates.end() || it->second.watchSerial != serial) co_return;
   auto& c = it->second;c.watching = false;
   if (c.awaitingHints) { --adoptions;c.awaitingHints = false; }
@@ -285,7 +290,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
       auto w = ownerWaiters.find(invalidOwners.front());
       if (w == ownerWaiters.end() || w->second.empty()) { if (w != ownerWaiters.end()) ownerWaiters.erase(w);invalidOwners.pop_front();continue; }
       const auto key = *w->second.begin();w->second.erase(w->second.begin());auto it = candidates.find(key);
-      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;it->second.priority = 1;schedule(key, 0); }
+      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;schedule(key, 0); }
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
     if (scans < 2 && !directories.empty()) {
@@ -317,7 +322,7 @@ void AlarmDiscovery::pump() {
 std::string AlarmDiscovery::json() const {
   const auto state = !membership.durableProcesses ? "disabled-no-durable-processes" : access ? "enabled" : denials ? "disabled-access-denied" : "checking";
   return "{\"state\":" + json::quote(state) + ",\"scanIntervalMs\":" + std::to_string(settings.intervalMs) +
-      ",\"takeoverLimit\":" + std::to_string(settings.takeovers) + ",\"readLimit\":" + std::to_string(settings.reads) +
+      ",\"takeoverLimit\":" + std::to_string(settings.takeovers) + ",\"readLimit\":" + std::to_string(AlarmPublication::ReadBudget::limit) +
       ",\"active\":" + std::to_string(active) + ",\"pendingHintAdoptions\":" + std::to_string(adoptions) + ",\"peakActive\":" + std::to_string(peakActive) +
       ",\"sharedPeakReads\":" + std::to_string(peakReads) + ",\"pending\":" + std::to_string(candidates.size()) +
       ",\"peakPending\":" + std::to_string(peakPending) + ",\"candidateLimit\":16384,\"evicted\":" + std::to_string(evicted) +

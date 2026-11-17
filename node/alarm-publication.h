@@ -19,8 +19,8 @@ class AlarmPublication final: private kj::TaskSet::ErrorHandler {
 public:
   struct ReadBudget {
     struct Permit { ReadBudget& budget;bool publisher;Permit(ReadBudget& b, bool p): budget(b), publisher(p) {} ~Permit() noexcept(false); };
-    uint32_t active = 0, limit = 2, publisherActive = 0, discoveryActive = 0;
-    bool publisherDemand = false, preferDiscovery = false;
+    static constexpr uint32_t limit = 2;
+    uint32_t active = 0, publisherActive = 0, discoveryActive = 0;
     bool publisherAvailable() const;
     bool discoveryAvailable() const;
     std::function<void()> available;
@@ -43,7 +43,7 @@ public:
   void report(std::string ns, std::string object, uint32_t shard, uint64_t epoch,
       std::string tenant, uint64_t at);
   void tick();
-  void setReadBudget(ReadBudget& budget, uint32_t limit) { readBudget = &budget;budget.limit = limit;budget.available = [this]() { pump(); }; }
+  void setReadBudget(ReadBudget& budget) { readBudget = &budget;budget.available = [this]() { pump(); }; }
   enum class PublicationState { PENDING, READY, EMPTY };
   PublicationState publicationState(const std::string&, uint32_t, uint64_t) const;
   bool hintsReady(const std::string&, uint32_t, uint64_t) const;
@@ -59,7 +59,7 @@ private:
     uint32_t shard = 0, failures = 0;
     uint64_t epoch = 0, memberEpoch = 0, markerMemberEpoch = 0, generation = 0, order = 0;
     uint64_t previousOrder = 0, repairOrder = 0, hintCommittedNs = 0;
-    bool adopted = false, reading = false, startupOnly = false, nonempty = false, initial = true;
+    bool adopted = false, reading = false, nonempty = false, initial = true;
     bool markerWritten = false, markerMayExist = false, scanning = false, previousDone = false;
     bool pendingRecorded = false;
     bool previousPending = false, repairPending = false;

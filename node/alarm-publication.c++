@@ -98,10 +98,10 @@ bool AlarmPublication::ReadBudget::publisherAvailable() const {
   return active < limit && (!publisherActive || waiters.empty());
 }
 bool AlarmPublication::ReadBudget::discoveryAvailable() const {
-  return active < limit && (!publisherDemand || !discoveryActive);
+  return active < limit;
 }
 kj::Own<AlarmPublication::ReadBudget::Permit> AlarmPublication::ReadBudget::acquireNow() {
-  KJ_REQUIRE(publisherAvailable());++active;++publisherActive;publisherDemand = false;return kj::heap<Permit>(*this, true);
+  KJ_REQUIRE(publisherAvailable());++active;++publisherActive;return kj::heap<Permit>(*this, true);
 }
 kj::Promise<kj::Own<AlarmPublication::ReadBudget::Permit>> AlarmPublication::ReadBudget::acquire() {
   if (discoveryAvailable()) { ++active;++discoveryActive;return kj::heap<Permit>(*this, false); }
@@ -171,7 +171,7 @@ void AlarmPublication::setNodeEpoch(uint64_t epoch) {
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
   if (!nodeEpoch || !epoch || !current(ns, shard, epoch, nodeEpoch)) return;const auto key = shardKey(ns, shard);auto it = shards.find(key);
   if (it != shards.end() && it->second.epoch == epoch && it->second.memberEpoch == nodeEpoch && valid(it->second)) {
-    auto& s = it->second;s.startupOnly = false;if (!s.reading) { s.adopted = false;s.next = 0; }
+    auto& s = it->second;if (!s.reading) { s.adopted = false;s.next = 0; }
     offerRead(s);pump();return;
   }
   gone(ns, shard);Shard s;s.ns = std::move(ns);s.shard = shard;s.epoch = epoch;s.tenant = std::move(tenant);
@@ -361,10 +361,7 @@ void AlarmPublication::markerRestored() {
 }
 void AlarmPublication::pump(unsigned limit) {
   Scope measured(*this);if (stopping) return;
-  KJ_DEFER(readBudget->publisherDemand = false;readBudget->wake());
-  const auto demandNow = monotonicTimeMs();
-  readBudget->publisherDemand = active < 16 && ((activeHints < 7 && !readyReads.empty() && hintGate.available(demandNow)) ||
-      (!activeScans && !markerDenied && markerGate.available(demandNow) && (!readyScans.empty() || initialMarkerScan || (!ownMarkers.empty() && demandNow >= nextMarkerScan))));
+  KJ_DEFER(readBudget->wake());
   for (unsigned attempt = 0; attempt < limit && active < 16; ++attempt) {
     const auto now = monotonicTimeMs();Ready work{};bool have = false, permissionProbe = false, gateProbe = false;
     auto choose = [this](std::set<Ready>& queue, const Gate& gate) {
@@ -560,7 +557,7 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
       if (pending != writes.end() && pending->second.generation == generation) {
         if (pending->second.at) s.desired[object] = pending->second.at;else s.desired.erase(object);
       } else if (!s.duringRead.contains(object) && !s.desired.contains(object)) s.desired[object] = at;
-      if (!s.startupOnly && s.desired.contains(object)) adopt(ns, object, shard, epoch, s.tenant, s.desired.at(object));
+      if (s.desired.contains(object)) adopt(ns, object, shard, epoch, s.tenant, s.desired.at(object));
     }
     s.duringRead.clear();s.reading = false;s.adopted = true;s.failures = 0;s.checked = monotonicTimeMs();
     pending(s, !s.hints.empty() && !s.markerWritten);

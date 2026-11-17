@@ -829,10 +829,10 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
         }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
     const auto pendingDirectory = this->settings.stackDirectory / "alarm-pending";
     alarmPublication->setPendingDirectory(pendingDirectory);
-    alarmPublication->setReadBudget(alarmReads, this->settings.config.alarmReadConcurrency);
+    alarmPublication->setReadBudget(alarmReads);
     alarmDiscovery = std::make_unique<AlarmDiscovery>(AlarmDiscovery::Settings{this->settings.nodeId,
         pendingDirectory, this->settings.config.alarmDiscoveryIntervalMs,
-        this->settings.config.alarmTakeoverConcurrency, this->settings.config.alarmReadConcurrency},
+        this->settings.config.alarmTakeoverConcurrency},
         *store, timer, membership, alarmReads,
         [this]() { return startupReady && !stopped && bool(alarmTake) && nodeEpoch && membership.epoch == std::to_string(nodeEpoch) && membership.durableProcesses; },
         [this](std::string ns, uint32_t shard, uint32_t waited) { return alarmTake(std::move(ns), shard, waited); },

@@ -21,7 +21,7 @@ public:
   using HintsReady = std::function<bool(const std::string&, uint32_t, uint64_t)>;
   using Retire = std::function<bool(const std::string&, uint32_t, uint64_t, const std::string&)>;
   using Rank = std::function<uint32_t(const std::string&, uint32_t, const std::string&)>;
-  struct Settings { std::string nodeId;std::filesystem::path pendingDirectory;uint32_t intervalMs = 60000, takeovers = 4, reads = 2; };
+  struct Settings { std::string nodeId;std::filesystem::path pendingDirectory;uint32_t intervalMs = 60000, takeovers = 4; };
   AlarmDiscovery(Settings, ObjectStore&, kj::Timer&, const MembershipView&, AlarmPublication::ReadBudget&,
       std::function<bool()> ready, Take, Tenant, Rank, Valid active,
       std::function<void(const std::string&, uint32_t, uint64_t)> adopt,
