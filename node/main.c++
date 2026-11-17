@@ -992,7 +992,23 @@ public:
 
   kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline) {
     auto unavailable = co_await desiredState.ensureCode(version, deadline - monotonicTimeMs());
-    if (!unavailable.empty() || preparationBytes.contains(version.contentHash)) co_return unavailable;
+    if (!unavailable.empty()) co_return unavailable;
+    if (preparationBytes.contains(version.contentHash)) {
+      preparationByteFlights.erase(version.contentHash);
+      co_return std::string();
+    }
+    auto found = preparationByteFlights.find(version.contentHash);
+    if (found == preparationByteFlights.end()) {
+      if (preparationByteFlights.size() >= 16384) co_return std::string("package metadata preparation capacity reached");
+      auto shared = std::make_unique<kj::ForkedPromise<uint64_t>>(preparationMemory(version).fork());
+      found = preparationByteFlights.emplace(version.contentHash, std::move(shared)).first;
+    }
+    auto branch = found->second->addBranch();
+    co_await branch;
+    preparationByteFlights.erase(version.contentHash);
+    co_return std::string();
+  }
+  kj::Promise<uint64_t> preparationMemory(VersionDefinition version) {
     // The verified package supplies the size. Caller-controlled metadata and
     // request bodies cannot obtain a smaller reservation in the runtime.
     auto source = co_await desiredState.source(version);
@@ -1005,13 +1021,13 @@ public:
         bytes = 0;
         for (const auto& module : coworkerd::readCodePackage(coworkerd::json::text(payload, "manifest"))) bytes += 8 * module.bytes;
       } catch (const kj::Exception&) {
-        co_return std::string("verified package metadata unavailable");
+        KJ_FAIL_REQUIRE("verified package metadata unavailable");
       }
     }
     if (version.format != "v2") bytes = 2 * source.size() + 2 * jsonEscape(source).size();
     if (preparationBytes.size() == 16384) preparationBytes.erase(preparationBytes.begin());
     preparationBytes[version.contentHash] = std::max<uint64_t>(1, bytes);
-    co_return std::string();
+    co_return std::max<uint64_t>(1, bytes);
   }
 
   // The executing Server gives a version its secrets from its own deployment
@@ -3019,6 +3035,7 @@ private:
   std::deque<ExecutionRecord> executions;
   std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
   std::map<std::string, uint64_t> preparationBytes;
+  std::map<std::string, std::unique_ptr<kj::ForkedPromise<uint64_t>>> preparationByteFlights;
   std::deque<DebitRecord> debits;
   std::map<std::string, InvocationLeaseState> leases;
   std::priority_queue<
