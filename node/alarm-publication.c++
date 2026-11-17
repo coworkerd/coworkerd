@@ -160,12 +160,21 @@ void AlarmPublication::setNodeEpoch(uint64_t epoch) {
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
   if (!nodeEpoch || !epoch) return;const auto key = shardKey(ns, shard);auto it = shards.find(key);
   if (it != shards.end() && it->second.epoch == epoch && it->second.memberEpoch == nodeEpoch && valid(it->second)) {
-    offerRead(it->second);pump();return;
+    auto& s = it->second;s.startupOnly = false;if (!s.reading) { s.adopted = false;s.next = 0; }
+    offerRead(s);pump();return;
   }
   gone(ns, shard);Shard s;s.ns = std::move(ns);s.shard = shard;s.epoch = epoch;s.tenant = std::move(tenant);
   s.memberEpoch = s.markerMemberEpoch = nodeEpoch;s.generation = s.order = ++serial;s.checked = monotonicTimeMs();
   if (!pendingDirectory.empty()) { std::error_code error;s.pendingRecorded = std::filesystem::exists(pendingDirectory / (s.ns + "-" + std::to_string(shard) + ".pending"), error); }
   auto [held, inserted] = shards.emplace(key, std::move(s));offerRead(held->second);pump();
+}
+void AlarmPublication::ensureTake(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
+  auto it = shards.find(shardKey(ns, shard));
+  if (it != shards.end() && it->second.epoch == epoch && valid(it->second) &&
+      (!it->second.adopted || it->second.reading || !it->second.hints.empty() || !it->second.desired.empty())) {
+    offerRead(it->second);pump();return;
+  }
+  take(std::move(ns), shard, epoch, std::move(tenant));
 }
 void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenant) {
   const auto key = shardKey(ns, shard);if (!nodeEpoch || shards.contains(key)) return;

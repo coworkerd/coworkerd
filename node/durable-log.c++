@@ -839,7 +839,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
         [this](const std::string& ns, uint32_t shard, const std::string& exclude) { return alarmRank ? alarmRank(ns, shard, exclude) : 0; },
         [this](const std::string& ns) { return !hooks.namespaceActive || hooks.namespaceActive(ns); },
         [this](const std::string& ns, uint32_t shard, uint64_t epoch) {
-          alarmPublication->take(ns, shard, epoch, alarmTenant ? alarmTenant(ns) : ns);
+          alarmPublication->ensureTake(ns, shard, epoch, alarmTenant ? alarmTenant(ns) : ns);
         }, [this](const std::string& ns, uint32_t shard) { return alarmPublication->forgetPending(ns, shard); });
   }
 }

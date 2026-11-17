@@ -34,6 +34,7 @@ public:
   ~AlarmPublication() noexcept(false);
   void setNodeEpoch(uint64_t);
   void take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant);
+  void ensureTake(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant);
   void restore(std::string ns, uint32_t shard, std::string tenant);
   void gone(const std::string& ns, uint32_t shard);
   void report(std::string ns, std::string object, uint32_t shard, uint64_t epoch,
