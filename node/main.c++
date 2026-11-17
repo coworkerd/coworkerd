@@ -4731,7 +4731,8 @@ public:
     });
     server.decisionTiming(decisionStart);
     pathMark(allocation.timing, "placement-decision");
-    server.recordForward(*version, allocation, ordered.empty() ? "" : ordered.front());
+    if (preparationRejectedNodes.empty())
+      server.recordForward(*version, allocation, ordered.empty() ? "" : ordered.front());
     std::string rankedCandidates = "[";
     for (const auto& id : ranked) {
       if (rankedCandidates.size() > 1) rankedCandidates += ',';
