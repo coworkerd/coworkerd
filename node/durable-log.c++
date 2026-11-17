@@ -826,10 +826,21 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           auto& state = alarms[key];state.namespaceId = ns;state.objectId = object;state.tenant = tenant;
           state.shard = shard;state.shardEpoch = epoch;state.atUnixMs = at;state.fromHint = true;
         }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
+    const auto pendingDirectory = this->settings.stackDirectory / "alarm-pending";
+    alarmPublication->setPendingDirectory(pendingDirectory);
+    alarmPublication->setReadBudget(alarmReads, this->settings.config.alarmReadConcurrency);
+    alarmDiscovery = std::make_unique<AlarmDiscovery>(AlarmDiscovery::Settings{this->settings.nodeId,
+        pendingDirectory, this->settings.config.alarmDiscoveryIntervalMs,
+        this->settings.config.alarmTakeoverConcurrency, this->settings.config.alarmReadConcurrency},
+        *store, timer, membership, alarmReads,
+        [this]() { return startupReady && !stopped && bool(alarmTake); },
+        [this](std::string ns, uint32_t shard) { return alarmTake(std::move(ns), shard); },
+        [this](const std::string& ns) { return alarmTenant ? alarmTenant(ns) : ns; });
   }
 }
 
 DurableLog::~DurableLog() noexcept(false) {
+  alarmDiscovery.reset();
   alarmPublication.reset();
   if (logFd >= 0) ::close(logFd);
   if (recoveryFd >= 0) ::close(recoveryFd);
@@ -1233,13 +1244,8 @@ kj::Promise<void> DurableLog::start() {
     }
   }
   startupReady = true;
-  if (alarmPublication) {
-    std::map<std::pair<std::string, uint32_t>, std::string> known;
-    for (const auto& [name, object]: objects) known[{object.namespaceId, object.shard}] = object.tenant;
-    for (const auto& [epoch, predecessor]: predecessorLogs)
-      for (const auto& shard: predecessor.shards) known.try_emplace(shard, "");
-    for (const auto& [shard, tenant]: known) alarmPublication->restore(shard.first, shard.second, tenant);
-  }
+  // Startup alarm work comes only from owner markers and the small pending-H index. Empty local shards require no
+  // object-store reads. The ordinary ownership chain reclaims same-id epochs before the publisher adopts hints.
   diskLimitBytes = settings.config.diskBytes;
   if (!diskLimitBytes) {
     auto space = std::filesystem::space(settings.stackDirectory, code);
@@ -6169,6 +6175,7 @@ std::string DurableLog::json() const {
       << alarmRetries << ",\"notDue\":" << alarmsNotDue << ",\"adopted\":" << alarmsAdopted << ",\"dropped\":"
       << alarmsDropped << ",\"hintWrites\":" << (alarmHintWrites + (alarmPublication ? alarmPublication->hintWrites : 0)) << ",\"hintFailures\":" << (alarmHintFailures + (alarmPublication ? alarmPublication->hintFailures : 0))
       << (alarmPublication ? "," + alarmPublication->json() : "")
+      << (alarmDiscovery ? ",\"discovery\":" + alarmDiscovery->json() : "")
       << ",\"next\":[";
   first = true;
   {

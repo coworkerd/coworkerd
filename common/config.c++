@@ -19,6 +19,9 @@ namespace rpc = v1::rpc;
 namespace fs = std::filesystem;
 
 void DurableLogConfig::validate() const {
+  KJ_REQUIRE(alarmDiscoveryIntervalMs >= 200, "durableObjects.alarmDiscoveryIntervalMs is at least 200");
+  KJ_REQUIRE(alarmTakeoverConcurrency > 0 && alarmTakeoverConcurrency <= 4, "durableObjects.alarmTakeoverConcurrency is between 1 and 4");
+  KJ_REQUIRE(alarmReadConcurrency > 0 && alarmReadConcurrency <= 2, "durableObjects.alarmReadConcurrency is between 1 and 2");
   KJ_REQUIRE(peers <= 8, "durableObjects.peers is at most 8");
   KJ_REQUIRE(confirmTimeoutMs >= 100 && confirmTimeoutMs <= 29000,
       "durableObjects.confirmTimeoutMs is between 100 and 29000 (workerd resets the object at 30 s)");
@@ -221,6 +224,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.rebuildConcurrency = durable.getRebuildConcurrency();
   result.durableLog.residentObjects = durable.getResidentObjects();
   result.durableLog.usagePublishMs = durable.getUsagePublishMs();
+  result.durableLog.alarmDiscoveryIntervalMs = durable.getAlarmDiscoveryIntervalMs();
+  result.durableLog.alarmTakeoverConcurrency = durable.getAlarmTakeoverConcurrency();
+  result.durableLog.alarmReadConcurrency = durable.getAlarmReadConcurrency();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
   result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();
   result.processPool.heatIdleMs = result.idleMs;

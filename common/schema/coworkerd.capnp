@@ -368,6 +368,10 @@ struct ServerConfig {
     usagePublishMs @18 :UInt32 = 3600000;
     # How many objects this node rebuilds at once; additional objects wait in FIFO order.
     rebuildConcurrency @19 :UInt32 = 4;
+    # Auxiliary alarm discovery; all ownership still uses the ordinary shard acquisition.
+    alarmDiscoveryIntervalMs @20 :UInt32 = 60000;
+    alarmTakeoverConcurrency @21 :UInt32 = 4;
+    alarmReadConcurrency @22 :UInt32 = 2;
   }
 
   struct IngressConfig {

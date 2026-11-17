@@ -203,6 +203,8 @@ struct DurableLogConfig {
   uint32_t residentObjects = 4096;
   // How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
   uint32_t usagePublishMs = 3600000;
+  uint32_t alarmDiscoveryIntervalMs = 60000;
+  uint32_t alarmTakeoverConcurrency = 4, alarmReadConcurrency = 2;
   void validate() const;
 };
 

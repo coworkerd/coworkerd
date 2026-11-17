@@ -109,6 +109,7 @@ add_executable(coworkerd
   node/durable-shards.c++
   node/durable-log.c++
   node/alarm-publication.c++
+  node/alarm-discovery.c++
   node/recovery-history.c++
   node/database-seed.c++
   node/root-objects.c++

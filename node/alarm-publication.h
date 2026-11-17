@@ -3,6 +3,7 @@
 #include <kj/async.h>
 #include <array>
 #include <functional>
+#include <filesystem>
 #include <list>
 #include <map>
 #include <set>
@@ -28,6 +29,8 @@ public:
   void report(std::string ns, std::string object, uint32_t shard, uint64_t epoch,
       std::string tenant, uint64_t at);
   void tick();
+  void setReadBudget(uint32_t& active, uint32_t limit) { readActive = &active;readLimit = limit; }
+  void setPendingDirectory(std::filesystem::path path) { pendingDirectory = std::move(path); }
   std::string json() const;
   uint64_t hintWrites = 0, hintFailures = 0;
 private:
@@ -38,6 +41,7 @@ private:
     uint64_t previousOrder = 0, repairOrder = 0, hintCommittedNs = 0;
     bool adopted = false, reading = false, startupOnly = false, nonempty = false, initial = true;
     bool markerWritten = false, markerMayExist = false, scanning = false, previousDone = false;
+    bool pendingRecorded = false;
     bool previousPending = false, repairPending = false;
     bool readTimed = false, hintTimed = false, previousTimed = false, repairTimed = false;
     double next = 0, checked = 0, hintAt = 0, previousNext = 0, repairNext = 0, markerConfirmedAt = 0;
@@ -130,6 +134,12 @@ private:
   std::unordered_set<std::string> inFlightKeys, inFlightDeletes;
   std::unordered_map<std::string, unsigned> inFlightHints;
   std::set<Ready> readyHints, readyMarkers, readyScans;
+  std::set<Ready> readyReads;
+  std::filesystem::path pendingDirectory;
+  uint32_t privateReadActive = 0, readLimit = 2;
+  uint32_t* readActive = &privateReadActive;
+  kj::Promise<void> guardRead(kj::Promise<void>);
+  void pending(Shard&, bool);
   std::string lastTenant, deniedPrefix;
   Probe deniedOperation = Probe::LIST;
   Gate hintGate, markerGate;

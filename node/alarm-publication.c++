@@ -16,6 +16,7 @@
 #include <charconv>
 #include <optional>
 #include <vector>
+#include <fstream>
 
 namespace coworkerd {
 namespace {
@@ -91,6 +92,25 @@ AlarmPublication::AlarmPublication(ObjectStore& store, kj::Timer& timer, std::st
   }
 }
 AlarmPublication::~AlarmPublication() noexcept(false) { stopping = true; }
+kj::Promise<void> AlarmPublication::guardRead(kj::Promise<void> promise) {
+  ++*readActive;
+  return promise.attach(kj::defer([this]() { --*readActive;pump(); }));
+}
+void AlarmPublication::pending(Shard& s, bool value) {
+  if (pendingDirectory.empty() || s.pendingRecorded == value) return;
+  std::error_code error;
+  const auto path = pendingDirectory / (s.ns + "-" + std::to_string(s.shard) + ".pending");
+  if (value) {
+    std::filesystem::create_directories(pendingDirectory, error);
+    KJ_REQUIRE(!error, "cannot create alarm publication pending directory");
+    std::ofstream file(path);file.close();
+    KJ_REQUIRE(file.good(), "cannot record pending alarm publication");
+  } else {
+    std::filesystem::remove(path, error);
+    if (error) return;  // An extra candidate after restart is harmless.
+  }
+  s.pendingRecorded = value;
+}
 std::string AlarmPublication::shardKey(const std::string& ns, uint32_t shard) const { return ns + "/" + std::to_string(shard); }
 bool AlarmPublication::valid(const Shard& s) const { return !stopping && nodeEpoch && s.memberEpoch == nodeEpoch && current(s.ns, s.shard, s.epoch, s.memberEpoch); }
 bool AlarmPublication::valid(const Write& w) const {
@@ -102,7 +122,7 @@ bool AlarmPublication::deleting(const std::string& key) const {
 double AlarmPublication::hintCheckInterval() const { return hintRoundMs / std::max<uint64_t>(1, nonemptyShards); }
 void AlarmPublication::setNodeEpoch(uint64_t epoch) {
   if (epoch == nodeEpoch) return;nodeEpoch = epoch;shards.clear();writes.clear();writeSweep.clear();sweepCursor = writeSweep.end();
-  deadlines.clear();readyHints.clear();readyMarkers.clear();readyScans.clear();ownMarkers.clear();observedOwn.clear();
+  deadlines.clear();readyHints.clear();readyReads.clear();readyMarkers.clear();readyScans.clear();ownMarkers.clear();observedOwn.clear();
   markerPuts.clear();markerRemoves.clear();cleanupReady.clear();nonemptyShards = 0;initialMarkerScan = true;nextMarkerScan = 0;
 }
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
@@ -112,6 +132,7 @@ void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std:
   }
   gone(ns, shard);Shard s;s.ns = std::move(ns);s.shard = shard;s.epoch = epoch;s.tenant = std::move(tenant);
   s.memberEpoch = s.markerMemberEpoch = nodeEpoch;s.generation = s.order = ++serial;s.checked = monotonicTimeMs();
+  if (!pendingDirectory.empty()) { std::error_code error;s.pendingRecorded = std::filesystem::exists(pendingDirectory / (s.ns + "-" + std::to_string(shard) + ".pending"), error); }
   auto [held, inserted] = shards.emplace(key, std::move(s));offerRead(held->second);pump();
 }
 void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenant) {
@@ -122,7 +143,7 @@ void AlarmPublication::restore(std::string ns, uint32_t shard, std::string tenan
 }
 void AlarmPublication::gone(const std::string& ns, uint32_t shard) {
   const auto key = shardKey(ns, shard);auto it = shards.find(key);if (it == shards.end()) return;auto& s = it->second;
-  readyHints.erase({s.tenant, s.order, key, 0});readyScans.erase({s.tenant, s.repairOrder, key, 2});readyScans.erase({s.tenant, s.previousOrder, key, 4});
+  readyReads.erase({s.tenant, s.order, key, 0});readyScans.erase({s.tenant, s.repairOrder, key, 2});readyScans.erase({s.tenant, s.previousOrder, key, 4});
   if (s.readTimed) deadlines.erase({s.next, 0, key, s.generation});
   if (s.hintTimed) deadlines.erase({s.hintAt, 2, key, s.generation});
   if (s.previousTimed) deadlines.erase({s.previousNext, 3, key, s.generation});
@@ -150,11 +171,11 @@ void AlarmPublication::refresh(Write& w, double now) {
   (w.marker ? readyMarkers : readyHints).insert({w.tenant, w.order, w.key, w.marker ? 3u : 1u});w.queued = true;
 }
 void AlarmPublication::offerRead(Shard& s) {
-  const auto key = shardKey(s.ns, s.shard);readyHints.erase({s.tenant, s.order, key, 0});
+  const auto key = shardKey(s.ns, s.shard);readyReads.erase({s.tenant, s.order, key, 0});
   if (s.readTimed) { deadlines.erase({s.next, 0, key, s.generation});s.readTimed = false; }
   if (!valid(s) || s.adopted || s.reading || inFlightHints.contains(key)) return;
   if (s.next > monotonicTimeMs()) { deadlines.insert({s.next, 0, key, s.generation});s.readTimed = true; }
-  else readyHints.insert({s.tenant, s.order, key, 0});
+  else readyReads.insert({s.tenant, s.order, key, 0});
 }
 void AlarmPublication::offerScan(Shard& s, bool repair) {
   const auto key = shardKey(s.ns, s.shard);auto& timed = repair ? s.repairTimed : s.previousTimed;
@@ -273,16 +294,17 @@ void AlarmPublication::pump(unsigned limit) {
         }
       }
       nextMarkerProbe = now + 30000;permissionProbeActive = true;++markerProbes;
-      if (!have && activeScans) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
-      if (!have) { ++active;++activeScans;tasks.add(kj::evalLater([this]() { return probeMarkers(); }));continue; }
+      if (!have && (activeScans || *readActive >= readLimit)) { permissionProbeActive = false;nextMarkerProbe = now + 200;continue; }
+      if (!have) { ++active;++activeScans;tasks.add(guardRead(kj::evalLater([this]() { return probeMarkers(); })));continue; }
     }
     if (!have && activeMarkers < 8 && !markerDenied && !readyMarkers.empty() && markerGate.available(now)) { work = choose(readyMarkers, markerGate);have = true; }
     if (!have && activeHints < 7 && !readyHints.empty() && hintGate.available(now)) { work = choose(readyHints, hintGate);have = true; }
-    if (!have && !activeScans && !markerDenied && markerGate.available(now)) {
+    if (!have && activeHints < 7 && *readActive < readLimit && !readyReads.empty() && hintGate.available(now)) { work = choose(readyReads, hintGate);have = true; }
+    if (!have && !activeScans && *readActive < readLimit && !markerDenied && markerGate.available(now)) {
       if (!readyScans.empty()) { work = choose(readyScans, markerGate);have = true; }
       else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
         gateProbe = markerGate.enter(now, nodeId);globalScanRunning = true;++active;++activeScans;
-        tasks.add(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); }));continue;
+        tasks.add(guardRead(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); })));continue;
       }
     }
     if (!have) return;lastTenant = work.tenant;
@@ -292,19 +314,19 @@ void AlarmPublication::pump(unsigned limit) {
       if (work.kind == 0) {
         if (s.reading || s.adopted || inFlightHints.contains(work.key)) continue;
         gateProbe = hintGate.enter(now, work.key);s.reading = true;refreshActivity(s);++active;++activeHints;
-        tasks.add(kj::evalLater([this, key = work.key, generation, gateProbe]() -> kj::Promise<void> {
+        tasks.add(guardRead(kj::evalLater([this, key = work.key, generation, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
           if (it == shards.end() || it->second.generation != generation) { hintGate.cancel(gateProbe);--active;--activeHints;pump();return kj::READY_NOW; }
           return readHints(key, gateProbe);
-        }));
+        })));
       } else {
         if (s.scanning || !s.adopted || s.reading) continue;
         gateProbe = markerGate.enter(now, work.key);s.scanning = true;++active;++activeScans;
-        tasks.add(kj::evalLater([this, key = work.key, generation, repair = work.kind == 2, gateProbe]() -> kj::Promise<void> {
+        tasks.add(guardRead(kj::evalLater([this, key = work.key, generation, repair = work.kind == 2, gateProbe]() -> kj::Promise<void> {
           auto it = shards.find(key);
           if (it == shards.end() || it->second.generation != generation) { markerGate.cancel(gateProbe);--active;--activeScans;pump();return kj::READY_NOW; }
           return scanPrevious(key, repair, gateProbe);
-        }));
+        })));
       }
     } else {
       auto it = writes.find(work.key);
@@ -340,6 +362,9 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
   if (!valid(sent)) { gate.cancel(probe);ownershipChanged(shardKey(sent.ns, sent.shard), sent.generation);co_return; }
   bool success = false, rejected = false;
   try {
+    // This auxiliary file precedes H PUT, so a process killed before M PUT has a bounded startup candidate index.
+    // It is outside SQLite, the WAL, the manifest and snapshots, and is never on the acknowledgement path.
+    if (!sent.marker && sent.at) pending(shards.at(shardKey(sent.ns, sent.shard)), true);
     kj::Promise<ObjectResponse> operation = nullptr;
     {
       Scope measured(*this);
@@ -366,7 +391,7 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
   if (success) {
     if (sent.marker) {
       w.mayExist = sent.at;
-      if (s.marker == key && sent.at) { s.markerWritten = s.markerMayExist = true;s.markerConfirmedAt = monotonicTimeMs(); }
+      if (s.marker == key && sent.at) { s.markerWritten = s.markerMayExist = true;s.markerConfirmedAt = monotonicTimeMs();pending(s, false); }
       if (!sent.at) {
         if (globalScanRunning) deletedDuringScan.insert(key);
         const auto prefix = key.substr(0, key.rfind('/') + 1);auto cached = observedOwn.find(prefix);
@@ -375,6 +400,7 @@ kj::Promise<void> AlarmPublication::write(Write sent, bool probe, bool permissio
     } else {
       if (sent.at) { if (s.hints.empty() && s.marker.empty()) s.hintCommittedNs = nanoTime();s.hints[sent.object] = sent.at; }
       else s.hints.erase(sent.object);
+      if (s.markerWritten || (s.hints.empty() && s.desired.empty())) pending(s, false);
     }
     if (w.version == sent.version) eraseWrite(found);else { w.next = 0;w.failures = 0; }
   } else {
@@ -444,6 +470,7 @@ kj::Promise<void> AlarmPublication::readHints(std::string key, bool probe) {
       if (!s.startupOnly && s.desired.contains(object)) adopt(ns, object, shard, epoch, s.tenant, s.desired.at(object));
     }
     s.duringRead.clear();s.reading = false;s.adopted = true;s.failures = 0;s.checked = monotonicTimeMs();
+    pending(s, !s.hints.empty() && !s.markerWritten);
     for (const auto& [object, at]: s.desired) if (!s.hints.contains(object) || s.hints.at(object) != at) queueHint(s, object, at);
     if (s.initial) {
       const auto ownPrefix = markerPrefix(nodeId, s.markerMemberEpoch, ns, shard, epoch);

@@ -96,6 +96,11 @@ public:
   // the shard itself when it still has no live owner.
   kj::Promise<ShardRoute> route(std::string namespaceId, uint32_t shard, bool retry = false, std::string failedNode = {},
       bool designated = false);
+  // Every survivor independently offers marked shards. The existing designated retry waits for its rendezvous rank,
+  // reads the latest epoch, probes its owner, and shares the ordinary acquisition. No object request is dispatched.
+  kj::Promise<ShardRoute> background(std::string namespaceId, uint32_t shard) {
+    return route(std::move(namespaceId), shard, true, {}, true);
+  }
   // The decision at the node another node sent such a request to, expecting it to hold the shard at `expectedEpoch` (0:
   // asked to take it).
   kj::Promise<ShardRoute> accept(std::string namespaceId, uint32_t shard, uint64_t expectedEpoch, std::string fromNode);
