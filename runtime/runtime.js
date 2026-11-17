@@ -1479,7 +1479,7 @@ function claimPlainCold(item, cacheKey) {
   return cold;
 }
 
-async function selectedPlain(descriptor, env, ctx, options = {}) {
+function selectedPlain(descriptor, env, ctx, options = {}) {
   let base = descriptor.rootPlan;
   if (base?.kind !== "tenant" || !Array.isArray(base.namespaces) || base.namespaces.length ||
       descriptor.rootSelection?.kind !== "plain" || descriptor.rootSelection.dispatchChecked !== true)
@@ -1512,39 +1512,41 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     try {return chosen(remember(item));}
     catch (error) {if (!missing(error)) throw error; plainPlanKeys.delete(cacheKey);}
   }
-  const manage = async (path, deployment) => {
-    let response, reply;
-    try {
-      response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
-      reply = await response.json();
-    } catch (error) {throw staged("package", rootManagementFailure(error));}
-    if (!response.ok) {
-      const error = new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
-      if (typeof reply?.error?.name === "string") error.name = reply.error.name;
-      if (reply?.error?.noExecution === true) error.coworkerdNoExecution = true;
-      if (reply?.error?.kind === "preparation-limit") error.coworkerdPreparationLimit = true;
-      if (reply?.error?.kind === "source") throw staged(reply.error.stage || "package", error);
-      if (reply?.error?.kind === "tenant-code") {rootTenantCodeErrors.add(error); throw error;}
-      throw staged("package", rootManagementFailure(error, reply?.error?.kind === "plan-missing"));
+  return (async () => {
+    const manage = async (path, deployment) => {
+      let response, reply;
+      try {
+        response = await env.ROOTS.fetch("http://roots/" + path, {method: "POST", body: JSON.stringify(deployment)});
+        reply = await response.json();
+      } catch (error) {throw staged("package", rootManagementFailure(error));}
+      if (!response.ok) {
+        const error = new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
+        if (typeof reply?.error?.name === "string") error.name = reply.error.name;
+        if (reply?.error?.noExecution === true) error.coworkerdNoExecution = true;
+        if (reply?.error?.kind === "preparation-limit") error.coworkerdPreparationLimit = true;
+        if (reply?.error?.kind === "source") throw staged(reply.error.stage || "package", error);
+        if (reply?.error?.kind === "tenant-code") {rootTenantCodeErrors.add(error); throw error;}
+        throw staged("package", rootManagementFailure(error, reply?.error?.kind === "plan-missing"));
+      }
+      if (typeof reply?.plan !== "string" && !(path === "lookup" && reply?.plan === null))
+        throw staged("package", rootManagementFailure(new Error("Invalid ordinary plan reply")));
+      return reply;
+    };
+    // One registry-owned preparation request. Native suspends this caller's wait;
+    // another request's cancellation never owns the code fetch, install or result.
+    for (let attempt = 0; attempt < 2; ++attempt) {
+      const reply = await manage("prepare", {...base, descriptor});
+      if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
+        throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
+      item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
+      try {return chosen(item);}
+      catch (error) {
+        plainPlanKeys.delete(cacheKey);
+        if (!missing(error)) throw error;
+        if (attempt) throw staged("package", rootManagementFailure(new Error(rootFailureReason(error)), true));
+      }
     }
-    if (typeof reply?.plan !== "string" && !(path === "lookup" && reply?.plan === null))
-      throw staged("package", rootManagementFailure(new Error("Invalid ordinary plan reply")));
-    return reply;
-  };
-  // One registry-owned preparation request. Native suspends this caller's wait;
-  // another request's cancellation never owns the code fetch, install or result.
-  for (let attempt = 0; attempt < 2; ++attempt) {
-    const reply = await manage("prepare", {...base, descriptor});
-    if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
-      throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
-    item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
-    try {return chosen(item);}
-    catch (error) {
-      plainPlanKeys.delete(cacheKey);
-      if (!missing(error)) throw error;
-      if (attempt) throw staged("package", rootManagementFailure(new Error(rootFailureReason(error)), true));
-    }
-  }
+  })();
 }
 
 // This request is started and owned by the Native registry. Its props and code
@@ -1733,7 +1735,10 @@ async function rpcEntrypoint(value, env, ctx) {
     }
   }
   let selected;
-  try { selected = await selectedPlain(descriptor, env, ctx); }
+  try {
+    const selection = selectedPlain(descriptor, env, ctx);
+    selected = selection instanceof Promise ? await selection : selection;
+  }
   catch (error) {
     if (error?.coworkerdNoExecution === true) {
       const reply = await dispatchState(descriptor, env, error.coworkerdPreparationLimit ? "load-failed" : "rejected", rootFailureReason(error));
@@ -1780,7 +1785,8 @@ async function serve(request, env, ctx) {
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
   let selected, notExecuted = false, preparationLimit = false, notExecutedReason = "", coldStart = descriptor.coldLoaded === true;
   try {
-    selected = await selectedPlain(descriptor, env, ctx);
+    const selection = selectedPlain(descriptor, env, ctx);
+    selected = selection instanceof Promise ? await selection : selection;
     coldStart = selected.claimCold() || coldStart;
     if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
     return await selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) });
