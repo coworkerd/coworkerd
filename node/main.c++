@@ -8507,7 +8507,7 @@ int run(Launch launch) {
   DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable, timer);
   durableLog.setAlarmTakeoverHook([&shards, &server](std::string ns, uint32_t shard) {
     const auto owner = server.namespaceOwner(ns);
-    if (!owner || !owner->active()) return kj::Promise<coworkerd::ShardRoute>(
+    if (!owner || !owner->active() || shard >= owner->shards) return kj::Promise<coworkerd::ShardRoute>(
         coworkerd::ShardRoute::refuse(503, "DO_UNAVAILABLE", "the alarm namespace is not active"));
     return shards.background(std::move(ns), shard);
   }, [&server](const std::string& ns) {

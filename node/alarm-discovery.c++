@@ -100,7 +100,7 @@ kj::Promise<void> AlarmDiscovery::scan(std::string key) {
         }
       }
       for (const auto& object: page.objects) {
-        if (auto m = parse(object.key)) {
+        if (auto m = parse(object.key); m && object.size == 0) {
           if (!living(m->node, m->member)) candidate(m->ns, m->shard, object.key);
         } else if (object.key.starts_with(ROOT + settings.nodeId + "/") &&
             object.lastModifiedUnixMs && page.dateUnixMs > object.lastModifiedUnixMs + 60000) {
@@ -133,7 +133,7 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
         currentPrefix = prefix(route, ns, shard);
         auto own = co_await list(currentPrefix, 1000);
         done = std::any_of(own.objects.begin(), own.objects.end(), [&](const auto& o) {
-          return o.key.starts_with(currentPrefix) && hex(o.key.substr(currentPrefix.size()), 32);
+          return o.size == 0 && o.key.starts_with(currentPrefix) && hex(o.key.substr(currentPrefix.size()), 32);
         });
       }
     } else done = true;
