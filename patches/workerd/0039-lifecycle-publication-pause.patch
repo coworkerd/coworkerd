@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 13:22:13 +0800
+Subject: [PATCH] Expose the longest complete lifecycle publication pause
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 935338e2c0a6065cf920160c2a56ffd62100e83b..431c10776e466f22597c8db1dbd62b9191e9822a 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -169,6 +169,7 @@ class IdleReaper {
+   kj::Promise<void> task = nullptr, collectTask = nullptr, retirementTask = nullptr;
+   uint64_t publishedGc = 0;
+   uint64_t publicationCpuNs = 0, publications = 0, drainCpuNs = 0, drainPublications = 0, lastDrainRequest = 0;
++  uint64_t publicationMaxWallNs = 0;
+ 
+   void publishDrain() {
+     auto& channel = lifecycleChannel();
+@@ -245,6 +246,7 @@ class IdleReaper {
+         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
+         ",\"publicationCpuNs\":", publicationCpuNs, ",\"publications\":", publications,
++        ",\"publicationMaxWallNs\":", publicationMaxWallNs,
+         ",\"drainCpuNs\":", drainCpuNs, ",\"drainPublications\":", drainPublications,
+         gcSettings().observes() ? processGcJson() : kj::str(""),
+         ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
+@@ -254,6 +256,7 @@ class IdleReaper {
+       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
+     }
+     ++publications; publicationCpuNs += cpuNs() - start; lastPublish = monotonicMs();
++    publicationMaxWallNs = std::max(publicationMaxWallNs, uint64_t((lastPublish - now) * 1000000));
+   }
+   bool overflowReported = false;
+  private:

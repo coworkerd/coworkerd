@@ -34,3 +34,4 @@
 0036-bounded-preparation-completion.patch
 0037-preparation-io-turn.patch
 0038-preparation-queue-and-failure-cache.patch
+0039-lifecycle-publication-pause.patch
