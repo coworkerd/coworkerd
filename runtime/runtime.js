@@ -1396,6 +1396,7 @@ async function trialLoad(descriptor, env, ctx) {
     if (typeof error?.coworkerdStage === "string") {stage = "code"; codeStage = stageOf(error);}
     report = { ok: false, stage, codeStage, name: typeof error?.name === "string" ? error.name : typeof error,
       message: typeof error?.message === "string" ? error.message : String(error) };
+    if (error?.coworkerdPreparationLimit === true) report.preparationLimit = true;
   }
   report.coldLoad = coldLoad;
   report.loadMs = performance.now() - started;
