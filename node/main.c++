@@ -5944,7 +5944,7 @@ private:
     }
     auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
         coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false,
-        target.alarmAtUnixMs != 0);
+        target.alarmAtUnixMs != 0, target.alarmAtUnixMs == 0);
     if (!ready.ready) {
       line.recovered = ready.elapsedMs;
       co_return refused(server.refusal(ready.code, ready.reason, ready.status));
@@ -5953,7 +5953,7 @@ private:
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
-    while (!server.durableReady(target.key()) && !server.durablePaused(version->workerId, target.key()) && monotonicTimeMs() < waitUntil)
+    while (!target.alarmAtUnixMs && !server.durableReady(target.key()) && !server.durablePaused(version->workerId, target.key()) && monotonicTimeMs() < waitUntil)
       co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
     auto admitted = co_await server.admit(version->workerId, version->definitionHash, false, deadline, false, false,
         &target, target.alarmAtUnixMs == 0);
@@ -5978,8 +5978,9 @@ private:
     if (request.allocation && !request.allocation->pins)
       request.allocation->pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
     auto current = co_await server.admit(version->workerId, version->definitionHash, false,
-        deadline, false, false, &target, true, slot);
+        deadline, false, false, &target, target.alarmAtUnixMs == 0, slot);
     if (current.refused) co_return refused(*current.refused);
+    if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
       durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
@@ -6084,13 +6085,31 @@ constexpr const char* DURABLE_ALARM_PATH = "http://coworkerd-node/__coworkerd/du
 // class, admission, the CPU topped up for the event, a lease of its own, its lines kept and one [do] line. The
 // answer says what the object's own database held -- that is the truth, so a schedule that has fallen behind it
 // fires nothing and is corrected instead.
-kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, ServerCore& server,
-    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, coworkerd::DurableAlarm alarm) {
-  auto owner = server.namespaceOwner(alarm.namespaceId);
-  if (!owner || !owner->active()) {
-    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::INACTIVE, 0,
-        "no Worker class or database of this cluster names that namespace"};
+coworkerd::AlarmNamespace alarmNamespaceStatus(ServerCore& server, const std::string& ns) {
+  using Status = coworkerd::AlarmNamespace::Status;auto owner = server.namespaceOwner(ns);
+  if (!owner) return {Status::UNKNOWN, {}};
+  if (owner->status == "deleting" || owner->status == "deleted") return {Status::DELETED, owner->tenant};
+  if (!owner->active()) return {Status::PAUSED, owner->tenant};
+  if (!owner->isDatabase()) {
+    DurableTarget target;target.namespaceId = ns;target.className = owner->className;
+    std::string code, reason;
+    if (!server.durableVersion(owner->workerId, target, code, reason)) return {Status::PAUSED, owner->tenant};
   }
+  return {Status::ACTIVE, owner->tenant};
+}
+bool alarmCapacityRefusal(const std::string& code, const std::string& reason) {
+  return code == "OVERLOADED" || code == "LOAD_BAND_REJECTED" || code == "PROCESS_UNAVAILABLE" ||
+      (code == "DO_UNAVAILABLE" && reason.starts_with("the durable process of this object ("));
+}
+kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, ServerCore& server,
+    coworkerd::DurableShards& shards, coworkerd::DurableLog& durableLog,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, coworkerd::DurableAlarm alarm) {
+  const auto space = alarmNamespaceStatus(server, alarm.namespaceId);
+  if (space.status != coworkerd::AlarmNamespace::Status::ACTIVE)
+    co_return coworkerd::AlarmResult{space.status == coworkerd::AlarmNamespace::Status::DELETED
+        ? coworkerd::AlarmOutcome::DELETED : coworkerd::AlarmOutcome::NAMESPACE_WAIT, 0, "alarm namespace is not active yet"};
+  auto owner = server.namespaceOwner(alarm.namespaceId);
+  KJ_REQUIRE(owner.has_value());
   DurableDispatch::Request request;
   request.workerId = owner->isDatabase()
       ? owner->tenant + "/" + coworkerd::DATABASE_WORKER_NAME
@@ -6103,6 +6122,36 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   request.target.alarmAtUnixMs = alarm.atUnixMs;
   request.target.alarmRetryCount = alarm.retryCount;
   request.target.alarmFacetId = alarm.facetId;
+  const auto destination = server.durableProcessFor(request.target.key());
+  auto capacityResult = [&destination](std::string code, std::string reason) {
+    coworkerd::AlarmResult result{coworkerd::AlarmOutcome::DEFERRED, 0, std::move(reason)};
+    result.capacityKey = code == "OVERLOADED" || code == "LOAD_BAND_REJECTED" ? "node" : "process:" + destination;
+    result.capacityObservedMs = monotonicTimeMs();return result;
+  };
+  std::string hash;
+  if (!owner->isDatabase()) {
+    std::string code, reason;auto version = server.durableVersion(request.workerId, request.target, code, reason);
+    if (version) hash = version->definitionHash;
+  }
+  if (auto capacity = server.admission(request.workerId, hash, false, server.rootDeadline(), false, false,
+          &request.target, false, true, !owner->isDatabase())) {
+    if (alarmCapacityRefusal(capacity->code, capacity->reason)) co_return capacityResult(capacity->code, capacity->reason);
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, capacity->reason};
+  }
+  durableLog.alarmCapacityAvailable(destination);
+  auto route = co_await shards.route(alarm.namespaceId, alarm.shard);
+  if (route.kind != coworkerd::ShardRoute::Kind::LOCAL)
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, "the alarm is no longer held locally"};
+  coworkerd::DurableLog::ObjectIdentity identity{alarm.namespaceId, alarm.objectId, owner->tenant,
+      route.dataEpoch, route.epoch, alarm.shard};
+  auto ready = co_await durableLog.openObject(identity, false, true, false);
+  if (!ready.ready) {
+    if (ready.code == "DO_ALARM_REBUILDING") {
+      coworkerd::AlarmResult result{coworkerd::AlarmOutcome::REBUILDING};
+      result.resume = durableLog.waitForAlarmRebuild(identity);co_return kj::mv(result);
+    }
+    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, ready.reason};
+  }
   CollectedResponse answer;
   try {
     answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
@@ -6131,9 +6180,11 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
   if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
   if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
-  if (code == "OVERLOADED" || code == "DO_UNAVAILABLE" || code == "PROCESS_UNAVAILABLE" ||
-      code == "LOAD_BAND_REJECTED" || code == "TENANT_LIMIT" || answer.status == 429)
-    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::DEFERRED, 0, reason};
+  if (code == "DO_ALARM_REBUILDING") {
+    coworkerd::AlarmResult result{coworkerd::AlarmOutcome::REBUILDING};
+    result.resume = durableLog.waitForAlarmRebuild(alarm.namespaceId, alarm.objectId);co_return kj::mv(result);
+  }
+  if (alarmCapacityRefusal(code, reason)) co_return capacityResult(code, reason);
   if (answer.status == 500 && code == "EXECUTION_FAILED")
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
@@ -8527,8 +8578,10 @@ int run(Launch launch) {
     const auto owner = server.namespaceOwner(ns);return owner && owner->active() && shard < owner->shards;
   }, [&shards](const std::string& ns, uint32_t shard) { return shards.heldShardEpoch(ns, shard); });
   // Firing an alarm is a request to the object, so it needs the dispatcher; the quota is the tenant's record.
-  durableLog.setAlarmHook([&durable, &server, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {
-    return fireDurableAlarm(durable, server, httpOverCapnpFactory, *headerTable, std::move(alarm));
+  durableLog.setAlarmSchedulingHooks([&server](const std::string& ns) { return alarmNamespaceStatus(server, ns); },
+      [&server](const coworkerd::DurableAlarm& alarm) { return server.durableProcessFor(alarm.namespaceId + "/" + alarm.objectId); });
+  durableLog.setAlarmHook([&durable, &server, &shards, &durableLog, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {
+    return fireDurableAlarm(durable, server, shards, durableLog, httpOverCapnpFactory, *headerTable, std::move(alarm));
   });
   durableLog.setQuotaHook([&server](const std::string& tenant) {
     return server.tenantQuotas(tenant).durableObjectBytes;

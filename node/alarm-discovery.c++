@@ -300,7 +300,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
       auto w = ownerWaiters.find(invalidOwners.front());
       if (w == ownerWaiters.end() || w->second.empty()) { if (w != ownerWaiters.end()) ownerWaiters.erase(w);invalidOwners.pop_front();continue; }
       const auto key = *w->second.begin();w->second.erase(w->second.begin());auto it = candidates.find(key);
-      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;schedule(key, 0); }
+      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;evictable.erase(key);schedule(key, 0); }
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
     pumpDirectories();

@@ -167,6 +167,7 @@ void AlarmPublication::setNodeEpoch(uint64_t epoch) {
   for (auto& [key, waiting]: markerWaiters) for (auto& [id, waiter]: waiting) if (waiter.fulfiller->isWaiting()) waiter.fulfiller->fulfill(PublicationState::PENDING);markerWaiters.clear();markerWaiterCount = 0;
   deadlines.clear();readyHints.clear();readyReads.clear();readyMarkers.clear();readyScans.clear();ownMarkers.clear();observedOwn.clear();
   markerPuts.clear();markerRemoves.clear();cleanupReady.clear();nonemptyShards = 0;initialMarkerScan = true;nextMarkerScan = 0;
+  ownMarkerChecks.clear();ownMarkerCheckDue.clear();ownMarkerWindow = 0;ownMarkerChecksThisMinute = 0;
 }
 void AlarmPublication::take(std::string ns, uint32_t shard, uint64_t epoch, std::string tenant) {
   if (!nodeEpoch || !epoch || !current(ns, shard, epoch, nodeEpoch)) return;const auto key = shardKey(ns, shard);auto it = shards.find(key);
@@ -394,6 +395,17 @@ void AlarmPublication::pump(unsigned limit) {
       else if (!globalScanRunning && (initialMarkerScan || now >= nextMarkerScan)) {
         gateProbe = markerGate.enter(now, nodeId);globalScanRunning = true;++active;++activeScans;
         tasks.add(guardRead(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); })));continue;
+      }
+    }
+    if (!have && !activeOwnMarkerChecks && readBudget->publisherAvailable() && !ownMarkerCheckDue.empty()) {
+      if (now >= ownMarkerWindow + 60000) { ownMarkerWindow = now;ownMarkerChecksThisMinute = 0; }
+      if (ownMarkerChecksThisMinute < 16 && ownMarkerCheckDue.begin()->first <= now) {
+        const auto key = ownMarkerCheckDue.begin()->second;ownMarkerCheckDue.erase(ownMarkerCheckDue.begin());
+        auto it = ownMarkerChecks.find(key);
+        if (it != ownMarkerChecks.end()) {
+          ++ownMarkerChecksThisMinute;++ownMarkerChecksStarted;++active;++activeOwnMarkerChecks;
+          tasks.add(guardRead(kj::evalLater([this, key, epoch = it->second.memberEpoch]() { return checkOwnMarker(key, epoch); })));continue;
+        }
       }
     }
     if (!have) return;lastTenant = work.tenant;
@@ -628,6 +640,33 @@ std::optional<MarkerAddress> markerAddress(const std::string& key, const std::st
   return MarkerAddress{std::string(part[1]), key.substr(0, key.rfind('/') + 1), shard, member, epoch};
 }
 }
+void AlarmPublication::queueOwnMarkerCheck(const std::string& marker, uint64_t epoch, uint64_t scan) {
+  auto [it, inserted] = ownMarkerChecks.try_emplace(marker);
+  it->second.seenInScan = scan;
+  if (inserted) { it->second.memberEpoch = epoch;it->second.next = monotonicTimeMs();ownMarkerCheckDue.emplace(it->second.next, marker); }
+}
+kj::Promise<void> AlarmPublication::checkOwnMarker(std::string marker, uint64_t epoch) {
+  auto release = kj::defer([this]() { --active;--activeOwnMarkerChecks;pump(); });
+  auto initial = ownMarkerChecks.find(marker);
+  if (initial == ownMarkerChecks.end()) co_return;
+  if (initial->second.seenInScan < completedMarkerScan) { ownMarkerChecks.erase(initial);co_return; }
+  bool removed = false, failed = false;
+  try { removed = co_await cleanOwnMarker(marker, epoch); }
+  catch (const kj::Exception&) { ++ownMarkerCheckErrors;failed = true; }
+  catch (const std::exception&) { ++ownMarkerCheckErrors;failed = true; }
+  auto it = ownMarkerChecks.find(marker);if (it == ownMarkerChecks.end() || it->second.memberEpoch != epoch) co_return;
+  auto address = markerAddress(marker, "alarm-wake/by-owner/" + nodeId + "/");
+  if (removed || epoch != nodeEpoch || (address && current(address->ns, address->shard, address->epoch, epoch))) {
+    ownMarkerChecks.erase(it);co_return;
+  }
+  auto& row = it->second;
+  if (!row.epochToken.empty() && !failed) row.next = monotonicTimeMs() + 1000;
+  else {
+    row.failures = std::min(6u, row.failures + 1);
+    row.next = monotonicTimeMs() + std::min<uint64_t>(3600000, uint64_t(60000) << row.failures);
+  }
+  ownMarkerCheckDue.emplace(row.next, marker);
+}
 kj::Promise<bool> AlarmPublication::cleanOwnMarker(std::string marker, uint64_t memberEpoch) {
   const auto root = "alarm-wake/by-owner/" + nodeId + "/";
   auto address = markerAddress(marker, root);
@@ -646,33 +685,37 @@ kj::Promise<bool> AlarmPublication::cleanOwnMarker(std::string marker, uint64_t 
     if (auto it = writes.find(marker);it != writes.end()) refresh(it->second, monotonicTimeMs());
   });
   // No new current owner marker is needed when H is empty. Otherwise only a verified successor M permits removal.
+  ++ownMarkerCheckRequests;
   auto hints = co_await store.listPage("do/" + ns + "/shards/" + std::to_string(shard) + "/alarms/", 1);
   if (!eligible()) co_return false;
   bool safe = hints.objects.empty() && hints.nextToken.empty();
   if (!safe) {
-    std::string token, latest;
-    do {
-      auto page = co_await store.listPage(shardEpochsPrefix(ns, shard) + "/", 1000, token);
-      if (!eligible()) co_return false;
-      for (const auto& row: page.objects) {
+    auto pending = ownMarkerChecks.find(marker);if (pending == ownMarkerChecks.end()) co_return false;
+    // One history page per check. Continuation and the largest observed key survive the bounded job.
+    const auto token = pending->second.epochToken;++ownMarkerCheckRequests;
+    auto page = co_await store.listPage(shardEpochsPrefix(ns, shard) + "/", 1000, token);
+    if (!eligible()) co_return false;
+    pending = ownMarkerChecks.find(marker);if (pending == ownMarkerChecks.end()) co_return false;
+    for (const auto& row: page.objects) {
         const auto part = row.key.substr(row.key.rfind('/') + 1);
-        if (part.size() == 20 && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) latest = std::max(latest, row.key);
-      }
-      token = std::move(page.nextToken);
-    } while (!token.empty());
+        if (part.size() == 20 && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) pending->second.latestEpochKey = std::max(pending->second.latestEpochKey, row.key);
+    }
+    pending->second.epochToken = std::move(page.nextToken);
+    if (!pending->second.epochToken.empty()) { ++staleOwnMarkersKept;co_return false; }
+    const auto latest = std::move(pending->second.latestEpochKey);pending->second.latestEpochKey.clear();
     if (!latest.empty()) {
-      auto response = co_await store.get(latest);
+      ++ownMarkerCheckRequests;auto response = co_await store.get(latest);
       requireStorage(response.status == 200, "stale alarm marker owner read failed");
       auto owner = parseShardEpoch(response.bytes);
       requireStorage(owner && owner->namespaceId == ns && owner->shard == shard, "invalid stale alarm marker owner");
       if (owner->nodeId != nodeId) {
-        auto successor = co_await store.listPage(markerPrefix(owner->nodeId, owner->nodeEpoch, ns, shard, owner->epoch), 1);
+        ++ownMarkerCheckRequests;auto successor = co_await store.listPage(markerPrefix(owner->nodeId, owner->nodeEpoch, ns, shard, owner->epoch), 1);
         for (const auto& row: successor.objects) if (row.size == 0 && markerName(row.key.substr(row.key.rfind('/') + 1))) safe = true;
       }
     }
   }
   if (!safe || !eligible()) { ++staleOwnMarkersKept;co_return false; }
-  inFlightDeletes.insert(marker);co_await store.remove(marker);
+  inFlightDeletes.insert(marker);++ownMarkerCheckRequests;co_await store.remove(marker);
   deletedDuringScan.insert(marker);++staleOwnMarkersRemoved;
   if (auto it = shards.find(shardKey(ns, shard));it != shards.end() && it->second.marker == marker && valid(it->second)) {
     it->second.markerWritten = false;it->second.markerMayExist = false;reconcile(it->second);
@@ -681,6 +724,7 @@ kj::Promise<bool> AlarmPublication::cleanOwnMarker(std::string marker, uint64_t 
 }
 kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
   const auto epoch = nodeEpoch;const auto started = monotonicTimeMs();const auto root = "alarm-wake/by-owner/" + nodeId + "/";bool finished = false;
+  const auto scan = ++markerScanSerial;
   deletedDuringScan.clear();
   auto release = kj::defer([this, probe, &finished]() {
     if (!finished) markerGate.cancel(probe);globalScanRunning = false;deletedDuringScan.clear();--active;--activeScans;pump();
@@ -700,8 +744,7 @@ kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
       if (deletedDuringScan.contains(marker) || deleting(marker)) { it = keys.erase(it);continue; }
       auto a = markerAddress(marker, root);KJ_REQUIRE(a.has_value());auto s = shards.find(shardKey(a->ns, a->shard));
       if (s != shards.end() && s->second.epoch == a->epoch && s->second.markerMemberEpoch == a->member) acceptOwnMarker(s->second, marker);
-      if (a->member == epoch && co_await cleanOwnMarker(marker, epoch)) { currentEpoch();it = keys.erase(it);continue; }
-      currentEpoch();
+      if (a->member == epoch && !current(a->ns, a->shard, a->epoch, epoch)) queueOwnMarkerCheck(marker, epoch, scan);
       ++it;
       if (++slice == 32) { slice = 0;co_await kj::evalLater([]() {});currentEpoch(); }
     }
@@ -722,7 +765,7 @@ kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
       if (++slice == 32) { slice = 0;co_await kj::evalLater([]() {});currentEpoch(); }
     }
     for (const auto& marker: deletedDuringScan) { const auto prefix = marker.substr(0, marker.rfind('/') + 1);if (auto it = observed.find(prefix);it != observed.end()) it->second.erase(marker); }
-    observedOwn = std::move(observed);initialMarkerScan = false;nextMarkerScan = monotonicTimeMs() + 60000;
+    observedOwn = std::move(observed);completedMarkerScan = scan;initialMarkerScan = false;nextMarkerScan = monotonicTimeMs() + 60000;
     markerGate.result(true, probe, monotonicTimeMs(), nodeId);finished = true;
   } catch (const kj::Exception& error) {
     Scope measured(*this);if (canceled(error)) { ++ownerChanges;co_return; }
@@ -786,6 +829,14 @@ void AlarmPublication::tick() {
     if (old != s.marker) queueMarker(s, old, false, true);
     if (s.previousMarkers.empty()) cleanupReady.erase(key);
   }
+  for (unsigned n = 0;n < 16 && !ownMarkerChecks.empty();++n) {
+    auto it = ownMarkerChecks.upper_bound(ownMarkerSweepCursor);
+    if (it == ownMarkerChecks.end()) { ownMarkerSweepCursor.clear();break; }
+    ownMarkerSweepCursor = it->first;++work;
+    if (it->second.seenInScan < completedMarkerScan && !inFlightKeys.contains(it->first)) {
+      ownMarkerCheckDue.erase({it->second.next, it->first});ownMarkerChecks.erase(it);
+    }
+  }
   tickMaxItems = std::max<uint64_t>(tickMaxItems, work + dueItems);scheduleDeadlineDrain();pump(8);failure(nullptr);
 }
 void AlarmPublication::taskFailed(kj::Exception&& error) { if (canceled(error)) ++ownerChanges;else failure("task"); }
@@ -801,6 +852,9 @@ std::string AlarmPublication::json() const {
       << ",\"publicationMaxConcurrency\":16,\"publicationHintCapacity\":7,\"publicationMarkerWriteCapacity\":8,\"publicationMarkerScanCapacity\":1"
       << ",\"publicationHintPending\":" << writes.size() - markerPending << ",\"publicationOwnerChanges\":" << ownerChanges << ",\"markerScanPages\":" << markerPages
       << ",\"staleOwnMarkersRemoved\":" << staleOwnMarkersRemoved << ",\"staleOwnMarkersKept\":" << staleOwnMarkersKept
+      << ",\"ownMarkerCheckPending\":" << ownMarkerChecks.size() << ",\"ownMarkerChecksStarted\":" << ownMarkerChecksStarted
+      << ",\"ownMarkerCheckErrors\":" << ownMarkerCheckErrors << ",\"ownMarkerCheckRequests\":" << ownMarkerCheckRequests
+      << ",\"ownMarkerCheckBudgetPerMinute\":16,\"ownMarkerCheckMaxOperationsPerJob\":5"
       << ",\"hintPublicationBackoff\":" << (hintGate.open ? "true" : "false") << ",\"markerPublicationBackoff\":" << (markerGate.open ? "true" : "false")
       << ",\"publicationTickMaxItems\":" << tickMaxItems << ",\"publicationDeadlineRows\":" << deadlines.size()
       << ",\"publicationFailureLogLines\":" << failureLogLines << ",\"publicationCpuNs\":" << cpuNs << ",\"publicationThreadCpuNs\":" << threadCpuNs;

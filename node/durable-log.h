@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <list>
 #include <memory>
 #include <optional>
 #include <set>
@@ -219,12 +220,20 @@ struct DurableAlarm {
 // database holds another time (`atUnixMs`), which is the truth. FAILED: the handler threw, so it is tried again with
 // Cloudflare's backoff. UNAVAILABLE: the object could not be reached at all (this node no longer owns the shard, the
 // store is down), so nothing is counted against the retry limit. DEFERRED is ordinary admission capacity,
-// rechecked on the scheduler's next tick without changing retry state. INACTIVE removes a retired namespace's entry.
-enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, INACTIVE };
+// rechecked through a destination gate without changing retry state. Only a known deletion drops an entry.
+enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, DELETED, NAMESPACE_WAIT, REBUILDING };
 struct AlarmResult {
   AlarmOutcome outcome = AlarmOutcome::FIRED;
   uint64_t atUnixMs = 0;
   std::string reason;
+  std::string capacityKey;
+  double capacityObservedMs = 0;
+  kj::Maybe<kj::Promise<void>> resume = nullptr;
+};
+struct AlarmNamespace {
+  enum class Status { ACTIVE, UNKNOWN, PAUSED, DELETED };
+  Status status = Status::ACTIVE;
+  std::string tenant;
 };
 
 // ---- The replicator ----
@@ -318,6 +327,11 @@ public:
   void setQuotaHook(std::function<uint64_t(const std::string& tenant)> hook) {
     hooks.tenantQuotaBytes = std::move(hook);
   }
+  void setAlarmSchedulingHooks(std::function<AlarmNamespace(const std::string&)> ns,
+      std::function<std::string(const DurableAlarm&)> destination) {
+    alarmNamespace = std::move(ns);alarmDestination = std::move(destination);
+  }
+  void alarmCapacityAvailable(const std::string& destination);
   void setNamespaceHook(std::function<bool(const std::string& namespaceId)> hook) {
     hooks.namespaceActive = std::move(hook);
   }
@@ -360,7 +374,10 @@ public:
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
   // says what to tell the caller when they cannot be.
   // A dispatch caller may defer the open marker to checkObjectDispatch(), after catalog/admission checks.
-  kj::Promise<ObjectReady> openObject(ObjectIdentity identity, bool prepareDispatch = true, bool background = false);
+  kj::Promise<ObjectReady> openObject(ObjectIdentity identity, bool prepareDispatch = true,
+      bool background = false, bool waitForRebuild = true);
+  kj::Promise<void> waitForAlarmRebuild(const ObjectIdentity&);
+  kj::Promise<void> waitForAlarmRebuild(const std::string& ns, const std::string& object);
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // Called synchronously after dispatch, before another request can prepare these files again.
@@ -493,8 +510,11 @@ private:
     // is opened, and a hint that turns out to be stale is dropped.
     bool fromHint = false;
     bool indexed = false;
+    bool retryIndexed = false, dueObserved = false, namespaceWaiting = false;
+    bool preparationWaiting = false, rebuildWaiting = false;
     uint64_t wakeUnixMs = 0, fireToken = 0;
-    double capacityAtMs = 0;
+    std::string destination;
+    std::vector<std::string> capacityProbes;
   };
   // What one durable process reports of its resident objects (patches/workerd 0014).
   struct Residency {
@@ -676,9 +696,19 @@ private:
   void unindexAlarm(const std::string&, AlarmState&);
   void indexAlarm(const std::string&, AlarmState&);
   bool eraseAlarm(const std::string&);
-  void refreshAlarmTenant(const std::string&);
+  using AlarmBucketKey = std::pair<std::string, std::string>; // tenant, durable process
+  void refreshAlarmBucket(const AlarmBucketKey&);
+  void suspendAlarmBucket(const AlarmBucketKey&);
+  void armAlarmTimer(double atMs);
+  void probeAlarmNamespace(const std::string&);
+  void closeAlarmCapacity(const std::string&, double observedMs);
+  void openAlarmCapacity(const std::string&);
+  void wakeAlarmPreparations();
+  bool alarmLocallyReady(const AlarmState&) const;
+  kj::Promise<void> alarmRebuilt(std::string key, uint64_t token, kj::Promise<void>);
   void pumpAlarmFires();
   void scheduleAlarmPump();
+  struct AlarmCpuScope { DurableLog& owner;uint64_t started = 0;explicit AlarmCpuScope(DurableLog&);~AlarmCpuScope(); };
 
   // ---- what this machine's files are at, so the same boot reuses them ----
   bool writePosition(const Object& object);
@@ -700,6 +730,7 @@ private:
   // ---- rebuilding an object ----
   kj::Promise<void> rebuild(std::string objectName, std::string reason, bool background);
   void pumpRebuilds();
+  void promoteRebuild(const std::string&);
   kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
@@ -785,6 +816,7 @@ private:
   std::set<std::string> carriedRecoveryObjects;
 
   std::map<std::string, Object> objects;         // objectName -> object
+  std::map<std::string, std::string> alarmObjectNames; // logical object -> latest opened data epoch
   // A complete remote owner proof freezes every earlier ownership in this
   // process. Keep the boundary even when no object of an epoch is resident.
   std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
@@ -792,10 +824,31 @@ private:
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
   using AlarmOrder = std::tuple<uint64_t, uint64_t, std::string>; // eligible time, due time, key
-  struct AlarmTenant { std::set<AlarmOrder> queue;uint64_t wake = 0;bool ready = false; };
-  std::map<std::string, AlarmTenant> alarmTenants;
-  std::set<std::pair<uint64_t, std::string>> alarmDeadlines;
-  std::set<std::string> alarmReadyTenants;
+  struct AlarmBucket {
+    std::set<AlarmOrder> queue, retryReady;AlarmOrder head;bool ready = false, timed = false;
+    bool paceBacklog = false;
+    uint64_t futureWake = 0;
+    double pacedUntil = 0;
+    std::string gate;
+  };
+  using AlarmHead = std::tuple<uint64_t, std::string, std::string>; // due time, key, destination
+  std::map<AlarmBucketKey, AlarmBucket> alarmBuckets;
+  std::map<std::string, std::set<AlarmHead>> alarmReadyTenants;
+  std::set<std::tuple<uint64_t, std::string, std::string>> alarmDeadlines;
+  std::set<std::pair<double, std::string>> alarmRetryDeadlines, alarmNamespaceDeadlines;
+  std::set<std::pair<double, AlarmBucketKey>> alarmBucketDeadlines;
+  struct AlarmGate { bool open = true, probing = false;double next = 0, opened = 0;std::set<AlarmBucketKey> blocked; };
+  std::map<std::string, AlarmGate> alarmCapacityGates;
+  struct AlarmPausedNamespace { std::set<std::string> keys;double next = 0; };
+  std::map<std::string, AlarmPausedNamespace> alarmPausedNamespaces;
+  std::set<std::pair<std::string, std::string>> alarmPreparationQueue;
+  static constexpr uint32_t ALARM_REBUILD_WAIT_LIMIT = 256;
+  uint32_t alarmRebuildWaiting = 0, peakAlarmRebuildWaiting = 0;
+  uint64_t alarmAttempts = 0, alarmPumpCpuNs = 0;
+  unsigned alarmCpuDepth = 0;bool measureAlarmCpu = false;
+  std::function<AlarmNamespace(const std::string&)> alarmNamespace;
+  std::function<std::string(const DurableAlarm&)> alarmDestination;
+  kj::Promise<void> alarmTimer = nullptr;double alarmTimerAt = 0;
   std::string lastAlarmTenant;
   uint32_t activeAlarmFires = 0, peakAlarmFires = 0;
   uint64_t alarmFireSerial = 0, alarmDeferred = 0, alarmInactive = 0;
@@ -836,12 +889,17 @@ private:
   uint32_t activeBackgroundRebuilds = 0;
   bool nextBackgroundRebuild = true;
   uint64_t foregroundRebuilds = 0, backgroundRebuilds = 0;
+  uint64_t rebuildPromotions = 0, rebuildWaitSerial = 0;
   struct RebuildWaiter {
     kj::Own<kj::PromiseFulfiller<void>> ready;
     bool* acquired = nullptr;  // Valid while ready has a waiting observer.
+    bool* background = nullptr;
+    std::string objectName;uint64_t ticket = 0;
   };
   // KJ exposes the observer check isWaiting() through a non-const interface.
-  mutable std::deque<RebuildWaiter> rebuildWaiters, backgroundRebuildWaiters;
+  mutable std::list<RebuildWaiter> rebuildWaiters, backgroundRebuildWaiters;
+  struct QueuedRebuild { bool background;uint64_t ticket;std::list<RebuildWaiter>::iterator row; };
+  std::map<std::string, QueuedRebuild> queuedRebuildIndex;
 
   // The promises' cancellation callbacks use the gate and settled maps: both
   // must outlive the last pending operation during process shutdown.

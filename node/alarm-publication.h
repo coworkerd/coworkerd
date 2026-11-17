@@ -136,6 +136,8 @@ private:
   kj::Promise<void> scanPrevious(std::string key, bool repair, bool probe);
   kj::Promise<void> scanMarkers(bool probe);
   kj::Promise<bool> cleanOwnMarker(std::string marker, uint64_t memberEpoch);
+  void queueOwnMarkerCheck(const std::string&, uint64_t memberEpoch, uint64_t scan);
+  kj::Promise<void> checkOwnMarker(std::string, uint64_t memberEpoch);
   kj::Promise<void> probeMarkers();
   uint32_t retry(uint32_t& failures);
   double hintCheckInterval() const;
@@ -175,6 +177,17 @@ private:
   uint64_t pages = 0, maxPage = 0, badHints = 0, markerDenials = 0, markerProbes = 0, ownerChanges = 0;
   uint64_t markerPages = 0, failuresToLog = 0, failureLogLines = 0, cpuNs = 0, cpuStarted = 0;
   uint64_t staleOwnMarkersRemoved = 0, staleOwnMarkersKept = 0;
+  struct OwnMarkerCheck {
+    uint64_t memberEpoch = 0, seenInScan = 0;uint32_t failures = 0;double next = 0;
+    std::string epochToken, latestEpochKey;
+  };
+  std::map<std::string, OwnMarkerCheck> ownMarkerChecks;
+  std::set<std::pair<double, std::string>> ownMarkerCheckDue;
+  uint32_t activeOwnMarkerChecks = 0, ownMarkerChecksThisMinute = 0;
+  double ownMarkerWindow = 0;
+  uint64_t ownMarkerCheckErrors = 0, ownMarkerCheckRequests = 0, ownMarkerChecksStarted = 0;
+  uint64_t markerScanSerial = 0, completedMarkerScan = 0;
+  std::string ownMarkerSweepCursor;
   uint64_t threadCpuNs = 0, threadCpuStarted = 0, tickMaxItems = 0;
   unsigned cpuDepth = 0;
   double hintRoundMs = 3600000, nextMarkerScan = 0, nextMarkerProbe = 0, nextFailureLog = 0;
