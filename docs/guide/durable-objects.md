@@ -116,7 +116,7 @@ async alarm({ retryCount, isRetry }) {
 
 `setAlarm`, `getAlarm` and `deleteAlarm` store the time in the object's database, replicated and recovered with it. The shard owner schedules due alarms and invokes `alarm(alarmInfo)` as an event. A successful handler's unchanged alarm is deleted; setting another time preserves that new alarm. A throwing handler is retried with backoff; a class without a handler has its alarm removed.
 
-After an owner node stops, a new owner appears only when a request reaches that shard; alarms in that shard do not fire before then.
+After an owner node stops, the surviving nodes with durable processes find its shards that have pending alarms, and each such shard's next owner takes it without waiting for a request: at each membership change and every `durableObjects.alarmDiscoveryIntervalMs` (60 s), at most `durableObjects.alarmTakeoverConcurrency` (4) takeovers at a time on a node. An object is opened only when its alarm is due. A shard without pending alarms gets its new owner when a request reaches it. This needs the node storage permissions on `alarm-wake/by-owner/` (see the [installation guide](install.md)); without them alarms fire after the shard's next request.
 
 Object-store hints identify which objects the next shard owner should wake, but the database decides whether an alarm is due. A stale hint can cause a harmless wake; a missing hint delays discovery until the object is opened again. Treat delivery as retryable, with no exactly-once side-effect guarantee.
 
