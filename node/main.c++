@@ -80,6 +80,7 @@ namespace fs = std::filesystem;
 namespace coworkerd {
 // `coworkerd check storage ENDPOINT BUCKET` (storage-probe.c++): the object store's self-check.
 int runStorageCheck(int argc, char** argv);
+std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCall>& call);
 }  // namespace coworkerd
 
 namespace {
@@ -2366,8 +2367,10 @@ private:
       coldLoaded,
     });
     const auto record = executions.back();
+    const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
     auto decision = [this, version, process, record, invocationId, sequence, grant, remainingAfter,
-                     depth, expiresAtMonotonicMs, ingressServerId](bool executed) {
+                     depth, expiresAtMonotonicMs, ingressServerId, deferredCpu](bool executed) {
+      if (deferredCpu) deferredCpu(executed);
       pendingPreparations.erase(invocationId);
       if (!executed) {
         std::erase_if(executions, [&](const auto& item) { return item.invocationId == invocationId; });
@@ -4669,17 +4672,18 @@ public:
   // `forwarded`: the call went to another node; `placedOn`: the node it went to.
   kj::Promise<rpc::EventDispatcher::Client> place(std::shared_ptr<const VersionDefinition> version,
       ChildAllocation allocation, bool* forwarded = nullptr, std::string* placedOn = nullptr,
-      std::set<std::string> preparationRejectedNodes = {}, std::shared_ptr<bool> preparationRetryAvailable = {}) {
+      std::set<std::string> preparationRejectedNodes = {}, std::shared_ptr<bool> preparationRetryAvailable = {},
+      std::optional<uint8_t> remainingPreparationHops = std::nullopt) {
     if (!preparationRetryAvailable) preparationRetryAvailable = std::make_shared<bool>(true);
-    auto withPreparationRetry = [&](rpc::EventDispatcher::Client dispatcher, const std::string& id) {
-      if (!*preparationRetryAvailable || server.candidates(version->workerId).size() <= preparationRejectedNodes.size() + 1)
+    auto withPreparationRetry = [&](rpc::EventDispatcher::Client dispatcher, const std::string& id, uint8_t remainingHops) {
+      if (!remainingHops || !*preparationRetryAvailable || server.candidates(version->workerId).size() <= preparationRejectedNodes.size() + 1)
         return dispatcher;
-      PreparationRetry retry = [this, version, allocation, id, preparationRejectedNodes, preparationRetryAvailable]() mutable {
+      PreparationRetry retry = [this, version, allocation, id, preparationRejectedNodes, preparationRetryAvailable, remainingHops]() mutable {
         KJ_REQUIRE(*preparationRetryAvailable, "preparation retry already consumed");
         *preparationRetryAvailable = false;
         preparationRejectedNodes.insert(id);
         server.reroute("CODE_UNAVAILABLE");
-        return place(version, allocation, nullptr, nullptr, preparationRejectedNodes, preparationRetryAvailable);
+        return place(version, allocation, nullptr, nullptr, preparationRejectedNodes, preparationRetryAvailable, remainingHops);
       };
       return rpc::EventDispatcher::Client(kj::heap<PreparationRetryDispatcher>(kj::mv(dispatcher), std::move(retry), factory));
     };
@@ -4742,7 +4746,7 @@ public:
               << jsonEscape(allocation.ingressServerId) << "\""
               << ",\"rankedCandidates\":" << rankedCandidates
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << allocation.expiresAtMonotonicMs << "}" << std::endl;
-    uint8_t hops = config.initialPlacementHops;
+    uint8_t hops = remainingPreparationHops.value_or(config.initialPlacementHops);
     pathMark(allocation.timing, "placement-logs");
     std::string failures = "["; size_t attempted = 0;
     bool packagesUnavailable = true;  // every candidate tried failed to load the package
@@ -4843,7 +4847,7 @@ public:
         if (placedOn) *placedOn = id;
         if (!localFirst) server.decision(id == config.serverId && homeFailed ? "homeFailureLocal" :
             id == config.serverId && id == home ? "localHome" : id == home ? "toHome" : "candidate" + std::to_string(rank), allocation.ingressRoot);
-        co_return withPreparationRetry(std::move(result.dispatcher), id);
+        co_return withPreparationRetry(std::move(result.dispatcher), id, hops);
       }
       if (!result.retryable) co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
       // The call's lease ran out: no other candidate can take it, and none is to be avoided for it (a refusal of this
@@ -4876,7 +4880,7 @@ public:
         if (forwarded) *forwarded = false;
         if (placedOn) *placedOn = target;
         server.decision("localPausedResumed", allocation.ingressRoot);
-        co_return withPreparationRetry(std::move(result.dispatcher), target);
+        co_return withPreparationRetry(std::move(result.dispatcher), target, hops);
       }
       server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
       if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)

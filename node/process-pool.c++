@@ -777,6 +777,34 @@ std::string observeSandbox(pid_t pid) {
 // tenant; shared by the pool and its generations, read and reset by ProcessPool::takeCpuUsage.
 using TenantCpu = std::map<std::string, uint64_t>;
 
+namespace {
+struct PreparedCpuUsage {
+  enum Decision { PENDING, EXECUTED, NOT_EXECUTED } decision = PENDING;
+  std::shared_ptr<TenantCpu> source;
+  TenantCpu pending;
+  void add(std::shared_ptr<TenantCpu> counters, const std::string& tenant, uint64_t ns) {
+    source = std::move(counters);
+    if (decision == PENDING) pending[tenant] += ns;
+    else if (decision == EXECUTED) (*source)[tenant] += ns;
+  }
+  void resolve(bool executed) {
+    if (decision != PENDING) return;
+    decision = executed ? EXECUTED : NOT_EXECUTED;
+    if (executed && source) for (const auto& [tenant, ns] : pending) (*source)[tenant] += ns;
+    pending.clear();
+  }
+};
+// The node event loop owns both the call and its CPU rows. Entries last only
+// until ProcessCall::finish(), including callers that disconnect while pending.
+std::map<const ProcessCall*, std::shared_ptr<PreparedCpuUsage>> preparedCpuUsage;
+}
+std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCall>& call) {
+  auto state = std::make_shared<PreparedCpuUsage>();
+  preparedCpuUsage[call.get()] = state;
+  return [state](bool executed) { state->resolve(executed); };
+}
+
+
 struct ProcessGeneration {
   std::string id;
   bool quarantine = false, durable = false;
@@ -1079,7 +1107,12 @@ struct ProcessGeneration {
           const uint64_t total = report.getCpuUsedNs() + report.getGcExcludedNs();
           auto metered = meteredCpu.find(report.getInvocationId().cStr());
           const uint64_t before = metered == meteredCpu.end() ? 0 : metered->second;
-          if (!tenant.empty() && total > before) (*cpuUsage)[tenant] += total - before;
+          if (!tenant.empty() && total > before) {
+            auto call = calls.find(report.getInvocationId().cStr());
+            auto pending = call == calls.end() ? preparedCpuUsage.end() : preparedCpuUsage.find(call->second);
+            if (pending == preparedCpuUsage.end()) (*cpuUsage)[tenant] += total - before;
+            else pending->second->add(cpuUsage, tenant, total - before);
+          }
           if (event == "completed") { if (metered != meteredCpu.end()) meteredCpu.erase(metered); }
           else if (total > before) meteredCpu[report.getInvocationId().cStr()] = total;
         }
@@ -1155,6 +1188,10 @@ void ProcessCall::finish() {
       process->notExecutedInvocations.erase(oldest);
     }
     process->notExecutedInvocations[invocationId] = mono();
+  }
+  if (auto pending = preparedCpuUsage.find(this); pending != preparedCpuUsage.end()) {
+    pending->second->resolve(dispatched);
+    preparedCpuUsage.erase(pending);
   }
   process->calls.erase(invocationId);
 }
