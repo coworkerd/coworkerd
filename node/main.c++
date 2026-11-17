@@ -996,7 +996,7 @@ public:
     // The verified package supplies the size. Caller-controlled metadata and
     // request bodies cannot obtain a smaller reservation in the runtime.
     auto source = co_await desiredState.source(version);
-    uint64_t bytes = 2 * source.size() + 2 * jsonEscape(source).size();
+    uint64_t bytes = 0;
     if (version.format == "v2") {
       try {
         capnp::MallocMessageBuilder message;
@@ -1008,6 +1008,7 @@ public:
         co_return std::string("verified package metadata unavailable");
       }
     }
+    if (version.format != "v2") bytes = 2 * source.size() + 2 * jsonEscape(source).size();
     if (preparationBytes.size() == 16384) preparationBytes.erase(preparationBytes.begin());
     preparationBytes[version.contentHash] = std::max<uint64_t>(1, bytes);
     co_return std::string();

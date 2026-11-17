@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Tue, 17 Nov 2026 15:40:12 +0800
+Date: Tue, 17 Nov 2026 15:44:48 +0800
 Subject: [PATCH] Bound preparation memory and wake live callers once
 
 
 diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
-index f386f69b45b60613d80115bb5b89cc48c01f21a9..b6a9a5bd0b18e06e77094cc75529dd00260499c5 100644
+index f386f69b45b60613d80115bb5b89cc48c01f21a9..71fe19db2f5efd9de6eae9faf286284ab22e71ed 100644
 --- a/src/workerd/server/server/root_loader.rs
 +++ b/src/workerd/server/server/root_loader.rs
 @@ -6,7 +6,7 @@
@@ -90,9 +90,9 @@ index f386f69b45b60613d80115bb5b89cc48c01f21a9..b6a9a5bd0b18e06e77094cc75529dd00
          }
          ffi::factory_set_root_lifecycle(factory.raw(), !plain_only);
 +        let heap_mib = std::env::var("COWORKERD_STATIC_HEAP_MIB").ok()
-+            .and_then(|value| value.parse::<u64>().ok()).unwrap_or(128).clamp(1, 65536);
-+        let preparation_byte_budget = (heap_mib * 1024 * 1024 * 21 / 32)
-+            .max(PREPARATION_QUANTUM);
++            .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0).unwrap_or(128).clamp(1, 65536);
++        let preparation_byte_budget = (heap_mib * 1024 * 1024 * 21 / 32 / PREPARATION_QUANTUM)
++            .max(1) * PREPARATION_QUANTUM;
 +        let preparation_small_budget = (heap_mib * 1024 * 1024 / 128).max(PREPARATION_QUANTUM);
          Ok(Rc::new_cyclic(|this| Self {
              this: this.clone(),
