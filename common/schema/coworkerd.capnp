@@ -372,7 +372,7 @@ struct ServerConfig {
     alarmDiscoveryIntervalMs @20 :UInt32 = 60000;
     alarmTakeoverConcurrency @21 :UInt32 = 4;
     # Background alarm dispatches per node; ordinary process and tenant admission still applies.
-    alarmFireConcurrency @22 :UInt32 = 8;
+    alarmFireConcurrency @22 :UInt32 = 2;
   }
 
   struct IngressConfig {

@@ -537,7 +537,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `rebuildConcurrency` | `4` | Objects being rebuilt at once per node; range 1–64; foreground and alarm queues share capacity, with promotion when a user joins a queued alarm rebuild |
 | `alarmDiscoveryIntervalMs` | `60000` | How often a node with durable processes looks for shards of stopped members that have pending alarms (it also looks at each membership change); at least 200 |
 | `alarmTakeoverConcurrency` | `4` | Such shards a node takes over at once; range 1–4 |
-| `alarmFireConcurrency` | `8` | Dispatching or executing background alarms per node; range 1–512; queued cold rebuilds wait separately, and ordinary admission remains in force |
+| `alarmFireConcurrency` | `2` | Dispatching or executing background alarms per node; range 1–512; queued cold rebuilds wait separately, and ordinary admission remains in force. Increase only after measuring hot-request latency during alarm drain |
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
