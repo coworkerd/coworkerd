@@ -8514,7 +8514,9 @@ int run(Launch launch) {
     const auto owner = server.namespaceOwner(ns);return owner ? owner->tenant : ns;
   }, [&shards](const std::string& ns, uint32_t shard, const std::string& exclude) {
     return shards.backgroundRank(ns, shard, exclude);
-  });
+  }, [&server](const std::string& ns, uint32_t shard) {
+    const auto owner = server.namespaceOwner(ns);return owner && owner->active() && shard < owner->shards;
+  }, [&shards](const std::string& ns, uint32_t shard) { return shards.heldShardEpoch(ns, shard); });
   // Firing an alarm is a request to the object, so it needs the dispatcher; the quota is the tenant's record.
   durableLog.setAlarmHook([&durable, &server, &httpOverCapnpFactory, &headerTable](coworkerd::DurableAlarm alarm) {
     return fireDurableAlarm(durable, server, httpOverCapnpFactory, *headerTable, std::move(alarm));

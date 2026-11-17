@@ -14,12 +14,16 @@ class AlarmDiscovery final: private kj::TaskSet::ErrorHandler {
 public:
   using Take = std::function<kj::Promise<ShardRoute>(std::string, uint32_t, uint32_t)>;
   using Tenant = std::function<std::string(const std::string&)>;
+  using Valid = std::function<bool(const std::string&, uint32_t)>;
+  using Held = std::function<uint64_t(const std::string&, uint32_t)>;
+  using Published = std::function<kj::Promise<bool>(const std::string&, uint32_t, uint64_t)>;
+  using Retire = std::function<bool(const std::string&, uint32_t, uint64_t, const std::string&)>;
   using Rank = std::function<uint32_t(const std::string&, uint32_t, const std::string&)>;
   struct Settings { std::string nodeId;std::filesystem::path pendingDirectory;uint32_t intervalMs = 60000, takeovers = 4, reads = 2; };
   AlarmDiscovery(Settings, ObjectStore&, kj::Timer&, const MembershipView&, AlarmPublication::ReadBudget&,
-      std::function<bool()> ready, Take, Tenant, Rank, std::function<bool(const std::string&)> active,
+      std::function<bool()> ready, Take, Tenant, Rank, Valid active,
       std::function<void(const std::string&, uint32_t, uint64_t)> adopt,
-      std::function<bool(const std::string&, uint32_t)> forgetPending);
+      std::function<bool(const std::string&, uint32_t)> forgetPending, Held, Published, Retire);
   ~AlarmDiscovery() noexcept(false);
   std::string json() const;
 private:
@@ -41,6 +45,7 @@ private:
   void schedule(const std::string&, double);
   void erase(const std::string&);
   void cache(const std::string&, ShardRoute);
+  void uncache(const std::string&);
   void failed(const kj::Exception&);
   void taskFailed(kj::Exception&&) override;
   kj::Promise<void> loop();
@@ -52,7 +57,7 @@ private:
   Settings settings;ObjectStore& store;kj::Timer& timer;const MembershipView& membership;
   AlarmPublication::ReadBudget& readBudget;
   std::function<bool()> ready;Take take;Tenant tenant;Rank rank;
-  std::function<bool(const std::string&)> namespaceActive;
+  Valid namespaceActive;Held held;Published published;Retire retire;
   std::function<void(const std::string&, uint32_t, uint64_t)> adopt;
   std::function<bool(const std::string&, uint32_t)> forgetPending;
   std::map<std::string, std::string> members;
@@ -64,7 +69,7 @@ private:
   std::string lastTenant;
   uint64_t memberEpoch = 0, memberChanges = UINT64_MAX, serial = 0, discovered = 0, acquired = 0, forwarded = 0;
   uint64_t removed = 0, failures = 0, denials = 0, lists = 0, peakPending = 0, peakActive = 0, evicted = 0;
-  uint64_t inactiveDropped = 0, deferred = 0, takeCalls = 0, takeNs = 0, cpuNs = 0;
+  uint64_t inactiveDropped = 0, deferred = 0, takeCalls = 0, takeNs = 0, cpuNs = 0, handoffJobs = 0, handoffNs = 0;
   unsigned cpuDepth = 0;uint32_t active = 0, scans = 0, peakReads = 0;
   double nextRoot = 0;bool access = false, stopping = false, measureCpu = false, pumping = false;
   kj::TaskSet tasks;

@@ -310,8 +310,8 @@ public:
   void setAlarmHook(std::function<kj::Promise<AlarmResult>(DurableAlarm alarm)> hook) {
     hooks.fireAlarm = std::move(hook);
   }
-  void setAlarmTakeoverHook(AlarmDiscovery::Take take, AlarmDiscovery::Tenant tenant, AlarmDiscovery::Rank rank) {
-    alarmTake = std::move(take);alarmTenant = std::move(tenant);alarmRank = std::move(rank);
+  void setAlarmTakeoverHook(AlarmDiscovery::Take take, AlarmDiscovery::Tenant tenant, AlarmDiscovery::Rank rank, AlarmDiscovery::Valid valid, AlarmDiscovery::Held held) {
+    alarmTake = std::move(take);alarmTenant = std::move(tenant);alarmRank = std::move(rank);alarmValid = std::move(valid);alarmHeld = std::move(held);
   }
   void setQuotaHook(std::function<uint64_t(const std::string& tenant)> hook) {
     hooks.tenantQuotaBytes = std::move(hook);
@@ -844,6 +844,8 @@ private:
   AlarmDiscovery::Take alarmTake;
   AlarmDiscovery::Tenant alarmTenant;
   AlarmDiscovery::Rank alarmRank;
+  AlarmDiscovery::Valid alarmValid;
+  AlarmDiscovery::Held alarmHeld;
   uint64_t positionWrites = 0, quotaRefusals = 0;
   bool sealing = false, noPeerWarned = false;
   bool sealingForRecovery = false;

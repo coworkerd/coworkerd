@@ -18,13 +18,16 @@ namespace coworkerd {
 class AlarmPublication final: private kj::TaskSet::ErrorHandler {
 public:
   struct ReadBudget {
-    struct Permit { ReadBudget& budget;explicit Permit(ReadBudget& b): budget(b) {} ~Permit() noexcept(false); };
-    uint32_t active = 0, limit = 2;
+    struct Permit { ReadBudget& budget;bool publisher;Permit(ReadBudget& b, bool p): budget(b), publisher(p) {} ~Permit() noexcept(false); };
+    uint32_t active = 0, limit = 2, publisherActive = 0, discoveryActive = 0;
+    bool publisherDemand = false, preferDiscovery = false;
+    bool publisherAvailable() const;
+    bool discoveryAvailable() const;
     std::function<void()> available;
     std::deque<kj::Own<kj::PromiseFulfiller<kj::Own<Permit>>>> waiters;
     kj::Promise<kj::Own<Permit>> acquire();
     kj::Own<Permit> acquireNow();
-    void release();
+    void release(bool publisher);
   };
   using Current = std::function<bool(const std::string&, uint32_t, uint64_t, uint64_t)>;
   using Adopt = std::function<void(const std::string&, const std::string&, uint32_t, uint64_t,
@@ -41,6 +44,8 @@ public:
       std::string tenant, uint64_t at);
   void tick();
   void setReadBudget(ReadBudget& budget, uint32_t limit) { readBudget = &budget;budget.limit = limit;budget.available = [this]() { pump(); }; }
+  kj::Promise<bool> waitPublished(const std::string& ns, uint32_t shard, uint64_t epoch);
+  bool claimRetirement(const std::string& ns, uint32_t shard, uint64_t epoch, const std::string& marker);
   bool forgetPending(const std::string& ns, uint32_t shard);
   void setPendingDirectory(std::filesystem::path path) { pendingDirectory = std::move(path); }
   std::string json() const;
@@ -58,7 +63,7 @@ private:
     bool readTimed = false, hintTimed = false, previousTimed = false, repairTimed = false;
     double next = 0, checked = 0, hintAt = 0, previousNext = 0, repairNext = 0, markerConfirmedAt = 0;
     std::map<std::string, uint64_t> desired, hints, duringRead;
-    std::set<std::string> previousMarkers, writeKeys;
+    std::set<std::string> previousMarkers, retiredMarkers, writeKeys;
   };
   struct Write {
     std::string key, ns, object, tenant;
@@ -154,6 +159,8 @@ private:
   kj::Promise<void> guardRead(kj::Promise<void>);
   void pending(Shard&, bool);
   void pendingFailure();
+  void notifyPublished(const Shard&, bool);
+  std::map<std::string, std::vector<std::pair<uint64_t, kj::Own<kj::PromiseFulfiller<bool>>>>> markerWaiters;
   std::string lastTenant, deniedPrefix;
   Probe deniedOperation = Probe::LIST;
   Gate hintGate, markerGate;

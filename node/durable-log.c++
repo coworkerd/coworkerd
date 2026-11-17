@@ -814,6 +814,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           if (stopped || memberEpoch != nodeEpoch || membership.selfExpired || membership.identityTaken) return false;
           auto fence = ownerFenceThrough.find({ns, shard});
           if (epoch && fence != ownerFenceThrough.end() && fence->second >= epoch) return false;
+          if (epoch && alarmHeld && alarmHeld(ns, shard) != epoch) return false;
           const auto known = hooks.knownShardEpoch ? hooks.knownShardEpoch(ns, shard) : 0;
           return !epoch || !known || known == epoch;
         },
@@ -837,10 +838,13 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
         [this](std::string ns, uint32_t shard, uint32_t waited) { return alarmTake(std::move(ns), shard, waited); },
         [this](const std::string& ns) { return alarmTenant ? alarmTenant(ns) : ns; },
         [this](const std::string& ns, uint32_t shard, const std::string& exclude) { return alarmRank ? alarmRank(ns, shard, exclude) : 0; },
-        [this](const std::string& ns) { return !hooks.namespaceActive || hooks.namespaceActive(ns); },
+        [this](const std::string& ns, uint32_t shard) { return alarmValid ? alarmValid(ns, shard) : !hooks.namespaceActive || hooks.namespaceActive(ns); },
         [this](const std::string& ns, uint32_t shard, uint64_t epoch) {
           alarmPublication->ensureTake(ns, shard, epoch, alarmTenant ? alarmTenant(ns) : ns);
-        }, [this](const std::string& ns, uint32_t shard) { return alarmPublication->forgetPending(ns, shard); });
+        }, [this](const std::string& ns, uint32_t shard) { return alarmPublication->forgetPending(ns, shard); },
+        [this](const std::string& ns, uint32_t shard) { return alarmHeld ? alarmHeld(ns, shard) : uint64_t(0); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch) { return alarmPublication->waitPublished(ns, shard, epoch); },
+        [this](const std::string& ns, uint32_t shard, uint64_t epoch, const std::string& marker) { return alarmPublication->claimRetirement(ns, shard, epoch, marker); });
   }
 }
 

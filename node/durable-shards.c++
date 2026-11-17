@@ -574,7 +574,7 @@ kj::Promise<ShardRoute> DurableShards::takeOrForward(std::string namespaceId, ui
       co_return deferred;
     }
     if (backgroundWaitedMs < 0) co_await timer.afterDelay(pause * kj::MILLISECONDS);
-    latest = co_await readLatest(namespaceId, shard, false, backgroundWaitedMs < 0);
+    if (backgroundWaitedMs < 0) latest = co_await readLatest(namespaceId, shard, false);
     if (latest.record && !latest.released) {
       auto owner = ownerOf(*latest.record);
       if (owner == Owner::GONE) owner = co_await probeOwner(*latest.record);

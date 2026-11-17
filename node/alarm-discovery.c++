@@ -40,12 +40,12 @@ std::optional<AlarmDiscovery::Marker> AlarmDiscovery::parse(const std::string& k
 }
 AlarmDiscovery::AlarmDiscovery(Settings settings, ObjectStore& store, kj::Timer& timer, const MembershipView& membership,
     AlarmPublication::ReadBudget& budget, std::function<bool()> ready, Take take, Tenant tenant, Rank rank,
-    std::function<bool(const std::string&)> active,
+    Valid active,
     std::function<void(const std::string&, uint32_t, uint64_t)> adopt,
-    std::function<bool(const std::string&, uint32_t)> forgetPending)
+    std::function<bool(const std::string&, uint32_t)> forgetPending, Held held, Published published, Retire retire)
     : settings(std::move(settings)), store(store), timer(timer), membership(membership), readBudget(budget),
       ready(std::move(ready)), take(std::move(take)), tenant(std::move(tenant)), rank(std::move(rank)),
-      namespaceActive(std::move(active)), adopt(std::move(adopt)), forgetPending(std::move(forgetPending)), tasks(*this) {
+      namespaceActive(std::move(active)), held(std::move(held)), published(std::move(published)), retire(std::move(retire)), adopt(std::move(adopt)), forgetPending(std::move(forgetPending)), tasks(*this) {
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureCpu = std::string_view(v) == "1";
   tasks.add(kj::evalLater([this]() { return loop(); }));
 }
@@ -69,7 +69,7 @@ void AlarmDiscovery::schedule(const std::string& key, double at) {
   if (at > monotonicTimeMs()) delayed.emplace(at, key);else { c.next = 0;runnable.emplace(c.priority, c.tenant, c.order, key); }
 }
 void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marker, bool local) {
-  Scope measured(*this);if (!namespaceActive(ns)) { ++inactiveDropped;return; }
+  Scope measured(*this);if (!namespaceActive(ns, shard)) { ++inactiveDropped;return; }
   const auto key = ns + "/" + std::to_string(shard);
   if (!candidates.contains(key) && candidates.size() >= 16384) {
     // Never suspend a directory scan behind stalled candidates. They remain discoverable in the next patrol.
@@ -94,6 +94,14 @@ void AlarmDiscovery::cache(const std::string& key, ShardRoute route) {
   if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key); }
   c.owner = std::move(route);ownerWaiters[{c.owner->nodeId, c.owner->nodeEpoch}].insert(key);
 }
+void AlarmDiscovery::uncache(const std::string& key) {
+  auto& c = candidates.at(key);
+  if (c.owner) {
+    auto it = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});
+    if (it != ownerWaiters.end()) { it->second.erase(key);if (it->second.empty()) ownerWaiters.erase(it); }
+  }
+  c.owner.reset();c.waitedMs = 0;
+}
 void AlarmDiscovery::loadPending() {
   std::error_code error;
   for (std::filesystem::directory_iterator it(settings.pendingDirectory, error), end; !error && it != end; it.increment(error)) {
@@ -103,14 +111,18 @@ void AlarmDiscovery::loadPending() {
     if (number(part, shard) && part == std::to_string(shard)) candidate(name.substr(0, 64), shard, {}, true);
   }
 }
-void AlarmDiscovery::failed(const kj::Exception& error) {
-  Scope measured(*this);++failures;const std::string_view text(error.getDescription().cStr());
-  if (text.find("HTTP 403") != text.npos || text.find("AccessDenied") != text.npos) { ++denials;access = false;nextRoot = monotonicTimeMs() + 30000; }
-}
+void AlarmDiscovery::failed(const kj::Exception&) { Scope measured(*this);++failures; }
 void AlarmDiscovery::taskFailed(kj::Exception&& error) { failed(error); }
 kj::Promise<ObjectListingPage> AlarmDiscovery::list(std::string key, uint32_t count, std::string token, std::string delimiter) {
   auto permit = co_await readBudget.acquire();peakReads = std::max(peakReads, readBudget.active);++lists;
-  co_return co_await store.listPage(key, count, token, delimiter);
+  try { co_return co_await store.listPage(key, count, token, delimiter); }
+  catch (const kj::Exception& error) {
+    const std::string_view text(error.getDescription().cStr());
+    if (key.starts_with(ROOT) && (text.find("HTTP 403") != text.npos || text.find("AccessDenied") != text.npos)) {
+      ++denials;access = false;nextRoot = monotonicTimeMs() + 30000;
+    }
+    throw;
+  }
 }
 kj::Promise<void> AlarmDiscovery::scan(std::string key) {
   KJ_DEFER(--scans;queuedDirectories.erase(key));
@@ -126,7 +138,7 @@ kj::Promise<void> AlarmDiscovery::scan(std::string key) {
         if (root || node) for (auto& group: page.commonPrefixes) {
           if (root) { directory(group);continue; }
           const auto id = remainder.substr(0, remainder.size() - 1);const auto part = group.substr(key.size(), group.size() - key.size() - 1);uint64_t epoch = 0;
-          if (number(part, epoch, 20) && epoch) { if (!living(id, epoch) || id == settings.nodeId) directory(group); }
+          if (number(part, epoch, 20) && epoch) { if (!living(id, epoch) && !(id == settings.nodeId && epoch == memberEpoch)) directory(group); }
           else if (id == settings.nodeId) directory(group);
         }
         for (const auto& object: page.objects) {
@@ -163,52 +175,72 @@ kj::Promise<bool> AlarmDiscovery::sourcePresent(std::string key) {
   co_return false;
 }
 kj::Promise<void> AlarmDiscovery::process(std::string key) {
-  KJ_DEFER(--active;pump());
+  bool closed = false;
+  KJ_DEFER(
+    --active;
+    if (auto it = candidates.find(key);it != candidates.end()) {
+      it->second.active = false;
+      if (!closed) { it->second.failures = std::min(6u, it->second.failures + 1);schedule(key, monotonicTimeMs() + std::min(60000u, 1000u << it->second.failures)); }
+    }
+    pump();
+  );
   auto& c = candidates.at(key);const auto version = c.version;const auto ns = c.ns;const auto shard = c.shard;
-  bool done = false, drop = false;uint32_t delay = 0;
+  const auto started = monotonicTimeMs();bool done = false, drop = false, tookLocal = false;uint32_t delay = 0;
   try {
-    if (!namespaceActive(ns)) { ++inactiveDropped;drop = true; }
-    else if ((c.waitedMs || c.owner || c.failures) && !co_await sourcePresent(key)) done = true;
+    if (!namespaceActive(ns, shard)) { ++inactiveDropped;drop = true; }
     else {
-      bool empty = false;std::string currentPrefix;
-      if (c.owner && !living(c.owner->nodeId, c.owner->nodeEpoch)) {
-        auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) w->second.erase(key);c.owner.reset();
-      }
-      if (!c.owner) {
-        if (!co_await hints(ns, shard)) { empty = true;done = true; }
-        else {
-          const auto started = monotonicTimeMs();auto route = co_await take(ns, shard, c.waitedMs);
-          ++takeCalls;takeNs += uint64_t((monotonicTimeMs() - started) * 1000000);
-          if (route.code == "DO_BACKGROUND_DEFERRED") { delay = route.backgroundDelayMs;c.waitedMs += delay;++deferred; }
-          else if (route.kind == ShardRoute::Kind::LOCAL || route.kind == ShardRoute::Kind::FORWARD) {
-            if (route.kind == ShardRoute::Kind::LOCAL) { ++acquired;c.localPending = true; }else ++forwarded;
-            cache(key, std::move(route));
+      if (c.owner && ((c.owner->kind == ShardRoute::Kind::LOCAL && held(ns, shard) != c.owner->epoch) || !living(c.owner->nodeId, c.owner->nodeEpoch))) uncache(key);
+      const bool local = c.owner && c.owner->kind == ShardRoute::Kind::LOCAL;
+      if (!local && (c.waitedMs || c.owner || c.failures) && !co_await sourcePresent(key)) done = true;
+      else {
+        bool empty = false;std::string currentPrefix;
+        if (!c.owner) {
+          if (!co_await hints(ns, shard)) { empty = true;done = true; }
+          else {
+            const auto taking = monotonicTimeMs();auto route = co_await take(ns, shard, c.waitedMs);
+            ++takeCalls;takeNs += uint64_t((monotonicTimeMs() - taking) * 1000000);
+            if (route.code == "DO_BACKGROUND_DEFERRED") { delay = route.backgroundDelayMs;c.waitedMs += delay;++deferred; }
+            else if (route.kind == ShardRoute::Kind::LOCAL || route.kind == ShardRoute::Kind::FORWARD) {
+              if (route.kind == ShardRoute::Kind::LOCAL) { ++acquired;c.localPending = true;tookLocal = true; }else ++forwarded;
+              cache(key, std::move(route));
+            }
           }
         }
-      }
-      if (c.owner) {
-        const auto owner = *c.owner;currentPrefix = prefix(owner, ns, shard);
-        auto own = co_await list(currentPrefix, 1000);
-        const bool exists = std::any_of(own.objects.begin(), own.objects.end(), [&](const auto& object) {
-          auto m = parse(object.key);return object.size == 0 && m && m->node == owner.nodeId && m->member == owner.nodeEpoch &&
-              m->ns == ns && m->shard == shard && (!owner.epoch || m->epoch == owner.epoch);
-        });
-        if (owner.kind == ShardRoute::Kind::LOCAL && !exists) adopt(ns, shard, owner.epoch);
-        // A restart-forward has no current shard epoch yet. Its winner retires the old marker; never infer ownership
-        // from a marker's epoch. Later retries observe that old marker disappearing, without rewriting an owner hint.
-        done = exists && owner.epoch && living(owner.nodeId, owner.nodeEpoch);
-      }
-      if (done) {
-        const auto markers = c.markers;
-        for (const auto& marker: markers) { if (!empty && marker.starts_with(currentPrefix)) continue;co_await store.remove(marker);++removed; }
+        if (c.owner) {
+          const auto owner = *c.owner;currentPrefix = prefix(owner, ns, shard);
+          if (owner.kind == ShardRoute::Kind::LOCAL) {
+            if (held(ns, shard) != owner.epoch) uncache(key);
+            else {
+              adopt(ns, shard, owner.epoch);
+              done = co_await published(ns, shard, owner.epoch);
+              if (held(ns, shard) != owner.epoch) { uncache(key);done = false; }
+            }
+          } else {
+            auto own = co_await list(currentPrefix, 1000);
+            const bool exists = std::any_of(own.objects.begin(), own.objects.end(), [&](const auto& object) {
+              auto m = parse(object.key);return object.size == 0 && m && m->node == owner.nodeId && m->member == owner.nodeEpoch && m->ns == ns && m->shard == shard && (!owner.epoch || m->epoch == owner.epoch);
+            });
+            done = exists && owner.epoch && living(owner.nodeId, owner.nodeEpoch);
+          }
+        }
+        if (done) {
+          const auto markers = c.markers;
+          for (const auto& marker: markers) {
+            if (!empty && marker.starts_with(currentPrefix)) continue;
+            if (c.owner && c.owner->kind == ShardRoute::Kind::LOCAL && !retire(ns, shard, c.owner->epoch, marker)) continue;
+            co_await store.remove(marker);++removed;
+          }
+        }
       }
     }
     if (done && c.localPending) done = forgetPending(ns, shard);
   } catch (const kj::Exception& error) { failed(error); }
-  Scope measured(*this);c.active = false;
-  if (drop || (done && c.version == version)) { erase(key);co_return; }
+  catch (const std::exception&) { ++failures; }
+  Scope measured(*this);
+  if (tookLocal && done) { ++handoffJobs;handoffNs += uint64_t((monotonicTimeMs() - started) * 1000000); }
+  if (drop || (done && c.version == version)) { closed = true;erase(key);co_return; }
   if (!delay) { c.failures = std::min(6u, c.failures + 1);delay = std::min(60000u, 1000u << c.failures); }
-  schedule(key, monotonicTimeMs() + delay);
+  schedule(key, monotonicTimeMs() + delay);closed = true;
 }
 kj::Promise<void> AlarmDiscovery::loop() {
   for (;;) {
@@ -229,7 +261,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
       auto w = ownerWaiters.find(invalidOwners.front());
       if (w == ownerWaiters.end() || w->second.empty()) { if (w != ownerWaiters.end()) ownerWaiters.erase(w);invalidOwners.pop_front();continue; }
       const auto key = *w->second.begin();w->second.erase(w->second.begin());auto it = candidates.find(key);
-      if (it != candidates.end() && !it->second.active) { it->second.owner.reset();it->second.failures = 0;schedule(key, 0); }
+      if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;it->second.priority = 0;schedule(key, 0); }
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
     if (scans < 2 && !directories.empty()) {
@@ -268,6 +300,6 @@ std::string AlarmDiscovery::json() const {
       ",\"listRequests\":" + std::to_string(lists) + ",\"failures\":" + std::to_string(failures) +
       ",\"denials\":" + std::to_string(denials) + ",\"inactiveDropped\":" + std::to_string(inactiveDropped) +
       ",\"deferred\":" + std::to_string(deferred) + ",\"takeCalls\":" + std::to_string(takeCalls) +
-      ",\"takeNs\":" + std::to_string(takeNs) + ",\"cpuNs\":" + std::to_string(cpuNs) + ",\"tickMs\":200}";
+      ",\"takeNs\":" + std::to_string(takeNs) + ",\"handoffJobs\":" + std::to_string(handoffJobs) + ",\"handoffNs\":" + std::to_string(handoffNs) + ",\"cpuNs\":" + std::to_string(cpuNs) + ",\"tickMs\":200}";
 }
 }  // namespace coworkerd

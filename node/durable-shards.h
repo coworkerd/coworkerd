@@ -140,6 +140,9 @@ public:
 
   // Whether this node may hold shards ("" when it may): processes, the store's create-if-absent, the membership.
   std::string unavailable() const;
+  uint64_t heldShardEpoch(const std::string& ns, uint32_t shard) const {
+    auto it = held.find({ns, shard});return it == held.end() ? 0 : it->second.epoch;
+  }
   size_t heldCount() const { return held.size(); }
   bool holds(const std::string& namespaceId, uint32_t shard) const { return held.contains({namespaceId, shard}); }
   // The state endpoint's section: the shards held, by namespace, the takeovers by reason, the releases, the refusals
