@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 12:14:27 +0800
+Subject: [PATCH] Deliver shared preparation outcomes in bounded batches
+ between I/O turns
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index f386f69b45b60613d80115bb5b89cc48c01f21a9..89ed0be97195b30b19265e8e97233c47b45545e8 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -6,7 +6,7 @@
+ //! Compiled instances and stable namespace/class providers have separate lifetimes.
+ 
+ use std::cell::{Cell, RefCell};
+-use std::collections::{HashMap, HashSet};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::pin::Pin;
+ use std::future::Future;
+ use std::rc::{Rc, Weak};
+@@ -443,15 +443,15 @@ impl InstallFlight {
+ 
+ struct PreparationFlight {
+     result: RefCell<Option<Value>>,
+-    completed: tokio::sync::Notify,
++    waiters: RefCell<VecDeque<futures::channel::oneshot::Sender<Value>>>,
+ }
+ impl PreparationFlight {
+     async fn wait(&self) -> Value {
+-        loop {
+-            let notified = self.completed.notified();
+-            if let Some(result) = self.result.borrow().clone() { return result; }
+-            notified.await;
+-        }
++        if let Some(result) = self.result.borrow().clone() { return result; }
++        let (send, receive) = futures::channel::oneshot::channel();
++        self.waiters.borrow_mut().push_back(send);
++        receive.await.unwrap_or_else(|_| json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
++            "message":"Ordinary preparation stopped; no tenant event was delivered"}}))
+     }
+ }
+ 
+@@ -467,6 +467,8 @@ pub struct RootRegistry {
+     preparations: RefCell<HashMap<String, Rc<PreparationFlight>>>,
+     preparation_wait_cpu_ns: Cell<u64>,
+     preparation_wait_polls: Cell<u64>,
++    preparation_wake_cpu_ns: Cell<u64>,
++    preparation_wake_batches: Cell<u64>,
+     failed_installs: RefCell<HashMap<String, FailedInstall>>,
+     failure_use: Cell<u64>,
+     tenant_compilations: Cell<u64>,
+@@ -504,6 +506,8 @@ impl RootRegistry {
+             preparations: RefCell::new(HashMap::new()),
+             preparation_wait_cpu_ns: Cell::new(0),
+             preparation_wait_polls: Cell::new(0),
++            preparation_wake_cpu_ns: Cell::new(0),
++            preparation_wake_batches: Cell::new(0),
+             failed_installs: RefCell::new(HashMap::new()),
+             failure_use: Cell::new(0),
+             tenant_compilations: Cell::new(0),
+@@ -554,7 +558,7 @@ impl RootRegistry {
+             }
+             let flight = Rc::new(PreparationFlight {
+                 result: RefCell::new(None),
+-                completed: tokio::sync::Notify::new(),
++                waiters: RefCell::new(VecDeque::new()),
+             });
+             self.preparations
+                 .borrow_mut()
+@@ -578,13 +582,26 @@ impl RootRegistry {
+                     futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
+                         "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
+                 };
+-                *task.result.borrow_mut()=Some(result);task.completed.notify_waiters();
++                *task.result.borrow_mut()=Some(result.clone());
+                 // Existing waiters own the same completed result. Remove the rendezvous
+                 // immediately so a new request can recover as soon as SOURCE recovers.
+                 let current=registry.preparations.borrow().get(&task_key).is_some_and(|current|Rc::ptr_eq(current,&task));
+                 if current {
+                     registry.preparations.borrow_mut().remove(&task_key);
+                 }
++                // Completing hundreds of JS continuations in one turn also starves
++                // probes. Release small groups, yielding real I/O time between them.
++                while !task.waiters.borrow().is_empty() {
++                    let start = ffi::factory_thread_cpu_ns();
++                    for _ in 0..16 {
++                        let waiter = task.waiters.borrow_mut().pop_front();
++                        if let Some(waiter) = waiter { let _ = waiter.send(result.clone()); }
++                        else { break; }
++                    }
++                    registry.preparation_wake_cpu_ns.set(registry.preparation_wake_cpu_ns.get() + ffi::factory_thread_cpu_ns() - start);
++                    registry.preparation_wake_batches.set(registry.preparation_wake_batches.get() + 1);
++                    registry.factory.sleep(Duration::from_millis(1)).await;
++                }
+             });
+             flight
+         };
+@@ -1917,6 +1934,8 @@ impl RootRegistry {
+             "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
+             "preparationWaitCpuNs": self.preparation_wait_cpu_ns.get(),
+             "preparationWaitPolls": self.preparation_wait_polls.get(),
++            "preparationWakeCpuNs": self.preparation_wake_cpu_ns.get(),
++            "preparationWakeBatches": self.preparation_wake_batches.get(),
+             "preparations": self.preparations.borrow().len(),
+             "failedInstalls": self.failed_installs.borrow().len(),
+             "closingFences": self.closing_roots.pending(),
