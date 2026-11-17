@@ -1723,9 +1723,23 @@ async function rpcEntrypoint(value, env, ctx) {
         ": " + reason.slice(0, 300));
     }
   }
-  const selected = await selectedPlain(descriptor, env, ctx);
+  let selected;
+  try { selected = await selectedPlain(descriptor, env, ctx); }
+  catch (error) {
+    if (error?.coworkerdNoExecution === true)
+      await dispatchState(descriptor, env, "rejected", rootFailureReason(error));
+    throw error;
+  }
   selected.claimCold();
   return selected.fetcher.__coworkerdRpcTarget;
+}
+
+async function dispatchState(descriptor, env, state, reason = "") {
+  if (!descriptor.dispatchReceipt) return;
+  const response = await env.SOURCE.fetch("http://coworkerd-source/v1/dispatch-state", {method:"POST",
+    body:JSON.stringify({invocationId:descriptor.invocationId,receipt:descriptor.dispatchReceipt,state,reason})});
+  if (!response.ok || (await response.json()).accepted !== true)
+    throw new Error("Worker dispatch confirmation unavailable");
 }
 
 async function serve(request, env, ctx) {
@@ -1749,15 +1763,18 @@ async function serve(request, env, ctx) {
   // A request to an object uses its namespace, public id and data epoch on the shard owner's durable process.
   if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
-  let selected, coldStart = descriptor.coldLoaded === true;
+  let selected, notExecutedReason, coldStart = descriptor.coldLoaded === true;
   try {
     selected = await selectedPlain(descriptor, env, ctx);
     coldStart = selected.claimCold() || coldStart;
     if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
     return await selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) });
   } catch (error) {
-    if (error?.coworkerdNoExecution === true) return Response.json({error:"Worker preparation unavailable",
-      code:"CODE_UNAVAILABLE",reason:rootFailureReason(error),retryable:true,dispatched:false},{status:503});
+    if (!selected && error?.coworkerdNoExecution === true) {
+      notExecutedReason = rootFailureReason(error);
+      return Response.json({error:"Worker preparation unavailable",code:"CODE_UNAVAILABLE",
+        reason:notExecutedReason,retryable:true,dispatched:false},{status:503});
+    }
     throw error;
   } finally {
     console.log("[runtime-execution] " + JSON.stringify({
@@ -1767,6 +1784,7 @@ async function serve(request, env, ctx) {
       coldStart, loadGeneration: selected?.generation ?? null, observedAtUnixMs: Date.now(),
       ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
     }));
+    if (notExecutedReason) await dispatchState(descriptor, env, "rejected", notExecutedReason);
   }
 }
 

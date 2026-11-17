@@ -36,6 +36,7 @@
 #include <kj/async-unix.h>
 #include <kj/compat/http.h>
 #include <openssl/sha.h>
+#include <openssl/rand.h>
 
 #include <algorithm>
 #include <array>
@@ -304,6 +305,7 @@ struct ExecutionRecord {
   double expiresAtMonotonicMs;
   std::string ingressServerId;
   bool coldStart = false;
+  bool dispatched = false;
 };
 
 struct DebitRecord {
@@ -441,11 +443,45 @@ struct AdmissionSlot {
   coworkerd::DurableLog::ObjectIdentity durableObject;
   coworkerd::DurableLog* durableLog = nullptr;
   std::function<void(uint status, const std::string& code)> outcome;
+  // Only the platform runtime receives this receipt. A tenant response cannot
+  // turn an uncertain execution into a refusal that placement may retry.
+  std::string dispatchReceipt, preparationReason;
+  double deadline = 0;
+  bool decided = false, notExecuted = false;
+  std::function<void(bool)> executionDecision;
+  kj::Own<kj::PromiseFulfiller<void>> preparationRejected;
+  kj::Maybe<kj::ForkedPromise<void>> rejection;
+  void watchPreparation() {
+    auto pair = kj::newPromiseAndFulfiller<void>();
+    preparationRejected = kj::mv(pair.fulfiller);
+    rejection = pair.promise.fork();
+  }
+  void decide(bool executed) {
+    if (decided) return;
+    decided = true;
+    notExecuted = !executed;
+    if (notExecuted && process) process->dispatched = false;
+    if (executionDecision) { auto callback = std::move(executionDecision); callback(executed); }
+    if (notExecuted && preparationRejected.get() != nullptr) preparationRejected->fulfill();
+  }
+  template <typename T = void> kj::Promise<T> onPreparationRejected() {
+    KJ_IF_SOME(signal, rejection) {
+      return signal.addBranch().then([]() -> kj::Promise<T> {
+        return KJ_EXCEPTION(FAILED, "Worker preparation rejected before execution");
+      });
+    }
+    return kj::NEVER_DONE;
+  }
   void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
-  ~AdmissionSlot() { finish(); report(0, ""); }
+  ~AdmissionSlot() { decide(true); finish(); report(0, ""); }
   void finish() { if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
 };
+
+constexpr const char* PREPARATION_REFUSAL_HEADER = "x-coworkerd-preparation-not-executed";
+kj::HttpHeaderId preparationRefusalHeaderId;
+constexpr kj::Exception::DetailTypeId PREPARATION_REFUSAL_DETAIL = 0xcb3d86a790ba152full;
+kj::Exception preparationRefusalError(const AdmissionSlot& slot);
 
 rpc::EventDispatcher::Client trackAdmission(rpc::EventDispatcher::Client dispatcher,
     std::shared_ptr<AdmissionSlot> slot, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headers);
@@ -723,8 +759,8 @@ private:
 // tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
 class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor)
-      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)) {}
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
+      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
@@ -746,11 +782,22 @@ private:
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
     context.releaseParams();
-    return context.tailCall(kj::mv(request));
+    try {
+      kj::Promise<capnp::Response<capnp::AnyPointer>> pending = request.send();
+      if (slot) pending = pending.exclusiveJoin(slot->onPreparationRejected<capnp::Response<capnp::AnyPointer>>());
+      auto reply = co_await pending;
+      if (slot) slot->decide(true);
+      context.setResults(reply);
+    } catch (const kj::Exception&) {
+      if (slot && slot->notExecuted) kj::throwFatalException(preparationRefusalError(*slot));
+      if (slot) slot->decide(true);
+      throw;
+    }
   }
 
   capnp::Capability::Client runtimeTarget;
   kj::String descriptor;
+  std::shared_ptr<AdmissionSlot> slot;
 };
 
 // A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
@@ -758,8 +805,8 @@ private:
 // descriptor into the runtime.
 class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor)
-      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)) {}
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
+      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
@@ -769,7 +816,7 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor)));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
@@ -777,6 +824,7 @@ public:
 private:
   rpc::EventDispatcher::Client inner;
   kj::String descriptor;
+  std::shared_ptr<AdmissionSlot> slot;
 };
 
 class ServerCore final {
@@ -2317,29 +2365,58 @@ private:
       // The load check before this dispatch loaded the version: this call's cold start.
       coldLoaded,
     });
-    std::cout << "[server] execute target=" << version->key()
-              << " kind=" << executions.back().kind
-              << " tree=" << executions.back().treeId
-              << " invocation=" << invocationId << std::endl;
-    lastExecution[version->definitionHash] = monotonicTimeMs();
-    if (usage) usage->request(coworkerd::tenantOf(version->workerId));
-    std::cout << "[execution] {\"nodeId\":\"" << serverConfig.serverId
-              << "\",\"processId\":\"" << process->processId << "\",\"processGeneration\":" << process->generation
-              << ",\"sequence\":" << sequence << ",\"treeId\":\"" << executions.back().treeId
-              << "\",\"invocationId\":\"" << invocationId << "\",\"target\":\"" << version->key()
-              << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back().kind
-              << "\",\"parentInvocationId\":\"" << executions.back().parentInvocationId
-              << "\",\"grant\":" << grant << ",\"remainingAfter\":" << remainingAfter << ",\"depth\":" << depth
-              << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
-              << ",\"ingressNodeId\":\"" << jsonEscape(ingressServerId) << "\",\"coldStart\":null"
-              << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    const auto record = executions.back();
+    auto decision = [this, version, process, record, invocationId, sequence, grant, remainingAfter,
+                     depth, expiresAtMonotonicMs, ingressServerId](bool executed) {
+      pendingPreparations.erase(invocationId);
+      if (!executed) {
+        std::erase_if(executions, [&](const auto& item) { return item.invocationId == invocationId; });
+        leases.erase(invocationId);
+        const auto refusal = this->refusal("CODE_UNAVAILABLE", "Worker preparation unavailable before execution", 503, record.kind == "ingress");
+        observeLocalRefusal(refusal, record.kind == "ingress" ? "localIngress" : "localBinding");
+        std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
+                  << "\",\"treeId\":\"" << record.treeId << "\",\"target\":\"" << version->key()
+                  << "\",\"dispatched\":false,\"code\":\"CODE_UNAVAILABLE\",\"observedAtUnixMs\":"
+                  << wallTimeMsForTest() << "}" << std::endl;
+        return;
+      }
+      for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = true;
+      lastExecution[version->definitionHash] = monotonicTimeMs();
+      if (usage) usage->request(coworkerd::tenantOf(version->workerId));
+      std::cout << "[execution] {\"nodeId\":\"" << serverConfig.serverId
+                << "\",\"processId\":\"" << process->processId << "\",\"processGeneration\":" << process->generation
+                << ",\"sequence\":" << sequence << ",\"treeId\":\"" << record.treeId
+                << "\",\"invocationId\":\"" << invocationId << "\",\"target\":\"" << version->key()
+                << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << record.kind
+                << "\",\"parentInvocationId\":\"" << record.parentInvocationId
+                << "\",\"grant\":" << grant << ",\"remainingAfter\":" << remainingAfter << ",\"depth\":" << depth
+                << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
+                << ",\"ingressNodeId\":\"" << jsonEscape(ingressServerId) << "\",\"coldStart\":null"
+                << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    };
+    if (slot && durable == nullptr) {
+      std::array<unsigned char, 16> receipt;
+      KJ_REQUIRE(RAND_bytes(receipt.data(), receipt.size()) == 1, "dispatch receipt unavailable");
+      static constexpr char HEX[] = "0123456789abcdef";
+      for (auto byte : receipt) { slot->dispatchReceipt += HEX[byte >> 4]; slot->dispatchReceipt += HEX[byte & 15]; }
+      slot->deadline = expiresAtMonotonicMs;
+      slot->executionDecision = std::move(decision);
+      slot->watchPreparation();
+      pendingPreparations[invocationId] = slot;
+      std::string envelope(descriptor.cStr(), descriptor.size());
+      KJ_ASSERT(!envelope.empty() && envelope.back() == '}');
+      envelope.pop_back();
+      descriptor = kj::str(envelope, ",\"dispatchReceipt\":\"", slot->dispatchReceipt, "\"}");
+    } else {
+      decision(true);
+    }
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
     auto opened = runtime.open(process, descriptor, version->definitionHash);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
-        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor)));
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -2350,6 +2427,17 @@ private:
   }
 
 public:
+
+  bool confirmPreparation(const std::string& invocation, const std::string& receipt,
+      const std::string& state, const std::string& reason) {
+    auto found = pendingPreparations.find(invocation);
+    if (found == pendingPreparations.end()) return false;
+    auto slot = found->second.lock();
+    if (!slot || slot->decided || receipt != slot->dispatchReceipt || state != "rejected") return false;
+    slot->preparationReason = cleanReason(reason).substr(0, 300);
+    slot->decide(false);
+    return true;
+  }
 
   void reload() {
     desiredState.reload();
@@ -2595,6 +2683,7 @@ public:
              << ",\"depth\":" << record.depth
              << ",\"ingressNodeId\":\"" << jsonEscape(record.ingressServerId)
              << "\",\"coldStart\":" << (record.coldStart ? "true" : "false")
+             << ",\"dispatched\":" << (record.dispatched ? "true" : "false")
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
     }
     output << "]";
@@ -2921,6 +3010,7 @@ private:
   coworkerd::ProcessPool& runtime;
   coworkerd::MemoryWatermark& memory;
   std::deque<ExecutionRecord> executions;
+  std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
   std::deque<DebitRecord> debits;
   std::map<std::string, InvocationLeaseState> leases;
   std::priority_queue<
@@ -3241,6 +3331,17 @@ std::string refusalBody(const InvocationRejection& refusal, double deadline) {
   return body;
 }
 
+InvocationRejection preparationRefusal(const AdmissionSlot& slot) {
+  return {503, "CODE_UNAVAILABLE", slot.preparationReason.empty() ? "Worker preparation unavailable before execution" :
+      slot.preparationReason, "", 0, 0, 100, "package-unavailable"};
+}
+kj::Exception preparationRefusalError(const AdmissionSlot& slot) {
+  const auto text = "jsg.Error: CODE_UNAVAILABLE: " + refusalBody(preparationRefusal(slot), slot.deadline);
+  auto error = tagRpcError(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(text)), "CODE_UNAVAILABLE");
+  error.setDetail(PREPARATION_REFUSAL_DETAIL, kj::heapArray(kj::arrayPtr(reinterpret_cast<const kj::byte*>("1"), 1)));
+  return error;
+}
+
 rpc::EventDispatcher::Client rejectedDispatcher(capnp::HttpOverCapnpFactory& factory,
     const kj::HttpHeaderTable& headers, const InvocationRejection& refusal, double deadline) {
   return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
@@ -3550,20 +3651,27 @@ private:
 
 class TrackingHttpResponse final: public kj::HttpService::Response {
 public:
-  explicit TrackingHttpResponse(Response& inner, SharedPathTiming timing = {}): inner(inner), timing(std::move(timing)) {}
+  explicit TrackingHttpResponse(Response& inner, SharedPathTiming timing = {}, std::shared_ptr<AdmissionSlot> slot = {},
+      bool stripPreparation = false): inner(inner), timing(std::move(timing)), slot(std::move(slot)), stripPreparation(stripPreparation) {}
 
   kj::Own<kj::AsyncOutputStream> send(
       uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
     pathMark(timing, "workerd-headers");
-    auto body = inner.send(status, statusText, headers, expectedBodySize);
+    if (slot) slot->decide(true);
+    auto filtered = headers.cloneShallow();
+    if (slot || stripPreparation) filtered.unset(preparationRefusalHeaderId);
+    auto body = inner.send(status, statusText, filtered, expectedBodySize);
     started = true;
     sentStatus = status;
     return body;
   }
 
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
-    auto socket = inner.acceptWebSocket(headers);
+    if (slot) slot->decide(true);
+    auto filtered = headers.cloneShallow();
+    if (slot || stripPreparation) filtered.unset(preparationRefusalHeaderId);
+    auto socket = inner.acceptWebSocket(filtered);
     started = true;
     sentStatus = 101;
     return socket;
@@ -3575,6 +3683,8 @@ public:
 private:
   Response& inner;
   SharedPathTiming timing;
+  std::shared_ptr<AdmissionSlot> slot;
+  bool stripPreparation = false;
   bool started = false;
   uint sentStatus = 0;
 };
@@ -3612,13 +3722,17 @@ public:
       uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
     pathMark(slot->timing, "workerd-headers");
-    auto body = inner.send(status, statusText, headers, expectedBodySize);
+    slot->decide(true);
+    auto filtered = headers.cloneShallow(); filtered.unset(preparationRefusalHeaderId);
+    auto body = inner.send(status, statusText, filtered, expectedBodySize);
     started = true;
     return body;
   }
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
     pathMark(slot->timing, "workerd-headers");
-    auto ingress = inner.acceptWebSocket(headers);
+    slot->decide(true);
+    auto filtered = headers.cloneShallow(); filtered.unset(preparationRefusalHeaderId);
+    auto ingress = inner.acceptWebSocket(filtered);
     started = true;
     auto& server = *slot->server;
     auto process = slot->process;
@@ -3684,12 +3798,13 @@ public:
     // An ingress root's upgrade, or one to a Durable Object, may become a WebSocket connection relayed here.
     if ((slot->root || slot->durable) && slot->server != nullptr && method == kj::HttpMethod::GET && requestHeaders.isWebSocket())
       co_return co_await webSocketRequest(method, url, requestHeaders, body, response);
-    auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing);
+    auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing, slot);
     auto started = monotonicTimeMs();
     std::string failure;
     try {
       pathMark(slot->timing, "http-dispatch");
-      auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      auto request = inner->request(method, url, requestHeaders, body, *tracked)
+          .exclusiveJoin(slot->onPreparationRejected());
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
         process->snapshotAfterFailure();
@@ -3706,7 +3821,7 @@ public:
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
     }
-    co_await refuse(*tracked, failure);
+    co_await refuse(slot->notExecuted ? response : *tracked, failure);
   }
 private:
   // An ingress root that asks for a WebSocket. Once the Worker answered 101 the connection is the response: when the request
@@ -3719,7 +3834,8 @@ private:
     std::string failure;
     try {
       pathMark(slot->timing, "http-dispatch");
-      auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      auto request = inner->request(method, url, requestHeaders, body, *tracked)
+          .exclusiveJoin(slot->onPreparationRejected());
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
       co_await request;
     } catch (const kj::Exception& error) {
@@ -3733,11 +3849,22 @@ private:
     }
     KJ_IF_SOME(error, failed) {
       if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
-      co_await refuse(*tracked, failure);
+      co_await refuse(slot->notExecuted ? response : *tracked, failure);
     }
   }
   // A failure before the response started: the code the call's limits or its process say.
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure) {
+    if (slot->notExecuted) {
+      slot->report(503, "CODE_UNAVAILABLE");
+      const auto body = refusalBody(preparationRefusal(*slot), slot->deadline);
+      kj::HttpHeaders replyHeaders(headers);
+      replyHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+      replyHeaders.setPtr(preparationRefusalHeaderId, "1");
+      auto output = tracked.send(503, "Service Unavailable", replyHeaders, body.size());
+      co_await output->write(kj::arrayPtr(body.data(), body.size()).asBytes());
+      co_return;
+    }
+    slot->decide(true);
     const auto code = limitCode();
     slot->report(503, code.empty() ? "RESULT_UNCERTAIN" : code);
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, 503, "Service Unavailable",
@@ -3787,6 +3914,162 @@ rpc::EventDispatcher::Client trackAdmission(rpc::EventDispatcher::Client dispatc
     std::shared_ptr<AdmissionSlot> slot, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headers) {
   return rpc::EventDispatcher::Client(kj::heap<AdmissionDispatcher>(std::move(dispatcher), std::move(slot), factory, headers));
 }
+
+// Retries only a refusal authenticated by the executing node before tenant code
+// ran. The original allocation and pins are reused; no uncertain result is retried.
+using PreparationRetry = std::function<kj::Promise<rpc::EventDispatcher::Client>()>;
+class PreparationReplayBody final: public kj::AsyncInputStream {
+public:
+  explicit PreparationReplayBody(kj::AsyncInputStream& inner): inner(inner) {}
+  kj::Promise<size_t> tryRead(void* output, size_t minimum, size_t maximum) override {
+    if (replaying && position < prefix.size()) {
+      auto copied = std::min(maximum, prefix.size() - position);
+      memcpy(output, prefix.data() + position, copied); position += copied;
+      if (copied >= minimum) co_return copied;
+      co_return copied + co_await inner.tryRead(static_cast<char*>(output) + copied, minimum - copied, maximum - copied);
+    }
+    auto count = co_await inner.tryRead(output, minimum, maximum);
+    if (!replaying && replayable) {
+      if (count <= LIMIT - prefix.size()) prefix.append(static_cast<const char*>(output), count);
+      else { replayable = false; prefix.clear(); }
+    }
+    co_return count;
+  }
+  kj::Maybe<uint64_t> tryGetLength() override {
+    KJ_IF_SOME(length, inner.tryGetLength()) { return length + (replaying ? prefix.size() - position : 0); }
+    return kj::none;
+  }
+  bool rewind() { if (!replayable) return false; replaying = true; position = 0; return true; }
+private:
+  static constexpr size_t LIMIT = 1u << 20;
+  kj::AsyncInputStream& inner;
+  std::string prefix;
+  size_t position = 0;
+  bool replayable = true, replaying = false;
+};
+class PreparationResponse final: public kj::HttpService::Response {
+public:
+  explicit PreparationResponse(Response& inner): inner(inner) {}
+  kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr text, const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> length = kj::none) override {
+    KJ_IF_SOME(value, headers.get(preparationRefusalHeaderId)) {
+      if (status == 503 && value == "1") {
+        refused = true; replyHeaders = headers.clone();
+        return kj::heap<Collector>(body);
+      }
+    }
+    return inner.send(status, text, headers, length);
+  }
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override { return inner.acceptWebSocket(headers); }
+  kj::Promise<void> sendRefusal() {
+    auto& headers = KJ_ASSERT_NONNULL(replyHeaders);
+    headers.unset(preparationRefusalHeaderId);
+    auto output = inner.send(503, "Service Unavailable", headers, body.size());
+    co_await output->write(kj::arrayPtr(body.data(), body.size()).asBytes());
+  }
+  bool refused = false;
+private:
+  class Collector final: public kj::AsyncOutputStream {
+  public:
+    explicit Collector(std::string& body): body(body) {}
+    kj::Promise<void> write(kj::ArrayPtr<const kj::byte> bytes) override {
+      KJ_REQUIRE(bytes.size() <= 8192 - body.size(), "invalid preparation refusal length");
+      body.append(reinterpret_cast<const char*>(bytes.begin()), bytes.size()); return kj::READY_NOW;
+    }
+    kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+      for (auto piece : pieces) co_await write(piece);
+    }
+    kj::Promise<void> whenWriteDisconnected() override { return kj::NEVER_DONE; }
+  private:
+    std::string& body;
+  };
+  Response& inner;
+  kj::Maybe<kj::HttpHeaders> replyHeaders;
+  std::string body;
+};
+class PreparationRetryHttp final: public kj::HttpService {
+public:
+  PreparationRetryHttp(kj::Own<kj::HttpService> inner, PreparationRetry retry, capnp::HttpOverCapnpFactory& factory)
+      : inner(kj::mv(inner)), retry(std::move(retry)), factory(factory) {}
+  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& body, Response& response) override {
+    PreparationReplayBody replay(body);
+    PreparationResponse first(response);
+    co_await inner->request(method, url, headers, replay, first);
+    if (!first.refused) co_return;
+    // A body larger than the bounded prefix is still returned as known not
+    // executed, so the caller can retry it; it is never replayed incompletely.
+    if (!replay.rewind()) co_return co_await first.sendRefusal();
+    auto next = co_await retry();
+    auto service = factory.capnpToKj(next.getHttpServiceRequest().send().getHttp());
+    co_await service->request(method, url, headers, replay, response);
+  }
+private:
+  kj::Own<kj::HttpService> inner;
+  PreparationRetry retry;
+  capnp::HttpOverCapnpFactory& factory;
+};
+struct PreparationSessions { std::vector<rpc::JsRpcSession::Client> sessions; };
+class PreparationSession final: public rpc::JsRpcSession::Server {
+public:
+  explicit PreparationSession(std::shared_ptr<PreparationSessions> sessions): sessions(std::move(sessions)) {}
+private:
+  std::shared_ptr<PreparationSessions> sessions;
+};
+class PreparationRetryTarget final: public rpc::JsRpcTarget::Server {
+public:
+  PreparationRetryTarget(capnp::Capability::Client target, PreparationRetry retry, std::shared_ptr<PreparationSessions> sessions)
+      : target(kj::mv(target)), retry(std::move(retry)), sessions(std::move(sessions)) {}
+  DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
+    return {forward(interfaceId, methodId, kj::mv(context)), false, true};
+  }
+private:
+  kj::Promise<void> forward(uint64_t interfaceId, uint16_t methodId,
+      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
+    KJ_REQUIRE(interfaceId == JS_RPC_TARGET_TYPE_ID && methodId == 0, "invalid entrypoint selection");
+    auto params = context.getParams();
+    try {
+      auto call = target.typelessRequest(interfaceId, methodId, params.targetSize(), {}); call.set(params);
+      auto result = co_await call.send(); context.setResults(result); co_return;
+    } catch (const kj::Exception& error) {
+      if (error.getDetail(PREPARATION_REFUSAL_DETAIL) == kj::none) throw;
+    }
+    // This is still the platform's entrypoint getter. No tenant method or
+    // returned capability has been exposed, and neither will be replayed.
+    auto dispatcher = co_await retry();
+    auto opened = co_await dispatcher.jsRpcSessionRequest().send();
+    sessions->sessions.push_back(opened.getSession());
+    auto next = opened.getTopLevel();
+    auto call = next.typelessRequest(interfaceId, methodId, params.targetSize(), {}); call.set(params);
+    auto result = co_await call.send(); context.setResults(result);
+  }
+  capnp::Capability::Client target;
+  PreparationRetry retry;
+  std::shared_ptr<PreparationSessions> sessions;
+};
+class PreparationRetryDispatcher final: public rpc::EventDispatcher::Server {
+public:
+  PreparationRetryDispatcher(rpc::EventDispatcher::Client inner, PreparationRetry retry, capnp::HttpOverCapnpFactory& factory)
+      : inner(kj::mv(inner)), retry(std::move(retry)), factory(factory) {}
+  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+    auto http = inner.getHttpServiceRequest().send().getHttp();
+    context.initResults().setHttp(factory.kjToCapnp(kj::heap<PreparationRetryHttp>(factory.capnpToKj(http), retry, factory)));
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+    auto opened = inner.jsRpcSessionRequest().send();
+    auto sessions = std::make_shared<PreparationSessions>(); sessions->sessions.push_back(opened.getSession());
+    auto result = context.initResults();
+    result.setSession(kj::heap<PreparationSession>(sessions));
+    result.setTopLevel(kj::heap<PreparationRetryTarget>(opened.getTopLevel(), retry, std::move(sessions)));
+    return kj::READY_NOW;
+  }
+private:
+  rpc::EventDispatcher::Client inner;
+  PreparationRetry retry;
+  capnp::HttpOverCapnpFactory& factory;
+};
 
 struct InvocationAttempt {
   rpc::EventDispatcher::Client dispatcher = nullptr;
@@ -4385,7 +4668,21 @@ public:
 
   // `forwarded`: the call went to another node; `placedOn`: the node it went to.
   kj::Promise<rpc::EventDispatcher::Client> place(std::shared_ptr<const VersionDefinition> version,
-      ChildAllocation allocation, bool* forwarded = nullptr, std::string* placedOn = nullptr) {
+      ChildAllocation allocation, bool* forwarded = nullptr, std::string* placedOn = nullptr,
+      std::set<std::string> preparationRejectedNodes = {}, std::shared_ptr<bool> preparationRetryAvailable = {}) {
+    if (!preparationRetryAvailable) preparationRetryAvailable = std::make_shared<bool>(true);
+    auto withPreparationRetry = [&](rpc::EventDispatcher::Client dispatcher, const std::string& id) {
+      if (!*preparationRetryAvailable || server.candidates(version->workerId).size() <= preparationRejectedNodes.size() + 1)
+        return dispatcher;
+      PreparationRetry retry = [this, version, allocation, id, preparationRejectedNodes, preparationRetryAvailable]() mutable {
+        KJ_REQUIRE(*preparationRetryAvailable, "preparation retry already consumed");
+        *preparationRetryAvailable = false;
+        preparationRejectedNodes.insert(id);
+        server.reroute("CODE_UNAVAILABLE");
+        return place(version, allocation, nullptr, nullptr, preparationRejectedNodes, preparationRetryAvailable);
+      };
+      return rpc::EventDispatcher::Client(kj::heap<PreparationRetryDispatcher>(kj::mv(dispatcher), std::move(retry), factory));
+    };
     if (allocation.timing) allocation.timing->treeId = allocation.treeId;
     pathMark(allocation.timing, "placement-start");
     const auto& config = server.placementConfig();
@@ -4402,10 +4699,11 @@ public:
     if (!lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
     for (const auto& id : ranked) if (id != home && id != config.serverId) ordered.push_back(id);
     if (lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
+    std::erase_if(ordered, [&](const auto& id) { return preparationRejectedNodes.contains(id); });
     if (forwarded) *forwarded = false;
     auto avoidedHome = avoidance.find(home);
     bool homeFailed = avoidedHome != avoidance.end() && avoidedHome->second.until > monotonicTimeMs();
-    bool localFirst = !lastResort && selfRanked &&
+    bool localFirst = !lastResort && selfRanked && !preparationRejectedNodes.contains(config.serverId) &&
         server.hot(version->definitionHash) &&
         !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot, allocation.expiresAtMonotonicMs, false);
     if (localFirst && home != config.serverId && server.drawHome()) {
@@ -4545,7 +4843,7 @@ public:
         if (placedOn) *placedOn = id;
         if (!localFirst) server.decision(id == config.serverId && homeFailed ? "homeFailureLocal" :
             id == config.serverId && id == home ? "localHome" : id == home ? "toHome" : "candidate" + std::to_string(rank), allocation.ingressRoot);
-        co_return std::move(result.dispatcher);
+        co_return withPreparationRetry(std::move(result.dispatcher), id);
       }
       if (!result.retryable) co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
       // The call's lease ran out: no other candidate can take it, and none is to be avoided for it (a refusal of this
@@ -4578,7 +4876,7 @@ public:
         if (forwarded) *forwarded = false;
         if (placedOn) *placedOn = target;
         server.decision("localPausedResumed", allocation.ingressRoot);
-        co_return std::move(result.dispatcher);
+        co_return withPreparationRetry(std::move(result.dispatcher), target);
       }
       server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
       if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)
@@ -6820,6 +7118,22 @@ private:
       kj::AsyncInputStream& body,
       Response& response) {
     if (method == kj::HttpMethod::POST && requestPath(url) == "/v1/log") co_return co_await log(url, body, response);
+    if (method == kj::HttpMethod::POST && requestPath(url) == "/v1/dispatch-state") {
+      bool accepted = false;
+      try {
+        auto text = co_await body.readAllText(4096);
+        capnp::MallocMessageBuilder message;
+        auto json = message.initRoot<capnp::JsonValue>();
+        capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
+        accepted = server.confirmPreparation(coworkerd::json::text(json, "invocationId"),
+            coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"));
+      } catch (const kj::Exception&) {}
+      const std::string text = accepted ? "{\"accepted\":true}" : "{\"accepted\":false}";
+      kj::HttpHeaders headers(headerTable); headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+      auto output = response.send(accepted ? 200 : 409, accepted ? "OK" : "Conflict", headers, text.size());
+      co_await output->write(kj::arrayPtr(text.data(), text.size()).asBytes());
+      co_return;
+    }
     KJ_REQUIRE(method == kj::HttpMethod::GET, "source endpoint requires GET");
     auto workerId = queryParameter(url, "workerId");
     auto versionId = queryParameter(url, "versionId");
@@ -7450,7 +7764,7 @@ public:
       const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody,
       Response& response) override {
-    auto tracked = kj::heap<TrackingHttpResponse>(response);
+    auto tracked = kj::heap<TrackingHttpResponse>(response, nullptr, nullptr, true);
     auto request = kj::evalNow([&]() {
       return routeRequest(method, url, headers, requestBody, *tracked);
     });
@@ -8356,6 +8670,7 @@ int run(Launch launch) {
 
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
+  preparationRefusalHeaderId = headerTableBuilder.add(PREPARATION_REFUSAL_HEADER);
   capnp::HttpOverCapnpFactory httpOverCapnpFactory(
       byteStreamFactory,
       headerTableBuilder,
