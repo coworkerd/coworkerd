@@ -514,7 +514,6 @@ private:
     bool preparationWaiting = false, rebuildWaiting = false;
     uint64_t wakeUnixMs = 0, fireToken = 0;
     std::string destination;
-    std::vector<std::string> capacityProbes;
   };
   // What one durable process reports of its resident objects (patches/workerd 0014).
   struct Residency {
@@ -709,6 +708,12 @@ private:
   void pumpAlarmFires();
   void scheduleAlarmPump();
   struct AlarmCpuScope { DurableLog& owner;uint64_t started = 0;explicit AlarmCpuScope(DurableLog&);~AlarmCpuScope(); };
+  struct AlarmDispatchLease {
+    DurableLog& owner;std::string key, process;uint64_t token;bool cold;
+    std::vector<std::string> probes;
+    AlarmDispatchLease(DurableLog&, std::string key, std::string process, uint64_t token, bool cold, std::vector<std::string> probes);
+    ~AlarmDispatchLease() noexcept(false);
+  };
 
   // ---- what this machine's files are at, so the same boot reuses them ----
   bool writePosition(const Object& object);
@@ -816,7 +821,6 @@ private:
   std::set<std::string> carriedRecoveryObjects;
 
   std::map<std::string, Object> objects;         // objectName -> object
-  std::map<std::string, std::string> alarmObjectNames; // logical object -> latest opened data epoch
   // A complete remote owner proof freezes every earlier ownership in this
   // process. Keep the boundary even when no object of an epoch is resident.
   std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
@@ -826,9 +830,7 @@ private:
   using AlarmOrder = std::tuple<uint64_t, uint64_t, std::string>; // eligible time, due time, key
   struct AlarmBucket {
     std::set<AlarmOrder> queue, retryReady;AlarmOrder head;bool ready = false, timed = false;
-    bool paceBacklog = false;
     uint64_t futureWake = 0;
-    double pacedUntil = 0;
     std::string gate;
   };
   using AlarmHead = std::tuple<uint64_t, std::string, std::string>; // due time, key, destination
@@ -836,12 +838,13 @@ private:
   std::map<std::string, std::set<AlarmHead>> alarmReadyTenants;
   std::set<std::tuple<uint64_t, std::string, std::string>> alarmDeadlines;
   std::set<std::pair<double, std::string>> alarmRetryDeadlines, alarmNamespaceDeadlines;
-  std::set<std::pair<double, AlarmBucketKey>> alarmBucketDeadlines;
-  struct AlarmGate { bool open = true, probing = false;double next = 0, opened = 0;std::set<AlarmBucketKey> blocked; };
+  struct AlarmGate { bool open = true, probing = false;uint64_t probeToken = 0;double next = 0, opened = 0;std::set<AlarmBucketKey> blocked; };
   std::map<std::string, AlarmGate> alarmCapacityGates;
-  struct AlarmPausedNamespace { std::set<std::string> keys;double next = 0; };
+  struct AlarmPausedNamespace { std::set<std::string> keys;uint32_t misses = 0;double next = 0; };
   std::map<std::string, AlarmPausedNamespace> alarmPausedNamespaces;
-  std::set<std::pair<std::string, std::string>> alarmPreparationQueue;
+  double alarmNamespaceBatchAt = 0;
+  std::map<std::string, std::set<std::pair<uint64_t, std::string>>> alarmPreparationQueue;
+  uint64_t alarmPreparationCount = 0;
   static constexpr uint32_t ALARM_REBUILD_WAIT_LIMIT = 256;
   uint32_t alarmRebuildWaiting = 0, peakAlarmRebuildWaiting = 0;
   uint64_t alarmAttempts = 0, alarmPumpCpuNs = 0;
@@ -850,7 +853,8 @@ private:
   std::function<std::string(const DurableAlarm&)> alarmDestination;
   kj::Promise<void> alarmTimer = nullptr;double alarmTimerAt = 0;
   std::string lastAlarmTenant;
-  uint32_t activeAlarmFires = 0, peakAlarmFires = 0;
+  uint32_t activeAlarmFires = 0, peakAlarmFires = 0, activeAlarmPreparations = 0, alarmReadyBucketCount = 0;
+  std::map<std::string, std::pair<uint32_t, uint32_t>> alarmProcessFires; // active, peak by durable process
   uint64_t alarmFireSerial = 0, alarmDeferred = 0, alarmInactive = 0;
   bool alarmPumpScheduled = false;
   uint64_t alarmTickSamples = 0, alarmTickMaxNs = 0, alarmTickCpuNs = 0;

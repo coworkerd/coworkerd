@@ -829,6 +829,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           else unindexAlarm(key, found->second);
           auto& state = alarms[key];state.namespaceId = ns;state.objectId = object;state.tenant = tenant;
           state.shard = shard;state.shardEpoch = epoch;state.atUnixMs = at;state.fromHint = true;
+          state.dueObserved = false;state.objectName.clear();state.dataEpoch = 0;
           indexAlarm(key, state);
         }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
     const auto pendingDirectory = this->settings.stackDirectory / "alarm-pending";
@@ -855,6 +856,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
 }
 
 DurableLog::~DurableLog() noexcept(false) {
+  stopped = true;
   alarmDiscovery.reset();
   alarmPublication.reset();
   if (logFd >= 0) ::close(logFd);
@@ -3722,7 +3724,10 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     co_return ObjectReady{false, 409, "DO_SHARD_EPOCH_MISMATCH", "the owner epoch was fenced"};
   if (!membership.epoch.empty()) setNodeEpoch(decimal(membership.epoch));
   const auto objectName = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
-  alarmObjectNames[identity.namespaceId + "/" + identity.objectId] = objectName;
+  if (background) {
+    auto alarm = alarms.find(identity.namespaceId + "/" + identity.objectId + "/0");
+    if (alarm != alarms.end()) { alarm->second.objectName = objectName;alarm->second.dataEpoch = identity.dataEpoch; }
+  }
   auto settled = rebuilding.find(objectName);
   if (settled != rebuilding.end() && settledRebuilds.contains(objectName)) {
     rebuilding.erase(settled);
@@ -3839,13 +3844,12 @@ kj::Promise<void> DurableLog::waitForAlarmRebuild(const ObjectIdentity& identity
   const auto name = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
   auto it = rebuilding.find(name);
   if (it == rebuilding.end()) return kj::READY_NOW;
-  // Both outcomes wake the schedule. The next preparation reads the resulting state; a failure is not a handler retry.
-  return it->second.addBranch().then([]() {}, [](kj::Exception&&) {});
+  return it->second.addBranch();
 }
 kj::Promise<void> DurableLog::waitForAlarmRebuild(const std::string& ns, const std::string& object) {
-  auto current = alarmObjectNames.find(ns + "/" + object);if (current == alarmObjectNames.end()) return kj::READY_NOW;
-  auto it = rebuilding.find(current->second);if (it == rebuilding.end()) return kj::READY_NOW;
-  return it->second.addBranch().then([]() {}, [](kj::Exception&&) {});
+  auto current = alarms.find(ns + "/" + object + "/0");if (current == alarms.end()) return kj::READY_NOW;
+  auto it = rebuilding.find(current->second.objectName);if (it == rebuilding.end()) return kj::READY_NOW;
+  return it->second.addBranch();
 }
 void DurableLog::promoteRebuild(const std::string& name) {
   auto it = queuedRebuildIndex.find(name);
@@ -5283,15 +5287,41 @@ DurableLog::AlarmCpuScope::AlarmCpuScope(DurableLog& owner): owner(owner) {
 DurableLog::AlarmCpuScope::~AlarmCpuScope() {
   if (owner.measureAlarmCpu && !--owner.alarmCpuDepth) owner.alarmPumpCpuNs += alarmThreadTime() - started;
 }
+DurableLog::AlarmDispatchLease::AlarmDispatchLease(DurableLog& owner, std::string key,
+    std::string process, uint64_t token, bool cold, std::vector<std::string> probes)
+    : owner(owner), key(std::move(key)), process(std::move(process)), token(token), cold(cold), probes(std::move(probes)) {
+  ++owner.activeAlarmFires;owner.peakAlarmFires = std::max(owner.peakAlarmFires, owner.activeAlarmFires);
+  if (cold) ++owner.activeAlarmPreparations;
+  auto& count = owner.alarmProcessFires[this->process];++count.first;count.second = std::max(count.second, count.first);
+}
+DurableLog::AlarmDispatchLease::~AlarmDispatchLease() noexcept(false) {
+  AlarmCpuScope measured(owner);--owner.activeAlarmFires;
+  if (cold) --owner.activeAlarmPreparations;
+  --owner.alarmProcessFires.at(process).first;
+  const auto now = monotonicTimeMs();
+  // This lease exists before evalLater: even a dispatch that never starts or loses its entry releases its probe.
+  for (const auto& probe: probes) {
+    auto gate = owner.alarmCapacityGates.find(probe);
+    if (gate != owner.alarmCapacityGates.end() && !gate->second.open && gate->second.probeToken == token) {
+      gate->second.probing = false;gate->second.probeToken = 0;gate->second.next = now + 200;
+    }
+  }
+  if (owner.stopped) return;
+  auto alarm = owner.alarms.find(key);
+  if (alarm != owner.alarms.end() && alarm->second.fireToken == token && alarm->second.firing) {
+    alarm->second.firing = false;alarm->second.notBeforeMs = std::max(alarm->second.notBeforeMs, now + 1000);
+    owner.indexAlarm(key, alarm->second);
+  }
+  owner.wakeAlarmPreparations();owner.scheduleAlarmPump();
+}
 void DurableLog::suspendAlarmBucket(const AlarmBucketKey& key) {
   auto it = alarmBuckets.find(key);if (it == alarmBuckets.end()) return;auto& b = it->second;
   if (b.ready) {
     auto t = alarmReadyTenants.find(key.first);
-    if (t != alarmReadyTenants.end()) { t->second.erase({std::get<1>(b.head), std::get<2>(b.head), key.second});if (t->second.empty()) alarmReadyTenants.erase(t); }
+    if (t != alarmReadyTenants.end()) { if (t->second.erase({std::get<1>(b.head), std::get<2>(b.head), key.second})) --alarmReadyBucketCount;if (t->second.empty()) alarmReadyTenants.erase(t); }
     b.ready = false;
   }
   if (b.timed) { alarmDeadlines.erase({b.futureWake, key.first, key.second});b.timed = false; }
-  if (b.pacedUntil) alarmBucketDeadlines.erase({b.pacedUntil, key});
   if (!b.gate.empty()) { alarmCapacityGates[b.gate].blocked.erase(key);b.gate.clear(); }
 }
 void DurableLog::refreshAlarmBucket(const AlarmBucketKey& key) {
@@ -5302,8 +5332,7 @@ void DurableLog::refreshAlarmBucket(const AlarmBucketKey& key) {
   if (!b.queue.empty() && !ordinaryDue) {
     b.futureWake = std::get<0>(*b.queue.begin());b.timed = true;alarmDeadlines.emplace(b.futureWake, key.first, key.second);
   }
-  if (!ordinaryDue && b.retryReady.empty()) { b.paceBacklog = false;b.pacedUntil = 0;return; }
-  if (b.pacedUntil > now) { alarmBucketDeadlines.emplace(b.pacedUntil, key);return; }b.pacedUntil = 0;
+  if (!ordinaryDue && b.retryReady.empty()) return;
   b.head = !ordinaryDue ? *b.retryReady.begin() : b.retryReady.empty() ? *b.queue.begin() : std::min(*b.queue.begin(), *b.retryReady.begin());
   for (const auto& gateKey: {std::string("node"), std::string("process:") + key.second}) {
     auto gate = alarmCapacityGates.find(gateKey);
@@ -5311,13 +5340,17 @@ void DurableLog::refreshAlarmBucket(const AlarmBucketKey& key) {
       b.gate = gateKey;gate->second.blocked.insert(key);return;
     }
   }
-  b.ready = true;alarmReadyTenants[key.first].emplace(std::get<1>(b.head), std::get<2>(b.head), key.second);
+  b.ready = true;if (alarmReadyTenants[key.first].emplace(std::get<1>(b.head), std::get<2>(b.head), key.second).second) ++alarmReadyBucketCount;
 }
 void DurableLog::unindexAlarm(const std::string& key, AlarmState& state) {
   AlarmCpuScope measured(*this);
   if (state.retryIndexed) { alarmRetryDeadlines.erase({state.notBeforeMs, key});state.retryIndexed = false; }
   if (state.namespaceWaiting) { alarmPausedNamespaces[state.namespaceId].keys.erase(key);state.namespaceWaiting = false; }
-  if (state.preparationWaiting) { alarmPreparationQueue.erase({state.tenant, key});state.preparationWaiting = false; }
+  if (state.preparationWaiting) {
+    auto tenant = alarmPreparationQueue.find(state.tenant);
+    if (tenant != alarmPreparationQueue.end()) { if (tenant->second.erase({state.atUnixMs, key})) --alarmPreparationCount;if (tenant->second.empty()) alarmPreparationQueue.erase(tenant); }
+    state.preparationWaiting = false;
+  }
   if (!state.indexed) return;state.indexed = false;
   const AlarmBucketKey bucket{state.tenant, state.destination};auto it = alarmBuckets.find(bucket);KJ_REQUIRE(it != alarmBuckets.end());
   (state.dueObserved ? it->second.retryReady : it->second.queue).erase({state.wakeUnixMs, state.atUnixMs, key});refreshAlarmBucket(bucket);
@@ -5352,12 +5385,8 @@ bool DurableLog::eraseAlarm(const std::string& key) {
   unindexAlarm(key, it->second);alarms.erase(it);return true;
 }
 bool DurableLog::alarmLocallyReady(const AlarmState& state) const {
-  const std::string* name = &state.objectName;
-  if (name->empty()) {
-    auto current = alarmObjectNames.find(state.namespaceId + "/" + state.objectId);
-    if (current == alarmObjectNames.end()) return false;name = &current->second;
-  }
-  auto object = objects.find(*name);
+  if (state.objectName.empty()) return false;
+  auto object = objects.find(state.objectName);
   return object != objects.end() && object->second.state == ObjectState::LOCAL && object->second.shardEpoch == state.shardEpoch;
 }
 void DurableLog::probeAlarmNamespace(const std::string& ns) {
@@ -5366,9 +5395,12 @@ void DurableLog::probeAlarmNamespace(const std::string& ns) {
   alarmNamespaceDeadlines.erase({it->second.next, ns});
   if (status == AlarmNamespace::Status::UNKNOWN || status == AlarmNamespace::Status::PAUSED) {
     if (it->second.keys.empty()) { alarmPausedNamespaces.erase(it);return; }
-    it->second.next = monotonicTimeMs() + 500;alarmNamespaceDeadlines.emplace(it->second.next, ns);return;
+    it->second.misses = std::min(7u, it->second.misses + 1);
+    it->second.next = monotonicTimeMs() + std::min<uint64_t>(60000, uint64_t(500) << it->second.misses);
+    alarmNamespaceDeadlines.emplace(it->second.next, ns);return;
   }
-  for (unsigned n = 0;n < 16 && !it->second.keys.empty();++n) {
+  it->second.misses = 0;
+  for (unsigned n = 0;n < 64 && !it->second.keys.empty();++n) {
     const auto key = *it->second.keys.begin();it->second.keys.erase(it->second.keys.begin());auto alarm = alarms.find(key);
     if (alarm != alarms.end()) { alarm->second.namespaceWaiting = false;indexAlarm(key, alarm->second); }
   }
@@ -5378,27 +5410,28 @@ void DurableLog::probeAlarmNamespace(const std::string& ns) {
 void DurableLog::closeAlarmCapacity(const std::string& key, double observedMs) {
   auto& gate = alarmCapacityGates[key];const auto now = monotonicTimeMs();
   if (observedMs && observedMs < gate.opened) return;
-  gate.open = false;gate.probing = false;gate.next = now + 200;
+  gate.open = false;gate.probing = false;gate.probeToken = 0;gate.next = now + 200;
 }
 void DurableLog::openAlarmCapacity(const std::string& key) {
   auto it = alarmCapacityGates.find(key);if (it == alarmCapacityGates.end()) return;
-  it->second.open = true;it->second.probing = false;it->second.next = 0;it->second.opened = monotonicTimeMs();
+  it->second.open = true;it->second.probing = false;it->second.probeToken = 0;it->second.next = 0;it->second.opened = monotonicTimeMs();
 }
 void DurableLog::alarmCapacityAvailable(const std::string& destination) {
   AlarmCpuScope measured(*this);openAlarmCapacity("node");openAlarmCapacity("process:" + destination);scheduleAlarmPump();
 }
 void DurableLog::wakeAlarmPreparations() {
-  for (unsigned n = 0;n < 8 && alarmRebuildWaiting + activeAlarmFires < ALARM_REBUILD_WAIT_LIMIT && !alarmPreparationQueue.empty();++n) {
-    auto entry = *alarmPreparationQueue.begin();alarmPreparationQueue.erase(alarmPreparationQueue.begin());auto it = alarms.find(entry.second);
-    if (it != alarms.end()) { it->second.preparationWaiting = false;indexAlarm(entry.second, it->second); }
-  }
+  if (!alarmPreparationQueue.empty() && alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT) scheduleAlarmPump();
 }
 kj::Promise<void> DurableLog::alarmRebuilt(std::string key, uint64_t token, kj::Promise<void> promise) {
-  try { co_await kj::mv(promise); } catch (const kj::Exception&) {}
+  bool failed = false;
+  try { co_await kj::mv(promise); } catch (const kj::Exception&) { failed = true; }
   AlarmCpuScope measured(*this);--alarmRebuildWaiting;
   if (stopped) co_return;
   auto it = alarms.find(key);
-  if (it != alarms.end() && it->second.fireToken == token) { it->second.rebuildWaiting = false;indexAlarm(key, it->second); }
+  if (it != alarms.end() && it->second.fireToken == token) {
+    it->second.rebuildWaiting = false;if (failed) it->second.notBeforeMs = std::max(it->second.notBeforeMs, monotonicTimeMs() + 1000);
+    indexAlarm(key, it->second);
+  }
   wakeAlarmPreparations();scheduleAlarmPump();
 }
 void DurableLog::armAlarmTimer(double at) {
@@ -5423,12 +5456,11 @@ void DurableLog::pumpAlarmFires() {
     const auto key = alarmRetryDeadlines.begin()->second;alarmRetryDeadlines.erase(alarmRetryDeadlines.begin());auto it = alarms.find(key);
     if (it != alarms.end()) { it->second.retryIndexed = false;indexAlarm(key, it->second); }
   }
-  promoted = 0;
-  while (promoted++ < 64 && !alarmBucketDeadlines.empty() && alarmBucketDeadlines.begin()->first <= now) {
-    const auto key = alarmBucketDeadlines.begin()->second;alarmBucketDeadlines.erase(alarmBucketDeadlines.begin());refreshAlarmBucket(key);
-  }
-  if (!alarmNamespaceDeadlines.empty() && alarmNamespaceDeadlines.begin()->first <= now) {
-    const auto ns = alarmNamespaceDeadlines.begin()->second;probeAlarmNamespace(ns);
+  if (now >= alarmNamespaceBatchAt && !alarmNamespaceDeadlines.empty() && alarmNamespaceDeadlines.begin()->first <= now) {
+    alarmNamespaceBatchAt = now + 500;
+    for (unsigned n = 0;n < 8 && !alarmNamespaceDeadlines.empty() && alarmNamespaceDeadlines.begin()->first <= now;++n) {
+      const auto ns = alarmNamespaceDeadlines.begin()->second;probeAlarmNamespace(ns);
+    }
   }
   unsigned gateWork = 0;
   for (auto& [key, gate]: alarmCapacityGates) {
@@ -5438,38 +5470,57 @@ void DurableLog::pumpAlarmFires() {
       if (!gate.open) break; // Only one bucket can offer the next probe.
     }
   }
-  wakeAlarmPreparations();
-  for (unsigned n = 0;n < 8 && activeAlarmFires < settings.config.alarmFireConcurrency && !alarmReadyTenants.empty();++n) {
-    auto tenant = alarmReadyTenants.upper_bound(lastAlarmTenant);if (tenant == alarmReadyTenants.end()) tenant = alarmReadyTenants.begin();
-    const auto tenantName = tenant->first;const auto head = *tenant->second.begin();lastAlarmTenant = tenantName;
-    const AlarmBucketKey bucket{tenantName, std::get<2>(head)};
+  for (unsigned n = 0;n < 8 && activeAlarmFires < settings.config.alarmFireConcurrency;++n) {
+    const bool coldRoom = alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT;
+    std::optional<std::string> nextTenant, firstTenant;
+    auto consider = [&](const auto& queue) {
+      if (queue.empty()) return;
+      if (!firstTenant || queue.begin()->first < *firstTenant) firstTenant = queue.begin()->first;
+      auto it = queue.upper_bound(lastAlarmTenant);
+      if (it != queue.end() && (!nextTenant || it->first < *nextTenant)) nextTenant = it->first;
+    };
+    consider(alarmReadyTenants);if (coldRoom) consider(alarmPreparationQueue);
+    if (!nextTenant) nextTenant = firstTenant;if (!nextTenant) break;
+    const auto tenantName = *nextTenant;lastAlarmTenant = tenantName;
+    auto ready = alarmReadyTenants.find(tenantName);auto preparation = alarmPreparationQueue.find(tenantName);
+    const bool takePreparation = coldRoom && preparation != alarmPreparationQueue.end() &&
+        (ready == alarmReadyTenants.end() || *preparation->second.begin() <
+         std::make_pair(std::get<0>(*ready->second.begin()), std::get<1>(*ready->second.begin())));
+    AlarmBucketKey bucket;
+    if (takePreparation) {
+      const auto key = preparation->second.begin()->second;auto entry = alarms.find(key);
+      KJ_REQUIRE(entry != alarms.end());indexAlarm(key, entry->second);
+      entry = alarms.find(key);if (entry == alarms.end() || !entry->second.indexed) continue;
+      bucket = {entry->second.tenant, entry->second.destination};
+    } else {
+      KJ_REQUIRE(ready != alarmReadyTenants.end());bucket = {tenantName, std::get<2>(*ready->second.begin())};
+    }
     refreshAlarmBucket(bucket);auto b = alarmBuckets.find(bucket);if (b == alarmBuckets.end() || !b->second.ready) continue;
     const auto key = std::get<2>(b->second.head);auto& state = alarms.at(key);
     const bool locallyReady = alarmLocallyReady(state);
-    if (!locallyReady && alarmRebuildWaiting + activeAlarmFires >= ALARM_REBUILD_WAIT_LIMIT) {
-      unindexAlarm(key, state);state.preparationWaiting = true;alarmPreparationQueue.emplace(state.tenant, key);continue;
+    if (!locallyReady && !coldRoom) {
+      unindexAlarm(key, state);state.dueObserved = true;state.preparationWaiting = true;
+      if (alarmPreparationQueue[state.tenant].emplace(state.atUnixMs, key).second) ++alarmPreparationCount;continue;
     }
-    // Once a large ready bucket is identified, it yields between submissions until its eligible backlog drains.
-    // This bounded lookahead is independent of the backlog's size and never crosses a future deadline.
-    const bool large = locallyReady && (b->second.paceBacklog || b->second.retryReady.size() > 128 ||
-        (b->second.queue.size() > 128 && std::get<0>(*std::next(b->second.queue.begin(), 128)) <= wall));
-    state.capacityProbes.clear();
+    const auto token = state.fireToken = ++alarmFireSerial;std::vector<std::string> probes;
     for (const auto& gateKey: {std::string("node"), std::string("process:") + state.destination}) {
       auto gate = alarmCapacityGates.find(gateKey);
-      if (gate != alarmCapacityGates.end() && !gate->second.open) { gate->second.probing = true;state.capacityProbes.push_back(gateKey); }
+      if (gate != alarmCapacityGates.end() && !gate->second.open) {
+        gate->second.probing = true;gate->second.probeToken = token;probes.push_back(gateKey);
+      }
     }
     unindexAlarm(key, state);
-    if (large) if (auto found = alarmBuckets.find(bucket);found != alarmBuckets.end()) { found->second.paceBacklog = true;found->second.pacedUntil = now + 16;refreshAlarmBucket(bucket); }
-    state.dueObserved = true;state.firing = true;const auto token = state.fireToken = ++alarmFireSerial;
-    ++activeAlarmFires;peakAlarmFires = std::max(peakAlarmFires, activeAlarmFires);
-    tasks.add(kj::evalLater([this, key, token]() { return fireAlarm(key, token); }));
+    state.dueObserved = true;state.firing = true;
+    auto lease = kj::heap<AlarmDispatchLease>(*this, key, state.destination, token, !locallyReady, std::move(probes));
+    tasks.add(kj::evalLater([this, key, token, lease = kj::mv(lease)]() mutable {
+      return fireAlarm(key, token).attach(kj::mv(lease));
+    }));
   }
   if (activeAlarmFires < settings.config.alarmFireConcurrency && (!alarmReadyTenants.empty() ||
-      (!alarmPreparationQueue.empty() && alarmRebuildWaiting + activeAlarmFires < ALARM_REBUILD_WAIT_LIMIT))) scheduleAlarmPump();
+      (!alarmPreparationQueue.empty() && alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT))) scheduleAlarmPump();
   double next = 0;auto deadline = [&next](double at) { if (!next || at < next) next = at; };
   if (!alarmRetryDeadlines.empty()) deadline(alarmRetryDeadlines.begin()->first);
-  if (!alarmBucketDeadlines.empty()) deadline(alarmBucketDeadlines.begin()->first);
-  if (!alarmNamespaceDeadlines.empty()) deadline(alarmNamespaceDeadlines.begin()->first);
+  if (!alarmNamespaceDeadlines.empty()) deadline(std::max(alarmNamespaceDeadlines.begin()->first, alarmNamespaceBatchAt));
   for (const auto& [key, gate]: alarmCapacityGates) if (!gate.open && !gate.probing && !gate.blocked.empty()) deadline(gate.next);
   if (next) armAlarmTimer(activeAlarmFires >= settings.config.alarmFireConcurrency && next <= now ? now + 200 : next);
 }
@@ -5491,10 +5542,8 @@ kj::Promise<void> DurableLog::alarmLoop() {
 }
 
 kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
-  KJ_DEFER(--activeAlarmFires;scheduleAlarmPump());
   auto found = alarms.find(key);
   if (found == alarms.end() || found->second.fireToken != token) co_return;
-  const auto probes = found->second.capacityProbes;
   DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
       found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
       found->second.retries};
@@ -5508,9 +5557,6 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     result = AlarmResult{AlarmOutcome::UNAVAILABLE, 0, std::string(error.getDescription().cStr())};
   }
   AlarmCpuScope measured(*this);
-  for (const auto& key: probes) if (auto gate = alarmCapacityGates.find(key);gate != alarmCapacityGates.end() && !gate->second.open) {
-    gate->second.probing = false;gate->second.next = monotonicTimeMs() + 200;
-  }
   if (result.outcome == AlarmOutcome::DEFERRED) closeAlarmCapacity(result.capacityKey.empty() ? "node" : result.capacityKey, result.capacityObservedMs);
   // Counted from the outcome, before the schedule is looked at again: the object's own clearing of its alarm is
   // reported as soon as the handler's transaction is confirmed, which is usually before this answer arrives.
@@ -6484,8 +6530,9 @@ std::string DurableLog::json() const {
       << ",\"capacityDeferred\":" << alarmDeferred << ",\"inactiveDropped\":" << alarmInactive
       << ",\"dispatchAttempts\":" << alarmAttempts << ",\"schedulingThreadCpuNs\":" << alarmPumpCpuNs
       << ",\"waitingRebuilds\":" << alarmRebuildWaiting << ",\"peakWaitingRebuilds\":" << peakAlarmRebuildWaiting
-      << ",\"rebuildWaitLimit\":" << ALARM_REBUILD_WAIT_LIMIT << ",\"preparationPending\":" << alarmPreparationQueue.size()
-      << ",\"pausedNamespaces\":" << alarmPausedNamespaces.size() << ",\"readyBuckets\":" << alarmBuckets.size()
+      << ",\"rebuildWaitLimit\":" << ALARM_REBUILD_WAIT_LIMIT << ",\"preparationPending\":" << alarmPreparationCount
+      << ",\"activePreparations\":" << activeAlarmPreparations
+      << ",\"pausedNamespaces\":" << alarmPausedNamespaces.size() << ",\"readyBuckets\":" << alarmReadyBucketCount
       << ",\"tickSamples\":" << alarmTickSamples << ",\"tickP99Us\":" << alarmTickP99Us
       << ",\"tickMaxUs\":" << alarmTickMaxNs / 1000.0 << ",\"tickThreadCpuNs\":" << alarmTickCpuNs
       << ",\"loopMaxLagMs\":" << alarmLoopMaxLagMs
@@ -6493,7 +6540,13 @@ std::string DurableLog::json() const {
       << alarmsDropped << ",\"hintWrites\":" << (alarmHintWrites + (alarmPublication ? alarmPublication->hintWrites : 0)) << ",\"hintFailures\":" << (alarmHintFailures + (alarmPublication ? alarmPublication->hintFailures : 0))
       << (alarmPublication ? "," + alarmPublication->json() : "")
       << (alarmDiscovery ? ",\"discovery\":" + alarmDiscovery->json() : "")
-      << ",\"next\":[";
+      << ",\"processInFlight\":[";
+  first = true;
+  for (const auto& [process, counts]: alarmProcessFires) {
+    if (!first) out << ",";first = false;
+    out << "{\"process\":" << quote(process) << ",\"inFlight\":" << counts.first << ",\"peakInFlight\":" << counts.second << "}";
+  }
+  out << "],\"next\":[";
   first = true;
   {
     std::vector<const AlarmState*> soonest;
