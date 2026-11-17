@@ -135,6 +135,7 @@ private:
   kj::Promise<void> readHints(std::string key, bool probe);
   kj::Promise<void> scanPrevious(std::string key, bool repair, bool probe);
   kj::Promise<void> scanMarkers(bool probe);
+  kj::Promise<bool> cleanOwnMarker(std::string marker, uint64_t memberEpoch);
   kj::Promise<void> probeMarkers();
   uint32_t retry(uint32_t& failures);
   double hintCheckInterval() const;
@@ -173,6 +174,7 @@ private:
   uint64_t peakPending = 0, retries = 0, markerWrites = 0, markerDeletes = 0;
   uint64_t pages = 0, maxPage = 0, badHints = 0, markerDenials = 0, markerProbes = 0, ownerChanges = 0;
   uint64_t markerPages = 0, failuresToLog = 0, failureLogLines = 0, cpuNs = 0, cpuStarted = 0;
+  uint64_t staleOwnMarkersRemoved = 0, staleOwnMarkersKept = 0;
   uint64_t threadCpuNs = 0, threadCpuStarted = 0, tickMaxItems = 0;
   unsigned cpuDepth = 0;
   double hintRoundMs = 3600000, nextMarkerScan = 0, nextMarkerProbe = 0, nextFailureLog = 0;

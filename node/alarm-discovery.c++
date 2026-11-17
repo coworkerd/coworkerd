@@ -58,6 +58,7 @@ void AlarmDiscovery::directory(std::string key, bool urgent) {
   if (queuedDirectories.insert(key).second) { if (urgent) directories.push_front(std::move(key));else directories.push_back(std::move(key)); }
 }
 void AlarmDiscovery::erase(const std::string& key) {
+  evictable.erase(key);
   auto it = candidates.find(key);if (it == candidates.end()) return;auto& c = it->second;
   runnable.erase({c.priority, c.tenant, c.order, key});if (c.next) delayed.erase({c.next, key});
   if (c.owner) { auto w = ownerWaiters.find({c.owner->nodeId, c.owner->nodeEpoch});if (w != ownerWaiters.end()) { w->second.erase(key);if (w->second.empty()) ownerWaiters.erase(w); } }
@@ -68,27 +69,27 @@ void AlarmDiscovery::schedule(const std::string& key, double at) {
   auto& c = candidates.at(key);runnable.erase({c.priority, c.tenant, c.order, key});if (c.next) delayed.erase({c.next, key});
   c.next = at;c.order = ++serial;
   if (at > monotonicTimeMs()) delayed.emplace(at, key);else { c.next = 0;runnable.emplace(c.priority, c.tenant, c.order, key); }
+  if (c.failures && !c.active && !c.watching && !c.awaitingHints) evictable.insert(key);
 }
-void AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marker, bool local) {
-  Scope measured(*this);if (!namespaceActive(ns, shard)) { ++inactiveDropped;return; }
+bool AlarmDiscovery::candidate(std::string ns, uint32_t shard, std::string marker, bool local) {
+  Scope measured(*this);if (!namespaceActive(ns, shard)) { ++inactiveDropped;return true; }
   const auto key = ns + "/" + std::to_string(shard);
   if (!candidates.contains(key) && candidates.size() >= 16384) {
-    // Never suspend a directory scan behind stalled candidates. They remain discoverable in the next patrol.
-    if (!delayed.empty()) { const auto victim = delayed.rbegin()->second;erase(victim);++evicted; }
-    else if (!runnable.empty()) { const auto victim = std::get<3>(*runnable.rbegin());erase(victim);++evicted; }
-    else { ++evicted;return; }
+    // Only already-attempted retries may be displaced. Unprocessed rows stay in a resumable LIST cursor.
+    if (!evictable.empty()) { const auto victim = *evictable.begin();erase(victim);++evicted; }
+    else return false;
   }
   auto [it, inserted] = candidates.try_emplace(key);auto& c = it->second;
   if (inserted) { c.ns = std::move(ns);c.shard = shard;c.tenant = tenant(c.ns);++discovered; }
   c.localPending |= local;
-  if (!marker.empty() && !c.markers.insert(marker).second) return;
+  if (!marker.empty() && !c.markers.insert(marker).second) return true;
   ++c.version;
   if (inserted) {
     uint32_t r = 0;if (!marker.empty()) if (auto m = parse(marker)) r = rank(c.ns, c.shard, m->node);
     if (r != UINT32_MAX && r) { c.priority = 2;c.waitedMs = r * 1000;++deferred;schedule(key, monotonicTimeMs() + c.waitedMs); }
     else schedule(key, 0);
   }
-  peakPending = std::max<uint64_t>(peakPending, candidates.size());pump();
+  peakPending = std::max<uint64_t>(peakPending, candidates.size());pump();return true;
 }
 void AlarmDiscovery::cache(const std::string& key, ShardRoute route) {
   auto& c = candidates.at(key);const bool queued = runnable.erase({c.priority, c.tenant, c.order, key}) != 0;
@@ -130,15 +131,15 @@ kj::Promise<ObjectListingPage> AlarmDiscovery::list(std::string key, uint32_t co
   }
 }
 kj::Promise<void> AlarmDiscovery::scan(std::string key) {
-  KJ_DEFER(--scans;queuedDirectories.erase(key));
+  bool paused = false;
+  KJ_DEFER(--scans;if (!paused) { queuedDirectories.erase(key);scanCursors.erase(key); });
   try {
     const auto remainder = key.substr(ROOT.size());const bool root = key == ROOT;
     const bool node = !root && std::count(remainder.begin(), remainder.end(), '/') == 1;
-    std::string token;
-    do {
-      auto page = co_await list(key, 1000, token, root || node ? "/" : "");
-      std::vector<std::string> garbage;
-      {
+    auto& cursor = scanCursors[key];
+    for (;;) {
+      if (!cursor.loaded) {
+        auto page = co_await list(key, 1000, cursor.token, root || node ? "/" : "");
         Scope measured(*this);if (root) access = true;
         if (root || node) for (auto& group: page.commonPrefixes) {
           if (root) { directory(group);continue; }
@@ -146,15 +147,23 @@ kj::Promise<void> AlarmDiscovery::scan(std::string key) {
           if (number(part, epoch, 20) && epoch) { if (!living(id, epoch) && !(id == settings.nodeId && epoch == memberEpoch)) directory(group); }
           else if (id == settings.nodeId) directory(group);
         }
-        for (const auto& object: page.objects) {
-          if (auto m = parse(object.key);m && object.size == 0) { if (!living(m->node, m->member)) candidate(m->ns, m->shard, object.key); }
-          else if (object.key.starts_with(ROOT + settings.nodeId + "/") && object.lastModifiedUnixMs && page.dateUnixMs > object.lastModifiedUnixMs + 60000) garbage.push_back(object.key);
-        }
-        token = std::move(page.nextToken);
+        cursor.page = std::move(page.objects);cursor.token = std::move(page.nextToken);
+        cursor.at = 0;cursor.date = page.dateUnixMs;cursor.loaded = true;
       }
-      // A failed auxiliary garbage DELETE must not disable discovery's LIST/acquisition path.
-      for (const auto& object: garbage) try { co_await store.remove(object);++removed; } catch (const kj::Exception&) { ++failures; }
-    } while (!token.empty());
+      while (cursor.at < cursor.page.size()) {
+        const auto object = cursor.page[cursor.at];
+        if (auto m = parse(object.key);m && object.size == 0) {
+          if (!living(m->node, m->member) && !candidate(m->ns, m->shard, object.key)) {
+            paused = true;pausedDirectories.push_back(key);++scanPauses;co_return;
+          }
+        } else if (object.key.starts_with(ROOT + settings.nodeId + "/") && object.lastModifiedUnixMs && cursor.date > object.lastModifiedUnixMs + 60000) {
+          try { co_await store.remove(object.key);++removed; } catch (const kj::Exception&) { ++failures; }
+        }
+        ++cursor.at;
+      }
+      if (cursor.token.empty()) break;
+      cursor.page.clear();cursor.loaded = false;
+    }
   } catch (const kj::Exception& error) { failed(error); }
 }
 kj::Promise<bool> AlarmDiscovery::hints(std::string ns, uint32_t shard) {
@@ -186,6 +195,7 @@ kj::Promise<void> AlarmDiscovery::process(std::string key) {
     if (auto it = candidates.find(key);it != candidates.end()) {
       it->second.active = false;
       if (!closed) { it->second.failures = std::min(6u, it->second.failures + 1);schedule(key, monotonicTimeMs() + std::min(60000u, 1000u << it->second.failures)); }
+      if (it->second.failures && !it->second.watching && !it->second.awaitingHints) evictable.insert(key);
     }
     pump();
   );
@@ -293,10 +303,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
       if (it != candidates.end() && !it->second.active) { uncache(key);it->second.failures = 0;schedule(key, 0); }
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs;loadPending(); }
-    if (scans < 2 && !directories.empty()) {
-      auto it = access ? directories.begin() : std::find(directories.begin(), directories.end(), ROOT);
-      if (it != directories.end()) { auto key = std::move(*it);directories.erase(it);++scans;tasks.add(scan(std::move(key))); }
-    }
+    pumpDirectories();
     slice = 0;
     while (!delayed.empty() && delayed.begin()->first <= now && slice++ < 256) {
       const auto key = delayed.begin()->second;delayed.erase(delayed.begin());auto it = candidates.find(key);
@@ -308,6 +315,7 @@ kj::Promise<void> AlarmDiscovery::loop() {
 void AlarmDiscovery::pump() {
   if (pumping || stopping || !ready() || membership.selfExpired || membership.identityTaken || membership.draining) return;
   pumping = true;KJ_DEFER(pumping = false);unsigned slice = 0;
+    pumpDirectories();
     while (slice++ < 64 && access && active < settings.takeovers && !runnable.empty()) {
       const auto priority = std::get<0>(*runnable.begin());
       auto it = runnable.upper_bound({priority, lastTenant, UINT64_MAX, ""});
@@ -316,8 +324,26 @@ void AlarmDiscovery::pump() {
       if (pending != candidates.end() && (!pending->second.owner || pending->second.owner->kind != ShardRoute::Kind::LOCAL) && active + adoptions >= settings.takeovers) return;
       const auto key = std::get<3>(*it);lastTenant = std::get<1>(*it);runnable.erase(it);auto found = candidates.find(key);
       if (found == candidates.end() || found->second.active) continue;
-      found->second.active = true;++active;peakActive = std::max<uint64_t>(peakActive, active);tasks.add(process(key));
+      evictable.erase(key);found->second.active = true;++active;peakActive = std::max<uint64_t>(peakActive, active);tasks.add(process(key));
     }
+}
+void AlarmDiscovery::pumpDirectories() {
+  for (unsigned n = 0;n < 2 && scans < 2;++n) {
+    std::string key;
+    if (access && !pausedDirectories.empty() && (candidates.size() < 16384 || !evictable.empty())) {
+      key = std::move(pausedDirectories.front());pausedDirectories.pop_front();++scanResumes;
+    } else {
+      auto it = std::find_if(directories.begin(), directories.end(), [this](const auto& key) {
+        if (!access) return key == ROOT;
+        const auto rest = key.substr(ROOT.size());
+        return candidates.size() < 16384 || !evictable.empty() || key == ROOT ||
+            std::count(rest.begin(), rest.end(), '/') == 1 || scanCursors.size() < 2;
+      });
+      if (it == directories.end()) break;
+      key = std::move(*it);directories.erase(it);
+    }
+    ++scans;tasks.add(kj::evalLater([this, key]() { return scan(key); }));
+  }
 }
 std::string AlarmDiscovery::json() const {
   const auto state = !membership.durableProcesses ? "disabled-no-durable-processes" : access ? "enabled" : denials ? "disabled-access-denied" : "checking";
@@ -326,6 +352,7 @@ std::string AlarmDiscovery::json() const {
       ",\"active\":" + std::to_string(active) + ",\"pendingHintAdoptions\":" + std::to_string(adoptions) + ",\"peakActive\":" + std::to_string(peakActive) +
       ",\"sharedPeakReads\":" + std::to_string(peakReads) + ",\"pending\":" + std::to_string(candidates.size()) +
       ",\"peakPending\":" + std::to_string(peakPending) + ",\"candidateLimit\":16384,\"evicted\":" + std::to_string(evicted) +
+      ",\"pausedScans\":" + std::to_string(pausedDirectories.size()) + ",\"scanPauses\":" + std::to_string(scanPauses) + ",\"scanResumes\":" + std::to_string(scanResumes) +
       ",\"discovered\":" + std::to_string(discovered) + ",\"localResults\":" + std::to_string(acquired) +
       ",\"forwardedResults\":" + std::to_string(forwarded) + ",\"removed\":" + std::to_string(removed) +
       ",\"listRequests\":" + std::to_string(lists) + ",\"failures\":" + std::to_string(failures) +

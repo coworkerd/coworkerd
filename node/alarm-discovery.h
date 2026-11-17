@@ -41,7 +41,8 @@ private:
   static std::optional<Marker> parse(const std::string&);
   bool living(const std::string&, uint64_t) const;
   void directory(std::string, bool urgent = false);
-  void candidate(std::string, uint32_t, std::string marker = {}, bool local = false);
+  bool candidate(std::string, uint32_t, std::string marker = {}, bool local = false);
+  void pumpDirectories();
   void loadPending();
   void pump();
   void schedule(const std::string&, double);
@@ -65,6 +66,11 @@ private:
   std::function<bool(const std::string&, uint32_t)> forgetPending;
   std::map<std::string, std::string> members;
   std::deque<std::string> directories;std::set<std::string> queuedDirectories;
+  struct ScanCursor { std::vector<ListedObject> page;size_t at = 0;std::string token;uint64_t date = 0;bool loaded = false; };
+  std::map<std::string, ScanCursor> scanCursors;
+  std::deque<std::string> pausedDirectories;
+  std::set<std::string> evictable;
+  uint64_t scanPauses = 0, scanResumes = 0;
   std::map<std::string, Candidate> candidates;
   std::set<Ready> runnable;std::set<std::pair<double, std::string>> delayed;
   std::map<std::pair<std::string, uint64_t>, std::set<std::string>> ownerWaiters;

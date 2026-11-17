@@ -366,11 +366,13 @@ struct ServerConfig {
     residentObjects @17 :UInt32 = 4096;
     # How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
     usagePublishMs @18 :UInt32 = 3600000;
-    # How many objects this node rebuilds at once; additional objects wait in FIFO order.
+    # How many objects this node rebuilds at once; foreground requests and background alarms each have a FIFO.
     rebuildConcurrency @19 :UInt32 = 4;
     # Auxiliary alarm discovery; all ownership still uses the ordinary shard acquisition.
     alarmDiscoveryIntervalMs @20 :UInt32 = 60000;
     alarmTakeoverConcurrency @21 :UInt32 = 4;
+    # Background alarm dispatches per node; ordinary process and tenant admission still applies.
+    alarmFireConcurrency @22 :UInt32 = 8;
   }
 
   struct IngressConfig {

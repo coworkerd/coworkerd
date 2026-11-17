@@ -37,6 +37,8 @@ void DurableLogConfig::validate() const {
       "durableObjects.recoverParallelism is between 1 and 16");
   KJ_REQUIRE(rebuildConcurrency > 0 && rebuildConcurrency <= 64,
       "durableObjects.rebuildConcurrency is between 1 and 64");
+  KJ_REQUIRE(alarmFireConcurrency > 0 && alarmFireConcurrency <= 512,
+      "durableObjects.alarmFireConcurrency is between 1 and 512");
   KJ_REQUIRE(uploadRetryMs > 0 && uploadRetryMaxMs >= uploadRetryMs,
       "durableObjects.uploadRetryMaxMs is at least uploadRetryMs");
 }
@@ -221,6 +223,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();
   result.durableLog.recoverParallelism = durable.getRecoverParallelism();
   result.durableLog.rebuildConcurrency = durable.getRebuildConcurrency();
+  result.durableLog.alarmFireConcurrency = durable.getAlarmFireConcurrency();
   result.durableLog.residentObjects = durable.getResidentObjects();
   result.durableLog.usagePublishMs = durable.getUsagePublishMs();
   result.durableLog.alarmDiscoveryIntervalMs = durable.getAlarmDiscoveryIntervalMs();

@@ -13,6 +13,7 @@
 #include <kj/refcount.h>
 
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -217,8 +218,9 @@ struct DurableAlarm {
 // What firing one came to. FIRED: the handler ran and the object cleared its own alarm. NOT_DUE: the object's own
 // database holds another time (`atUnixMs`), which is the truth. FAILED: the handler threw, so it is tried again with
 // Cloudflare's backoff. UNAVAILABLE: the object could not be reached at all (this node no longer owns the shard, the
-// store is down), so nothing is counted against the retry limit.
-enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE };
+// store is down), so nothing is counted against the retry limit. DEFERRED is ordinary admission capacity,
+// rechecked on the scheduler's next tick without changing retry state. INACTIVE removes a retired namespace's entry.
+enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, INACTIVE };
 struct AlarmResult {
   AlarmOutcome outcome = AlarmOutcome::FIRED;
   uint64_t atUnixMs = 0;
@@ -358,7 +360,7 @@ public:
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
   // says what to tell the caller when they cannot be.
   // A dispatch caller may defer the open marker to checkObjectDispatch(), after catalog/admission checks.
-  kj::Promise<ObjectReady> openObject(ObjectIdentity identity, bool prepareDispatch = true);
+  kj::Promise<ObjectReady> openObject(ObjectIdentity identity, bool prepareDispatch = true, bool background = false);
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   // Called synchronously after dispatch, before another request can prepare these files again.
@@ -490,6 +492,9 @@ private:
     // Read from the hint in the store rather than reported by the object: the object's own database decides when it
     // is opened, and a hint that turns out to be stale is dropped.
     bool fromHint = false;
+    bool indexed = false;
+    uint64_t wakeUnixMs = 0, fireToken = 0;
+    double capacityAtMs = 0;
   };
   // What one durable process reports of its resident objects (patches/workerd 0014).
   struct Residency {
@@ -667,7 +672,13 @@ private:
       uint32_t facetId, uint64_t shardEpoch, std::string tenant);
   kj::Promise<void> readAlarmHints(std::string namespaceId, uint32_t shard, uint64_t shardEpoch, std::string tenant);
   kj::Promise<void> alarmLoop();
-  kj::Promise<void> fireAlarm(std::string key);
+  kj::Promise<void> fireAlarm(std::string key, uint64_t token);
+  void unindexAlarm(const std::string&, AlarmState&);
+  void indexAlarm(const std::string&, AlarmState&);
+  bool eraseAlarm(const std::string&);
+  void refreshAlarmTenant(const std::string&);
+  void pumpAlarmFires();
+  void scheduleAlarmPump();
 
   // ---- what this machine's files are at, so the same boot reuses them ----
   bool writePosition(const Object& object);
@@ -687,7 +698,8 @@ private:
   kj::Promise<void> readUsage();
 
   // ---- rebuilding an object ----
-  kj::Promise<void> rebuild(std::string objectName, std::string reason);
+  kj::Promise<void> rebuild(std::string objectName, std::string reason, bool background);
+  void pumpRebuilds();
   kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
@@ -779,6 +791,18 @@ private:
   std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
+  using AlarmOrder = std::tuple<uint64_t, uint64_t, std::string>; // eligible time, due time, key
+  struct AlarmTenant { std::set<AlarmOrder> queue;uint64_t wake = 0;bool ready = false; };
+  std::map<std::string, AlarmTenant> alarmTenants;
+  std::set<std::pair<uint64_t, std::string>> alarmDeadlines;
+  std::set<std::string> alarmReadyTenants;
+  std::string lastAlarmTenant;
+  uint32_t activeAlarmFires = 0, peakAlarmFires = 0;
+  uint64_t alarmFireSerial = 0, alarmDeferred = 0, alarmInactive = 0;
+  bool alarmPumpScheduled = false;
+  uint64_t alarmTickSamples = 0, alarmTickMaxNs = 0, alarmTickCpuNs = 0;
+  std::array<uint64_t, 1024> alarmTickUs{};
+  double alarmLoopMaxLagMs = 0;
   std::map<std::string, Residency> residency;    // processId -> its resident objects
   // What each node published of its tenants' Durable Object bytes, and what this node published last.
   std::map<std::string, std::map<std::string, uint64_t>> publishedBytes;  // nodeId -> tenant -> bytes
@@ -809,12 +833,15 @@ private:
 
   // Rebuild slots must outlive the coroutine guards in rebuilding.
   uint32_t activeRebuilds = 0;
+  uint32_t activeBackgroundRebuilds = 0;
+  bool nextBackgroundRebuild = true;
+  uint64_t foregroundRebuilds = 0, backgroundRebuilds = 0;
   struct RebuildWaiter {
     kj::Own<kj::PromiseFulfiller<void>> ready;
     bool* acquired = nullptr;  // Valid while ready has a waiting observer.
   };
   // KJ exposes the observer check isWaiting() through a non-const interface.
-  mutable std::deque<RebuildWaiter> rebuildWaiters;
+  mutable std::deque<RebuildWaiter> rebuildWaiters, backgroundRebuildWaiters;
 
   // The promises' cancellation callbacks use the gate and settled maps: both
   // must outlive the last pending operation during process shutdown.

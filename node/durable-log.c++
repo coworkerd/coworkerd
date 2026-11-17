@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <algorithm>
 #include <cmath>
@@ -824,8 +825,10 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
           auto found = alarms.find(key);
           if (found != alarms.end() && !found->second.fromHint) return;
           if (found == alarms.end()) ++alarmsAdopted;
+          else unindexAlarm(key, found->second);
           auto& state = alarms[key];state.namespaceId = ns;state.objectId = object;state.tenant = tenant;
           state.shard = shard;state.shardEpoch = epoch;state.atUnixMs = at;state.fromHint = true;
+          indexAlarm(key, state);
         }, [this](const std::string& event, const std::string& fields) { log(event, fields); });
     const auto pendingDirectory = this->settings.stackDirectory / "alarm-pending";
     alarmPublication->setPendingDirectory(pendingDirectory);
@@ -3705,7 +3708,7 @@ void DurableLog::finishObjectHolder(
   if (holder->second.requests == 0 && holder->second.connections == 0) object->holders.erase(holder);
 }
 
-kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity, bool prepareDispatch) {
+kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity identity, bool prepareDispatch, bool background) {
   if (!enabled()) co_return ObjectReady{};
   if (startupAttempted && !startupReady) {
     if (!startupInitializing && monotonicTimeMs() >= startupRetryAfterMs) co_await start();
@@ -3769,7 +3772,7 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
       : std::string("this node has not served the object at this data epoch");
   if (rebuilding.find(objectName) == rebuilding.end()) {
     auto canceler = std::make_unique<kj::Canceler>();
-    auto operation = rebuild(objectName, reason);
+    auto operation = rebuild(objectName, reason, background);
     auto counted = kj::mv(operation).catch_([this, identity, objectName](kj::Exception&& error) {
       auto* current = objectOf(objectName);
       if (current != nullptr && current->state != ObjectState::GONE &&
@@ -3827,31 +3830,42 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
 // The whole of a rebuild: the object's files on this machine go, its manifest says which snapshot and which
 // segments make it up, and what no segment covers comes from the peers of its shard (and from this node's own log
 // when it is repairing an object of its own). The previous owner's files are never read.
-kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason) {
+void DurableLog::pumpRebuilds() {
+  const auto width = std::max<uint32_t>(1, settings.config.rebuildConcurrency);
+  auto discard = [](auto& queue) { while (!queue.empty() && !queue.front().ready->isWaiting()) queue.pop_front(); };
+  while (activeRebuilds < width) {
+    discard(rebuildWaiters);discard(backgroundRebuildWaiters);
+    const bool foreground = !rebuildWaiters.empty(), background = !backgroundRebuildWaiters.empty();
+    if (!foreground && !background) break;
+    bool pickBackground = background;
+    if (foreground && background) {
+      const auto reserved = std::min(2u, width);
+      if (width <= 2) pickBackground = nextBackgroundRebuild;
+      else if (activeBackgroundRebuilds < reserved) pickBackground = true;
+      else if (activeRebuilds - activeBackgroundRebuilds < width - reserved) pickBackground = false;
+      else pickBackground = nextBackgroundRebuild;
+    }
+    auto& queue = pickBackground ? backgroundRebuildWaiters : rebuildWaiters;
+    auto next = kj::mv(queue.front());queue.pop_front();
+    ++activeRebuilds;if (pickBackground) ++activeBackgroundRebuilds;
+    nextBackgroundRebuild = !pickBackground;
+    // Reserve before waking so cancellation before resumption returns this class's slot too.
+    *next.acquired = true;next.ready->fulfill();
+  }
+}
+kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason, bool background) {
   const auto done = kj::defer([this, objectName]() { settledRebuilds.insert(objectName); });
   bool active = false;
   const auto release = kj::defer([&]() {
     if (!active) return;
     --activeRebuilds;
-    while (!rebuildWaiters.empty()) {
-      auto next = kj::mv(rebuildWaiters.front());
-      rebuildWaiters.pop_front();
-      if (!next.ready->isWaiting()) continue;
-      ++activeRebuilds;
-      // Reserve before waking so cancellation before resumption returns the slot.
-      *next.acquired = true;
-      next.ready->fulfill();
-      break;
-    }
+    if (background) --activeBackgroundRebuilds;
+    pumpRebuilds();
   });
-  if (activeRebuilds >= std::max<uint32_t>(1, settings.config.rebuildConcurrency)) {
-    auto available = kj::newPromiseAndFulfiller<void>();
-    rebuildWaiters.push_back({kj::mv(available.fulfiller), &active});
-    co_await kj::mv(available.promise);
-  } else {
-    ++activeRebuilds;
-  }
-  active = true;
+  auto available = kj::newPromiseAndFulfiller<void>();
+  (background ? backgroundRebuildWaiters : rebuildWaiters).push_back({kj::mv(available.fulfiller), &active});
+  pumpRebuilds();co_await kj::mv(available.promise);
+  if (background) ++backgroundRebuilds;else ++foregroundRebuilds;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
   const auto targetEpoch = object->shardEpoch, targetDataEpoch = object->dataEpoch;
@@ -5179,7 +5193,7 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
   object->alarms[facetId] = atUnixMs;
   if (atUnixMs == 0) {
     if (previous) ++alarmsCleared;
-    const bool had = alarms.erase(key) > 0;
+    const bool had = eraseAlarm(key);
     if (previous || had) {
       log("alarm-cleared", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
               ",\"was\":" + std::to_string(previous));
@@ -5188,6 +5202,7 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
     return;
   }
   auto& state = alarms[key];
+  unindexAlarm(key, state);
   const bool fresh = state.atUnixMs != atUnixMs || state.fromHint;
   state.objectName = object->objectName;
   state.namespaceId = object->namespaceId;
@@ -5209,6 +5224,7 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
             ",\"atUnixMs\":" + std::to_string(atUnixMs));
     writeAlarmHint(object->namespaceId, object->objectId, object->shard, atUnixMs, facetId, object->shardEpoch, object->tenant);
   }
+  indexAlarm(key, state);
 }
 
 // Publication is auxiliary and never joins a storage confirmation. The latest desired state is coalesced.
@@ -5224,26 +5240,76 @@ kj::Promise<void> DurableLog::readAlarmHints(std::string namespaceId, uint32_t s
   co_return;
 }
 
+void DurableLog::refreshAlarmTenant(const std::string& tenant) {
+  auto it = alarmTenants.find(tenant);if (it == alarmTenants.end()) return;auto& t = it->second;
+  if (t.ready) alarmReadyTenants.erase(tenant);else alarmDeadlines.erase({t.wake, tenant});
+  if (t.queue.empty()) { alarmTenants.erase(it);return; }
+  t.wake = std::get<0>(*t.queue.begin());t.ready = t.wake <= realClockUnixMs();
+  if (t.ready) alarmReadyTenants.insert(tenant);else alarmDeadlines.emplace(t.wake, tenant);
+}
+void DurableLog::unindexAlarm(const std::string& key, AlarmState& state) {
+  if (!state.indexed) return;state.indexed = false;
+  auto it = alarmTenants.find(state.tenant);KJ_REQUIRE(it != alarmTenants.end());
+  it->second.queue.erase({state.wakeUnixMs, state.atUnixMs, key});refreshAlarmTenant(state.tenant);
+}
+void DurableLog::indexAlarm(const std::string& key, AlarmState& state) {
+  unindexAlarm(key, state);if (state.firing || !state.atUnixMs) return;
+  const auto remaining = std::max(state.notBeforeMs, state.capacityAtMs) - monotonicTimeMs();
+  state.wakeUnixMs = std::max(state.atUnixMs, realClockUnixMs() + (remaining > 0 ? uint64_t(remaining) + 1 : 0));
+  state.indexed = true;alarmTenants[state.tenant].queue.emplace(state.wakeUnixMs, state.atUnixMs, key);
+  refreshAlarmTenant(state.tenant);
+}
+bool DurableLog::eraseAlarm(const std::string& key) {
+  auto it = alarms.find(key);if (it == alarms.end()) return false;
+  unindexAlarm(key, it->second);alarms.erase(it);return true;
+}
+void DurableLog::scheduleAlarmPump() {
+  if (stopped || alarmPumpScheduled) return;alarmPumpScheduled = true;
+  tasks.add(kj::evalLater([this]() { alarmPumpScheduled = false;pumpAlarmFires(); }));
+}
+void DurableLog::pumpAlarmFires() {
+  if (stopped || !hooks.fireAlarm) return;
+  const auto now = realClockUnixMs();
+  // One deadline per tenant, never one task per due object. Promotion and dispatch both have fixed slice limits.
+  for (unsigned n = 0;n < 64 && !alarmDeadlines.empty() && alarmDeadlines.begin()->first <= now;++n) {
+    auto row = *alarmDeadlines.begin();alarmDeadlines.erase(alarmDeadlines.begin());
+    auto& t = alarmTenants.at(row.second);t.ready = true;alarmReadyTenants.insert(row.second);
+  }
+  const auto limit = settings.config.alarmFireConcurrency;
+  for (unsigned n = 0;n < 8 && activeAlarmFires < limit && !alarmReadyTenants.empty();++n) {
+    auto next = alarmReadyTenants.upper_bound(lastAlarmTenant);if (next == alarmReadyTenants.end()) next = alarmReadyTenants.begin();
+    const auto tenant = *next;lastAlarmTenant = tenant;
+    const auto key = std::get<2>(*alarmTenants.at(tenant).queue.begin());auto& state = alarms.at(key);
+    unindexAlarm(key, state);
+    if (alarmValid && !alarmValid(state.namespaceId, state.shard)) { ++alarmInactive;alarms.erase(key);continue; }
+    if (state.atUnixMs > now || std::max(state.notBeforeMs, state.capacityAtMs) > monotonicTimeMs()) { indexAlarm(key, state);continue; }
+    state.firing = true;const auto token = state.fireToken = ++alarmFireSerial;
+    ++activeAlarmFires;peakAlarmFires = std::max(peakAlarmFires, activeAlarmFires);
+    tasks.add(kj::evalLater([this, key, token]() { return fireAlarm(key, token); }));
+  }
+  if (activeAlarmFires < limit && (!alarmReadyTenants.empty() ||
+      (!alarmDeadlines.empty() && alarmDeadlines.begin()->first <= now))) scheduleAlarmPump();
+}
 kj::Promise<void> DurableLog::alarmLoop() {
+  const bool measureCpu = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST") != nullptr;
+  auto cpu = []() { timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec; };
   for (;;) {
+    const auto expected = monotonicTimeMs() + 200;
     co_await timer.afterDelay(200 * kj::MILLISECONDS);
+    const auto started = monotonicTimeMs();const auto thread = measureCpu ? cpu() : 0;
+    alarmLoopMaxLagMs = std::max(alarmLoopMaxLagMs, started - expected);
     if (alarmPublication) alarmPublication->tick();
-    if (!hooks.fireAlarm) continue;
-    const auto now = realClockUnixMs();
-    const auto mono = monotonicTimeMs();
-    std::vector<std::string> due;
-    for (const auto& [key, state] : alarms) {
-      if (state.firing || !state.atUnixMs || state.atUnixMs > now || state.notBeforeMs > mono) continue;
-      due.push_back(key);
-    }
-    for (auto& key : due) tasks.add(fireAlarm(key));
+    pumpAlarmFires();
+    const auto ns = uint64_t((monotonicTimeMs() - started) * 1000000);
+    ++alarmTickSamples;++alarmTickUs[std::min<uint64_t>(1023, ns / 1000)];alarmTickMaxNs = std::max(alarmTickMaxNs, ns);
+    if (measureCpu) alarmTickCpuNs += cpu() - thread;
   }
 }
 
-kj::Promise<void> DurableLog::fireAlarm(std::string key) {
+kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
+  KJ_DEFER(--activeAlarmFires;scheduleAlarmPump());
   auto found = alarms.find(key);
-  if (found == alarms.end() || found->second.firing) co_return;
-  found->second.firing = true;
+  if (found == alarms.end() || found->second.fireToken != token) co_return;
   DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
       found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
       found->second.retries};
@@ -5261,6 +5327,8 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
     case AlarmOutcome::NOT_DUE: ++alarmsNotDue; break;
     case AlarmOutcome::FAILED: ++alarmFailures; break;
     case AlarmOutcome::UNAVAILABLE: break;
+    case AlarmOutcome::DEFERRED: ++alarmDeferred;break;
+    case AlarmOutcome::INACTIVE: ++alarmInactive;break;
   }
   auto again = alarms.find(key);
   const auto gone = again == alarms.end();
@@ -5275,7 +5343,11 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
     co_return;
   }
   auto& state = again->second;
+  if (state.fireToken != token) co_return;
   state.firing = false;
+  auto requeue = kj::defer([this, &key, token]() {
+    auto it = alarms.find(key);if (it != alarms.end() && it->second.fireToken == token) indexAlarm(key, it->second);
+  });
   if (state.atUnixMs != ask.atUnixMs || state.shardEpoch != ask.shardEpoch) {
     log("alarm-completion-superseded", fields);
     co_return;
@@ -5287,7 +5359,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
       // not come (the object went away with the answer in flight) leaves this entry behind, so it goes now; the
       // object's database is still the truth and reports again at its next open.
       if (state.atUnixMs == ask.atUnixMs) {
-        alarms.erase(key);
+        eraseAlarm(key);
         writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
       }
       co_return;
@@ -5296,7 +5368,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
       log("alarm-not-due", fields + ",\"holds\":" + std::to_string(result.atUnixMs));
       state.fromHint = false;
       if (result.atUnixMs == 0) {
-        alarms.erase(key);
+        eraseAlarm(key);
         writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
       } else {
         state.atUnixMs = result.atUnixMs;
@@ -5328,6 +5400,13 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key) {
               std::to_string(delay) + ",\"reason\":" + quote(result.reason.substr(0, 200)));
       co_return;
     }
+    case AlarmOutcome::DEFERRED:
+      // Capacity refusals do not alter retry state. Poll on the next scheduler tick, without a busy retry loop.
+      state.capacityAtMs = monotonicTimeMs() + 50;
+      co_return;
+    case AlarmOutcome::INACTIVE:
+      eraseAlarm(key);
+      co_return;
     case AlarmOutcome::UNAVAILABLE: {
       // Nothing ran: this node may not own the shard any more, or the object could not be rebuilt. Not counted
       // against the retries; tried again shortly, and the shard's new owner has the hint either way.
@@ -5724,6 +5803,7 @@ void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const
   uint32_t droppedAlarms = 0;
   for (auto it = alarms.begin(); it != alarms.end();) {
     if (it->second.namespaceId == namespaceId && it->second.shard == shard && !it->second.firing) {
+      unindexAlarm(it->first, it->second);
       it = alarms.erase(it);
       ++droppedAlarms;
     } else {
@@ -6068,6 +6148,15 @@ std::string DurableLog::json() const {
   }
   uint32_t queuedRebuilds = 0;
   for (auto& waiter : rebuildWaiters) if (waiter.ready->isWaiting()) ++queuedRebuilds;
+  uint32_t queuedBackgroundRebuilds = 0;
+  for (auto& waiter : backgroundRebuildWaiters) if (waiter.ready->isWaiting()) ++queuedBackgroundRebuilds;
+  double alarmTickP99Us = 0;uint64_t tickSeen = 0;
+  for (size_t i = 0;i < alarmTickUs.size();++i) {
+    tickSeen += alarmTickUs[i];
+    if (tickSeen && tickSeen >= (alarmTickSamples * 99 + 99) / 100) {
+      alarmTickP99Us = i == 1023 ? alarmTickMaxNs / 1000.0 : i + 1;break;
+    }
+  }
   uint32_t local = 0, rebuildingNow = 0, repairing = 0, openCaches = 0;
   uint64_t activeRequests = 0, activeConnections = 0;
   for (const auto& [name, object] : objects) {
@@ -6129,7 +6218,9 @@ std::string DurableLog::json() const {
       << snapshotBytesWritten << "\",\"failures\":" << snapshotFailures << "},\"checkpoints\":{\"done\":"
       << checkpoints << ",\"asked\":" << checkpointAsks << "},\"objects\":{\"known\":" << objects.size()
       << ",\"local\":" << local << ",\"rebuilding\":" << rebuildingNow << ",\"repairing\":" << repairing
-      << ",\"activeRebuilds\":" << activeRebuilds << ",\"queuedRebuilds\":" << queuedRebuilds
+      << ",\"activeRebuilds\":" << activeRebuilds << ",\"queuedRebuilds\":" << queuedRebuilds + queuedBackgroundRebuilds
+      << ",\"activeBackgroundRebuilds\":" << activeBackgroundRebuilds << ",\"queuedBackgroundRebuilds\":" << queuedBackgroundRebuilds
+      << ",\"foregroundRebuilds\":" << foregroundRebuilds << ",\"backgroundRebuilds\":" << backgroundRebuilds
       << ",\"openCache\":" << openCaches
       << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
@@ -6183,7 +6274,13 @@ std::string DurableLog::json() const {
       << ",\"recordLimitRefusals\":" << recordLimitRefusals
       << ",\"objectFailures\":" << objectFailures << "},\"alarms\":{\"scheduled\":" << alarms.size() << ",\"set\":" << alarmsSet << ",\"cleared\":"
       << alarmsCleared << ",\"fired\":" << alarmsFired << ",\"failed\":" << alarmFailures << ",\"retries\":"
-      << alarmRetries << ",\"notDue\":" << alarmsNotDue << ",\"adopted\":" << alarmsAdopted << ",\"dropped\":"
+      << alarmRetries << ",\"fireConcurrency\":" << settings.config.alarmFireConcurrency
+      << ",\"inFlight\":" << activeAlarmFires << ",\"peakInFlight\":" << peakAlarmFires
+      << ",\"capacityDeferred\":" << alarmDeferred << ",\"inactiveDropped\":" << alarmInactive
+      << ",\"tickSamples\":" << alarmTickSamples << ",\"tickP99Us\":" << alarmTickP99Us
+      << ",\"tickMaxUs\":" << alarmTickMaxNs / 1000.0 << ",\"tickThreadCpuNs\":" << alarmTickCpuNs
+      << ",\"loopMaxLagMs\":" << alarmLoopMaxLagMs
+      << ",\"notDue\":" << alarmsNotDue << ",\"adopted\":" << alarmsAdopted << ",\"dropped\":"
       << alarmsDropped << ",\"hintWrites\":" << (alarmHintWrites + (alarmPublication ? alarmPublication->hintWrites : 0)) << ",\"hintFailures\":" << (alarmHintFailures + (alarmPublication ? alarmPublication->hintFailures : 0))
       << (alarmPublication ? "," + alarmPublication->json() : "")
       << (alarmDiscovery ? ",\"discovery\":" + alarmDiscovery->json() : "")

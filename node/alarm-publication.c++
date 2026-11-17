@@ -391,7 +391,7 @@ void AlarmPublication::pump(unsigned limit) {
     if (!have && activeHints < 7 && readBudget->publisherAvailable() && !readyReads.empty() && hintGate.available(now)) { work = choose(readyReads, hintGate);have = true; }
     if (!have && !activeScans && readBudget->publisherAvailable() && !markerDenied && markerGate.available(now)) {
       if (!readyScans.empty()) { work = choose(readyScans, markerGate);have = true; }
-      else if (!globalScanRunning && (initialMarkerScan || (!ownMarkers.empty() && now >= nextMarkerScan))) {
+      else if (!globalScanRunning && (initialMarkerScan || now >= nextMarkerScan)) {
         gateProbe = markerGate.enter(now, nodeId);globalScanRunning = true;++active;++activeScans;
         tasks.add(guardRead(kj::evalLater([this, gateProbe]() { return scanMarkers(gateProbe); })));continue;
       }
@@ -628,6 +628,57 @@ std::optional<MarkerAddress> markerAddress(const std::string& key, const std::st
   return MarkerAddress{std::string(part[1]), key.substr(0, key.rfind('/') + 1), shard, member, epoch};
 }
 }
+kj::Promise<bool> AlarmPublication::cleanOwnMarker(std::string marker, uint64_t memberEpoch) {
+  const auto root = "alarm-wake/by-owner/" + nodeId + "/";
+  auto address = markerAddress(marker, root);
+  if (!address || address->member != memberEpoch || inFlightKeys.contains(marker) || writes.contains(marker)) co_return false;
+  const auto ns = address->ns;const auto shard = address->shard;const auto epoch = address->epoch;
+  auto eligible = [this, &ns, shard, epoch, memberEpoch]() {
+    return !stopping && nodeEpoch == memberEpoch && current(ns, shard, 0, memberEpoch) &&
+        !current(ns, shard, epoch, memberEpoch);
+  };
+  if (!eligible()) co_return false;
+  inFlightKeys.insert(marker);
+  auto release = kj::defer([this, &marker]() {
+    inFlightKeys.erase(marker);inFlightDeletes.erase(marker);
+    if (auto it = writes.find(marker);it != writes.end()) refresh(it->second, monotonicTimeMs());
+    pump();
+    if (auto it = writes.find(marker);it != writes.end()) refresh(it->second, monotonicTimeMs());
+  });
+  // No new current owner marker is needed when H is empty. Otherwise only a verified successor M permits removal.
+  auto hints = co_await store.listPage("do/" + ns + "/shards/" + std::to_string(shard) + "/alarms/", 1);
+  if (!eligible()) co_return false;
+  bool safe = hints.objects.empty() && hints.nextToken.empty();
+  if (!safe) {
+    std::string token, latest;
+    do {
+      auto page = co_await store.listPage(shardEpochsPrefix(ns, shard) + "/", 1000, token);
+      if (!eligible()) co_return false;
+      for (const auto& row: page.objects) {
+        const auto part = row.key.substr(row.key.rfind('/') + 1);
+        if (part.size() == 20 && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) latest = std::max(latest, row.key);
+      }
+      token = std::move(page.nextToken);
+    } while (!token.empty());
+    if (!latest.empty()) {
+      auto response = co_await store.get(latest);
+      requireStorage(response.status == 200, "stale alarm marker owner read failed");
+      auto owner = parseShardEpoch(response.bytes);
+      requireStorage(owner && owner->namespaceId == ns && owner->shard == shard, "invalid stale alarm marker owner");
+      if (owner->nodeId != nodeId) {
+        auto successor = co_await store.listPage(markerPrefix(owner->nodeId, owner->nodeEpoch, ns, shard, owner->epoch), 1);
+        for (const auto& row: successor.objects) if (row.size == 0 && markerName(row.key.substr(row.key.rfind('/') + 1))) safe = true;
+      }
+    }
+  }
+  if (!safe || !eligible()) { ++staleOwnMarkersKept;co_return false; }
+  inFlightDeletes.insert(marker);co_await store.remove(marker);
+  deletedDuringScan.insert(marker);++staleOwnMarkersRemoved;
+  if (auto it = shards.find(shardKey(ns, shard));it != shards.end() && it->second.marker == marker && valid(it->second)) {
+    it->second.markerWritten = false;it->second.markerMayExist = false;reconcile(it->second);
+  }
+  co_return true;
+}
 kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
   const auto epoch = nodeEpoch;const auto started = monotonicTimeMs();const auto root = "alarm-wake/by-owner/" + nodeId + "/";bool finished = false;
   deletedDuringScan.clear();
@@ -649,6 +700,8 @@ kj::Promise<void> AlarmPublication::scanMarkers(bool probe) {
       if (deletedDuringScan.contains(marker) || deleting(marker)) { it = keys.erase(it);continue; }
       auto a = markerAddress(marker, root);KJ_REQUIRE(a.has_value());auto s = shards.find(shardKey(a->ns, a->shard));
       if (s != shards.end() && s->second.epoch == a->epoch && s->second.markerMemberEpoch == a->member) acceptOwnMarker(s->second, marker);
+      if (a->member == epoch && co_await cleanOwnMarker(marker, epoch)) { currentEpoch();it = keys.erase(it);continue; }
+      currentEpoch();
       ++it;
       if (++slice == 32) { slice = 0;co_await kj::evalLater([]() {});currentEpoch(); }
     }
@@ -747,6 +800,7 @@ std::string AlarmPublication::json() const {
       << ",\"invalidAlarmHints\":" << badHints << ",\"markerAccessDenied\":" << (markerDenied ? "true" : "false") << ",\"markerDenials\":" << markerDenials << ",\"markerProbes\":" << markerProbes << ",\"markerPending\":" << markerPending
       << ",\"publicationMaxConcurrency\":16,\"publicationHintCapacity\":7,\"publicationMarkerWriteCapacity\":8,\"publicationMarkerScanCapacity\":1"
       << ",\"publicationHintPending\":" << writes.size() - markerPending << ",\"publicationOwnerChanges\":" << ownerChanges << ",\"markerScanPages\":" << markerPages
+      << ",\"staleOwnMarkersRemoved\":" << staleOwnMarkersRemoved << ",\"staleOwnMarkersKept\":" << staleOwnMarkersKept
       << ",\"hintPublicationBackoff\":" << (hintGate.open ? "true" : "false") << ",\"markerPublicationBackoff\":" << (markerGate.open ? "true" : "false")
       << ",\"publicationTickMaxItems\":" << tickMaxItems << ",\"publicationDeadlineRows\":" << deadlines.size()
       << ",\"publicationFailureLogLines\":" << failureLogLines << ",\"publicationCpuNs\":" << cpuNs << ",\"publicationThreadCpuNs\":" << threadCpuNs;

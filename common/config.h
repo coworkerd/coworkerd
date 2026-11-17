@@ -197,6 +197,7 @@ struct DurableLogConfig {
   uint32_t uploadRetryMs = 500, uploadRetryMaxMs = 30000;
   uint32_t recoverParallelism = 4;
   uint32_t rebuildConcurrency = 4;
+  uint32_t alarmFireConcurrency = 8;
   // How many objects one durable process keeps resident (COWORKERD_DO_RESIDENT_OBJECTS; 0: no limit). Past it the
   // least recently used objects are evicted: their hibernatable WebSockets hibernate, so the connections stay up
   // and the next message wakes the object on the same storage.
