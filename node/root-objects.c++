@@ -261,7 +261,12 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
 std::string RootDispatch::descriptor(std::string encoded) const {
   KJ_REQUIRE(!encoded.empty() && encoded.back() == '}', "an invocation descriptor is a JSON object");
   encoded.pop_back();
-  return encoded+",\"rootPlan\":"+plan+",\"rootSelection\":"+selection+'}';
+  encoded += ",\"rootPlan\":";
+  encoded += plan;
+  encoded += ",\"rootSelection\":";
+  encoded += selection;
+  encoded += '}';
+  return encoded;
 }
 
 }  // namespace coworkerd

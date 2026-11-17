@@ -249,6 +249,8 @@ with the admin credential it also shows each node's processes and the revision o
 
 ## 13. Troubleshooting
 
+`COWORKERD_STATIC_HEAP_MIB` also bounds ordinary Worker preparation: the large-package lane reserves at most 21/32 of this heap, charging eight times the v2 code bytes plus four times the invocation descriptor. The default 128 MiB fits the maximum 10 MiB code package with a descriptor up to 1 MiB; lowering it can make a package fail with non-retryable `409 LOAD_FAILED`. Startup logs and node state report this check. A separate lane admits up to four small preparations (about 126 KiB of v2 code each under the default heap); a slow startup holds its lane's slot until startup finishes, and medium packages queue behind a large preparation when the byte budget is full.
+
 | Symptom | Remedy |
 | --- | --- |
 | `cannot reach the control plane at http://127.0.0.1:18090` | The cluster is not up, or the control plane's port differs: `docker compose ps`; after changing `COWORKERD_CONTROL_PORT` in `.env`, `cowctl init --tenant T --url http://127.0.0.1:<port> --force` (it writes the whole `cowctl.json` again), or set `COWCTL_CONTROL_PLANE` |

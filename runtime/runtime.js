@@ -1514,6 +1514,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       const error = new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
       if (typeof reply?.error?.name === "string") error.name = reply.error.name;
       if (reply?.error?.noExecution === true) error.coworkerdNoExecution = true;
+      if (reply?.error?.kind === "preparation-limit") error.coworkerdPreparationLimit = true;
       if (reply?.error?.kind === "source") throw staged(reply.error.stage || "package", error);
       if (reply?.error?.kind === "tenant-code") {rootTenantCodeErrors.add(error); throw error;}
       throw staged("package", rootManagementFailure(error, reply?.error?.kind === "plan-missing"));
@@ -1727,9 +1728,9 @@ async function rpcEntrypoint(value, env, ctx) {
   try { selected = await selectedPlain(descriptor, env, ctx); }
   catch (error) {
     if (error?.coworkerdNoExecution === true) {
-      const reply = await dispatchState(descriptor, env, "rejected", rootFailureReason(error));
-      const refused = new Error("CODE_UNAVAILABLE: " + JSON.stringify(reply.refusal));
-      refused.code = "CODE_UNAVAILABLE"; refused.retryable = true;
+      const reply = await dispatchState(descriptor, env, error.coworkerdPreparationLimit ? "load-failed" : "rejected", rootFailureReason(error));
+      const refused = new Error(reply.refusal.code + ": " + JSON.stringify(reply.refusal));
+      refused.code = reply.refusal.code; refused.retryable = reply.refusal.retryable;
       throw refused;
     }
     throw error;
@@ -1769,7 +1770,7 @@ async function serve(request, env, ctx) {
   // A request to an object uses its namespace, public id and data epoch on the shard owner's durable process.
   if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
-  let selected, notExecuted = false, notExecutedReason = "", coldStart = descriptor.coldLoaded === true;
+  let selected, notExecuted = false, preparationLimit = false, notExecutedReason = "", coldStart = descriptor.coldLoaded === true;
   try {
     selected = await selectedPlain(descriptor, env, ctx);
     coldStart = selected.claimCold() || coldStart;
@@ -1778,6 +1779,7 @@ async function serve(request, env, ctx) {
   } catch (error) {
     if (!selected && error?.coworkerdNoExecution === true) {
       notExecuted = true;
+      preparationLimit = error.coworkerdPreparationLimit === true;
       notExecutedReason = rootFailureReason(error);
     } else {throw error;}
   } finally {
@@ -1790,8 +1792,8 @@ async function serve(request, env, ctx) {
     }));
   }
   if (notExecuted) {
-    const reply = await dispatchState(descriptor, env, "rejected", notExecutedReason);
-    return Response.json(reply.refusal, {status:503});
+    const reply = await dispatchState(descriptor, env, preparationLimit ? "load-failed" : "rejected", notExecutedReason);
+    return Response.json(reply.refusal, {status:preparationLimit ? 409 : 503});
   }
 }
 

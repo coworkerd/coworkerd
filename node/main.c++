@@ -426,6 +426,12 @@ bool rerouteAfter(const InvocationRejection& refusal) {
   return refusal.code != "RESULT_UNCERTAIN" && (refusal.code != "LOAD_FAILED" || refusal.category == PACKAGE_UNAVAILABLE);
 }
 
+uint64_t preparationLargeBudget(uint32_t heapMiB) {
+  const auto heap = std::clamp<uint64_t>(heapMiB ? heapMiB : 128, 1, 65536);
+  return std::max<uint64_t>(1, heap * 1024 * 1024 * 21 / 32 / 65536) * 65536;
+}
+constexpr uint64_t MAX_PACKAGE_PREPARATION_BYTES = 84ull * 1024 * 1024;  // 10 MiB code plus a 1 MiB descriptor.
+
 class ServerCore;
 struct AdmissionSlot {
   std::function<void()> release;
@@ -449,7 +455,7 @@ struct AdmissionSlot {
   // turn an uncertain execution into a refusal that placement may retry.
   std::string dispatchReceipt, preparationReason;
   double deadline = 0;
-  bool decided = false, notExecuted = false;
+  bool decided = false, notExecuted = false, preparationLimit = false;
   std::function<void(bool)> executionDecision;
   void decide(bool executed) {
     if (decided) return;
@@ -765,12 +771,12 @@ private:
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
     context.releaseParams();
-    return context.tailCall(kj::mv(request)).attach(kj::defer([slot = slot] { if (slot) slot->decide(true); }));
+    return context.tailCall(kj::mv(request)).attach(kj::defer([slot = slot] { if (auto current = slot.lock()) current->decide(true); }));
   }
 
   capnp::Capability::Client runtimeTarget;
   kj::String descriptor;
-  std::shared_ptr<AdmissionSlot> slot;
+  std::weak_ptr<AdmissionSlot> slot;
 };
 
 // A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
@@ -789,7 +795,7 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot.lock()));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
@@ -797,7 +803,7 @@ public:
 private:
   rpc::EventDispatcher::Client inner;
   kj::String descriptor;
-  std::shared_ptr<AdmissionSlot> slot;
+  std::weak_ptr<AdmissionSlot> slot;
 };
 
 class ServerCore final {
@@ -847,6 +853,7 @@ public:
               << " load-check=" << (this->serverConfig.loadCheck ? "on" : "off") << std::endl;
   }
   ~ServerCore() noexcept(false) {
+    executionLifetime.reset();
     auto& redactions = secretRedactions();
     redactions.stamp = nullptr;
     redactions.values = nullptr;
@@ -991,44 +998,58 @@ public:
   }
 
   kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline) {
-    auto unavailable = co_await desiredState.ensureCode(version, deadline - monotonicTimeMs());
-    if (!unavailable.empty()) co_return unavailable;
-    if (preparationBytes.contains(version.contentHash)) {
+    if (auto known = preparationBytes.find(version.contentHash); known != preparationBytes.end()) {
+      known->second.used = ++preparationByteSequence;
       preparationByteFlights.erase(version.contentHash);
-      co_return std::string();
+      co_return co_await desiredState.ensureCode(version, deadline - monotonicTimeMs());
     }
     auto found = preparationByteFlights.find(version.contentHash);
     if (found == preparationByteFlights.end()) {
-      if (preparationByteFlights.size() >= 16384) co_return std::string("package metadata preparation capacity reached");
-      auto shared = std::make_unique<kj::ForkedPromise<uint64_t>>(preparationMemory(version).fork());
+      if (preparationByteFlights.size() >= 16384) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata capacity reached");
+      auto shared = std::make_unique<kj::ForkedPromise<std::string>>(preparationMemory(version, deadline).fork());
       found = preparationByteFlights.emplace(version.contentHash, std::move(shared)).first;
     }
+    auto* identity = found->second.get();
     auto branch = found->second->addBranch();
-    try { co_await branch; }
-    catch (const kj::Exception&) { preparationByteFlights.erase(version.contentHash); throw; }
-    preparationByteFlights.erase(version.contentHash);
-    co_return std::string();
+    auto reason = co_await branch;
+    auto current = preparationByteFlights.find(version.contentHash);
+    if (current != preparationByteFlights.end() && current->second.get() == identity) preparationByteFlights.erase(current);
+    co_return reason;
   }
-  kj::Promise<uint64_t> preparationMemory(VersionDefinition version) {
-    // The verified package supplies the size. Caller-controlled metadata and
-    // request bodies cannot obtain a smaller reservation in the runtime.
-    auto source = co_await desiredState.source(version);
-    uint64_t bytes = 0;
-    if (version.format == "v2") {
-      try {
-        capnp::MallocMessageBuilder message;
-        auto payload = message.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(source.data(), source.size()), payload);
-        bytes = 0;
-        for (const auto& module : coworkerd::readCodePackage(coworkerd::json::text(payload, "manifest"))) bytes += 8 * module.bytes;
-      } catch (const kj::Exception&) {
-        KJ_FAIL_REQUIRE("verified package metadata unavailable");
+  kj::Promise<std::string> preparationMemory(VersionDefinition version, double deadline) {
+    try {
+      auto unavailable = co_await desiredState.ensureCode(version, deadline - monotonicTimeMs());
+      if (!unavailable.empty()) co_return unavailable;
+      const auto& config = desiredState.config();
+      const bool stored = config.backend == "objectStore";
+      uint64_t bytes = 0;
+      if (version.format == "v2") {
+        const auto path = stored ? config.cache.directory / "packages" / version.contentHash
+            : version.packagePath.empty() ? config.codeDirectory / coworkerd::workerNameOf(version.workerId) / version.versionId / "package.json"
+            : version.packagePath;
+        // Read only the verified manifest, never rebuild/base64/parse the code payload.
+        const auto manifest = readFile(path);
+        KJ_REQUIRE(coworkerd::deploymentSha256(manifest) == version.contentHash, "package manifest changed after verification");
+        for (const auto& module : coworkerd::readCodePackage(manifest)) bytes += 8 * module.bytes;
+      } else {
+        const auto path = stored ? config.cache.directory / version.contentHash
+            : config.codeDirectory / coworkerd::workerNameOf(version.workerId) / version.versionId / version.mainModule;
+        // Worst-case JSON escaping needs six bytes per source byte. No source copy is needed.
+        bytes = 14 * std::filesystem::file_size(path) + 4;
       }
+      if (preparationBytes.size() == 16384) {
+        auto oldest = std::min_element(preparationBytes.begin(), preparationBytes.end(),
+            [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
+        preparationBytes.erase(oldest);
+      }
+      ++preparationByteComputations;
+      preparationBytes[version.contentHash] = {std::max<uint64_t>(1, bytes), ++preparationByteSequence};
+      co_return std::string();
+    } catch (const kj::Exception&) {
+      co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata unavailable");
+    } catch (const std::exception&) {
+      co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata unavailable");
     }
-    if (version.format != "v2") bytes = 2 * source.size() + 2 * jsonEscape(source).size();
-    if (preparationBytes.size() == 16384) preparationBytes.erase(preparationBytes.begin());
-    preparationBytes[version.contentHash] = std::max<uint64_t>(1, bytes);
-    co_return std::max<uint64_t>(1, bytes);
   }
 
   // The executing Server gives a version its secrets from its own deployment
@@ -1597,7 +1618,8 @@ public:
 
   std::shared_ptr<AdmissionSlot> reserve(bool root) {
     if (root) ++inFlightRoots; else ++inFlightNested;
-    auto slot = std::make_shared<AdmissionSlot>([this, root]() {
+    auto slot = std::make_shared<AdmissionSlot>([this, lifetime = std::weak_ptr<int>(executionLifetime), root]() {
+      if (lifetime.expired()) return;
       auto& count = root ? inFlightRoots : inFlightNested;
       KJ_ASSERT(count > 0, "admission count underflow");
       --count;
@@ -2340,6 +2362,13 @@ private:
     auto timing = slot ? slot->timing : nullptr;
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }
     pathMark(timing, "open-execution");
+    if (slot && durable == nullptr) {
+      std::array<unsigned char, 16> receipt;
+      KJ_REQUIRE(RAND_bytes(receipt.data(), receipt.size()) == 1, "dispatch receipt unavailable");
+      static constexpr char HEX[] = "0123456789abcdef";
+      for (auto byte : receipt) { slot->dispatchReceipt += HEX[byte >> 4]; slot->dispatchReceipt += HEX[byte & 15]; }
+      slot->deadline = expiresAtMonotonicMs;
+    }
     auto descriptor = encodeDescriptor(
         *version,
         invocationId,
@@ -2349,7 +2378,8 @@ private:
         orderSequence,
         depth,
         expiresAtMonotonicMs,
-        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable, root);
+        pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable, root,
+        slot ? slot->dispatchReceipt : std::string());
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
@@ -2375,38 +2405,34 @@ private:
       // The load check before this dispatch loaded the version: this call's cold start.
       coldLoaded,
     });
-    const auto record = executions.back();
+    const bool ingress = executions.back().kind == "ingress";
+    const bool peerIngress = ingress && !ingressServerId.empty() && ingressServerId != serverConfig.serverId;
     const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
-    auto decision = [this, version, process, record, invocationId, sequence, grant, remainingAfter,
-                     depth, expiresAtMonotonicMs, ingressServerId, deferredCpu](bool executed) {
+    auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId,
+                     ingress, peerIngress, deferredCpu](bool executed) {
       if (deferredCpu) deferredCpu(executed);
+      if (lifetime.expired()) return;
       pendingPreparations.erase(invocationId);
       if (!executed) {
-        for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = false;
+        std::string treeId;
+        for (auto& item : executions) if (item.invocationId == invocationId) { item.dispatched = false; treeId = item.treeId; }
         process->snapshotAfterFailure();
         leases.erase(invocationId);
-        const auto refusal = this->refusal("CODE_UNAVAILABLE", "Worker preparation unavailable before execution", 503, record.kind == "ingress");
-        observeLocalRefusal(refusal, record.kind == "ingress" ? "localIngress" : "localBinding");
+        const auto current = slotRef.lock();
+        const bool limited = current && current->preparationLimit;
+        const auto refusal = this->refusal(limited ? "LOAD_FAILED" : "CODE_UNAVAILABLE", "Worker preparation unavailable before execution", limited ? 409 : 503, ingress);
+        observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
-                  << "\",\"treeId\":\"" << record.treeId << "\",\"target\":\"" << version->key()
-                  << "\",\"dispatched\":false,\"code\":\"CODE_UNAVAILABLE\",\"observedAtUnixMs\":"
+                  << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
+                  << "\",\"dispatched\":false,\"code\":\"" << refusal.code << "\",\"observedAtUnixMs\":"
                   << wallTimeMsForTest() << "}" << std::endl;
         return;
       }
       if (usage) usage->request(coworkerd::tenantOf(version->workerId));
     };
     if (slot && durable == nullptr) {
-      std::array<unsigned char, 16> receipt;
-      KJ_REQUIRE(RAND_bytes(receipt.data(), receipt.size()) == 1, "dispatch receipt unavailable");
-      static constexpr char HEX[] = "0123456789abcdef";
-      for (auto byte : receipt) { slot->dispatchReceipt += HEX[byte >> 4]; slot->dispatchReceipt += HEX[byte & 15]; }
-      slot->deadline = expiresAtMonotonicMs;
       slot->executionDecision = std::move(decision);
       pendingPreparations[invocationId] = slot;
-      std::string envelope(descriptor.cStr(), descriptor.size());
-      KJ_ASSERT(!envelope.empty() && envelope.back() == '}');
-      envelope.pop_back();
-      descriptor = kj::str(envelope.c_str(), ",\"dispatchReceipt\":\"", slot->dispatchReceipt.c_str(), "\"}");
     } else {
       decision(true);
     }
@@ -2448,12 +2474,14 @@ public:
     auto found = pendingPreparations.find(invocation);
     if (found == pendingPreparations.end()) return std::nullopt;
     auto slot = found->second.lock();
-    if (!slot || slot->decided || receipt != slot->dispatchReceipt || state != "rejected") return std::nullopt;
+    if (!slot || slot->decided || receipt != slot->dispatchReceipt || (state != "rejected" && state != "load-failed")) return std::nullopt;
     slot->preparationReason = cleanReason(reason).substr(0, 300);
+    slot->preparationLimit = state == "load-failed";
     slot->decide(false);
-    auto refused = refusal("CODE_UNAVAILABLE", slot->preparationReason, 503, slot->root);
+    auto refused = refusal(slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE", slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
+    if (slot->preparationLimit) refused.category = "limit";
     auto body = refusalBody(refused, slot->deadline); body.pop_back();
-    body += ",\"dispatched\":false,\"retryable\":true}";
+    body += std::string(",\"dispatched\":false,\"retryable\":") + (slot->preparationLimit ? "false}" : "true}");
     return body;
   }
 
@@ -2589,6 +2617,8 @@ public:
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
            << ",\"bundles\":" << desiredState.bundlesJson()
+           << ",\"preparationMemory\":{\"computations\":" << preparationByteComputations
+           << ",\"entries\":" << preparationBytes.size() << ",\"pending\":" << preparationByteFlights.size() << '}'
            << ",\"deployment\":" << desiredState.json()
            << ",\"generation\":" << desiredState.state().generation()
            << ",\"routeRejections\":" << routeRejectionsJson()
@@ -2851,7 +2881,8 @@ private:
       const SharedVersionPins& pins, const coworkerd::ProcessCall& process,
       const std::string& ingressServerId, const std::string& entrypoint, bool trial = false,
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
-      const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr) const {
+      const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
+      const std::string& dispatchReceipt = {}) const {
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
     descriptor.setServerId(serverConfig.serverId.c_str());
@@ -2919,7 +2950,9 @@ private:
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB);
       auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
       const auto known = preparationBytes.find(version.contentHash);
-      encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second) + '}';
+      encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
+      if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
+      encoded += '}';
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
     }
     // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
@@ -3004,9 +3037,11 @@ private:
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB);
     auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
-      const auto known = preparationBytes.find(version.contentHash);
-      encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second) + '}';
-      return kj::str(plain.descriptor(std::move(encoded)).c_str());
+    const auto known = preparationBytes.find(version.contentHash);
+    encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
+    if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
+    encoded += '}';
+    return kj::str(plain.descriptor(std::move(encoded)).c_str());
   }
 
   void addLease(std::string invocationId, InvocationLeaseState state) {
@@ -3035,8 +3070,11 @@ private:
   coworkerd::MemoryWatermark& memory;
   std::deque<ExecutionRecord> executions;
   std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
-  std::map<std::string, uint64_t> preparationBytes;
-  std::map<std::string, std::unique_ptr<kj::ForkedPromise<uint64_t>>> preparationByteFlights;
+  struct PreparationBytes { uint64_t bytes, used; };
+  std::map<std::string, PreparationBytes> preparationBytes;
+  uint64_t preparationByteSequence = 0, preparationByteComputations = 0;
+  std::map<std::string, std::unique_ptr<kj::ForkedPromise<std::string>>> preparationByteFlights;
+  std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
   std::deque<DebitRecord> debits;
   std::map<std::string, InvocationLeaseState> leases;
   std::priority_queue<
@@ -8335,6 +8373,13 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   // The steady-state table of the same build, beside it as well.
   if (pool.steadyAllowlistPath.empty()) pool.steadyAllowlistPath = (executableDirectory() / "coworkerd-syscalls-steady.txt").string();
   pool.validate();
+  const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
+  std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
+            << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
+            << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
+  if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
+    std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
+  std::cout << '}' << std::endl;
 }
 
 // The shortest text that reads back as the same double (0.05, not 0.050000000000000003).
@@ -8390,6 +8435,9 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"longPauseMs\":" << p.gcLongPauseMs << ",\"idleCollectAfterMs\":" << p.gcIdleCollectAfterMs
       << ",\"idleCollectMinGrowthMiB\":" << p.gcIdleCollectMinGrowthMiB << ",\"initialOldSpaceMiB\":" << p.gcInitialOldSpaceMiB
       << ",\"runtimeHeapMiB\":" << p.gcRuntimeHeapMiB
+      << ",\"preparationLargeBudgetBytes\":" << preparationLargeBudget(p.gcRuntimeHeapMiB)
+      << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
+      << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << b(preparationLargeBudget(p.gcRuntimeHeapMiB) >= MAX_PACKAGE_PREPARATION_BYTES)
       << "},\"sandbox\":{\"mode\":" << q(p.sandboxMode) << ",\"launcherPath\":" << q(p.launcherPath)
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
