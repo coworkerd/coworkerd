@@ -771,14 +771,15 @@ private:
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
     context.releaseParams();
-    // Retain admission only while this binding request is outstanding. The
-    // returned target and any tenant capabilities retain only the weak handle.
-    return context.tailCall(kj::mv(request)).attach(kj::defer([current = slot.lock()] { if (current) current->decide(true); }));
+    // The dispatcher is gone before the first pipelined property call arrives.
+    // Transfer its one-shot reservation into this outstanding request; the
+    // top-level target and returned tenant capabilities then hold none.
+    return context.tailCall(kj::mv(request)).attach(kj::defer([current = std::move(slot)] { if (current) current->decide(true); }));
   }
 
   capnp::Capability::Client runtimeTarget;
   kj::String descriptor;
-  std::weak_ptr<AdmissionSlot> slot;
+  std::shared_ptr<AdmissionSlot> slot;
 };
 
 // A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
