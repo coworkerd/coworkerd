@@ -43,11 +43,12 @@ struct RootDispatch {
   std::string descriptor(std::string encoded) const;
 };
 
-// Owned by one node's event loop. A new catalogue generation invalidates every
-// entry, including changes to declared secrets, variables and namespace state.
+// Owned by one node's event loop. A new catalogue revision or generation
+// invalidates every entry, including environment and namespace changes.
 struct PlainPlanCache {
   using Key = std::tuple<std::string, std::string, std::string, uint32_t, uint32_t>;
   std::optional<uint64_t> generation;
+  std::optional<uint64_t> revision;
   std::map<Key, std::string> plans;
 };
 
