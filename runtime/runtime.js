@@ -1459,11 +1459,17 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   const cacheKey = JSON.stringify([base.workerId, base.versionId, base.versionFingerprint,
     base.creationRecord?.generation ?? 0, base.creationRecord?.cpuLimitMs, base.creationRecord?.memoryLimitMib]);
   const nonce = crypto.randomUUID();
-  const select = item => env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
+  const select = async item => {
+    try {return await env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
     plan: item.plan, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
     activePlan: !options.rootTrial && descriptor.rootSelection.activePlan === true,
-    trial: options.trial === true, rootTrial: options.rootTrial === true, classes: descriptor.durableObjectClasses ?? []}));
+    trial: options.trial === true, rootTrial: options.rootTrial === true, classes: descriptor.durableObjectClasses ?? []}));}
+    catch (error) {
+      if (rootPreparationKind(error, nonce) === "platform") throw staged("package", rootManagementFailure(new Error(rootFailureReason(error))));
+      throw error;
+    }
+  };
   const remember = item => {
     plainPlanKeys.delete(cacheKey); plainPlanKeys.set(cacheKey, item);
     if (plainPlanKeys.size > MAX_ROOT_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
@@ -1510,7 +1516,11 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
     item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
     try {return await chosen(item);}
-    catch (error) {plainPlanKeys.delete(cacheKey);if (!missing(error) || attempt) throw error;}
+    catch (error) {
+      plainPlanKeys.delete(cacheKey);
+      if (!missing(error)) throw error;
+      if (attempt) throw staged("package", rootManagementFailure(new Error(rootFailureReason(error)), true));
+    }
   }
 }
 

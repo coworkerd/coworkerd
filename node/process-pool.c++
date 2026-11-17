@@ -2993,19 +2993,25 @@ public:
     // Without an event channel no `completed` row arrives: background work is invisible, so the
     // generation keeps the whole drain period. (Every generation has one.)
     if (!old.contextsVisible) return now - since >= periodMs;
-    if (old.openContexts.empty()) return true;
     if (now - lastLifecycleCheck < 100) return false;
     lastLifecycleCheck = now;
     // Inspect each resident instance separately. A partially tagged instance retains
     // its own contexts; unrelated tagged instances remain usable for the decision.
     const auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
+    bool unknownResidents = false;
     try {
       capnp::MallocMessageBuilder arena;
       auto value = arena.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
       const auto workers = json::field(value, "residentWorkers");
       if (!workers.isArray()) return false;
+      for (auto resident : workers.getArray()) {
+        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId"), revision = json::field(resident, "planRevision");
+        if (!worker.isString() || worker.getString().size() == 0 || !version.isString() || version.getString().size() == 0 ||
+            !revision.isString() || revision.getString().size() == 0 || !json::field(resident, "loadGeneration").isNumber() ||
+            !json::field(resident, "instance").isNumber()) unknownResidents = true;
+      }
       const bool legacyWouldDrain = std::all_of(old.openContexts.begin(), old.openContexts.end(), [&](const auto& entry) {
         const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
         return entry.second.finishedAt != 0 && lifecycle.find(marker) == std::string::npos;
@@ -3030,10 +3036,10 @@ public:
         ++old.contextsCleared; ++cleared;
         return true;
       });
-      if (legacyWouldDrain != old.openContexts.empty()) ++legacyDrainDisagreements;
+      if (legacyWouldDrain != (old.openContexts.empty() && !unknownResidents)) ++legacyDrainDisagreements;
     } catch (const kj::Exception&) {return false;}
 
-    return old.openContexts.empty();
+    return old.openContexts.empty() && !unknownResidents;
   }
   void closeConnections(ProcessGeneration& p) {
     p.runtime.reset();
@@ -3513,11 +3519,11 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
         if (typed) ++impl->lifecycleLabels.typed;
         else ++impl->lifecycleLabels.missing;
         const auto at = isolate.find('@');
-        if (typed) {
-          const auto owner = json::field(entry, "tenant");
-          const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) : tenantOf(worker.getString().cStr());
-          if (!tenant.empty()) ++counts[tenant];
-        }
+        const auto owner = json::field(entry, "tenant");
+        const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) :
+            worker.isString() ? tenantOf(worker.getString().cStr()) : std::string();
+        // A partial label still charges this known owner; it cannot silently disappear.
+        if (!tenant.empty()) ++counts[tenant];
         if (at == std::string::npos) continue;
         const auto colon = isolate.rfind(':', at);
         const auto legacyWorker = isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1));
