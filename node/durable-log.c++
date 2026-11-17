@@ -5484,6 +5484,7 @@ void DurableLog::pumpAlarmFires() {
     bool takePreparation = preparation != alarmPreparationQueue.end();AlarmBucketKey bucket;
     if (takePreparation) {
       const auto tenantName = preparation->first;
+      lastAlarmPreparationTenant = tenantName;
       const auto key = preparation->second.begin()->second;auto entry = alarms.find(key);
       KJ_REQUIRE(entry != alarms.end());indexAlarm(key, entry->second);
       entry = alarms.find(key);if (entry == alarms.end() || !entry->second.indexed) continue;
@@ -5505,11 +5506,10 @@ void DurableLog::pumpAlarmFires() {
     refreshAlarmBucket(bucket);auto b = alarmBuckets.find(bucket);if (b == alarmBuckets.end() || !b->second.ready) continue;
     const auto key = std::get<2>(b->second.head);auto& state = alarms.at(key);
     const bool locallyReady = alarmLocallyReady(state);
-    if (!locallyReady && !coldRoom) {
+    if (!locallyReady && (!coldRoom || (!takePreparation && !alarmPreparationQueue.empty()))) {
       unindexAlarm(key, state);state.dueObserved = true;state.preparationWaiting = true;
       if (alarmPreparationQueue[state.tenant].emplace(state.atUnixMs, key).second) ++alarmPreparationCount;continue;
     }
-    if (!locallyReady) lastAlarmPreparationTenant = state.tenant;
     const auto token = state.fireToken = ++alarmFireSerial;std::vector<std::string> probes;
     for (const auto& gateKey: {std::string("node"), std::string("process:") + state.destination}) {
       auto gate = alarmCapacityGates.find(gateKey);
