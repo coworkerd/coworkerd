@@ -3896,7 +3896,23 @@ kj::Promise<std::string> ProcessPool::closeDurable() {
   impl->refresh();
   impl->durableClosed = true;
   if (impl->rotation && impl->slots[impl->rotation->slot].durable) impl->abortRotation(mono());
-  return impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
+  // Shard release also waits for the bounded Native activity aggregate. The
+  // node's drain controller owns the deadline and kills/closes any remaining
+  // generation there; raw in-flight calls alone omit post-response waitUntil.
+  const auto since = mono();
+  std::map<ProcessGeneration*, double> checked;
+  while (true) {
+    impl->refresh();
+    bool quiet = true;
+    const auto now = mono();
+    for (auto& s : impl->slots) if (s.durable) Impl::eachGeneration(s, [&](const auto& p) {
+      if (p->pid == 0 || p->state == "killed") return;
+      quiet = impl->generationDrained(*p, since, now, UINT32_MAX, checked[p.get()], impl->shutdownClearedContexts) && quiet;
+    });
+    if (quiet) break;
+    co_await impl->provider.getTimer().afterDelay(20 * kj::MILLISECONDS);
+  }
+  co_return co_await impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
 }
 
 kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(const Slot&)> which) {
