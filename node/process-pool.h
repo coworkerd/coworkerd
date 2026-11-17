@@ -123,7 +123,7 @@ public:
   uint32_t resetDurable(const std::string& reason);
   // The drain's close of the durable processes alone (as closeAll() closes every process), before the node lets its
   // shards go: no durable generation starts from then on. Resolves with the record once they exited.
-  kj::Promise<std::string> closeDurable();
+  kj::Promise<std::string> closeDurable(double deadlineMonotonicMs);
   // The Durable Object log channel (node/durable-log.h): a durable process inherits one end of a socket under
   // descriptor 9 and ships its objects' WAL frames over it. `open` gives the descriptor the child is to inherit
   // (-1: this node ships nothing), `close` is called when a generation is gone, and the settings the processes read

@@ -3892,27 +3892,49 @@ kj::Promise<std::string> ProcessPool::closeAll() {
   return impl->closeGenerations([](const Impl::Slot&) { return true; });
 }
 
-kj::Promise<std::string> ProcessPool::closeDurable() {
+kj::Promise<std::string> ProcessPool::closeDurable(double deadline) {
   impl->refresh();
   impl->durableClosed = true;
   if (impl->rotation && impl->slots[impl->rotation->slot].durable) impl->abortRotation(mono());
   // Shard release also waits for the bounded Native activity aggregate. The
-  // node's drain controller owns the deadline and kills/closes any remaining
-  // generation there; raw in-flight calls alone omit post-response waitUntil.
+  // same deadline bounds this wait and the node's drain. After it expires the
+  // processes still close, so sealing and shard release can always proceed.
   const auto since = mono();
   std::map<ProcessGeneration*, double> checked;
-  while (true) {
+  bool quiet = false;
+  const auto period = static_cast<uint32_t>(std::clamp(std::ceil(deadline - since), 0.0, double(UINT32_MAX)));
+  while (mono() < deadline) {
     impl->refresh();
-    bool quiet = true;
+    quiet = true;
     const auto now = mono();
     for (auto& s : impl->slots) if (s.durable) Impl::eachGeneration(s, [&](const auto& p) {
       if (p->pid == 0 || p->state == "killed") return;
-      quiet = impl->generationDrained(*p, since, now, UINT32_MAX, checked[p.get()], impl->shutdownClearedContexts) && quiet;
+      quiet = impl->generationDrained(*p, since, now, period, checked[p.get()], impl->shutdownClearedContexts) && quiet;
     });
     if (quiet) break;
-    co_await impl->provider.getTimer().afterDelay(20 * kj::MILLISECONDS);
+    const auto waitMicros = static_cast<int64_t>(std::max(0.0, std::min(20.0, deadline - mono())) * 1000);
+    co_await impl->provider.getTimer().afterDelay(waitMicros * kj::MICROSECONDS);
   }
-  co_return co_await impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
+  std::ostringstream remaining;
+  remaining << std::setprecision(17) << "{\"startedAtMonotonicMs\":" << since << ",\"deadlineMonotonicMs\":" << deadline
+            << ",\"finishedAtMonotonicMs\":" << mono() << ",\"deadlineReached\":" << (!quiet ? "true" : "false") << ",\"generations\":[";
+  size_t count = 0;
+  for (const auto& s : impl->slots) if (s.durable) Impl::eachGeneration(s, [&](const auto& p) {
+    const auto snapshot = p->lifecycle.readDrain();
+    const bool fresh = snapshot && snapshot->observedMs >= std::max(since, p->lastDurableReplyAt);
+    if (p->inFlight == 0 && fresh && !snapshot->active && !snapshot->background && !snapshot->unknown) return;
+    remaining << (count++ ? "," : "") << "{\"processId\":\"" << p->id << "\",\"generation\":" << p->generation
+              << ",\"pid\":" << p->pid << ",\"state\":\"" << p->state << "\",\"inFlight\":" << p->inFlight
+              << ",\"nativeSnapshotFresh\":" << (fresh ? "true" : "false");
+    if (snapshot) remaining << ",\"nativeObservedAtMonotonicMs\":" << snapshot->observedMs << ",\"nativeActive\":" << snapshot->active
+                            << ",\"nativeBackground\":" << snapshot->background << ",\"nativeUnknown\":" << snapshot->unknown;
+    remaining << '}';
+  });
+  remaining << "]}";
+  auto closed = co_await impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
+  KJ_ASSERT(!closed.empty() && closed.back() == '}');
+  closed.pop_back();
+  co_return closed + ",\"drain\":" + remaining.str() + '}';
 }
 
 kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(const Slot&)> which) {
