@@ -864,7 +864,13 @@ ${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""
 ${RPC_SOURCE}
 ${DURABLE_SOURCE}
 ${root ? classes.map(name => `const ${DURABLE_EXPORT_PREFIX}${name} = __coworkerdDurableClass(tenant, ${JSON.stringify(name)});\nexport { ${DURABLE_EXPORT_PREFIX}${name}, ${DURABLE_EXPORT_PREFIX}${name} as ${name} };\n`).join("") : ""}
-${root ? `const __coworkerdRootTrialNamespace = { ...tenant, ${classes.map(name => `${JSON.stringify(name)}: ${DURABLE_EXPORT_PREFIX}${name}`).join(", ")} };` : ""}
+${root ? `const __coworkerdRootTrialNamespace = { ...tenant, ${classes.map(name => `${JSON.stringify(name)}: ${DURABLE_EXPORT_PREFIX}${name}`).join(", ")} };` : `let __coworkerdRootTrialNamespace = tenant, __coworkerdRootTrialError;
+if (${JSON.stringify(classes)}.length) {
+  try { __coworkerdRootTrialNamespace = { ...tenant,
+    ...Object.fromEntries(${JSON.stringify(classes)}.map(name => [name, __coworkerdDurableClass(tenant, name)])) }; }
+  catch (error) { __coworkerdRootTrialError = {name: error.name,
+    message: "Failed to start Worker:\\nUncaught " + String(error.stack || (error.name + ": " + error.message))}; }
+}`}
 function __coworkerdEnvOf(variables, props) {
   const { bindings, durableObjects } = props;
   return { ...variables, ...__coworkerdServices(bindings), ...__coworkerdNamespaces(durableObjects) };
@@ -873,9 +879,10 @@ export default class extends WorkerEntrypoint {
   fetch(request) {
     const variables = this.env, ctx = this.ctx;
     if (ctx.props.trial === true) {
-      const namespace = ctx.props.rootTrial === true ? { ...tenant,
-        ...Object.fromEntries(${JSON.stringify(classes)}.map(name => [name, __coworkerdDurableClass(tenant, name)])) } : tenant;
-      return __coworkerdTrial(namespace, true, ctx.props.entrypoint, ctx.props.classes);
+      ${root ? "" : `if (ctx.props.rootTrial === true && __coworkerdRootTrialError)
+        return Response.json({ok:false, stage:"load", ...__coworkerdRootTrialError});`}
+      return __coworkerdTrial(ctx.props.rootTrial === true ? __coworkerdRootTrialNamespace : tenant,
+        true, ctx.props.entrypoint, ctx.props.classes);
     }
     const entrypoint = ctx.props.entrypoint;
     const env = __coworkerdEnvOf(variables, ctx.props);
