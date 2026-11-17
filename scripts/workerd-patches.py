@@ -41,6 +41,7 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0037-preparation-io-turn.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0036-bounded-preparation-completion.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0035-preparation-failure-recovery.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0033-owned-preparation-and-demand-drain.patch": frozenset({"src/workerd/server/server/root_loader.rs", "src/workerd/server/server/bridge.rs"}),
