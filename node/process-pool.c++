@@ -243,6 +243,29 @@ public:
     }
     return {};
   }
+  // Read only the bounded aggregate prefix, checking the same publication sequence
+  // and the final completion marker. No full snapshot copy/parse is needed for d.
+  std::string readDrain() const {
+    if (!base) return {};
+    constexpr std::string_view trailer = ",\"drainSnapshotComplete\":true}";
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      const auto published = __atomic_load_n(reinterpret_cast<const uint64_t*>(base), __ATOMIC_ACQUIRE);
+      if (!published) return {};
+      const char* buffer = base + 64 + (published % 2) * (16 + size_t(CAPACITY));
+      const auto before = __atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_ACQUIRE);
+      if (before & 1) continue;
+      const auto length = __atomic_load_n(reinterpret_cast<const uint32_t*>(buffer + 8), __ATOMIC_RELAXED);
+      if (length > CAPACITY || length < trailer.size()) return {};
+      std::string prefix(buffer + 16, std::min<size_t>(length, 512));
+      const bool complete = std::string_view(buffer + 16 + length - trailer.size(), trailer.size()) == trailer;
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_RELAXED) != before) continue;
+      const auto end = prefix.find("},\"pid\":");
+      if (!complete || !prefix.starts_with("{\"drain\":{") || end == std::string::npos) return {};
+      prefix.resize(end + 1); prefix += '}'; return prefix;
+    }
+    return {};
+  }
 private:
   char* base = nullptr;
 };
@@ -847,6 +870,7 @@ struct ProcessGeneration {
   // from its cpu-progress rows, until its completed row comes.
   std::unordered_map<std::string, uint64_t> meteredCpu;
   uint64_t contextsCompleted = 0, contextsCleared = 0, contextsDropped = 0;
+  double lastDurableReplyAt = 0;
   double drainLifecycleCheck = 0;  // the Server drain's lifecycle reads
   // The workerd file the Server opened for this generation: its identity, which becomes the
   // generation's `binary` once the generation is ready (an identity is attached after the probe).
@@ -1115,8 +1139,11 @@ void ProcessCall::finish() {
   if (dispatched) {
     if (process->recentDispatched.size() == 4096) process->recentDispatched.pop_front();
     process->recentDispatched.push_back({workerId, versionId, invocationId});
-    auto open = process->openContexts.find(invocationId);
-    if (open != process->openContexts.end()) open->second.finishedAt = mono();
+    if (process->durable) process->lastDurableReplyAt = mono();
+    else {
+      auto open = process->openContexts.find(invocationId);
+      if (open != process->openContexts.end()) open->second.finishedAt = mono();
+    }
   }
   process->calls.erase(invocationId);
 }
@@ -2602,7 +2629,7 @@ public:
         if (name.isString() && owner.isString() && revision.isString() && std::string(name.getString().cStr()) == isolate &&
             std::string(owner.getString().cStr()) == worker && std::string(revision.getString().cStr()) == version) {
           if (!legacy) ++legacyLimitDisagreements;
-          return true;
+          return !process.durable;
         }
       }
     } catch (const kj::Exception&) {}
@@ -2990,59 +3017,72 @@ public:
       double& lastLifecycleCheck, uint64_t& cleared) {
     old.pullEvents();
     if (old.inFlight > 0) return false;
-    // Without an event channel no `completed` row arrives: background work is invisible, so the
-    // generation keeps the whole drain period. (Every generation has one.)
+    // Ordinary generations retain the original fast path when no context remains.
+    if (!old.durable && old.openContexts.empty()) return true;
     if (!old.contextsVisible) return now - since >= periodMs;
     if (now - lastLifecycleCheck < 100) return false;
     lastLifecycleCheck = now;
-    // Inspect each resident instance separately. A partially tagged instance retains
-    // its own contexts; unrelated tagged instances remain usable for the decision.
+    if (old.durable) {
+      const auto snapshot = old.lifecycle.readDrain();
+      if (snapshot.empty()) return false;
+      try {
+        capnp::MallocMessageBuilder arena;
+        auto value = arena.initRoot<capnp::JsonValue>();
+        capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
+        const auto summary = json::field(value, "drain");
+        const auto observed = json::field(summary, "observedAtMonotonicMs");
+        const auto background = json::field(summary, "backgroundActive"), unknown = json::field(summary, "unknownBusy");
+        const bool result = observed.isNumber() && observed.getNumber() >= old.lastDurableReplyAt &&
+            background.isBoolean() && !background.getBoolean() && unknown.isBoolean() && !unknown.getBoolean();
+        ++legacyDrainChecks;
+        // The old durable path registered no invocation contexts and drained at inFlight == 0.
+        if (!result) ++legacyDrainDisagreements;
+        return result;
+      } catch (const kj::Exception&) { return false; }
+    }
     const auto lifecycle = old.lifecycle.read();
     if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
-    bool unknownResidents = false;
     try {
       capnp::MallocMessageBuilder arena;
       auto value = arena.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
       const auto workers = json::field(value, "residentWorkers");
       if (!workers.isArray()) return false;
+      std::set<std::string> owners, legacyOwners;
+      bool unknownBusy = false;
       for (auto resident : workers.getArray()) {
-        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId"), revision = json::field(resident, "planRevision"), tenant = json::field(resident, "tenant");
-        if (!tenant.isString() || tenant.getString().size() == 0 || !worker.isString() || worker.getString().size() == 0 || !version.isString() || version.getString().size() == 0 ||
-            !revision.isString() || revision.getString().size() == 0 || !json::field(resident, "loadGeneration").isNumber() ||
-            !json::field(resident, "instance").isNumber()) unknownResidents = true;
+        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
+        const auto revision = json::field(resident, "planRevision"), tenant = json::field(resident, "tenant");
+        const auto active = json::field(resident, "active"), background = json::field(resident, "backgroundActive");
+        const bool typed = tenant.isString() && tenant.getString().size() && worker.isString() && worker.getString().size() &&
+            version.isString() && version.getString().size() && revision.isString() && revision.getString().size() &&
+            json::field(resident, "loadGeneration").isNumber() && json::field(resident, "instance").isNumber();
+        const bool busy = (active.isNumber() && active.getNumber() > 0) || (background.isBoolean() && background.getBoolean());
+        if (!typed) {unknownBusy |= busy; continue;}
+        owners.insert(std::string(worker.getString().cStr()) + "@" + version.getString().cStr());
+        const auto name = json::field(resident, "isolate");
+        if (name.isString()) {
+          const std::string isolate = name.getString().cStr();
+          if (isolate.starts_with("coworkerd-v1:")) {
+            const auto hash = isolate.find('#');
+            if (hash != std::string::npos) legacyOwners.insert(isolate.substr(13, hash - 13));
+          }
+        }
       }
+      if (unknownBusy) return false;
       const bool legacyWouldDrain = std::all_of(old.openContexts.begin(), old.openContexts.end(), [&](const auto& entry) {
-        const auto marker = "\"isolate\":\"coworkerd-v1:" + entry.second.workerId + "@" + entry.second.versionId + "#";
-        return entry.second.finishedAt != 0 && lifecycle.find(marker) == std::string::npos;
+        return entry.second.finishedAt != 0 && !legacyOwners.contains(entry.second.workerId + "@" + entry.second.versionId);
       });
       ++legacyDrainChecks;
       std::erase_if(old.openContexts, [&](const auto& entry) {
-        if (entry.second.finishedAt == 0) return false;
-        for (auto resident : workers.getArray()) {
-          const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
-          const auto active = json::field(resident, "active"), background = json::field(resident, "backgroundActive");
-          const bool busy = (active.isNumber() && active.getNumber() > 0) || (background.isBoolean() && background.getBoolean());
-          if (!worker.isString() || worker.getString().size() == 0 || !version.isString()) {
-            if (busy) return false;
-            continue;
-          }
-          if (std::string(worker.getString().cStr()) != entry.second.workerId || std::string(version.getString().cStr()) != entry.second.versionId) continue;
-          const auto revision = json::field(resident, "planRevision");
-          if (!revision.isString() || revision.getString().size() == 0 ||
-              !json::field(resident, "loadGeneration").isNumber() || !json::field(resident, "instance").isNumber()) return false;
-          const auto observed = json::field(value, "observedAtMonotonicMs");
-          if (!old.durable || !observed.isNumber() || observed.getNumber() < entry.second.finishedAt ||
-              !background.isBoolean() || background.getBoolean()) return false;
-        }
-        ++old.contextsCleared; ++cleared;
-        return true;
+        if (!entry.second.finishedAt || owners.contains(entry.second.workerId + "@" + entry.second.versionId)) return false;
+        ++old.contextsCleared; ++cleared; return true;
       });
-      if (legacyWouldDrain != (old.openContexts.empty() && !unknownResidents)) ++legacyDrainDisagreements;
+      if (legacyWouldDrain != old.openContexts.empty()) ++legacyDrainDisagreements;
     } catch (const kj::Exception&) {return false;}
-
-    return old.openContexts.empty() && !unknownResidents;
+    return old.openContexts.empty();
   }
+
   void closeConnections(ProcessGeneration& p) {
     p.runtime.reset();
     p.probeClient = nullptr;
@@ -3549,7 +3589,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   ++p->dispatched;
   // Object contexts outlive replies. Their instance labels and observed background
   // activity let rotation wait for remaining work without waiting for idle actors.
-  if (p->contextsVisible) {
+  if (p->contextsVisible && !p->durable) {
     const auto ticket = p->quarantine && call->invocationId.find("-invocation-") != std::string::npos
         ? impl->suspects.probationTicket(tenantOf(call->workerId)) : 0;
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};

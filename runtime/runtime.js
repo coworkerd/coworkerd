@@ -1447,6 +1447,7 @@ function rootManagementFailure(error, missing = false) {
 }
 const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
+const MAX_PLAIN_PLAN_KEYS = 16384;
 const plainPlanKeys = new Map();
 
 const plainColdLoads = new Map();
@@ -1459,7 +1460,7 @@ function claimPlainCold(item, cacheKey) {
   if (remembered?.plan === item.plan && remembered.generation === item.generation) remembered.cold = false;
   if (plainColdLoads.get(item.plan) === item.generation) return false;
   plainColdLoads.delete(item.plan); plainColdLoads.set(item.plan, item.generation);
-  if (plainColdLoads.size > MAX_ROOT_PLAN_KEYS) plainColdLoads.delete(plainColdLoads.keys().next().value);
+  if (plainColdLoads.size > MAX_PLAIN_PLAN_KEYS) plainColdLoads.delete(plainColdLoads.keys().next().value);
   return cold;
 }
 
@@ -1484,7 +1485,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   };
   const remember = item => {
     plainPlanKeys.delete(cacheKey); plainPlanKeys.set(cacheKey, item);
-    if (plainPlanKeys.size > MAX_ROOT_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
+    if (plainPlanKeys.size > MAX_PLAIN_PLAN_KEYS) plainPlanKeys.delete(plainPlanKeys.keys().next().value);
     return item;
   };
   const chosen = async item => ({fetcher: await select(item), generation: item.generation,
@@ -1512,17 +1513,31 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   };
   // Only preparation is repeated. No event has been delivered on either attempt.
   for (let attempt = 0; attempt < 2; ++attempt) {
-    let reply = await manage("lookup", base);
+    let reply;
+    for (;;) {
+      reply = await manage("lookup", {...base, preparationOwner: nonce});
+      if (reply.plan !== null && reply.info?.loaded === true) break;
+      if (reply.preparation?.owned === true) break;
+      if (reply.preparation?.owned !== false)
+        throw staged("package", rootManagementFailure(new Error("Invalid ordinary preparation reservation")));
+      // This caller owns its own wait; Native owns the bounded reservation, never a JS promise.
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
     if (reply.plan === null || reply.info?.loaded !== true) {
-      let code;
-      try {code = await makeWorkerCode(descriptor, env, ctx);}
-      catch (error) {throw staged(stageOf(error), error);}
-      const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
-      reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
-        compatibilityFlags: code.compatibilityFlags, environment: code.env,
-        startupIdentity: JSON.stringify({workerId: descriptor.workerId, versionId: descriptor.versionId,
-          invocationId: descriptor.invocationId}),
-        modules: names.map(name => rootModule(name, code.modules[name]))});
+      try {
+        let code;
+        try {code = await makeWorkerCode(descriptor, env, ctx);}
+        catch (error) {throw staged(stageOf(error), error);}
+        const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+        reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
+          compatibilityFlags: code.compatibilityFlags, environment: code.env, preparationOwner: nonce,
+          startupIdentity: JSON.stringify({workerId: descriptor.workerId, versionId: descriptor.versionId,
+            invocationId: descriptor.invocationId}),
+          modules: names.map(name => rootModule(name, code.modules[name]))});
+      } finally {
+        await env.ROOTS.fetch("http://roots/release-preparation", {method:"POST",
+          body:JSON.stringify({...base,preparationOwner:nonce})}).catch(() => {});
+      }
     }
     if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
       throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
@@ -1712,18 +1727,21 @@ async function serve(request, env, ctx) {
   // A request to an object uses its namespace, public id and data epoch on the shard owner's durable process.
   if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   const pathTiming = env.PATH_TIMING === "1" ? { receivedAtUnixMs: Date.now(), receivedMonotonicMs: performance.now() } : undefined;
-  const selected = await selectedPlain(descriptor, env, ctx);
-  const coldStart = selected.claimCold() || descriptor.coldLoaded === true;
-  if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
-  return selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) }).finally(() => {
+  let selected, coldStart = descriptor.coldLoaded === true;
+  try {
+    selected = await selectedPlain(descriptor, env, ctx);
+    coldStart = selected.claimCold() || coldStart;
+    if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
+    return await selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) });
+  } finally {
     console.log("[runtime-execution] " + JSON.stringify({
       serverId: descriptor.serverId, processId: env.PROCESS_ID,
       processGeneration: Number(env.PROCESS_GENERATION), invocationId: descriptor.invocationId,
       treeId: descriptor.treeId, target: `${descriptor.workerId}@${descriptor.versionId}`,
-      coldStart, loadGeneration: selected.generation, observedAtUnixMs: Date.now(),
+      coldStart, loadGeneration: selected?.generation ?? null, observedAtUnixMs: Date.now(),
       ...(pathTiming ? { pathTiming: { ...pathTiming, returnedAtUnixMs: Date.now(), returnedMonotonicMs: performance.now() } } : {}),
     }));
-  });
+  }
 }
 
 // LOADER belongs only to this platform runtime; tenant env/props contain no WorkerLoader or WorkerStub.
