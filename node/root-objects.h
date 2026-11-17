@@ -4,8 +4,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 
 namespace coworkerd {
 
@@ -41,10 +43,19 @@ struct RootDispatch {
   std::string descriptor(std::string encoded) const;
 };
 
+// Owned by one node's event loop. A new catalogue generation invalidates every
+// entry, including changes to declared secrets, variables and namespace state.
+struct PlainPlanCache {
+  using Key = std::tuple<std::string, std::string, std::string, uint32_t, uint32_t>;
+  std::optional<uint64_t> generation;
+  std::map<Key, std::string> plans;
+};
+
 std::string plainEnvironmentRevision(const DeploymentState& catalog, const VersionDefinition& version);
 
 RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
-    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib);
+    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
+    PlainPlanCache* cache = nullptr);
 
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,

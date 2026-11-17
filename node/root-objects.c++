@@ -117,15 +117,26 @@ std::string plainEnvironmentRevision(const DeploymentState& catalog, const Versi
 }
 
 RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
-    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib) {
+    const VersionPins& pins, uint32_t cpuLimitMs, uint32_t memoryLimitMib, PlainPlanCache* cache) {
   using json::quote;
-  const auto tenant = tenantOf(version.workerId);
-  const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
+  const PlainPlanCache::Key key{version.workerId, version.versionId, version.definitionHash, cpuLimitMs, memoryLimitMib};
+  const std::string* cached = nullptr;
+  if (cache) {
+    if (cache->generation != catalog.generation()) {
+      cache->plans.clear();
+      cache->generation = catalog.generation();
+    }
+    const auto found = cache->plans.find(key);
+    if (found != cache->plans.end()) cached = &found->second;
+  }
   auto target = [&](const std::string& entrypoint, const std::string& props) {
     return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
   };
   std::ostringstream plan, services, objects;
-  plan << "{\"kind\":\"tenant\",\"tenant\":" << quote(tenant)
+  if (!cached) {
+    const auto tenant = tenantOf(version.workerId);
+    const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
+    plan << "{\"kind\":\"tenant\",\"tenant\":" << quote(tenant)
       << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
       << ",\"compatibilityDate\":" << quote(version.compatibilityDate)
       << ",\"compatibilityFlags\":[],\"modules\":[],\"namespaces\":[],\"structuredProps\":"
@@ -135,12 +146,15 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
       << ",\"cpuLimitMs\":" << cpuLimitMs << ",\"memoryLimitMib\":" << memoryLimitMib << '}'
       << ",\"globalOutbound\":" << target("Egress", identity)
       << ",\"streamingTail\":" << target("TenantLog", identity) << ",\"serviceBindings\":[";
+  }
   bool first = true;
   for (const auto& binding : version.bindings) {
-    const auto props = "{\"workerId\":"+quote(binding.assets ? version.workerId : binding.workerId)+
-        ",\"entrypoint\":"+quote(binding.entrypoint)+(binding.assets ? ",\"assets\":true}" : "}");
-    plan << (first ? "" : ",") << "{\"metadata\":{\"name\":" << quote(binding.name)
-        << "},\"target\":" << target("BoundWorker", props) << '}';
+    if (!cached) {
+      const auto props = "{\"workerId\":"+quote(binding.assets ? version.workerId : binding.workerId)+
+          ",\"entrypoint\":"+quote(binding.entrypoint)+(binding.assets ? ",\"assets\":true}" : "}");
+      plan << (first ? "" : ",") << "{\"metadata\":{\"name\":" << quote(binding.name)
+          << "},\"target\":" << target("BoundWorker", props) << '}';
+    }
     // Trials do not dispatch bindings and may not have acquired a call-tree lease yet.
     auto resolved = binding.assets ? std::optional<VersionPin>(versionPin(version)) :
         pins.contains(binding.workerId) ? std::optional<VersionPin>(pins.at(binding.workerId)) : std::nullopt;
@@ -152,28 +166,40 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
     }
     first = false;
   }
-  plan << "],\"durableObjects\":[";first = true;
+  if (!cached) plan << "],\"durableObjects\":[";
+  first = true;
   for (const auto& binding : version.durableObjects) {
-    const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
-        ",\"database\":"+quote(binding.database)+'}';
-    const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
-        ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
-        ",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
-    plan << (first ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":" << target("DurableNamespace", props) << '}';
+    if (!cached) {
+      const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
+          ",\"database\":"+quote(binding.database)+'}';
+      const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
+          ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
+          ",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
+      plan << (first ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":" << target("DurableNamespace", props) << '}';
+    }
     const auto* value = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
-        : catalog.database(tenant, binding.database);
+        : catalog.database(tenantOf(version.workerId), binding.database);
     const auto ns = value && value->status == "active" ? value->id : "";
     const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
     objects << (first ? "" : ",") << quote(binding.binding) << ":{\"namespaceId\":" << quote(ns)
         << ",\"objectId\":" << quote(id) << '}';
     first = false;
   }
-  plan << ']';
-  plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
-      sha256Hex(plan.str()+plainEnvironmentRevision(catalog, version))) << '}';
+  std::string encodedPlan;
+  if (cached) encodedPlan = *cached;
+  else {
+    plan << ']';
+    plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
+        sha256Hex(plan.str()+plainEnvironmentRevision(catalog, version))) << '}';
+    encodedPlan = plan.str();
+    if (cache) {
+      if (cache->plans.size() == 16384) cache->plans.clear();
+      cache->plans.emplace(key, encodedPlan);
+    }
+  }
   const auto* active = catalog.worker(version.workerId);
   const bool current = active && active->valid && active->versionId == version.versionId && active->definitionHash == version.definitionHash;
-  return RootDispatch{plan.str(), "{\"kind\":\"plain\",\"dispatchChecked\":true,\"catalogGeneration\":"+
+  return RootDispatch{std::move(encodedPlan), "{\"kind\":\"plain\",\"dispatchChecked\":true,\"catalogGeneration\":"+
       std::to_string(catalog.generation())+",\"activePlan\":"+(current ? "true" : "false")+
       ",\"serviceVersions\":{"+services.str()+"},\"durableObjectBindings\":{"+objects.str()+"}}"};
 }
