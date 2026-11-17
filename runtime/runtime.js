@@ -1484,6 +1484,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
   const select = item => {
     try {return env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection,
     plan: item.plan, entrypoint: descriptor.entrypoint || "default", tenantCf: tenantCf(descriptor, env),
+    leaseDeadline: String(descriptor.lease.expiresAtMonotonicMs),
     requiresChildSequence: descriptor.requiresChildSequence, preparationNonce: nonce,
     activePlan: !options.rootTrial && descriptor.rootSelection.activePlan === true,
     trial: options.trial === true, rootTrial: options.rootTrial === true, classes: descriptor.durableObjectClasses ?? []}));}
