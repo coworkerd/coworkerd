@@ -122,9 +122,10 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
   const PlainPlanCache::Key key{version.workerId, version.versionId, version.definitionHash, cpuLimitMs, memoryLimitMib};
   const std::string* cached = nullptr;
   if (cache) {
-    if (cache->generation != catalog.generation()) {
+    if (cache->generation != catalog.generation() || cache->revision != catalog.revision()) {
       cache->plans.clear();
       cache->generation = catalog.generation();
+      cache->revision = catalog.revision();
     }
     const auto found = cache->plans.find(key);
     if (found != cache->plans.end()) cached = &found->second;
