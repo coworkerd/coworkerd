@@ -2959,7 +2959,7 @@ private:
       }
       capnp::JsonCodec json;
       const coworkerd::VersionPins emptyPins;
-      const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB);
+      const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
       auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
       const auto known = preparationBytes.find(version.contentHash);
       encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
@@ -3047,7 +3047,7 @@ private:
     capnp::JsonCodec json;
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
-        bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB);
+        bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
     auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
     const auto known = preparationBytes.find(version.contentHash);
     encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
@@ -3084,6 +3084,7 @@ private:
   std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
   struct PreparationBytes { uint64_t bytes, used; };
   std::map<std::string, PreparationBytes> preparationBytes;
+  mutable coworkerd::PlainPlanCache plainPlanCache;
   uint64_t preparationByteSequence = 0, preparationByteComputations = 0;
   std::map<std::string, std::unique_ptr<kj::ForkedPromise<std::string>>> preparationByteFlights;
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
