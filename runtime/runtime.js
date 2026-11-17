@@ -795,7 +795,15 @@ async function loadSource(descriptor, env) {
     for (const module of manifest.modules) {
       const encoded = payload.modules[module.sha256];
       if (typeof encoded !== "string") throw new Error("Missing trusted module");
-      const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+      const binary = atob(encoded), bytes = new Uint8Array(binary.length);
+      // Avoid the iterator's intermediate number array for large modules. Keep
+      // code verification responsive to probes and other tenants on this loop.
+      for (let first = 0; first < binary.length; first += 65536) {
+        const end = Math.min(first + 65536, binary.length);
+        for (let index = first; index < end; ++index) bytes[index] = binary.charCodeAt(index);
+        if (binary.length > 262144 && end < binary.length)
+          await new Promise(resolve => setTimeout(resolve, 0));
+      }
       if (bytes.length !== module.bytes || hex(await crypto.subtle.digest("SHA-256", bytes)) !== module.sha256) {
         throw new Error("Trusted module content hash mismatch");
       }
