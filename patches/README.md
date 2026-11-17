@@ -78,7 +78,7 @@ operations validate the series before mutating a checkout or exporting files.
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,
-0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027, 0028, 0029 and 0030, in that order.
+0001, 0003, 0004, 0018, 0013, 0014, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027, 0028, 0029, 0030 and 0031, in that order.
 0014 completes the Durable Object port; 0020 adds the private runtime root loader;
 0021 bounds cumulative native SQL execution. Follow-up commits may be folded into their patch when exported.
 The deferred patch list is empty.
@@ -363,3 +363,5 @@ The factory lifecycle snapshot observes the existing wait-until task set and rep
 0029 carries only the trial-view flag. Both trial checks use the same ordinary plan and compiled instance; the second checks the DO wrapper in that instance without another load.
 
 0030 gives ordinary compilation failures the same compiler diagnostic envelope as WorkerLoader; configured root-object diagnostics are unchanged.
+
+0031 publishes actor request activity on the next loop turn, after its background drain is queued, and timestamps snapshots so the node can reject a pre-completion observation.
