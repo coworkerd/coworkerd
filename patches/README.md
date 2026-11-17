@@ -75,6 +75,14 @@ operations validate the series before mutating a checkout or exporting files.
 
 ## Rust server port (v1.20261114.1)
 
+### 0041: Exact ordinary call deadlines
+
+The private ordinary selection carries the lease deadline's original decimal text.
+Rust parses it with the standard floating parser before constructing binding props
+and tenant call metadata, preserving the node's exact deadline check across JSON.
+This avoids one-ULP changes from serde_json's default numeric parser. The only path
+is `src/workerd/server/server/root_loader.rs`; node admission rules are unchanged.
+
 The current series targets `v1.20261114.1`, with the runtime root loader added to the
 baseline from `coworkerd-v1.20261114.1`.
 It includes 0002, 0006, 0007, 0008, 0012, 0016, 0005, 0010, 0011, 0015, 0017,

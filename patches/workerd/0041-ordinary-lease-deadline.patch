@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 20:43:57 +0800
+Subject: [PATCH] Preserve exact ordinary invocation lease deadlines
+
+
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index 9478e8c74f33201d5c92bec8d4b613d8dc03bcf4..95c10ef3d9f4b86624ca6ece8092109642823942 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -86,6 +86,8 @@ struct RootSelection {
+     #[serde(default)]
+     tenant_cf: Value,
+     #[serde(default)]
++    lease_deadline: String,
++    #[serde(default)]
+     alarm_facet_id: Option<u32>,
+     #[serde(default)]
+     preparation_nonce: String,
+@@ -953,7 +955,7 @@ impl RootRegistry {
+         Ok(props)
+     }
+ 
+-    fn plain_channel(&self, selection: RootSelection) -> Result<Rc<dyn Channel>> {
++    fn plain_channel(&self, mut selection: RootSelection) -> Result<Rc<dyn Channel>> {
+         if !selection.namespace_id.is_empty() || !selection.object_id.is_empty() || !selection.data_epoch.is_empty() {
+             return Err(kj::failed!("an ordinary worker selection cannot name an object"));
+         }
+@@ -964,6 +966,19 @@ impl RootRegistry {
+         }
+         // The hot path neither waits on the plan lock nor creates a deferred load.
+         let worker = self.loaded(&plan).ok_or_else(|| kj::failed!("unknown root plan: instance was evicted"))?;
++        if !selection.trial {
++            // serde_json's default number parser can move a floating deadline by
++            // one ULP. The node checks this value exactly, so parse its original
++            // decimal text with the standard round-trip parser before forwarding.
++            let deadline = selection.lease_deadline.parse::<f64>()
++                .map_err(|_| kj::failed!("ordinary selection lease deadline missing"))?;
++            if !deadline.is_finite() || deadline <= 0.0 {
++                return Err(kj::failed!("ordinary selection lease deadline invalid"));
++            }
++            let lease = selection.tenant_cf.get_mut("lease").and_then(Value::as_object_mut)
++                .ok_or_else(|| kj::failed!("ordinary selection lease missing"))?;
++            lease.insert("expiresAtMonotonicMs".to_owned(), json!(deadline));
++        }
+         let props = if selection.trial {
+             ffi::frankenvalue_from_json(&if plan.deployment.structured_props {
+                 json!({"trial": true, "rootTrial": selection.root_trial,
