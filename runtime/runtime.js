@@ -1449,7 +1449,6 @@ const rootPlanKeys = new Map();
 const MAX_ROOT_PLAN_KEYS = 256;
 const MAX_PLAIN_PLAN_KEYS = 16384;
 const plainPlanKeys = new Map();
-const plainPreparers = new Map();
 
 const plainColdLoads = new Map();
 // Preparation may be cancelled. Claim the cold observation only at actual dispatch.
@@ -1505,6 +1504,9 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     } catch (error) {throw staged("package", rootManagementFailure(error));}
     if (!response.ok) {
       const error = new Error(reply?.error?.message ?? "Ordinary plan preparation failed");
+      if (typeof reply?.error?.name === "string") error.name = reply.error.name;
+      if (reply?.error?.noExecution === true) error.coworkerdNoExecution = true;
+      if (reply?.error?.kind === "source") throw staged(reply.error.stage || "package", error);
       if (reply?.error?.kind === "tenant-code") {rootTenantCodeErrors.add(error); throw error;}
       throw staged("package", rootManagementFailure(error, reply?.error?.kind === "plan-missing"));
     }
@@ -1512,51 +1514,10 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       throw staged("package", rootManagementFailure(new Error("Invalid ordinary plan reply")));
     return reply;
   };
-  // Pure reservation hints only. Every follower owns its timer and selection;
-  // Native fences the actual reservation and owns any compilation already submitted.
-  for (;;) {
-    const ready = plainPlanKeys.get(cacheKey);
-    if (ready) {
-      try {return await chosen(remember(ready));}
-      catch (error) {if (!missing(error)) throw error; plainPlanKeys.delete(cacheKey);}
-    }
-    const hint = plainPreparers.get(cacheKey), now = Date.now();
-    if (!hint || hint.until <= now) {
-      plainPreparers.delete(cacheKey); plainPreparers.set(cacheKey, {owner:nonce,until:now+5000});
-      if (plainPreparers.size > MAX_PLAIN_PLAN_KEYS) plainPreparers.delete(plainPreparers.keys().next().value);
-      break;
-    }
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-  try {
-  // Only preparation is repeated. No event has been delivered on either attempt.
+  // One registry-owned preparation request. Native suspends this caller's wait;
+  // another request's cancellation never owns the code fetch, install or result.
   for (let attempt = 0; attempt < 2; ++attempt) {
-    let reply;
-    for (;;) {
-      reply = await manage("lookup", {...base, preparationOwner: nonce});
-      if (reply.plan !== null && reply.info?.loaded === true) break;
-      if (reply.preparation?.owned === true) break;
-      if (reply.preparation?.owned !== false)
-        throw staged("package", rootManagementFailure(new Error("Invalid ordinary preparation reservation")));
-      // This caller owns its own wait; Native owns the bounded reservation, never a JS promise.
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    if (reply.plan === null || reply.info?.loaded !== true) {
-      try {
-        let code;
-        try {code = await makeWorkerCode(descriptor, env, ctx);}
-        catch (error) {throw staged(stageOf(error), error);}
-        const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
-        reply = await manage("install", {...base, compatibilityDate: code.compatibilityDate,
-          compatibilityFlags: code.compatibilityFlags, environment: code.env, preparationOwner: nonce,
-          startupIdentity: JSON.stringify({workerId: descriptor.workerId, versionId: descriptor.versionId,
-            invocationId: descriptor.invocationId}),
-          modules: names.map(name => rootModule(name, code.modules[name]))});
-      } finally {
-        await env.ROOTS.fetch("http://roots/release-preparation", {method:"POST",
-          body:JSON.stringify({...base,preparationOwner:nonce})}).catch(() => {});
-      }
-    }
+    const reply = await manage("prepare", {...base, descriptor});
     if (!Number.isSafeInteger(reply.info?.generation) || reply.info.loaded !== true)
       throw staged("package", rootManagementFailure(new Error("Ordinary instance is not ready")));
     item = remember({plan: reply.plan, generation: reply.info.generation, cold: reply.info.cold === true});
@@ -1567,8 +1528,40 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
       if (attempt) throw staged("package", rootManagementFailure(new Error(rootFailureReason(error)), true));
     }
   }
-  } finally {
-    if (plainPreparers.get(cacheKey)?.owner === nonce) plainPreparers.delete(cacheKey);
+}
+
+// This request is started and owned by the Native registry. Its props and code
+// never belong to any of the callers awaiting the shared preparation result.
+export class PlainPreparer extends WorkerEntrypoint {
+  async fetch(request) {
+    return preparePlainPackage(this.ctx.props.base, this.ctx.props.descriptor, this.env, this.ctx, request);
+  }
+}
+async function preparePlainPackage(base, descriptor, env, ctx, request) {
+  try {
+    let code;
+    try {code = await makeWorkerCode(descriptor, env, ctx);}
+    catch (error) {throw staged(stageOf(error), error);}
+    const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+    let response, reply;
+    try {
+      response = await env.ROOTS.fetch("http://roots/install", {method:"POST",body:JSON.stringify({...base,
+        compatibilityDate:code.compatibilityDate,compatibilityFlags:code.compatibilityFlags,environment:code.env,
+        startupIdentity:JSON.stringify({workerId:descriptor.workerId,versionId:descriptor.versionId,invocationId:descriptor.invocationId}),
+        modules:names.map(name=>rootModule(name,code.modules[name]))})});
+      reply = await response.json();
+    } catch (error) {throw staged("package", rootManagementFailure(error));}
+    if (!response.ok) {
+      const error = new Error(reply?.error?.message || "Ordinary installation failed");
+      if (reply?.error?.kind === "tenant-code") rootTenantCodeErrors.add(error);
+      else staged("package", rootManagementFailure(error));
+      throw error;
+    }
+    return Response.json({ok:true,result:reply});
+  } catch (error) {
+    return Response.json({ok:false,error:{kind:rootTenantCodeErrors.has(error)?"tenant-code":
+      rootPreparationErrors.has(error)?"platform":"source",stage:typeof error?.coworkerdStage==="string"?error.coworkerdStage:null,
+      name:typeof error?.name==="string"?error.name.slice(0,100):"Error",message:String(error?.message || error).slice(0,2000)}});
   }
 }
 
@@ -1754,6 +1747,10 @@ async function serve(request, env, ctx) {
     coldStart = selected.claimCold() || coldStart;
     if (pathTiming) { pathTiming.dispatchedAtUnixMs = Date.now(); pathTiming.dispatchedMonotonicMs = performance.now(); }
     return await selected.fetcher.fetch(request, { cf: tenantCf(descriptor, env) });
+  } catch (error) {
+    if (error?.coworkerdNoExecution === true) return Response.json({error:"Worker preparation unavailable",
+      code:"CODE_UNAVAILABLE",reason:rootFailureReason(error),retryable:true,dispatched:false},{status:503});
+    throw error;
   } finally {
     console.log("[runtime-execution] " + JSON.stringify({
       serverId: descriptor.serverId, processId: env.PROCESS_ID,

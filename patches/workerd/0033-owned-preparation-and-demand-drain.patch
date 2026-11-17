@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 17 Nov 2026 11:40:50 +0800
+Subject: [PATCH] Own ordinary preparation in Native and answer drain requests
+ without full publication
+
+
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.c++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+index 90af6c38c3b0fc93a7a83162632dff9c1a459dbb..935338e2c0a6065cf920160c2a56ffd62100e83b 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.c++
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.c++
+@@ -43,6 +43,9 @@ void emit(kj::StringPtr row) {
+ //   [0, 8)    publications completed; the latest snapshot is in buffer (publications % 2)
+ //   [8, 12)   magic 0x434c5743 ("CWLC")
+ //   [12, 16)  capacity of each buffer's data in bytes
++//   [16, 24)  reader's drain request counter
++//   [24, 32)  drain reply sequence (request * 2; odd while writing)
++//   [32, 64)  observed monotonic ns, active count, background count, unknown busy count
+ //   buffer i at 64 + i * (16 + capacity): sequence (8; odd while being written), length (4),
+ //             4 unused, data
+ // One writer, this process; a reader copies the published buffer and keeps the copy only if its
+@@ -54,6 +57,19 @@ class LifecycleChannel {
+     if (base) capacity = *reinterpret_cast<uint32_t*>(base + 12);
+   }
+   explicit operator bool() const { return base != nullptr; }
++  uint64_t drainRequest() const {
++    return base ? __atomic_load_n(reinterpret_cast<const uint64_t*>(base + 16), __ATOMIC_ACQUIRE) : 0;
++  }
++  void publishDrain(uint64_t request, uint64_t observed, uint64_t active, uint64_t background, uint64_t unknown) {
++    auto* sequence = reinterpret_cast<uint64_t*>(base + 24);
++    __atomic_store_n(sequence, request * 2 - 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 32), observed, __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 40), active, __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 48), background, __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 56), unknown, __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, request * 2, __ATOMIC_RELEASE);
++  }
+   // False when the snapshot does not fit; the previous one stays published.
+   bool publish(kj::StringPtr row) {
+     auto lock = mutex.lockExclusive();
+@@ -126,11 +142,11 @@ class IdleReaper {
+     KJ_REQUIRE(interval > 0, "COWORKERD_IDLE_DESTROY_INTERVAL_MS must be positive");
+     publishedBand = inheritedBand();
+     publish();
+-    if (threshold || publishedBand || gcSettings().observes()) startLoop();
++    if (threshold || publishedBand || gcSettings().observes() || lifecycleChannel()) startLoop();
+     if (gcSettings().idleCollectMs) collectTask = collectLoop().eagerlyEvaluate(nullptr);
+   }
+   kj::Timer& timer;
+-  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false, backgroundDirty = false;
++  bool loopStarted = false, retirementLoopStarted = false, observesBackground = false, durableLifecycle = false;
+   void startLoop() {
+     if (!loopStarted) {loopStarted = true; task = loop().eagerlyEvaluate(nullptr);}
+   }
+@@ -152,6 +168,28 @@ class IdleReaper {
+   std::list<std::weak_ptr<IdleWorker>> retiringWorkers;
+   kj::Promise<void> task = nullptr, collectTask = nullptr, retirementTask = nullptr;
+   uint64_t publishedGc = 0;
++  uint64_t publicationCpuNs = 0, publications = 0, drainCpuNs = 0, drainPublications = 0, lastDrainRequest = 0;
++
++  void publishDrain() {
++    auto& channel = lifecycleChannel();
++    const auto request = channel.drainRequest();
++    if (!request || request == lastDrainRequest) return;
++    const auto start = cpuNs();
++    uint64_t active = 0, background = 0, unknown = 0;
++    for (const auto& entry: workers) if (auto worker = entry.lock()) {
++      if (!worker->created || worker->destroyed) continue;
++      bool busy = false;
++      KJ_IF_SOME(done, worker->backgroundDone) { busy = !done(); }
++      active += worker->active; background += busy;
++      const auto& labels = worker->labels;
++      if ((!labels.tenant.size() || !labels.workerId.size() || !labels.versionId.size() || !labels.planRevision.size()) &&
++          (worker->active || busy)) ++unknown;
++    }
++    const auto observed = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    channel.publishDrain(request, observed, active, background, unknown);
++    lastDrainRequest = request; ++drainPublications; drainCpuNs += cpuNs() - start;
++  }
+ 
+   void event(const IdleWorker& worker, kj::StringPtr event, double elapsed = 0, uint64_t cpu = 0) {
+     emit(kj::str("{\"event\":", escapeCpuJsonString(event), ",\"isolate\":",
+@@ -168,13 +206,17 @@ class IdleReaper {
+   void publish() {
+     auto& channel = lifecycleChannel();
+     if (!channel) return;
++    const auto now = monotonicMs();
++    if (durableLifecycle && publications && now - lastPublish < 1000) return;
++    const auto start = cpuNs();
+     kj::Vector<kj::String> entries;
+-    bool anyBackground = false, unknownBusy = false;
++    bool anyActive = false, anyBackground = false, unknownBusy = false;
+     for (auto it = workers.begin(); it != workers.end();) {
+       if (auto worker = it->lock()) {
+         bool backgroundActive = false;
+         KJ_IF_SOME(done, worker->backgroundDone) { backgroundActive = !done(); }
+         if (worker->created && !worker->destroyed) {
++          anyActive |= worker->active > 0;
+           anyBackground |= backgroundActive;
+           const auto& labels = worker->labels;
+           const bool tagged = labels.tenant.size() && labels.workerId.size() && labels.versionId.size() &&
+@@ -194,13 +236,16 @@ class IdleReaper {
+     // The small prefix and completion trailer share the full snapshot's atomic publication.
+     // A durable generation needs this aggregate, independently of its historical call count.
+     auto row = kj::str("{\"drain\":{\"observedAtMonotonicMs\":", observed,
+-        ",\"residentCount\":", entries.size(), ",\"backgroundActive\":", anyBackground ? "true" : "false",
++        ",\"residentCount\":", entries.size(), ",\"active\":", anyActive ? "true" : "false",
++        ",\"backgroundActive\":", anyBackground ? "true" : "false",
+         ",\"unknownBusy\":", unknownBusy ? "true" : "false", "},\"pid\":", coworkerdPid(),
+         ",\"observedAtMonotonicMs\":", observed, ",\"residentIsolates\":", created - destroyed,
+         ",\"createdIsolates\":", created, ",\"destroyedIsolates\":", destroyed,
+         ",\"idleEvictions\":", evicted, ",\"watermarkEvictions\":", watermarkEvicted,
+         ",\"memoryBand\":", band, ",\"bandReadCount\":", bandReads, ",\"bandReadNs\":", bandReadNs, ",\"loadFailureRemovals\":", failed,
+         ",\"idleEvictMs\":", threshold, ",\"idleDestroyIntervalMs\":", interval,
++        ",\"publicationCpuNs\":", publicationCpuNs, ",\"publications\":", publications,
++        ",\"drainCpuNs\":", drainCpuNs, ",\"drainPublications\":", drainPublications,
+         gcSettings().observes() ? processGcJson() : kj::str(""),
+         ",\"residentWorkers\":[", kj::strArray(entries, ","), "],\"drainSnapshotComplete\":true}");
+     if (gcSettings().observes()) publishedGc = processGcVersion();
+@@ -208,6 +253,7 @@ class IdleReaper {
+       overflowReported = true;
+       emit(kj::str("{\"event\":\"snapshot-too-large\",\"pid\":", coworkerdPid(), ",\"bytes\":", row.size(), "}"));
+     }
++    ++publications; publicationCpuNs += cpuNs() - start; lastPublish = monotonicMs();
+   }
+   bool overflowReported = false;
+  private:
+@@ -286,12 +332,13 @@ class IdleReaper {
+             std::chrono::steady_clock::now() - start).count();
+         ++bandReads;
+       }
+-      // At most once a second: for the band, and for the collections when they changed.
+-      if (backgroundDirty || (monotonicMs() - lastPublish >= 1000 &&
+-          (publishedBand || observesBackground || (gcSettings().observes() && processGcVersion() != publishedGc)))) {
+-        backgroundDirty = false;
++      publishDrain();
++      // Actor activity never causes a full publication. Even an empty registry
++      // answers drain requests and publishes its observation once per second.
++      if (monotonicMs() - lastPublish >= 1000 &&
++          (lifecycleChannel() || publishedBand || observesBackground ||
++              (gcSettings().observes() && processGcVersion() != publishedGc))) {
+         publish();
+-        lastPublish = monotonicMs();
+       }
+       auto minimum = effectiveThreshold();
+       if (!minimum || pending || monotonicMs() - lastDestroy < interval) continue;
+@@ -352,6 +399,10 @@ class IdleReaper {
+ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer) {
+   return std::make_shared<IdleReaper>(timer);
+ }
++void idleReaperRootLifecycle(const std::shared_ptr<IdleReaper>& reaper, bool durable) {
++  reaper->durableLifecycle = durable;
++  reaper->startLoop();
++}
+ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+     kj::StringPtr name, kj::Function<void()> remove, bool eligible, IdleWorkerLabels labels) {
+   auto worker = std::make_shared<IdleWorker>(reaper, name, kj::mv(remove), reaper->nextId++);
+@@ -412,7 +463,6 @@ void idleWorkerActorEvent(const IdleWorkerRef& worker) {
+   // An actor's events never pass through the isolate's entry (activity()), so its last one counts as its last use: the
+   // reaper does not evict an isolate whose actors are still receiving events.
+   worker->lastActorEvent = worker->lastEnd = monotonicMs();
+-  if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
+ }
+ 
+ namespace {
+@@ -421,8 +471,6 @@ struct Activity {
+   explicit Activity(IdleWorkerRef worker): worker(kj::mv(worker)) { ++this->worker->active; }
+   ~Activity() {
+     KJ_ASSERT(worker->active); --worker->active; worker->lastEnd = monotonicMs();
+-    // Publish on a later loop turn, after IncomingRequest has queued its drain task.
+-    if (worker->actorEvents) if (auto owner = worker->owner.lock()) owner->backgroundDirty = true;
+   }
+ };
+ class IdleObserver final: public IsolateObserver {
+diff --git a/src/workerd/server/factory/coworkerd-idle-eviction.h b/src/workerd/server/factory/coworkerd-idle-eviction.h
+index 9ea364c6461ad24feb83d387d35ea58257e55587..e5af1c672024f4aae8878d6d6775f2a3dd2752a3 100644
+--- a/src/workerd/server/factory/coworkerd-idle-eviction.h
++++ b/src/workerd/server/factory/coworkerd-idle-eviction.h
+@@ -18,6 +18,9 @@ struct IdleWorkerLabels {
+ };
+ 
+ std::shared_ptr<IdleReaper> idleReaper(kj::Timer& timer);
++// Durable registries publish the full observation at most once per second. Drain
++// requests use a separate bounded aggregate in the channel header.
++void idleReaperRootLifecycle(const std::shared_ptr<IdleReaper>& reaper, bool durable);
+ IdleWorkerRef registerIdleWorker(std::shared_ptr<IdleReaper> reaper,
+     kj::StringPtr name, kj::Function<void()> remove, bool eligible = true,
+     IdleWorkerLabels labels = {});
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index cd4fd537da9e9ce1cc7e306b784ebe8e5ab153f4..965888a64cf9c04058459062a03c108aa5f300c3 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -2072,6 +2072,62 @@ void worker_idle_ready(const CompiledWorker& worker, ::rust::Box<ChannelFactory>
+   }
+ }
+ 
++namespace {
++class PlainPreparationBody final: public kj::AsyncOutputStream {
++ public:
++  explicit PlainPreparationBody(kj::Vector<kj::byte>& body): body(body) {}
++  kj::Promise<void> write(const void* buffer, size_t size) override {
++    KJ_REQUIRE(body.size() + size <= 32768, "ordinary preparation reply too large");
++    body.addAll(kj::arrayPtr(static_cast<const kj::byte*>(buffer), size));
++    return kj::READY_NOW;
++  }
++  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
++    for (auto piece: pieces) {KJ_REQUIRE(body.size()+piece.size()<=32768);body.addAll(piece);}
++    return kj::READY_NOW;
++  }
++ private:
++  kj::Vector<kj::byte>& body;
++};
++class PlainPreparationResponse final: public kj::HttpService::Response {
++ public:
++  kj::Vector<kj::byte> body;
++  bool sent = false;
++  kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr,
++      const kj::HttpHeaders&, kj::Maybe<uint64_t> expected) override {
++    KJ_REQUIRE(!sent && status == 200, "private ordinary preparer failed", status);
++    sent = true;
++    KJ_IF_SOME(size, expected) {KJ_REQUIRE(size <= 32768, "ordinary preparation reply too large");}
++    return kj::heap<PlainPreparationBody>(body);
++  }
++  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders&) override {
++    KJ_FAIL_REQUIRE("ordinary preparation cannot upgrade");
++  }
++};
++}  // namespace
++
++kj::Promise<::rust::Vec<uint8_t>> factory_prepare_plain(
++    const WorkerFactory& factory, kj::Own<WorkerInterface> request) {
++  PlainPreparationResponse response;
++  kj::HttpHeaders headers(*factory.getImpl().headerTable);
++  auto pipe = kj::newOneWayPipe(); pipe.out = nullptr;
++  co_await request->request(kj::HttpMethod::POST, "http://coworkerd-plain-prepare/",
++      headers, *pipe.in, response);
++  KJ_REQUIRE(response.sent, "private ordinary preparer returned no reply");
++  ::rust::Vec<uint8_t> bytes;
++  for (auto byte: response.body) bytes.push_back(byte);
++  co_return bytes;
++}
++
++uint64_t factory_thread_cpu_ns() {
++  timespec time;
++  KJ_REQUIRE(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0);
++  return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
++}
++
++void factory_set_root_lifecycle(const WorkerFactory& factory, bool durable) {
++  idleReaperRootLifecycle(factory.getImpl().idleReaper, durable);
++}
++
+ kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker) {
+   return kj::heap<WorkerSelectionActivity>(idleActivity(worker.getImpl().idleWorker));
+ }
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index c24e9eb8f7783a4f977702790f34c8a908c4f3f7..9b55e4b3e6845ea99204cc8a15d1472b8a4eb607 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -229,6 +229,11 @@ class WorkerSelectionActivity final {
+   kj::Own<void> activity;
+ };
+ kj::Own<WorkerSelectionActivity> worker_selection_activity(const CompiledWorker& worker);
++// A registry-owned request to the configured runtime's private ordinary preparer.
++kj::Promise<::rust::Vec<uint8_t>> factory_prepare_plain(
++    const WorkerFactory& factory, kj::Own<WorkerInterface> request);
++uint64_t factory_thread_cpu_ns();
++void factory_set_root_lifecycle(const WorkerFactory& factory, bool durable);
+ void worker_retire_when_idle(const CompiledWorker& worker);
+ void worker_unlink(const CompiledWorker& worker);
+ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index fed243c90d4cdcd618652ad85d6c6d736967ca2a..ecaeb88afbba43b2aa2581b0ed467ff0ce30b619 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -427,6 +427,12 @@ pub mod ffi {
+         fn worker_idle_ready(worker: &CompiledWorker, channels: Box<ChannelFactory>) -> Result<()>;
+         type WorkerSelectionActivity;
+         fn worker_selection_activity(worker: &CompiledWorker) -> KjOwn<WorkerSelectionActivity>;
++        async fn factory_prepare_plain(
++            factory: &WorkerFactory,
++            request: KjOwn<WorkerInterface>,
++        ) -> Result<Vec<u8>>;
++        fn factory_thread_cpu_ns() -> u64;
++        fn factory_set_root_lifecycle(factory: &WorkerFactory, durable: bool);
+         fn worker_retire_when_idle(worker: &CompiledWorker) -> Result<()>;
+         /// Cancels the worker's requests still in flight (background work past the response: a
+         /// `waitUntil()`, a tail worker's event), each of which holds the worker and its I/O
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index 92fd30a1b80c6da7e1ff66a7c757c29fb0d15397..a5d288bc6f667a523b2a0588789bcb5dcf9913f6 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -8,6 +8,7 @@
+ use std::cell::{Cell, RefCell};
+ use std::collections::{HashMap, HashSet};
+ use std::pin::Pin;
++use std::future::Future;
+ use std::rc::{Rc, Weak};
+ use std::time::{Duration, Instant, SystemTime};
+ 
+@@ -440,6 +441,20 @@ impl InstallFlight {
+     }
+ }
+ 
++struct PreparationFlight {
++    result: RefCell<Option<Value>>,
++    completed: tokio::sync::Notify,
++}
++impl PreparationFlight {
++    async fn wait(&self) -> Value {
++        loop {
++            let notified = self.completed.notified();
++            if let Some(result) = self.result.borrow().clone() { return result; }
++            notified.await;
++        }
++    }
++}
++
+ pub struct RootRegistry {
+     this: Weak<Self>,
+     factory: Rc<Factory>,
+@@ -449,7 +464,9 @@ pub struct RootRegistry {
+     latest_plain: RefCell<HashMap<String, (u64, String)>>,
+     install_lock: tokio::sync::Mutex<()>,
+     installing: RefCell<HashMap<String, Rc<InstallFlight>>>,
+-    preparations: RefCell<HashMap<String, (String, Instant)>>,
++    preparations: RefCell<HashMap<String, Rc<PreparationFlight>>>,
++    preparation_wait_cpu_ns: Cell<u64>,
++    preparation_wait_polls: Cell<u64>,
+     failed_installs: RefCell<HashMap<String, FailedInstall>>,
+     failure_use: Cell<u64>,
+     tenant_compilations: Cell<u64>,
+@@ -474,6 +491,7 @@ impl RootRegistry {
+                 "the private root loader needs an absolute storagePath"
+             ));
+         }
++        ffi::factory_set_root_lifecycle(factory.raw(), !plain_only);
+         Ok(Rc::new_cyclic(|this| Self {
+             this: this.clone(),
+             factory,
+@@ -484,6 +502,8 @@ impl RootRegistry {
+             install_lock: tokio::sync::Mutex::new(()),
+             installing: RefCell::new(HashMap::new()),
+             preparations: RefCell::new(HashMap::new()),
++            preparation_wait_cpu_ns: Cell::new(0),
++            preparation_wait_polls: Cell::new(0),
+             failed_installs: RefCell::new(HashMap::new()),
+             failure_use: Cell::new(0),
+             tenant_compilations: Cell::new(0),
+@@ -502,25 +522,83 @@ impl RootRegistry {
+         }))
+     }
+ 
+-    fn claim_preparation(&self, key: &str, owner: &str) -> Value {
+-        let now = Instant::now();
+-        let mut leases = self.preparations.borrow_mut();
+-        leases.retain(|_, (_, deadline)| *deadline > now);
+-        // An install flight owns its source independently of its original caller.
+-        if self.installing.borrow().contains_key(key) {
+-            return json!({"owned":false,"retryAfterMs":25});
++    async fn prepare(self: &Rc<Self>, value: Value) -> Result<Value> {
++        let deployment: Deployment = serde_json::from_value(value.clone())
++            .map_err(|error| kj::failed!("ordinary preparation: {error}"))?;
++        if !deployment.is_plain()
++            || value["descriptor"]["workerId"] != deployment.worker_id
++            || value["descriptor"]["versionId"] != deployment.version_id
++        {
++            return Err(kj::failed!(
++                "ordinary preparation needs its trusted descriptor"
++            ));
+         }
+-        if let Some((current, _)) = leases.get(key) {
+-            return json!({"owned":current == owner,"retryAfterMs":25});
++        let key = deployment.plan_key()?;
++        if let Some(plan) = self.plans.borrow().get(&key) {
++            if self.loaded(plan).is_some() {
++                return Ok(json!({"ok":true,"result":{"plan":key,"info":{"loaded":true,
++                    "generation":plan.generation.get(),"cold":plan.reported_plain_generation.get()!=plan.generation.get()}}}));
++            }
+         }
+-        if leases.len() >= 1024 { return json!({"owned":false,"retryAfterMs":25}); }
+-        leases.insert(key.to_owned(), (owner.to_owned(), now + Duration::from_secs(5)));
+-        json!({"owned":true,"retryAfterMs":25})
+-    }
+-
+-    fn release_preparation(&self, key: &str, owner: &str) {
+-        let mut leases = self.preparations.borrow_mut();
+-        if leases.get(key).is_some_and(|(current, _)| current == owner) { leases.remove(key); }
++        let existing = self.preparations.borrow().get(&key).cloned();
++        let flight = if let Some(flight) = existing {
++            flight
++        } else {
++            // No spinning at capacity. This is twice the Node's maximum in-flight cohort;
++            // detached cancellations are bounded too, and an overflow is never a tenant event.
++            if self.preparations.borrow().len() >= 1024 {
++                return Ok(
++                    json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
++                    "message":"Ordinary preparation capacity reached; no tenant event was delivered"}}),
++                );
++            }
++            let flight = Rc::new(PreparationFlight {
++                result: RefCell::new(None),
++                completed: tokio::sync::Notify::new(),
++            });
++            self.preparations
++                .borrow_mut()
++                .insert(key.clone(), Rc::clone(&flight));
++            let registry = Rc::clone(self);
++            let task = Rc::clone(&flight);
++            let task_key = key.clone();
++            self.factory.spawn_detached(async move {
++                let prepare=async {
++                    let target=RootTarget {service:"runtime".to_owned(),entrypoint:Some("PlainPreparer".to_owned()),
++                        props:json!({"base":deployment,"descriptor":value["descriptor"]})};
++                    let channel=registry.target(&target,&target.props)?;
++                    let request=channel.start_request(ffi::new_request_metadata(None.into(),None.into()))?;
++                    let bytes=ffi::factory_prepare_plain(registry.factory.raw(),request).await?;
++                    serde_json::from_slice::<Value>(&bytes).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))
++                };
++                let prepare=std::pin::pin!(prepare);let timeout=std::pin::pin!(registry.factory.sleep(Duration::from_secs(30)));
++                let result=match futures::future::select(prepare,timeout).await {
++                    futures::future::Either::Left((Ok(reply),_))=>reply,
++                    futures::future::Either::Left((Err(error),_))=>json!({"ok":false,"error":{"kind":"platform","message":error.description()}}),
++                    futures::future::Either::Right(_)=>json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
++                        "message":"Ordinary preparation timed out after 30 seconds; no tenant event was delivered"}}),
++                };
++                let success=result["ok"]==true;
++                *task.result.borrow_mut()=Some(result);task.completed.notify_waiters();
++                // A short shared memory covers pre-install failures for the arriving cohort.
++                // Completion belongs to this task, never to a cancelled requesting context.
++                if !success {registry.factory.sleep(Duration::from_millis(100)).await;}
++                let current=registry.preparations.borrow().get(&task_key).is_some_and(|current|Rc::ptr_eq(current,&task));
++                if current {
++                    registry.preparations.borrow_mut().remove(&task_key);
++                }
++            });
++            flight
++        };
++        let wait = std::pin::pin!(flight.wait());
++        let timeout = std::pin::pin!(self.factory.sleep(Duration::from_secs(25)));
++        Ok(match futures::future::select(wait, timeout).await {
++            futures::future::Either::Left((reply, _)) => reply,
++            futures::future::Either::Right(_) => {
++                json!({"ok":false,"error":{"kind":"wait-unavailable","noExecution":true,
++                "message":"Ordinary preparation wait timed out after 25 seconds; no tenant event was delivered"}})
++            }
++        })
+     }
+ 
+     fn cached_failure(&self, key: &str) -> Option<crate::Error> {
+@@ -1839,6 +1917,9 @@ impl RootRegistry {
+         json!({"plans": plans, "namespaces": namespaces, "compiledWorkers": self.compiled.borrow().len(),
+             "installingNamespaces": self.installing.borrow().values().flat_map(|flight| flight.namespaces.iter().cloned()).collect::<Vec<_>>(),
+             "installingPlans": self.installing.borrow().len(), "tenantCompilations": self.tenant_compilations.get(),
++            "preparationWaitCpuNs": self.preparation_wait_cpu_ns.get(),
++            "preparationWaitPolls": self.preparation_wait_polls.get(),
++            "preparations": self.preparations.borrow().len(),
+             "failedInstalls": self.failed_installs.borrow().len(),
+             "closingFences": self.closing_roots.pending(),
+             "retiredNamespaceCount": self.removed_namespaces.borrow().len(),
+@@ -2388,32 +2469,37 @@ impl Service for RootRequest {
+     ) -> Result<()> {
+         let text = std::str::from_utf8(url).map_err(|error| kj::failed!("root URL: {error}"))?;
+         let url = url::Url::parse(text).map_err(|error| kj::failed!("root URL: {error}"))?;
++        if method==Method::POST && url.path()=="/prepare" {
++            let registry=Rc::clone(&self.registry);let meter=Rc::clone(&registry);
++            let future=async move {
++                let reply=registry.prepare(read_json(body).await?).await?;
++                let (status,value)=if reply["ok"]==true {(200,reply["result"].clone())} else {
++                    (if reply["error"]["kind"]=="tenant-code" {500} else {503},reply)
++                };
++                let bytes=serde_json::to_vec(&value).map_err(|error|kj::failed!("ordinary preparation reply: {error}"))?;
++                let headers=Headers::new(header_table(&registry.factory));
++                response.send(status,"Ordinary preparation",&headers,Some(bytes.len() as u64))?.write(&bytes).await
++            };
++            let mut future=std::pin::pin!(future);
++            return futures::future::poll_fn(move |context| {
++                let start=ffi::factory_thread_cpu_ns();let result=future.as_mut().poll(context);
++                meter.preparation_wait_cpu_ns.set(meter.preparation_wait_cpu_ns.get()+ffi::factory_thread_cpu_ns()-start);
++                meter.preparation_wait_polls.set(meter.preparation_wait_polls.get()+1);result
++            }).await;
++        }
+         let mut status = 200;
+         let value = match (method, url.path()) {
+             (Method::POST, "/lookup") => {
+-                let value = read_json(body).await?;
+-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
+-                let deployment: Deployment = serde_json::from_value(value.clone())
++                let deployment: Deployment = serde_json::from_value(read_json(body).await?)
+                     .map_err(|error| kj::failed!("root lookup: {error}"))?;
+-                let key = deployment.plan_key()?;
+-                if let Some(error) = self.registry.cached_failure(&key) {
+-                    let (code, value) = preparation_failure(error.description());
+-                    status = code;
+-                    value
++                let key=deployment.plan_key()?;
++                if let Some(error)=self.registry.cached_failure(&key) {
++                    let (code,value)=preparation_failure(error.description());status=code;value
+                 } else {
+-                    let plans = self.registry.plans.borrow();
+-                    let installed = plans.get(&key);
+-                    let loaded = installed.is_some_and(|plan| plan.loaded.borrow().is_some());
+-                    let mut reply = json!({"plan": installed.map(|_| &key), "info": installed.map(|plan| json!({
+-                        "loaded": plan.loaded.borrow().is_some(), "generation": plan.generation.get(),
+-                        "cold": plan.deployment.is_plain() && plan.reported_plain_generation.get() != plan.generation.get()
+-                    }))});
+-                    drop(plans);
+-                    if deployment.is_plain() && !owner.is_empty() {
+-                        if loaded { self.registry.release_preparation(&key, owner); }
+-                        else { reply["preparation"] = self.registry.claim_preparation(&key, owner); }
+-                    }
+-                    reply
++                    let plans=self.registry.plans.borrow();let installed=plans.get(&key);
++                    json!({"plan":installed.map(|_|&key),"info":installed.map(|plan|json!({
++                        "loaded":plan.loaded.borrow().is_some(),"generation":plan.generation.get(),
++                        "cold":plan.deployment.is_plain()&&plan.reported_plain_generation.get()!=plan.generation.get()}))})
+                 }
+             }
+             (Method::POST, "/install") => {
+@@ -2428,16 +2514,9 @@ impl Service for RootRequest {
+                     }
+                     format!("{},", &identity[1..identity.len() - 1])
+                 };
+-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("").to_owned();
+                 let deployment: Deployment = serde_json::from_value(value)
+                     .map_err(|error| kj::failed!("root deployment: {error}"))?;
+-                let key = deployment.plan_key()?;
+-                if deployment.is_plain() && !owner.is_empty() && !self.registry.preparations.borrow().get(&key)
+-                    .is_some_and(|(current, deadline)| current == &owner && *deadline > Instant::now()) {
+-                    return Err(kj::failed!("ordinary preparation reservation expired; no event was delivered"));
+-                }
+-                let result = self.registry.install(deployment, startup_identity).await;
+-                self.registry.release_preparation(&key, &owner);
++                let result=self.registry.install(deployment,startup_identity).await;
+                 match result {
+                     Ok(plan) => {
+                         let plans = self.registry.plans.borrow();
+@@ -2541,14 +2620,6 @@ impl Service for RootRequest {
+                 self.registry.prune_plans();
+                 json!({"removed": removed})
+             }
+-            (Method::POST, "/release-preparation") => {
+-                let value = read_json(body).await?;
+-                let owner = value.get("preparationOwner").and_then(Value::as_str).unwrap_or("");
+-                let deployment: Deployment = serde_json::from_value(value.clone())
+-                    .map_err(|error| kj::failed!("ordinary preparation release: {error}"))?;
+-                self.registry.release_preparation(&deployment.plan_key()?, owner);
+-                json!({"released":true})
+-            }
+             (Method::POST, "/hibernate") => {
+                 let namespaces: Vec<_> = self
+                     .registry
