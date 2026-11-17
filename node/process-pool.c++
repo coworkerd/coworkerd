@@ -3007,8 +3007,8 @@ public:
       const auto workers = json::field(value, "residentWorkers");
       if (!workers.isArray()) return false;
       for (auto resident : workers.getArray()) {
-        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId"), revision = json::field(resident, "planRevision");
-        if (!worker.isString() || worker.getString().size() == 0 || !version.isString() || version.getString().size() == 0 ||
+        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId"), revision = json::field(resident, "planRevision"), tenant = json::field(resident, "tenant");
+        if (!tenant.isString() || tenant.getString().size() == 0 || !worker.isString() || worker.getString().size() == 0 || !version.isString() || version.getString().size() == 0 ||
             !revision.isString() || revision.getString().size() == 0 || !json::field(resident, "loadGeneration").isNumber() ||
             !json::field(resident, "instance").isNumber()) unknownResidents = true;
       }
@@ -3513,13 +3513,13 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
         std::string isolate = name.getString().cStr();
         const auto worker = json::field(entry, "workerId"), version = json::field(entry, "versionId");
         const auto revision = json::field(entry, "planRevision");
-        const bool typed = worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
+        const auto owner = json::field(entry, "tenant");
+        const bool typed = owner.isString() && owner.getString().size() && worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
             && revision.isString() && revision.getString().size() && json::field(entry, "loadGeneration").isNumber()
             && json::field(entry, "instance").isNumber();
         if (typed) ++impl->lifecycleLabels.typed;
         else ++impl->lifecycleLabels.missing;
         const auto at = isolate.find('@');
-        const auto owner = json::field(entry, "tenant");
         const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) :
             worker.isString() ? tenantOf(worker.getString().cStr()) : std::string();
         // A partial label still charges this known owner; it cannot silently disappear.

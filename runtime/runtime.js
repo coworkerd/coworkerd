@@ -1451,11 +1451,15 @@ const plainPlanKeys = new Map();
 
 const plainColdLoads = new Map();
 // Preparation may be cancelled. Claim the cold observation only at actual dispatch.
-function claimPlainCold(item) {
+function claimPlainCold(item, cacheKey) {
+  const cold = item.cold === true;
+  item.cold = false;
+  const remembered = plainPlanKeys.get(cacheKey);
+  if (remembered?.plan === item.plan && remembered.generation === item.generation) remembered.cold = false;
   if (plainColdLoads.get(item.plan) === item.generation) return false;
   plainColdLoads.delete(item.plan); plainColdLoads.set(item.plan, item.generation);
   if (plainColdLoads.size > MAX_ROOT_PLAN_KEYS) plainColdLoads.delete(plainColdLoads.keys().next().value);
-  return item.cold === true;
+  return cold;
 }
 
 async function selectedPlain(descriptor, env, ctx, options = {}) {
@@ -1483,7 +1487,7 @@ async function selectedPlain(descriptor, env, ctx, options = {}) {
     return item;
   };
   const chosen = async item => ({fetcher: await select(item), generation: item.generation,
-    cold: item.cold === true, claimCold: () => claimPlainCold(item)});
+    cold: item.cold === true, claimCold: () => claimPlainCold(item, cacheKey)});
   const missing = error => rootPreparationKind(error, nonce) === "plan-missing";
   let item = plainPlanKeys.get(cacheKey);
   if (item) {
