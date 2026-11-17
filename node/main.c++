@@ -1011,18 +1011,25 @@ public:
     return ensurePreparationMemory(version, deadline);
   }
   kj::Promise<std::string> ensurePreparationMemory(VersionDefinition version, double deadline) {
+    if (deadline <= monotonicTimeMs()) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata wait timed out");
     auto found = preparationByteFlights.find(version.contentHash);
+    std::shared_ptr<kj::ForkedPromise<std::string>> shared;
     if (found == preparationByteFlights.end()) {
       if (preparationByteFlights.size() >= 16384) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata capacity reached");
-      auto shared = std::make_unique<kj::ForkedPromise<std::string>>(preparationMemory(version, deadline).fork());
-      found = preparationByteFlights.emplace(version.contentHash, std::move(shared)).first;
-    }
-    auto* identity = found->second.get();
-    auto branch = found->second->addBranch();
-    auto reason = co_await branch;
-    auto current = preparationByteFlights.find(version.contentHash);
-    if (current != preparationByteFlights.end() && current->second.get() == identity) preparationByteFlights.erase(current);
-    co_return reason;
+      shared = std::make_shared<kj::ForkedPromise<std::string>>(preparationMemory(version, monotonicTimeMs() + 30000).fork());
+      preparationByteFlights.emplace(version.contentHash, shared);
+      // This node-owned branch survives every caller's cancellation. Holding the
+      // wrapper also prevents its address being reused before cleanup runs.
+      auto finish = [this, hash = version.contentHash, shared] {
+        auto current = preparationByteFlights.find(hash);
+        if (current != preparationByteFlights.end() && current->second == shared) preparationByteFlights.erase(current);
+      };
+      preparationByteTasks.add(shared->addBranch().then(
+          [finish](std::string&&) { finish(); }, [finish](kj::Exception&&) { finish(); }));
+    } else { shared = found->second; }
+    co_return co_await shared->addBranch().exclusiveJoin(timer.afterDelay(
+        static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS)
+        .then([] { return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata wait timed out"); }));
   }
   kj::Promise<std::string> preparationMemory(VersionDefinition version, double deadline) {
     try {
@@ -1042,8 +1049,25 @@ public:
       } else {
         const auto path = stored ? config.cache.directory / version.contentHash
             : config.codeDirectory / coworkerd::workerNameOf(version.workerId) / version.versionId / version.mainModule;
-        // Worst-case JSON escaping needs six bytes per source byte. No source copy is needed.
-        bytes = 14 * std::filesystem::file_size(path) + 4;
+        // Count the actual JSON representation in bounded pieces. A legal large
+        // ASCII v1 package must not be charged as all-control-character input.
+        std::ifstream input(path, std::ios::binary);
+        KJ_REQUIRE(input.good(), "cannot read package metadata");
+        std::array<char, 16384> chunk;
+        uint64_t sourceBytes = 0, escapedBytes = 2;
+        while (input) {
+          input.read(chunk.data(), chunk.size());
+          const auto count = input.gcount();
+          KJ_REQUIRE(!input.bad(), "cannot read package metadata");
+          if (count) {
+            sourceBytes += count;
+            escapedBytes += jsonEscape(std::string(chunk.data(), static_cast<size_t>(count))).size();
+            co_await timer.afterDelay(0 * kj::MILLISECONDS);
+            if (monotonicTimeMs() >= deadline) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata computation timed out");
+          }
+        }
+        KJ_REQUIRE(input.eof(), "cannot read package metadata");
+        bytes = 2 * sourceBytes + 2 * escapedBytes;
       }
       if (preparationBytes.size() == 16384) {
         auto oldest = std::min_element(preparationBytes.begin(), preparationBytes.end(),
@@ -2400,7 +2424,7 @@ private:
     }
     executions.push_back({
       sequence, process->processId, process->generation,
-      std::move(treeId),
+      treeId,
       invocationId,
       version->key(),
       std::move(kind),
@@ -2418,14 +2442,13 @@ private:
     const bool ingress = executions.back().kind == "ingress";
     const bool peerIngress = ingress && !ingressServerId.empty() && ingressServerId != serverConfig.serverId;
     const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
-    auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId,
+    auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
                      ingress, peerIngress, deferredCpu](bool executed) {
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
       pendingPreparations.erase(invocationId);
       if (!executed) {
-        std::string treeId;
-        for (auto& item : executions) if (item.invocationId == invocationId) { item.dispatched = false; treeId = item.treeId; }
+        for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = false;
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
@@ -3086,7 +3109,9 @@ private:
   std::map<std::string, PreparationBytes> preparationBytes;
   mutable coworkerd::PlainPlanCache plainPlanCache;
   uint64_t preparationByteSequence = 0, preparationByteComputations = 0;
-  std::map<std::string, std::unique_ptr<kj::ForkedPromise<std::string>>> preparationByteFlights;
+  std::map<std::string, std::shared_ptr<kj::ForkedPromise<std::string>>> preparationByteFlights;
+  struct PreparationErrors final: kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } preparationErrors;
+  kj::TaskSet preparationByteTasks{preparationErrors};
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
   std::deque<DebitRecord> debits;
   std::map<std::string, InvocationLeaseState> leases;
