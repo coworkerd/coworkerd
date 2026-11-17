@@ -1,6 +1,7 @@
 #pragma once
 
 #include "durable-shards.h"
+#include <array>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -64,10 +65,13 @@ private:
   std::set<Ready> runnable;
   std::multimap<double, std::string> delayed;
   std::string lastTenant;
+  std::string lastGoneNode;
   uint64_t memberEpoch = 0, serial = 0, discovered = 0, acquired = 0, forwarded = 0;
   uint64_t removed = 0, failures = 0, denials = 0, lists = 0, peakPending = 0, peakActive = 0;
   uint32_t active = 0, scans = 0, peakReads = 0;
   double nextRoot = 0, lastLoop = 0, maxLoopDelayMs = 0;
+  double lastGoneMs = 0;
+  std::array<std::pair<uint64_t, double>, 120> loopSeconds{};
   bool access = false, stopping = false;
   kj::TaskSet tasks;
 };

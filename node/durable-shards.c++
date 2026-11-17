@@ -378,6 +378,22 @@ kj::Promise<ShardRoute> DurableShards::route(std::string namespaceId, uint32_t s
   }
 }
 
+kj::Promise<ShardRoute> DurableShards::background(std::string namespaceId, uint32_t shard) {
+  try {
+    if (auto atomic = co_await waitForAtomic(); atomic.kind == ShardRoute::Kind::REFUSE) co_return atomic;
+    if (membership.selfExpired || membership.identityTaken)
+      co_return ShardRoute::refuse(503, "DO_OWNER_EXPIRED", "this node's membership expired");
+    // Background callers also use the decision's metadata to retire old clues. Bypass request caches, including the
+    // held fast path, so that metadata always comes from a complete latest-epoch read. Acquisition itself is unchanged.
+    auto latest = co_await readLatest(namespaceId, shard, false);
+    co_return co_await decide(namespaceId, shard, std::move(latest), true, {}, true, false);
+  } catch (const kj::Exception& error) {
+    ++acquireFailures;
+    co_return ShardRoute::refuse(503, isStorageFailure(error) ? "STORAGE_UNAVAILABLE" : "DO_UNAVAILABLE",
+        error.getDescription().cStr());
+  }
+}
+
 kj::Promise<ShardRoute> DurableShards::accept(std::string namespaceId, uint32_t shard, uint64_t expectedEpoch, std::string fromNode) {
   const Key key{namespaceId, shard};
   try {

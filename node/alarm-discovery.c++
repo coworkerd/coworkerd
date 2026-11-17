@@ -148,14 +148,19 @@ kj::Promise<void> AlarmDiscovery::loop() {
   for (;;) {
     co_await timer.afterDelay(10 * kj::MILLISECONDS);
     const auto now = monotonicTimeMs();
-    if (lastLoop) maxLoopDelayMs = std::max(maxLoopDelayMs, std::max(0.0, now - lastLoop - 10));lastLoop = now;
+    const auto delay = lastLoop ? std::max(0.0, now - lastLoop - 10) : 0;
+    maxLoopDelayMs = std::max(maxLoopDelayMs, delay);lastLoop = now;
+    const auto second = uint64_t(now / 1000);auto& sample = loopSeconds[second % loopSeconds.size()];
+    if (sample.first != second) sample = {second, delay};else sample.second = std::max(sample.second, delay);
     if (!ready() || membership.backend != "objectStore" || membership.selfExpired || membership.identityTaken || membership.draining) continue;
     uint64_t epoch = 0;if (!number(membership.epoch, epoch) || !epoch) continue;
     if (epoch != memberEpoch) { memberEpoch = epoch;loadPending();nextRoot = 0; }
     std::map<std::string, std::string> next;
     for (const auto& [id, member]: membership.members) next[id] = member.epoch;
     if (next != members) {
-      for (const auto& [id, old]: members) if (!next.contains(id) || next.at(id) != old) directory(ROOT + id + "/");
+      for (const auto& [id, old]: members) if (!next.contains(id) || next.at(id) != old) {
+        directory(ROOT + id + "/");lastGoneNode = id;lastGoneMs = now;
+      }
       members = std::move(next);
     }
     if (now >= nextRoot) { directory(ROOT);nextRoot = now + settings.intervalMs; }
@@ -177,6 +182,12 @@ kj::Promise<void> AlarmDiscovery::loop() {
   }
 }
 std::string AlarmDiscovery::json() const {
+  std::string samples = "[";
+  for (const auto& [second, delay]: loopSeconds) if (second) {
+    if (samples.size() > 1) samples += ",";
+    samples += "{\"monotonicSecond\":" + std::to_string(second) + ",\"maxDelayMs\":" + std::to_string(delay) + "}";
+  }
+  samples += "]";
   return "{\"state\":" + json::quote(access ? "enabled" : denials ? "disabled-access-denied" : "checking") +
       ",\"scanIntervalMs\":" + std::to_string(settings.intervalMs) + ",\"takeoverLimit\":" + std::to_string(settings.takeovers) +
       ",\"readLimit\":" + std::to_string(settings.reads) + ",\"active\":" + std::to_string(active) +
@@ -185,6 +196,8 @@ std::string AlarmDiscovery::json() const {
       ",\"discovered\":" + std::to_string(discovered) + ",\"localResults\":" + std::to_string(acquired) +
       ",\"forwardedResults\":" + std::to_string(forwarded) + ",\"removed\":" + std::to_string(removed) +
       ",\"listRequests\":" + std::to_string(lists) + ",\"failures\":" + std::to_string(failures) +
-      ",\"denials\":" + std::to_string(denials) + ",\"loopProbeIntervalMs\":10,\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + "}";
+      ",\"denials\":" + std::to_string(denials) + ",\"lastGoneNode\":" + json::quote(lastGoneNode) +
+      ",\"lastGoneMonotonicMs\":" + std::to_string(lastGoneMs) + ",\"probeMonotonicMs\":" + std::to_string(monotonicTimeMs()) +
+      ",\"loopProbeIntervalMs\":10,\"maxLoopDelayMs\":" + std::to_string(maxLoopDelayMs) + ",\"loopSeconds\":" + samples + "}";
 }
 }  // namespace coworkerd
