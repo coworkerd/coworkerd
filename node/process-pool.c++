@@ -3031,7 +3031,9 @@ public:
           const auto revision = json::field(resident, "planRevision");
           if (!revision.isString() || revision.getString().size() == 0 ||
               !json::field(resident, "loadGeneration").isNumber() || !json::field(resident, "instance").isNumber()) return false;
-          if (!old.durable || !background.isBoolean() || background.getBoolean()) return false;
+          const auto observed = json::field(value, "observedAtMonotonicMs");
+          if (!old.durable || !observed.isNumber() || observed.getNumber() < entry.second.finishedAt ||
+              !background.isBoolean() || background.getBoolean()) return false;
         }
         ++old.contextsCleared; ++cleared;
         return true;
