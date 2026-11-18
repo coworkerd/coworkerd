@@ -676,6 +676,10 @@ struct PlacementConfig {
   # R9 (lab results/r9/PROTOCOL.md, section 0) found lower local p99 at both tenant counts and all three RTTs, at the
   # cost of additional svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.
   subcalls @9 :Text = "local";
+  # Per-tenant limits for concurrent roots and nested calls, respectively, inside the node limits.
+  # Zero keeps the corresponding per-tenant limit disabled.
+  tenantRootLimit @10 :UInt32 = 0;
+  tenantNestedLimit @11 :UInt32 = 0;
 }
 
 struct MembershipConfig {
