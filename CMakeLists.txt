@@ -164,3 +164,29 @@ add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
 )
 target_include_directories(coworkerd-durable-channel-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
 target_link_libraries(coworkerd-durable-channel-test PRIVATE common kj-tls-local)
+
+# This gate runs the already built unit/component tests without starting a cluster.
+enable_testing()
+add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
+  node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
+target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
+target_link_libraries(coworkerd-node-contract-test PRIVATE common)
+add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
+add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
+foreach(case deadlines leases tree-lease budget identity admission package module-types cache
+    cpu-culprit-current-behavior memory-culprit rejected-manifest)
+  add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
+endforeach()
+add_custom_target(check
+  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test
+  USES_TERMINAL)
+
+# The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.
+find_program(COWORKERD_TEST_NODE NAMES node)
+if(NOT COWORKERD_TEST_NODE)
+  set(COWORKERD_TEST_NODE node)
+endif()
+foreach(case export import migrations project-config)
+  add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
+endforeach()

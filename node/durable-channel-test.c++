@@ -2,13 +2,13 @@
 
 #include <kj/async-io.h>
 #include <kj/timer.h>
-#include <sys/wait.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace coworkerd {
 
 struct DurableLogChannelTest {
-  static void run() {
+  static void run(bool indexOnly) {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-channel-test-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
     KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
@@ -23,7 +23,37 @@ struct DurableLogChannelTest {
     MembershipView membership;
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, {});
-    constexpr int COUNT = 32;
+    if (indexOnly) {
+      const auto check = [&]() {
+        decltype(log.unsealedByObject) expected;
+        for (const auto& [sequence, record] : log.parsed) expected[record.objectName].insert(sequence);
+        KJ_REQUIRE(bool(expected == log.unsealedByObject), "parsed records and object index differ");
+      };
+      const auto insert = [&](uint64_t sequence, const char* object) {
+        LogRecord record;
+        record.nodeSeq = sequence;
+        record.objectName = object;
+        log.rememberParsedRecord(record);
+      };
+      log.setNodeEpoch(1);
+      insert(1, "object-a");
+      insert(2, "object-b");
+      insert(3, "object-a");
+      check();
+      // Seal commits and fenced-tail retirement both remove metadata through this path.
+      log.forgetParsedRecord(1);
+      log.forgetParsedRecord(1);
+      check();
+      KJ_REQUIRE(log.parsed.size() == 2 && log.unsealedByObject.at("object-a").contains(3));
+      log.forgetParsedRecord(2);
+      check();
+      KJ_REQUIRE(!log.unsealedByObject.contains("object-b"));
+      log.setNodeEpoch(2);
+      check();
+      KJ_REQUIRE(log.parsed.empty() && log.unsealedByObject.empty());
+      return;
+    }
+    constexpr int COUNT = 256;
     std::vector<std::string> objects;
     std::string burst;
     const auto appendLe = [](std::string& out, uint64_t value, int bytes) {
@@ -64,15 +94,11 @@ struct DurableLogChannelTest {
     const auto completeBytes = burst.size();
     appendLe(burst, 25, 4);
     burst.push_back('\x07');
-    const auto child = ::fork();
-    KJ_REQUIRE(child != -1);
-    if (child == 0) {
-      const auto n = ::write(peer, burst.data(), burst.size());
-      ::_exit(n == static_cast<ssize_t>(burst.size()) ? 0 : 1);
-    }
+    // Queue the whole burst before polling so the first read can deliver all of it.
+    int sendBuffer = 128 * 1024;
+    KJ_REQUIRE(::setsockopt(peer, SOL_SOCKET, SO_SNDBUF, &sendBuffer, sizeof sendBuffer) == 0);
+    KJ_REQUIRE(::send(peer, burst.data(), burst.size(), MSG_DONTWAIT) == static_cast<ssize_t>(burst.size()));
     ::close(peer);
-    int status = 0;
-    KJ_REQUIRE(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     io.waitScope.poll();
     const auto handled = channel.messages;
     bool suspended = false;
@@ -99,6 +125,6 @@ struct DurableLogChannelTest {
 
 }  // namespace coworkerd
 
-int main() {
-  coworkerd::DurableLogChannelTest::run();
+int main(int argc, char* argv[]) {
+  coworkerd::DurableLogChannelTest::run(argc == 2 && std::string_view(argv[1]) == "index");
 }

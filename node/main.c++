@@ -1,3 +1,4 @@
+#include "invocation-contract.h"
 #include "reasons.h"
 #include "r47-trace.h"
 #include "background-value.h"
@@ -238,8 +239,7 @@ struct LeaseConfig {
 };
 
 double remainingLeaseMs(double expiresAtMonotonicMs) {
-  const auto remaining = expiresAtMonotonicMs - monotonicTimeMs();
-  return remaining > 0 ? remaining : 0;
+  return coworkerd::remainingLeaseMs(expiresAtMonotonicMs, monotonicTimeMs());
 }
 
 using coworkerd::VersionDefinition;
@@ -338,7 +338,9 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
-  bool presents(double value) const { return value == (presentedExpiresAtMonotonicMs > 0 ? presentedExpiresAtMonotonicMs : expiresAtMonotonicMs); }
+  bool presents(double value) const {
+    return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
+  }
 };
 
 struct ChildAllocation {
@@ -1167,8 +1169,7 @@ public:
   }
 
   std::string invocationId(uint64_t sequence) const {
-    return serverConfig.serverId + "." + membership.view().epoch +
-        "-invocation-" + std::to_string(sequence);
+    return coworkerd::invocationName(serverConfig.serverId, membership.view().epoch, "-invocation-", sequence);
   }
 
   std::string targetServer(const std::string& workerId) const {
@@ -1552,9 +1553,9 @@ public:
     if (auto limit = root ? serverConfig.tenantRootLimit : serverConfig.tenantNestedLimit; checkTenant && limit) {
       auto found = tenantAdmissions.find(admissionTenant(worker, durable));
       if (found != tenantAdmissions.end()) {
-        const auto count = root ? found->second.roots : found->second.nested;
+        const auto count = found->second.active(root);
         KJ_ASSERT(!reserved || count > 0, "reserved admission must belong to the same tenant");
-        if (count - (reserved ? 1 : 0) >= limit) {
+        if (coworkerd::tenantAtLimit(count, limit, reserved)) {
           auto value = refusal("OVERLOADED", "tenant ingress concurrency limit reached", 503, root);
           value.inFlight = count;
           value.limit = limit;
@@ -1707,14 +1708,14 @@ public:
       KJ_ASSERT(count > 0, "admission count underflow");
       --count;
       if (tenant != tenantAdmissions.end()) {
-        auto& active = root ? tenant->second.roots : tenant->second.nested;
+        auto& active = tenant->second.active(root);
         KJ_ASSERT(active > 0, "tenant admission count underflow");
         --active;
         if (tenant->second.empty()) tenantAdmissions.erase(tenant);
       }
     });
     if (root) ++inFlightRoots; else ++inFlightNested;
-    if (tenant != tenantAdmissions.end()) ++(root ? tenant->second.roots : tenant->second.nested);
+    if (tenant != tenantAdmissions.end()) ++tenant->second.active(root);
     slot->server = this;
     slot->root = root;
     return slot;
@@ -1757,7 +1758,7 @@ public:
   }
   std::string nextPlacementId() { return invocationId(nextPlacementSequence++) + "-placement"; }
   ChildAllocation allocateRoot(SharedVersionPins pins, double deadline) {
-    auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
+    auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     std::cout << "[root] {\"nodeId\":\"" << serverConfig.serverId << "\",\"treeId\":\"" << tree
               << "\",\"grant\":" << leaseConfig.rootBudget << ",\"remainingMs\":" << remainingLeaseMs(deadline)
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << deadline
@@ -2211,7 +2212,7 @@ public:
           allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
           &*root);
     }
-    auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
+    auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
     addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
@@ -2246,36 +2247,21 @@ public:
       std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
       KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
-    auto expiresAtMonotonicMs = parent->second.expiresAtMonotonicMs;
+    auto inherited = coworkerd::inheritLease(parent->second);
     auto depth = static_cast<uint16_t>(parent->second.depth + 1);
     KJ_REQUIRE(depth > parent->second.depth, "invocation depth overflow");
-    auto parentRemainingBefore = parent->second.remainingSubrequests;
-    uint16_t grant;
-    uint16_t charged;
-    uint16_t remainingAfter;
-
-    if (leaseConfig.naive()) {
-      // Deliberately retain the bug of the test-only counterexample: each
-      // child receives a copy of its parent's remaining budget.
-      grant = parentRemainingBefore;
-      charged = 0;
-      remainingAfter = parentRemainingBefore;
-    } else {
-      if (parentRemainingBefore < 1) {
-        ++budgetRejections;
-        lastRejection = "subrequest budget exhausted before execution for parent=" +
-            parentInvocationId + " tree=" + treeId;
-        std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
-        KJ_FAIL_REQUIRE(lastRejection.c_str());
-      }
-      grant = std::min<uint16_t>(
-          leaseConfig.grantCap,
-          static_cast<uint16_t>(parentRemainingBefore - 1));
-      charged = static_cast<uint16_t>(1 + grant);
-      parent->second.remainingSubrequests =
-          static_cast<uint16_t>(parentRemainingBefore - charged);
-      remainingAfter = parent->second.remainingSubrequests;
+    const auto parentRemainingBefore = parent->second.remainingSubrequests;
+    if (!leaseConfig.naive() && parentRemainingBefore < 1) {
+      ++budgetRejections;
+      lastRejection = "subrequest budget exhausted before execution for parent=" +
+          parentInvocationId + " tree=" + treeId;
+      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
+    // The naive counterexample copies the budget without debiting the parent.
+    const auto [grant, charged, remainingAfter] = coworkerd::childBudget(
+        parentRemainingBefore, leaseConfig.grantCap, leaseConfig.naive());
+    if (!leaseConfig.naive()) parent->second.remainingSubrequests = remainingAfter;
 
     if (leaseConfig.naive()) {
       auto orderKey = treeId + "#" + std::to_string(depth);
@@ -2302,10 +2288,10 @@ public:
       charged,
       remainingAfter,
       depth,
-      expiresAtMonotonicMs,
+      inherited.deadline,
       parent->second.pins,
       false,
-      parent->second.ingressServerId,
+      inherited.ingressServerId,
     };
   }
 
@@ -3286,12 +3272,7 @@ private:
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
   uint32_t inFlightRoots = 0;
   uint32_t inFlightNested = 0;
-  struct TenantAdmissionCounts {
-    uint32_t roots = 0, nested = 0;
-    uint64_t rootRejections = 0, nestedRejections = 0;
-    bool empty() const { return roots == 0 && nested == 0 && rootRejections == 0 && nestedRejections == 0; }
-  };
-  std::map<std::string, TenantAdmissionCounts, std::less<>> tenantAdmissions;
+  std::map<std::string, coworkerd::TenantAdmissionCounts, std::less<>> tenantAdmissions;
   struct PausedAdmissionCounts {
     uint64_t count = 0, active = 0, maxActive = 0;
     double totalWaitMs = 0, maxWaitMs = 0;
@@ -3517,7 +3498,7 @@ private:
 std::string rejectionJson(
     const std::string& code, const std::string& reason, double expiresAtMonotonicMs) {
   std::ostringstream body;
-  body << std::setprecision(17)
+  coworkerd::exactDeadlinePrecision(body)
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :

@@ -806,6 +806,7 @@ private:
   std::map<uint64_t, LogRecord> parsed;
   // Sequences in `parsed`, ordered within the logical object (including its facets).
   std::map<std::string, std::set<uint64_t>, std::less<>> unsealedByObject;
+  void rememberParsedRecord(const LogRecord& record);
   void forgetParsedRecord(uint64_t sequence);
   uint64_t recordBytes = 0;
   // Records confirmed by the peers, and records isolated: never confirmed, never sealed.

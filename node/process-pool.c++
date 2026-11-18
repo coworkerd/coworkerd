@@ -1,3 +1,4 @@
+#include "process-culprit.h"
 #include "process-pool.h"
 #include "root-objects.h"
 #include "memory-observation.h"
@@ -2703,12 +2704,7 @@ public:
       if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
-        auto current = p.calls.find(invocation);
-        bool dispatched = current != p.calls.end() && current->second->dispatched &&
-            current->second->workerId == worker && current->second->versionId == version;
-        if (!dispatched) dispatched = std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& call) {
-          return call.invocationId == invocation && call.workerId == worker && call.versionId == version;
-        });
+        const auto dispatched = memoryCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
         if (dispatched && !worker.empty() && !version.empty() && !invocation.empty() &&
             labelledIsolate(p, report.getIsolate().cStr(), worker, version)) {
           offender = capnp::JsonCodec().encode(report.asReader()).cStr();
@@ -2750,13 +2746,10 @@ public:
       // The limit this Worker's executions run under (its own where it names one): the row has to be
       // against that limit, and to have spent it.
       const auto limit = call == p.calls.end() ? 0u : limitsOf(call->second->workerId).cpuMs;
-      if (!limit) return "null";
-      if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
-          value.getCpuLimitMs() != limit ||
-          value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
-          call == p.calls.end() || !call->second->dispatched ||
-          call->second->workerId != value.getWorkerId().cStr() ||
-          call->second->versionId != value.getVersionId().cStr()) return "null";
+      if (call == p.calls.end() || !cpuCulpritMatches(value.getEvent().cStr(), value.getPid(),
+          static_cast<uint32_t>(p.pid), value.getCpuLimitMs(), limit, value.getCpuUsedNs(), call->second->dispatched,
+          value.getWorkerId().cStr(), call->second->workerId,
+          value.getVersionId().cStr(), call->second->versionId)) return "null";
       if (!labelledIsolate(p, value.getIsolate().cStr(), call->second->workerId, call->second->versionId)) return "null";
       ++workerCpuStats[call->second->workerId].culprit;
       return capnp::JsonCodec().encode(value.asReader()).cStr();

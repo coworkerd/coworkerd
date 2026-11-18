@@ -2296,8 +2296,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     // Drop payload capacity as well as size before retaining metadata.
     std::string().swap(record.frameBytes);
     std::string().swap(record.header);
-    parsed[record.nodeSeq] = record;
-    unsealedByObject[record.objectName].insert(record.nodeSeq);
+    rememberParsedRecord(record);
   }
   InFlight flight;
   flight.nodeSeq = record.nodeSeq;
@@ -3179,6 +3178,11 @@ kj::Promise<std::optional<ObjectManifest>> DurableLog::readManifest(std::string 
     failStorage("the latest Durable Object manifest is invalid");
   }
   co_return manifest;
+}
+
+void DurableLog::rememberParsedRecord(const LogRecord& record) {
+  parsed[record.nodeSeq] = record;
+  unsealedByObject[record.objectName].insert(record.nodeSeq);
 }
 
 void DurableLog::forgetParsedRecord(uint64_t sequence) {
