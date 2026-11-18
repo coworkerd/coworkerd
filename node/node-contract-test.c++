@@ -197,6 +197,125 @@ void cache() {
   KJ_REQUIRE(!std::filesystem::exists(config.directory / first));
   KJ_REQUIRE(cache.read(first, 1000).wait(io.waitScope).bytes == "first");
 }
+class BundleStoreFault final: public kj::HttpService {
+public:
+  enum class Mode { MISSING, CORRUPT, CUT, SLOW, GOOD };
+  explicit BundleStoreFault(const kj::HttpHeaderTable& table): table(table) {}
+  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr, const kj::HttpHeaders&,
+      kj::AsyncInputStream&, Response& response) override {
+    KJ_REQUIRE(method == kj::HttpMethod::GET);
+    ++requests;
+    kj::HttpHeaders headers(table);
+    if (mode == Mode::MISSING) {
+      response.send(404, "Not Found", headers, uint64_t(0));
+      co_return;
+    }
+    auto body = response.send(200, "OK", headers, uint64_t(4));
+    if (mode == Mode::CUT) {
+      co_await body->write(kj::arrayPtr("g", 1).asBytes());
+      ++cuts;
+      KJ_FAIL_REQUIRE("test store intentionally terminated a partial response");
+    }
+    if (mode == Mode::SLOW) {
+      waiting.fulfiller->fulfill();
+      co_await kj::mv(release.promise);
+    }
+    co_await body->write(kj::arrayPtr(mode == Mode::CORRUPT ? "evil" : "good", 4).asBytes());
+  }
+  kj::PromiseFulfillerPair<void> waiting = kj::newPromiseAndFulfiller<void>();
+  kj::PromiseFulfillerPair<void> release = kj::newPromiseAndFulfiller<void>();
+  Mode mode = Mode::MISSING;
+  unsigned requests = 0;
+  unsigned cuts = 0;
+private:
+  const kj::HttpHeaderTable& table;
+};
+
+void cacheFaults(bool slow) {
+  TempDir path;
+  auto io = kj::setupAsyncIo();
+  auto& timer = io.provider->getTimer();
+  auto& network = io.provider->getNetwork();
+  auto listener = network.parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+  kj::HttpHeaderTable table;
+  BundleStoreFault service(table);
+  kj::HttpServer server(timer, table, service);
+  auto http = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+  ObjectStoreConfig config;
+  config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+  config.accessKey = "test-only";
+  config.secretKey = "test-only";
+  ObjectStore storage(config, network, timer);
+  BundleCacheConfig settings;
+  settings.directory = path / "cache";
+  kj::TimerImpl clock(timer.now());
+  BundleCache cache(storage, settings, slow ? static_cast<kj::Timer&>(clock) : timer, "bundles/");
+  const auto key = objectSha256("good");
+  const auto expectEmpty = [&] {
+    KJ_REQUIRE(std::filesystem::is_empty(settings.directory), "unverified bytes reached disk cache");
+    KJ_REQUIRE(number(cache.json(), "entries") == 0);
+  };
+  using Mode = BundleStoreFault::Mode;
+  if (slow) {
+    service.mode = Mode::SLOW;
+    auto request = cache.read(key, 20).eagerlyEvaluate(nullptr);
+    timer.timeoutAfter(2 * kj::SECONDS, kj::mv(service.waiting.promise)).wait(io.waitScope);
+    clock.advanceTo(clock.now() + 19 * kj::MILLISECONDS);
+    KJ_REQUIRE(!request.poll(io.waitScope), "the caller is still waiting before its deadline");
+    clock.advanceTo(clock.now() + 1 * kj::MILLISECONDS);
+    KJ_REQUIRE(request.poll(io.waitScope), "the caller must stop waiting at its deadline");
+    auto timedOut = request.wait(io.waitScope);
+    KJ_REQUIRE(timedOut.bytes.empty() && timedOut.reason == "code unavailable: fetch timed out (call deadline)");
+    expectEmpty();
+    auto joined = cache.read(key, 100).eagerlyEvaluate(nullptr);
+    service.release.fulfiller->fulfill();
+    KJ_REQUIRE(timer.timeoutAfter(2 * kj::SECONDS, kj::mv(joined)).wait(io.waitScope).bytes == "good");
+    KJ_REQUIRE(service.requests == 1 && number(cache.json(), "singleFlightMerged") == 1);
+  } else {
+    auto unavailable = [&](Mode mode, const char* reason) {
+      service.mode = mode;
+      auto result = cache.read(key, 2000).wait(io.waitScope);
+      KJ_REQUIRE(result.bytes.empty() && result.reason == reason, result.reason.c_str());
+      expectEmpty();
+    };
+    unavailable(Mode::MISSING, "code unavailable: object not found");
+    unavailable(Mode::CORRUPT, "code unavailable: content hash mismatch");
+    unavailable(Mode::CUT, "code unavailable: fetch failed");
+    KJ_REQUIRE(service.cuts > 0, "the fake store must cut a response after writing part of its body");
+    service.mode = Mode::GOOD;
+    KJ_REQUIRE(cache.read(key, 2000).wait(io.waitScope).bytes == "good");
+  }
+  KJ_REQUIRE(number(cache.json(), "entries") == 1 && number(cache.json(), "fetchSucceeded") == 1);
+}
+
+void cacheCapacity() {
+  TempDir path;
+  auto io = kj::setupAsyncIo();
+  auto& timer = io.provider->getTimer();
+  ObjectStoreConfig config;
+  config.backend = "directory";
+  config.directory = (path / "store").string();
+  ObjectStore storage(config, io.provider->getNetwork(), timer);
+  BundleCacheConfig settings;
+  settings.directory = path / "cache";
+  settings.maxBytes = 5;
+  BundleCache cache(storage, settings, timer, "bundles/");
+  for (auto data : {"aaa", "bbb", "too big"}) {
+    storage.put("bundles/" + objectSha256(data), data).wait(io.waitScope);
+  }
+  const auto first = objectSha256("aaa"), second = objectSha256("bbb"), large = objectSha256("too big");
+  KJ_REQUIRE(cache.read(first, 1000).wait(io.waitScope).bytes == "aaa");
+  KJ_REQUIRE(cache.read(second, 1000).wait(io.waitScope).bytes == "bbb");
+  KJ_REQUIRE(!std::filesystem::exists(settings.directory / first));
+  KJ_REQUIRE(number(cache.json(), "bytes") == 3 && number(cache.json(), "evictions") == 1);
+  auto overLimit = cache.read(large, 1000).wait(io.waitScope);
+  KJ_REQUIRE(overLimit.bytes.empty() && overLimit.reason == "code unavailable: cache size limit exceeded");
+  KJ_REQUIRE(!std::filesystem::exists(settings.directory / large));
+  KJ_REQUIRE(cache.read(first, 1000).wait(io.waitScope).bytes == "aaa");
+  KJ_REQUIRE(!std::filesystem::exists(settings.directory / second));
+  KJ_REQUIRE(number(cache.json(), "bytes") == 3 && number(cache.json(), "evictions") == 2);
+}
+
 void rejectedManifest() {
   class EmptyStore final: public kj::HttpService {
   public:
@@ -267,6 +386,9 @@ int main(int argc, char* argv[]) {
   else if (name == "package") package();
   else if (name == "module-types") moduleTypes();
   else if (name == "cache") cache();
+  else if (name == "cache-unavailable") cacheFaults(false);
+  else if (name == "cache-deadline") cacheFaults(true);
+  else if (name == "cache-capacity") cacheCapacity();
   else if (name == "rejected-manifest") rejectedManifest();
   else KJ_FAIL_REQUIRE("unknown contract test", argv[1]);
 }
