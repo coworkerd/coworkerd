@@ -46,4 +46,16 @@ inline ChildBudget childBudget(uint16_t before, uint16_t cap, bool naive) {
   return {grant, charged, static_cast<uint16_t>(before - charged)};
 }
 
+struct TenantAdmissionCounts {
+  uint32_t roots = 0, nested = 0;
+  uint64_t rootRejections = 0, nestedRejections = 0;
+  uint32_t& active(bool root) { return root ? roots : nested; }
+  uint32_t active(bool root) const { return root ? roots : nested; }
+  bool empty() const { return roots == 0 && nested == 0 && rootRejections == 0 && nestedRejections == 0; }
+};
+
+inline bool tenantAtLimit(uint32_t count, uint32_t limit, bool reserved) {
+  return count - (reserved ? 1 : 0) >= limit;
+}
+
 }  // namespace coworkerd

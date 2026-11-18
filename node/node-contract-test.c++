@@ -4,6 +4,7 @@
 #include "event-loop.h"
 #include "trial-verdict.h"
 #include "json.h"
+#include "process-culprit.h"
 #include "manifests.h"
 
 #include <bit>
@@ -134,6 +135,50 @@ void identity() {
   KJ_REQUIRE(invocationName("n1", "epoch-9", "-invocation-", 12) == "n1.epoch-9-invocation-12");
   KJ_REQUIRE(invocationName("n1", "epoch-9", "-tree-", 13) != invocationName("n1", "epoch-9", "-tree-", 12));
   KJ_REQUIRE(invocationName("n2", "epoch-9", "-tree-", 12) != invocationName("n1", "epoch-9", "-tree-", 12));
+}
+void admission() {
+  TenantAdmissionCounts tenant, other;
+  KJ_REQUIRE(tenant.empty());
+  ++tenant.active(true);
+  ++tenant.active(true);
+  ++tenant.active(false);
+  KJ_REQUIRE(tenant.roots == 2 && tenant.nested == 1 && other.empty());
+  KJ_REQUIRE(tenantAtLimit(tenant.active(true), 2, false));
+  KJ_REQUIRE(!tenantAtLimit(tenant.active(true), 2, true));
+  --tenant.active(true);
+  KJ_REQUIRE(!tenantAtLimit(tenant.active(true), 2, false));
+  --tenant.active(false);
+  --tenant.active(true);
+  KJ_REQUIRE(tenant.empty());
+  ++tenant.rootRejections;
+  KJ_REQUIRE(!tenant.empty(), "idle tenants keep their refusal counters");
+}
+void cpuCulpritCurrentBehavior() {
+  const auto matches = [](bool live, uint32_t pid, uint32_t limit, uint64_t used,
+      const char* worker, const char* version, const char* event = "culprit") {
+    return cpuCulpritMatches(event, pid, 11, limit, 100, used, live, worker, "tenant/worker", version, "v1");
+  };
+  KJ_REQUIRE(matches(true, 11, 100, 100000000, "tenant/worker", "v1"));
+  KJ_REQUIRE(!matches(false, 11, 100, 100000000, "tenant/worker", "v1"), "completed call is not attributed by current CPU behavior");
+  KJ_REQUIRE(!matches(true, 11, 100, 100000000, "tenant/other", "v1"));
+  KJ_REQUIRE(!matches(true, 11, 100, 100000000, "tenant/worker", "v2"));
+  KJ_REQUIRE(!matches(true, 12, 100, 100000000, "tenant/worker", "v1"));
+  KJ_REQUIRE(!matches(true, 11, 101, 101000000, "tenant/worker", "v1"));
+  KJ_REQUIRE(!matches(true, 11, 100, 99999999, "tenant/worker", "v1"));
+  KJ_REQUIRE(!matches(true, 11, 100, 100000000, "tenant/worker", "v1", "memory-culprit"));
+}
+void memoryCulprit() {
+  struct Call { std::string invocationId, workerId, versionId; bool dispatched; };
+  Call active{"in-flight", "tenant/worker", "v1", true};
+  Call queued{"queued", "tenant/worker", "v1", false};
+  std::map<std::string, const Call*> live{{active.invocationId, &active}, {queued.invocationId, &queued}};
+  std::vector<Call> recent{{"completed", "tenant/worker", "v1", true}};
+  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "in-flight", "tenant/worker", "v1"));
+  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v1"));
+  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v2"));
+  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/other", "v1"));
+  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "not-dispatched", "tenant/worker", "v1"));
+  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
 }
 void package() {
   TempDir path;
@@ -434,6 +479,9 @@ int main(int argc, char* argv[]) {
   else if (name == "tree-lease") treeLease();
   else if (name == "budget") budget();
   else if (name == "identity") identity();
+  else if (name == "admission") admission();
+  else if (name == "cpu-culprit-current-behavior") cpuCulpritCurrentBehavior();
+  else if (name == "memory-culprit") memoryCulprit();
   else if (name == "package") package();
   else if (name == "module-types") moduleTypes();
   else if (name == "cache") cache();

@@ -148,6 +148,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_dependencies(coworkerd coworkerd-launcher)
 endif()
 
+# A component test against the actual durable log and reader, without running a cluster.
+add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
+  node/durable-channel-test.c++
+  node/memory-watermark.c++
+  node/durable-log.c++
+  node/alarm-publication.c++
+  node/alarm-discovery.c++
+  node/recovery-history.c++
+  node/root-objects.c++
+  node/durable-shards.c++
+  node/membership.c++
+  node/blob-store.c++
+  node/peer-auth.c++
+)
+target_include_directories(coworkerd-durable-channel-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
+target_link_libraries(coworkerd-durable-channel-test PRIVATE common kj-tls-local)
 
 # This gate runs the already built unit/component tests without starting a cluster.
 enable_testing()
@@ -159,8 +175,10 @@ add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
-foreach(case deadlines event-loop trial-verdicts leases tree-lease budget identity package module-types cache
-    cache-unavailable cache-deadline cache-capacity cache-single-flight rejected-manifest)
+add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
+add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
+foreach(case deadlines event-loop trial-verdicts leases tree-lease budget identity admission package module-types cache
+    cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
 set(COWORKERD_TEST_JUNIT "" CACHE FILEPATH "Optional JUnit result path for the check target")
@@ -170,7 +188,7 @@ if(COWORKERD_TEST_JUNIT)
 endif()
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
-  DEPENDS coworkerd-node-contract-test coworkerd-process-culprit-test
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.

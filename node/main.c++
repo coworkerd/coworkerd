@@ -2,6 +2,8 @@
 #include "event-loop.h"
 #include "trial-verdict.h"
 #include "reasons.h"
+#include "r47-trace.h"
+#include "background-value.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
@@ -429,6 +431,11 @@ struct InvocationRejection {
     return out.str();
   }
 };
+
+constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
+bool tenantLimitRefusal(const InvocationRejection& refusal) {
+  return refusal.code == "OVERLOADED" && refusal.category == TENANT_ADMISSION_LIMIT;
+}
 
 bool pausedRefusal(const InvocationRejection& refusal) {
   return refusal.status == 503 &&
@@ -1555,7 +1562,7 @@ public:
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
       bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr,
-      bool reserved = false, bool checkProcess = true, bool checkMemoryBand = true) {
+      bool reserved = false, bool checkProcess = true, bool checkMemoryBand = true, bool checkTenant = true) {
     auto started = monotonicTimeMs();
     auto timing = kj::defer([&] { phaseTiming("admission", started); });
     auto rejected = [&](std::string code, std::string reason, uint status = 503) {
@@ -1569,6 +1576,25 @@ public:
     }
     if (inFlightRoots + inFlightNested - (reserved ? 1 : 0) >= (root ? serverConfig.rootLimit : serverConfig.nestedLimit))
       return rejected("OVERLOADED", "concurrency limit reached");
+    if (auto limit = root ? serverConfig.tenantRootLimit : serverConfig.tenantNestedLimit; checkTenant && limit) {
+      auto found = tenantAdmissions.find(admissionTenant(worker, durable));
+      if (found != tenantAdmissions.end()) {
+        const auto count = found->second.active(root);
+        KJ_ASSERT(!reserved || count > 0, "reserved admission must belong to the same tenant");
+        if (coworkerd::tenantAtLimit(count, limit, reserved)) {
+          auto value = refusal("OVERLOADED", "tenant ingress concurrency limit reached", 503, root);
+          value.inFlight = count;
+          value.limit = limit;
+          value.avoidMs = 0;
+          value.category = TENANT_ADMISSION_LIMIT;
+          if (record) {
+            recordTenantLimitRefusal(worker, root, value, durable);
+            observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+          }
+          return value;
+        }
+      }
+    }
     const auto band = memory.effectiveBand();
     if (checkMemoryBand && (!root || forwardedRoot) && (band == "red" ||
         (band == "yellow" && !(durable ? runtime.durableHot(hash) : hot(hash)))))
@@ -1597,10 +1623,13 @@ public:
       bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr, bool wait = true,
       std::shared_ptr<AdmissionSlot> slot = {}) {
     auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
-    if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root)};
+    if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root, worker, durable)};
     auto reject = [&](InvocationRejection value) {
-      value.category.clear();
-      value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
+      if (tenantLimitRefusal(value)) recordTenantLimitRefusal(worker, root, value, durable);
+      else {
+        value.category.clear();
+        value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
+      }
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return Admission{std::move(value), {}};
     };
@@ -1612,7 +1641,7 @@ public:
     if (!paused) co_return reject(std::move(*failure));
     const auto kind = failure->category.substr(7);
     const auto began = monotonicTimeMs();
-    if (!slot) slot = reserve(root);
+    if (!slot) slot = reserve(root, worker, durable);
     const auto until = std::min(deadline, began + std::max(0.0, pausedAdmissionWaitMs() - slot->pausedWaitMs));
     const auto id = beginAdmissionWait(kind);
     std::string outcome = "canceled";
@@ -1675,14 +1704,44 @@ public:
     out << '}'; return out.str();
   }
 
-  std::shared_ptr<AdmissionSlot> reserve(bool root) {
-    if (root) ++inFlightRoots; else ++inFlightNested;
-    auto slot = std::make_shared<AdmissionSlot>([this, lifetime = std::weak_ptr<int>(executionLifetime), root]() {
+  std::string_view admissionTenant(const std::string& worker, const DurableTarget* durable = nullptr) const {
+    // Worker identity comes from the selected deployment. Do not use an ingress header.
+    // A scheduled alarm has no ingress caller; its scheduler continues to use the node-wide limits.
+    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) || (durable && durable->alarmAtUnixMs)) return {};
+    auto slash = worker.find('/');
+    return slash == std::string::npos ? std::string_view() : std::string_view(worker).substr(0, slash);
+  }
+
+  void recordTenantLimitRefusal(const std::string& worker, bool root, const InvocationRejection& refusal,
+      const DurableTarget* durable = nullptr) {
+    if (!tenantLimitRefusal(refusal)) return;
+    auto found = tenantAdmissions.find(admissionTenant(worker, durable));
+    KJ_ASSERT(found != tenantAdmissions.end());
+    ++(root ? found->second.rootRejections : found->second.nestedRejections);
+  }
+
+  std::shared_ptr<AdmissionSlot> reserve(bool root, const std::string& worker, const DurableTarget* durable = nullptr) {
+    const auto key = admissionTenant(worker, durable);
+    auto tenant = tenantAdmissions.end();
+    if (!key.empty()) {
+      tenant = tenantAdmissions.lower_bound(key);
+      if (tenant == tenantAdmissions.end() || tenant->first != key)
+        tenant = tenantAdmissions.try_emplace(tenant, std::string(key));
+    }
+    auto slot = std::make_shared<AdmissionSlot>([this, lifetime = std::weak_ptr<int>(executionLifetime), root, tenant]() {
       if (lifetime.expired()) return;
       auto& count = root ? inFlightRoots : inFlightNested;
       KJ_ASSERT(count > 0, "admission count underflow");
       --count;
+      if (tenant != tenantAdmissions.end()) {
+        auto& active = tenant->second.active(root);
+        KJ_ASSERT(active > 0, "tenant admission count underflow");
+        --active;
+        if (tenant->second.empty()) tenantAdmissions.erase(tenant);
+      }
     });
+    if (root) ++inFlightRoots; else ++inFlightNested;
+    if (tenant != tenantAdmissions.end()) ++tenant->second.active(root);
     slot->server = this;
     slot->root = root;
     return slot;
@@ -1749,10 +1808,28 @@ public:
     out << "]"; return out.str();
   }
 
+  std::string tenantAdmissionJson() const {
+    std::ostringstream out;
+    out << "{\"rootLimit\":" << serverConfig.tenantRootLimit << ",\"nestedLimit\":" << serverConfig.tenantNestedLimit
+        << ",\"tenants\":[";
+    bool first = true;
+    for (const auto& [id, count] : tenantAdmissions) {
+      if (count.empty()) continue;
+      if (!first) out << ',';
+      first = false;
+      out << "{\"tenant\":\"" << jsonEscape(id) << "\",\"inFlight\":{\"roots\":" << count.roots
+          << ",\"nested\":" << count.nested << "},\"rejections\":{\"roots\":" << count.rootRejections
+          << ",\"nested\":" << count.nestedRejections << "}}";
+    }
+    out << "]}";
+    return out.str();
+  }
+
   std::string placementJson() const {
     std::ostringstream out; out << std::setprecision(17) << "{\"inFlight\":{\"roots\":" << inFlightRoots
         << ",\"nested\":" << inFlightNested << ",\"total\":" << inFlightRoots + inFlightNested
         << "},\"rootLimit\":" << serverConfig.rootLimit << ",\"nestedLimit\":" << serverConfig.nestedLimit
+        << ",\"tenantAdmission\":" << tenantAdmissionJson()
         << ",\"loadBand\":\"" << memory.effectiveBand() << "\",\"loadBandForTest\":\"" << serverConfig.loadBandForTest << "\",\"p\":" << serverConfig.homeProbability
         << ",\"idleMs\":" << serverConfig.idleMs << ",\"hotVersions\":[";
     size_t n = 0;
@@ -2401,7 +2478,7 @@ public:
     ++forwardedInvocations;
     auto sequence = nextDebitSequence++;
     if (debits.size() == MAX_EXECUTION_RECORDS) debits.pop_front();
-    debits.push_back({
+    debits.push_back(std::make_shared<DebitRecord>(DebitRecord{
       sequence,
       allocation.treeId,
       allocation.parentInvocationId,
@@ -2412,7 +2489,7 @@ public:
       allocation.remainingAfter,
       allocation.depth,
       allocation.expiresAtMonotonicMs,
-    });
+    }));
   }
 
   void recordRelay(
@@ -2426,10 +2503,10 @@ public:
     ++forwardedInvocations;
     auto sequence = nextDebitSequence++;
     if (debits.size() == MAX_EXECUTION_RECORDS) debits.pop_front();
-    debits.push_back({
+    debits.push_back(std::make_shared<DebitRecord>(DebitRecord{
       sequence, treeId, parentInvocationId, target, targetServerId,
       grant, 0, grant, depth, expiresAtMonotonicMs,
-    });
+    }));
   }
 
   void observeRemoteInvocationSize(uint64_t bytes, size_t pins) {
@@ -2512,7 +2589,7 @@ private:
       executions.pop_front();
       ++droppedExecutions;
     }
-    executions.push_back({
+    executions.push_back(std::make_shared<ExecutionRecord>(ExecutionRecord{
       sequence, process->processId, process->generation,
       treeId,
       invocationId,
@@ -2528,8 +2605,8 @@ private:
       ingressServerId,
       // The load check before this dispatch loaded the version: this call's cold start.
       coldLoaded,
-    });
-    const bool ingress = executions.back().kind == "ingress";
+    }));
+    const bool ingress = executions.back()->kind == "ingress";
     const bool peerIngress = ingress && !ingressServerId.empty() && ingressServerId != serverConfig.serverId;
     const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
     auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
@@ -2538,7 +2615,10 @@ private:
       if (lifetime.expired()) return;
       pendingDispatchDecisions.erase(invocationId);
       if (!executed) {
-        for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = false;
+        for (auto& item : executions) if (item->invocationId == invocationId) {
+          if (item.use_count() != 1) item = std::make_shared<ExecutionRecord>(*item);
+          item->dispatched = false;
+        }
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
@@ -2560,16 +2640,16 @@ private:
       decision(true);
     }
     std::cout << "[server] execute target=" << version->key()
-              << " kind=" << executions.back().kind
-              << " tree=" << executions.back().treeId
+              << " kind=" << executions.back()->kind
+              << " tree=" << executions.back()->treeId
               << " invocation=" << invocationId << std::endl;
     lastExecution[version->definitionHash] = monotonicTimeMs();
     std::cout << "[execution] {\"nodeId\":\"" << serverConfig.serverId
               << "\",\"processId\":\"" << process->processId << "\",\"processGeneration\":" << process->generation
-              << ",\"sequence\":" << sequence << ",\"treeId\":\"" << executions.back().treeId
+              << ",\"sequence\":" << sequence << ",\"treeId\":\"" << executions.back()->treeId
               << "\",\"invocationId\":\"" << invocationId << "\",\"target\":\"" << version->key()
-              << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back().kind
-              << "\",\"parentInvocationId\":\"" << executions.back().parentInvocationId
+              << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back()->kind
+              << "\",\"parentInvocationId\":\"" << executions.back()->parentInvocationId
               << "\",\"grant\":" << grant << ",\"remainingAfter\":" << remainingAfter << ",\"depth\":" << depth
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
               << ",\"ingressNodeId\":\"" << jsonEscape(ingressServerId) << "\",\"coldStart\":null"
@@ -2715,7 +2795,10 @@ public:
           version->definitionHash == definitionHash, "invalid loader observation");
       const auto key = processId + ":" + generation + ":" + definitionHash;
       if (coldStarts.emplace(key, 1).second) {
-        for (auto& execution : executions) if (execution.invocationId == invocationId) execution.coldStart = true;
+        for (auto& execution : executions) if (execution->invocationId == invocationId) {
+          if (execution.use_count() != 1) execution = std::make_shared<ExecutionRecord>(*execution);
+          execution->coldStart = true;
+        }
         std::cout << "[cold-start] {\"nodeId\":\"" << serverConfig.serverId << "\",\"processId\":\""
                   << processId << "\",\"processGeneration\":" << generation << ",\"invocationId\":\"" << invocationId
                   << "\",\"target\":\"" << version->key() << "\",\"definitionHash\":\"" << definitionHash
@@ -2732,14 +2815,32 @@ public:
     co_return output.str();
   }
 
-  std::string stateJson(const std::string& peerConnectionsJson = "{}", const std::string& avoidanceJson = "[]") {
+  kj::Promise<std::string> stateJson(std::string peerConnectionsJson, std::string avoidanceJson) {
+    while (buildingState) co_await timer.afterDelay(1 * kj::MILLISECONDS);
+    buildingState = true;
+    const auto release = kj::defer([this]() { buildingState = false; });
+    const auto started = coworkerd::r47::trace ? coworkerd::r47::clockNs(CLOCK_MONOTONIC) : 0;
+    coworkerd::r47::Span expiry(coworkerd::r47::STATE_EXPIRY);
     expireForState();
+    expiry.finish();
+    coworkerd::r47::Span snapshot(coworkerd::r47::STATE_SNAPSHOT);
     std::set<const VersionPins*> pinTables;
     size_t pinReferences = 0;
+    std::vector<std::pair<std::string, InvocationLeaseState>> stateLeases;
+    stateLeases.reserve(leases.size());
     for (const auto& [id, lease] : leases) {
       pinTables.insert(lease.pins.get());
       pinReferences += lease.pins->size();
+      stateLeases.emplace_back(id, lease);
     }
+    // The two bounded histories share their immutable records with the response. A later execution update
+    // replaces its record while a response holds this snapshot.
+    const auto stateDebits = debits;
+    const auto stateExecutions = executions;
+    const auto capturedDropped = droppedExecutions;
+    const auto capturedUnix = wallTimeMsForTest();
+    const auto capturedMonotonic = monotonicTimeMs();
+    snapshot.finish(stateLeases.size()+stateDebits.size()+stateExecutions.size());
     std::ostringstream output;
     output << std::setprecision(17);
     output << "{\"nodeId\":\"" << jsonEscape(serverConfig.serverId)
@@ -2750,10 +2851,16 @@ public:
            << ",\"launch\":" << launch << ",\"configuration\":" << configuration << ",\"management\":" << managementJson()
            << ",\"drain\":" << drainJson()
            << ",\"tenants\":" << tenantsJson()
-           << ",\"usage\":" << usageJson()
-           << ",\"processes\":" << runtime.json(serverConfig.idleMs)
-           << ",\"memory\":" << memoryStateJson()
-           << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
+           << ",\"usage\":" << usageJson();
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    auto processes = co_await runtime.stateJson(serverConfig.idleMs, timer);
+    output << ",\"processes\":" << processes;
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    auto memorySection = co_await memoryStateJson();
+    output << ",\"memory\":" << memorySection;
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    coworkerd::r47::Span coreFields(coworkerd::r47::STATE_CORE_FIELDS);
+    output << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
            << ",\"bundles\":" << desiredState.bundlesJson()
@@ -2765,8 +2872,8 @@ public:
            << ",\"jsRpc\":" << jsRpcJson()
            << ",\"assets\":" << assetsJson()
            << ",\"maxExecutionRecords\":" << MAX_EXECUTION_RECORDS
-           << ",\"droppedExecutions\":" << droppedExecutions
-           << ",\"leaseCount\":" << leases.size()
+           << ",\"droppedExecutions\":" << capturedDropped
+           << ",\"leaseCount\":" << stateLeases.size()
            << ",\"leaseVersionPinTables\":" << pinTables.size()
            << ",\"leaseVersionPinReferences\":" << pinReferences
            << ",\"remoteInvocationObjectBytes\":" << remoteInvocationBytes
@@ -2775,8 +2882,8 @@ public:
            << ",\"leaseMode\":\"" << (leaseConfig.naive() ? "naive" : "correct") << "\""
            << ",\"leaseTtlMs\":" << leaseConfig.ttlMs
            << ",\"clockOffsetMsForTest\":" << serverConfig.clockOffsetMsForTest
-           << ",\"serverNowUnixMs\":" << wallTimeMsForTest()
-           << ",\"serverNowMonotonicMs\":" << monotonicTimeMs()
+           << ",\"serverNowUnixMs\":" << capturedUnix
+           << ",\"serverNowMonotonicMs\":" << capturedMonotonic
            << ",\"expiredLeases\":" << expiredLeases
            << ",\"expiredLeaseRejections\":" << expiredLeaseRejections
            << ",\"renewedLeases\":" << renewedLeases
@@ -2820,20 +2927,30 @@ public:
            << ",\"ingressPlacement\":" << (serverConfig.ingressPlacement ? "true" : "false")
            << ",\"proxyingIngress\":" << proxyingIngress
            << ",\"leases\":[";
-    size_t leaseIndex = 0;
-    for (const auto& [invocationId, lease] : leases) {
-      if (leaseIndex++ > 0) output << ',';
-      output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
+    coreFields.finish(static_cast<uint64_t>(output.tellp()));
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    constexpr size_t RECORD_SLICE = 32;
+    for (size_t begin = 0; begin < stateLeases.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateLeases.size(), begin + RECORD_SLICE); ++index) {
+        const auto& [invocationId, lease] = stateLeases[index];
+        if (index > 0) output << ',';
+        output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
              << "\",\"invocationId\":\"" << jsonEscape(invocationId)
              << "\",\"grant\":" << lease.grant
              << ",\"remainingSubrequests\":" << lease.remainingSubrequests
              << ",\"depth\":" << lease.depth
              << ",\"expiresAtMonotonicMs\":" << lease.expiresAtMonotonicMs << "}";
+      }
+      span.finish(1);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "],\"debits\":[";
-    for (size_t index = 0; index < debits.size(); ++index) {
+    for (size_t begin = 0; begin < stateDebits.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateDebits.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
-      const auto& record = debits[index];
+      const auto& record = *stateDebits[index];
       output << "{\"sequence\":" << record.sequence
              << ",\"treeId\":\"" << jsonEscape(record.treeId)
              << "\",\"parentInvocationId\":\""
@@ -2846,6 +2963,9 @@ public:
              << ",\"remainingAfter\":" << record.remainingAfter
              << ",\"depth\":" << record.depth
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
+      }
+      span.finish(2);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "],\"peerOrigins\":{";
     size_t originIndex = 0;
@@ -2854,9 +2974,11 @@ public:
       output << "\"" << jsonEscape(origin) << "\":" << count;
     }
     output << "},\"executions\":[";
-    for (size_t index = 0; index < executions.size(); ++index) {
+    for (size_t begin = 0; begin < stateExecutions.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateExecutions.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
-      const auto& record = executions[index];
+      const auto& record = *stateExecutions[index];
       output << "{\"sequence\":" << record.sequence
              << ",\"processId\":\"" << record.processId << "\",\"processGeneration\":" << record.processGeneration
              << ",\"treeId\":\"" << jsonEscape(record.treeId)
@@ -2873,25 +2995,44 @@ public:
              << "\",\"coldStart\":" << (record.coldStart ? "true" : "false")
              << ",\"dispatched\":" << (record.dispatched ? "true" : "false")
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
+      }
+      span.finish(3);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "]";
-    for (const auto& [name, section] : stateSections) output << ",\"" << name << "\":" << section();
+    uint64_t index = 0;
+    for (const auto& [name, section] : stateSections) {
+      const auto partStart = coworkerd::r47::trace ? output.tellp() : std::streampos{};
+      coworkerd::r47::Span partTrace(coworkerd::r47::STATE_SECTION_BASE + index++);
+      output << ",\"" << name << "\":" << section();
+      if (coworkerd::r47::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    }
     output << "}";
-    return output.str();
+    coworkerd::r47::Span flatten(coworkerd::r47::STATE_FLATTEN);
+    auto result = output.str();
+    flatten.finish(result.size());
+    if (started) coworkerd::r47::record(coworkerd::r47::STATE_ASYNC, started,
+        coworkerd::r47::clockNs(CLOCK_MONOTONIC), 0, result.size());
+    co_return result;
   }
 
   // Sections the state endpoint appends after the ones above, each from its own part of the node (egress,
   // peerAuth, storage).
   void addStateSection(std::string name, std::function<std::string()> section) {
-    if (name == "memory.daemon") daemonMemory = std::move(section);
-    else stateSections.emplace_back(std::move(name), std::move(section));
+    stateSections.emplace_back(std::move(name), std::move(section));
   }
   std::vector<std::pair<std::string, std::function<std::string()>>> stateSections;
-  std::function<std::string()> daemonMemory;
-  std::string memoryStateJson() const {
+  void setDaemonMemory(std::function<kj::Promise<std::string>()> section) { daemonMemory = std::move(section); }
+  bool buildingState = false;
+  std::function<kj::Promise<std::string>()> daemonMemory;
+  kj::Promise<std::string> memoryStateJson() const {
     auto result = memory.json();
-    if (daemonMemory) { result.pop_back(); result += ",\"daemon\":" + daemonMemory() + '}'; }
-    return result;
+    if (daemonMemory) {
+      auto section = co_await daemonMemory();
+      result.pop_back(); result += ",\"daemon\":" + section + '}';
+    }
+    co_return result;
   }
 
   std::string retainedMemoryJson() const {
@@ -2990,7 +3131,7 @@ public:
   // The culprit a workerd exit or kill confirmed for this invocation: "memory"
   // (fatal OOM), "cpu" (watchdog kill), or empty.
   std::string culpritOf(const std::string& invocationId) {
-    auto text = runtime.json(serverConfig.idleMs);
+    auto text = runtime.culpritRecordsJson();
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), json);
@@ -3226,7 +3367,7 @@ private:
   coworkerd::DesiredState& desiredState;
   coworkerd::ProcessPool& runtime;
   coworkerd::MemoryWatermark& memory;
-  std::deque<ExecutionRecord> executions;
+  std::deque<std::shared_ptr<ExecutionRecord>> executions;
   std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingDispatchDecisions;
   struct PreparationBytes { uint64_t bytes, used; };
   std::map<std::string, PreparationBytes> preparationBytes;
@@ -3236,7 +3377,7 @@ private:
   struct PreparationErrors final: kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } preparationErrors;
   kj::TaskSet preparationByteTasks{preparationErrors};
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
-  std::deque<DebitRecord> debits;
+  std::deque<std::shared_ptr<DebitRecord>> debits;
   std::map<std::string, InvocationLeaseState> leases;
   std::priority_queue<
       LeaseExpiry,
@@ -3272,6 +3413,7 @@ private:
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
   uint32_t inFlightRoots = 0;
   uint32_t inFlightNested = 0;
+  std::map<std::string, coworkerd::TenantAdmissionCounts, std::less<>> tenantAdmissions;
   struct PausedAdmissionCounts {
     uint64_t count = 0, active = 0, maxActive = 0;
     double totalWaitMs = 0, maxWaitMs = 0;
@@ -4423,8 +4565,11 @@ public:
     const auto deadline = invocation.expiresAtMonotonicMs;
     auto guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
         deadline, false, false, nullptr, false, false, false);
-    if (guard) co_return InvocationAttempt{nullptr, std::move(guard), true};
-    auto slot = server.reserve(invocation.ingressRoot);
+    if (guard) {
+      server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
+      co_return InvocationAttempt{nullptr, std::move(guard), true};
+    }
+    auto slot = server.reserve(invocation.ingressRoot, invocation.workerId);
     const auto kind = original.category.substr(7);
     const auto began = monotonicTimeMs();
     const auto until = std::min(deadline, began + server.pausedAdmissionWaitMs());
@@ -4435,6 +4580,7 @@ public:
       guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
           deadline, false, false, nullptr, true, false, false);
       if (guard) {
+        server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
         outcome = guard->code == "LEASE_EXPIRED" ? "lease" : "unavailable";
         co_return InvocationAttempt{nullptr, std::move(guard), true};
       }
@@ -4744,7 +4890,8 @@ public:
     bool homeFailed = avoidedHome != avoidance.end() && avoidedHome->second.until > monotonicTimeMs();
     bool localFirst = !lastResort && selfRanked &&
         server.hot(version->definitionHash) &&
-        !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot, allocation.expiresAtMonotonicMs, false);
+        !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot,
+            allocation.expiresAtMonotonicMs, false, false, nullptr, false, true, true, false);
     if (localFirst && home != config.serverId && server.drawHome()) {
       localFirst = false; server.decision("probabilityHome", allocation.ingressRoot);
     } else if (localFirst) {
@@ -4837,8 +4984,9 @@ public:
           allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint, allocation.nativeProps};
     };
-    bool allPaused = true;
+    bool allPaused = true, allTenantLimited = true;
     bool allNotExecuted = true;
+    std::optional<InvocationRejection> tenantRefusal;
     std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
       if (hops == 0) break;
@@ -4896,13 +5044,19 @@ public:
       if (id == home) homeFailed = true;
       if (attempted > 1) failures += ',';
       failures += "{\"nodeId\":\"" + id + "\",\"failure\":" + result.failure->json() + "}";
-      auto& avoid = avoidance[id];
-      auto delay = std::min(result.failure->avoidMs, config.avoidMaxMs);
-      if (result.connectionFailure) {
-        avoid.failures = std::min<uint32_t>(avoid.failures + 1, 32);
-        delay = std::min<uint64_t>(uint64_t(config.connectBackoffMs) << (avoid.failures - 1), config.avoidMaxMs);
-      } else avoid.failures = 0;
-      avoid.until = monotonicTimeMs() + delay;
+      if (tenantLimitRefusal(*result.failure)) {
+        // This candidate can still accept other tenants. Do not touch shared node avoidance.
+        tenantRefusal = *result.failure;
+      } else {
+        allTenantLimited = false;
+        auto& avoid = avoidance[id];
+        auto delay = std::min(result.failure->avoidMs, config.avoidMaxMs);
+        if (result.connectionFailure) {
+          avoid.failures = std::min<uint32_t>(avoid.failures + 1, 32);
+          delay = std::min<uint64_t>(uint64_t(config.connectBackoffMs) << (avoid.failures - 1), config.avoidMaxMs);
+        } else avoid.failures = 0;
+        avoid.until = monotonicTimeMs() + delay;
+      }
       if (attempted < ordered.size() && hops > 0) server.reroute(result.failure->code);
     }
     // Every candidate explicitly refused before execution because its eligible processes were paused.
@@ -4925,6 +5079,8 @@ public:
         co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
       failures += ",{\"nodeId\":\"" + target + "\",\"failure\":" + result.failure->json() + "}";
     }
+    if (allTenantLimited && tenantRefusal)
+      co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
     failures += ']';
     auto refusal = server.refusal("PLACEMENT_EXHAUSTED", hops == 0 ? "placement hops exhausted" : "all candidates rejected or unavailable", 503, allocation.ingressRoot);
     // Preserve explicit pre-execution proof through placement aggregation. A failed
@@ -5327,9 +5483,10 @@ public:
     }
     if (auto refusal = server.admission(version->workerId, version->definitionHash, invocation.ingressRoot,
         invocation.expiresAtMonotonicMs, false, invocation.ingressRoot)) {
+      server.recordTenantLimitRefusal(version->workerId, invocation.ingressRoot, *refusal);
       reject(*refusal); co_return;
     }
-    auto slot = server.reserve(invocation.ingressRoot);
+    auto slot = server.reserve(invocation.ingressRoot, version->workerId);
     slot->entrypoint = invocation.entrypoint;
     unavailable = co_await server.ensureCode(*version, invocation.expiresAtMonotonicMs);
     if (!unavailable.empty()) {
@@ -5579,7 +5736,7 @@ public:
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable,
       kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial,
-      WorkerLogsEndpoint& logs, kj::Function<std::string()> state, coworkerd::PeerAuth& peerAuth,
+      WorkerLogsEndpoint& logs, kj::Function<kj::Promise<std::string>()> state, coworkerd::PeerAuth& peerAuth,
       ControlPlaneAddresses& controlPlane)
       : server(server), headerTable(headerTable),
         rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
@@ -5647,12 +5804,14 @@ public:
       return sqlQuery(url, body, response);
     }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
-      auto text = kj::heap<std::string>(state());
-      kj::HttpHeaders headers(headerTable);
-      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-      auto stream = response.send(200, "OK", headers, text->size());
-      auto write = stream->write(kj::arrayPtr(text->data(), text->size()).asBytes());
-      return write.attach(kj::mv(stream), kj::mv(text));
+      return state().then([this, &response](std::string result) {
+        auto text = kj::heap<std::string>(std::move(result));
+        kj::HttpHeaders headers(headerTable);
+        headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+        auto stream = response.send(200, "OK", headers, text->size());
+        auto write = stream->write(kj::arrayPtr(text->data(), text->size()).asBytes());
+        return write.attach(kj::mv(stream), kj::mv(text));
+      });
     }
     return response.sendError(404, "Cap'n Proto CONNECT required", headerTable);
   }
@@ -5736,7 +5895,7 @@ private:
   capnp::TwoPartyServer rpcServer;
   kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial;
   WorkerLogsEndpoint& logs;
-  kj::Function<std::string()> state;
+  kj::Function<kj::Promise<std::string>()> state;
   coworkerd::PeerAuth& peerAuth;
   ControlPlaneAddresses& controlPlane;
   DurableDispatch& durable;
@@ -7916,7 +8075,7 @@ private:
     if (url == "/__coworkerd/state") {
       co_return co_await sendText(
           response, 200, "OK",
-          server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
     }
     {
       // Process rotation. POST /__coworkerd/rotate?all=1 or ?process=p0&process=p1;
@@ -7974,7 +8133,7 @@ private:
       server.reload();
       co_return co_await sendText(
           response, 200, "OK",
-          server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
     }
 
     if (server.draining()) {
@@ -8781,6 +8940,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
+      << ",\"tenantRootLimit\":" << c.tenantRootLimit << ",\"tenantNestedLimit\":" << c.tenantNestedLimit
       << ",\"subcalls\":" << q(c.subcalls)
       << ",\"idleMs\":" << c.idleMs << ",\"homeProbability\":" << shortestNumber(c.homeProbability) << ",\"avoidMaxMs\":" << c.avoidMaxMs
       << ",\"rejectionAvoidMs\":" << c.rejectionAvoidMs << ",\"connectBackoffMs\":" << c.connectBackoffMs
@@ -8837,8 +8997,10 @@ private:
 
 int run(Launch launch) {
   auto io = kj::setupAsyncIo();
+  const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
   auto& timer = io.provider->getTimer();
+  coworkerd::r47::openTrace();
 
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
@@ -9107,15 +9269,26 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
-  server.addStateSection("memory.daemon", [&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server]() {
-    // members is the current membership view, replaced/expired by the backend's watch/listing.
-    const auto& view = membership->view();
-    std::string containers = "{\"durableLog\":" + durableLog.memoryJson() +
-        ",\"membership\":{\"members\":{\"entries\":" + std::to_string(view.members.size()) + "}}" +
-        ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson() +
-        ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
-        ",\"serverCore\":" + server.retainedMemoryJson() + '}';
-    return coworkerd::MemoryWatermark::daemonJson(containers);
+  server.setDaemonMemory([&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server, &timer]()
+      -> kj::Promise<std::string> {
+    std::string containers;
+    {
+      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      containers = "{\"durableLog\":" + durableLog.memoryJson() +
+          ",\"membership\":{\"members\":{\"entries\":" + std::to_string(membership->view().members.size()) + "}}" +
+          ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson();
+    }
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    {
+      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      containers += ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
+          ",\"serverCore\":" + server.retainedMemoryJson() + '}';
+    }
+    // The fresh kernel RSS/PSS sample may walk many mappings. It only needs the captured counters.
+    auto sample = coworkerd::backgroundValue([containers = std::move(containers)]() {
+      return coworkerd::MemoryWatermark::daemonJson(containers);
+    });
+    co_return co_await kj::mv(sample);
   });
   // The object store as this node uses it: the membership's measurements, and the tenant index's revision it has applied
   // (what a deployment waits for: cowctl, /v1/nodes).
@@ -9226,6 +9399,7 @@ int run(Launch launch) {
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer))
       .exclusiveJoin(durableLog.run())
+      .exclusiveJoin(coworkerd::r47::runTimer(timer))
       .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())

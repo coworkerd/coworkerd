@@ -6,6 +6,8 @@
 #include "support.h"
 #include "async-log.h"
 #include "memory-watermark.h"
+#include "background-value.h"
+#include "r47-trace.h"
 #include <capnp/rpc-twoparty.h>
 #include <capnp/membrane.h>
 #include <capnp/compat/json.h>
@@ -1557,7 +1559,7 @@ public:
   // The durable processes were closed for the node's exit (closeDurable()): none starts again.
   bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
-  struct {uint64_t typed = 0, missing = 0, comparable = 0, matches = 0, mismatches = 0;} lifecycleLabels;
+
   uint64_t legacyDrainChecks = 0, legacyDrainDisagreements = 0, legacyLimitChecks = 0, legacyLimitDisagreements = 0;
 
   Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
@@ -3793,53 +3795,68 @@ std::map<std::string, uint64_t> ProcessPool::takeCpuUsage() {
   taken.swap(*impl->cpuUsage);
   return taken;
 }
-std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
-  // Each generation's lifecycle snapshot: its resident isolates, named "<namespace>:<loader key>"; a dynamic
-  // Worker's loader key starts with its full name (runtime/runtime.js: <workerId>@<versionId>#...).
+namespace {
+struct LifecycleCount {
   std::map<std::string, uint64_t> counts;
-  impl->lifecycleLabels = {};
-  for (const auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
-    if (p->pid <= 0) return;
-    auto row = p->lifecycle.read();
-    if (row.empty() || row.front() != '{') return;
-    try {
-      capnp::MallocMessageBuilder message;
-      auto json = message.initRoot<capnp::JsonValue>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), json);
-      auto list = json::field(json, "residentWorkers");
-      if (!list.isArray()) return;
-      for (auto entry : list.getArray()) {
-        auto name = json::field(entry, "isolate");
-        if (!name.isString()) continue;
-        std::string isolate = name.getString().cStr();
-        const auto worker = json::field(entry, "workerId"), version = json::field(entry, "versionId");
-        const auto revision = json::field(entry, "planRevision");
-        const auto owner = json::field(entry, "tenant");
-        const bool typed = owner.isString() && owner.getString().size() && worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
-            && revision.isString() && revision.getString().size() && json::field(entry, "loadGeneration").isNumber()
-            && json::field(entry, "instance").isNumber();
-        if (typed) ++impl->lifecycleLabels.typed;
-        else ++impl->lifecycleLabels.missing;
-        const auto at = isolate.find('@');
-        const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) :
-            worker.isString() ? tenantOf(worker.getString().cStr()) : std::string();
-        // A partial label still charges this known owner; it cannot silently disappear.
-        if (!tenant.empty()) ++counts[tenant];
-        if (at == std::string::npos) continue;
-        const auto colon = isolate.rfind(':', at);
-        const auto legacyWorker = isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1));
-        if (typed) {
-          const auto hash = isolate.find('#', at);
-          ++impl->lifecycleLabels.comparable;
-          if (legacyWorker == worker.getString().cStr() && isolate.substr(at + 1, hash - at - 1) == version.getString().cStr())
-            ++impl->lifecycleLabels.matches;
-          else ++impl->lifecycleLabels.mismatches;
-        }
+  uint64_t typed = 0, missing = 0, comparable = 0, matches = 0, mismatches = 0;
+};
 
+void addLifecycle(std::string_view row, LifecycleCount& result) {
+  if (row.empty() || row.front() != '{') return;
+  try {
+    capnp::MallocMessageBuilder message;
+    auto json = message.initRoot<capnp::JsonValue>();
+    capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), json);
+    auto list = json::field(json, "residentWorkers");
+    if (!list.isArray()) return;
+    for (auto entry : list.getArray()) {
+      auto name = json::field(entry, "isolate");
+      if (!name.isString()) continue;
+      std::string isolate = name.getString().cStr();
+      const auto worker = json::field(entry, "workerId"), version = json::field(entry, "versionId");
+      const auto revision = json::field(entry, "planRevision");
+      const auto owner = json::field(entry, "tenant");
+      const bool typed = owner.isString() && owner.getString().size() && worker.isString() && worker.getString().size() && version.isString() && version.getString().size()
+          && revision.isString() && revision.getString().size() && json::field(entry, "loadGeneration").isNumber()
+          && json::field(entry, "instance").isNumber();
+      if (typed) ++result.typed;
+      else ++result.missing;
+      const auto at = isolate.find('@');
+      const auto tenant = owner.isString() && owner.getString().size() ? std::string(owner.getString().cStr()) :
+          worker.isString() ? tenantOf(worker.getString().cStr()) : std::string();
+      // A partial label still charges this known owner; it cannot silently disappear.
+      if (!tenant.empty()) ++result.counts[tenant];
+      if (at == std::string::npos) continue;
+      const auto colon = isolate.rfind(':', at);
+      const auto legacyWorker = isolate.substr(colon == std::string::npos ? 0 : colon + 1, at - (colon == std::string::npos ? 0 : colon + 1));
+      if (typed) {
+        const auto hash = isolate.find('#', at);
+        ++result.comparable;
+        if (legacyWorker == worker.getString().cStr() && isolate.substr(at + 1, hash - at - 1) == version.getString().cStr())
+          ++result.matches;
+        else ++result.mismatches;
       }
-    } catch (const kj::Exception&) {}
+
+    }
+  } catch (const kj::Exception&) {}
+}
+
+struct StateLifecycle {
+  int pid;
+  std::string row;
+};
+struct StateLifecycleResult {
+  LifecycleCount resident;
+  std::map<int, uint64_t> rss;
+};
+}  // namespace
+
+std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
+  LifecycleCount result;
+  for (const auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
+    if (p->pid > 0) addLifecycle(p->lifecycle.read(), result);
   });
-  return counts;
+  return std::move(result.counts);
 }
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
@@ -3865,10 +3882,38 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   }).attach(std::shared_ptr<ProcessCall>(call));
   return result;
 }
-std::string ProcessPool::json(uint32_t idleMs) const {
-  impl->refresh();
-  impl->syncEvents();
-  const auto residentCounts = residentIsolatesByTenant();
+kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& timer) const {
+  {
+    r47::Span span(r47::STATE_POOL);
+    impl->refresh();
+    impl->syncEvents();
+  }
+  std::vector<StateLifecycle> inputs;
+  // The worker gets only value snapshots; process generations are owned by the node thread.
+  for (const auto& slot : impl->slots) {
+    {
+      r47::Span span(r47::STATE_POOL);
+      Impl::eachGeneration(slot, [&](const auto& p) {
+        if (p->pid > 0) inputs.push_back({p->pid, p->lifecycle.read()});
+      });
+    }
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+  }
+  auto result = backgroundValue([inputs = std::move(inputs)]() {
+    StateLifecycleResult result;
+    for (const auto& input : inputs) {
+      addLifecycle(input.row, result.resident);
+      result.rss.emplace(input.pid, MemoryWatermark::residentBytes(input.pid));
+    }
+    return result;
+  });
+  auto sampled = co_await kj::mv(result);
+  const auto& residentCounts = sampled.resident.counts;
+  auto residentBytes = [&](int pid) -> uint64_t {
+    if (auto found = sampled.rss.find(pid); found != sampled.rss.end()) return found->second;
+    // A fresh generation may have appeared between collection and serialization.
+    return MemoryWatermark::residentBytes(pid);
+  };
   std::ostringstream out; out << std::setprecision(17) << "{\"configuration\":{\"count\":" << impl->config.count
       << ",\"cpuLimitMs\":" << impl->config.cpuLimitMs
       << ",\"memoryLimitMiB\":" << impl->config.memoryLimitMiB
@@ -3892,12 +3937,13 @@ std::string ProcessPool::json(uint32_t idleMs) const {
       << "}},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
+    r47::Span span(r47::STATE_POOL);
     const auto slotIndex = i;
     if (i++) out << ',';
     auto p = s.current;
     out << "{\"processId\":\"" << s.id << "\",\"processClass\":\"" << processClass(s)
         << "\",\"generation\":" << (p ? p->generation : s.generation) << ",\"pid\":" << (p ? p->pid : 0)
-        << ",\"residentBytes\":" << MemoryWatermark::residentBytes(p ? p->pid : 0)
+        << ",\"residentBytes\":" << residentBytes(p ? p->pid : 0)
         << ",\"state\":\"" << (p ? p->state : "starting") << "\",\"restartCount\":" << s.restarts << ",\"exitCount\":" << s.exits
         << ",\"cpuTerminatedRequests\":" << s.cpuTerminatedRequests << ",\"cpuInvalidatedIsolates\":" << s.cpuInvalidatedIsolates
         << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
@@ -3942,7 +3988,10 @@ std::string ProcessPool::json(uint32_t idleMs) const {
     out << "],\"probeDelayMs\":[";
     if (p) for (size_t j = 0; j < p->probeDelays.size(); ++j) { if (j) out << ','; out << p->probeDelays[j]; }
     out << "]}";
+    span.finish();
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
   }
+  r47::Span tail(r47::STATE_POOL);
   out << "],\"residentIsolatesByTenant\":{";
   bool firstResidentTenant = true;
   for (const auto& [tenant, count] : residentCounts) {
@@ -3952,9 +4001,9 @@ std::string ProcessPool::json(uint32_t idleMs) const {
   out << "},\"legacyLifecycleComparison\":{\"drainChecks\":" << impl->legacyDrainChecks
       << ",\"drainDisagreements\":" << impl->legacyDrainDisagreements
       << ",\"limitChecks\":" << impl->legacyLimitChecks << ",\"limitDisagreements\":" << impl->legacyLimitDisagreements << "}"
-      << ",\"lifecycleLabels\":{\"typed\":" << impl->lifecycleLabels.typed
-      << ",\"missing\":" << impl->lifecycleLabels.missing << ",\"comparable\":" << impl->lifecycleLabels.comparable
-      << ",\"matches\":" << impl->lifecycleLabels.matches << ",\"mismatches\":" << impl->lifecycleLabels.mismatches
+      << ",\"lifecycleLabels\":{\"typed\":" << sampled.resident.typed
+      << ",\"missing\":" << sampled.resident.missing << ",\"comparable\":" << sampled.resident.comparable
+      << ",\"matches\":" << sampled.resident.matches << ",\"mismatches\":" << sampled.resident.mismatches
       << "},\"recentKills\":[";
   for (size_t j = 0; j < impl->kills.size(); ++j) { if (j) out << ','; out << impl->kills[j]; }
   out << "],\"recentGcPauses\":[";
@@ -3989,8 +4038,26 @@ std::string ProcessPool::json(uint32_t idleMs) const {
       << ",\"suspects\":" << impl->suspects.json()
       << ",\"output\":" << WorkerdOutput::stateJson() << ",\"rotation\":" << impl->rotationStateJson(16)
       << ",\"shuttingDown\":" << (impl->shuttingDown ? "true" : "false") << ",\"closing\":" << (impl->closingAll ? "true" : "false")
-      << "}"; return out.str();
+      << "}";
+  co_return std::move(out).str();
 }
+
+std::string ProcessPool::culpritRecordsJson() const {
+  impl->refresh();
+  impl->syncEvents();
+  std::string out = "{\"recentMemoryCrashes\":[";
+  for (size_t i = 0; i < impl->memoryCrashes.size(); ++i) {
+    if (i) out += ',';
+    out += impl->memoryCrashes[i];
+  }
+  out += "],\"recentKills\":[";
+  for (size_t i = 0; i < impl->kills.size(); ++i) {
+    if (i) out += ',';
+    out += impl->kills[i];
+  }
+  return out + "]}";
+}
+
 std::string ProcessPool::placementJson(const std::vector<std::string>& workers) {
   impl->refresh();
   std::ostringstream out; out << '[';

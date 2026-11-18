@@ -469,6 +469,8 @@ private:
     uint64_t bytes = 0;            // the databases together, as the last checkpoint reported
     bool overLimit = false;
     double lastAccessMs = 0, lastCheckpointAskMs = 0;
+    double checkpointDueMs = 0;
+    uint64_t cachedDiskBytes = 0;
     bool manifestDirty = false;
     std::string repairReason;
     std::pair<uint64_t, uint64_t> repairGeneration, rebuildGeneration, imageRepairGeneration;
@@ -625,7 +627,9 @@ private:
       uint32_t lastFrame);
 
   // ---- the channel to a durable process ----
+  friend struct DurableLogChannelTest;
   kj::Promise<void> readChannel(Channel& channel);
+  bool consumeChannelInbox(Channel& channel, bool sliced);
   void onMessage(Channel& channel, std::string_view message);
   void sendToChannel(Channel& channel, std::string message);
   void answer(Channel& channel, uint64_t request, uint8_t status);
@@ -667,18 +671,28 @@ private:
   };
   kj::Promise<void> sealLoop();
   kj::Promise<void> sealNow(std::string reason);
-  kj::Promise<bool> uploadSegment(const SegmentHeader& header, const std::string& body);
+  bool sealDrainExpired() const;
+  kj::Promise<bool> uploadSegment(const SegmentHeader& header, const std::string& body,
+      std::string payloadSha256 = {}, bool observeDrainDeadline = false);
   kj::Promise<bool> writeManifest(Object& object, bool withSnapshot,
       std::optional<uint64_t> expectedRevision = std::nullopt, const SnapshotImage* image = nullptr);
   kj::Promise<void> snapshotIfDue(std::string objectName);
   kj::Promise<void> uploadSnapshotPart(std::string namespaceId, std::string objectId, uint64_t sequence,
       uint32_t facetId, uint64_t part, std::string bytes);
   kj::Promise<void> housekeeping();
+  void scheduleIdleCheckpoint(Object& object);
+  kj::Promise<void> checkpointIdleObjects(double now);
   kj::Promise<void> resealEarlier();
   void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
   void persistEarlierSeals();
   void cleanupClosedEpoch();
   kj::Promise<void> dropColdFiles(uint64_t reservedBytes = 0);
+  void accountCacheSize(Object& object);
+  std::set<std::pair<double, std::string>> idleCheckpoints;
+  std::set<std::string> dirtyCacheSizes;
+  uint64_t cachedObjectDiskBytes = 0;
+  double nextDiskReconciliationMs = 0;
+  bool scanningColdFiles = false;
   uint64_t seedReservedBytes = 0;
 
   // The object's size from its databases, and the single-object limit judged on it.
@@ -787,7 +801,13 @@ private:
   std::filesystem::path logPath;
   // The records this node holds: those not yet in a segment (by sequence), and how many bytes they take.
   std::map<uint64_t, std::string> records;
+  // Changes that invalidate a pending normal-seal selection; appends are outside its fixed prefix.
+  uint64_t sealSelectionRevision = 0;
   std::map<uint64_t, LogRecord> parsed;
+  // Sequences in `parsed`, ordered within the logical object (including its facets).
+  std::map<std::string, std::set<uint64_t>, std::less<>> unsealedByObject;
+  void rememberParsedRecord(const LogRecord& record);
+  void forgetParsedRecord(uint64_t sequence);
   uint64_t recordBytes = 0;
   // Records confirmed by the peers, and records isolated: never confirmed, never sealed.
   std::set<uint64_t> confirmed;
@@ -937,6 +957,7 @@ private:
   AlarmDiscovery::Valid alarmValid;
   AlarmDiscovery::Held alarmHeld;
   uint64_t positionWrites = 0, quotaRefusals = 0;
+  std::optional<double> sealDrainDeadlineMs;
   bool sealing = false, noPeerWarned = false;
   bool sealingForRecovery = false;
   uint32_t recoveryPublishWaiters = 0;

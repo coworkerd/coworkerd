@@ -237,6 +237,8 @@ struct ServerConfig {
   int64_t clockOffsetMsForTest = 0;
   uint32_t rootLimit = 128;
   uint32_t nestedLimit = 384;
+  uint32_t tenantRootLimit = 0;
+  uint32_t tenantNestedLimit = 0;
   uint32_t idleMs = 30000;
   double homeProbability = 0.05;
   uint32_t avoidMaxMs = 2000;

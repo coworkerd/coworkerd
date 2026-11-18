@@ -4,9 +4,21 @@
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <algorithm>
+#include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace coworkerd {
+
+// The current CPU watchdog evidence only matches a live dispatched invocation.
+inline bool cpuCulpritMatches(std::string_view event, uint32_t reportedPid, uint32_t pid,
+    uint32_t reportedLimit, uint32_t limit, uint64_t usedNs, bool dispatched,
+    std::string_view reportedWorker, std::string_view worker,
+    std::string_view reportedVersion, std::string_view version) {
+  return limit && event == "culprit" && reportedPid == pid && reportedLimit == limit &&
+      usedNs >= uint64_t(limit) * 1000000 && dispatched &&
+      reportedWorker == worker && reportedVersion == version;
+}
 
 // Validate both active and recently completed invocations before attribution.
 template <typename Process, typename Limits, typename Labelled, typename Confirmed>
@@ -27,11 +39,10 @@ std::string confirmedCpuCulprit(Process& p, Limits limits, Labelled labelled, Co
     });
     const auto limit = call == p.calls.end() ? (recent ? limits(worker, p.durable).cpuMs : 0u) : limits(call->second->workerId, p.durable).cpuMs;
     if (!limit) return "null";
-    if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
-        value.getCpuLimitMs() != limit ||
-        value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
-        (call == p.calls.end() ? !recent : (!call->second->dispatched ||
-        call->second->workerId != worker || call->second->versionId != version))) return "null";
+    const bool live = call != p.calls.end();
+    if (!cpuCulpritMatches(value.getEvent().cStr(), value.getPid(), static_cast<uint32_t>(p.pid),
+        value.getCpuLimitMs(), limit, value.getCpuUsedNs(), live ? call->second->dispatched : recent,
+        worker, live ? call->second->workerId : worker, version, live ? call->second->versionId : version)) return "null";
     if (!labelled(p, value.getIsolate().cStr(), worker, version)) return "null";
     confirmed(worker);
     return capnp::JsonCodec().encode(value.asReader()).cStr();

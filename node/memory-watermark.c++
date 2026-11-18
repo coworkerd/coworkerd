@@ -2,6 +2,7 @@
 #include <kj/debug.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -32,7 +33,7 @@ double nowMs() {
 #ifdef __GLIBC__
 constexpr int DAEMON_TRIM_BYTES = 128 * 1024;
 constexpr double DAEMON_IDLE_TRIM_MS = 60000;
-uint64_t daemonTrims = 0;  // Explicit malloc_trim calls since this daemon started; no history retained.
+std::atomic<uint64_t> daemonTrims{0};  // Explicit malloc_trim calls since this daemon started; no history retained.
 double daemonLastAppendMs = nowMs(), daemonLastTrimMs = daemonLastAppendMs;
 bool daemonAllocatorConfigured = false;
 #endif
@@ -171,7 +172,7 @@ kj::Promise<void> MemoryWatermark::run(kj::Timer& timer) {
     if (now - daemonLastAppendMs >= DAEMON_IDLE_TRIM_MS && now - daemonLastTrimMs >= DAEMON_IDLE_TRIM_MS) {
       daemonLastTrimMs = now;
       malloc_trim(0);
-      ++daemonTrims;
+      daemonTrims.fetch_add(1, std::memory_order_relaxed);
     }
 #endif
   }
@@ -273,7 +274,7 @@ std::string MemoryWatermark::daemonJson(const std::string& containers) {
 #ifdef __GLIBC__
   out << "{\"arena\":" << allocated.arena << ",\"uordblks\":" << allocated.uordblks
       << ",\"fordblks\":" << allocated.fordblks << ",\"hblkhd\":" << allocated.hblkhd
-      << ",\"keepcost\":" << allocated.keepcost << ",\"trims\":" << daemonTrims
+      << ",\"keepcost\":" << allocated.keepcost << ",\"trims\":" << daemonTrims.load(std::memory_order_relaxed)
       << ",\"policy\":{\"thpDisabled\":" << thpDisabled
       << ",\"configured\":" << (daemonAllocatorConfigured ? "true" : "false")
       << ",\"trimThresholdBytes\":" << DAEMON_TRIM_BYTES  // Startup-fixed trim threshold.
