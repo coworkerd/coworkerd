@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 19:28:04 +0800
-Subject: [PATCH] Add threaded ordinary Worker server, channels and execution
- limits
+Date: Wed, 18 Nov 2026 19:59:40 +0800
+Subject: [PATCH] Add threaded ordinary Worker server with channels and
+ resource checks
 
-Cumulative S1a/S1b source at ef7495a82bdce4294ff573546885e4f01710a0f0.
+Cumulative S1a/S1b source at 03e90921c8aec746cab5496042a177774ea8f47f.
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
 index d34e4a75c69d0366d2b786fd97ebf7b2269ef5bd..dc3de8a916f4d151c825bf0c7815ccbccdb5a266 100644
@@ -253,18 +253,25 @@ index 0000000000000000000000000000000000000000..53044781b353534a6fbabb5b07c42630
 +}
 diff --git a/src/workerd/threaded/protocol.h b/src/workerd/threaded/protocol.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3fcb07283a1ef01de83e9098e8e469a82d4235c7
+index 0000000000000000000000000000000000000000..9a8a4b4c8f9263adf0cbf2084f65b78d4e69b7dd
 --- /dev/null
 +++ b/src/workerd/threaded/protocol.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,123 @@
 +#pragma once
 +
 +#include <cctype>
++#include <cstdint>
 +#include <initializer_list>
 +#include <stdexcept>
 +#include <string_view>
 +
 +namespace workerd::threaded {
++
++// A call loop owns its mailbox, event port and invocation channels. Leave room
++// for probes, the platform and the node's prepared connections as well.
++inline constexpr uint64_t descriptorBudget(uint32_t callThreads) {
++  return uint64_t(callThreads) * 8 + 256;
++}
 +
 +// A descriptor has already passed JSON decoding. These views retain the exact
 +// wire spelling of values that must be forwarded without another float conversion.
@@ -375,10 +382,10 @@ index 0000000000000000000000000000000000000000..3fcb07283a1ef01de83e9098e8e469a8
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd976982105674
+index 0000000000000000000000000000000000000000..ab39e67f44a1536185c683bcfb4882f31dbaa907
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,2284 @@
+@@ -0,0 +1,2334 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -418,6 +425,7 @@ index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd9769
 +#include <signal.h>
 +#include <sys/epoll.h>
 +#include <sys/eventfd.h>
++#include <sys/resource.h>
 +#include <sys/socket.h>
 +#include <sys/syscall.h>
 +#include <time.h>
@@ -459,6 +467,26 @@ index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd9769
 +  timespec t;
 +  KJ_SYSCALL(clock_gettime(clock, &t));
 +  return uint64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
++}
++
++bool prepareDescriptors(uint32_t threads) {
++  rlimit current;
++  auto required = threaded::descriptorBudget(threads);
++  if (getrlimit(RLIMIT_NOFILE, &current) != 0 || current.rlim_max < required) {
++    fprintf(stderr,
++        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptors\",\"required\":%llu}\n",
++        (unsigned long long)required);
++    return false;
++  }
++  if (current.rlim_cur < required) {
++    current.rlim_cur = required;
++    if (setrlimit(RLIMIT_NOFILE, &current) != 0) {
++      fprintf(stderr,
++          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"descriptor-soft-limit\"}\n");
++      return false;
++    }
++  }
++  return true;
 +}
 +
 +struct Entropy final: kj::EntropySource {
@@ -1340,11 +1368,18 @@ index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd9769
 +    pthread_setname_np(pthread_self(), "cwkd-pool");
 +    // The initial high watermark is the in-flight limit. Readiness waits for all
 +    // native loops, so a cold burst never makes the accept thread initialize one.
-+    for (uint i = 0; i < limit; ++i) {
-+      auto item = std::make_unique<Thread>();
-+      auto* pointer = item.get();
-+      item->thread = std::thread([this, pointer]() { runThread(*pointer); });
-+      threads.push_back(std::move(item));
++    try {
++      threads.reserve(limit);
++      for (uint i = 0; i < limit; ++i) {
++        auto item = std::make_unique<Thread>();
++        auto* pointer = item.get();
++        item->thread = std::thread([this, pointer]() { runThread(*pointer); });
++        threads.push_back(std::move(item));
++      }
++    } catch (...) {
++      fprintf(stderr,
++          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-thread-pool\"}\n");
++      _exit(78);
 +    }
 +    for (auto& item: threads)
 +      while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
@@ -1377,7 +1412,15 @@ index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd9769
 +  }
 +  void runThread(Thread& thread) {
 +    pthread_setname_np(pthread_self(), "cwkd-call");
-+    ThreadState state;
++    std::unique_ptr<ThreadState> storage;
++    try {
++      storage = std::make_unique<ThreadState>();
++    } catch (...) {
++      fprintf(stderr,
++          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
++      _exit(78);
++    }
++    auto& state = *storage;
 +    thread.descriptor.store(-1, std::memory_order_release);
 +    for (;;) {
 +      uint64_t count;
@@ -2654,11 +2697,25 @@ index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd9769
 +
 +int main(int argc, char** argv) {
 +  using namespace workerd;
-+  KJ_REQUIRE(argc == 5, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT");
++  if (argc != 5) {
++    fprintf(stderr, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT\n");
++    return 64;
++  }
++  char* end = nullptr;
++  auto limit = strtoul(argv[4], &end, 10);
++  if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
++  if (!prepareDescriptors(limit)) return 78;
 +  signal(SIGPIPE, SIG_IGN);
 +  util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
 +  setenv("COWORKERD_THREADED", "1", 1);
-+  auto* server = new ThreadedServer(strtoul(argv[4], nullptr, 10), argv[2], argv[3]);
++  ThreadedServer* server;
++  try {
++    server = new ThreadedServer(limit, argv[2], argv[3]);
++  } catch (...) {
++    fprintf(stderr,
++        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"server-initialization\"}\n");
++    return 78;
++  }
 +  const char* parent = getenv("COWORKERD_PARENT_FD");
 +  acceptLoop(
 +      *server, strtol(argv[1], nullptr, 10), parent == nullptr ? -1 : strtol(parent, nullptr, 10));
