@@ -619,10 +619,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..746c6b9063e565c6401c657747df90e3ea9e7c5b
+index 0000000000000000000000000000000000000000..378764568cacf770b582a3534dfb247263abaa23
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,365 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -934,6 +934,10 @@ index 0000000000000000000000000000000000000000..746c6b9063e565c6401c657747df90e3
 +  execution.finish();
 +  KJ_EXPECT(limits.memoryState->load() == LimitCause::MEMORY);
 +  KJ_EXPECT(!isolate->IsExecutionTerminating());
++  auto metrics = reservation->metrics();
++  KJ_EXPECT(reservation->heapPhysical > 0);
++  KJ_EXPECT(threaded::rawField(metrics, "heapPhysicalBytes") ==
++      std::to_string(reservation->heapPhysical));
 +  checkNeighbor();
 +}
 +
@@ -986,10 +990,10 @@ index 0000000000000000000000000000000000000000..746c6b9063e565c6401c657747df90e3
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..302c554e0ca562a68b44192cfe0d639e9cdb4c17
+index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442aa262613
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3666 @@
+@@ -0,0 +1,3669 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1304,7 +1308,8 @@ index 0000000000000000000000000000000000000000..302c554e0ca562a68b44192cfe0d639e
 +  std::shared_ptr<ResourceBudget> budget;
 +  const uint64_t maximumHeap;
 +  std::mutex mutex;
-+  uint64_t heap = 1536ull << 10, otherExternal = 0, ownedExternal = 0, source = 0, logs = 0;
++  uint64_t heap = 2 * MiB, heapPhysical = 0, otherExternal = 0, ownedExternal = 0, source = 0,
++           logs = 0;
 +  uint64_t memoryCharge = 0, addressCharge = 0;
 +  uint32_t preparing = 0;
 +  bool registered = false;
@@ -1321,6 +1326,7 @@ index 0000000000000000000000000000000000000000..302c554e0ca562a68b44192cfe0d639e
 +  std::string metrics() {
 +    std::lock_guard lock(mutex);
 +    return "{\"heapBytes\":" + std::to_string(heap) +
++        ",\"heapPhysicalBytes\":" + std::to_string(heapPhysical) +
 +        ",\"ownedExternalBytes\":" + std::to_string(ownedExternal) +
 +        ",\"otherExternalBytes\":" + std::to_string(otherExternal) +
 +        ",\"sourceBytes\":" + std::to_string(source) + ",\"logBytes\":" + std::to_string(logs) +
@@ -1356,6 +1362,7 @@ index 0000000000000000000000000000000000000000..302c554e0ca562a68b44192cfe0d639e
 +  bool observe(v8::HeapStatistics &stats, uint64_t owned) {
 +    std::lock_guard lock(mutex);
 +    heap = stats.total_heap_size();
++    heapPhysical = stats.total_physical_size();
 +    otherExternal = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
 +    return resize(false, true);
 +  }
