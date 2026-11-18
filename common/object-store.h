@@ -123,7 +123,7 @@ public:
   // answer does not come back, the key is read back -- these very bytes there mean this create made it, which is why
   // every creator's bytes carry its own identity (a process instance and a random value of the write) -- and only an
   // absent key is created once more, on a new connection.
-  kj::Promise<CreateResult> create(std::string key, std::string bytes);
+  kj::Promise<CreateResult> create(std::string key, std::string bytes, std::string payloadSha256 = {});
   // Every object whose key starts with `prefix` (ListObjectsV2, page after page until the store says that was the
   // last one); `maxKeys` bounds one page.
   kj::Promise<ObjectListing> list(std::string prefix, uint32_t maxKeys = 1000);
@@ -153,6 +153,8 @@ private:
     bool ifNoneMatch = false;
     // Only headSize supplies this; existing operations do not parse length.
     std::optional<uint64_t>* headLength = nullptr;
+    // SHA-256 of the exact bytes when the producer already computed it off the event loop.
+    std::string payloadSha256;
   };
   ObjectStoreConfig settings;
   ObjectStoreStats statistics;

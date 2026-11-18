@@ -319,7 +319,7 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
 
   const std::string host = settings.endpoint.substr(7);
   const std::string path = '/' + settings.bucket + (key.empty() ? "" : '/' + key);
-  const std::string payloadHash = objectSha256(bytes);
+  const std::string payloadHash = call.payloadSha256.empty() ? objectSha256(bytes) : call.payloadSha256;
   kj::HttpHeaders headers(*table);
   headers.setPtr(kj::HttpHeaderId::HOST, host.c_str());
   headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
@@ -454,11 +454,11 @@ kj::Promise<ObjectResponse> ObjectStore::get(std::string key) {
   return request(kj::HttpMethod::GET, std::move(key));
 }
 
-kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes) {
+kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes, std::string payloadSha256) {
   KJ_REQUIRE(settings.backend == "s3", "the object directory backend keeps no cluster state");
   KJ_REQUIRE(!key.empty(), "create needs a key");
   KJ_REQUIRE(safeKey(key), "invalid object key");
-  const Call call{kj::HttpMethod::PUT, key, bytes, true, {}, true};
+  const Call call{kj::HttpMethod::PUT, key, std::move(bytes), true, {}, true, nullptr, std::move(payloadSha256)};
   for (uint32_t attempt = 1;; ++attempt) {
     ++statistics.requests;
     kj::Maybe<kj::Exception> failure;
@@ -481,7 +481,7 @@ kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes
     ++statistics.createsReadBack;
     auto back = co_await get(key);
     if (back.status == 200) {
-      const bool own = back.bytes == bytes;
+      const bool own = back.bytes == call.bytes;
       ++(own ? statistics.createsConfirmed : statistics.createsFoundOther);
       co_return CreateResult{own, own ? 200u : 412u, back.dateUnixMs, true};
     }

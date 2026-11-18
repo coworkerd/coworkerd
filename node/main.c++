@@ -1,4 +1,6 @@
 #include "reasons.h"
+#include "r47-trace.h"
+#include "background-value.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
@@ -2311,7 +2313,7 @@ public:
     ++forwardedInvocations;
     auto sequence = nextDebitSequence++;
     if (debits.size() == MAX_EXECUTION_RECORDS) debits.pop_front();
-    debits.push_back({
+    debits.push_back(std::make_shared<DebitRecord>(DebitRecord{
       sequence,
       allocation.treeId,
       allocation.parentInvocationId,
@@ -2322,7 +2324,7 @@ public:
       allocation.remainingAfter,
       allocation.depth,
       allocation.expiresAtMonotonicMs,
-    });
+    }));
   }
 
   void recordRelay(
@@ -2336,10 +2338,10 @@ public:
     ++forwardedInvocations;
     auto sequence = nextDebitSequence++;
     if (debits.size() == MAX_EXECUTION_RECORDS) debits.pop_front();
-    debits.push_back({
+    debits.push_back(std::make_shared<DebitRecord>(DebitRecord{
       sequence, treeId, parentInvocationId, target, targetServerId,
       grant, 0, grant, depth, expiresAtMonotonicMs,
-    });
+    }));
   }
 
   void observeRemoteInvocationSize(uint64_t bytes, size_t pins) {
@@ -2422,7 +2424,7 @@ private:
       executions.pop_front();
       ++droppedExecutions;
     }
-    executions.push_back({
+    executions.push_back(std::make_shared<ExecutionRecord>(ExecutionRecord{
       sequence, process->processId, process->generation,
       treeId,
       invocationId,
@@ -2438,8 +2440,8 @@ private:
       ingressServerId,
       // The load check before this dispatch loaded the version: this call's cold start.
       coldLoaded,
-    });
-    const bool ingress = executions.back().kind == "ingress";
+    }));
+    const bool ingress = executions.back()->kind == "ingress";
     const bool peerIngress = ingress && !ingressServerId.empty() && ingressServerId != serverConfig.serverId;
     const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
     auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
@@ -2448,7 +2450,10 @@ private:
       if (lifetime.expired()) return;
       pendingPreparations.erase(invocationId);
       if (!executed) {
-        for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = false;
+        for (auto& item : executions) if (item->invocationId == invocationId) {
+          if (item.use_count() != 1) item = std::make_shared<ExecutionRecord>(*item);
+          item->dispatched = false;
+        }
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
@@ -2470,16 +2475,16 @@ private:
       decision(true);
     }
     std::cout << "[server] execute target=" << version->key()
-              << " kind=" << executions.back().kind
-              << " tree=" << executions.back().treeId
+              << " kind=" << executions.back()->kind
+              << " tree=" << executions.back()->treeId
               << " invocation=" << invocationId << std::endl;
     lastExecution[version->definitionHash] = monotonicTimeMs();
     std::cout << "[execution] {\"nodeId\":\"" << serverConfig.serverId
               << "\",\"processId\":\"" << process->processId << "\",\"processGeneration\":" << process->generation
-              << ",\"sequence\":" << sequence << ",\"treeId\":\"" << executions.back().treeId
+              << ",\"sequence\":" << sequence << ",\"treeId\":\"" << executions.back()->treeId
               << "\",\"invocationId\":\"" << invocationId << "\",\"target\":\"" << version->key()
-              << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back().kind
-              << "\",\"parentInvocationId\":\"" << executions.back().parentInvocationId
+              << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back()->kind
+              << "\",\"parentInvocationId\":\"" << executions.back()->parentInvocationId
               << "\",\"grant\":" << grant << ",\"remainingAfter\":" << remainingAfter << ",\"depth\":" << depth
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
               << ",\"ingressNodeId\":\"" << jsonEscape(ingressServerId) << "\",\"coldStart\":null"
@@ -2610,7 +2615,10 @@ public:
           version->definitionHash == definitionHash, "invalid loader observation");
       const auto key = processId + ":" + generation + ":" + definitionHash;
       if (coldStarts.emplace(key, 1).second) {
-        for (auto& execution : executions) if (execution.invocationId == invocationId) execution.coldStart = true;
+        for (auto& execution : executions) if (execution->invocationId == invocationId) {
+          if (execution.use_count() != 1) execution = std::make_shared<ExecutionRecord>(*execution);
+          execution->coldStart = true;
+        }
         std::cout << "[cold-start] {\"nodeId\":\"" << serverConfig.serverId << "\",\"processId\":\""
                   << processId << "\",\"processGeneration\":" << generation << ",\"invocationId\":\"" << invocationId
                   << "\",\"target\":\"" << version->key() << "\",\"definitionHash\":\"" << definitionHash
@@ -2627,14 +2635,32 @@ public:
     co_return output.str();
   }
 
-  std::string stateJson(const std::string& peerConnectionsJson = "{}", const std::string& avoidanceJson = "[]") {
+  kj::Promise<std::string> stateJson(std::string peerConnectionsJson, std::string avoidanceJson) {
+    while (buildingState) co_await timer.afterDelay(1 * kj::MILLISECONDS);
+    buildingState = true;
+    const auto release = kj::defer([this]() { buildingState = false; });
+    const auto started = coworkerd::r47::trace ? coworkerd::r47::clockNs(CLOCK_MONOTONIC) : 0;
+    coworkerd::r47::Span expiry(coworkerd::r47::STATE_EXPIRY);
     expireForState();
+    expiry.finish();
+    coworkerd::r47::Span snapshot(coworkerd::r47::STATE_SNAPSHOT);
     std::set<const VersionPins*> pinTables;
     size_t pinReferences = 0;
+    std::vector<std::pair<std::string, InvocationLeaseState>> stateLeases;
+    stateLeases.reserve(leases.size());
     for (const auto& [id, lease] : leases) {
       pinTables.insert(lease.pins.get());
       pinReferences += lease.pins->size();
+      stateLeases.emplace_back(id, lease);
     }
+    // The two bounded histories share their immutable records with the response. A later execution update
+    // replaces its record while a response holds this snapshot.
+    const auto stateDebits = debits;
+    const auto stateExecutions = executions;
+    const auto capturedDropped = droppedExecutions;
+    const auto capturedUnix = wallTimeMsForTest();
+    const auto capturedMonotonic = monotonicTimeMs();
+    snapshot.finish(stateLeases.size()+stateDebits.size()+stateExecutions.size());
     std::ostringstream output;
     output << std::setprecision(17);
     output << "{\"nodeId\":\"" << jsonEscape(serverConfig.serverId)
@@ -2645,10 +2671,16 @@ public:
            << ",\"launch\":" << launch << ",\"configuration\":" << configuration << ",\"management\":" << managementJson()
            << ",\"drain\":" << drainJson()
            << ",\"tenants\":" << tenantsJson()
-           << ",\"usage\":" << usageJson()
-           << ",\"processes\":" << runtime.json(serverConfig.idleMs)
-           << ",\"memory\":" << memoryStateJson()
-           << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
+           << ",\"usage\":" << usageJson();
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    auto processes = co_await runtime.stateJson(serverConfig.idleMs, timer);
+    output << ",\"processes\":" << processes;
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    auto memorySection = co_await memoryStateJson();
+    output << ",\"memory\":" << memorySection;
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    coworkerd::r47::Span coreFields(coworkerd::r47::STATE_CORE_FIELDS);
+    output << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
            << ",\"bundles\":" << desiredState.bundlesJson()
@@ -2660,8 +2692,8 @@ public:
            << ",\"jsRpc\":" << jsRpcJson()
            << ",\"assets\":" << assetsJson()
            << ",\"maxExecutionRecords\":" << MAX_EXECUTION_RECORDS
-           << ",\"droppedExecutions\":" << droppedExecutions
-           << ",\"leaseCount\":" << leases.size()
+           << ",\"droppedExecutions\":" << capturedDropped
+           << ",\"leaseCount\":" << stateLeases.size()
            << ",\"leaseVersionPinTables\":" << pinTables.size()
            << ",\"leaseVersionPinReferences\":" << pinReferences
            << ",\"remoteInvocationObjectBytes\":" << remoteInvocationBytes
@@ -2670,8 +2702,8 @@ public:
            << ",\"leaseMode\":\"" << (leaseConfig.naive() ? "naive" : "correct") << "\""
            << ",\"leaseTtlMs\":" << leaseConfig.ttlMs
            << ",\"clockOffsetMsForTest\":" << serverConfig.clockOffsetMsForTest
-           << ",\"serverNowUnixMs\":" << wallTimeMsForTest()
-           << ",\"serverNowMonotonicMs\":" << monotonicTimeMs()
+           << ",\"serverNowUnixMs\":" << capturedUnix
+           << ",\"serverNowMonotonicMs\":" << capturedMonotonic
            << ",\"expiredLeases\":" << expiredLeases
            << ",\"expiredLeaseRejections\":" << expiredLeaseRejections
            << ",\"renewedLeases\":" << renewedLeases
@@ -2715,20 +2747,30 @@ public:
            << ",\"ingressPlacement\":" << (serverConfig.ingressPlacement ? "true" : "false")
            << ",\"proxyingIngress\":" << proxyingIngress
            << ",\"leases\":[";
-    size_t leaseIndex = 0;
-    for (const auto& [invocationId, lease] : leases) {
-      if (leaseIndex++ > 0) output << ',';
-      output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
+    coreFields.finish(static_cast<uint64_t>(output.tellp()));
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    constexpr size_t RECORD_SLICE = 32;
+    for (size_t begin = 0; begin < stateLeases.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateLeases.size(), begin + RECORD_SLICE); ++index) {
+        const auto& [invocationId, lease] = stateLeases[index];
+        if (index > 0) output << ',';
+        output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
              << "\",\"invocationId\":\"" << jsonEscape(invocationId)
              << "\",\"grant\":" << lease.grant
              << ",\"remainingSubrequests\":" << lease.remainingSubrequests
              << ",\"depth\":" << lease.depth
              << ",\"expiresAtMonotonicMs\":" << lease.expiresAtMonotonicMs << "}";
+      }
+      span.finish(1);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "],\"debits\":[";
-    for (size_t index = 0; index < debits.size(); ++index) {
+    for (size_t begin = 0; begin < stateDebits.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateDebits.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
-      const auto& record = debits[index];
+      const auto& record = *stateDebits[index];
       output << "{\"sequence\":" << record.sequence
              << ",\"treeId\":\"" << jsonEscape(record.treeId)
              << "\",\"parentInvocationId\":\""
@@ -2741,6 +2783,9 @@ public:
              << ",\"remainingAfter\":" << record.remainingAfter
              << ",\"depth\":" << record.depth
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
+      }
+      span.finish(2);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "],\"peerOrigins\":{";
     size_t originIndex = 0;
@@ -2749,9 +2794,11 @@ public:
       output << "\"" << jsonEscape(origin) << "\":" << count;
     }
     output << "},\"executions\":[";
-    for (size_t index = 0; index < executions.size(); ++index) {
+    for (size_t begin = 0; begin < stateExecutions.size(); begin += RECORD_SLICE) {
+      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      for (size_t index = begin; index < std::min(stateExecutions.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
-      const auto& record = executions[index];
+      const auto& record = *stateExecutions[index];
       output << "{\"sequence\":" << record.sequence
              << ",\"processId\":\"" << record.processId << "\",\"processGeneration\":" << record.processGeneration
              << ",\"treeId\":\"" << jsonEscape(record.treeId)
@@ -2768,25 +2815,44 @@ public:
              << "\",\"coldStart\":" << (record.coldStart ? "true" : "false")
              << ",\"dispatched\":" << (record.dispatched ? "true" : "false")
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
+      }
+      span.finish(3);
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "]";
-    for (const auto& [name, section] : stateSections) output << ",\"" << name << "\":" << section();
+    uint64_t index = 0;
+    for (const auto& [name, section] : stateSections) {
+      const auto partStart = coworkerd::r47::trace ? output.tellp() : std::streampos{};
+      coworkerd::r47::Span partTrace(coworkerd::r47::STATE_SECTION_BASE + index++);
+      output << ",\"" << name << "\":" << section();
+      if (coworkerd::r47::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    }
     output << "}";
-    return output.str();
+    coworkerd::r47::Span flatten(coworkerd::r47::STATE_FLATTEN);
+    auto result = output.str();
+    flatten.finish(result.size());
+    if (started) coworkerd::r47::record(coworkerd::r47::STATE_ASYNC, started,
+        coworkerd::r47::clockNs(CLOCK_MONOTONIC), 0, result.size());
+    co_return result;
   }
 
   // Sections the state endpoint appends after the ones above, each from its own part of the node (egress,
   // peerAuth, storage).
   void addStateSection(std::string name, std::function<std::string()> section) {
-    if (name == "memory.daemon") daemonMemory = std::move(section);
-    else stateSections.emplace_back(std::move(name), std::move(section));
+    stateSections.emplace_back(std::move(name), std::move(section));
   }
   std::vector<std::pair<std::string, std::function<std::string()>>> stateSections;
-  std::function<std::string()> daemonMemory;
-  std::string memoryStateJson() const {
+  void setDaemonMemory(std::function<kj::Promise<std::string>()> section) { daemonMemory = std::move(section); }
+  bool buildingState = false;
+  std::function<kj::Promise<std::string>()> daemonMemory;
+  kj::Promise<std::string> memoryStateJson() const {
     auto result = memory.json();
-    if (daemonMemory) { result.pop_back(); result += ",\"daemon\":" + daemonMemory() + '}'; }
-    return result;
+    if (daemonMemory) {
+      auto section = co_await daemonMemory();
+      result.pop_back(); result += ",\"daemon\":" + section + '}';
+    }
+    co_return result;
   }
 
   std::string retainedMemoryJson() const {
@@ -2878,7 +2944,7 @@ public:
   // The culprit a workerd exit or kill confirmed for this invocation: "memory"
   // (fatal OOM), "cpu" (watchdog kill), or empty.
   std::string culpritOf(const std::string& invocationId) {
-    auto text = runtime.json(serverConfig.idleMs);
+    auto text = runtime.culpritRecordsJson();
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), json);
@@ -3103,7 +3169,7 @@ private:
   coworkerd::DesiredState& desiredState;
   coworkerd::ProcessPool& runtime;
   coworkerd::MemoryWatermark& memory;
-  std::deque<ExecutionRecord> executions;
+  std::deque<std::shared_ptr<ExecutionRecord>> executions;
   std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
   struct PreparationBytes { uint64_t bytes, used; };
   std::map<std::string, PreparationBytes> preparationBytes;
@@ -3113,7 +3179,7 @@ private:
   struct PreparationErrors final: kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } preparationErrors;
   kj::TaskSet preparationByteTasks{preparationErrors};
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
-  std::deque<DebitRecord> debits;
+  std::deque<std::shared_ptr<DebitRecord>> debits;
   std::map<std::string, InvocationLeaseState> leases;
   std::priority_queue<
       LeaseExpiry,
@@ -5432,7 +5498,7 @@ public:
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable,
       kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial,
-      WorkerLogsEndpoint& logs, kj::Function<std::string()> state, coworkerd::PeerAuth& peerAuth,
+      WorkerLogsEndpoint& logs, kj::Function<kj::Promise<std::string>()> state, coworkerd::PeerAuth& peerAuth,
       ControlPlaneAddresses& controlPlane)
       : server(server), headerTable(headerTable),
         rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
@@ -5500,12 +5566,14 @@ public:
       return sqlQuery(url, body, response);
     }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
-      auto text = kj::heap<std::string>(state());
-      kj::HttpHeaders headers(headerTable);
-      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-      auto stream = response.send(200, "OK", headers, text->size());
-      auto write = stream->write(kj::arrayPtr(text->data(), text->size()).asBytes());
-      return write.attach(kj::mv(stream), kj::mv(text));
+      return state().then([this, &response](std::string result) {
+        auto text = kj::heap<std::string>(std::move(result));
+        kj::HttpHeaders headers(headerTable);
+        headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+        auto stream = response.send(200, "OK", headers, text->size());
+        auto write = stream->write(kj::arrayPtr(text->data(), text->size()).asBytes());
+        return write.attach(kj::mv(stream), kj::mv(text));
+      });
     }
     return response.sendError(404, "Cap'n Proto CONNECT required", headerTable);
   }
@@ -5589,7 +5657,7 @@ private:
   capnp::TwoPartyServer rpcServer;
   kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial;
   WorkerLogsEndpoint& logs;
-  kj::Function<std::string()> state;
+  kj::Function<kj::Promise<std::string>()> state;
   coworkerd::PeerAuth& peerAuth;
   ControlPlaneAddresses& controlPlane;
   DurableDispatch& durable;
@@ -7763,7 +7831,7 @@ private:
     if (url == "/__coworkerd/state") {
       co_return co_await sendText(
           response, 200, "OK",
-          server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
     }
     {
       // Process rotation. POST /__coworkerd/rotate?all=1 or ?process=p0&process=p1;
@@ -7821,7 +7889,7 @@ private:
       server.reload();
       co_return co_await sendText(
           response, 200, "OK",
-          server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
     }
 
     if (server.draining()) {
@@ -8576,8 +8644,10 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
 
 int run(Launch launch) {
   auto io = kj::setupAsyncIo();
+  const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
   auto& timer = io.provider->getTimer();
+  coworkerd::r47::openTrace();
 
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
@@ -8844,15 +8914,26 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
-  server.addStateSection("memory.daemon", [&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server]() {
-    // members is the current membership view, replaced/expired by the backend's watch/listing.
-    const auto& view = membership->view();
-    std::string containers = "{\"durableLog\":" + durableLog.memoryJson() +
-        ",\"membership\":{\"members\":{\"entries\":" + std::to_string(view.members.size()) + "}}" +
-        ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson() +
-        ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
-        ",\"serverCore\":" + server.retainedMemoryJson() + '}';
-    return coworkerd::MemoryWatermark::daemonJson(containers);
+  server.setDaemonMemory([&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server, &timer]()
+      -> kj::Promise<std::string> {
+    std::string containers;
+    {
+      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      containers = "{\"durableLog\":" + durableLog.memoryJson() +
+          ",\"membership\":{\"members\":{\"entries\":" + std::to_string(membership->view().members.size()) + "}}" +
+          ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson();
+    }
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    {
+      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      containers += ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
+          ",\"serverCore\":" + server.retainedMemoryJson() + '}';
+    }
+    // The fresh kernel RSS/PSS sample may walk many mappings. It only needs the captured counters.
+    auto sample = coworkerd::backgroundValue([containers = std::move(containers)]() {
+      return coworkerd::MemoryWatermark::daemonJson(containers);
+    });
+    co_return co_await kj::mv(sample);
   });
   // The object store as this node uses it: the membership's measurements, and the tenant index's revision it has applied
   // (what a deployment waits for: cowctl, /v1/nodes).
@@ -8962,6 +9043,7 @@ int run(Launch launch) {
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer))
       .exclusiveJoin(durableLog.run())
+      .exclusiveJoin(coworkerd::r47::runTimer(timer))
       .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())

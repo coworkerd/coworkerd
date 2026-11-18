@@ -138,7 +138,8 @@ public:
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash);
-  std::string json(uint32_t idleMs) const;
+  kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
+  std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);
   // A rotation's switch from a generation: `callback(processId, generation)` tells that generation's WebSocket
   // connections to go away (1001) and returns how many it told; the rotation's record keeps the number.
