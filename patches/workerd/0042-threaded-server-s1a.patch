@@ -619,7 +619,7 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..fa58d3226e77f66dea03c05dc7798bac9fa874ac
+index 0000000000000000000000000000000000000000..ab71d2323caddcc878f11241f77e7a4780cb3d69
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -0,0 +1,327 @@
@@ -918,7 +918,7 @@ index 0000000000000000000000000000000000000000..fa58d3226e77f66dea03c05dc7798bac
 +        "{\"decoy\":[{\"lease\":\"x\\\"}y\"}],\"lease\":{\"expiresAtMonotonicMs\":", literal, "}}");
 +    auto raw = threaded::rawPath(descriptor.cStr(), {"lease", "expiresAtMonotonicMs"});
 +    KJ_EXPECT(raw == literal);
-+    auto forwarded = kj::str("{\"deadline\":", kj::StringPtr(raw.data(), raw.size()), "}");
++    auto forwarded = kj::str("{\"deadline\":", kj::heapString(raw.data(), raw.size()), "}");
 +    KJ_EXPECT(threaded::rawField(forwarded.cStr(), "deadline") == literal);
 +  }
 +  for (auto item: {std::pair{LimitCause::CPU, "CPU_LIMIT_EXCEEDED"},
