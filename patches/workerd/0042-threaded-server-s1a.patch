@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 21:30:20 +0800
-Subject: [PATCH] Add native threaded server with bounded channels and resource
- recovery
+Date: Wed, 18 Nov 2026 23:13:00 +0800
+Subject: [PATCH] Native threaded execution, channels, limits and lifecycle
 
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
@@ -36,18 +35,93 @@ index 27ead7ad05c3ce86c9476b81bb717914c2e304e5..a6ae671461633de4f44a27e2133ddf95
 +    visibility = ["//src/workerd/threaded:__pkg__"],
 +)
 diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
-index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..37233fe36b488c92e1db6f80bf202704dfdfda99 100644
+index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..5d82d06bb84b18394bb1af58ec11285942f1efa1 100644
 --- a/src/workerd/server/factory/coworkerd-steady.c++
 +++ b/src/workerd/server/factory/coworkerd-steady.c++
-@@ -20,6 +20,7 @@
+@@ -1,5 +1,7 @@
+ #include "coworkerd-steady.h"
+ 
++#include <unistd.h>
++
+ #include <atomic>
+ #include <cerrno>
+ #include <condition_variable>
+@@ -7,19 +9,20 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+-#include <unistd.h>
+ #if __linux__
+-#include <kj/debug.h>
+-
+ #include <fcntl.h>
+ #include <linux/audit.h>
+ #include <linux/filter.h>
+ #include <linux/seccomp.h>
+ #include <pthread.h>
++#include <sched.h>
+ #include <signal.h>
  #include <sys/ioctl.h>
  #include <sys/prctl.h>
  #include <sys/syscall.h>
-+#include <sched.h>
++
++#include <kj/debug.h>
++
  #include <thread>
  #include <vector>
  #endif
-@@ -87,10 +88,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+@@ -48,7 +51,10 @@ constexpr size_t MAX_CALLS = 512;
+ // Read before the filter goes on, so openat/read/close are still the startup table's.
+ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+   const int fd = open(path, O_RDONLY | O_CLOEXEC);
+-  if (fd < 0) { failure = errno; return 0; }
++  if (fd < 0) {
++    failure = errno;
++    return 0;
++  }
+   size_t count = 0, held = 0;
+   bool comment = false, digits = false;
+   int value = 0;
+@@ -56,7 +62,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+   for (;;) {
+     const auto n = read(fd, buffer, sizeof buffer);
+     if (n < 0 && errno == EINTR) continue;
+-    if (n < 0) { failure = errno; close(fd); return 0; }
++    if (n < 0) {
++      failure = errno;
++      close(fd);
++      return 0;
++    }
+     if (n == 0) break;
+     held += static_cast<size_t>(n);
+     // A line that does not begin with a digit is a comment, as in the file the launcher reads; a line that does
+@@ -71,7 +81,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+         continue;
+       }
+       if (comment) continue;
+-      if (c >= '0' && c <= '9') { digits = true; value = value * 10 + (c - '0'); continue; }
++      if (c >= '0' && c <= '9') {
++        digits = true;
++        value = value * 10 + (c - '0');
++        continue;
++      }
+       if (digits) {  // the number ended; the rest of the line says what it is called
+         if (count < MAX_CALLS) numbers[count++] = value;
+         digits = false;
+@@ -79,7 +93,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+       }
+       if (c != ' ' && c != '\t') comment = true;
+     }
+-    if (held > (1u << 20)) { failure = EFBIG; close(fd); return 0; }
++    if (held > (1u << 20)) {
++      failure = EFBIG;
++      close(fd);
++      return 0;
++    }
+   }
+   if (digits && count < MAX_CALLS) numbers[count++] = value;
+   close(fd);
+@@ -87,10 +105,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
  }
  
  size_t programLength(size_t count) {
@@ -61,27 +135,158 @@ index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..37233fe36b488c92e1db6f80bf202704
  #else
  #error "the steady-state system call filter needs this architecture's audit arch"
  #endif
-@@ -119,6 +121,20 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
+@@ -109,19 +128,39 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
+ #error "the steady-state system call filter needs this architecture's audit arch"
+ #endif
+   size_t at = 0;
+-  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
++  program[at++] =
++      (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
+   program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, arch, 1, 0);
+   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+-  program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
++  program[at++] =
++      (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+ #if defined(__x86_64__)
+   // An x32 call carries bit 30; reject the whole range rather than letting it alias an allowed number.
+   program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 1, 0);
    program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
  #endif
 +  if (std::getenv("COWORKERD_THREADED") != nullptr) {
-+    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-+        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
++    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
++        CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 +    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
 +    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
 +    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
-+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
++    program[at++] = (struct sock_filter)BPF_STMT(
++        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
 +    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, threadFlags, 1, 0);
-+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
++    program[at++] = (struct sock_filter)BPF_STMT(
++        BPF_RET | BPF_K, action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
++    program[at++] = (struct sock_filter)BPF_STMT(
++        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
 +    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
-+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++    program[at++] = (struct sock_filter)BPF_STMT(
++        BPF_RET | BPF_K, action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
 +    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
 +  }
    for (size_t i = 0; i < count; ++i)
-     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
-         static_cast<__u8>(count - i), 0);
+-    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
+-        static_cast<__u8>(count - i), 0);
++    program[at++] = (struct sock_filter)BPF_JUMP(
++        BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]), static_cast<__u8>(count - i), 0);
+   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, action);
+   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+   return at;
+@@ -142,7 +181,9 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
+ // the mode for production.
+ class SteadySupervisor final {
+  public:
+-  void start() { std::thread([this] { loop(); }).detach(); }
++  void start() {
++    std::thread([this] { loop(); }).detach();
++  }
+   void supervise(int fd) {
+     {
+       std::lock_guard<std::mutex> lock(mutex);
+@@ -174,8 +215,9 @@ class SteadySupervisor final {
+       struct seccomp_notif request;
+       memset(&request, 0, sizeof request);
+       if (ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &request) != 0) {
+-        if (errno == EINTR || errno == ENOENT) continue;  // ENOENT: that thread was signalled meanwhile
+-        return;                                          // the filter is gone with this process
++        if (errno == EINTR || errno == ENOENT)
++          continue;  // ENOENT: that thread was signalled meanwhile
++        return;      // the filter is gone with this process
+       }
+       struct seccomp_notif_resp response;
+       memset(&response, 0, sizeof response);
+@@ -189,9 +231,11 @@ class SteadySupervisor final {
+         char row[256];
+         const auto length = snprintf(row, sizeof row,
+             "[coworkerd-seccomp] {\"event\":\"steady-observed\",\"call\":%d,\"pid\":%u,\"answered\":%s,"
+-            "\"notifications\":%llu}\n", static_cast<int>(request.data.nr), request.pid,
+-            answered ? "true" : "false", static_cast<unsigned long long>(notifications));
+-        if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
++            "\"notifications\":%llu}\n",
++            static_cast<int>(request.data.nr), request.pid, answered ? "true" : "false",
++            static_cast<unsigned long long>(notifications));
++        if (length > 0 && static_cast<size_t>(length) < sizeof row)
++          writeRow(row, static_cast<size_t>(length));
+       }
+     }
+   }
+@@ -217,14 +261,15 @@ void narrow() {
+   size_t instructions = 0;
+   if ((observe || enforce) && path != nullptr && *path != '\0') {
+     count = readTable(path, numbers, failure);
+-    if (count == 0 && failure == 0) failure = EINVAL;  // a table without a call is a configuration error
++    if (count == 0 && failure == 0)
++      failure = EINVAL;  // a table without a call is a configuration error
+   } else if (observe || enforce) {
+     failure = ENOENT;
+   }
+   if (count > 0) {
+     std::vector<struct sock_filter> program(programLength(count));
+-    const auto at = buildFilter(numbers, count, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS,
+-        program.data());
++    const auto at = buildFilter(numbers, count,
++        observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS, program.data());
+     KJ_REQUIRE(at == program.size(), count, at, program.size());
+     instructions = at;
+     struct sock_fprog filter = {static_cast<unsigned short>(instructions), program.data()};
+@@ -237,10 +282,16 @@ void narrow() {
+       // table waits for an answer, and only this thread can give one.
+       auto* supervisor = new SteadySupervisor();
+       supervisor->start();
+-      const long fd = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &filter);
+-      if (fd < 0) failure = errno;
+-      else { supervisor->supervise(static_cast<int>(fd)); installed = true; }
+-    } else if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &filter) != 0) {
++      const long fd =
++          syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &filter);
++      if (fd < 0)
++        failure = errno;
++      else {
++        supervisor->supervise(static_cast<int>(fd));
++        installed = true;
++      }
++    } else if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &filter) !=
++        0) {
+       failure = errno;
+     } else {
+       installed = true;
+@@ -256,7 +307,8 @@ void narrow() {
+     if (probe != nullptr && strcmp(probe, "execve") == 0) {
+       char row[160];
+       const auto length = snprintf(row, sizeof row,
+-          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"execve\",\"pid\":%d}\n", getpid());
++          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"execve\",\"pid\":%d}\n",
++          getpid());
+       if (length > 0) writeRow(row, static_cast<size_t>(length));
+       char* const argv[] = {const_cast<char*>("/proc/self/exe"), nullptr};
+       char* const envp[] = {nullptr};
+@@ -264,7 +316,8 @@ void narrow() {
+     } else if (probe != nullptr && strcmp(probe, "seccomp") == 0) {
+       char row[160];
+       const auto length = snprintf(row, sizeof row,
+-          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"seccomp\",\"pid\":%d}\n", getpid());
++          "[coworkerd-seccomp] {\"event\":\"steady-probe\",\"call\":\"seccomp\",\"pid\":%d}\n",
++          getpid());
+       if (length > 0) writeRow(row, static_cast<size_t>(length));
+       syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, nullptr);
+     }
+@@ -278,7 +331,8 @@ void narrow() {
+       "\"instructions\":%zu,\"errno\":%d,\"nonDumpable\":%s,\"dumpableErrno\":%d,\"pid\":%d}\n",
+       mode, installed ? "true" : "false", count, instructions, failure,
+       wantNonDumpable && dumpable == 0 ? "true" : "false", dumpableErrno, getpid());
+-  if (length > 0 && static_cast<size_t>(length) < sizeof row) writeRow(row, static_cast<size_t>(length));
++  if (length > 0 && static_cast<size_t>(length) < sizeof row)
++    writeRow(row, static_cast<size_t>(length));
+ }
+ #endif
+ 
 diff --git a/src/workerd/server/workerd-api.c++ b/src/workerd/server/workerd-api.c++
 index 594f2c5ec28b8c0e0bfc7e437d764af649f66055..3aa06806bea227a246cdaadecb020a07f8109b92 100644
 --- a/src/workerd/server/workerd-api.c++
@@ -394,10 +599,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d81ea9feb3
+index 0000000000000000000000000000000000000000..c917809634c46fa588c30ce9a4fa4a163d568a01
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,2497 @@
+@@ -0,0 +1,3308 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -437,8 +642,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +#include <signal.h>
 +#include <sys/epoll.h>
 +#include <sys/eventfd.h>
++#include <sys/mman.h>
 +#include <sys/resource.h>
 +#include <sys/socket.h>
++#include <sys/stat.h>
 +#include <sys/syscall.h>
 +#include <time.h>
 +#include <unistd.h>
@@ -515,7 +722,12 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        originWall(kj::systemPreciseCalendarClock().now()),
 +        observed(originWall) {}
 +  void syncTime() override {
-+    observed = originWall + (timer.now() - originMono);
++    auto mono = timer.now();
++    if (mono != originMono) {
++      originMono = mono;
++      originWall = kj::systemPreciseCalendarClock().now();
++    }
++    observed = originWall;
 +  }
 +  kj::Date now(kj::Maybe<kj::Date> clamp) override {
 +    KJ_IF_SOME(deadline, clamp) {
@@ -560,16 +772,233 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +
 +struct Channels;
 +
-+enum class LimitCause { NONE, CPU, MEMORY };
++enum class LimitCause { NONE, CPU, MEMORY, DEADLINE };
 +using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
++thread_local uint64_t callDeadlineNs = 0;
++
++kj::Exception limitException(LimitCause cause);
++
++// Only native counters and ownership cross threads. A resident Worker keeps its
++// committed heap charged; JavaScript turns reserve their whole possible heap
++// before entering V8, and return unused capacity when they yield.
++struct ResourceBudget {
++  static constexpr uint64_t MiB = 1ull << 20;
++  ResourceBudget(uint64_t memoryMaximum, uint32_t residentMaximum, uint32_t callThreads)
++      : memoryMaximum(memoryMaximum),
++        addressMaximum(v8::IsolateGroup::CanCreateNewGroups() ? UINT64_MAX : (4ull << 30) / 10 * 9),
++        baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
++        residentMaximum(residentMaximum),
++        memoryReserved(baselineMemory) {
++    KJ_REQUIRE(
++        memoryMaximum > baselineMemory, "native thread budget exceeds process memory budget");
++    KJ_REQUIRE(residentMaximum > 0 && residentMaximum <= 1840,
++        "invalid resident budget for this shared-group build");
++  }
++  const uint64_t memoryMaximum, addressMaximum, baselineMemory;
++  const uint32_t residentMaximum;
++  std::mutex mutex;
++  std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
++  std::atomic<uint32_t> residents{0};
++  std::atomic<uint64_t> rejections{0}, evictions{0};
++  bool change(uint64_t oldMemory, uint64_t newMemory, uint64_t oldAddress, uint64_t newAddress) {
++    std::lock_guard lock(mutex);
++    auto memory = memoryReserved.load() - oldMemory;
++    auto address = addressReserved.load() - oldAddress;
++    if (newMemory > memoryMaximum - kj::min(memory, memoryMaximum) ||
++        newAddress > addressMaximum - kj::min(address, addressMaximum))
++      return false;
++    memoryReserved.store(memory + newMemory);
++    addressReserved.store(address + newAddress);
++    return true;
++  }
++};
++
++struct ResourceReservation {
++  static constexpr uint64_t MiB = ResourceBudget::MiB;
++  ResourceReservation(std::shared_ptr<ResourceBudget> budget, uint32_t memoryMiB)
++      : budget(std::move(budget)),
++        maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB) {}
++  ~ResourceReservation() {
++    if (!registered) return;
++    (void)budget->change(memoryCharge, 0, addressCharge, 0);
++    budget->residents.fetch_sub(1);
++  }
++  std::shared_ptr<ResourceBudget> budget;
++  const uint64_t maximumHeap;
++  std::mutex mutex;
++  uint64_t heap = 0, otherExternal = 0, ownedExternal = 0, source = 0;
++  uint64_t memoryCharge = 0, addressCharge = 0;
++  uint32_t preparing = 0, entering = 0;
++  bool registered = false;
++  bool resize(bool active) {
++    uint64_t memory = 8 * MiB + source + ownedExternal +
++        (active ? kj::max(2 * maximumHeap + 8 * MiB, heap + otherExternal) : heap + otherExternal);
++    uint64_t address = kj::max(2 * MiB, active ? kj::max(maximumHeap + 8 * MiB, heap) : heap);
++    if (!budget->change(memoryCharge, memory, addressCharge, address)) return false;
++    memoryCharge = memory;
++    addressCharge = address;
++    return true;
++  }
++  bool registerPreparation() {
++    std::lock_guard lock(mutex);
++    if (budget->residents.fetch_add(1) >= budget->residentMaximum) {
++      budget->residents.fetch_sub(1);
++      return false;
++    }
++    if (!resize(true)) {
++      budget->residents.fetch_sub(1);
++      return false;
++    }
++    registered = true;
++    preparing = 1;
++    return true;
++  }
++  bool prepare() {
++    std::lock_guard lock(mutex);
++    if (!resize(true)) return false;
++    ++preparing;
++    return true;
++  }
++  void prepared() {
++    std::lock_guard lock(mutex);
++    KJ_ASSERT(preparing > 0);
++    --preparing;
++    (void)resize(preparing || entering);
++  }
++  bool enter() {
++    std::lock_guard lock(mutex);
++    if (!resize(true)) return false;
++    ++entering;
++    return true;
++  }
++  void exit() {
++    std::lock_guard lock(mutex);
++    KJ_ASSERT(entering > 0);
++    --entering;
++    (void)resize(preparing || entering);
++  }
++  // Called only on the isolate's current thread while its lock is held.
++  bool observe(v8::HeapStatistics& stats, uint64_t owned) {
++    std::lock_guard lock(mutex);
++    heap = stats.total_heap_size();
++    otherExternal = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
++    return resize(preparing || entering);
++  }
++  bool retainSource(uint64_t length) {
++    std::lock_guard lock(mutex);
++    auto old = source;
++    if (length > (256ull << 20)) return false;
++    source = length * 5;
++    if (resize(preparing || entering)) return true;
++    source = old;
++    return false;
++  }
++  bool allocateExternal(uint64_t size) {
++    std::lock_guard lock(mutex);
++    ownedExternal += size;
++    if (resize(preparing || entering)) return true;
++    ownedExternal -= size;
++    return false;
++  }
++  void freeExternal(uint64_t size) {
++    std::lock_guard lock(mutex);
++    KJ_ASSERT(size <= ownedExternal);
++    ownedExternal -= size;
++    (void)resize(preparing || entering);
++  }
++};
++
++struct ResourceJsScope {
++  explicit ResourceJsScope(std::shared_ptr<ResourceReservation> reservation)
++      : reservation(std::move(reservation)) {
++    if (this->reservation && !this->reservation->enter())
++      kj::throwRecoverableException(limitException(LimitCause::MEMORY));
++  }
++  void finish() {
++    if (reservation) {
++      reservation->exit();
++      reservation.reset();
++    }
++  }
++  ~ResourceJsScope() noexcept(false) {
++    finish();
++  }
++  std::shared_ptr<ResourceReservation> reservation;
++};
++
++struct ResourcePreparation {
++  explicit ResourcePreparation(std::shared_ptr<ResourceReservation> reservation)
++      : reservation(std::move(reservation)) {}
++  ~ResourcePreparation() {
++    reservation->prepared();
++  }
++  std::shared_ptr<ResourceReservation> reservation;
++};
++
++constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
++kj::Exception capacityError() {
++  auto error = jsg::tagCoworkerdRpcError(
++      KJ_EXCEPTION(OVERLOADED, "jsg.Error: OVERLOADED: process admission budget is full"),
++      "OVERLOADED");
++  error.setDetail(CAPACITY_DETAIL, kj::heapArray<kj::byte>(0));
++  return error;
++}
++
++struct TenantBudget {
++  explicit TenantBudget(uint32_t limit): limit(limit) {
++    KJ_REQUIRE(limit > 0 && limit <= 16384, "invalid per-tenant in-flight limit");
++  }
++  const uint32_t limit;
++  std::mutex mutex;
++  std::map<std::string, uint32_t> active;
++  std::atomic<uint64_t> rejected{0};
++};
++struct TenantPermit {
++  TenantPermit(std::shared_ptr<TenantBudget> budget, std::string tenant)
++      : budget(std::move(budget)),
++        tenant(std::move(tenant)) {
++    std::lock_guard lock(this->budget->mutex);
++    auto found = this->budget->active.find(this->tenant);
++    if (found != this->budget->active.end() && found->second >= this->budget->limit) {
++      this->budget->rejected.fetch_add(1);
++      kj::throwRecoverableException(capacityError());
++    }
++    ++this->budget->active[this->tenant];
++  }
++  ~TenantPermit() {
++    std::lock_guard lock(budget->mutex);
++    auto found = budget->active.find(tenant);
++    if (found != budget->active.end() && --found->second == 0) budget->active.erase(found);
++  }
++  std::shared_ptr<TenantBudget> budget;
++  std::string tenant;
++};
++
++uint64_t configuredCount(const char* name, uint64_t fallback) {
++  auto text = getenv(name);
++  if (!text) return fallback;
++  char* end;
++  errno = 0;
++  auto result = strtoull(text, &end, 10);
++  KJ_REQUIRE(
++      *text && *text != '-' && end && !*end && errno == 0, "invalid native configuration", name);
++  return result;
++}
++
++kj::StringPtr executionIdentity(kj::StringPtr fallback);
 +
 +kj::Exception limitException(LimitCause cause) {
++  if (cause == LimitCause::DEADLINE)
++    return jsg::tagCoworkerdRpcError(
++        KJ_EXCEPTION(OVERLOADED, "jsg.Error: LEASE_EXPIRED: invocation lease expired"),
++        "LEASE_EXPIRED");
 +  auto info = threaded::refusalInfo(
 +      cause == LimitCause::MEMORY ? threaded::Refusal::MEMORY : threaded::Refusal::CPU);
 +  auto code = kj::StringPtr(info.code.data(), info.code.size());
 +  return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, kj::str("jsg.Error: ", code)), code);
 +}
 +
++std::atomic<uint64_t> limitRowsDropped{0};
 +int limitEventFd() {
 +  static int fd = [] {
 +    auto value = getenv("COWORKERD_EVENT_FD");
@@ -577,40 +1006,60 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  }();
 +  return fd;
 +}
-+void writeLimitRow(kj::StringPtr event,
++bool writeLimitRow(kj::StringPtr event,
 +    kj::StringPtr identity,
 +    uint64_t used,
 +    uint32_t cpuMs,
-+    uint32_t memoryMiB) {
++    uint32_t memoryMiB,
++    uint64_t peakUsedBytes = 0) {
 +  int fd = limitEventFd();
-+  if (fd < 0) return;
++  if (fd < 0) return false;
 +  auto row = kj::str("{\"event\":\"", event, "\",", identity, "\"cpuUsedNs\":", used,
-+      ",\"cpuLimitMs\":", cpuMs, ",\"memoryLimitMiB\":", memoryMiB, ",\"pid\":", getpid(), "}\n");
-+  if (row.size() > 4096) return;
++      ",\"cpuLimitMs\":", cpuMs, ",\"memoryLimitMiB\":", memoryMiB,
++      ",\"peakUsedBytes\":", peakUsedBytes, ",\"pid\":", getpid(), "}\n");
++  if (row.size() > 4096) {
++    limitRowsDropped.fetch_add(1);
++    return false;
++  }
 +  ssize_t result;
 +  do {
 +    result = write(fd, row.begin(), row.size());
 +  } while (result < 0 && errno == EINTR);
++  if (result != ssize_t(row.size())) {
++    limitRowsDropped.fetch_add(1);
++    return false;
++  }
++  return true;
 +}
 +
 +struct MemoryBudget final: v8::ArrayBuffer::Allocator {
-+  MemoryBudget(uint32_t mib, LimitState cause)
++  MemoryBudget(uint32_t mib, LimitState cause, std::shared_ptr<ResourceReservation> reservation)
 +      : maximum(uint64_t(mib) << 20),
 +        cause(std::move(cause)),
++        reservation(std::move(reservation)),
 +        inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
 +  ~MemoryBudget() noexcept override {
 +    delete inner;
 +  }
 +  const uint64_t maximum;
 +  LimitState cause;
++  std::shared_ptr<ResourceReservation> reservation;
 +  std::atomic<uint64_t> external{0}, heap{0};
++  std::atomic<uint64_t> peakUsedBytes{0};
 +  v8::ArrayBuffer::Allocator* inner;
 +  v8::Isolate* isolate = nullptr;
 +  bool reserve(size_t size) {
++    if (reservation && !reservation->allocateExternal(size)) {
++      cause->store(LimitCause::MEMORY);
++      if (isolate) isolate->TerminateExecution();
++      return false;
++    }
 +    auto used = external.load();
 +    for (;;) {
 +      auto base = heap.load();
-+      if (size > maximum || base > maximum - size || used > maximum - size - base) {
++      if (maximum != 0 &&
++          (size > maximum || base > maximum - size || used > maximum - size - base)) {
++        if (reservation) reservation->freeExternal(size);
 +        cause->store(LimitCause::MEMORY);
 +        if (isolate != nullptr) isolate->TerminateExecution();
 +        return false;
@@ -621,26 +1070,47 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  void* Allocate(size_t size) override {
 +    if (!reserve(size)) return nullptr;
 +    auto result = inner->Allocate(size);
-+    if (result == nullptr) external.fetch_sub(size);
++    if (result == nullptr) {
++      external.fetch_sub(size);
++      if (reservation) reservation->freeExternal(size);
++    }
 +    return result;
 +  }
 +  void* AllocateUninitialized(size_t size) override {
 +    if (!reserve(size)) return nullptr;
 +    auto result = inner->AllocateUninitialized(size);
-+    if (result == nullptr) external.fetch_sub(size);
++    if (result == nullptr) {
++      external.fetch_sub(size);
++      if (reservation) reservation->freeExternal(size);
++    }
 +    return result;
 +  }
 +  void Free(void* pointer, size_t size) override {
 +    inner->Free(pointer, size);
 +    external.fetch_sub(size);
++    if (reservation) reservation->freeExternal(size);
 +  }
-+  void observe() {
++  void observe(bool afterGc = false) {
 +    v8::HeapStatistics stats;
 +    isolate->GetHeapStatistics(&stats);
 +    auto owned = external.load();
 +    auto other = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
-+    heap.store(stats.used_heap_size() + other);
-+    if (stats.used_heap_size() + other + owned >= maximum) {
++    auto bytes = stats.used_heap_size() + other + owned;
++    auto peak = peakUsedBytes.load();
++    while (peak < bytes && !peakUsedBytes.compare_exchange_weak(peak, bytes)) {}
++    // The allocator compares against live bytes observed after collection;
++    // unreclaimed garbage from an ordinary turn is not an isolate violation.
++    if (afterGc) heap.store(stats.used_heap_size() + other);
++    if (reservation && !reservation->observe(stats, owned)) {
++      cause->store(LimitCause::MEMORY);
++      isolate->TerminateExecution();
++    }
++    if (maximum != 0 && stats.used_heap_size() + other + owned >= maximum) {
++      if (!afterGc) {
++        isolate->LowMemoryNotification();
++        observe(true);
++        return;
++      }
 +      cause->store(LimitCause::MEMORY);
 +      isolate->TerminateExecution();
 +    }
@@ -654,7 +1124,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      return std::max(current, initial + (8u << 20));
 +    }, this);
 +    value->AddGCEpilogueCallback([](v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* opaque) {
-+      static_cast<MemoryBudget*>(opaque)->observe();
++      static_cast<MemoryBudget*>(opaque)->observe(true);
 +    }, this);
 +  }
 +};
@@ -668,7 +1138,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    v8::Isolate* isolate;
 +    std::atomic<LimitCause>& cause;
 +    LimitState memory;
-+    uint64_t started, allowance, due, terminatedAt = 0;
++    uint64_t started, allowance, due, terminatedAt = 0, deadline = 0, previousCpu = 0;
 +    kj::String identity;
 +    uint32_t cpuMs, memoryMiB;
 +    bool culpritReported = false;
@@ -708,6 +1178,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        }
 +        auto used = nowNs(entry->clock) - entry->started;
 +        if (entry->memory->load() == LimitCause::MEMORY) entry->cause.store(LimitCause::MEMORY);
++        if (entry->deadline && now >= entry->deadline) {
++          auto expected = LimitCause::NONE;
++          entry->cause.compare_exchange_strong(expected, LimitCause::DEADLINE);
++        }
 +        if (entry->allowance != UINT64_MAX && used >= entry->allowance) {
 +          auto expected = LimitCause::NONE;
 +          entry->cause.compare_exchange_strong(expected, LimitCause::CPU);
@@ -716,9 +1190,11 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +          if (entry->terminatedAt == 0) {
 +            entry->isolate->TerminateExecution();
 +            entry->terminatedAt = now;
-+          } else if (!entry->culpritReported && now - entry->terminatedAt >= 100000000) {
-+            writeLimitRow("culprit", entry->identity, used, entry->cpuMs, entry->memoryMiB);
-+            entry->culpritReported = true;
++          } else if (!entry->culpritReported && now - entry->terminatedAt >= 100000000 &&
++              (entry->cause.load() != LimitCause::DEADLINE ||
++                  (entry->cpuMs != 0 && used >= entry->allowance))) {
++            entry->culpritReported = writeLimitRow("culprit", entry->identity,
++                used + entry->previousCpu, entry->cpuMs, entry->memoryMiB);
 +          }
 +          entry->due = now + 1000000;
 +        } else {
@@ -726,6 +1202,8 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +              std::max<uint64_t>(
 +                  100000, entry->allowance == UINT64_MAX ? 1000000 : entry->allowance - used);
 +        }
++        if (entry->deadline && entry->cause.load() == LimitCause::NONE)
++          entry->due = std::min(entry->due, entry->deadline);
 +        next = std::min(next, entry->due);
 +      }
 +      if (entries.empty())
@@ -741,8 +1219,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +struct CpuExecution {
 +  std::atomic<LimitCause>& cause;
 +  std::shared_ptr<MemoryBudget> memory;
++  ResourceJsScope resources;
 +  CpuWatchdog::Entry entry;
 +  bool registered;
++  bool finished = false;
 +  CpuExecution(v8::Isolate* isolate,
 +      std::atomic<LimitCause>& cause,
 +      LimitState memoryState,
@@ -753,28 +1233,38 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      kj::StringPtr identity)
 +      : cause(cause),
 +        memory(std::move(memory)),
++        resources(this->memory ? this->memory->reservation : nullptr),
 +        entry{.isolate = isolate,
 +          .cause = cause,
 +          .memory = std::move(memoryState),
 +          .allowance = cpuMs == 0                ? UINT64_MAX
 +              : uint64_t(cpuMs) * 1000000 > used ? uint64_t(cpuMs) * 1000000 - used
 +                                                 : 0,
++          .deadline = callDeadlineNs,
++          .previousCpu = used,
 +          .identity = kj::str(identity),
 +          .cpuMs = cpuMs,
 +          .memoryMiB = memoryMiB},
-+        registered(cpuMs != 0 || memoryMiB != 0) {
++        registered(cpuMs != 0 || memoryMiB != 0 || callDeadlineNs != 0) {
 +    KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &entry.clock) == 0);
 +    entry.started = nowNs(entry.clock);
 +    entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
-+    if (this->memory) this->memory->observe();
++    if (entry.deadline) entry.due = std::min(entry.due, entry.deadline);
 +    if (registered) CpuWatchdog::instance().add(entry);
++    if (this->memory) this->memory->observe();
 +  }
 +  void finish() {
++    if (finished) return;
++    finished = true;
 +    if (registered) {
 +      CpuWatchdog::instance().remove(entry);
 +      registered = false;
-+      if (memory) memory->observe();
 +    }
++    // remove() synchronizes with the watchdog before a new invocation can take
++    // this isolate lock. A late termination must not leak into that invocation.
++    if (entry.terminatedAt != 0) entry.isolate->CancelTerminateExecution();
++    if (memory) memory->observe();
++    resources.finish();
 +  }
 +  ~CpuExecution() noexcept(false) {
 +    finish();
@@ -782,11 +1272,14 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +};
 +
 +struct IsolateLimits final: IsolateLimitEnforcer {
-+  IsolateLimits(uint32_t cpuMs, uint32_t memoryMiB, kj::String identity)
++  IsolateLimits(uint32_t cpuMs,
++      uint32_t memoryMiB,
++      kj::String identity,
++      std::shared_ptr<ResourceReservation> reservation)
 +      : cpuMs(cpuMs),
 +        memoryMiB(memoryMiB),
 +        identity(kj::mv(identity)) {
-+    if (memoryMiB != 0) memory = std::make_shared<MemoryBudget>(memoryMiB, memoryState);
++    memory = std::make_shared<MemoryBudget>(memoryMiB, memoryState, std::move(reservation));
 +  }
 +  uint32_t cpuMs, memoryMiB;
 +  kj::String identity;
@@ -797,7 +1290,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  v8::Isolate::CreateParams getCreateParams() override {
 +    v8::Isolate::CreateParams params;
 +    if (memory) {
-+      params.constraints.ConfigureDefaultsFromHeapSize(0, memory->maximum);
++      if (memory->maximum) params.constraints.ConfigureDefaultsFromHeapSize(0, memory->maximum);
 +      params.array_buffer_allocator_shared = memory;
 +    }
 +    return params;
@@ -815,6 +1308,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    std::atomic<LimitCause> localCause{LimitCause::NONE};
 +    uint64_t& totalCpu;
 +    std::atomic<LimitCause>& cause;
++    kj::String identity;
 +    uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
 +    CpuExecution execution;
 +    Startup(const IsolateLimits& owner,
@@ -825,6 +1319,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +          result(result),
 +          totalCpu(startup ? owner.startupCpu : localCpu),
 +          cause(startup ? owner.startupCause : localCause),
++          identity(kj::str(executionIdentity(owner.identity))),
 +          execution(js.v8Isolate,
 +              cause,
 +              owner.memoryState,
@@ -832,7 +1327,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +              totalCpu,
 +              owner.cpuMs,
 +              owner.memoryMiB,
-+              owner.identity) {}
++              identity) {}
 +    ~Startup() noexcept(false) {
 +      execution.finish();
 +      totalCpu += nowNs(CLOCK_THREAD_CPUTIME_ID) - start;
@@ -842,8 +1337,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        result = int64_t(totalCpu) * kj::NANOSECONDS;
 +      else {
 +        result = limitException(exceeded);
-+        writeLimitRow(exceeded == LimitCause::CPU ? "terminated" : "memory-terminated",
-+            owner.identity, totalCpu, owner.cpuMs, owner.memoryMiB);
++        writeLimitRow(exceeded == LimitCause::DEADLINE ? "deadline-terminated"
++                : exceeded == LimitCause::CPU          ? "terminated"
++                                                       : "memory-terminated",
++            identity, totalCpu, owner.cpuMs, owner.memoryMiB, owner.memory->peakUsedBytes.load());
 +      }
 +    }
 +  };
@@ -907,8 +1404,15 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  capnp::MallocMessageBuilder configArena, flagsArena;
 +  api::MemoryCacheProvider cache;
 +  std::mutex mutex;
-+  bool complete = false;
++  std::atomic<bool> complete{false};
++  std::atomic<bool> retryableLoad{false};
++  std::shared_ptr<ResourceReservation> reservation;
++  std::string workerId, versionId, planRevision, isolateLabel;
++  uint64_t instance = 0;
++  std::atomic<uint64_t> lastUseNs{nowNs()};
++  std::atomic<uint32_t> contexts{0};
 +  kj::Maybe<kj::Own<Worker>> worker;
++  kj::Own<IsolateLimits> limitsOwner;
 +  IsolateLimits* limits = nullptr;
 +  threaded::LoadStage loadStage = threaded::LoadStage::LOAD;
 +  kj::Maybe<kj::Exception> error;
@@ -927,6 +1431,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  kj::Vector<Entry> entries;
 +  uint64_t totalCpu = 0;
 +  std::atomic<LimitCause> limitCause{LimitCause::NONE};
++  std::shared_ptr<ResourcePreparation> preparation;
 +  kj::Maybe<kj::String> unsupportedFeature;
 +};
 +
@@ -938,8 +1443,8 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        identity(kj::mv(identity)),
 +        failure(failurePair.promise.fork()) {}
 +  ~RequestLimits() noexcept(false) {
-+    writeLimitRow(
-+        "completed", identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB);
++    writeLimitRow("completed", identity, measurement.totalCpu, slot.limits->cpuMs,
++        slot.limits->memoryMiB, slot.limits->memory->peakUsedBytes.load());
 +  }
 +  struct Scope {
 +    Scope(RequestLimits& owner, IoContext& context, v8::Isolate* isolate)
@@ -958,9 +1463,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +              slot.limits->cpuMs,
 +              slot.limits->memoryMiB,
 +              owner.identity) {
-+      auto active = slot.active.fetch_add(1) + 1;
-+      KJ_REQUIRE(active == 1, "overlapping JS entries");
-+      slot.maxActive.store(active);
++      uint expected = 0;
++      KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
++      slot.maxActive.store(1);
 +    }
 +    ~Scope() noexcept(false) {
 +      execution.finish();
@@ -990,7 +1495,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    // runImpl synchronizes before waiting for the isolate; sample again after
 +    // that wait, while its lock is held and before this turn enters JavaScript.
 +    timer.syncTime();
-+    return kj::heap<Scope>(*this, context, js.v8Isolate);
++    auto scope = kj::heap<Scope>(*this, context, js.v8Isolate);
++    measurement.preparation.reset();
++    return scope;
 +  }
 +  void topUpActor() override {}
 +  void newSubrequest(bool) override {}
@@ -1001,7 +1508,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    unsupported("analytics");
 +  }
 +  kj::Promise<void> limitDrain() override {
-+    return kj::NEVER_DONE;
++    auto remaining = callDeadlineNs == 0
++        ? uint64_t(30000000000)
++        : std::min<uint64_t>(30000000000, callDeadlineNs > nowNs() ? callDeadlineNs - nowNs() : 0);
++    return timer.timer.afterDelay(int64_t(remaining) * kj::NANOSECONDS);
 +  }
 +  kj::Promise<void> limitScheduled() override {
 +    return kj::NEVER_DONE;
@@ -1024,14 +1534,18 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    auto value = cause();
 +    if (value == LimitCause::NONE || published) return;
 +    published = true;
-+    writeLimitRow(value == LimitCause::MEMORY ? "memory-terminated" : "terminated", identity,
-+        measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB);
++    writeLimitRow(value == LimitCause::DEADLINE ? "deadline-terminated"
++            : value == LimitCause::MEMORY       ? "memory-terminated"
++                                                : "terminated",
++        identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
++        slot.limits->memory->peakUsedBytes.load());
 +    if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
 +    context.abort(limitException(value));
 +  }
 +  kj::Maybe<EventOutcome> getLimitsExceeded() override {
 +    auto value = cause();
 +    if (value == LimitCause::NONE) return kj::none;
++    if (value == LimitCause::DEADLINE) return EventOutcome::CANCELED;
 +    return value == LimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
 +  }
 +  kj::Promise<void> onLimitsExceeded() override {
@@ -1056,6 +1570,13 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  kj::ForkedPromise<void> failure;
 +  bool published = false;
 +};
++
++kj::StringPtr executionIdentity(kj::StringPtr fallback) {
++  if (IoContext::hasCurrent()) {
++    return static_cast<RequestLimits&>(IoContext::current().getLimitEnforcer()).identity;
++  }
++  return fallback;
++}
 +
 +void noteUnsupported(kj::StringPtr feature) {
 +  if (IoContext::hasCurrent()) {
@@ -1086,6 +1607,18 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  Timer timer{io.provider->getTimer()};
 +  Errors errors;
 +  kj::TaskSet tasks{errors};
++  bool rejectOnly = false;
++  uint64_t deadlineNs = 0;
++  kj::Own<kj::PromiseFulfiller<void>> expirationFulfiller;
++  kj::Maybe<kj::ForkedPromise<void>> expiration;
++  kj::Maybe<kj::Promise<void>> deadlineTimer;
++  void acceptDeadline(kj::StringPtr descriptor);
++  kj::Duration backgroundAllowance() {
++    auto remaining = deadlineNs == 0
++        ? uint64_t(30000000000)
++        : std::min<uint64_t>(30000000000, deadlineNs > nowNs() ? deadlineNs - nowNs() : 0);
++    return int64_t(remaining) * kj::NANOSECONDS;
++  }
 +};
 +
 +Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value);
@@ -1122,6 +1655,75 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  Json::Reader get() {
 +    return arena.getRoot<Json>();
 +  }
++};
++
++void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
++  JsonDoc document(descriptor);
++  auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
++  if (!value.isNumber() || !(value.getNumber() > 0) ||
++      value.getNumber() > double(UINT64_MAX / 1000000))
++    return;
++  deadlineNs = uint64_t(value.getNumber() * 1000000);
++  callDeadlineNs = deadlineNs;
++  auto now = nowNs();
++  deadlineTimer =
++      io.provider->getTimer()
++          .afterDelay(int64_t(deadlineNs > now ? deadlineNs - now : 0) * kj::NANOSECONDS)
++          .then([this] {
++    if (expirationFulfiller.get() && expirationFulfiller->isWaiting())
++      expirationFulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "invocation lease expired"));
++  }).eagerlyEvaluate(nullptr);
++}
++
++// The existing node lifecycle wire layout, with one native writer. No KJ
++// object is shared with the publisher or with the node's read-only view.
++class LifecycleChannel {
++ public:
++  static constexpr uint32_t CAPACITY = 8 << 20;
++  static constexpr size_t SIZE = 64 + 2 * (16 + size_t(CAPACITY));
++  LifecycleChannel() {
++    auto fd = configuredCount("COWORKERD_LIFECYCLE_FD", 0);
++    if (fd == 0) return;
++    struct stat facts;
++    KJ_REQUIRE(fd > 2 && fstat(fd, &facts) == 0 && facts.st_size >= off_t(SIZE),
++        "invalid lifecycle descriptor");
++    auto mapping = mmap(nullptr, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    KJ_REQUIRE(mapping != MAP_FAILED, "cannot map lifecycle channel");
++    close(fd);
++    base = static_cast<char*>(mapping);
++    KJ_REQUIRE(*reinterpret_cast<uint32_t*>(base + 8) == 0x434c5743 &&
++            *reinterpret_cast<uint32_t*>(base + 12) == CAPACITY,
++        "invalid lifecycle channel header");
++  }
++  ~LifecycleChannel() {
++    if (base) munmap(base, SIZE);
++  }
++  void publish(const std::string& json, uint64_t active, uint64_t background, uint64_t unknown) {
++    if (!base) return;
++    KJ_REQUIRE(json.size() <= CAPACITY, "lifecycle snapshot exceeds channel");
++    std::lock_guard lock(writer);
++    auto next = __atomic_load_n(reinterpret_cast<uint64_t*>(base), __ATOMIC_ACQUIRE) + 1;
++    auto buffer = base + 64 + (next % 2) * (16 + size_t(CAPACITY));
++    auto sequence = reinterpret_cast<uint64_t*>(buffer);
++    __atomic_store_n(sequence, next * 2 + 1, __ATOMIC_SEQ_CST);
++    memcpy(buffer + 16, json.data(), json.size());
++    __atomic_store_n(
++        reinterpret_cast<uint32_t*>(buffer + 8), uint32_t(json.size()), __ATOMIC_RELAXED);
++    __atomic_store_n(sequence, next * 2 + 2, __ATOMIC_RELEASE);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base), next, __ATOMIC_RELEASE);
++    auto drainSequence = reinterpret_cast<uint64_t*>(base + 24);
++    auto drain = __atomic_load_n(drainSequence, __ATOMIC_RELAXED);
++    __atomic_store_n(drainSequence, drain + 1, __ATOMIC_SEQ_CST);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 32), nowNs(), __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 40), active, __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 48), background, __ATOMIC_RELAXED);
++    __atomic_store_n(reinterpret_cast<uint64_t*>(base + 56), unknown, __ATOMIC_RELAXED);
++    __atomic_store_n(drainSequence, drain + 2, __ATOMIC_RELEASE);
++  }
++
++ private:
++  char* base = nullptr;
++  std::mutex writer;
 +};
 +std::string digest(kj::ArrayPtr<const kj::byte> value) {
 +  kj::byte result[SHA256_DIGEST_LENGTH];
@@ -1217,6 +1819,10 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +class DescriptorQueue {
 + public:
 +  explicit DescriptorQueue(size_t limit): entries(limit + 1) {}
++  bool hasSpace() const {
++    return (tail.load(std::memory_order_relaxed) + 1) % entries.size() !=
++        head.load(std::memory_order_acquire);
++  }
 +  bool push(int fd) {
 +    auto position = tail.load(std::memory_order_relaxed);
 +    auto next = (position + 1) % entries.size();
@@ -1240,8 +1846,18 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +
 +struct ThreadedServer;
 +struct InvocationState: kj::Refcounted {
-+  explicit InvocationState(std::shared_ptr<Slot> slot): slot(std::move(slot)) {}
++  explicit InvocationState(std::shared_ptr<Slot> slot, std::shared_ptr<TenantPermit> tenant)
++      : slot(std::move(slot)),
++        tenant(std::move(tenant)) {
++    this->slot->contexts.fetch_add(1);
++    this->slot->lastUseNs.store(nowNs());
++  }
++  ~InvocationState() noexcept(false) {
++    slot->lastUseNs.store(nowNs());
++    slot->contexts.fetch_sub(1);
++  }
 +  std::shared_ptr<Slot> slot;
++  std::shared_ptr<TenantPermit> tenant;
 +  Measurement measurement;
 +};
 +
@@ -1299,6 +1915,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    auto params = context.getParams();
 +    KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
 +        "NOT_SUPPORTED: persistent objects and handoff");
++    state.acceptDeadline(params.getCfBlobJson());
 +    context.initResults().setDispatcher(
 +        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue()));
 +    return kj::READY_NOW;
@@ -1308,6 +1925,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    KJ_REQUIRE(!used, "one startEvent per connection");
 +    used = true;
 +    auto params = context.getParams();
++    state.acceptDeadline(params.getCfBlobJson());
 +    context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
 +        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
 +    return kj::READY_NOW;
@@ -1335,20 +1953,37 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      : getenv("COWORKERD_THREADED_EGRESS_TOKEN");
 +  std::mutex registryMutex;
 +  std::map<std::string, std::shared_ptr<Slot>> registry;
++  std::vector<std::shared_ptr<Slot>> retiredSlots;
 +  DescriptorQueue pending;
 +  const uint limit;
++  static constexpr uint CONTROL_THREADS = 8;
++  static constexpr int MAINTAIN = -3, STOP = -4, STOPPED = -5;
++  std::shared_ptr<ResourceBudget> resources;
++  LifecycleChannel lifecycle;
++  std::shared_ptr<TenantBudget> tenantBudget;
++  uint64_t nextInstance = 0;
 +  struct Thread {
++    const bool control;
++    const bool maintenanceOnly;
 +    int wake;
 +    std::atomic<int> descriptor{-2};  // -2 initializes/runs; -1 is idle
++    std::atomic<bool> invocation{false};
++    std::atomic<uint64_t> idleSince{nowNs()};
 +    std::thread thread;
-+    Thread(): wake(eventfd(0, EFD_CLOEXEC)) {
++    Thread(bool control, bool maintenanceOnly)
++        : control(control),
++          maintenanceOnly(maintenanceOnly),
++          wake(eventfd(0, EFD_CLOEXEC)) {
 +      KJ_REQUIRE(wake >= 0);
 +    }
 +  };
 +  std::vector<std::unique_ptr<Thread>> threads;
 +  int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 +  std::atomic<bool> ready{false};
++  std::atomic<uint32_t> liveThreads{0};
++  std::atomic<uint64_t> growthFailures{0};
 +  std::atomic<uint> compilations{0};
++  std::atomic<uint64_t> isolateCreationAttempts{0};
 +  std::atomic<uint> canceledLoads{0};
 +  std::atomic<uint> subrequestsActive{0};
 +  std::atomic<uint64_t> subrequestsRejected{0}, acceptFailures{0};
@@ -1361,11 +1996,157 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      : sourceAddress(std::move(sourceAddress)),
 +        identity(std::move(identity)),
 +        pending(limit * 2),
-+        limit(limit) {
++        limit(limit),
++        resources(std::make_shared<ResourceBudget>(
++            configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30),
++            configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
++            limit)),
++        tenantBudget(std::make_shared<TenantBudget>(
++            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))) {
 +    KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
 +    server::coworkerdServing();
 +    fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
 +    manager = std::thread([this]() { manage(); });
++  }
++
++  std::shared_ptr<TenantPermit> admitTenant(Json::Reader descriptor) {
++    auto worker = str(descriptor, "workerId");
++    auto separator = worker.find('/');
++    KJ_REQUIRE(separator != std::string::npos && separator > 0, "invalid trusted Worker tenant");
++    return std::make_shared<TenantPermit>(tenantBudget, worker.substr(0, separator));
++  }
++
++  void maintain() {
++    reapRetired();
++    for (uint32_t i = 0; i < 8 && evictOne(nullptr, true); ++i) {}
++    std::vector<std::shared_ptr<Slot>> snapshot;
++    {
++      std::lock_guard lock(registryMutex);
++      for (auto& [key, slot]: registry) snapshot.push_back(slot);
++      for (auto& slot: retiredSlots) snapshot.push_back(slot);
++    }
++    auto quote = [](const std::string& value) {
++      capnp::MallocMessageBuilder arena;
++      auto root = arena.initRoot<Json>();
++      root.setString(value.c_str());
++      return std::string(encode(root.asReader()).cStr());
++    };
++    std::string json = "{\"ordinaryServer\":\"threaded\",\"residentWorkers\":[";
++    uint64_t active = 0, background = 0, unknown = 0;
++    bool first = true;
++    for (auto& slot: snapshot) {
++      auto complete = slot->complete.load();
++      if (!complete) ++unknown;
++      if (complete && slot->worker == kj::none) continue;
++      auto contexts = std::max(slot->contexts.load(), complete ? 0u : 1u);
++      auto js = slot->active.load();
++      active += contexts;
++      background += contexts && js == 0;
++      json += first ? "" : ",";
++      first = false;
++      auto separator = slot->workerId.find('/');
++      json += "{\"tenant\":" + quote(slot->workerId.substr(0, separator)) +
++          ",\"workerId\":" + quote(slot->workerId) + ",\"versionId\":" + quote(slot->versionId) +
++          ",\"planRevision\":" + quote(slot->planRevision) +
++          ",\"isolate\":" + quote(slot->isolateLabel) +
++          ",\"loadGeneration\":" + std::to_string(slot->instance) +
++          ",\"instance\":" + std::to_string(slot->instance) +
++          ",\"active\":" + std::to_string(contexts) +
++          ",\"loading\":" + (complete ? "false" : "true") +
++          ",\"backgroundActive\":" + (contexts && js == 0 ? "true" : "false") + "}";
++    }
++    json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
++        ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
++        ",\"memoryMaximum\":" + std::to_string(resources->memoryMaximum) +
++        ",\"addressBytes\":" + std::to_string(resources->addressReserved.load()) +
++        ",\"addressMaximum\":" + std::to_string(resources->addressMaximum) +
++        ",\"residents\":" + std::to_string(resources->residents.load()) +
++        ",\"rejected\":" + std::to_string(resources->rejections.load()) +
++        ",\"evicted\":" + std::to_string(resources->evictions.load()) +
++        ",\"tenantRejected\":" + std::to_string(tenantBudget->rejected.load()) +
++        ",\"limitRowsDropped\":" + std::to_string(limitRowsDropped.load()) + "}}";
++    lifecycle.publish(json, active, background, unknown);
++  }
++
++  void reapRetired() {
++    std::vector<std::shared_ptr<Slot>> released;
++    {
++      std::lock_guard lock(registryMutex);
++      std::erase_if(retiredSlots, [&](auto& slot) {
++        if (slot.use_count() != 1 || slot->contexts.load() != 0) return false;
++        released.push_back(std::move(slot));
++        return true;
++      });
++    }
++    released.clear();
++  }
++
++  static uint32_t workerLimit(Json::Reader descriptor, kj::StringPtr name, const char* variable) {
++    auto value = field(descriptor, name);
++    if (value.isNumber() && value.getNumber() != 0) return uint32_t(value.getNumber());
++    return uint32_t(configuredCount(variable, 0));
++  }
++
++  // Destruction runs on the current call thread, with its ThreadContext alive,
++  // and never while holding the shared registry lock.
++  bool evictOne(Slot* exclude = nullptr, bool expiredOnly = false) {
++    std::shared_ptr<Slot> victim;
++    {
++      std::lock_guard lock(registryMutex);
++      auto selected = registry.end();
++      auto cutoff = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000) * 1000000;
++      auto now = nowNs();
++      for (auto at = registry.begin(); at != registry.end(); ++at) {
++        auto& slot = at->second;
++        if (slot.get() == exclude || !slot->complete.load() || slot.use_count() != 1 ||
++            slot->contexts.load() != 0)
++          continue;
++        if (expiredOnly && (cutoff == 0 || now - slot->lastUseNs.load() < cutoff) &&
++            !(slot->limits && slot->limits->memoryState->load() == LimitCause::MEMORY))
++          continue;
++        if (selected == registry.end() ||
++            slot->lastUseNs.load() < selected->second->lastUseNs.load())
++          selected = at;
++      }
++      if (selected == registry.end()) return false;
++      victim = std::move(selected->second);
++      registry.erase(selected);
++    }
++    resources->evictions.fetch_add(1);
++    victim.reset();
++    return true;
++  }
++
++  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot>& slot) {
++    while (!slot->reservation->prepare()) {
++      if (!evictOne(slot.get())) {
++        resources->rejections.fetch_add(1);
++        kj::throwRecoverableException(capacityError());
++      }
++    }
++    return std::make_shared<ResourcePreparation>(slot->reservation);
++  }
++
++  kj::Promise<kj::String> confirmCapacity(Json::Reader input, ThreadState& state) {
++    auto receipt = field(input, "dispatchReceipt");
++    KJ_REQUIRE(receipt.isString() && receipt.getString().size() == 32,
++        "missing private dispatch decision receipt");
++    auto body = kj::str("{\"invocationId\":", encode(field(input, "invocationId")),
++        ",\"receipt\":", encode(receipt), ",\"state\":\"capacity-rejected\",",
++        "\"reason\":\"process admission budget is full\"}");
++    auto address = co_await state.io.provider->getNetwork().parseAddress(sourceAddress.c_str());
++    auto client = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
++    kj::HttpHeaders headers(*state.headers);
++    headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
++    auto request =
++        client->request(kj::HttpMethod::POST, "/v1/dispatch-state", headers, body.size());
++    co_await request.body->write(body.asBytes());
++    auto response = co_await request.response;
++    KJ_REQUIRE(response.statusCode == 200, "private dispatch decision unavailable");
++    auto report = co_await response.body->readAllText(8192);
++    JsonDoc decoded(report);
++    KJ_REQUIRE(flag(decoded.get(), "accepted"), "private dispatch decision refused");
++    co_return encode(field(decoded.get(), "refusal"));
 +  }
 +  static void wake(int fd) {
 +    uint64_t one = 1;
@@ -1385,10 +2166,11 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    // The initial high watermark is the in-flight limit. Readiness waits for all
 +    // native loops, so a cold burst never makes the accept thread initialize one.
 +    try {
-+      threads.reserve(limit);
-+      for (uint i = 0; i < limit; ++i) {
-+        auto item = std::make_unique<Thread>();
++      threads.reserve(limit + CONTROL_THREADS);
++      for (uint i = 0; i < limit + CONTROL_THREADS; ++i) {
++        auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
 +        auto* pointer = item.get();
++        liveThreads.fetch_add(1);
 +        item->thread = std::thread([this, pointer]() { runThread(*pointer); });
 +        threads.push_back(std::move(item));
 +      }
@@ -1401,13 +2183,44 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
 +    ready.store(true, std::memory_order_release);
 +    int held = -1;
++    auto nextMaintenance = nowNs();
++    auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
 +    for (;;) {
++      for (auto& item: threads) {
++        if (item->descriptor.load() == STOPPED && item->thread.joinable()) item->thread.join();
++      }
++      auto now = nowNs();
++      if (now >= nextMaintenance) {
++        nextMaintenance = now + 100000000;
++        for (auto& item: threads) {
++          if (!item->maintenanceOnly) continue;
++          int idle = -1;
++          if (item->descriptor.compare_exchange_strong(idle, MAINTAIN)) {
++            wake(item->wake);
++            break;
++          }
++        }
++        auto remaining = liveThreads.load();
++        if (idleMs != 0)
++          for (auto& item: threads) {
++            if (item->control || remaining <= std::min(limit, 32u) + CONTROL_THREADS ||
++                now - item->idleSince.load() < idleMs * 1000000)
++              continue;
++            int idle = -1;
++            if (item->descriptor.compare_exchange_strong(idle, STOP)) {
++              --remaining;
++              wake(item->wake);
++            }
++          }
++      }
 +      if (held < 0) held = pending.pop();
 +      if (held >= 0) {
 +        bool assigned = false;
 +        for (auto& item: threads) {
++          if (item->control) continue;
 +          int idle = -1;
 +          if (item->descriptor.compare_exchange_strong(idle, held)) {
++            item->invocation.store(true);
 +            wake(item->wake);
 +            held = -1;
 +            assigned = true;
@@ -1415,29 +2228,74 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +          }
 +        }
 +        if (assigned) continue;
++        uint growing = 0;
++        for (auto& item: threads) {
++          if (item->control || item->descriptor.load() != STOPPED || growing == 16) continue;
++          item->descriptor.store(-2);
++          liveThreads.fetch_add(1);
++          try {
++            item->thread = std::thread([this, pointer = item.get()] { runThread(*pointer); });
++            ++growing;
++          } catch (...) {
++            liveThreads.fetch_sub(1);
++            item->descriptor.store(STOPPED);
++            growthFailures.fetch_add(1);
++          }
++        }
++        // Dedicated control loops can decode a descriptor and confirm a refusal
++        // even while every execution loop owns an invocation's background work.
++        const bool warming = std::any_of(threads.begin(), threads.end(), [](const auto& item) {
++          const auto descriptor = item->descriptor.load();
++          return !item->control && (descriptor == -2 || descriptor == STOP);
++        });
++        if (growing == 0 && !warming)
++          for (auto& item: threads) {
++            if (!item->control || item->maintenanceOnly) continue;
++            int idle = -1;
++            if (item->descriptor.compare_exchange_strong(idle, held)) {
++              item->invocation.store(true);
++              wake(item->wake);
++              held = -1;
++              assigned = true;
++              break;
++            }
++          }
++        if (assigned) continue;
 +      }
 +      pollfd wait{managerWake, POLLIN, 0};
 +      int result;
 +      do {
-+        result = poll(&wait, 1, -1);
++        result = poll(&wait, 1, held >= 0 ? 1 : 100);
 +      } while (result < 0 && errno == EINTR);
-+      KJ_REQUIRE(result > 0);
++      if (result < 0) {
++        growthFailures.fetch_add(1);
++        usleep(1000);
++        continue;
++      }
 +      uint64_t count;
 +      while (read(managerWake, &count, sizeof(count)) > 0) {}
 +    }
 +  }
 +  void runThread(Thread& thread) {
-+    pthread_setname_np(pthread_self(), "cwkd-call");
++    pthread_setname_np(pthread_self(), thread.control ? "cwkd-refuse" : "cwkd-call");
 +    std::unique_ptr<ThreadState> storage;
 +    try {
 +      storage = std::make_unique<ThreadState>();
 +    } catch (...) {
 +      fprintf(stderr,
 +          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"call-event-loop\"}\n");
-+      _exit(78);
++      if (!ready.load()) _exit(78);
++      growthFailures.fetch_add(1);
++      liveThreads.fetch_sub(1);
++      thread.descriptor.store(STOPPED);
++      wake(managerWake);
++      return;
 +    }
 +    auto& state = *storage;
++    state.rejectOnly = thread.control;
++    thread.idleSince.store(nowNs());
 +    thread.descriptor.store(-1, std::memory_order_release);
++    wake(managerWake);
 +    for (;;) {
 +      uint64_t count;
 +      ssize_t n;
@@ -1446,7 +2304,18 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      } while (n < 0 && errno == EINTR);
 +      KJ_REQUIRE(n == sizeof(count));
 +      auto fd = thread.descriptor.exchange(-2);
++      if (fd == STOP) break;
++      if (fd == MAINTAIN) {
++        auto ignored = kj::runCatchingExceptions([&] { maintain(); });
++        thread.descriptor.store(-1, std::memory_order_release);
++        wake(managerWake);
++        continue;
++      }
 +      KJ_REQUIRE(fd >= 0);
++      state.deadlineNs = callDeadlineNs = 0;
++      auto expiration = kj::newPromiseAndFulfiller<void>();
++      state.expiration = kj::mv(expiration.promise).fork();
++      state.expirationFulfiller = kj::mv(expiration.fulfiller);
 +      // The idle mailbox wait is outside KJ. Refresh its cached I/O time before
 +      // an already-buffered RPC can enter JavaScript without another OS poll.
 +      state.io.unixEventPort.poll();
@@ -1454,7 +2323,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        auto stream = state.io.lowLevelProvider->wrapSocketFd(
 +            fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
 +        capnp::TwoPartyServer session(kj::heap<Bootstrap>(*this, state));
-+        session.accept(*stream).wait(state.io.waitScope);
++        session.accept(*stream)
++            .exclusiveJoin(KJ_ASSERT_NONNULL(state.expiration).addBranch())
++            .wait(state.io.waitScope);
 +      });
 +      KJ_IF_SOME(exception, error) {
 +        // Never print the descriptor, variables, secret values, or request body.
@@ -1463,16 +2334,28 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      }
 +      auto backgroundError = kj::runCatchingExceptions([&]() {
 +        state.io.provider->getTimer()
-+            .timeoutAfter(30 * kj::SECONDS, state.tasks.onEmpty())
++            .timeoutAfter(state.backgroundAllowance(),
++                state.tasks.onEmpty().exclusiveJoin(
++                    KJ_ASSERT_NONNULL(state.expiration).addBranch()))
 +            .wait(state.io.waitScope);
 +      });
 +      if (backgroundError != kj::none) state.tasks.clear();
++      state.deadlineTimer = kj::none;
++      state.expiration = kj::none;
++      state.expirationFulfiller = nullptr;
++      state.deadlineNs = callDeadlineNs = 0;
++      thread.invocation.store(false);
++      thread.idleSince.store(nowNs());
 +      thread.descriptor.store(-1, std::memory_order_release);
 +      wake(managerWake);
 +    }
++    storage.reset();
++    liveThreads.fetch_sub(1);
++    thread.descriptor.store(STOPPED);
++    wake(managerWake);
 +  }
 +
-+  kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState& state) {
++  kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState& state, Slot& slot) {
 +    if (const char* delay = getenv("COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST")) {
 +      const auto milliseconds = strtoul(delay, nullptr, 10);
 +      KJ_REQUIRE(milliseconds <= 10000, "invalid source test delay");
@@ -1500,6 +2383,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    auto response = co_await request.response;
 +    KJ_REQUIRE(
 +        response.statusCode == 200, kj::str("Trusted source fetch failed: ", response.statusCode));
++    auto length =
++        KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
++    if (!slot.reservation->retainSource(length)) kj::throwRecoverableException(capacityError());
 +    auto content = co_await response.body->readAllText(256u << 20);
 +    JsonDoc source(content);
 +    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
@@ -1582,18 +2468,17 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      module.setName(main);
 +      module.setEsModule(source);
 +    }
-+    auto configured = [&](kj::StringPtr name, const char* variable) {
-+      auto value = field(descriptor, name);
-+      if (value.isNumber() && value.getNumber() != 0) return uint32_t(value.getNumber());
-+      auto text = getenv(variable);
-+      return text == nullptr ? uint32_t(0) : uint32_t(strtoul(text, nullptr, 10));
-+    };
 +    auto identity = kj::str("\"workerId\":", encode(field(descriptor, "workerId")),
 +        ",\"versionId\":", encode(field(descriptor, "versionId")),
-+        ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",");
-+    auto limits = kj::refcounted<IsolateLimits>(configured("cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
-+        configured("memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity));
++        ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",\"isolate\":\"",
++        slot.isolateLabel.c_str(), "\",");
++    auto limits = kj::refcounted<IsolateLimits>(
++        workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
++        workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity),
++        slot.reservation);
 +    slot.limits = limits.get();
++    slot.limitsOwner = kj::addRef(*limits);
++    isolateCreationAttempts.fetch_add(1);
 +    auto group = jsg::newIsolateGroup();
 +    const api::pyodide::PythonConfig python{
 +      .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
@@ -1726,6 +2611,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    slot.actorClasses = std::move(reporter.actorClasses);
 +    slot.creates.fetch_add(1);
 +    compilations.fetch_add(1);
++    writeLimitRow("created", slot.limits->identity, 0, slot.limits->cpuMs, slot.limits->memoryMiB);
++    writeLimitRow(
++        "memory-created", slot.limits->identity, 0, slot.limits->cpuMs, slot.limits->memoryMiB);
 +    auto row = kj::str("[threaded-worker] {\"workerId\":", encode(field(descriptor, "workerId")),
 +        ",\"definitionHash\":", encode(field(descriptor, "definitionHash")),
 +        ",\"tid\":", syscall(SYS_gettid), ",\"isolate\":", (uint64_t)isolateAddress,
@@ -1756,77 +2644,128 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +        digest(
 +            encode(field(field(descriptor, "rootSelection"), "durableObjectBindings")).asBytes());
 +    key += ":" + digest(encode(field(descriptor, "nativeNamespaces")).asBytes());
-+    std::shared_ptr<Slot> slot;
-+    bool creator;
-+    {
-+      std::lock_guard lock(registryMutex);
-+      auto [iterator, inserted] = registry.try_emplace(key);
-+      creator = inserted;
-+      if (inserted) iterator->second = std::make_shared<Slot>();
-+      slot = iterator->second;
-+    }
-+    if (creator) {
-+      auto trace = [&](const char* phase) {
-+        if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") == nullptr) return;
-+        auto row = kj::str("[threaded-load] {\"workerId\":", encode(field(descriptor, "workerId")),
-+            ",\"phase\":\"", phase, "\",\"atNs\":", nowNs(), "}\n");
-+        (void)!write(STDERR_FILENO, row.begin(), row.size());
-+      };
-+      auto remove = [this, &key, &slot] {
-+        std::lock_guard lock(registryMutex);
-+        auto found = registry.find(key);
-+        if (found != registry.end() && found->second == slot) registry.erase(found);
-+      };
-+      auto publish = [&slot] {
-+        std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
++    for (;;) {
++      std::shared_ptr<Slot> slot;
++      bool creator = false;
++      for (;;) {
++        std::shared_ptr<Slot> condemned;
++        bool full = false;
++        {
++          std::lock_guard lock(registryMutex);
++          auto at = registry.find(key);
++          if (at != registry.end() && at->second->complete.load() && at->second->limits &&
++              at->second->limits->memoryState->load() == LimitCause::MEMORY) {
++            condemned = std::move(at->second);
++            registry.erase(at);
++            retiredSlots.push_back(condemned);
++            at = registry.end();
++          }
++          if (at != registry.end())
++            slot = at->second;
++          else {
++            auto reservation = std::make_shared<ResourceReservation>(
++                resources, workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
++            if (!reservation->registerPreparation())
++              full = true;
++            else {
++              slot = std::make_shared<Slot>();
++              slot->reservation = std::move(reservation);
++              slot->instance = ++nextInstance;
++              slot->workerId = str(descriptor, "workerId");
++              slot->versionId = str(descriptor, "versionId");
++              slot->planRevision = fingerprint.isString()
++                  ? std::string(fingerprint.getString().cStr())
++                  : str(descriptor, "definitionHash");
++              slot->isolateLabel = "coworkerd-v1:" + slot->workerId + "@" + slot->versionId + "#" +
++                  digest(kj::arrayPtr(reinterpret_cast<const kj::byte*>(key.data()), key.size()));
++              registry.emplace(key, slot);
++              creator = true;
++            }
++          }
++        }
++        if (condemned) {
++          resources->evictions.fetch_add(1);
++          condemned.reset();
++          reapRetired();
++          if (full) continue;
++        }
++        if (!full) break;
++        if (!evictOne()) {
++          resources->rejections.fetch_add(1);
++          kj::throwRecoverableException(capacityError());
++        }
++      }
++      if (creator) {
++        auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
++        auto trace = [&](const char* phase) {
++          if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") == nullptr) return;
++          auto row =
++              kj::str("[threaded-load] {\"workerId\":", encode(field(descriptor, "workerId")),
++                  ",\"phase\":\"", phase, "\",\"atNs\":", nowNs(), "}\n");
++          (void)!write(STDERR_FILENO, row.begin(), row.size());
++        };
++        auto remove = [this, &key, &slot] {
++          std::lock_guard lock(registryMutex);
++          auto found = registry.find(key);
++          if (found != registry.end() && found->second == slot) registry.erase(found);
++        };
++        auto publish = [&slot] {
++          std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
++          {
++            std::lock_guard lock(slot->mutex);
++            slot->complete = true;
++            waiters.swap(slot->waiters);
++          }
++          for (auto& waiter: waiters) waiter->fulfill();
++        };
++        auto cancel = kj::defer([&] {
++          if (!slot->complete) {
++            canceledLoads.fetch_add(1);
++            slot->retryableLoad.store(true);
++            remove();
++            slot->error =
++                KJ_EXCEPTION(DISCONNECTED, "Worker initialization canceled before publication");
++            publish();
++          }
++        });
++        bool fetched = false;
++        try {
++          trace("source-start");
++          slot->loadStage = threaded::LoadStage::PACKAGE;
++          auto source = co_await fetchSource(descriptor, state, *slot);
++          trace("source-end");
++          fetched = true;
++          slot->worker = compile(*slot, descriptor, source);
++          trace("compiled");
++        } catch (kj::Exception& error) {
++          auto stage = kj::heapArray<kj::byte>(1);
++          stage[0] = static_cast<kj::byte>(slot->loadStage);
++          error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
++          slot->error = kj::mv(error);
++        }
++        if (!fetched) {
++          slot->retryableLoad.store(true);
++          remove();
++        }
++        publish();
++      } else {
++        auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
++        bool wait;
 +        {
 +          std::lock_guard lock(slot->mutex);
-+          slot->complete = true;
-+          waiters.swap(slot->waiters);
++          wait = !slot->complete;
++          if (wait) slot->waiters.push_back(kj::mv(signal.fulfiller));
 +        }
-+        for (auto& waiter: waiters) waiter->fulfill();
-+      };
-+      auto cancel = kj::defer([&] {
-+        if (!slot->complete) {
-+          canceledLoads.fetch_add(1);
-+          remove();
-+          slot->error =
-+              KJ_EXCEPTION(DISCONNECTED, "Worker initialization canceled before publication");
-+          publish();
-+        }
-+      });
-+      bool fetched = false;
-+      try {
-+        trace("source-start");
-+        slot->loadStage = threaded::LoadStage::PACKAGE;
-+        auto source = co_await fetchSource(descriptor, state);
-+        trace("source-end");
-+        fetched = true;
-+        slot->worker = compile(*slot, descriptor, source);
-+        trace("compiled");
-+      } catch (kj::Exception& error) {
-+        auto stage = kj::heapArray<kj::byte>(1);
-+        stage[0] = static_cast<kj::byte>(slot->loadStage);
-+        error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
-+        slot->error = kj::mv(error);
++        if (wait) co_await signal.promise;
 +      }
-+      if (!fetched) remove();
-+      publish();
-+    } else {
-+      auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
-+      bool wait;
-+      {
-+        std::lock_guard lock(slot->mutex);
-+        wait = !slot->complete;
-+        if (wait) slot->waiters.push_back(kj::mv(signal.fulfiller));
++      KJ_IF_SOME(error, slot->error) {
++        if (!creator && slot->retryableLoad.load()) continue;
++        kj::throwRecoverableException(error.clone());
 +      }
-+      if (wait) co_await signal.promise;
++      slot->lastUseNs.store(nowNs());
++      coldLoaded = creator;
++      co_return slot;
 +    }
-+    KJ_IF_SOME(error, slot->error) {
-+      kj::throwRecoverableException(error.clone());
-+    }
-+    coldLoaded = creator;
-+    co_return slot;
 +  }
 +};
 +
@@ -2539,7 +3478,8 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    } external;
 +    auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
 +    auto& worker = *KJ_REQUIRE_NONNULL(slot->worker);
-+    worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
++    auto asyncLock = co_await worker.takeAsyncLockWithoutRequest(SpanParent(nullptr));
++    worker.runInLockScope(asyncLock, [&](Worker::Lock& lock) {
 +      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
 +        auto placeholder = jsg::check(
 +            v8::Function::New(js.v8Context(), [](const v8::FunctionCallbackInfo<v8::Value>&) {}));
@@ -2554,7 +3494,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    });
 +    results.getResult().initExternals(1)[0].initRpcTarget().setCap(target);
 +    results.setCallPipeline(target);
-+    return kj::READY_NOW;
++    co_return;
 +  }
 +
 +  std::shared_ptr<Slot> slot;
@@ -2567,8 +3507,12 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    std::shared_ptr<Slot> slot,
 +    Json::Reader input,
 +    kj::StringPtr raw,
-+    Frankenvalue props) {
-+  auto invocation = kj::refcounted<InvocationState>(slot);
++    Frankenvalue props,
++    std::shared_ptr<ResourcePreparation> preparation,
++    std::shared_ptr<TenantPermit> tenant) {
++  if (!preparation) preparation = server.prepareSlot(slot);
++  auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
++  invocation->measurement.preparation = std::move(preparation);
 +  auto worker = kj::atomicAddRef(*KJ_REQUIRE_NONNULL(slot->worker));
 +  auto cf = kj::str("{\"nodeId\":", encode(field(input, "serverId")),
 +      ",\"serverId\":", encode(field(input, "serverId")));
@@ -2593,7 +3537,8 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer,
 +          kj::str("\"workerId\":", encode(field(input, "workerId")),
 +              ",\"versionId\":", encode(field(input, "versionId")),
-+              ",\"invocationId\":", encode(field(input, "invocationId")), ",")),
++              ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
++              slot->isolateLabel.c_str(), "\",")),
 +      kj::addRef(*invocation), kj::mv(channels), kj::refcounted<RequestObserver>(), state.tasks,
 +      true, kj::mv(tracer), kj::mv(cf), kj::none);
 +  return {kj::mv(entry), kj::mv(invocation)};
@@ -2606,9 +3551,25 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  auto input = document.get();
 +  KJ_REQUIRE(!flag(input, "trial"), "a trial load cannot start an RPC session");
 +  bool coldLoaded = false;
-+  auto slot = co_await server.getWorker(input, state, coldLoaded);
-+  auto prepared = kj::heap<PreparedInvocation>(
-+      prepareInvocation(state, server, slot, input, descriptor, kj::mv(props)));
++  std::shared_ptr<Slot> slot;
++  std::shared_ptr<ResourcePreparation> preparation;
++  std::shared_ptr<TenantPermit> tenant;
++  bool capacity = false;
++  try {
++    if (state.rejectOnly) kj::throwRecoverableException(capacityError());
++    tenant = server.admitTenant(input);
++    slot = co_await server.getWorker(input, state, coldLoaded);
++    preparation = server.prepareSlot(slot);
++  } catch (const kj::Exception& error) {
++    if (error.getDetail(CAPACITY_DETAIL) == kj::none) throw;
++    capacity = true;
++  }
++  if (capacity) {
++    co_await server.confirmCapacity(input, state);
++    kj::throwRecoverableException(capacityError());
++  }
++  auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
++      descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
 +  auto event = kj::heap<api::JsRpcSessionCustomEvent>(
 +      api::JsRpcSessionCustomEvent::WORKER_RPC_EVENT_TYPE, kj::none);
 +  auto target = event->getCap();
@@ -2633,15 +3594,34 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  kj::Maybe<kj::String> loadError;
 +  auto loadStage = threaded::LoadStage::LOAD;
 +  bool coldLoaded = false;
++  bool capacity = false;
++  std::shared_ptr<ResourcePreparation> preparation;
++  std::shared_ptr<TenantPermit> tenant;
 +  try {
++    if (state.rejectOnly) kj::throwRecoverableException(capacityError());
++    tenant = server.admitTenant(input);
 +    slot = co_await server.getWorker(input, state, coldLoaded);
++    if (!trial) preparation = server.prepareSlot(slot);
 +  } catch (const kj::Exception& error) {
-+    if (!trial) throw;
++    if (error.getDetail(CAPACITY_DETAIL) != kj::none)
++      capacity = true;
++    else if (!trial)
++      throw;
 +    loadError = kj::str(error.getDescription());
 +    KJ_IF_SOME(stage, error.getDetail(LOAD_STAGE_DETAIL)) {
 +      if (stage.size() == 1 && stage[0] <= static_cast<kj::byte>(threaded::LoadStage::EVALUATION))
 +        loadStage = static_cast<threaded::LoadStage>(stage[0]);
 +    }
++  }
++  if (capacity) {
++    auto report = trial
++        ? kj::str(
++              "{\"ok\":false,\"capacityRejected\":true,\"message\":\"process admission budget is full\"}")
++        : co_await server.confirmCapacity(input, state);
++    auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
++        kj::HttpHeaders(*state.headers), report.size());
++    co_await output->write(report.asBytes());
++    co_return;
 +  }
 +  KJ_IF_SOME(message, loadError) {
 +    capnp::MallocMessageBuilder arena;
@@ -2695,7 +3675,8 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    co_await output->write(report.asBytes());
 +    co_return;
 +  }
-+  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props));
++  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
++      std::move(preparation), std::move(tenant));
 +  auto& invocation = prepared.invocation;
 +  auto& entry = prepared.entry;
 +  kj::Maybe<kj::Exception> failure;
@@ -2712,7 +3693,9 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +    }
 +    kj::throwRecoverableException(kj::mv(error));
 +  }
-+  co_await state.io.provider->getTimer().timeoutAfter(30 * kj::SECONDS, state.tasks.onEmpty());
++  co_await state.io.provider->getTimer()
++      .timeoutAfter(state.backgroundAllowance(), state.tasks.onEmpty())
++      .catch_([&state = this->state](kj::Exception&&) { state.tasks.clear(); });
 +}
 +
 +void acceptLoop(ThreadedServer& server, int listener, int parent) {
@@ -2797,7 +3780,12 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +          (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
 +          epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
 +          connections.erase(found);
-+          if (!server.enqueue(fd)) ::close(fd);
++          char admission = server.pending.hasSpace() ? 'A' : 'R';
++          auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
++          if (sent != 1 || admission == 'R')
++            ::close(fd);
++          else if (!server.enqueue(fd))
++            ::close(fd);
 +          continue;
 +        }
 +        if (size == 0) close = true;
@@ -2816,12 +3804,17 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +            uint busy = 0;
 +            if (server.ready.load(std::memory_order_acquire))
 +              for (auto& thread: server.threads)
-+                if (thread->descriptor.load() != -1) ++busy;
++                if (!thread->control && thread->invocation.load()) ++busy;
 +            body = "{\"threadLimit\":" + std::to_string(server.limit) +
 +                ",\"busyThreads\":" + std::to_string(busy) +
 +                ",\"idleConnections\":" + std::to_string(connections.size() - 1) +
 +                ",\"compilations\":" + std::to_string(server.compilations.load()) +
++                ",\"isolateCreationAttempts\":" +
++                std::to_string(server.isolateCreationAttempts.load()) +
 +                ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) +
++                ",\"liveThreads\":" + std::to_string(server.liveThreads.load()) +
++                ",\"controlThreads\":" + std::to_string(server.CONTROL_THREADS) +
++                ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
 +                ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
 +                ",\"subrequestsActive\":" + std::to_string(server.subrequestsActive.load()) +
 +                ",\"subrequestsRejected\":" + std::to_string(server.subrequestsRejected.load()) +
@@ -2839,7 +3832,7 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +                "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded lifecycle controls require S1c\"}";
 +          }
 +          connection.output = "HTTP/1.1 " + std::string(status) +
-+              "\r\nX-Coworkerd-Threaded-Protocol: 2\r\nContent-Length: " +
++              "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +
 +              std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
 +        }
 +      }
@@ -2880,6 +3873,29 @@ index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d8
 +  auto limit = strtoul(argv[4], &end, 10);
 +  if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
 +  if (!prepareDescriptors(limit)) return 78;
++  auto event = limitEventFd();
++  if (event >= 0) {
++    auto flags = fcntl(event, F_GETFL);
++    if (flags < 0 || fcntl(event, F_SETFL, flags | O_NONBLOCK) != 0) {
++      fprintf(stderr,
++          "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"event-channel\"}\n");
++      return 78;
++    }
++  }
++  try {
++    auto wasmMiB = configuredCount("COWORKERD_THREADED_WASM_MAX_MIB", 128);
++    KJ_REQUIRE(wasmMiB <= 65536, "invalid WebAssembly memory configuration");
++    if (wasmMiB != 0) {
++      auto flags = std::string("--wasm-max-mem-pages=") +
++          std::to_string(std::min<uint64_t>(65536, wasmMiB * 16)) +
++          " --enforce-global-heap-limit --maximum-global-heap-limit-factor=1";
++      v8::V8::SetFlagsFromString(flags.c_str());
++    }
++  } catch (...) {
++    fprintf(stderr,
++        "[threaded-start] {\"event\":\"startup-rejected\",\"resource\":\"v8-configuration\"}\n");
++    return 78;
++  }
 +  signal(SIGPIPE, SIG_IGN);
 +  util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
 +  setenv("COWORKERD_THREADED", "1", 1);

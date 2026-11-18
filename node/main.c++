@@ -60,6 +60,7 @@
 #include <optional>
 #include <random>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sstream>
 #include <cerrno>
 #include <cstring>
@@ -409,6 +410,7 @@ struct InvocationRejection {
   uint32_t limit = 0;
   uint32_t avoidMs = 0;
   std::string category;  // LOAD_FAILED: package-unavailable, evaluation, limit, secret-missing
+  bool notExecuted = false, retryable = false;
 
   std::string json() const {
     std::ostringstream out;
@@ -418,6 +420,7 @@ struct InvocationRejection {
     if (!category.empty()) out << ",\"category\":\"" << jsonEscape(category) << "\"";
     if (code == "LOAD_FAILED" && status == 409 && category == "limit")
       out << ",\"dispatched\":false,\"retryable\":false";
+    else if (notExecuted) out << ",\"dispatched\":false,\"retryable\":" << (retryable ? "true" : "false");
     out << "}";
     return out.str();
   }
@@ -466,7 +469,7 @@ struct AdmissionSlot {
   // turn an uncertain execution into a refusal that placement may retry.
   std::string dispatchReceipt, preparationReason;
   double deadline = 0;
-  bool decided = false, notExecuted = false, preparationLimit = false;
+  bool decided = false, notExecuted = false, preparationLimit = false, capacityRejected = false;
   std::function<void(bool)> executionDecision;
   void decide(bool executed) {
     if (decided) return;
@@ -477,8 +480,8 @@ struct AdmissionSlot {
   }
   void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
-  ~AdmissionSlot() { decide(true); finish(); report(0, ""); }
-  void finish() { decide(true); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
+  ~AdmissionSlot() { decide(!process || process->dispatched); finish(); report(0, ""); }
+  void finish() { decide(!process || process->dispatched); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
   NativeProps nativeProps;
 };
 
@@ -1944,6 +1947,8 @@ public:
             LoadCheck failed;
             failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
             failed.refusal->category = result.refusal->category;
+            failed.refusal->notExecuted = result.refusal->notExecuted;
+            failed.refusal->retryable = result.refusal->retryable;
             co_return failed;
           }
         }
@@ -1991,6 +1996,9 @@ public:
             message = entrypointName == "default" ? (flag("hasDefault") ? "the default export has no fetch handler" : "there is no default export")
                 : "the entrypoint " + entrypointName + " is missing or has no fetch handler";
           }
+        } else if (flag("capacityRejected")) {
+          result.refusal = refusal("OVERLOADED", "process admission budget is full", 503, root);
+          result.refusal->notExecuted = result.refusal->retryable = true;
         } else if (flag("preparationLimit")) {
           category = "limit"; detail = "PREPARATION_LIMIT"; message = string("message"); preparationLimit = true;
         } else if (string("stage") == "code") {
@@ -2551,7 +2559,9 @@ private:
         leases.erase(invocationId);
         const auto current = slotRef.lock();
         const bool limited = current && current->preparationLimit;
-        const auto refusal = this->refusal(limited ? "LOAD_FAILED" : "CODE_UNAVAILABLE", "Worker preparation unavailable before execution", limited ? 409 : 503, ingress);
+        const bool capacity = current && current->capacityRejected;
+        const auto refusal = this->refusal(capacity ? "OVERLOADED" : limited ? "LOAD_FAILED" : "CODE_UNAVAILABLE",
+            capacity ? "process admission budget is full" : "Worker preparation unavailable before execution", limited ? 409 : 503, ingress);
         observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
@@ -2584,6 +2594,10 @@ private:
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
+    if (slot) process->onCapacityRejected = [this, lifetime = std::weak_ptr<int>(executionLifetime),
+        invocation = invocationId, receipt = slot->dispatchReceipt] {
+      if (!lifetime.expired()) confirmPreparation(invocation, receipt, "capacity-rejected", "process admission budget is full");
+    };
     auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
@@ -2605,14 +2619,18 @@ public:
     auto found = pendingPreparations.find(invocation);
     if (found == pendingPreparations.end()) return std::nullopt;
     auto slot = found->second.lock();
-    if (!slot || slot->decided || receipt != slot->dispatchReceipt || (state != "rejected" && state != "load-failed")) return std::nullopt;
+    if (!slot || slot->decided || receipt != slot->dispatchReceipt ||
+        (state != "rejected" && state != "load-failed" && state != "capacity-rejected")) return std::nullopt;
     slot->preparationReason = cleanReason(reason).substr(0, 300);
     slot->preparationLimit = state == "load-failed";
+    slot->capacityRejected = state == "capacity-rejected";
     slot->decide(false);
-    auto refused = refusal(slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE", slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
+    auto refused = refusal(slot->capacityRejected ? "OVERLOADED" : slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE",
+        slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
+    if (slot->capacityRejected) refused.notExecuted = refused.retryable = true;
     if (slot->preparationLimit) refused.category = "limit";
     auto body = refusalBody(refused, slot->deadline);
-    if (!slot->preparationLimit) {
+    if (!slot->preparationLimit && !slot->capacityRejected) {
       body.pop_back(); body += ",\"dispatched\":false,\"retryable\":true}";
     }
     return body;
@@ -3561,12 +3579,13 @@ void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRej
   refusal.setCode(value.code.c_str()); refusal.setReason(cleanReason(value.reason).c_str());
   refusal.setLoadBand(value.loadBand.c_str()); refusal.setInFlight(value.inFlight);
   refusal.setLimit(value.limit); refusal.setAvoidMs(value.avoidMs); refusal.setStatus(value.status);
+  refusal.setNotExecuted(value.notExecuted); refusal.setRetryable(value.retryable);
   if (!value.category.empty()) refusal.setCategory(value.category.c_str());
 }
 
 InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
   return {value.getStatus(), value.getCode().cStr(), value.getReason().cStr(), value.getLoadBand().cStr(),
-      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr()};
+      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr(), value.getNotExecuted(), value.getRetryable()};
 }
 
 // One relay of an inbound WebSocket connection (WebSocketRegistry): `outer` toward the client -- the client itself at the
@@ -4824,6 +4843,7 @@ public:
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint, allocation.nativeProps};
     };
     bool allPaused = true;
+    bool allNotExecuted = true;
     std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
       if (hops == 0) break;
@@ -4832,6 +4852,7 @@ public:
       const auto startedAt = wallTimeMsForTest();
       if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1);
       else result = co_await tryOpen(id, invocationFor(hops));
+      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
       allPaused = allPaused && result.failure && pausedRefusal(*result.failure);
       if (result.failure && pausedRefusal(*result.failure) && !firstPaused) firstPaused = result.failure;
       server.observeAttempt(id, allocation.ingressRoot, result.failure);
@@ -4895,6 +4916,7 @@ public:
         std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
       const auto target = config.serverId;
       auto result = co_await attemptHere(true);
+      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
       server.observeAttempt(target, allocation.ingressRoot, result.failure);
       if (!result.failure) {
         avoidance.erase(target);
@@ -4910,6 +4932,9 @@ public:
     }
     failures += ']';
     auto refusal = server.refusal("PLACEMENT_EXHAUSTED", hops == 0 ? "placement hops exhausted" : "all candidates rejected or unavailable", 503, allocation.ingressRoot);
+    // Preserve explicit pre-execution proof through placement aggregation. A failed
+    // connection alone is insufficient evidence that another node did not execute.
+    if (attempted > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
     if (attempted > 0 && packagesUnavailable) {
       // No candidate could load the code package: the load failure is the answer.
       refusal = server.refusal("LOAD_FAILED", "the code package could not be fetched or verified on any candidate (" +
@@ -7744,6 +7769,9 @@ private:
                 break;
               }
             }
+          } else if (flag("capacityRejected")) {
+            dispatched = false;
+            verdict = {"UNAVAILABLE", "", "native process admission budget is full; nothing executed"};
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
             verdict = flag("preparationLimit") ? TrialVerdict{"LOAD_FAILED", "", string("message")}
@@ -8580,6 +8608,32 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
+  pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
+  pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
+  pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
+  pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
+  pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
+  const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
+  const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
+  const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
+  if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
+  KJ_REQUIRE(pool.ordinaryServer != "threaded" || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
+      "native process memory budget exceeds its node share", memorySource.c_str());
+  if (pool.ordinaryServer == "threaded") {
+    // Include a replacement generation, private channels and prepared sockets;
+    // reject an insufficient host hard limit before starting any child process.
+    const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
+    const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
+    const auto required = std::max(childRequired, nodeRequired);
+    rlimit inherited;
+    KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");
+    KJ_REQUIRE(inherited.rlim_max >= required, "insufficient host descriptor hard limit",
+        required, inherited.rlim_max, "missing", required > inherited.rlim_max ? required - inherited.rlim_max : 0);
+    if (inherited.rlim_cur < required) {
+      inherited.rlim_cur = required;
+      KJ_REQUIRE(setrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot set node descriptor soft limit", required);
+    }
+  }
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
                              std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
                              std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &pool.rotationDrainTimeoutMs},

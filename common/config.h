@@ -85,9 +85,15 @@ struct ProcessPoolConfig {
   // COWORKERD_SANDBOX_STEADY_ALLOWLIST override them.
   std::string steadySyscallsMode = "off";
   std::string steadyAllowlistPath;
-  // S1a keeps the ordinary process implementation opt-in; other classes stay upstream.
+  // Selects the ordinary and quarantine backend; durable processes use upstream.
   std::string ordinaryServer = "upstream";
   std::string threadedExecutable;
+  // Per-tenant concurrent invocations in each native process.
+  uint32_t tenantInFlightLimit = 16;
+  // 0 derives a process share from the node's actual memory budget, including a spare generation.
+  uint64_t threadedMemoryBytes = 0;
+  uint32_t threadedResidentLimit = 1840;
+  uint32_t threadedThreadIdleMs = 60000;
   void validate() const;
 };
 

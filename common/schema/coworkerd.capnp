@@ -157,6 +157,8 @@ struct InvocationRejection {
   status @6 :UInt16;
   # LOAD_FAILED: package-unavailable, evaluation, limit or secret-missing.
   category @7 :Text;
+  notExecuted @8 :Bool;
+  retryable @9 :Bool;
 }
 
 struct RemoteInvocation {
@@ -596,10 +598,17 @@ struct ProcessPoolConfig {
   # Process-wide cumulative SQL CPU and active-SQL wall limits per event. Independent of tenant CPU limits.
   sqlCpuLimitMs @10 :UInt32 = 200;
   sqlWallLimitMs @11 :UInt32 = 800;
-  # HTTP backend for ordinary processes. Durable and quarantine processes stay upstream.
+  # Backend for ordinary and quarantine processes. Durable processes stay upstream.
   ordinaryServer @12 :Text = "upstream";
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
+  # Per-tenant calls in each native ordinary or quarantine generation.
+  tenantInFlightLimit @14 :UInt32 = 16;
+  # 0 derives a safe share from the node's cgroup/configured memory budget.
+  threadedMemoryBytes @15 :UInt64 = 0;
+  # Shared-pointer-space budget, below the measured fatal boundary.
+  threadedResidentLimit @16 :UInt32 = 1840;
+  threadedThreadIdleMs @17 :UInt32 = 60000;
 }
 
 struct RotationConfig {

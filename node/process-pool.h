@@ -43,10 +43,13 @@ public:
   double startedAtMonotonicMs = 0;
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
+  bool capacityRejected = false;
+  std::function<void()> onCapacityRejected;
 private:
   friend class ProcessPool;
-  explicit ProcessCall(std::shared_ptr<ProcessGeneration> process);
+  explicit ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string tenant = {});
   std::shared_ptr<ProcessGeneration> process;
+  std::string tenant;
   bool finished = false;
 };
 

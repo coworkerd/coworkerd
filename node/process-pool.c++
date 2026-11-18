@@ -190,7 +190,7 @@ int anonymousMemory(const char* name, size_t size) {
   return raised(fd);
 }
 // A listening Unix socket at `path` (an older file there is replaced).
-int listenUnix(const std::string& path) {
+int listenUnix(const std::string& path, uint32_t backlog) {
   sockaddr_un address{};
   address.sun_family = AF_UNIX;
   KJ_REQUIRE(path.size() < sizeof(address.sun_path), "Unix socket path too long", path.c_str());
@@ -200,7 +200,7 @@ int listenUnix(const std::string& path) {
   closeOnExec(fd);
   fd = raised(fd);
   ::unlink(path.c_str());
-  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(fd, 128) != 0) {
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(fd, std::max(128u, backlog)) != 0) {
     auto error = errno;
     ::close(fd);
     KJ_FAIL_REQUIRE("cannot listen on a Unix socket", path.c_str(), strerror(error));
@@ -279,6 +279,7 @@ class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
 public:
   RuntimeConnection(): tasks(*this) {}
   bool threaded = false;
+  uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
   static constexpr size_t IDLE_CONNECTIONS = 32;
   std::vector<kj::Own<kj::AsyncIoStream>> idle;
@@ -291,16 +292,24 @@ public:
   void replenish() {
     if (!filling && !disconnected) tasks.add(fill());
   }
-  kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps);
+  kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+      std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
   kj::Own<capnp::TwoPartyClient> rpc;
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
-  OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
-    if (threaded) return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps))), kj::READY_NOW};
+  OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
+      std::function<void()> onDispatched, std::function<void()> onCapacityRejected) {
+    if (threaded) {
+      auto ready = kj::newPromiseAndFulfiller<void>();
+      return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
+          std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))), kj::mv(ready.promise)};
+    }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
+    onDispatched();
     auto request = bootstrap.startEventRequest();
     request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
     auto response = request.send();
@@ -323,7 +332,9 @@ private:
   std::shared_ptr<RuntimeConnection> connection;
 };
 
-kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
+kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+    std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -339,6 +350,18 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   replenish();
   // No Cap'n Proto bytes may precede this raw routing prefix.
   co_await connection->stream->write(kj::StringPtr("T").asBytes());
+  if (threadedProtocol >= 3) {
+    char decision;
+    auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
+    KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
+    if (decision == 'R') {
+      onCapacityRejected();
+      kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
+    }
+    KJ_REQUIRE(decision == 'A', "invalid native admission response");
+  }
+  onDispatched();
+  ready->fulfill();
   connection->rpc = kj::heap<capnp::TwoPartyClient>(*connection->stream);
   connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
   v1::rpc::EventDispatcher::Client dispatcher = nullptr;
@@ -877,6 +900,7 @@ struct ProcessGeneration {
   std::string id;
   bool threaded = false;
   uint32_t threadedProtocol = 0;
+  bool threadedCulpritHandled = false;
   bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
   uint64_t generation;
@@ -895,6 +919,7 @@ struct ProcessGeneration {
   double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, probeStartedAt = 0, exitedAt = 0;
   uint64_t spawnedAtUnixMs = wall(), readyAtUnixMs = 0, exitedAtUnixMs = 0;
   uint32_t inFlight = 0;
+  std::map<std::string, uint32_t> tenantInFlight;
   uint64_t dispatched = 0;
   std::map<std::string, ProcessCall*> calls;
   // RPC failure may finish the calls before waitpid observes the crash. This is
@@ -1189,7 +1214,7 @@ struct ProcessGeneration {
         if (event == "cpu-progress") continue;
         if (event == "culprit") {
           culpritRow = row; culpritInvocation = report.getInvocationId().cStr();
-        } else if ((event == "terminated" || event == "memory-terminated") && !culpritRow.empty() &&
+        } else if ((event == "terminated" || event == "memory-terminated" || event == "deadline-terminated") && !culpritRow.empty() &&
             culpritInvocation == report.getInvocationId().cStr()) {
           culpritRow.clear(); culpritInvocation.clear();
         }
@@ -1217,9 +1242,11 @@ struct ProcessGeneration {
     contextsDropped += before - openContexts.size();
   }
 };
-ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process)
-    : processId(process->id), generation(process->generation), process(std::move(process)) {
+ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string tenant)
+    : processId(process->id), generation(process->generation), process(std::move(process)),
+      tenant(this->process->threaded ? std::move(tenant) : std::string()) {
   ++this->process->inFlight;
+  if (!this->tenant.empty()) ++this->process->tenantInFlight[this->tenant];
 }
 ProcessCall::~ProcessCall() { finish(); }
 void ProcessCall::snapshotAfterFailure() noexcept {
@@ -1239,6 +1266,11 @@ void ProcessCall::finish() {
   finished = true;
   KJ_ASSERT(process->inFlight > 0);
   --process->inFlight;
+  if (!tenant.empty()) {
+    auto entry = process->tenantInFlight.find(tenant);
+    KJ_ASSERT(entry != process->tenantInFlight.end() && entry->second > 0);
+    if (--entry->second == 0) process->tenantInFlight.erase(entry);
+  }
   if (dispatched) {
     if (process->recentDispatched.size() == 4096) process->recentDispatched.pop_front();
     process->recentDispatched.push_back({workerId, versionId, invocationId});
@@ -1291,7 +1323,7 @@ class ProcessPool::Impl final: public kj::TaskSet::ErrorHandler {
 public:
   struct Slot {
     std::string id;
-    bool quarantine = false, durable = false;
+    bool quarantine = false, durable = false, configurationFailed = false;
     uint64_t generation = 0, restarts = 0, exits = 0, rotations = 0;
     uint32_t failures = 0;
     double restartAt = 0;
@@ -1424,6 +1456,7 @@ public:
   std::shared_ptr<const std::vector<std::string>> rootMaintenanceWanted;
   double nextRootMaintenance = 0;
   BinarySignature configuredBinary;
+  BinarySignature threadedConfiguredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
   // checked then (through its descriptor), so a launcher replaced on disk -- one of another release -- is
@@ -1535,6 +1568,9 @@ public:
       this->config.durableProcesses = static_cast<uint32_t>(parsed);
     }
     for (const auto& setting : {std::pair{"COWORKERD_IDLE_EVICT_MS", &this->config.idleEvictMs},
+                               std::pair{"COWORKERD_TENANT_IN_FLIGHT_LIMIT", &this->config.tenantInFlightLimit},
+                               std::pair{"COWORKERD_THREADED_RESIDENT_LIMIT", &this->config.threadedResidentLimit},
+                               std::pair{"COWORKERD_THREADED_THREAD_IDLE_MS", &this->config.threadedThreadIdleMs},
                                std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &this->config.idleDestroyIntervalMs},
                                std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &this->config.rotationDrainTimeoutMs},
                                std::pair{"COWORKERD_ROTATION_TERM_GRACE_MS", &this->config.rotationTermGraceMs},
@@ -1623,6 +1659,7 @@ public:
     }
     setUpSandbox();
     configuredBinary = statSignature(this->executable);
+    threadedConfiguredBinary = statSignature(this->config.threadedExecutable);
     std::cout << "[process-pool] {\"event\":\"channels\",\"runDirectory\":\"" << escape(runDirectory)
         << "\",\"binding\":\"" << escape(this->bindingAddress) << "\",\"source\":\"" << escape(this->sourceAddress)
         << "\",\"memoryBand\":" << (bandFd >= 0 ? "true" : "false")
@@ -1798,7 +1835,7 @@ public:
   // the spawn goes ahead and the launcher reports the pair it was given.
   bool launchReady(Slot& s) {
     if (!sandbox.active || !sandbox.syscalls.active) return true;
-    const auto& program = !s.quarantine && !s.durable && config.ordinaryServer == "threaded"
+    const auto& program = !s.durable && config.ordinaryServer == "threaded"
         ? config.threadedExecutable : executable;
     const auto signature = statSignature(program);
     if (!signature.valid || !programDigest(signature).empty()) { s.digestWaitSince = 0; return true; }
@@ -1821,6 +1858,10 @@ public:
     std::vector<std::string> args = {sandbox.launcherPath, "--status-fd", std::to_string(LAUNCHER_STATUS_FD), "--program-fd",
         std::to_string(LAUNCHER_PROGRAM_FD), "--parent-pid", std::to_string(getpid()), "--root", sandbox.root,
         "--user", "--net", "--ipc", "--uts", "--drop-caps", "--no-new-privs", "--non-dumpable"};
+    if (!durable && config.ordinaryServer == "threaded") {
+      args.push_back("--nofile");
+      args.push_back(std::to_string(uint64_t(config.inFlightLimit) * 8 + 256));
+    }
     if (sandbox.syscalls.active) {
       args.push_back("--seccomp");
       args.push_back(sandbox.syscalls.mode);
@@ -2190,7 +2231,7 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
-    p->threaded = !s.quarantine && !s.durable && config.ordinaryServer == "threaded";
+    p->threaded = !s.durable && config.ordinaryServer == "threaded";
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -2205,7 +2246,7 @@ public:
     p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
-    const int listener = listenUnix(p->socketPath);
+    const int listener = listenUnix(p->socketPath, config.inFlightLimit);
     auto closeListener = kj::defer([listener] { ::close(listener); });
     const int lifecycle = p->lifecycle.create();
     auto closeLifecycle = kj::defer([lifecycle] { ::close(lifecycle); });
@@ -2386,6 +2427,12 @@ public:
     if (p->launched) childEnvironment.push_back("COWORKERD_NON_DUMPABLE=1");
 #endif
     if (p->threaded) {
+      childEnvironment.push_back("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT=" + std::to_string(config.tenantInFlightLimit));
+      childEnvironment.push_back("COWORKERD_THREADED_MEMORY_BYTES=" + std::to_string(config.threadedMemoryBytes));
+      childEnvironment.push_back("COWORKERD_THREADED_RESIDENT_LIMIT=" + std::to_string(config.threadedResidentLimit));
+      childEnvironment.push_back("COWORKERD_THREADED_THREAD_IDLE_MS=" + std::to_string(config.threadedThreadIdleMs));
+      childEnvironment.push_back("COWORKERD_THREADED_WASM_MAX_MIB=" + std::to_string(p->wasmMemoryCapMiB));
+      childEnvironment.push_back("COWORKERD_THREADED_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
       childEnvironment.push_back("COWORKERD_THREADED_BINDING_ADDRESS=" + bindingAddress);
       childEnvironment.push_back("COWORKERD_THREADED_EGRESS_ADDRESS=" + egressAddress);
       childEnvironment.push_back("COWORKERD_THREADED_EGRESS_TOKEN=" + p->egressToken);
@@ -2542,8 +2589,10 @@ public:
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
         if (p->threaded) response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "2") p->threadedProtocol = 2;
+          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && (value == "2" || value == "3"))
+            p->threadedProtocol = value == "3" ? 3 : 2;
         });
+        if (p->threaded && p->threadedProtocol >= 3) p->contextsVisible = true;
         if (!p->binary.valid) {
           // The generation's identity attaches once it answered its probe: it is the workerd
           // file the Server opened for it at the spawn -- what the launcher bound, or what posix_spawn
@@ -2559,6 +2608,7 @@ public:
         r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
         if (p->threaded) {
           r->threaded = true;
+          r->threadedProtocol = p->threadedProtocol;
           r->deferredDeletes = &tasks;
           co_await r->fill();
         } else {
@@ -2753,6 +2803,18 @@ public:
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
       if (p->pid == 0 || now < p->nextEventSync) return;
       applyEvents(s, *p);
+      if (p->threaded && !p->threadedCulpritHandled && !p->culpritRow.empty()) {
+        const auto offender = culprit(*p);
+        if (offender != "null") {
+          capnp::MallocMessageBuilder message;
+          auto report = message.initRoot<v1::rpc::CpuReport>();
+          capnp::JsonCodec().decode(kj::StringPtr(offender.c_str()), report);
+          suspects.confirm(report.getWorkerId().cStr(), p->id, p->generation, report.getInvocationId().cStr());
+          p->threadedCulpritHandled = true;
+          if (s.current == p && !shuttingDown && !closingAll) enqueueAutomatic(size_t(&s - slots.data()), "cpu-culprit");
+          event(*p, "culprit-drain", "thread CPU termination grace exceeded");
+        }
+      }
       p->pruneContexts(now);
       p->nextEventSync = now + LIMIT_EVENT_SYNC_MS;
     });
@@ -2843,16 +2905,19 @@ public:
       auto call = p.calls.find(value.getInvocationId().cStr());
       // The limit this Worker's executions run under (its own where it names one): the row has to be
       // against that limit, and to have spent it.
-      const auto limit = call == p.calls.end() ? 0u : limitsOf(call->second->workerId).cpuMs;
+      const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
+      const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
+        return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
+      });
+      const auto limit = call == p.calls.end() ? (recent ? limitsOf(worker).cpuMs : 0u) : limitsOf(call->second->workerId).cpuMs;
       if (!limit) return "null";
       if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
           value.getCpuLimitMs() != limit ||
           value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
-          call == p.calls.end() || !call->second->dispatched ||
-          call->second->workerId != value.getWorkerId().cStr() ||
-          call->second->versionId != value.getVersionId().cStr()) return "null";
+          (call == p.calls.end() ? !recent : (!call->second->dispatched ||
+          call->second->workerId != worker || call->second->versionId != version))) return "null";
       if (!labelledIsolate(p, value.getIsolate().cStr(), call->second->workerId, call->second->versionId)) return "null";
-      ++workerCpuStats[call->second->workerId].culprit;
+      ++workerCpuStats[worker].culprit;
       return capnp::JsonCodec().encode(value.asReader()).cStr();
     } catch (const kj::Exception&) { return "null"; }
   }
@@ -2922,7 +2987,11 @@ public:
         (sandbox.syscalls.steady.active && sandbox.syscalls.steady.mode == "enforce");
     const bool syscallDenied = p->launched && enforcing && !p->plannedExit && p->state != "killed" &&
         WIFSIGNALED(status) && WTERMSIG(status) == SYSCALL_DENIED_SIGNAL;
-    if (launchFailed) {
+    if (p->threaded && !p->plannedExit && WIFEXITED(status) && WEXITSTATUS(status) == 78) {
+      s.configurationFailed = true;
+      s.lastExitCategory = "configuration";
+      p->lastReason = "native process configuration insufficient (exit 78); restart the node after correcting resource limits";
+    } else if (launchFailed) {
       recordLaunchFailure(s, *p);
     } else if (syscallDenied) {
       recordSyscallDenial(s, *p);
@@ -2958,7 +3027,7 @@ public:
       drainSyscallObservations(*p);
 #endif
       if (p->pid > 0) reap(s, p);
-      if (config.watchdog && p->pid > 0 && p->probeStartedAt > 0 && !p->closing) {
+      if (config.watchdog && !p->threaded && p->pid > 0 && p->probeStartedAt > 0 && !p->closing) {
         auto delay = mono() - p->probeStartedAt;
         if (delay >= config.stuckTimeoutMs) killProcess(*p, "watchdog timeout", delay);
         else if (delay >= config.probeOverdueMs && p->state == "ready") { p->state = "paused"; event(*p, "pause"); }
@@ -2967,6 +3036,12 @@ public:
   }
   bool admitted(const ProcessGeneration& p) const {
     return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected && p.inFlight < config.inFlightLimit;
+  }
+  bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
+    if (!admitted(p)) return false;
+    if (!p.threaded) return true;
+    const auto found = p.tenantInFlight.find(tenantOf(worker));
+    return found == p.tenantInFlight.end() || found->second < config.tenantInFlightLimit;
   }
 
   // ---- Rotation ----
@@ -2994,16 +3069,17 @@ public:
     return id;
   }
   void enqueueAutomatic(size_t slot, const std::string& reason) {
-    const auto& target = slots[slot];
-    if (config.ordinaryServer == "threaded" && !target.quarantine && !target.durable) return;
     if (!queuedOrActive(slot)) enqueue(slot, reason);
   }
   // The slot's current generation runs other bytes than the configured executable.
   bool binaryMismatch(size_t index, const std::string& configured) const {
     const auto& p = slots[index].current;
-    if (configured.empty() || !p || p->pid == 0 || !p->binary.valid || p->binary == configuredBinary) return false;
+    if (!p || p->pid == 0 || !p->binary.valid) return false;
+    const auto expected = p->threaded ? threadedConfiguredBinary : configuredBinary;
+    const auto digest = p->threaded ? hasher.lookup(expected) : configured;
+    if (digest.empty() || p->binary == expected) return false;
     auto running = hasher.lookup(p->binary);
-    return !running.empty() && running != configured;
+    return !running.empty() && running != digest;
   }
   void triggers(double now) {
     // The launcher is not a rotation trigger: its change on disk only raises the restart hint.
@@ -3023,6 +3099,15 @@ public:
         configuredBinary = signature;
       }
       hasher.request(executable, configuredBinary);
+      if (config.ordinaryServer == "threaded") {
+        auto native = statSignature(config.threadedExecutable);
+        if (native.valid && !(native == threadedConfiguredBinary)) {
+          ++binaryChanges; binaryChangedAtUnixMs = wall();
+          automaticRetryAt = 0; automaticBackoffMs = 0;
+          threadedConfiguredBinary = native;
+        }
+        hasher.request(config.threadedExecutable, threadedConfiguredBinary);
+      }
     }
     if (now < automaticRetryAt) return;
     if (config.rotationBinaryCheckMs) {
@@ -3156,7 +3241,11 @@ public:
   }
   // Drained: no call in flight and, where workerd reports it, no open request context.
   bool drained(Rotation& r, double now) {
-    return generationDrained(*r.old, r.switchedAt, now, config.rotationDrainTimeoutMs, r.lastLifecycleCheck, r.clearedContexts);
+    return generationDrained(*r.old, r.switchedAt, now, drainAllowance(*r.old), r.lastLifecycleCheck, r.clearedContexts);
+  }
+  uint64_t drainAllowance(const ProcessGeneration& process) const {
+    return process.threaded ? std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs)
+                            : config.rotationDrainTimeoutMs;
   }
   // The same criterion for any generation; `since` stands for the moment it stopped taking
   // new calls. The Server's exit applies it to every live generation.
@@ -3165,19 +3254,23 @@ public:
     old.pullEvents();
     if (old.inFlight > 0) return false;
     // Ordinary generations retain the original fast path when no context remains.
-    if (!old.durable && old.openContexts.empty()) return true;
+    if (!old.durable && !old.threaded && old.openContexts.empty()) return true;
     if (!old.contextsVisible) return now - since >= periodMs;
     if (now - lastLifecycleCheck < (old.durable ? 20 : 100)) return false;
     lastLifecycleCheck = now;
-    if (old.durable) {
+    if (old.durable || old.threaded) {
       const auto snapshot = old.lifecycle.readDrain();
       if (!snapshot || snapshot->observedMs < std::max(since, old.lastDurableReplyAt)) return false;
       const bool result = !snapshot->active && !snapshot->background && !snapshot->unknown;
-      if (!old.drainComparisonRecorded) {
+      if (old.durable && !old.drainComparisonRecorded) {
         old.drainComparisonRecorded = true;
         ++legacyDrainChecks;
         // The old durable path registered no invocation contexts and drained at inFlight == 0.
         if (!result) ++legacyDrainDisagreements;
+      }
+      if (result && old.threaded) {
+        cleared += old.openContexts.size();
+        old.openContexts.clear();
       }
       return result;
     }
@@ -3253,7 +3346,7 @@ public:
         r.old->closing = true; r.old->plannedExit = true;
         if (r.old->state != "killed") r.old->state = "closing";
         r.phase = "closing";
-      } else if (now - r.switchedAt >= config.rotationDrainTimeoutMs) {
+      } else if (now - r.switchedAt >= drainAllowance(*r.old)) {
         // What is still in flight is lost with the process and gets RESULT_UNCERTAIN.
         r.drainOutcome = "timeout";
         r.drainedAt = now; r.drainedAtUnixMs = wall();
@@ -3480,7 +3573,7 @@ kj::Promise<void> ProcessPool::run() {
       // not hashed yet waits for its digest rather than being launched against a list.
       // A durable slot being rotated starts its next generation itself, once the previous one has exited.
       const bool rotating = impl->rotation && impl->rotation->slot == i && s.durable;
-      if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && mono() >= s.restartAt && !impl->closingAll
+      if ((!s.current || s.current->pid == 0) && !s.incoming && !rotating && !s.configurationFailed && mono() >= s.restartAt && !impl->closingAll
           && !(s.durable && impl->durableClosed) && impl->launchReady(s)) impl->spawn(s, i);
       impl->maybeProbe(s.current);
       for (const auto& p : s.retiring) impl->maybeProbe(p);
@@ -3496,7 +3589,7 @@ bool ProcessPool::quarantined(const std::string& worker) const {
 bool ProcessPool::available(const std::string& worker) {
   impl->refresh();
   const auto quarantine = quarantined(worker);
-  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && impl->admitted(*s.current)) return true;
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && impl->admittedTenant(*s.current, worker)) return true;
   return false;
 }
 bool ProcessPool::PausedAdmission::alive() const {
@@ -3641,25 +3734,26 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   std::vector<std::string> ids;
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
   for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
-    if (s.id == id && s.current && impl->admitted(*s.current)) {
+    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) {
       if (quarantine) ++impl->quarantineDispatches;
-      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current));
+      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, tenantOf(worker)));
     }
   }
   return {};
 }
 std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
-  if (impl->config.ordinaryServer != "threaded" || quarantined(worker)) return std::nullopt;
+  if (impl->config.ordinaryServer != "threaded") return std::nullopt;
+  const auto quarantine = quarantined(worker);
   std::vector<std::string> ids;
   for (const auto& s : impl->slots)
-    if (!s.durable && !s.quarantine && s.current && s.current->threaded && s.current->pid > 0) ids.push_back(s.id);
+    if (!s.durable && s.quarantine == quarantine && s.current && s.current->threaded && s.current->pid > 0) ids.push_back(s.id);
   if (ids.size() == 1) {
     for (const auto& s : impl->slots)
-      if (s.id == ids.front() && s.current && impl->admitted(*s.current)) return std::pair{s.id, s.current->generation};
+      if (s.id == ids.front() && s.current && impl->admittedTenant(*s.current, worker)) return std::pair{s.id, s.current->generation};
     return std::nullopt;
   }
-  for (const auto& id : rendezvousOrder(placementKey(worker, false), ids)) for (const auto& s : impl->slots) {
-    if (s.id == id && s.current && impl->admitted(*s.current)) return std::pair{s.id, s.current->generation};
+  for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
+    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) return std::pair{s.id, s.current->generation};
   }
   return std::nullopt;
 }
@@ -3672,9 +3766,9 @@ std::shared_ptr<ProcessCall> ProcessPool::selectTrial(const std::string& worker)
   std::vector<std::string> ids;
   for (const auto& s : impl->slots) if (s.quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
   for (const auto& id : rendezvousOrder(placementKey(worker, true), ids)) for (const auto& s : impl->slots) {
-    if (s.id == id && s.current && impl->admitted(*s.current)) {
+    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) {
       ++impl->trialDispatches;
-      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current));
+      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, tenantOf(worker)));
     }
   }
   return {};
@@ -3753,8 +3847,10 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
   }
   // From this send onward, a lost connection or a dead child is never retried.
-  call->dispatched = true;
-  auto result = p->runtime->open(descriptor, std::move(nativeProps));
+  auto result = p->runtime->open(descriptor, std::move(nativeProps), [call] { call->dispatched = true; }, [call] {
+    call->capacityRejected = true;
+    if (call->onCapacityRejected) call->onCapacityRejected();
+  });
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     call->snapshotAfterFailure();
     return kj::mv(error);
@@ -3768,6 +3864,10 @@ std::string ProcessPool::json(uint32_t idleMs) const {
   std::ostringstream out; out << std::setprecision(17) << "{\"configuration\":{\"count\":" << impl->config.count
       << ",\"cpuLimitMs\":" << impl->config.cpuLimitMs
       << ",\"memoryLimitMiB\":" << impl->config.memoryLimitMiB
+      << ",\"tenantInFlightLimit\":" << impl->config.tenantInFlightLimit
+      << ",\"threadedMemoryBytes\":" << impl->config.threadedMemoryBytes
+      << ",\"threadedResidentLimit\":" << impl->config.threadedResidentLimit
+      << ",\"threadedThreadIdleMs\":" << impl->config.threadedThreadIdleMs
       << ",\"wasmMemoryCapMiB\":" << impl->wasmMemoryCapMiB()
       << ",\"idleEvictMs\":" << impl->config.idleEvictMs
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
@@ -3901,8 +4001,6 @@ void ProcessPool::requestAutomaticRotation(const std::string& processId, const s
   KJ_REQUIRE(!impl->shuttingDown, "the Server is draining for its exit; no rotation starts");
   auto found = std::find_if(impl->slots.begin(), impl->slots.end(), [&](const auto& slot) { return slot.id == processId; });
   KJ_REQUIRE(found != impl->slots.end(), "unknown process slot", processId.c_str());
-  KJ_REQUIRE(impl->config.ordinaryServer != "threaded" || found->quarantine || found->durable,
-      "NOT_SUPPORTED: threaded process rotation requires S1c");
   impl->enqueueAutomatic(size_t(found - impl->slots.begin()), reason);
 }
 
@@ -3918,8 +4016,6 @@ std::string ProcessPool::requestRotation(const std::vector<std::string>& process
   }
   for (auto index: targets) {
     const auto& slot = impl->slots[index];
-    KJ_REQUIRE(impl->config.ordinaryServer != "threaded" || slot.quarantine || slot.durable,
-        "NOT_SUPPORTED: threaded process rotation requires S1c");
   }
   std::ostringstream out;
   out << "{\"requests\":[";
