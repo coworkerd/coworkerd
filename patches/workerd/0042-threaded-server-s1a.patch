@@ -619,10 +619,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..5262d86462a58da5c25b5d2fef266ed041ca8906
+index 0000000000000000000000000000000000000000..866c42241636181bcd71cbc7317266a5076dd275
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,370 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -988,6 +988,7 @@ index 0000000000000000000000000000000000000000..5262d86462a58da5c25b5d2fef266ed0
 +    fprintf(stdout, "NATIVE_ERROR_STATUS %u %.*s\n", info.status, int(info.code.size()),
 +        info.code.data());
 +  }
++  fflush(stdout);
 +}
 +
 +}  // namespace
