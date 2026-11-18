@@ -1644,7 +1644,8 @@ public:
     if (this->config.threadedExecutable.empty())
       this->config.threadedExecutable = (std::filesystem::path(this->executable).parent_path() / "coworkerd-threaded").string();
     KJ_REQUIRE(access(this->executable.c_str(), X_OK) == 0, "workerd executable is required");
-    KJ_REQUIRE(std::filesystem::is_regular_file(this->runtimeFile), "runtime module is required");
+    KJ_REQUIRE(this->config.durableProcesses == 0 || std::filesystem::is_regular_file(this->runtimeFile),
+        "durable runtime module is required");
     std::filesystem::create_directories(this->directory + "/logs");
     std::filesystem::create_directories(this->directory + "/processes");
     std::filesystem::create_directories(runDirectory);

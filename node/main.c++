@@ -437,7 +437,7 @@ bool pausedRefusal(const InvocationRejection& refusal) {
 // this Server could not get or verify, which another Server (another cache) may have.
 constexpr const char* PACKAGE_UNAVAILABLE = "package-unavailable";
 bool rerouteAfter(const InvocationRejection& refusal) {
-  return refusal.code != "RESULT_UNCERTAIN" && (refusal.code != "LOAD_FAILED" || refusal.category == PACKAGE_UNAVAILABLE);
+  return refusal.code != "RESULT_UNCERTAIN" && refusal.code != "PROCESS_MEMORY_PRESSURE" && (refusal.code != "LOAD_FAILED" || refusal.category == PACKAGE_UNAVAILABLE);
 }
 
 uint64_t preparationLargeBudget(uint32_t heapMiB) {
@@ -467,7 +467,7 @@ struct AdmissionSlot {
   std::function<void(uint status, const std::string& code)> outcome;
   // Only the platform runtime receives this receipt. A tenant response cannot
   // turn an uncertain execution into a refusal that placement may retry.
-  std::string dispatchReceipt, rejectionReason;
+  std::string dispatchReceipt, rejectionReason, rejectionCode, rejectionCategory;
   double deadline = 0;
   bool decided = false, notExecuted = false, capacityRejected = false;
   std::function<void(bool)> executionDecision;
@@ -2559,9 +2559,8 @@ private:
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
-        const bool capacity = current && current->capacityRejected;
-        const auto refusal = this->refusal(capacity ? "OVERLOADED" : "CODE_UNAVAILABLE",
-            capacity ? "process admission budget is full" : "Worker unavailable before execution", 503, ingress);
+        const auto refusal = this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
+            current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
         observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
@@ -2615,17 +2614,31 @@ private:
 public:
 
   std::optional<std::string> confirmCapacityRejection(const std::string& invocation, const std::string& receipt,
-      const std::string& state, const std::string& reason) {
+      const std::string& state, const std::string& reason, const std::string& stage = "", const std::string& codeStage = "") {
     auto found = pendingDispatchDecisions.find(invocation);
     if (found == pendingDispatchDecisions.end()) return std::nullopt;
     auto slot = found->second.lock();
     if (!slot || slot->decided || receipt != slot->dispatchReceipt ||
-        state != "capacity-rejected") return std::nullopt;
-    slot->rejectionReason = cleanReason(reason).substr(0, 300);
+        (state != "capacity-rejected" && state != "load-rejected")) return std::nullopt;
+    auto refused = refusal("OVERLOADED", "process admission budget is full", 503, slot->root);
+    if (state == "load-rejected") {
+      refused.code = "LOAD_FAILED";
+      if (stage == "code") {
+        refused.category = codeStage == "secrets" ? "secret-missing" : codeStage == "decode" ? "evaluation" : PACKAGE_UNAVAILABLE;
+        refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
+      } else {
+        auto limits = runtime.effectiveLimits(slot->process->workerId);
+        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
+        refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
+        refused.reason = verdict.message;
+      }
+      refused.retryable = refused.category == PACKAGE_UNAVAILABLE;
+    } else refused.retryable = true;
+    refused.reason = cleanReason(refused.reason).substr(0, 1000);
+    refused.notExecuted = true;
+    slot->rejectionReason = refused.reason; slot->rejectionCode = refused.code; slot->rejectionCategory = refused.category;
     slot->capacityRejected = state == "capacity-rejected";
     slot->decide(false);
-    auto refused = refusal("OVERLOADED", slot->rejectionReason, 503, slot->root);
-    refused.notExecuted = refused.retryable = true;
     return refusalBody(refused, slot->deadline);
   }
 
@@ -3499,7 +3512,7 @@ std::string rejectionJson(
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
            code == "NOT_SUPPORTED" ? "operation is not supported" :
-           code == "RESULT_UNCERTAIN" ? "execution result uncertain" :
+           (code == "RESULT_UNCERTAIN" || code == "PROCESS_MEMORY_PRESSURE") ? "execution result uncertain" :
            "execution rejected before start") << "\","
        << "\"reason\":\"" << jsonEscape(cleanReason(reason)) << "\",\"code\":\""
        << jsonEscape(code) << "\",\"observedAtUnixMs\":"
@@ -3553,7 +3566,7 @@ std::string hostWithoutPort(const std::string& host) {
 std::string refusalBody(const InvocationRejection& refusal, double deadline) {
   auto body = refusal.json();
   body.pop_back();
-  body += std::string(",\"error\":\"") + (refusal.code == "RESULT_UNCERTAIN" ? "execution result uncertain" : "execution rejected before start") + "\",\"observedAtUnixMs\":" +
+  body += std::string(",\"error\":\"") + ((refusal.code == "RESULT_UNCERTAIN" || refusal.code == "PROCESS_MEMORY_PRESSURE") ? "execution result uncertain" : "execution rejected before start") + "\",\"observedAtUnixMs\":" +
       std::to_string(wallTimeMsForTest()) + ",\"expiresAtMonotonicMs\":" + std::to_string(deadline) + "}";
   return body;
 }
@@ -4066,7 +4079,7 @@ private:
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
       const std::string& platformCode = "") {
     auto code = limitCode();
-    if (platformCode == "NOT_SUPPORTED") code = platformCode;
+    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE") code = platformCode;
     const bool unsupported = code == "NOT_SUPPORTED";
     slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
@@ -7188,7 +7201,9 @@ private:
         auto json = message.initRoot<capnp::JsonValue>();
         capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
         refused = server.confirmCapacityRejection(coworkerd::json::text(json, "invocationId"),
-            coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"));
+            coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"),
+            coworkerd::json::field(json, "stage").isString() ? coworkerd::json::text(json, "stage") : "",
+            coworkerd::json::field(json, "codeStage").isString() ? coworkerd::json::text(json, "codeStage") : "");
       } catch (const kj::Exception&) {}
       const std::string text = refused ? "{\"accepted\":true,\"refusal\":" + *refused + "}" : "{\"accepted\":false}";
       kj::HttpHeaders headers(headerTable); headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
@@ -8617,6 +8632,36 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
     const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
     const auto required = std::max(childRequired, nodeRequired);
+    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
+        (uint64_t(pool.inFlightLimit) + 12) + uint64_t(pool.durableProcesses) * 8;
+    rlimit processLimit;
+    KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
+    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= threadsRequired,
+        "insufficient host thread hard limit", threadsRequired, processLimit.rlim_max);
+    if (processLimit.rlim_cur < threadsRequired) {
+      processLimit.rlim_cur = threadsRequired;
+      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", threadsRequired);
+    }
+#ifdef __linux__
+    auto cgroup = fs::path("/sys/fs/cgroup");
+    std::ifstream membership("/proc/self/cgroup"); std::string member;
+    while (std::getline(membership, member)) if (member.starts_with("0::") && member.substr(3) != "/") {
+      auto candidate = cgroup / member.substr(4);
+      if (fs::exists(candidate / "pids.max")) cgroup = candidate;
+    }
+    for (auto directory = cgroup; !directory.empty() && directory.string().starts_with("/sys/fs/cgroup"); directory = directory.parent_path()) {
+      std::ifstream maximumFile(directory / "pids.max"), currentFile(directory / "pids.current");
+      std::string maximum; uint64_t current = 0;
+      if (maximumFile >> maximum && maximum != "max" && currentFile >> current) {
+        uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
+        KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
+            "insufficient cgroup thread headroom", threadsRequired, current, bound);
+      }
+    }
+#endif
+    const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
+    KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, 64ull << 20) > minimumMemory,
+        "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
     rlimit inherited;
     KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");
     KJ_REQUIRE(inherited.rlim_max >= required, "insufficient host descriptor hard limit",
