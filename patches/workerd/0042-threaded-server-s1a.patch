@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 19:59:40 +0800
-Subject: [PATCH] Add threaded ordinary Worker server with channels and
- resource checks
+Date: Wed, 18 Nov 2026 20:19:55 +0800
+Subject: [PATCH] Add threaded ordinary Worker server and native Worker
+ channels
 
-Cumulative S1a/S1b source at 03e90921c8aec746cab5496042a177774ea8f47f.
+Cumulative S1a/S1b source at 9f433d1eeb50f1d7662ae94996dab7a198c6f17a.
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
 index d34e4a75c69d0366d2b786fd97ebf7b2269ef5bd..dc3de8a916f4d151c825bf0c7815ccbccdb5a266 100644
@@ -382,10 +382,10 @@ index 0000000000000000000000000000000000000000..9a8a4b4c8f9263adf0cbf2084f65b78d
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab39e67f44a1536185c683bcfb4882f31dbaa907
+index 0000000000000000000000000000000000000000..a62cffe9444e31a06ccb9ed24264d4b6405f6ef9
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,2334 @@
+@@ -0,0 +1,2335 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1587,7 +1587,8 @@ index 0000000000000000000000000000000000000000..ab39e67f44a1536185c683bcfb4882f3
 +    auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
 +    auto isolate =
 +        kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
-+            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW);
++            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
++            Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
 +    slot.loadStage = threaded::LoadStage::LOAD;
 +    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
 +        server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
