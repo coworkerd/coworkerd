@@ -2,6 +2,7 @@
 
 #include "coworkerd.capnp.h"
 #include <capnp/compat/json.h>
+#include <capnp/message.h>
 #include <algorithm>
 #include <string>
 
