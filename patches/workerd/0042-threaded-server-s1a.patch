@@ -619,10 +619,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab71d2323caddcc878f11241f77e7a4780cb3d69
+index 0000000000000000000000000000000000000000..746c6b9063e565c6401c657747df90e3ea9e7c5b
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,361 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -832,6 +832,10 @@ index 0000000000000000000000000000000000000000..ab71d2323caddcc878f11241f77e7a47
 +  v8::Locker locker(isolate);
 +  v8::Isolate::Scope entered(isolate);
 +  v8::HandleScope handles(isolate);
++  auto context = v8::Context::New(isolate);
++  v8::Context::Scope inContext(context);
++  auto healthySource = v8::String::NewFromUtf8Literal(isolate, "6 * 7");
++  auto healthyScript = v8::Script::Compile(context, healthySource).ToLocalChecked();
 +  std::atomic<LimitCause> cause{LimitCause::NONE}, previous{LimitCause::NONE};
 +  limits.memory->pressure();
 +  KJ_EXPECT(limits.memory->pendingPressure.load() && !isolate->IsExecutionTerminating());
@@ -850,10 +854,40 @@ index 0000000000000000000000000000000000000000..ab71d2323caddcc878f11241f77e7a47
 +  KJ_EXPECT(limits.memory->currentCause == &cause);
 +  cause.store(LimitCause::CPU);
 +  isolate->TerminateExecution();
++  v8::TryCatch caught(isolate);
++  // Consume the termination in a real JS entry. IsExecutionTerminating() alone
++  // cannot distinguish an unprocessed interrupt from a successfully canceled one.
++  auto stopped = healthyScript->Run(context);
++  KJ_EXPECT(stopped.IsEmpty() && caught.HasTerminated());
 +  execution.finish();
 +  KJ_EXPECT(!isolate->IsExecutionTerminating() && limits.memory->currentCause == &previous);
++  caught.Reset();
++  auto healed = healthyScript->Run(context);
++  KJ_EXPECT(!healed.IsEmpty());
++  if (!healed.IsEmpty()) KJ_EXPECT(healed.ToLocalChecked()->Int32Value(context).FromJust() == 42);
++  // Cleanup also makes a deliberately broken cancellation safe for later tests.
++  isolate->CancelTerminateExecution();
++  caught.Reset();
 +  execution.finish();
 +  KJ_EXPECT(limits.memory->currentCause == &previous);
++  {
++    // Isolate the CPU scope's cancellation from heap-statistic API calls.
++    std::atomic<LimitCause> cpuCause{LimitCause::NONE};
++    CpuExecution cpuOnly(
++        isolate, cpuCause, limits.memoryState, nullptr, 0, 100, 32, limits.identity);
++    cpuCause.store(LimitCause::CPU);
++    isolate->TerminateExecution();
++    auto terminated = healthyScript->Run(context);
++    KJ_EXPECT(terminated.IsEmpty() && caught.HasTerminated());
++    cpuOnly.finish();
++    caught.Reset();
++    auto nextTurn = healthyScript->Run(context);
++    KJ_EXPECT(!nextTurn.IsEmpty());
++    if (!nextTurn.IsEmpty())
++      KJ_EXPECT(nextTurn.ToLocalChecked()->Int32Value(context).FromJust() == 42);
++    isolate->CancelTerminateExecution();
++    caught.Reset();
++  }
 +}
 +
 +void allocationComponent(kj::StringPtr code) {
