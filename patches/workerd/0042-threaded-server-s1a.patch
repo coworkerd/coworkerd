@@ -599,10 +599,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ac91e7f556e03718cb296e8112ac853994851f0
+index 0000000000000000000000000000000000000000..4765eeff1c4d934d0331d84dfe4f9c835ca3f480
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3499 @@
+@@ -0,0 +1,3532 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -3766,6 +3766,38 @@ index 0000000000000000000000000000000000000000..7ac91e7f556e03718cb296e8112ac853
 +      [prepared = kj::mv(prepared)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
 +}
 +
++// Response::send() can run inside the same JS turn that allocated a large
++// object, before the turn's final limit check. Check before committing headers.
++class LimitedResponse final: public kj::HttpService::Response {
++ public:
++  LimitedResponse(kj::HttpService::Response &inner, InvocationState &invocation)
++      : inner(inner),
++        invocation(invocation) {}
++  kj::Own<kj::AsyncOutputStream> send(uint status,
++      kj::StringPtr text,
++      const kj::HttpHeaders &headers,
++      kj::Maybe<uint64_t> length) override {
++    check();
++    return inner.send(status, text, headers, length);
++  }
++  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders &headers) override {
++    check();
++    return inner.acceptWebSocket(headers);
++  }
++
++ private:
++  void check() {
++    auto &limits = *invocation.slot->limits;
++    if (v8::Isolate::TryGetCurrent() == limits.memory->isolate) limits.memory->observe();
++    auto cause = limits.memoryState->load() == LimitCause::MEMORY
++        ? LimitCause::MEMORY
++        : invocation.measurement.limitCause.load();
++    if (cause != LimitCause::NONE) kj::throwRecoverableException(limitException(cause));
++  }
++  kj::HttpService::Response &inner;
++  InvocationState &invocation;
++};
++
 +kj::Promise<void> Invocation::request(kj::HttpMethod method,
 +    kj::StringPtr url,
 +    const kj::HttpHeaders &headers,
@@ -3865,8 +3897,9 @@ index 0000000000000000000000000000000000000000..7ac91e7f556e03718cb296e8112ac853
 +  auto &invocation = prepared.invocation;
 +  auto &entry = prepared.entry;
 +  kj::Maybe<kj::Exception> failure;
++  LimitedResponse checkedResponse(response, *invocation);
 +  try {
-+    co_await entry->request(method, url, headers, body, response);
++    co_await entry->request(method, url, headers, body, checkedResponse);
 +  } catch (const kj::Exception &error) {
 +    failure = error.clone();
 +  }
