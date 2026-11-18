@@ -961,6 +961,7 @@ void DurableLog::setNodeEpoch(uint64_t epoch) {
   segmentNumber = 0;
   records.clear();
   parsed.clear();
+  unsealedByObject.clear();
   recordBytes = 0;
   isolated.clear();
   if (!enabled() || !epoch) return;
@@ -1755,6 +1756,8 @@ void DurableLog::closeChannel(const std::string& processId) {
 
 kj::Promise<void> DurableLog::readChannel(Channel& channel) {
   auto buffer = kj::heapArray<kj::byte>(65536);
+  constexpr size_t FRAMES_PER_SLICE = 16;
+  constexpr double SLICE_MS = 0.5;
   for (;;) {
     const auto read = co_await channel.stream->tryRead(buffer.begin(), 1, buffer.size());
     if (read == 0) {
@@ -1764,6 +1767,9 @@ kj::Promise<void> DurableLog::readChannel(Channel& channel) {
     }
     channel.inbox.append(reinterpret_cast<const char*>(buffer.begin()), read);
     size_t at = 0;
+    size_t frames = 0;
+    auto began = monotonicTimeMs();
+    std::optional<r47::Span> slice(std::in_place, r47::DURABLE_CHANNEL_SLICE);
     while (channel.inbox.size() - at >= 4) {
       uint32_t length = 0;
       for (int i = 0; i < 4; i++) length |= uint32_t(uint8_t(channel.inbox[at + i])) << (8 * i);
@@ -1771,8 +1777,19 @@ kj::Promise<void> DurableLog::readChannel(Channel& channel) {
       ++channel.messages;
       onMessage(channel, std::string_view(channel.inbox).substr(at + 4, length));
       at += 4 + length;
+      // A single read may contain hundreds of close/checkpoint messages. Some write a local marker
+      // synchronously. Yield only after a complete frame, retaining wire order and the partial tail.
+      if (++frames >= FRAMES_PER_SLICE || monotonicTimeMs() - began >= SLICE_MS) {
+        slice->finish(frames);
+        slice.reset();
+        co_await timer.afterDelay(1 * kj::MICROSECONDS);
+        slice.emplace(r47::DURABLE_CHANNEL_SLICE);
+        frames = 0;
+        began = monotonicTimeMs();
+      }
     }
     if (at > 0) channel.inbox.erase(0, at);
+    slice->finish(frames);
   }
 }
 
@@ -2274,6 +2291,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     std::string().swap(record.frameBytes);
     std::string().swap(record.header);
     parsed[record.nodeSeq] = record;
+    unsealedByObject[record.objectName].insert(record.nodeSeq);
   }
   InFlight flight;
   flight.nodeSeq = record.nodeSeq;
@@ -2868,7 +2886,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
       recordBytes -= found->second.size();
       records.erase(found);
     }
-    parsed.erase(sequence);
+    forgetParsedRecord(sequence);
     confirmed.erase(sequence);
     // Keep isolated sequence numbers until nodeEpoch changes, so a reopened stream receives the drops again.
   }
@@ -3157,6 +3175,18 @@ kj::Promise<std::optional<ObjectManifest>> DurableLog::readManifest(std::string 
   co_return manifest;
 }
 
+void DurableLog::forgetParsedRecord(uint64_t sequence) {
+  auto metadata = parsed.find(sequence);
+  if (metadata == parsed.end()) return;
+  auto local = unsealedByObject.find(metadata->second.objectName);
+  KJ_DASSERT(local != unsealedByObject.end() && local->second.contains(sequence));
+  if (local != unsealedByObject.end()) {
+    local->second.erase(sequence);
+    if (local->second.empty()) unsealedByObject.erase(local);
+  }
+  parsed.erase(metadata);
+}
+
 // A newer snapshot is a cut, not a per-record receipt. Report unaccounted
 // confirmed bytes distinctly from a proven transfer and keep the old segment.
 kj::Promise<void> DurableLog::retireFencedTails(Object& object, const ObjectManifest& manifest) {
@@ -3237,7 +3267,7 @@ kj::Promise<void> DurableLog::retireFencedTails(Object& object, const ObjectMani
     }
     recordBytes -= std::min<uint64_t>(recordBytes, entry->second.size());
     noteEarlierRetired(record->nodeEpoch, *record);
-    parsed.erase(entry->first);
+    forgetParsedRecord(entry->first);
     confirmed.erase(entry->first);
     ++sealSelectionRevision;
     entry = records.erase(entry);
@@ -4228,15 +4258,28 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   // of whichever owner wrote last.
   const auto historyName = object->namespaceId + "/" + object->objectId;
   std::set<std::pair<uint64_t, uint64_t>> localUnsealed;
-  for (const auto& [sequence, encoded] : records) {
-    if (isolated.contains(sequence)) continue;
-    auto decoded = decodeLogRecord(encoded);
-    if (decoded && decoded->objectName == historyName) {
-      auto state = recoveryStates.find(hostNameOf(*decoded));
-      if (state != recoveryStates.end() && state->second.exclusions.contains({decoded->shardEpoch, decoded->nodeSeq})) continue;
-      localUnsealed.emplace(decoded->shardEpoch, decoded->nodeSeq);
-      history.push_back(std::move(*decoded));
+  {
+    r47::Span local(r47::RECOVERY_LOCAL_HISTORY);
+    size_t decodedCount = 0;
+    // The encoded unsealed log is node-wide. Decode only this object's sequences, in the
+    // same order as the log, from the same event-loop turn as before. Do not hold a view
+    // across an await: selection and its exclusion checks are one read of the local tail.
+    if (auto localRecords = unsealedByObject.find(historyName); localRecords != unsealedByObject.end()) {
+      for (auto sequence : localRecords->second) {
+        if (isolated.contains(sequence)) continue;
+        auto encoded = records.find(sequence);
+        KJ_DASSERT(encoded != records.end());
+        if (encoded == records.end()) continue;
+        ++decodedCount;
+        auto decoded = decodeLogRecord(encoded->second);
+        if (!decoded || decoded->objectName != historyName) continue;
+        auto state = recoveryStates.find(hostNameOf(*decoded));
+        if (state != recoveryStates.end() && state->second.exclusions.contains({decoded->shardEpoch, decoded->nodeSeq})) continue;
+        localUnsealed.emplace(decoded->shardEpoch, decoded->nodeSeq);
+        history.push_back(std::move(*decoded));
+      }
     }
+    local.finish(decodedCount);
   }
   for (const auto& [epoch, taken] : earlier) {
     for (const auto& [sequence, record] : taken) {

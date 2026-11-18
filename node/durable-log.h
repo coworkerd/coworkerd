@@ -802,6 +802,9 @@ private:
   // Changes that invalidate a pending normal-seal selection; appends are outside its fixed prefix.
   uint64_t sealSelectionRevision = 0;
   std::map<uint64_t, LogRecord> parsed;
+  // Sequences in `parsed`, ordered within the logical object (including its facets).
+  std::map<std::string, std::set<uint64_t>, std::less<>> unsealedByObject;
+  void forgetParsedRecord(uint64_t sequence);
   uint64_t recordBytes = 0;
   // Records confirmed by the peers, and records isolated: never confirmed, never sealed.
   std::set<uint64_t> confirmed;
