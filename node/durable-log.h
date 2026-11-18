@@ -627,7 +627,9 @@ private:
       uint32_t lastFrame);
 
   // ---- the channel to a durable process ----
+  friend struct DurableLogChannelTest;
   kj::Promise<void> readChannel(Channel& channel);
+  bool consumeChannelInbox(Channel& channel, bool sliced);
   void onMessage(Channel& channel, std::string_view message);
   void sendToChannel(Channel& channel, std::string message);
   void answer(Channel& channel, uint64_t request, uint8_t status);

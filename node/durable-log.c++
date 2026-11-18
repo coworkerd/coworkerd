@@ -1737,7 +1737,11 @@ int DurableLog::openChannel(const std::string& processId) {
   channel.writeChain = kj::READY_NOW;
   channel.reader = readChannel(channel).eagerlyEvaluate([this, processId](kj::Exception&& error) {
     auto found = channels.find(processId);
-    if (found != channels.end()) channelEnded(found->second, "the durable channel failed");
+    if (found != channels.end()) {
+      // A failing frame handler is not retried on the close path.
+      found->second.inbox.clear();
+      channelEnded(found->second, "the durable channel failed");
+    }
     log("channel-ended", "\"processId\":" + quote(processId) + ",\"reason\":" +
             quote(std::string(error.getDescription().cStr())));
   });
@@ -1756,8 +1760,6 @@ void DurableLog::closeChannel(const std::string& processId) {
 
 kj::Promise<void> DurableLog::readChannel(Channel& channel) {
   auto buffer = kj::heapArray<kj::byte>(65536);
-  constexpr size_t FRAMES_PER_SLICE = 16;
-  constexpr double SLICE_MS = 0.5;
   for (;;) {
     const auto read = co_await channel.stream->tryRead(buffer.begin(), 1, buffer.size());
     if (read == 0) {
@@ -1766,31 +1768,35 @@ kj::Promise<void> DurableLog::readChannel(Channel& channel) {
       co_return;
     }
     channel.inbox.append(reinterpret_cast<const char*>(buffer.begin()), read);
-    size_t at = 0;
-    size_t frames = 0;
-    auto began = monotonicTimeMs();
-    std::optional<r47::Span> slice(std::in_place, r47::DURABLE_CHANNEL_SLICE);
-    while (channel.inbox.size() - at >= 4) {
-      uint32_t length = 0;
-      for (int i = 0; i < 4; i++) length |= uint32_t(uint8_t(channel.inbox[at + i])) << (8 * i);
-      if (channel.inbox.size() - at - 4 < length) break;
-      ++channel.messages;
-      onMessage(channel, std::string_view(channel.inbox).substr(at + 4, length));
-      at += 4 + length;
-      // A single read may contain hundreds of close/checkpoint messages. Some write a local marker
-      // synchronously. Yield only after a complete frame, retaining wire order and the partial tail.
-      if (++frames >= FRAMES_PER_SLICE || monotonicTimeMs() - began >= SLICE_MS) {
-        slice->finish(frames);
-        slice.reset();
-        co_await timer.afterDelay(1 * kj::MICROSECONDS);
-        slice.emplace(r47::DURABLE_CHANNEL_SLICE);
-        frames = 0;
-        began = monotonicTimeMs();
-      }
-    }
-    if (at > 0) channel.inbox.erase(0, at);
-    slice->finish(frames);
+    while (consumeChannelInbox(channel, true)) co_await timer.afterDelay(1 * kj::MICROSECONDS);
   }
+}
+
+bool DurableLog::consumeChannelInbox(Channel& channel, bool sliced) {
+  constexpr size_t FRAMES_PER_SLICE = 16;
+  constexpr double SLICE_MS = 0.5;
+  const auto began = sliced ? monotonicTimeMs() : 0;
+  r47::Span slice(r47::DURABLE_CHANNEL_SLICE);
+  size_t at = 0, frames = 0;
+  // At every suspension the inbox starts at the first unprocessed frame. Close can cancel
+  // the reader and drain this same inbox without replaying its already processed prefix.
+  KJ_DEFER(if (at != 0) channel.inbox.erase(0, at));
+  while (channel.inbox.size() - at >= 4) {
+    uint32_t length = 0;
+    for (int i = 0; i < 4; i++) length |= uint32_t(uint8_t(channel.inbox[at + i])) << (8 * i);
+    if (channel.inbox.size() - at - 4 < length) break;
+    const auto message = std::string_view(channel.inbox).substr(at + 4, length);
+    at += 4 + length;
+    ++channel.messages;
+    ++frames;
+    onMessage(channel, message);
+    if (sliced && (frames >= FRAMES_PER_SLICE || monotonicTimeMs() - began >= SLICE_MS)) {
+      slice.finish(frames);
+      return true;
+    }
+  }
+  slice.finish(frames);
+  return false;
 }
 
 void DurableLog::sendToChannel(Channel& channel, std::string message) {
@@ -6029,6 +6035,14 @@ void DurableLog::maybeCloseMarker(Object& object) {
 
 void DurableLog::channelEnded(Channel& channel, const std::string& reason) {
   channel.open = false;
+  // Bytes already read from the process remain authoritative. In particular a buffered close
+  // may remove a facet from openFacets before we decide which objects need repair.
+  KJ_IF_SOME(error, kj::runCatchingExceptions([&]() { consumeChannelInbox(channel, false); })) {
+    log("channel-drain-failed", "\"processId\":" + quote(channel.processId) + ",\"reason\":" +
+        quote(std::string(error.getDescription().cStr())));
+  }
+  // A write-side failure can precede EOF. Retain an incomplete tail for the reader;
+  // explicit close destroys the inbox after this drain.
   std::set<std::string> affected;
   for (const auto& [key, generation] : channel.openFacets) {
     const auto split = key.rfind('/');

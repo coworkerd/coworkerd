@@ -147,3 +147,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_options(coworkerd-launcher PRIVATE -O2 -Wall -Wextra)
   add_dependencies(coworkerd coworkerd-launcher)
 endif()
+
+# A component test against the actual durable log and reader, without running a cluster.
+add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
+  node/durable-channel-test.c++
+  node/memory-watermark.c++
+  node/durable-log.c++
+  node/alarm-publication.c++
+  node/alarm-discovery.c++
+  node/recovery-history.c++
+  node/root-objects.c++
+  node/durable-shards.c++
+  node/membership.c++
+  node/blob-store.c++
+  node/peer-auth.c++
+)
+target_include_directories(coworkerd-durable-channel-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
+target_link_libraries(coworkerd-durable-channel-test PRIVATE common kj-tls-local)
