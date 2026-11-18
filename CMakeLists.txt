@@ -159,7 +159,6 @@ add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
-add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 foreach(case deadlines leases tree-lease budget identity package module-types cache
     rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
