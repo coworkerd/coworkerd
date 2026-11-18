@@ -130,6 +130,7 @@ def allowed_path(name, path):
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/threaded/protocol.h',
                               'src/workerd/threaded/protocol.capnp'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
