@@ -1086,7 +1086,7 @@ index 0000000000000000000000000000000000000000..0e5d972c3889ff23ac5ee1db1fecc973
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..bdd25723f4b1f5b9dfbb4b27c79e5e5bca036cd7
+index 0000000000000000000000000000000000000000..1ca55a53292149514adc8b81323502ec50f9b23d
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -0,0 +1,3698 @@
@@ -3918,7 +3918,7 @@ index 0000000000000000000000000000000000000000..bdd25723f4b1f5b9dfbb4b27c79e5e5b
 +    auto inherited = threaded::rawField(
 +        std::string_view(document.original.begin(), document.original.size()), "orderSequence");
 +    auto order = threaded::childOrderSequence(next != 0, inherited, next);
-+    add("orderSequence", kj::str(order));
++    add("orderSequence", kj::str(order.c_str()));
 +    add("sequenceMapSize", kj::str(next == 0 ? 0 : 1));
 +    auto deadline =
 +        threaded::rawPath(std::string_view(document.original.begin(), document.original.size()),
