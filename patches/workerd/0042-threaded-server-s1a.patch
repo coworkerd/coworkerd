@@ -619,10 +619,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..378764568cacf770b582a3534dfb247263abaa23
+index 0000000000000000000000000000000000000000..5262d86462a58da5c25b5d2fef266ed041ca8906
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,369 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -966,6 +966,8 @@ index 0000000000000000000000000000000000000000..378764568cacf770b582a3534dfb2472
 +    auto detail = KJ_REQUIRE_NONNULL(error.getDetail(jsg::COWORKERD_CODE_DETAIL_ID));
 +    KJ_EXPECT(detail.size() == strlen(item.second) &&
 +        memcmp(detail.begin(), item.second, detail.size()) == 0);
++    fprintf(stdout, "NATIVE_ERROR_CODE %.*s\n", int(detail.size()),
++        reinterpret_cast<const char*>(detail.begin()));
 +  }
 +  auto capacity = capacityError();
 +  KJ_EXPECT(capacity.getDetail(CAPACITY_DETAIL) != kj::none);
@@ -983,6 +985,8 @@ index 0000000000000000000000000000000000000000..378764568cacf770b582a3534dfb2472
 +        Expected{R::DRAINING, 503, "PROCESS_DRAINING"}}) {
 +    auto info = threaded::refusalInfo(row.reason);
 +    KJ_EXPECT(info.status == row.status && info.code == row.code);
++    fprintf(stdout, "NATIVE_ERROR_STATUS %u %.*s\n", info.status, int(info.code.size()),
++        info.code.data());
 +  }
 +}
 +

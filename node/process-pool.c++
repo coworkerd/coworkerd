@@ -1,3 +1,4 @@
+#include "process-culprit.h"
 #include "process-pool.h"
 #include "root-objects.h"
 #include "memory-observation.h"
@@ -1337,35 +1338,6 @@ bool ProcessCall::processMemoryPressure() const {
 template <typename T> const char* processClass(const T& p) { return p.durable ? "durable" : p.quarantine ? "quarantine" : "ordinary"; }
 template <typename T> uint32_t processClassCode(const T& p) { return p.durable ? 2 : p.quarantine ? 1 : 0; }
 
-// Validate both active and recently completed invocations before attribution.
-template <typename Limits, typename Labelled, typename Confirmed>
-std::string confirmedCpuCulprit(ProcessGeneration& p, Limits limits, Labelled labelled, Confirmed confirmed) {
-  p.pullEvents();
-  const auto row = p.culpritRow;
-  if (row.empty() || row.size() > 16384) return "null";
-  try {
-    capnp::MallocMessageBuilder message;
-    auto value = message.initRoot<v1::rpc::CpuReport>();
-    capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), value);
-    auto call = p.calls.find(value.getInvocationId().cStr());
-    // The limit this Worker's executions run under (its own where it names one): the row has to be
-    // against that limit, and to have spent it.
-    const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
-    const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
-      return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
-    });
-    const auto limit = call == p.calls.end() ? (recent ? limits(worker, p.durable).cpuMs : 0u) : limits(call->second->workerId, p.durable).cpuMs;
-    if (!limit) return "null";
-    if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
-        value.getCpuLimitMs() != limit ||
-        value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
-        (call == p.calls.end() ? !recent : (!call->second->dispatched ||
-        call->second->workerId != worker || call->second->versionId != version))) return "null";
-    if (!labelled(p, value.getIsolate().cStr(), worker, version)) return "null";
-    confirmed(worker);
-    return capnp::JsonCodec().encode(value.asReader()).cStr();
-  } catch (const kj::Exception&) { return "null"; }
-}
 
 class ProcessPool::Impl final: public kj::TaskSet::ErrorHandler {
 public:
@@ -2920,12 +2892,7 @@ public:
       if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
-        auto current = p.calls.find(invocation);
-        bool dispatched = current != p.calls.end() && current->second->dispatched &&
-            current->second->workerId == worker && current->second->versionId == version;
-        if (!dispatched) dispatched = std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& call) {
-          return call.invocationId == invocation && call.workerId == worker && call.versionId == version;
-        });
+        const auto dispatched = memoryCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
         if (dispatched && !worker.empty() && !version.empty() && !invocation.empty() &&
             labelledIsolate(p, report.getIsolate().cStr(), worker, version)) {
           offender = capnp::JsonCodec().encode(report.asReader()).cStr();

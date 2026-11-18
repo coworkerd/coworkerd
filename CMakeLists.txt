@@ -147,3 +147,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_options(coworkerd-launcher PRIVATE -O2 -Wall -Wextra)
   add_dependencies(coworkerd coworkerd-launcher)
 endif()
+
+
+# This gate runs the already built unit/component tests without starting a cluster.
+enable_testing()
+add_executable(coworkerd-process-culprit-test EXCLUDE_FROM_ALL node/process-culprit-test.c++)
+target_link_libraries(coworkerd-process-culprit-test PRIVATE common)
+add_test(NAME node-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
+add_test(NAME node-memory-culprit COMMAND coworkerd-process-culprit-test memory)
+add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
+  node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
+target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
+target_link_libraries(coworkerd-node-contract-test PRIVATE common)
+add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
+foreach(case deadlines leases tree-lease budget identity package module-types cache
+    rejected-manifest)
+  add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
+endforeach()
+add_custom_target(check
+  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
+  DEPENDS coworkerd-node-contract-test coworkerd-process-culprit-test
+  USES_TERMINAL)
+
+# The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.
+find_program(COWORKERD_TEST_NODE NAMES node)
+if(NOT COWORKERD_TEST_NODE)
+  set(COWORKERD_TEST_NODE node)
+endif()
+foreach(case export import migrations project-config)
+  add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
+endforeach()
+
+set(COWORKERD_NATIVE_TEST_LOG "" CACHE FILEPATH "Output of the native KJ contract test")
+set(COWORKERD_NATIVE_TEST_RECEIPT "" CACHE FILEPATH "Native test source and result receipt")
+set(COWORKERD_NATIVE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/workerd" CACHE PATH "Native source tested by the receipt")
+if(COWORKERD_NATIVE_TEST_LOG AND COWORKERD_NATIVE_TEST_RECEIPT)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME native-error-contract COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-native-error-contract.py"
+    --native-source "${COWORKERD_NATIVE_SOURCE_DIR}" --receipt "${COWORKERD_NATIVE_TEST_RECEIPT}"
+    --log "${COWORKERD_NATIVE_TEST_LOG}" --errors "${CMAKE_CURRENT_SOURCE_DIR}/docs/guide/errors.md")
+endif()

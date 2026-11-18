@@ -1,3 +1,4 @@
+#include "invocation-contract.h"
 #include "reasons.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
@@ -237,8 +238,7 @@ struct LeaseConfig {
 };
 
 double remainingLeaseMs(double expiresAtMonotonicMs) {
-  const auto remaining = expiresAtMonotonicMs - monotonicTimeMs();
-  return remaining > 0 ? remaining : 0;
+  return coworkerd::remainingLeaseMs(expiresAtMonotonicMs, monotonicTimeMs());
 }
 
 using coworkerd::VersionDefinition;
@@ -337,7 +337,9 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
-  bool presents(double value) const { return value == (presentedExpiresAtMonotonicMs > 0 ? presentedExpiresAtMonotonicMs : expiresAtMonotonicMs); }
+  bool presents(double value) const {
+    return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
+  }
 };
 
 using NativeProps = std::shared_ptr<capnp::MallocMessageBuilder>;
@@ -1187,8 +1189,7 @@ public:
   }
 
   std::string invocationId(uint64_t sequence) const {
-    return serverConfig.serverId + "." + membership.view().epoch +
-        "-invocation-" + std::to_string(sequence);
+    return coworkerd::invocationName(serverConfig.serverId, membership.view().epoch, "-invocation-", sequence);
   }
 
   std::string targetServer(const std::string& workerId) const {
@@ -1727,7 +1728,7 @@ public:
   }
   std::string nextPlacementId() { return invocationId(nextPlacementSequence++) + "-placement"; }
   ChildAllocation allocateRoot(SharedVersionPins pins, double deadline) {
-    auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
+    auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     std::cout << "[root] {\"nodeId\":\"" << serverConfig.serverId << "\",\"treeId\":\"" << tree
               << "\",\"grant\":" << leaseConfig.rootBudget << ",\"remainingMs\":" << remainingLeaseMs(deadline)
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << deadline
@@ -2240,7 +2241,7 @@ public:
           allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
           &*root);
     }
-    auto tree = serverConfig.serverId + "." + epoch() + "-tree-" + std::to_string(nextTreeSequence++);
+    auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
     addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
@@ -2275,36 +2276,21 @@ public:
       std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
       KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
-    auto expiresAtMonotonicMs = parent->second.expiresAtMonotonicMs;
+    auto inherited = coworkerd::inheritLease(parent->second);
     auto depth = static_cast<uint16_t>(parent->second.depth + 1);
     KJ_REQUIRE(depth > parent->second.depth, "invocation depth overflow");
-    auto parentRemainingBefore = parent->second.remainingSubrequests;
-    uint16_t grant;
-    uint16_t charged;
-    uint16_t remainingAfter;
-
-    if (leaseConfig.naive()) {
-      // Deliberately retain the bug of the test-only counterexample: each
-      // child receives a copy of its parent's remaining budget.
-      grant = parentRemainingBefore;
-      charged = 0;
-      remainingAfter = parentRemainingBefore;
-    } else {
-      if (parentRemainingBefore < 1) {
-        ++budgetRejections;
-        lastRejection = "subrequest budget exhausted before execution for parent=" +
-            parentInvocationId + " tree=" + treeId;
-        std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
-        KJ_FAIL_REQUIRE(lastRejection.c_str());
-      }
-      grant = std::min<uint16_t>(
-          leaseConfig.grantCap,
-          static_cast<uint16_t>(parentRemainingBefore - 1));
-      charged = static_cast<uint16_t>(1 + grant);
-      parent->second.remainingSubrequests =
-          static_cast<uint16_t>(parentRemainingBefore - charged);
-      remainingAfter = parent->second.remainingSubrequests;
+    const auto parentRemainingBefore = parent->second.remainingSubrequests;
+    if (!leaseConfig.naive() && parentRemainingBefore < 1) {
+      ++budgetRejections;
+      lastRejection = "subrequest budget exhausted before execution for parent=" +
+          parentInvocationId + " tree=" + treeId;
+      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
+    // The naive counterexample copies the budget without debiting the parent.
+    const auto [grant, charged, remainingAfter] = coworkerd::childBudget(
+        parentRemainingBefore, leaseConfig.grantCap, leaseConfig.naive());
+    if (!leaseConfig.naive()) parent->second.remainingSubrequests = remainingAfter;
 
     if (leaseConfig.naive()) {
       auto orderKey = treeId + "#" + std::to_string(depth);
@@ -2331,10 +2317,10 @@ public:
       charged,
       remainingAfter,
       depth,
-      expiresAtMonotonicMs,
+      inherited.deadline,
       parent->second.pins,
       false,
-      parent->second.ingressServerId,
+      inherited.ingressServerId,
     };
   }
 
@@ -3514,7 +3500,7 @@ private:
 std::string rejectionJson(
     const std::string& code, const std::string& reason, double expiresAtMonotonicMs) {
   std::ostringstream body;
-  body << std::setprecision(17)
+  coworkerd::exactDeadlinePrecision(body)
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
