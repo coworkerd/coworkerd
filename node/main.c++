@@ -339,6 +339,14 @@ struct InvocationLeaseState {
   bool presents(double value) const { return value == (presentedExpiresAtMonotonicMs > 0 ? presentedExpiresAtMonotonicMs : expiresAtMonotonicMs); }
 };
 
+using NativeProps = std::shared_ptr<capnp::MallocMessageBuilder>;
+NativeProps copyNativeProps(capnp::AnyPointer::Reader value) {
+  if (value.isNull()) return {};
+  auto message = std::make_shared<capnp::MallocMessageBuilder>();
+  message->initRoot<capnp::AnyPointer>().set(value);
+  return message;
+}
+
 struct ChildAllocation {
   std::string treeId;
   std::string parentInvocationId;
@@ -354,6 +362,7 @@ struct ChildAllocation {
   std::string ingressServerId;
   SharedPathTiming timing;
   std::string entrypoint;
+  NativeProps nativeProps;
 };
 
 // A request to a Durable Object (docs/compatibility.md, section 7): the object's namespace, id and class, and how many
@@ -470,6 +479,7 @@ struct AdmissionSlot {
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
   ~AdmissionSlot() { decide(true); finish(); report(0, ""); }
   void finish() { decide(true); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
+  NativeProps nativeProps;
 };
 
 std::string refusalBody(const InvocationRejection& refusal, double deadline);
@@ -758,8 +768,8 @@ private:
 // tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
 class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
-      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
+      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
@@ -774,9 +784,12 @@ private:
     auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
     auto request = runtimeTarget.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
-    auto path = builder.initMethodPath(2);
-    path.set(0, JS_RPC_RUNTIME_PROPERTY);
-    path.set(1, descriptor);
+    if (threaded) builder.setMethodName(JS_RPC_BIND_METHOD);
+    else {
+      auto path = builder.initMethodPath(2);
+      path.set(0, JS_RPC_RUNTIME_PROPERTY);
+      path.set(1, descriptor);
+    }
     copyCallParams(params, builder);
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
@@ -790,6 +803,7 @@ private:
   capnp::Capability::Client runtimeTarget;
   kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
+  bool threaded;
 };
 
 // A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
@@ -797,8 +811,8 @@ private:
 // descriptor into the runtime.
 class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
-      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
+      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
@@ -808,7 +822,7 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot, threaded));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
@@ -817,6 +831,7 @@ private:
   rpc::EventDispatcher::Client inner;
   kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
+  bool threaded;
 };
 
 class ServerCore final {
@@ -2318,7 +2333,8 @@ public:
       std::shared_ptr<const VersionDefinition> version,
       std::string kind,
       ChildAllocation allocation, std::shared_ptr<AdmissionSlot> slot = {}, const LoadCheck& check = {}) {
-    if (slot) { slot->timing = allocation.timing; slot->entrypoint = allocation.entrypoint; }
+    if (slot) { slot->timing = allocation.timing; slot->entrypoint = allocation.entrypoint; slot->nativeProps = allocation.nativeProps; }
+    KJ_REQUIRE(!allocation.nativeProps || slot, "loopback props require an invocation admission slot");
     auto process = selectProcess(version->workerId);
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
@@ -2568,11 +2584,11 @@ private:
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
-    auto opened = runtime.open(process, descriptor, version->definitionHash);
+    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
-        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot));
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot, process->threadedServer()));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -3000,6 +3016,20 @@ private:
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
       const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
       const std::string& dispatchReceipt = {}) const {
+    auto encodeNative = [&](kj::String encoded) {
+      if (!process.threadedServer()) return encoded;
+      std::string value(encoded.cStr()); value.pop_back();
+      value += ",\"nativeNamespaces\":[";
+      bool first = true;
+      for (const auto& className: version.declaredClasses) {
+        const auto* space = desiredState.state().durableNamespace(version.workerId, className);
+        value += (first ? "" : ",") + std::string("{\"className\":\"") + jsonEscape(className) +
+            "\",\"namespaceId\":\"" + jsonEscape(space && space->status == "active" ? space->id : "") + "\"}";
+        first = false;
+      }
+      value += "]}";
+      return kj::str(value.c_str());
+    };
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
     descriptor.setServerId(serverConfig.serverId.c_str());
@@ -3065,7 +3095,7 @@ private:
       capnp::JsonCodec json;
       const coworkerd::VersionPins emptyPins;
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-      auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
+      auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
       const auto known = preparationBytes.find(version.contentHash);
       encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
@@ -3120,10 +3150,10 @@ private:
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       if (root != nullptr) {
-        const auto encoded = root->descriptor(json.encode(descriptor.asReader()).cStr());
+        const auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
         return kj::str(encoded.c_str());
       }
-      return json.encode(descriptor.asReader());
+      return encodeNative(json.encode(descriptor.asReader()));
     }
     auto bindingPins = pins;
     if (perCallForTest()) {
@@ -3153,7 +3183,7 @@ private:
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-    auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
+    auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
     const auto known = preparationBytes.find(version.contentHash);
     encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
@@ -4105,6 +4135,7 @@ struct RemoteInvocationData {
   bool ingressRoot = false;
   std::string ingressServerId;
   std::string entrypoint;
+  NativeProps nativeProps;
 };
 
 // A request to a Durable Object sent to the owner of its shard (PeerServer.openObjectInvocation).
@@ -4526,6 +4557,7 @@ public:
     remote.setAlreadyPlaced(invocation.alreadyPlaced); remote.setOriginServerId(invocation.originServerId.c_str());
     remote.setIngressRoot(invocation.ingressRoot); remote.setIngressServerId(invocation.ingressServerId.c_str());
     remote.setEntrypoint(invocation.entrypoint.c_str());
+    if (invocation.nativeProps) remote.getCoworkerdProps().set(invocation.nativeProps->getRoot<capnp::AnyPointer>());
     remote.setCallSequence(invocation.callSequence); remote.setOrderSequence(invocation.orderSequence);
     remote.setDestinationEpoch(epoch.c_str());
     auto pins = remote.initVersionPins(invocation.pins->size()); size_t index = 0;
@@ -4789,7 +4821,7 @@ public:
       return RemoteInvocationData{version->workerId, pin.versionId, pin.contentHash,
           allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
           allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
-          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint};
+          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint, allocation.nativeProps};
     };
     bool allPaused = true;
     std::optional<InvocationRejection> firstPaused;
@@ -5195,6 +5227,7 @@ public:
       remote.getIngressRoot(),
       remote.getIngressServerId().cStr(),
       remote.getEntrypoint().cStr(),
+      copyNativeProps(remote.getCoworkerdProps()),
     };
     KJ_REQUIRE(coworkerd::workerFullName(invocation.workerId), "invalid remote workerId");
     KJ_REQUIRE(safeName(invocation.versionId), "invalid remote versionId");
@@ -5299,6 +5332,7 @@ public:
     current = co_await server.admit(version->workerId, version->definitionHash, invocation.ingressRoot,
         invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
     if (current.refused) { reject(*current.refused); co_return; }
+    slot->nativeProps = invocation.nativeProps;
     try {
       auto opened = server.openGranted(std::move(version), invocation.treeId, invocation.parentInvocationId,
           invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
@@ -5868,6 +5902,7 @@ public:
           false,
           allocation.ingressServerId,
           allocation.entrypoint,
+          allocation.nativeProps,
         };
         co_return Dispatched{peerForwarder.open(targetServerId, std::move(invocation))};
       }
@@ -6590,7 +6625,7 @@ class BindingBootstrap;
 // rpcTarget). It carries no HTTP request; its one method call is the envelope.
 class RpcSessionDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  explicit RpcSessionDispatcher(BindingBootstrap& bootstrap): bootstrap(bootstrap) {}
+  RpcSessionDispatcher(BindingBootstrap& bootstrap, NativeProps props): bootstrap(bootstrap), nativeProps(std::move(props)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext) override {
     KJ_FAIL_REQUIRE("a JS RPC session carries no HTTP request");
   }
@@ -6598,6 +6633,7 @@ public:
 
 private:
   BindingBootstrap& bootstrap;
+  NativeProps nativeProps;
 };
 
 // The top-level target of such a session: the one call made on it names the envelope and is answered with the
@@ -6606,8 +6642,8 @@ private:
 // go of the entrypoint and everything reached through it.
 class RpcBindTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcBindTarget(BindingBootstrap& bootstrap, kj::Own<kj::PromiseFulfiller<void>> done)
-      : bootstrap(bootstrap), done(kj::mv(done)) {}
+  RpcBindTarget(BindingBootstrap& bootstrap, kj::Own<kj::PromiseFulfiller<void>> done, NativeProps props)
+      : bootstrap(bootstrap), done(kj::mv(done)), nativeProps(std::move(props)) {}
   // Nothing was handed out: the session is over with this object. Once the bind answered, the capability's own
   // membrane holds the fulfiller instead, so the session lasts as long as the caller's capabilities.
   ~RpcBindTarget() noexcept(false) { if (done.get() != nullptr) done->fulfill(); }
@@ -6622,11 +6658,12 @@ private:
   kj::Promise<void> bind(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context);
   BindingBootstrap& bootstrap;
+  NativeProps nativeProps;
   kj::Own<kj::PromiseFulfiller<void>> done;
   bool used = false;
 };
 
-class BindingBootstrap final: public rpc::WorkerdBootstrap::Server {
+class BindingBootstrap final: public rpc::ThreadedBootstrap::Server {
 public:
   BindingBootstrap(
       ServerCore& server,
@@ -6648,7 +6685,7 @@ public:
   // the opened event, as `startEvent` always did; a session does not, because its answer is the target's own
   // capability and the open travels with it.
   kj::Promise<void> openBinding(rpc::BindingDescriptor::Reader descriptor, SharedPathTiming timing,
-      BindingDispatch::Dispatched& out, bool awaitReady) {
+      BindingDispatch::Dispatched& out, bool awaitReady, NativeProps nativeProps = {}) {
     // `context` below is this one, not the RPC call's: the body is what `startEvent` has always been, and it names
     // the dispatcher it chose in the one way it always has, so that the `fetch` path's behaviour is unchanged while a
     // method call opens its event through the very same code.
@@ -6799,6 +6836,7 @@ public:
       expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
       allocation.timing = timing;
       allocation.entrypoint = entrypoint;
+      allocation.nativeProps = std::move(nativeProps);
       pathMark(timing, "allocate-child");
       if (!server.perCallForTest() && !server.pinMatches(allocation.pins,
           {workerId, versionId, contentHash, definitionHash})) {
@@ -6863,10 +6901,26 @@ public:
     // A JS RPC session carries no cf: workerd sends none for one, in either direction (see JS_RPC_TARGET_TYPE_ID
     // above), so the envelope arrives as the name of the one method the session takes.
     if (metadata.size() == 0) {
-      context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::heap<RpcSessionDispatcher>(*this));
+      context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::heap<RpcSessionDispatcher>(*this, NativeProps()));
       return kj::READY_NOW;
     }
     return startFetchEvent(context);
+  }
+
+  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
+    auto params = context.getParams();
+    auto props = copyNativeProps(params.getCoworkerdProps());
+    auto metadata = params.getCfBlobJson();
+    if (metadata.size() == 0) {
+      context.getResults().setDispatcher(kj::heap<RpcSessionDispatcher>(*this, std::move(props)));
+      co_return;
+    }
+    capnp::MallocMessageBuilder message;
+    auto descriptor = message.initRoot<rpc::BindingDescriptor>();
+    capnp::JsonCodec json; json.setRejectUnknownFields(true); json.decode(metadata, descriptor);
+    BindingDispatch::Dispatched out;
+    co_await openBinding(descriptor.asReader(), pathTiming("binding"), out, true, std::move(props));
+    context.getResults().setDispatcher(kj::mv(out.dispatcher));
   }
 
   kj::Promise<void> startFetchEvent(StartEventContext context) {
@@ -6889,7 +6943,7 @@ public:
   void observeRpcFailure(const std::string& code) { server.observeRpcFailure(code); }
 
   kj::Promise<capnp::Capability::Client> openRpcTarget(kj::StringPtr envelope,
-      kj::Own<kj::PromiseFulfiller<void>> done) {
+      kj::Own<kj::PromiseFulfiller<void>> done, NativeProps nativeProps = {}) {
     auto timing = pathTiming("rpc");
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::BindingDescriptor>();
@@ -6903,7 +6957,7 @@ public:
     const bool durableCall = descriptor.hasDurableObject();
     const auto startedAt = monotonicTimeMs();
     BindingDispatch::Dispatched out;
-    co_await openBinding(descriptor.asReader(), std::move(timing), out, false);
+    co_await openBinding(descriptor.asReader(), std::move(timing), out, false, std::move(nativeProps));
     auto started = out.dispatcher.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
     server.observeRpcSession(durableCall);
     server.observeRpcProxied();
@@ -6947,7 +7001,7 @@ private:
 kj::Promise<void> RpcSessionDispatcher::jsRpcSession(JsRpcSessionContext context) {
   auto paf = kj::newPromiseAndFulfiller<void>();
   auto results = context.initResults(capnp::MessageSize{4, 2});
-  results.setTopLevel(kj::heap<RpcBindTarget>(bootstrap, kj::mv(paf.fulfiller)));
+  results.setTopLevel(kj::heap<RpcBindTarget>(bootstrap, kj::mv(paf.fulfiller), std::move(nativeProps)));
   // Resolves to a null capability once the caller has dropped the target: workerd's own signal that the session is
   // over (src/workerd/api/worker-rpc.c++, JsRpcSessionCustomEvent).
   results.setSession(paf.promise.then([]() { return rpc::JsRpcSession::Client(nullptr); },
@@ -6965,7 +7019,7 @@ kj::Promise<void> RpcBindTarget::bind(uint64_t interfaceId, uint16_t methodId,
   KJ_REQUIRE(params.which() == rpc::JsRpcTarget::CallParams::METHOD_NAME,
       "a Binding's JS RPC session names its envelope");
   try {
-    auto target = co_await bootstrap.openRpcTarget(params.getMethodName(), kj::mv(done));
+    auto target = co_await bootstrap.openRpcTarget(params.getMethodName(), kj::mv(done), std::move(nativeProps));
     auto request = target.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
     builder.setMethodName(JS_RPC_BIND_METHOD);

@@ -1,9 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 15:50:20 +0800
-Subject: [PATCH] Add the threaded HTTP server with cancellation-safe
- initialization
+Date: Wed, 18 Nov 2026 19:28:04 +0800
+Subject: [PATCH] Add threaded ordinary Worker server, channels and execution
+ limits
 
+Cumulative S1a/S1b source at ef7495a82bdce4294ff573546885e4f01710a0f0.
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
 index d34e4a75c69d0366d2b786fd97ebf7b2269ef5bd..dc3de8a916f4d151c825bf0c7815ccbccdb5a266 100644
@@ -82,20 +83,123 @@ index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..37233fe36b488c92e1db6f80bf202704
    for (size_t i = 0; i < count; ++i)
      program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
          static_cast<__u8>(count - i), 0);
+diff --git a/src/workerd/server/workerd-api.c++ b/src/workerd/server/workerd-api.c++
+index 594f2c5ec28b8c0e0bfc7e437d764af649f66055..3aa06806bea227a246cdaadecb020a07f8109b92 100644
+--- a/src/workerd/server/workerd-api.c++
++++ b/src/workerd/server/workerd-api.c++
+@@ -557,7 +557,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
+     Global::Reader global,
+     CompatibilityFlags::Reader featureFlags,
+     api::MemoryCacheProvider& memoryCacheProvider,
+-    IsInternalBinding isInternal) {
++    IsInternalBinding isInternal,
++    kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) {
+   TRACE_EVENT("workerd", "WorkerdApi::createBindingValue()");
+   auto context = lock.v8Context();
+ 
+@@ -590,8 +591,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
+ 
+     case Global::COWORKERD_ROOT_LOADER: {
+       auto root = global.getCoworkerdRootLoader();
+-      return lock.wrap(context,
+-          lock.alloc<CoworkerdRootLoader>(root.getChannel(), kj::str(root.getService())));
++      return lock.wrap(
++          context, lock.alloc<CoworkerdRootLoader>(root.getChannel(), kj::str(root.getService())));
+     }
+ 
+     case Global::LOOPBACK_SERVICE_STUB:
+@@ -670,16 +671,15 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
+     case Global::DURABLE_ACTOR_NAMESPACE: {
+       auto ns = global.getDurableActorNamespace();
+       return lock.wrap(context,
+-          lock.alloc<api::DurableObjectNamespace>(ns.getActorChannel(),
+-              kj::heap<ActorIdFactoryImpl>(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
+-              Persistent::NO));
++          lock.alloc<api::DurableObjectNamespace>(ns.getActorChannel(), actorIds(ns.getUniqueKey()),
++              api::ActorCallRetriesAllowed::YES, Persistent::NO));
+     }
+ 
+     case Global::LOOPBACK_DURABLE_ACTOR_NAMESPACE: {
+       auto ns = global.getLoopbackDurableActorNamespace();
+       return lock.wrap(context,
+           lock.alloc<api::LoopbackDurableObjectNamespace>(ns.getActorChannel(),
+-              kj::heap<ActorIdFactoryImpl>(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
++              actorIds(ns.getUniqueKey()), api::ActorCallRetriesAllowed::YES,
+               lock.alloc<api::LoopbackDurableObjectClass>(ns.getClassChannel()), featureFlags));
+     }
+ 
+@@ -706,8 +706,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
+         auto env = v8::Object::New(lock.v8Isolate);
+         for (auto innerBinding: innerBindings) {
+           lock.v8Set(env, innerBinding.getName(),
+-              createBindingValue(
+-                  lock, innerBinding, featureFlags, memoryCacheProvider, IsInternalBinding::YES));
++              createBindingValue(lock, innerBinding, featureFlags, memoryCacheProvider,
++                  IsInternalBinding::YES, actorIds));
+         }
+ 
+         // obtain exported function to call
+@@ -763,6 +763,15 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
+ 
+ void WorkerdApi::compileGlobals(
+     jsg::Lock& lockParam, capnp::List<Global>::Reader globals, v8::Local<v8::Object> target) const {
++  compileGlobals(lockParam, globals, target, [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
++    return kj::heap<ActorIdFactoryImpl>(key);
++  });
++}
++
++void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
++    capnp::List<Global>::Reader globals,
++    v8::Local<v8::Object> target,
++    kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) const {
+   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
+   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
+   lockParam.withinHandleScope([&] {
+@@ -772,7 +781,7 @@ void WorkerdApi::compileGlobals(
+       lockParam.withinHandleScope([&] {
+         // Don't use String's usual TypeHandler here because we want to intern the string.
+         auto value = createBindingValue(
+-            lock, global, featureFlags, impl->memoryCacheProvider, IsInternalBinding::NO);
++            lock, global, featureFlags, impl->memoryCacheProvider, IsInternalBinding::NO, actorIds);
+         KJ_ASSERT(!value.IsEmpty(), "global did not produce v8::Value");
+         lockParam.v8Set(target, global.getName(), value);
+       });
+diff --git a/src/workerd/server/workerd-api.h b/src/workerd/server/workerd-api.h
+index 2f7a6ecf263b79b3b8138faacc32000dba02c0ed..7bae2a94da686a3c4a57af4bc4790eebcbd71fe8 100644
+--- a/src/workerd/server/workerd-api.h
++++ b/src/workerd/server/workerd-api.h
+@@ -95,6 +95,12 @@ class WorkerdApi final: public Worker::Api {
+   // Sets each of `globals`, a worker's bindings as the server interpreted them, on `target`.
+   void compileGlobals(
+       jsg::Lock& lock, capnp::List<Global>::Reader globals, v8::Local<v8::Object> target) const;
++  // The embedder may preserve an established Durable Object ID format. The
++  // provider runs synchronously while constructing the binding, under its lock.
++  void compileGlobals(jsg::Lock& lock,
++      capnp::List<Global>::Reader globals,
++      v8::Local<v8::Object> target,
++      kj::FunctionParam<kj::Own<ActorIdFactory>(kj::StringPtr)> actorIds) const;
+ 
+   // Whether a binding of this kind can be created in the startup-snapshot zygote and transferred
+   // to the Worker started from the snapshot. A Worker with a binding of any other kind starts
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
 new file mode 100644
-index 0000000000000000000000000000000000000000..e6923379438c6c88224ae236d1a1df2a70e1d1c9
+index 0000000000000000000000000000000000000000..cb22c7a53616d6349e3cbbd8431fc03578be8cac
 --- /dev/null
 +++ b/src/workerd/threaded/BUILD.bazel
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,39 @@
++load("//:build/wd_capnp_library.bzl", "wd_capnp_library")
 +load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
 +
 +wd_cc_binary(
 +    name = "coworkerd-threaded",
-+    srcs = ["threaded-server.c++"],
++    srcs = [
++        "protocol.h",
++        "threaded-server.c++",
++    ],
 +    malloc = "//src/workerd/server:malloc",
 +    target_compatible_with = ["@platforms//os:linux"],
 +    deps = [
++        ":protocol_capnp",
 +        "//src/workerd/api:memory-cache",
 +        "//src/workerd/io",
 +        "//src/workerd/io:compatibility-date",
@@ -114,17 +218,175 @@ index 0000000000000000000000000000000000000000..e6923379438c6c88224ae236d1a1df2a
 +        "@ssl",
 +    ],
 +)
++
++wd_capnp_library(
++    src = "protocol.capnp",
++    deps = [
++        "//src/workerd/io:frankenvalue_capnp",
++        "//src/workerd/io:worker-interface_capnp",
++    ],
++)
+diff --git a/src/workerd/threaded/protocol.capnp b/src/workerd/threaded/protocol.capnp
+new file mode 100644
+index 0000000000000000000000000000000000000000..53044781b353534a6fbabb5b07c426300a8ef136
+--- /dev/null
++++ b/src/workerd/threaded/protocol.capnp
+@@ -0,0 +1,19 @@
++@0xd1a2c8be79534f61;
++using Cxx = import "/capnp/c++.capnp";
++$Cxx.namespace("workerd::threaded::rpc");
++using Worker = import "/workerd/io/worker-interface.capnp";
++
++# The native loopback's resolved channels. The node copies the enclosing props
++# without decoding JavaScript values or taking ownership of their implementation.
++struct Channel {
++  union {
++    service @0 :Worker.WorkerdBootstrap;
++    actorClass @1 :Text;
++  }
++}
++
++using Props = import "/workerd/io/frankenvalue.capnp".Frankenvalue;
++interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
++  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props)
++      -> (dispatcher :Worker.EventDispatcher);
++}
+diff --git a/src/workerd/threaded/protocol.h b/src/workerd/threaded/protocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fcb07283a1ef01de83e9098e8e469a82d4235c7
+--- /dev/null
++++ b/src/workerd/threaded/protocol.h
+@@ -0,0 +1,116 @@
++#pragma once
++
++#include <cctype>
++#include <initializer_list>
++#include <stdexcept>
++#include <string_view>
++
++namespace workerd::threaded {
++
++// A descriptor has already passed JSON decoding. These views retain the exact
++// wire spelling of values that must be forwarded without another float conversion.
++inline std::string_view trim(std::string_view value) {
++  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
++    value.remove_prefix(1);
++  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
++    value.remove_suffix(1);
++  return value;
++}
++inline size_t jsonValueEnd(std::string_view value, size_t start) {
++  bool quoted = false, escaped = false;
++  unsigned depth = 0;
++  for (size_t i = start; i < value.size(); ++i) {
++    char c = value[i];
++    if (quoted) {
++      if (escaped)
++        escaped = false;
++      else if (c == '\\')
++        escaped = true;
++      else if (c == '"') {
++        quoted = false;
++        if (depth == 0) return i + 1;
++      }
++    } else if (c == '"')
++      quoted = true;
++    else if (c == '{' || c == '[')
++      ++depth;
++    else if (c == '}' || c == ']') {
++      if (depth == 0) return i;
++      if (--depth == 0) return i + 1;
++    } else if (c == ',' && depth == 0)
++      return i;
++  }
++  return value.size();
++}
++inline std::string_view rawField(std::string_view object, std::string_view name) {
++  object = trim(object);
++  if (object.empty() || object.front() != '{') throw std::invalid_argument("expected JSON object");
++  size_t at = 1;
++  while (at < object.size()) {
++    while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
++    if (at == object.size()) break;
++    if (object[at] == '}') break;
++    if (object[at] != '"') throw std::invalid_argument("expected JSON field");
++    auto keyEnd = jsonValueEnd(object, at);
++    auto key = object.substr(at + 1, keyEnd - at - 2);
++    at = keyEnd;
++    while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
++    if (at == object.size() || object[at++] != ':')
++      throw std::invalid_argument("expected JSON colon");
++    while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
++    auto end = jsonValueEnd(object, at);
++    if (key == name) return trim(object.substr(at, end - at));
++    at = end;
++    while (at < object.size() && std::isspace(static_cast<unsigned char>(object[at]))) ++at;
++    if (at < object.size() && object[at] == ',')
++      ++at;
++    else
++      break;
++  }
++  throw std::invalid_argument("missing descriptor field");
++}
++inline std::string_view rawPath(
++    std::string_view value, std::initializer_list<std::string_view> path) {
++  for (auto name: path) value = rawField(value, name);
++  return value;
++}
++
++enum class LoadStage { LOAD, PACKAGE, DECODE, EVALUATION };
++struct LoadStageInfo {
++  std::string_view stage, codeStage, category;
++};
++inline constexpr LoadStageInfo loadStageInfo(LoadStage stage) {
++  switch (stage) {
++    case LoadStage::LOAD:
++      return {"load", "", "LOAD_FAILED"};
++    case LoadStage::PACKAGE:
++      return {"code", "package", "LOAD_FAILED"};
++    case LoadStage::DECODE:
++      return {"code", "decode", "LOAD_FAILED"};
++    case LoadStage::EVALUATION:
++      return {"evaluation", "", "TOP_LEVEL_THROW"};
++  }
++  throw std::invalid_argument("unknown load stage");
++}
++
++enum class Refusal { UNSUPPORTED, CPU, MEMORY, OVERLOADED, DRAINING };
++struct RefusalInfo {
++  unsigned status;
++  std::string_view code, message;
++};
++inline constexpr RefusalInfo refusalInfo(Refusal reason) {
++  switch (reason) {
++    case Refusal::UNSUPPORTED:
++      return {501, "NOT_SUPPORTED", "operation is not supported"};
++    case Refusal::CPU:
++      return {503, "CPU_LIMIT_EXCEEDED", "CPU_LIMIT_EXCEEDED"};
++    case Refusal::MEMORY:
++      return {503, "MEMORY_LIMIT_EXCEEDED", "MEMORY_LIMIT_EXCEEDED"};
++    case Refusal::OVERLOADED:
++      return {503, "OVERLOADED", "process admission budget is full"};
++    case Refusal::DRAINING:
++      return {503, "PROCESS_DRAINING", "process is draining"};
++  }
++  throw std::invalid_argument("unknown platform refusal");
++}
++}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d7f49782f
+index 0000000000000000000000000000000000000000..76a4b124a8065272d4edc68a18fd976982105674
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,1118 @@
+@@ -0,0 +1,2284 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
 +
++#include "protocol.h"
++
 +#include <workerd/api/memory-cache.h>
++#include <workerd/api/worker-rpc.h>
 +#include <workerd/io/actor-cache.h>
 +#include <workerd/io/compatibility-date.h>
 +#include <workerd/io/io-channels.h>
@@ -132,13 +394,16 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +#include <workerd/io/io-thread-context.h>
 +#include <workerd/io/limit-enforcer.h>
 +#include <workerd/io/observer.h>
++#include <workerd/io/tracer.h>
 +#include <workerd/io/tracked-wasm-instance.h>
 +#include <workerd/io/worker-entrypoint.h>
 +#include <workerd/io/worker-interface.h>
++#include <workerd/jsg/coworkerd-rpc-code.h>
 +#include <workerd/jsg/setup.h>
 +#include <workerd/server/factory/coworkerd-steady.h>
 +#include <workerd/server/v8-platform-impl.h>
 +#include <workerd/server/workerd-api.h>
++#include <workerd/threaded/protocol.capnp.h>
 +#include <workerd/util/autogate.h>
 +#include <workerd/util/entropy.h>
 +#include <workerd/util/stream-utils.h>
@@ -170,8 +435,11 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +#include <kj/thread.h>
 +#include <kj/vector.h>
 +
++#include <algorithm>
 +#include <atomic>
 +#include <cerrno>
++#include <chrono>
++#include <condition_variable>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
@@ -229,9 +497,10 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +void noteUnsupported(kj::StringPtr feature);
 +
 +kj::Exception unsupportedError(kj::StringPtr feature) {
-+  auto error = KJ_EXCEPTION(UNIMPLEMENTED, "jsg.Error: NOT_SUPPORTED: ", feature);
-+  error.setDetail(0xc6f4a09d8b3e2175ull, kj::heapArray("NOT_SUPPORTED"_kj.asBytes()));
-+  return error;
++  auto info = threaded::refusalInfo(threaded::Refusal::UNSUPPORTED);
++  auto code = kj::StringPtr(info.code.data(), info.code.size());
++  return jsg::tagCoworkerdRpcError(
++      KJ_EXCEPTION(UNIMPLEMENTED, kj::str("jsg.Error: ", code, ": ", feature)), code);
 +}
 +
 +[[noreturn]] void unsupported(kj::StringPtr feature) {
@@ -249,86 +518,322 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  }
 +};
 +
-+struct Channels final: IoChannelFactory {
-+  explicit Channels(TimerChannel& timer): timer(timer) {}
-+  void abortIsolate(kj::StringPtr) override {
-+    KJ_FAIL_REQUIRE("isolate abort");
++struct Channels;
++
++enum class LimitCause { NONE, CPU, MEMORY };
++using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
++
++kj::Exception limitException(LimitCause cause) {
++  auto info = threaded::refusalInfo(
++      cause == LimitCause::MEMORY ? threaded::Refusal::MEMORY : threaded::Refusal::CPU);
++  auto code = kj::StringPtr(info.code.data(), info.code.size());
++  return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(OVERLOADED, kj::str("jsg.Error: ", code)), code);
++}
++
++int limitEventFd() {
++  static int fd = [] {
++    auto value = getenv("COWORKERD_EVENT_FD");
++    return value == nullptr ? -1 : int(strtol(value, nullptr, 10));
++  }();
++  return fd;
++}
++void writeLimitRow(kj::StringPtr event,
++    kj::StringPtr identity,
++    uint64_t used,
++    uint32_t cpuMs,
++    uint32_t memoryMiB) {
++  int fd = limitEventFd();
++  if (fd < 0) return;
++  auto row = kj::str("{\"event\":\"", event, "\",", identity, "\"cpuUsedNs\":", used,
++      ",\"cpuLimitMs\":", cpuMs, ",\"memoryLimitMiB\":", memoryMiB, ",\"pid\":", getpid(), "}\n");
++  if (row.size() > 4096) return;
++  ssize_t result;
++  do {
++    result = write(fd, row.begin(), row.size());
++  } while (result < 0 && errno == EINTR);
++}
++
++struct MemoryBudget final: v8::ArrayBuffer::Allocator {
++  MemoryBudget(uint32_t mib, LimitState cause)
++      : maximum(uint64_t(mib) << 20),
++        cause(std::move(cause)),
++        inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
++  ~MemoryBudget() noexcept override {
++    delete inner;
 +  }
-+  kj::Own<WorkerInterface> startSubrequest(uint, SubrequestMetadata) override {
-+    unsupported("outbound");
++  const uint64_t maximum;
++  LimitState cause;
++  std::atomic<uint64_t> external{0}, heap{0};
++  v8::ArrayBuffer::Allocator* inner;
++  v8::Isolate* isolate = nullptr;
++  bool reserve(size_t size) {
++    auto used = external.load();
++    for (;;) {
++      auto base = heap.load();
++      if (size > maximum || base > maximum - size || used > maximum - size - base) {
++        cause->store(LimitCause::MEMORY);
++        if (isolate != nullptr) isolate->TerminateExecution();
++        return false;
++      }
++      if (external.compare_exchange_weak(used, used + size)) return true;
++    }
 +  }
-+  kj::Rc<SubrequestChannel> getSubrequestChannelResolved(
-+      uint, kj::Maybe<Frankenvalue>, kj::Maybe<VersionRequest>, Persistent) override {
-+    unsupported("outbound channel");
++  void* Allocate(size_t size) override {
++    if (!reserve(size)) return nullptr;
++    auto result = inner->Allocate(size);
++    if (result == nullptr) external.fetch_sub(size);
++    return result;
 +  }
-+  kj::Rc<ActorClassChannel> getActorClassResolved(
-+      uint, kj::Maybe<Frankenvalue>, Persistent) override {
-+    unsupported("actor class");
++  void* AllocateUninitialized(size_t size) override {
++    if (!reserve(size)) return nullptr;
++    auto result = inner->AllocateUninitialized(size);
++    if (result == nullptr) external.fetch_sub(size);
++    return result;
 +  }
-+  capnp::Capability::Client getCapability(uint) override {
-+    unsupported("capability");
++  void Free(void* pointer, size_t size) override {
++    inner->Free(pointer, size);
++    external.fetch_sub(size);
 +  }
-+  kj::Own<CacheClient> getCache() override {
-+    return kj::heap<Cache>();
++  void observe() {
++    v8::HeapStatistics stats;
++    isolate->GetHeapStatistics(&stats);
++    auto owned = external.load();
++    auto other = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
++    heap.store(stats.used_heap_size() + other);
++    if (stats.used_heap_size() + other + owned >= maximum) {
++      cause->store(LimitCause::MEMORY);
++      isolate->TerminateExecution();
++    }
 +  }
-+  TimerChannel& getTimer() override {
-+    return timer;
++  void install(v8::Isolate* value) {
++    isolate = value;
++    value->AddNearHeapLimitCallback([](void* opaque, size_t current, size_t initial) {
++      auto& self = *static_cast<MemoryBudget*>(opaque);
++      self.cause->store(LimitCause::MEMORY);
++      self.isolate->TerminateExecution();
++      return std::max(current, initial + (8u << 20));
++    }, this);
++    value->AddGCEpilogueCallback([](v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* opaque) {
++      static_cast<MemoryBudget*>(opaque)->observe();
++    }, this);
 +  }
-+  kj::Promise<void> writeLogfwdr(
-+      uint, kj::FunctionParam<void(capnp::AnyPointer::Builder)>) override {
-+    unsupported("log forwarding");
++};
++
++// Only native state, a thread CPU clock and V8's thread-safe termination API are
++// shared with the watchdog. Promises and IoContexts remain on the call thread.
++class CpuWatchdog {
++ public:
++  struct Entry {
++    clockid_t clock;
++    v8::Isolate* isolate;
++    std::atomic<LimitCause>& cause;
++    LimitState memory;
++    uint64_t started, allowance, due, terminatedAt = 0;
++    kj::String identity;
++    uint32_t cpuMs, memoryMiB;
++    bool culpritReported = false;
++  };
++  static CpuWatchdog& instance() {
++    static auto* watchdog = new CpuWatchdog();
++    return *watchdog;
 +  }
-+  kj::Rc<ActorChannel> getGlobalActor(uint,
-+      const ActorIdFactory::ActorId&,
-+      kj::Maybe<kj::String>,
-+      ActorGetMode,
-+      bool,
-+      ActorRoutingMode,
-+      SpanParent,
-+      kj::Maybe<ActorVersion>,
-+      Persistent) override {
-+    unsupported("actor");
++  void add(Entry& entry) {
++    std::lock_guard lock(mutex);
++    entries.push_back(&entry);
++    changed.notify_one();
 +  }
-+  kj::Rc<ActorChannel> getColoLocalActor(uint, kj::StringPtr, SpanParent) override {
-+    unsupported("local actor");
++  void remove(Entry& entry) {
++    std::lock_guard lock(mutex);
++    auto found = std::find(entries.begin(), entries.end(), &entry);
++    KJ_REQUIRE(found != entries.end());
++    entries.erase(found);
 +  }
-+  TimerChannel& timer;
++
++ private:
++  std::mutex mutex;
++  std::condition_variable changed;
++  std::vector<Entry*> entries;
++  std::thread thread;
++  CpuWatchdog(): thread([this] { run(); }) {}
++  void run() {
++    pthread_setname_np(pthread_self(), "cwkd-limits");
++    std::unique_lock lock(mutex);
++    for (;;) {
++      auto now = nowNs();
++      uint64_t next = now + 1000000000;
++      for (auto* entry: entries) {
++        if (now < entry->due && entry->memory->load() == LimitCause::NONE) {
++          next = std::min(next, entry->due);
++          continue;
++        }
++        auto used = nowNs(entry->clock) - entry->started;
++        if (entry->memory->load() == LimitCause::MEMORY) entry->cause.store(LimitCause::MEMORY);
++        if (entry->allowance != UINT64_MAX && used >= entry->allowance) {
++          auto expected = LimitCause::NONE;
++          entry->cause.compare_exchange_strong(expected, LimitCause::CPU);
++        }
++        if (entry->cause.load() != LimitCause::NONE) {
++          if (entry->terminatedAt == 0) {
++            entry->isolate->TerminateExecution();
++            entry->terminatedAt = now;
++          } else if (!entry->culpritReported && now - entry->terminatedAt >= 100000000) {
++            writeLimitRow("culprit", entry->identity, used, entry->cpuMs, entry->memoryMiB);
++            entry->culpritReported = true;
++          }
++          entry->due = now + 1000000;
++        } else {
++          entry->due = now +
++              std::max<uint64_t>(
++                  100000, entry->allowance == UINT64_MAX ? 1000000 : entry->allowance - used);
++        }
++        next = std::min(next, entry->due);
++      }
++      if (entries.empty())
++        changed.wait(lock);
++      else {
++        auto sampled = nowNs();
++        changed.wait_for(lock, std::chrono::nanoseconds(next > sampled ? next - sampled : 0));
++      }
++    }
++  }
++};
++
++struct CpuExecution {
++  std::atomic<LimitCause>& cause;
++  std::shared_ptr<MemoryBudget> memory;
++  CpuWatchdog::Entry entry;
++  bool registered;
++  CpuExecution(v8::Isolate* isolate,
++      std::atomic<LimitCause>& cause,
++      LimitState memoryState,
++      std::shared_ptr<MemoryBudget> memory,
++      uint64_t used,
++      uint32_t cpuMs,
++      uint32_t memoryMiB,
++      kj::StringPtr identity)
++      : cause(cause),
++        memory(std::move(memory)),
++        entry{.isolate = isolate,
++          .cause = cause,
++          .memory = std::move(memoryState),
++          .allowance = cpuMs == 0                ? UINT64_MAX
++              : uint64_t(cpuMs) * 1000000 > used ? uint64_t(cpuMs) * 1000000 - used
++                                                 : 0,
++          .identity = kj::str(identity),
++          .cpuMs = cpuMs,
++          .memoryMiB = memoryMiB},
++        registered(cpuMs != 0 || memoryMiB != 0) {
++    KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &entry.clock) == 0);
++    entry.started = nowNs(entry.clock);
++    entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
++    if (this->memory) this->memory->observe();
++    if (registered) CpuWatchdog::instance().add(entry);
++  }
++  void finish() {
++    if (registered) {
++      CpuWatchdog::instance().remove(entry);
++      registered = false;
++      if (memory) memory->observe();
++    }
++  }
++  ~CpuExecution() noexcept(false) {
++    finish();
++  }
 +};
 +
 +struct IsolateLimits final: IsolateLimitEnforcer {
-+  v8::Isolate::CreateParams getCreateParams() override {
-+    return {};
++  IsolateLimits(uint32_t cpuMs, uint32_t memoryMiB, kj::String identity)
++      : cpuMs(cpuMs),
++        memoryMiB(memoryMiB),
++        identity(kj::mv(identity)) {
++    if (memoryMiB != 0) memory = std::make_shared<MemoryBudget>(memoryMiB, memoryState);
 +  }
-+  void customizeIsolate(v8::Isolate*) override {}
++  uint32_t cpuMs, memoryMiB;
++  kj::String identity;
++  LimitState memoryState = std::make_shared<std::atomic<LimitCause>>(LimitCause::NONE);
++  std::shared_ptr<MemoryBudget> memory;
++  mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
++  mutable uint64_t startupCpu = 0;
++  v8::Isolate::CreateParams getCreateParams() override {
++    v8::Isolate::CreateParams params;
++    if (memory) {
++      params.constraints.ConfigureDefaultsFromHeapSize(0, memory->maximum);
++      params.array_buffer_allocator_shared = memory;
++    }
++    return params;
++  }
++  void customizeIsolate(v8::Isolate* value) override {
++    if (memory) memory->install(value);
++  }
 +  ActorCacheSharedLruOptions getActorCacheLruOptions() override {
 +    return {};
 +  }
-+  kj::Own<void> enterStartupJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-+    return {};
++  struct Startup {
++    const IsolateLimits& owner;
++    kj::OneOf<kj::Exception, kj::Duration>& result;
++    uint64_t localCpu = 0;
++    std::atomic<LimitCause> localCause{LimitCause::NONE};
++    uint64_t& totalCpu;
++    std::atomic<LimitCause>& cause;
++    uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
++    CpuExecution execution;
++    Startup(const IsolateLimits& owner,
++        jsg::Lock& js,
++        kj::OneOf<kj::Exception, kj::Duration>& result,
++        bool startup)
++        : owner(owner),
++          result(result),
++          totalCpu(startup ? owner.startupCpu : localCpu),
++          cause(startup ? owner.startupCause : localCause),
++          execution(js.v8Isolate,
++              cause,
++              owner.memoryState,
++              owner.memory,
++              totalCpu,
++              owner.cpuMs,
++              owner.memoryMiB,
++              owner.identity) {}
++    ~Startup() noexcept(false) {
++      execution.finish();
++      totalCpu += nowNs(CLOCK_THREAD_CPUTIME_ID) - start;
++      auto exceeded =
++          owner.memoryState->load() == LimitCause::MEMORY ? LimitCause::MEMORY : cause.load();
++      if (exceeded == LimitCause::NONE)
++        result = int64_t(totalCpu) * kj::NANOSECONDS;
++      else {
++        result = limitException(exceeded);
++        writeLimitRow(exceeded == LimitCause::CPU ? "terminated" : "memory-terminated",
++            owner.identity, totalCpu, owner.cpuMs, owner.memoryMiB);
++      }
++    }
++  };
++  kj::Own<void> enterStartupJs(
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    return kj::heap<Startup>(*this, js, result, true);
 +  }
 +  kj::Own<void> enterStartupPython(
-+      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+    return enterStartupJs(js, result);
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
++    return enterStartupJs(js, r);
 +  }
 +  kj::Own<void> enterDynamicImportJs(
-+      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+    return enterStartupJs(js, result);
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
++    return kj::heap<Startup>(*this, js, r, false);
 +  }
 +  kj::Own<void> enterLoggingJs(
-+      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+    return enterStartupJs(js, result);
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
++    return kj::heap<Startup>(*this, js, r, false);
 +  }
 +  kj::Own<void> enterInspectorJs(
-+      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+    return enterStartupJs(js, result);
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& r) const override {
++    return kj::heap<Startup>(*this, js, r, false);
 +  }
 +  void completedRequest(kj::StringPtr) const override {}
 +  bool exitJs(jsg::Lock&) const override {
-+    return false;
++    return memoryState->load() == LimitCause::MEMORY;
 +  }
 +  void reportMetrics(IsolateObserver&) const override {}
 +  bool hasExcessivelyExceededHeapLimit() const override {
-+    return false;
++    return memoryState->load() == LimitCause::MEMORY;
 +  }
 +  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
 +    return instances;
@@ -336,8 +841,10 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  TrackedWasmInstanceList instances;
 +};
 +
++constexpr kj::Exception::DetailTypeId LOAD_STAGE_DETAIL = 0xd6eae4a9047382b1ull;
++
 +struct Reporter final: Worker::ValidationErrorReporter {
-+  std::set<std::string> httpEntrypoints;
++  std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
 +  void addError(kj::String error) override {
 +    KJ_FAIL_REQUIRE("invalid Worker", error);
 +  }
@@ -346,10 +853,13 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +    KJ_IF_SOME(value, name) {
 +      key = value.cStr();
 +    }
++    entrypoints.insert(key);
 +    for (auto& handler: handlers)
 +      if (handler == "fetch") httpEntrypoints.insert(key);
 +  }
-+  void addActorClass(kj::StringPtr) override {}
++  void addActorClass(kj::StringPtr name) override {
++    actorClasses.insert(name.cStr());
++  }
 +  void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
 +};
 +
@@ -359,9 +869,12 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  std::mutex mutex;
 +  bool complete = false;
 +  kj::Maybe<kj::Own<Worker>> worker;
++  IsolateLimits* limits = nullptr;
++  threaded::LoadStage loadStage = threaded::LoadStage::LOAD;
 +  kj::Maybe<kj::Exception> error;
 +  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
-+  std::set<std::string> httpEntrypoints;
++  std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
++  std::vector<std::string> loopbacks, loopbackActors;
 +  std::atomic<uint> active{0}, maxActive{0}, creates{0};
 +};
 +
@@ -373,26 +886,44 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +struct Measurement {
 +  kj::Vector<Entry> entries;
 +  uint64_t totalCpu = 0;
++  std::atomic<LimitCause> limitCause{LimitCause::NONE};
 +  kj::Maybe<kj::String> unsupportedFeature;
 +};
 +
 +struct RequestLimits final: LimitEnforcer {
-+  RequestLimits(Slot& slot, Measurement& measurement, Timer& timer)
++  RequestLimits(Slot& slot, Measurement& measurement, Timer& timer, kj::String identity)
 +      : slot(slot),
 +        measurement(measurement),
-+        timer(timer) {}
++        timer(timer),
++        identity(kj::mv(identity)),
++        failure(failurePair.promise.fork()) {}
++  ~RequestLimits() noexcept(false) {
++    writeLimitRow(
++        "completed", identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB);
++  }
 +  struct Scope {
-+    Scope(Slot& slot, Measurement& measurement, v8::Isolate* isolate)
-+        : slot(slot),
-+          measurement(measurement),
++    Scope(RequestLimits& owner, IoContext& context, v8::Isolate* isolate)
++        : owner(owner),
++          context(context),
++          slot(owner.slot),
++          measurement(owner.measurement),
 +          isolate(isolate),
 +          start(nowNs()),
-+          cpu(nowNs(CLOCK_THREAD_CPUTIME_ID)) {
++          cpu(nowNs(CLOCK_THREAD_CPUTIME_ID)),
++          execution(isolate,
++              measurement.limitCause,
++              slot.limits->memoryState,
++              slot.limits->memory,
++              measurement.totalCpu,
++              slot.limits->cpuMs,
++              slot.limits->memoryMiB,
++              owner.identity) {
 +      auto active = slot.active.fetch_add(1) + 1;
 +      KJ_REQUIRE(active == 1, "overlapping JS entries");
 +      slot.maxActive.store(active);
 +    }
 +    ~Scope() noexcept(false) {
++      execution.finish();
 +      auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
 +      measurement.totalCpu += used;
 +      if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") != nullptr) {
@@ -404,22 +935,25 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +        if (size > 0) (void)!write(STDERR_FILENO, row, size);
 +      }
 +      slot.active.fetch_sub(1);
++      owner.publish(context);
 +    }
++    RequestLimits& owner;
++    IoContext& context;
 +    Slot& slot;
 +    Measurement& measurement;
 +    v8::Isolate* isolate;
 +    uint64_t start, cpu;
++    CpuExecution execution;
 +  };
-+  kj::Own<void> enterJs(jsg::Lock& js, IoContext&) override {
++  kj::Own<void> enterJs(jsg::Lock& js, IoContext& context) override {
++    requireLimitsNotExceeded();
 +    // runImpl synchronizes before waiting for the isolate; sample again after
 +    // that wait, while its lock is held and before this turn enters JavaScript.
 +    timer.syncTime();
-+    return kj::heap<Scope>(slot, measurement, js.v8Isolate);
++    return kj::heap<Scope>(*this, context, js.v8Isolate);
 +  }
 +  void topUpActor() override {}
-+  void newSubrequest(bool) override {
-+    unsupported("subrequest");
-+  }
++  void newSubrequest(bool) override {}
 +  void newKvRequest(KvOpType) override {
 +    unsupported("kv");
 +  }
@@ -438,14 +972,35 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  size_t getBufferingLimit() override {
 +    return 1 << 20;
 +  }
++  LimitCause cause() {
++    return slot.limits->memoryState->load() == LimitCause::MEMORY ? LimitCause::MEMORY
++                                                                  : measurement.limitCause.load();
++  }
++  void publish(IoContext& context) {
++    if (slot.limits->cpuMs != 0 && measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
++      auto expected = LimitCause::NONE;
++      measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
++    }
++    auto value = cause();
++    if (value == LimitCause::NONE || published) return;
++    published = true;
++    writeLimitRow(value == LimitCause::MEMORY ? "memory-terminated" : "terminated", identity,
++        measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB);
++    if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
++    context.abort(limitException(value));
++  }
 +  kj::Maybe<EventOutcome> getLimitsExceeded() override {
-+    return kj::none;
++    auto value = cause();
++    if (value == LimitCause::NONE) return kj::none;
++    return value == LimitCause::MEMORY ? EventOutcome::EXCEEDED_MEMORY : EventOutcome::EXCEEDED_CPU;
 +  }
 +  kj::Promise<void> onLimitsExceeded() override {
-+    return kj::NEVER_DONE;
++    return failure.addBranch();
 +  }
 +  void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
-+  void requireLimitsNotExceeded() override {}
++  void requireLimitsNotExceeded() override {
++    if (cause() != LimitCause::NONE) kj::throwFatalException(limitException(cause()));
++  }
 +  void reportMetrics(RequestObserver&) override {}
 +  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
 +    return 0 * kj::SECONDS;
@@ -456,6 +1011,10 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  Slot& slot;
 +  Measurement& measurement;
 +  Timer& timer;
++  kj::String identity;
++  kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
++  kj::ForkedPromise<void> failure;
++  bool published = false;
 +};
 +
 +void noteUnsupported(kj::StringPtr feature) {
@@ -476,6 +1035,8 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  Entropy entropy;
 +  capnp::ByteStreamFactory bytes;
 +  kj::HttpHeaderTable::Builder headerBuilder;
++  kj::HttpHeaderId egressSource = headerBuilder.add("x-coworkerd-egress-source");
++  kj::HttpHeaderId egressError = headerBuilder.add("x-coworkerd-egress-error");
 +  ThreadContext::HeaderIdBundle ids{headerBuilder};
 +  capnp::HttpOverCapnpFactory http{bytes,
 +    capnp::HttpOverCapnpFactory::HeaderIdBundle(headerBuilder),
@@ -486,6 +1047,8 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  Errors errors;
 +  kj::TaskSet tasks{errors};
 +};
++
++Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value);
 +
 +using Json = capnp::JsonValue;
 +Json::Reader field(Json::Reader value, kj::StringPtr name) {
@@ -511,8 +1074,9 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  return capnp::JsonCodec().encodeRaw(value);
 +}
 +struct JsonDoc {
++  kj::String original;
 +  capnp::MallocMessageBuilder arena;
-+  explicit JsonDoc(kj::StringPtr input) {
++  explicit JsonDoc(kj::StringPtr input): original(kj::str(input)) {
 +    capnp::JsonCodec().decodeRaw(input.asArray(), arena.initRoot<Json>());
 +  }
 +  Json::Reader get() {
@@ -535,6 +1099,79 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  value.resize(size);
 +  return value;
 +}
++
++// Coworkerd's persisted namespace IDs use SHA-256(namespace bytes || "name" ||
++// UTF-8 name). Changing this factory would select different durable data.
++class ObjectIdFactory final: public ActorIdFactory {
++ public:
++  struct Id final: ActorId {
++    Id(kj::String space, kj::String id, kj::Maybe<kj::String> name)
++        : space(kj::mv(space)),
++          id(kj::mv(id)),
++          name(kj::mv(name)) {}
++    kj::String space, id;
++    kj::Maybe<kj::String> name;
++    kj::String toString() const override {
++      return kj::str(id);
++    }
++    kj::Maybe<kj::StringPtr> getName() const override {
++      return name;
++    }
++    kj::Maybe<kj::StringPtr> getJurisdiction() const override {
++      return kj::none;
++    }
++    bool equals(const ActorId& other) const override {
++      auto& value = kj::downcast<const Id>(other);
++      return id == value.id;
++    }
++    kj::Own<ActorId> clone() const override {
++      return kj::heap<Id>(
++          kj::str(space), kj::str(id), name.map([](auto& value) { return kj::str(value); }));
++    }
++  };
++  explicit ObjectIdFactory(kj::StringPtr space): space(kj::str(space)) {}
++  kj::String space;
++  void requireAvailable() {
++    JSG_REQUIRE(space.size() == 64, Error,
++        "DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
++  }
++  kj::Own<ActorId> newUniqueId(kj::Maybe<kj::StringPtr> jurisdiction) override {
++    requireAvailable();
++    JSG_REQUIRE(
++        jurisdiction == kj::none, TypeError, "Durable Object jurisdictions are not supported");
++    kj::byte bytes[32];
++    getEntropy(bytes);
++    return kj::heap<Id>(kj::str(space), kj::encodeHex(kj::arrayPtr(bytes)), kj::none);
++  }
++  kj::Own<ActorId> idFromName(kj::String name) override {
++    requireAvailable();
++    auto prefix = kj::decodeHex(space);
++    KJ_REQUIRE(!prefix.hadErrors && prefix.size() == 32);
++    auto bytes = kj::heapArray<kj::byte>(32 + 4 + name.size());
++    memcpy(bytes.begin(), prefix.begin(), 32);
++    memcpy(bytes.begin() + 32, "name", 4);
++    memcpy(bytes.begin() + 36, name.begin(), name.size());
++    return kj::heap<Id>(kj::str(space), kj::str(digest(bytes).c_str()), kj::mv(name));
++  }
++  kj::Own<ActorId> idFromString(kj::String id) override {
++    requireAvailable();
++    bool valid = id.size() == 64;
++    for (char c: id) valid = valid && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
++    JSG_REQUIRE(valid, TypeError, "Invalid Durable Object ID: 64 lowercase hexadecimal digits");
++    return kj::heap<Id>(kj::str(space), kj::mv(id), kj::none);
++  }
++  bool matchesJurisdiction(const ActorId&) override {
++    return true;
++  }
++  kj::Own<ActorIdFactory> cloneWithJurisdiction(kj::Maybe<kj::StringPtr> jurisdiction) override {
++    JSG_REQUIRE(
++        jurisdiction == kj::none, TypeError, "Durable Object jurisdictions are not supported");
++    return kj::heap<ObjectIdFactory>(space);
++  }
++  kj::Maybe<kj::Own<ActorIdFactory>> cloneForSnapshot() const override {
++    return kj::heap<ObjectIdFactory>(space);
++  }
++};
 +
 +// Raw descriptors and atomic queue positions are the accept loop's only shared state.
 +class DescriptorQueue {
@@ -570,10 +1207,11 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +
 +class Invocation final: public kj::HttpService {
 + public:
-+  Invocation(ThreadedServer& server, ThreadState& state, kj::String descriptor)
++  Invocation(ThreadedServer& server, ThreadState& state, kj::String descriptor, Frankenvalue props)
 +      : server(server),
 +        state(state),
-+        descriptor(kj::mv(descriptor)) {}
++        descriptor(kj::mv(descriptor)),
++        props(kj::mv(props)) {}
 +  kj::Promise<void> request(kj::HttpMethod method,
 +      kj::StringPtr url,
 +      const kj::HttpHeaders& headers,
@@ -584,34 +1222,35 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  ThreadedServer& server;
 +  ThreadState& state;
 +  kj::String descriptor;
++  Frankenvalue props;
 +  bool used = false;
 +};
 +
 +class Dispatcher final: public rpc::EventDispatcher::Server {
 + public:
-+  Dispatcher(ThreadedServer& server, ThreadState& state, kj::String descriptor)
++  Dispatcher(ThreadedServer& server, ThreadState& state, kj::String descriptor, Frankenvalue props)
 +      : server(server),
 +        state(state),
-+        descriptor(kj::mv(descriptor)) {}
++        descriptor(kj::mv(descriptor)),
++        props(kj::mv(props)) {}
 +  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
 +    KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
 +    used = true;
-+    context.initResults().setHttp(
-+        state.http.kjToCapnp(kj::heap<Invocation>(server, state, kj::mv(descriptor))));
++    context.initResults().setHttp(state.http.kjToCapnp(
++        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props))));
 +    return kj::READY_NOW;
 +  }
-+  kj::Promise<void> jsRpcSession(JsRpcSessionContext) override {
-+    unsupported("JS RPC is not available in S1a");
-+  }
++  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
 +
 + private:
 +  ThreadedServer& server;
 +  ThreadState& state;
 +  kj::String descriptor;
++  Frankenvalue props;
 +  bool used = false;
 +};
 +
-+class Bootstrap final: public rpc::WorkerdBootstrap::Server {
++class Bootstrap final: public threaded::rpc::Bootstrap::Server {
 + public:
 +  Bootstrap(ThreadedServer& server, ThreadState& state): server(server), state(state) {}
 +  kj::Promise<void> startEvent(StartEventContext context) override {
@@ -621,7 +1260,16 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +    KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
 +        "NOT_SUPPORTED: persistent objects and handoff");
 +    context.initResults().setDispatcher(
-+        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson())));
++        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue()));
++    return kj::READY_NOW;
++  }
++
++  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
++    KJ_REQUIRE(!used, "one startEvent per connection");
++    used = true;
++    auto params = context.getParams();
++    context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
++        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
 +    return kj::READY_NOW;
 +  }
 +
@@ -636,6 +1284,15 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  server::WorkerdPlatform platform{*basePlatform};
 +  jsg::V8System v8{platform, {}, basePlatform.get()};
 +  const std::string sourceAddress, identity;
++  const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
++      ? ""
++      : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
++  const std::string egressAddress = getenv("COWORKERD_THREADED_EGRESS_ADDRESS") == nullptr
++      ? ""
++      : getenv("COWORKERD_THREADED_EGRESS_ADDRESS");
++  const std::string egressToken = getenv("COWORKERD_THREADED_EGRESS_TOKEN") == nullptr
++      ? ""
++      : getenv("COWORKERD_THREADED_EGRESS_TOKEN");
 +  std::mutex registryMutex;
 +  std::map<std::string, std::shared_ptr<Slot>> registry;
 +  DescriptorQueue pending;
@@ -782,7 +1439,8 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +    kj::HttpHeaders headers(*state.headers);
 +    auto request = client->request(kj::HttpMethod::GET, url, headers);
 +    auto response = co_await request.response;
-+    KJ_REQUIRE(response.statusCode == 200, "Trusted source unavailable");
++    KJ_REQUIRE(
++        response.statusCode == 200, kj::str("Trusted source fetch failed: ", response.statusCode));
 +    auto content = co_await response.body->readAllText(256u << 20);
 +    JsonDoc source(content);
 +    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
@@ -793,11 +1451,7 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  }
 +
 +  kj::Own<Worker> compile(Slot& slot, Json::Reader descriptor, kj::StringPtr source) {
-+    for (auto name: {"bindings", "durableObjects"}) {
-+      auto values = field(descriptor, name);
-+      if (values.isArray() && values.getArray().size() != 0)
-+        unsupported("service bindings and object stubs require S1b");
-+    }
++    slot.loadStage = threaded::LoadStage::PACKAGE;
 +    Reporter reporter;
 +    auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
 +    capnp::MallocMessageBuilder flagMessage;
@@ -822,7 +1476,7 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +      JsonDoc payload(source);
 +      auto manifestText = text(payload.get(), "manifest");
 +      KJ_REQUIRE(digest(manifestText.asBytes()) == str(descriptor, "contentHash"),
-+          "Trusted manifest hash mismatch");
++          "Trusted package manifest hash mismatch");
 +      JsonDoc manifest(manifestText);
 +      auto declarations = field(manifest.get(), "modules");
 +      KJ_REQUIRE(declarations.isArray(), "invalid module manifest");
@@ -841,7 +1495,7 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +        auto view = kj::arrayPtr(reinterpret_cast<const kj::byte*>(bytes.data()), bytes.size());
 +        KJ_REQUIRE(
 +            digest(view) == hash.cStr() && bytes.size() == field(declaration, "bytes").getNumber(),
-+            "Trusted module hash or length mismatch");
++            "Trusted module content hash mismatch");
 +        auto module = modules[index];
 +        module.setName(name);
 +        auto type = text(declaration, "type");
@@ -864,12 +1518,23 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +      KJ_REQUIRE(foundMain, "missing main module");
 +    } else {
 +      KJ_REQUIRE(digest(source.asBytes()) == str(descriptor, "contentHash"),
-+          "Trusted source hash mismatch");
++          "Trusted source content hash mismatch");
 +      auto module = config.initModules(1)[0];
 +      module.setName(main);
 +      module.setEsModule(source);
 +    }
-+    auto limits = kj::refcounted<IsolateLimits>();
++    auto configured = [&](kj::StringPtr name, const char* variable) {
++      auto value = field(descriptor, name);
++      if (value.isNumber() && value.getNumber() != 0) return uint32_t(value.getNumber());
++      auto text = getenv(variable);
++      return text == nullptr ? uint32_t(0) : uint32_t(strtoul(text, nullptr, 10));
++    };
++    auto identity = kj::str("\"workerId\":", encode(field(descriptor, "workerId")),
++        ",\"versionId\":", encode(field(descriptor, "versionId")),
++        ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",");
++    auto limits = kj::refcounted<IsolateLimits>(configured("cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
++        configured("memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity));
++    slot.limits = limits.get();
 +    auto group = jsg::newIsolateGroup();
 +    const api::pyodide::PythonConfig python{
 +      .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
@@ -880,14 +1545,18 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +    auto isolate =
 +        kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
 +            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW);
++    slot.loadStage = threaded::LoadStage::LOAD;
 +    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
 +        server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
 +        IsolateObserver::StartType::COLD, kj::none, kj::none, SpanParent(nullptr),
 +        newWorkerFileSystem(kj::heap<FsMap>(), getTmpDirectoryImpl()), kj::none);
++    kj::Maybe<jsg::V8Ref<v8::Object>> exportsHandle;
++    slot.loadStage = threaded::LoadStage::EVALUATION;
 +    auto worker =
 +        kj::atomicRefcounted<Worker>(kj::mv(compiled), kj::atomicRefcounted<WorkerObserver>(),
-+            [&](jsg::Lock& lock, const Worker::Api&, v8::Local<v8::Object> target,
-+                v8::Local<v8::Object>) {
++            [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
++                v8::Local<v8::Object> ctxExports) {
++      exportsHandle = lock.v8Ref(ctxExports);
 +      auto context = lock.v8Context();
 +      for (auto section: {"variables", "secrets"}) {
 +        auto values = field(descriptor, section);
@@ -896,36 +1565,105 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +          auto value = field(variable, "value");
 +          KJ_REQUIRE(value.isString(), "missing environment value");
 +          v8::Local<v8::Value> item = lock.str(value.getString());
-+          if (field(variable, "type").isString() && text(variable, "type") == "json")
++          if (field(variable, "type").isString() && text(variable, "type") == "json") {
++            slot.loadStage = threaded::LoadStage::DECODE;
 +            item = jsg::check(v8::JSON::Parse(context, lock.str(value.getString())));
++            slot.loadStage = threaded::LoadStage::EVALUATION;
++          }
 +          KJ_REQUIRE(
 +              jsg::check(target->DefineOwnProperty(context,
 +                  static_cast<v8::Local<v8::String>>(lock.str(text(variable, "name"))), item)),
 +              "invalid environment property");
 +        }
 +      }
-+      auto console = v8::Object::New(lock.v8Isolate);
-+      auto denied = jsg::check(
-+          v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value>& args) {
-+        noteUnsupported("tenant logging requires S1b");
-+        jsg::throwInternalError(args.GetIsolate(), unsupportedError("tenant logging requires S1b"));
-+      }));
-+      for (auto method: {"log", "info", "warn", "error", "debug", "trace", "table", "assert",
-+             "count", "time", "timeEnd", "timeLog", "countReset", "group", "groupCollapsed",
-+             "groupEnd", "clear", "dir", "dirxml", "profile", "profileEnd", "timeStamp"})
-+        jsg::check(console->Set(context, lock.str(kj::StringPtr(method)), denied));
-+      KJ_REQUIRE(jsg::check(context->Global()->DefineOwnProperty(
-+                     context, static_cast<v8::Local<v8::String>>(lock.str("console"_kj)), console)),
-+          "NOT_SUPPORTED: console override unavailable");
++      auto services = field(field(descriptor, "rootPlan"), "serviceBindings");
++      auto objects = field(field(descriptor, "rootPlan"), "durableObjects");
++      uint serviceCount = services.isArray() ? services.getArray().size() : 0;
++      uint objectCount = objects.isArray() ? objects.getArray().size() : 0;
++      capnp::MallocMessageBuilder globalsArena;
++      auto globals = globalsArena.initRoot<capnp::List<server::Global>>(serviceCount + objectCount);
++      for (uint i = 0; i < serviceCount; ++i) {
++        auto global = globals[i];
++        global.setName(text(field(services.getArray()[i], "metadata"), "name"));
++        global.setFetcher(IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT + i);
++      }
++      for (uint i = 0; i < objectCount; ++i) {
++        auto metadata = field(objects.getArray()[i], "metadata");
++        auto name = text(metadata, "binding");
++        auto global = globals[serviceCount + i];
++        global.setName(name);
++        auto space =
++            field(field(field(descriptor, "rootSelection"), "durableObjectBindings"), name);
++        auto database = field(metadata, "database");
++        if (database.isString() && database.getString().size() != 0) {
++          auto wrapped = global.initWrapped();
++          wrapped.setModuleName("cloudflare-internal:d1-api");
++          wrapped.setEntrypoint("default");
++          auto fetcher = wrapped.initInnerBindings(1)[0];
++          fetcher.setName("fetcher");
++          fetcher.setFetcher(IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT + serviceCount + i);
++        } else {
++          auto ns = global.initDurableActorNamespace();
++          ns.setActorChannel(i);
++          ns.setUniqueKey(text(space, "namespaceId"));
++        }
++      }
++      static_cast<const server::WorkerdApi&>(api).compileGlobals(
++          lock, globals.asReader(), target, [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
++        return kj::heap<ObjectIdFactory>(key);
++      });
 +    },
 +            IsolateObserver::StartType::COLD, SpanParent(nullptr),
 +            Worker::Lock::TakeSynchronously(kj::none), reporter);
 +    uintptr_t isolateAddress = 0;
 +    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
 +      lock.validateHandlers(reporter);
++      slot.loopbacks.assign(reporter.entrypoints.begin(), reporter.entrypoints.end());
++      auto namespaces = field(descriptor, "nativeNamespaces");
++      if (namespaces.isArray())
++        for (auto value: namespaces.getArray()) {
++          auto name = str(value, "className");
++          if (reporter.actorClasses.contains(name)) slot.loopbackActors.push_back(std::move(name));
++        }
++      uint base = IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
++      auto plan = field(descriptor, "rootPlan");
++      for (auto name: {"serviceBindings", "durableObjects"}) {
++        auto values = field(plan, name);
++        if (values.isArray()) base += values.getArray().size();
++      }
++      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
++        capnp::MallocMessageBuilder arena;
++        auto globals = arena.initRoot<capnp::List<server::Global>>(
++            slot.loopbacks.size() + slot.loopbackActors.size());
++        for (uint i = 0; i < slot.loopbacks.size(); ++i) {
++          globals[i].setName(slot.loopbacks[i].c_str());
++          globals[i].setLoopbackServiceStub(base + i);
++        }
++        auto objects = field(field(descriptor, "rootPlan"), "durableObjects");
++        uint objectCount = objects.isArray() ? objects.getArray().size() : 0;
++        for (uint i = 0; i < slot.loopbackActors.size(); ++i) {
++          auto& name = slot.loopbackActors[i];
++          auto global = globals[slot.loopbacks.size() + i];
++          global.setName(name.c_str());
++          auto ns = global.initLoopbackDurableActorNamespace();
++          ns.setActorChannel(objectCount + i);
++          ns.setClassChannel(i);
++          for (auto value: namespaces.getArray())
++            if (text(value, "className") == name.c_str())
++              ns.setUniqueKey(text(value, "namespaceId"));
++        }
++        static_cast<const server::WorkerdApi&>(worker->getIsolate().getApi())
++            .compileGlobals(js, globals.asReader(), KJ_REQUIRE_NONNULL(exportsHandle).getHandle(js),
++                [](kj::StringPtr key) -> kj::Own<ActorIdFactory> {
++          return kj::heap<ObjectIdFactory>(key);
++        });
++        exportsHandle = kj::none;
++      });
 +      isolateAddress = reinterpret_cast<uintptr_t>(lock.getIsolate());
 +    });
 +    slot.httpEntrypoints = std::move(reporter.httpEntrypoints);
++    slot.entrypoints = std::move(reporter.entrypoints);
++    slot.actorClasses = std::move(reporter.actorClasses);
 +    slot.creates.fetch_add(1);
 +    compilations.fetch_add(1);
 +    auto row = kj::str("[threaded-worker] {\"workerId\":", encode(field(descriptor, "workerId")),
@@ -938,6 +1676,15 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +
 +  kj::Promise<std::shared_ptr<Slot>> getWorker(
 +      Json::Reader descriptor, ThreadState& state, bool& coldLoaded) {
++    auto plan = field(descriptor, "rootPlan");
++    auto selection = field(descriptor, "rootSelection");
++    if (!field(plan, "kind").isString() || text(plan, "kind") != "tenant" ||
++        !field(plan, "namespaces").isArray() || field(plan, "namespaces").getArray().size() != 0 ||
++        !field(selection, "kind").isString() || text(selection, "kind") != "plain" ||
++        !flag(selection, "dispatchChecked")) {
++      kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
++          kj::str("Missing trusted ordinary worker plan")));
++    }
 +    auto fingerprint = field(field(descriptor, "rootPlan"), "versionFingerprint");
 +    auto key = str(descriptor, "workerId") + "@" + str(descriptor, "versionId") + ":" +
 +        str(descriptor, "definitionHash") + ":" +
@@ -945,6 +1692,10 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +                                : digest(kj::str(encode(field(descriptor, "variables")),
 +                                      encode(field(descriptor, "secrets")))
 +                                             .asBytes()));
++    key += ":" +
++        digest(
++            encode(field(field(descriptor, "rootSelection"), "durableObjectBindings")).asBytes());
++    key += ":" + digest(encode(field(descriptor, "nativeNamespaces")).asBytes());
 +    std::shared_ptr<Slot> slot;
 +    bool creator;
 +    {
@@ -987,12 +1738,16 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +      bool fetched = false;
 +      try {
 +        trace("source-start");
++        slot->loadStage = threaded::LoadStage::PACKAGE;
 +        auto source = co_await fetchSource(descriptor, state);
 +        trace("source-end");
 +        fetched = true;
 +        slot->worker = compile(*slot, descriptor, source);
 +        trace("compiled");
 +      } catch (kj::Exception& error) {
++        auto stage = kj::heapArray<kj::byte>(1);
++        stage[0] = static_cast<kj::byte>(slot->loadStage);
++        error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
 +        slot->error = kj::mv(error);
 +      }
 +      if (!fetched) remove();
@@ -1015,6 +1770,677 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  }
 +};
 +
++class ChannelDispatcher final: public rpc::EventDispatcher::Server {
++ public:
++  ChannelDispatcher(ThreadState& state, kj::Own<WorkerInterface> worker)
++      : state(state),
++        worker(kj::mv(worker)) {}
++  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
++    KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
++    context.getResults().setHttp(state.http.kjToCapnp(kj::mv(worker)));
++    return kj::READY_NOW;
++  }
++  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
++    KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
++    return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
++  }
++
++ private:
++  ThreadState& state;
++  kj::Own<WorkerInterface> worker;
++};
++
++class ChannelBootstrap final: public rpc::WorkerdBootstrap::Server {
++ public:
++  ChannelBootstrap(ThreadState& state, kj::Rc<IoChannelFactory::SubrequestChannel> channel)
++      : state(state),
++        channel(kj::mv(channel)) {}
++  kj::Promise<void> startEvent(StartEventContext context) override {
++    IoChannelFactory::SubrequestMetadata metadata;
++    auto cf = context.getParams().getCfBlobJson();
++    if (cf.size() != 0) metadata.cfBlobJson = kj::str(cf);
++    context.getResults().setDispatcher(
++        kj::heap<ChannelDispatcher>(state, channel->startRequest(kj::mv(metadata))));
++    return kj::READY_NOW;
++  }
++
++ private:
++  ThreadState& state;
++  kj::Rc<IoChannelFactory::SubrequestChannel> channel;
++};
++
++class RemoteChannel final: public IoChannelFactory::SubrequestChannel {
++ public:
++  RemoteChannel(ThreadState& state, rpc::WorkerdBootstrap::Client bootstrap)
++      : state(state),
++        bootstrap(kj::mv(bootstrap)) {}
++  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
++    auto request = bootstrap.startEventRequest();
++    KJ_IF_SOME(cf, metadata.cfBlobJson) {
++      request.setCfBlobJson(cf);
++    }
++    return kj::heap<RpcWorkerInterface>(state.http, state.bytes,
++        getUnsupportedFrankenvalueHandler(), request.send().getDispatcher());
++  }
++  void requireAllowsTransfer() override {}
++  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
++      IoChannelFactory::ChannelTokenUsage) override {
++    unsupported("binding persistence");
++  }
++
++ private:
++  ThreadState& state;
++  rpc::WorkerdBootstrap::Client bootstrap;
++};
++
++Frankenvalue readNativeProps(ThreadState& state, rpc::Frankenvalue::Reader value) {
++  kj::Vector<kj::Own<Frankenvalue::CapTableEntry>> capabilities;
++  auto table = value.getCapTable().getAs<capnp::List<threaded::rpc::Channel>>();
++  for (auto item: table) {
++    KJ_REQUIRE(item.isService(), "unsupported native props channel kind");
++    capabilities.add(kj::rc<RemoteChannel>(state, item.getService()).toOwn());
++  }
++  return Frankenvalue::fromCapnp(value, kj::mv(capabilities));
++}
++
++using PropsMessage = kj::Own<capnp::MallocMessageBuilder>;
++PropsMessage writeNativeProps(ThreadState& state, Frankenvalue& props) {
++  auto message = kj::heap<capnp::MallocMessageBuilder>();
++  auto root = message->initRoot<rpc::Frankenvalue>();
++  props.toCapnp(root);
++  auto caps = props.getCapTable();
++  auto table = root.getCapTable().initAs<capnp::List<threaded::rpc::Channel>>(caps.size());
++  for (auto i: kj::indices(caps)) {
++    auto& channel =
++        KJ_REQUIRE_NONNULL(kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*caps[i]),
++            "native props only transfer resolved service or actor channels");
++    table[i].setService(kj::heap<ChannelBootstrap>(state, channel.addRef()));
++  }
++  return message;
++}
++
++class NodeBindingDispatcher final: public rpc::EventDispatcher::Server {
++ public:
++  NodeBindingDispatcher(
++      rpc::WorkerdBootstrap::Client bootstrap, kj::String envelope, PropsMessage props)
++      : bootstrap(kj::mv(bootstrap)),
++        envelope(kj::mv(envelope)),
++        props(kj::mv(props)) {}
++  rpc::EventDispatcher::Client startEvent(bool http) {
++    if (props.get() != nullptr) {
++      auto request = bootstrap.castAs<threaded::rpc::Bootstrap>().startNativeEventRequest();
++      if (http) request.setCfBlobJson(envelope);
++      request.setCoworkerdProps(props->getRoot<rpc::Frankenvalue>());
++      return request.send().getDispatcher();
++    }
++    auto request = bootstrap.startEventRequest();
++    if (http) request.setCfBlobJson(envelope);
++    return request.send().getDispatcher();
++  }
++  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
++    return context.tailCall(startEvent(true).getHttpServiceRequest());
++  }
++  kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
++    auto session = startEvent(false).jsRpcSessionRequest().send();
++    auto bind = session.getTopLevel().callRequest();
++    bind.setMethodName(envelope);
++    auto bound = bind.send();
++    auto results = context.getResults();
++    results.setTopLevel(bound.getCallPipeline());
++    results.setSession(session.getSession());
++    return kj::READY_NOW;
++  }
++
++ private:
++  rpc::WorkerdBootstrap::Client bootstrap;
++  kj::String envelope;
++  PropsMessage props;
++};
++
++struct BindingConnection {
++  kj::Own<kj::NetworkAddress> address;
++  kj::Own<kj::HttpClient> connector;
++  kj::Own<kj::AsyncIoStream> stream;
++  capnp::TwoPartyClient rpc;
++  BindingConnection(kj::Own<kj::NetworkAddress> address,
++      kj::Own<kj::HttpClient> connector,
++      kj::Own<kj::AsyncIoStream> stream)
++      : address(kj::mv(address)),
++        connector(kj::mv(connector)),
++        stream(kj::mv(stream)),
++        rpc(*this->stream) {}
++};
++
++kj::Promise<kj::Own<WorkerInterface>> openBinding(
++    ThreadState& state, kj::String addressText, kj::String envelope, PropsMessage props = {}) {
++  KJ_REQUIRE(addressText.size() != 0, "missing node binding socket");
++  auto address = co_await state.io.provider->getNetwork().parseAddress(addressText);
++  auto connector = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
++  auto tunnel = connector->connect("coworkerd-server", kj::HttpHeaders(*state.headers), {});
++  auto status = co_await tunnel.status;
++  KJ_REQUIRE(status.statusCode == 200, "node binding CONNECT failed");
++  auto connection =
++      kj::heap<BindingConnection>(kj::mv(address), kj::mv(connector), kj::mv(tunnel.connection));
++  rpc::EventDispatcher::Client dispatcher = kj::heap<NodeBindingDispatcher>(
++      connection->rpc.bootstrap().castAs<rpc::WorkerdBootstrap>(), kj::mv(envelope), kj::mv(props));
++  kj::Own<WorkerInterface> result = kj::heap<RpcWorkerInterface>(
++      state.http, state.bytes, getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher));
++  co_return result.attach(kj::mv(connection));
++}
++
++class EgressWorker final: public WorkerInterface {
++ public:
++  EgressWorker(ThreadState& state, kj::Own<kj::NetworkAddress> address, kj::String identity)
++      : state(state),
++        address(kj::mv(address)),
++        client(kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *this->address)),
++        service(kj::newHttpService(*client)),
++        identity(kj::mv(identity)) {}
++  kj::Promise<void> request(kj::HttpMethod method,
++      kj::StringPtr url,
++      const kj::HttpHeaders& headers,
++      kj::AsyncInputStream& body,
++      Response& response) override {
++    auto outgoing = headers.clone();
++    outgoing.set(state.egressSource, identity);
++    struct EgressResponse final: Response {
++      EgressResponse(Response& inner, kj::HttpHeaderId errorId): inner(inner), errorId(errorId) {}
++      kj::Own<kj::AsyncOutputStream> send(uint status,
++          kj::StringPtr text,
++          const kj::HttpHeaders& headers,
++          kj::Maybe<uint64_t> size) override {
++        KJ_IF_SOME(error, headers.get(errorId)) {
++          kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str("jsg.Error: ", error)));
++        }
++        return inner.send(status, text, headers, size);
++      }
++      kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
++        return inner.acceptWebSocket(headers);
++      }
++      Response& inner;
++      kj::HttpHeaderId errorId;
++    } checked(response, state.egressError);
++    co_await service->request(method, url, outgoing, body, checked);
++  }
++  kj::Promise<void> connect(kj::StringPtr,
++      const kj::HttpHeaders&,
++      kj::AsyncIoStream&,
++      ConnectResponse&,
++      kj::HttpConnectSettings) override {
++    unsupported("outbound CONNECT");
++  }
++  kj::Promise<void> prewarm(kj::StringPtr) override {
++    return kj::READY_NOW;
++  }
++  kj::Promise<ScheduledResult> runScheduled(kj::Date, kj::StringPtr) override {
++    unsupported("scheduled outbound");
++  }
++  kj::Promise<AlarmResult> runAlarm(kj::Date, uint32_t) override {
++    unsupported("outbound alarm");
++  }
++  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
++    return event->notSupported().attach(kj::mv(event));
++  }
++
++ private:
++  ThreadState& state;
++  kj::Own<kj::NetworkAddress> address;
++  kj::Own<kj::HttpClient> client;
++  kj::Own<kj::HttpService> service;
++  kj::String identity;
++};
++
++kj::Promise<kj::Own<WorkerInterface>> openEgress(
++    ThreadState& state, kj::String addressText, kj::String identity) {
++  if (addressText.size() == 0) {
++    kj::throwRecoverableException(KJ_EXCEPTION(FAILED, "jsg.Error: EGRESS_DENIED: egress-off"));
++  }
++  auto address = co_await state.io.provider->getNetwork().parseAddress(addressText);
++  co_return kj::heap<EgressWorker>(state, kj::mv(address), kj::mv(identity));
++}
++
++struct Channels final: IoChannelFactory {
++  Channels(
++      ThreadState& state, ThreadedServer& server, std::shared_ptr<Slot> slot, kj::StringPtr input)
++      : document(input),
++        state(state),
++        server(server),
++        slot(std::move(slot)) {}
++  JsonDoc document;
++  ThreadState& state;
++  ThreadedServer& server;
++  std::shared_ptr<Slot> slot;
++  uint64_t sequence = 0;
++  kj::Vector<kj::String> lines;
++  bool flushing = false;
++
++  Json::Reader input() {
++    return document.get();
++  }
++  Json::Reader services() {
++    return field(field(input(), "rootPlan"), "serviceBindings");
++  }
++  Json::Reader objects() {
++    return field(field(input(), "rootPlan"), "durableObjects");
++  }
++  uint count(Json::Reader value) {
++    return value.isArray() ? value.getArray().size() : 0;
++  }
++  void abortIsolate(kj::StringPtr) override {
++    KJ_FAIL_REQUIRE("isolate abort");
++  }
++  kj::String envelope(Json::Reader target,
++      kj::StringPtr entrypoint,
++      bool assets,
++      kj::Maybe<kj::String> durable = kj::none) {
++    auto value = kj::str("{");
++    bool first = true;
++    auto add = [&](kj::StringPtr name, kj::String encoded) {
++      value = kj::str(value, first ? "" : ",", "\"", name, "\":", encoded);
++      first = false;
++    };
++    for (auto name: {"workerId", "versionId", "contentHash", "definitionHash"}) {
++      auto item = field(target, name);
++      KJ_REQUIRE(
++          item.isString() && item.getString().size() != 0, "invalid binding version identity");
++      add(name, encode(item));
++    }
++    add("treeId", encode(field(input(), "treeId")));
++    add("parentInvocationId", encode(field(input(), "invocationId")));
++    auto next = flag(input(), "requiresChildSequence") && !assets ? ++sequence : 0;
++    add("callSequence", kj::str(next));
++    add("orderSequence", kj::str(next));
++    add("sequenceMapSize", kj::str(next == 0 ? 0 : 1));
++    auto deadline =
++        threaded::rawPath(std::string_view(document.original.begin(), document.original.size()),
++            {"lease", "expiresAtMonotonicMs"});
++    add("expiresAtMonotonicMs", kj::heapString(deadline.data(), deadline.size()));
++    capnp::MallocMessageBuilder arena;
++    auto entry = arena.initRoot<Json>();
++    entry.setString(entrypoint);
++    add("entrypoint", encode(entry.asReader()));
++    if (assets) add("assets", kj::str("true"));
++    KJ_IF_SOME(object, durable) {
++      add("durableObject", kj::mv(object));
++    }
++    return kj::str(value, "}");
++  }
++  struct ObjectRoute {
++    kj::String space, className, database;
++  };
++  ObjectRoute objectRoute(uint channel) {
++    auto all = objects();
++    if (channel < count(all)) {
++      auto metadata = field(all.getArray()[channel], "metadata");
++      auto name = text(metadata, "binding");
++      auto selected = field(field(field(input(), "rootSelection"), "durableObjectBindings"), name);
++      return {
++        text(selected, "namespaceId"), text(metadata, "className"), text(metadata, "database")};
++    }
++    auto index = channel - count(all);
++    KJ_REQUIRE(index < slot->loopbackActors.size(), "invalid durable namespace channel");
++    auto& name = slot->loopbackActors[index];
++    auto spaces = field(input(), "nativeNamespaces");
++    if (spaces.isArray())
++      for (auto value: spaces.getArray()) {
++        if (text(value, "className") == name.c_str())
++          return {text(value, "namespaceId"), kj::str(name.c_str()), kj::str("")};
++      }
++    KJ_FAIL_REQUIRE("DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
++  }
++  kj::String objectEnvelope(uint channel, kj::StringPtr objectId) {
++    auto route = objectRoute(channel);
++    KJ_REQUIRE(route.space.size() != 0,
++        "jsg.Error: DO_NAMESPACE_UNAVAILABLE: the Durable Object namespace cannot be used");
++    auto quoted = [](kj::StringPtr value) {
++      capnp::MallocMessageBuilder arena;
++      auto root = arena.initRoot<Json>();
++      root.setString(value);
++      return encode(root.asReader());
++    };
++    auto object = kj::str("{\"namespaceId\":", quoted(route.space),
++        ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
++        ",\"callerNamespaceId\":\"\",\"callerObjectId\":\"\",\"database\":", quoted(route.database),
++        "}");
++    return envelope(input(), "", false, kj::mv(object));
++  }
++  kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
++    return startRequest(channel, kj::mv(metadata), kj::none);
++  }
++  kj::Own<WorkerInterface> startRequest(
++      uint channel, SubrequestMetadata metadata, kj::Maybe<Frankenvalue> props) {
++    if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
++      auto identity =
++          kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
++              ",\"versionId\":", encode(field(input(), "versionId")), "}");
++      return newPromisedWorkerInterface(
++          openEgress(state, kj::str(server.egressAddress.c_str()), kj::mv(identity)));
++    }
++    auto serviceCount = count(services());
++    auto objectCount = count(objects());
++    auto index = channel - IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
++    kj::String descriptor;
++    if (index < serviceCount) {
++      auto route = services().getArray()[index];
++      auto name = text(field(route, "metadata"), "name");
++      auto props = field(field(route, "target"), "props");
++      bool assets = flag(props, "assets");
++      auto target =
++          assets ? input() : field(field(field(input(), "rootSelection"), "serviceVersions"), name);
++      descriptor = envelope(target, text(props, "entrypoint"), assets);
++    } else if (index < serviceCount + objectCount) {
++      auto route = index - serviceCount;
++      auto name = text(field(objects().getArray()[route], "metadata"), "binding");
++      auto selected = field(field(field(input(), "rootSelection"), "durableObjectBindings"), name);
++      descriptor = objectEnvelope(route, text(selected, "objectId"));
++    } else {
++      auto route = index - serviceCount - objectCount;
++      KJ_REQUIRE(route < slot->loopbacks.size(), "invalid loopback channel");
++      descriptor = envelope(input(), slot->loopbacks[route].c_str(), false);
++    }
++    PropsMessage serialized;
++    KJ_IF_SOME(value, props) {
++      serialized = writeNativeProps(state, value);
++    }
++    return newPromisedWorkerInterface(openBinding(
++        state, kj::str(server.bindingAddress.c_str()), kj::mv(descriptor), kj::mv(serialized)));
++  }
++  struct Bound final: SubrequestChannel {
++    Bound(kj::Rc<Channels> owner,
++        uint channel,
++        kj::Maybe<kj::String> object,
++        kj::Maybe<Frankenvalue> props = kj::none)
++        : owner(kj::mv(owner)),
++          channel(channel),
++          object(kj::mv(object)),
++          props(kj::mv(props)) {}
++    kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
++      KJ_IF_SOME(id, object) {
++        return newPromisedWorkerInterface(openBinding(owner->state,
++            kj::str(owner->server.bindingAddress.c_str()), owner->objectEnvelope(channel, id)));
++      }
++      return owner->startRequest(
++          channel, kj::mv(metadata), props.map([](Frankenvalue& value) { return value.clone(); }));
++    }
++    void requireAllowsTransfer() override {}
++    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
++        ChannelTokenUsage) override {
++      unsupported("binding persistence");
++    }
++    kj::Rc<Channels> owner;
++    uint channel;
++    kj::Maybe<kj::String> object;
++    kj::Maybe<Frankenvalue> props;
++  };
++  kj::Rc<SubrequestChannel> getSubrequestChannelResolved(
++      uint channel, kj::Maybe<Frankenvalue> props, kj::Maybe<VersionRequest>, Persistent) override {
++    auto base = IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT + count(services()) + count(objects());
++    KJ_REQUIRE(props == kj::none || channel >= base, "props require a loopback channel");
++    return kj::rc<Bound>(kj::addRef(*this), channel, kj::none, kj::mv(props));
++  }
++  kj::Rc<ActorClassChannel> getActorClassResolved(
++      uint, kj::Maybe<Frankenvalue>, Persistent) override {
++    unsupported("actor class transfer");
++  }
++  capnp::Capability::Client getCapability(uint) override {
++    unsupported("capability");
++  }
++  kj::Own<CacheClient> getCache() override {
++    return kj::heap<Cache>();
++  }
++  TimerChannel& getTimer() override {
++    return state.timer;
++  }
++  kj::Promise<void> writeLogfwdr(
++      uint, kj::FunctionParam<void(capnp::AnyPointer::Builder)>) override {
++    unsupported("log forwarding binding");
++  }
++  kj::Rc<ActorChannel> getGlobalActor(uint channel,
++      const ActorIdFactory::ActorId& id,
++      kj::Maybe<kj::String>,
++      ActorGetMode,
++      bool,
++      ActorRoutingMode,
++      SpanParent,
++      kj::Maybe<ActorVersion>,
++      Persistent) override {
++    auto& object = kj::downcast<const ObjectIdFactory::Id>(id);
++    auto route = objectRoute(channel);
++    JSG_REQUIRE(
++        object.space == route.space, TypeError, "ID is not for this Durable Object namespace.");
++    return kj::rc<Bound>(kj::addRef(*this), channel, id.toString());
++  }
++  kj::Rc<ActorChannel> getColoLocalActor(uint, kj::StringPtr, SpanParent) override {
++    unsupported("local actor");
++  }
++  void log(kj::StringPtr level, kj::StringPtr message) {
++    capnp::MallocMessageBuilder arena;
++    auto value = arena.initRoot<Json>();
++    value.setString(message);
++    lines.add(kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}"));
++    if (!flushing) {
++      flushing = true;
++      IoContext::current().addWaitUntil(kj::evalLater(
++          [self = kj::addRef(*this)]() mutable { return self->flushLogs().attach(kj::mv(self)); }));
++    }
++  }
++  kj::Promise<void> flushLogs() {
++    while (lines.size() != 0) {
++      auto batch = lines.releaseAsArray();
++      auto body = kj::str("{\"workerId\":", encode(field(input(), "workerId")),
++          ",\"versionId\":", encode(field(input(), "versionId")),
++          ",\"invocationId\":", encode(field(input(), "invocationId")), ",\"lines\":[",
++          kj::strArray(batch, ","), "]}");
++      auto address =
++          co_await state.io.provider->getNetwork().parseAddress(server.sourceAddress.c_str());
++      auto client = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
++      auto generation = field(input(), "processGeneration");
++      auto url = kj::str("/v1/log?processId=", text(input(), "processId"), "&processGeneration=",
++          generation.isString() ? kj::str(generation.getString()) : encode(generation));
++      kj::HttpHeaders headers(*state.headers);
++      headers.set(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
++      auto request = client->request(kj::HttpMethod::POST, url, headers, body.size());
++      co_await request.body->write(body.asBytes());
++      auto response = co_await request.response;
++      co_await response.body->readAllBytes(1u << 20);
++    }
++    flushing = false;
++  }
++};
++
++class TenantTracer final: public BaseTracer {
++ public:
++  explicit TenantTracer(kj::Rc<Channels> channels): channels(kj::mv(channels)) {}
++  void addLog(const tracing::InvocationSpanContext&,
++      kj::Date,
++      LogLevel level,
++      kj::String message,
++      tracing::LogErrorInfo) override {
++    JsonDoc parsed(message);
++    auto parts = parsed.get();
++    auto joined = kj::str("");
++    if (parts.isArray()) {
++      bool first = true;
++      for (auto item: parts.getArray()) {
++        joined = kj::str(
++            joined, first ? "" : " ", item.isString() ? kj::str(item.getString()) : encode(item));
++        first = false;
++      }
++    } else
++      joined = kj::mv(message);
++    if (joined.startsWith("[tenant-entry] ")) return;
++    kj::StringPtr name = "log";
++    switch (level) {
++      case LogLevel::DEBUG_:
++        name = "debug";
++        break;
++      case LogLevel::INFO:
++        name = "info";
++        break;
++      case LogLevel::WARN:
++        name = "warn";
++        break;
++      case LogLevel::ERROR:
++        name = "error";
++        break;
++      default:
++        break;
++    }
++    channels->log(name, joined);
++  }
++  void addSpanOpen(tracing::SpanId, tracing::SpanId, kj::ConstString, kj::Date) override {}
++  void addSpanClose(tracing::SpanEndData&&, kj::Maybe<kj::Date>) override {}
++  void addSpanUpdate(tracing::SpanId, tracing::SpanUpdate&&) override {}
++  void addSpanAttribute(
++      const tracing::InvocationSpanContext&, kj::ConstString, tracing::Attribute::Value) override {}
++  void addException(const tracing::InvocationSpanContext&,
++      kj::Date,
++      kj::String,
++      kj::String,
++      kj::Maybe<kj::String>) override {}
++  void addSpanException(tracing::SpanId,
++      kj::Date,
++      kj::Maybe<tracing::Exception::Code>,
++      kj::String,
++      kj::String,
++      kj::Maybe<kj::String>) override {}
++  void addDiagnosticChannelEvent(
++      const tracing::InvocationSpanContext&, kj::Date, kj::String, kj::Array<kj::byte>) override {}
++  void setEventInfo(IoContext::IncomingRequest&, tracing::EventInfo&&) override {}
++  void setReturn(kj::Maybe<kj::Date>, kj::Maybe<tracing::FetchResponseInfo>) override {}
++  void setOutcome(EventOutcome, kj::Duration, kj::Duration) override {}
++  void recordTimestamp(kj::Date value) override {
++    completeTime = value;
++  }
++  void setJsRpcInfo(
++      const tracing::InvocationSpanContext&, kj::Date, const kj::ConstString&) override {}
++  void markUnused() override {}
++
++ private:
++  kj::Rc<Channels> channels;
++};
++
++struct PreparedInvocation {
++  kj::Own<WorkerInterface> entry;
++  kj::Own<InvocationState> invocation;
++};
++
++// The node's binding handshake returns a reference to the entrypoint before it
++// forwards the application's first method. No tenant constructor or method runs
++// for that handshake. The reference uses the library's normal RPC serializer.
++class BindingTarget final: public rpc::JsRpcTarget::Server {
++ public:
++  BindingTarget(std::shared_ptr<Slot> slot, rpc::JsRpcTarget::Client target)
++      : slot(std::move(slot)),
++        target(kj::mv(target)) {}
++
++  DispatchCallResult dispatchCall(uint64_t interfaceId,
++      uint16_t methodId,
++      capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
++    auto params = context.getParams();
++    if (interfaceId == capnp::typeId<rpc::JsRpcTarget>() && methodId == 0) {
++      auto call = params.getAs<rpc::JsRpcTarget::CallParams>();
++      if (call.isMethodName() && call.getMethodName() == "coworkerd-bind") {
++        return {bind(kj::mv(context)), false, true};
++      }
++    }
++    auto request = target.typelessRequest(interfaceId, methodId, params.targetSize(), {});
++    request.set(params);
++    return {context.tailCall(kj::mv(request)), false, true};
++  }
++
++ private:
++  kj::Promise<void> bind(capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) {
++    KJ_REQUIRE(!bound, "one binding handshake per invocation");
++    bound = true;
++    struct External final: jsg::Serializer::ExternalHandler {
++      void serializeFunction(
++          jsg::Lock&, jsg::Serializer& serializer, v8::Local<v8::Function>) override {
++        serializer.writeRawUint32(static_cast<uint>(rpc::SerializationTag::JS_RPC_STUB));
++      }
++    } external;
++    auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
++    auto& worker = *KJ_REQUIRE_NONNULL(slot->worker);
++    worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
++      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
++        auto placeholder = jsg::check(
++            v8::Function::New(js.v8Context(), [](const v8::FunctionCallbackInfo<v8::Value>&) {}));
++        jsg::Serializer serializer(js,
++            {.version = 15,
++              .omitHeader = false,
++              .treatClassInstancesAsPlainObjects = false,
++              .externalHandler = external});
++        serializer.write(js, jsg::JsValue(placeholder));
++        results.initResult().setV8Serialized(serializer.release().data);
++      });
++    });
++    results.getResult().initExternals(1)[0].initRpcTarget().setCap(target);
++    results.setCallPipeline(target);
++    return kj::READY_NOW;
++  }
++
++  std::shared_ptr<Slot> slot;
++  rpc::JsRpcTarget::Client target;
++  bool bound = false;
++};
++
++PreparedInvocation prepareInvocation(ThreadState& state,
++    ThreadedServer& server,
++    std::shared_ptr<Slot> slot,
++    Json::Reader input,
++    kj::StringPtr raw,
++    Frankenvalue props) {
++  auto invocation = kj::refcounted<InvocationState>(slot);
++  auto worker = kj::atomicAddRef(*KJ_REQUIRE_NONNULL(slot->worker));
++  auto cf = kj::str("{\"nodeId\":", encode(field(input, "serverId")),
++      ",\"serverId\":", encode(field(input, "serverId")));
++  for (auto name: {"processId", "workerId", "versionId", "contentHash", "invocationId", "treeId",
++         "ingressServerId", "lease", "orderSequence", "depth"})
++    if (kj::StringPtr(name) == "lease") {
++      auto lease = threaded::rawPath(std::string_view(raw.begin(), raw.size()), {"lease"});
++      cf = kj::str(cf, ",\"lease\":", kj::heapString(lease.data(), lease.size()));
++    } else
++      cf = kj::str(cf, ",\"", name, "\":", encode(field(input, name)));
++  auto generation = field(input, "processGeneration");
++  cf = kj::str(cf, ",\"processGeneration\":",
++      generation.isString() ? kj::str(generation.getString()) : encode(generation), "}");
++  auto entrypoint = field(input, "entrypoint").isString() ? str(input, "entrypoint") : "";
++  auto channels = kj::rc<Channels>(state, server, slot, raw);
++  auto tracer = kj::rc<TenantTracer>(channels.addRef());
++  auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
++      entrypoint.empty() || entrypoint == "default"
++          ? kj::Maybe<kj::String>(kj::none)
++          : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
++      kj::mv(props), kj::none,
++      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer,
++          kj::str("\"workerId\":", encode(field(input, "workerId")),
++              ",\"versionId\":", encode(field(input, "versionId")),
++              ",\"invocationId\":", encode(field(input, "invocationId")), ",")),
++      kj::addRef(*invocation), kj::mv(channels), kj::refcounted<RequestObserver>(), state.tasks,
++      true, kj::mv(tracer), kj::mv(cf), kj::none);
++  return {kj::mv(entry), kj::mv(invocation)};
++}
++
++kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
++  KJ_REQUIRE(!used, "one event per invocation");
++  used = true;
++  JsonDoc document(descriptor);
++  auto input = document.get();
++  KJ_REQUIRE(!flag(input, "trial"), "a trial load cannot start an RPC session");
++  bool coldLoaded = false;
++  auto slot = co_await server.getWorker(input, state, coldLoaded);
++  auto prepared = kj::heap<PreparedInvocation>(
++      prepareInvocation(state, server, slot, input, descriptor, kj::mv(props)));
++  auto event = kj::heap<api::JsRpcSessionCustomEvent>(
++      api::JsRpcSessionCustomEvent::WORKER_RPC_EVENT_TYPE, kj::none);
++  auto target = event->getCap();
++  auto completed = prepared->entry->customEvent(kj::mv(event));
++  auto results = context.getResults();
++  results.setTopLevel(kj::heap<BindingTarget>(std::move(slot), kj::mv(target)));
++  results.setSession(completed.then(
++      [prepared = kj::mv(prepared)](auto) { return rpc::JsRpcSession::Client(nullptr); }));
++}
++
 +kj::Promise<void> Invocation::request(kj::HttpMethod method,
 +    kj::StringPtr url,
 +    const kj::HttpHeaders& headers,
@@ -1027,29 +2453,27 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +  const bool trial = flag(input, "trial");
 +  std::shared_ptr<Slot> slot;
 +  kj::Maybe<kj::String> loadError;
++  auto loadStage = threaded::LoadStage::LOAD;
 +  bool coldLoaded = false;
 +  try {
-+    for (auto name: {"bindings", "durableObjects"}) {
-+      auto values = field(input, name);
-+      if (values.isArray() && values.getArray().size() != 0)
-+        unsupported("service bindings and object stubs require S1b");
-+    }
-+    for (auto name: {"cpuLimitMs", "memoryLimitMiB"}) {
-+      auto value = field(input, name);
-+      if (value.isNumber() && value.getNumber() != 0)
-+        unsupported("tenant limit overrides require S1b");
-+    }
 +    slot = co_await server.getWorker(input, state, coldLoaded);
 +  } catch (const kj::Exception& error) {
 +    if (!trial) throw;
 +    loadError = kj::str(error.getDescription());
++    KJ_IF_SOME(stage, error.getDetail(LOAD_STAGE_DETAIL)) {
++      if (stage.size() == 1 && stage[0] <= static_cast<kj::byte>(threaded::LoadStage::EVALUATION))
++        loadStage = static_cast<threaded::LoadStage>(stage[0]);
++    }
 +  }
 +  KJ_IF_SOME(message, loadError) {
 +    capnp::MallocMessageBuilder arena;
 +    auto value = arena.initRoot<Json>();
 +    value.setString(message);
++    auto info = threaded::loadStageInfo(loadStage);
 +    auto report =
-+        kj::str("{\"ok\":false,\"stage\":\"evaluation\",\"message\":", encode(value), "}");
++        kj::str("{\"ok\":false,\"stage\":\"", kj::heapString(info.stage.data(), info.stage.size()),
++            "\",\"codeStage\":\"", kj::heapString(info.codeStage.data(), info.codeStage.size()),
++            "\",\"name\":\"Error\",\"message\":", encode(value), "}");
 +    auto output = response.send(200, "OK", kj::HttpHeaders(*state.headers), report.size());
 +    co_await output->write(report.asBytes());
 +    co_return;
@@ -1069,32 +2493,33 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +      first = false;
 +    }
 +    names = kj::str(names, "]");
-+    auto report = kj::str("{\"ok\":true,\"nativeHttpValidated\":true,\"coldLoad\":",
-+        coldLoaded ? "true" : "false", ",\"defaultKind\":\"native\",\"namedEntrypoints\":", names,
-+        ",\"hasDefault\":", slot->httpEntrypoints.contains("default") ? "true" : "false",
-+        ",\"entrypointUsable\":", slot->httpEntrypoints.contains(entrypoint) ? "true" : "false",
-+        "}");
++    auto classes = kj::str("[");
++    auto declared = field(input, "durableObjectClasses");
++    if (declared.isArray()) {
++      bool first = true;
++      for (auto name: declared.getArray()) {
++        bool usable = name.isString() && slot->actorClasses.contains(name.getString().cStr());
++        classes = kj::str(classes, first ? "" : ",", "{\"name\":", encode(name),
++            ",\"usable\":", usable ? "true" : "false", ",\"reason\":",
++            usable ? "null" : "\"class is missing or is not a Durable Object class\"", "}");
++        first = false;
++      }
++    }
++    classes = kj::str(classes, "]");
++    auto report = kj::str("{\"ok\":true,\"nativeHttpValidated\":",
++        slot->httpEntrypoints.contains(entrypoint) ? "true" : "false",
++        ",\"durableObjectClasses\":", classes,
++        ",\"rootBridgeChecked\":true,\"coldLoad\":", coldLoaded ? "true" : "false",
++        ",\"defaultKind\":\"native\",\"namedEntrypoints\":", names,
++        ",\"hasDefault\":", slot->entrypoints.contains("default") ? "true" : "false",
++        ",\"entrypointUsable\":", slot->entrypoints.contains(entrypoint) ? "true" : "false", "}");
 +    auto output = response.send(200, "OK", kj::HttpHeaders(*state.headers), report.size());
 +    co_await output->write(report.asBytes());
 +    co_return;
 +  }
-+  auto invocation = kj::refcounted<InvocationState>(slot);
-+  auto worker = kj::atomicAddRef(*KJ_REQUIRE_NONNULL(slot->worker));
-+  auto cf = kj::str("{\"nodeId\":", encode(field(input, "serverId")),
-+      ",\"serverId\":", encode(field(input, "serverId")));
-+  for (auto name: {"processId", "workerId", "versionId", "contentHash", "invocationId", "treeId",
-+         "ingressServerId", "lease", "orderSequence", "depth"})
-+    cf = kj::str(cf, ",\"", name, "\":", encode(field(input, name)));
-+  auto generation = field(input, "processGeneration");
-+  cf = kj::str(cf, ",\"processGeneration\":",
-+      generation.isString() ? kj::str(generation.getString()) : encode(generation), "}");
-+  auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
-+      entrypoint == "default" ? kj::Maybe<kj::String>(kj::none)
-+                              : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
-+      Frankenvalue(), kj::none,
-+      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer), kj::addRef(*invocation),
-+      kj::rc<Channels>(state.timer), kj::refcounted<RequestObserver>(), state.tasks, true, kj::none,
-+      kj::mv(cf), kj::none);
++  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props));
++  auto& invocation = prepared.invocation;
++  auto& entry = prepared.entry;
 +  kj::Maybe<kj::Exception> failure;
 +  try {
 +    co_await entry->request(method, url, headers, body, response);
@@ -1196,8 +2621,8 @@ index 0000000000000000000000000000000000000000..bced01e2dfde903ee6813f5b8b373b3d
 +                "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded lifecycle controls require S1c\"}";
 +          }
 +          connection.output = "HTTP/1.1 " + std::string(status) +
-+              "\r\nContent-Length: " + std::to_string(body.size()) +
-+              "\r\nConnection: close\r\n\r\n" + body;
++              "\r\nX-Coworkerd-Threaded-Protocol: 2\r\nContent-Length: " +
++              std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
 +        }
 +      }
 +      if (!connection.output.empty() && !close) {

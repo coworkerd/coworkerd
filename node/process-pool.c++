@@ -291,15 +291,16 @@ public:
   void replenish() {
     if (!filling && !disconnected) tasks.add(fill());
   }
-  kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor);
+  kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
   kj::Own<capnp::TwoPartyClient> rpc;
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
-  OpenEvent open(kj::StringPtr descriptor) {
-    if (threaded) return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor))), kj::READY_NOW};
+  OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
+    if (threaded) return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps))), kj::READY_NOW};
+    KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
     auto request = bootstrap.startEventRequest();
     request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
     auto response = request.send();
@@ -322,7 +323,7 @@ private:
   std::shared_ptr<RuntimeConnection> connection;
 };
 
-kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor) {
+kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -340,10 +341,18 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   co_await connection->stream->write(kj::StringPtr("T").asBytes());
   connection->rpc = kj::heap<capnp::TwoPartyClient>(*connection->stream);
   connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
-  auto request = connection->bootstrap.startEventRequest();
-  request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
-  auto response = request.send();
-  co_return capnp::membrane(response.getDispatcher(), kj::refcounted<InvocationConnection>(connection));
+  v1::rpc::EventDispatcher::Client dispatcher = nullptr;
+  if (nativeProps) {
+    auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
+    request.setCfBlobJson(descriptor);
+    request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+    dispatcher = request.send().getDispatcher();
+  } else {
+    auto request = connection->bootstrap.startEventRequest();
+    request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+    dispatcher = request.send().getDispatcher();
+  }
+  co_return capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
 }
 
 // The identity of an executable file as stat() sees it; content hashes are keyed by it.
@@ -867,6 +876,7 @@ std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCal
 struct ProcessGeneration {
   std::string id;
   bool threaded = false;
+  uint32_t threadedProtocol = 0;
   bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
   uint64_t generation;
@@ -1750,7 +1760,8 @@ public:
     std::ostringstream out;
     out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false")
         << ",\"ordinaryServer\":\"" << (p.threaded ? "threaded" : "upstream")
-        << "\",\"limitsEnforced\":" << (p.threaded ? "false" : "true");
+        << "\",\"threadedProtocol\":" << p.threadedProtocol
+        << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol >= 2 ? "true" : "false");
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -2374,6 +2385,11 @@ public:
     }
     if (p->launched) childEnvironment.push_back("COWORKERD_NON_DUMPABLE=1");
 #endif
+    if (p->threaded) {
+      childEnvironment.push_back("COWORKERD_THREADED_BINDING_ADDRESS=" + bindingAddress);
+      childEnvironment.push_back("COWORKERD_THREADED_EGRESS_ADDRESS=" + egressAddress);
+      childEnvironment.push_back("COWORKERD_THREADED_EGRESS_TOKEN=" + p->egressToken);
+    }
     std::vector<char*> childEnv;
     for (auto& entry: childEnvironment) childEnv.push_back(entry.data());
     childEnv.push_back(nullptr);
@@ -2525,6 +2541,9 @@ public:
             p->probeClient->request(kj::HttpMethod::GET, "/__coworkerd/probe", probeHeaders).response);
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
+        if (p->threaded) response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
+          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "2") p->threadedProtocol = 2;
+        });
         if (!p->binary.valid) {
           // The generation's identity attaches once it answered its probe: it is the workerd
           // file the Server opened for it at the spawn -- what the launcher bound, or what posix_spawn
@@ -3720,7 +3739,8 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
   });
   return counts;
 }
-OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash) {
+OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat[hash] = mono();
@@ -3734,7 +3754,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   }
   // From this send onward, a lost connection or a dead child is never retried.
   call->dispatched = true;
-  auto result = p->runtime->open(descriptor);
+  auto result = p->runtime->open(descriptor, std::move(nativeProps));
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     call->snapshotAfterFailure();
     return kj::mv(error);

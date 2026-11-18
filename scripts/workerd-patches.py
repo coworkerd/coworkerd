@@ -129,7 +129,9 @@ def allowed_path(name, path):
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
-                              'src/workerd/threaded/threaded-server.c++'} or
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/protocol.h',
+                              'src/workerd/threaded/protocol.capnp'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <capnp/message.h>
+
 #include "coworkerd.capnp.h"
 #include "config.h"
 #include "suspects.h"
@@ -140,7 +142,8 @@ public:
   // The quarantine process a tenant's trials and (when it is a suspect) calls go to first; "" without one.
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
-      const std::string& definitionHash);
+      const std::string& definitionHash,
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {});
   std::string json(uint32_t idleMs) const;
   std::string placementJson(const std::vector<std::string>& workers);
   // A rotation's switch from a generation: `callback(processId, generation)` tells that generation's WebSocket

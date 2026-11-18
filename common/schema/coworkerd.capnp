@@ -67,6 +67,13 @@ interface WorkerdBootstrap @0x878048cda334ade3 {
       -> (dispatcher :EventDispatcher);
 }
 
+# Native ordinary-process loopback props. The wire type and method are private
+# to this transport; upstream workerd keeps using WorkerdBootstrap unchanged.
+interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
+  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer)
+      -> (dispatcher :EventDispatcher);
+}
+
 interface PeerServer @0xab4d6df924ec776f {
   openInvocation @0 (invocation :RemoteInvocation)
       -> (result :InvocationOpenResult);
@@ -172,6 +179,8 @@ struct RemoteInvocation {
   ingressRoot @16 :Bool = false;
   ingressServerId @17 :Text;
   entrypoint @18 :Text;
+  # Opaque native loopback props, including its capability table. Nodes only copy it.
+  coworkerdProps @19 :AnyPointer;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
