@@ -199,7 +199,7 @@ void cache() {
 }
 class BundleStoreFault final: public kj::HttpService {
 public:
-  enum class Mode { MISSING, CORRUPT, CUT, SLOW, GOOD };
+  enum class Mode { MISSING, CORRUPT, CUT, SLOW, SLOW_FAILURE, GOOD };
   explicit BundleStoreFault(const kj::HttpHeaderTable& table): table(table) {}
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr, const kj::HttpHeaders&,
       kj::AsyncInputStream&, Response& response) override {
@@ -208,6 +208,12 @@ public:
     kj::HttpHeaders headers(table);
     if (mode == Mode::MISSING) {
       response.send(404, "Not Found", headers, uint64_t(0));
+      co_return;
+    }
+    if (mode == Mode::SLOW_FAILURE) {
+      waiting.fulfiller->fulfill();
+      co_await kj::mv(release.promise);
+      response.send(503, "Service Unavailable", headers, uint64_t(0));
       co_return;
     }
     auto body = response.send(200, "OK", headers, uint64_t(4));
@@ -286,6 +292,50 @@ void cacheFaults(bool slow) {
     KJ_REQUIRE(cache.read(key, 2000).wait(io.waitScope).bytes == "good");
   }
   KJ_REQUIRE(number(cache.json(), "entries") == 1 && number(cache.json(), "fetchSucceeded") == 1);
+}
+
+void cacheSingleFlight() {
+  using Mode = BundleStoreFault::Mode;
+  for (const auto failure : {false, true}) {
+    TempDir path;
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    auto& network = io.provider->getNetwork();
+    auto listener = network.parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpHeaderTable table;
+    BundleStoreFault service(table);
+    service.mode = failure ? Mode::SLOW_FAILURE : Mode::SLOW;
+    kj::HttpServer server(timer, table, service);
+    auto http = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    ObjectStore storage(config, network, timer);
+    BundleCacheConfig settings;
+    settings.directory = path / "cache";
+    BundleCache cache(storage, settings, timer);
+    const auto key = objectSha256("good");
+    std::vector<kj::Promise<BundleCache::Read>> reads;
+    for (unsigned i = 0; i < 32; ++i) reads.push_back(cache.read(key, 2000).eagerlyEvaluate(nullptr));
+    timer.timeoutAfter(2 * kj::SECONDS, kj::mv(service.waiting.promise)).wait(io.waitScope);
+    for (auto& read : reads) KJ_REQUIRE(!read.poll(io.waitScope), "all 32 callers must wait for the same GET");
+    KJ_REQUIRE(service.requests == 1 && number(cache.json(), "singleFlightMerged") == 31);
+    KJ_REQUIRE(std::filesystem::is_empty(settings.directory));
+    service.release.fulfiller->fulfill();
+    for (auto& read : reads) {
+      auto result = timer.timeoutAfter(2 * kj::SECONDS, kj::mv(read)).wait(io.waitScope);
+      if (failure) KJ_REQUIRE(result.bytes.empty() && result.reason == "code unavailable: fetch failed HTTP 503");
+      else KJ_REQUIRE(result.bytes == "good" && result.reason.empty());
+    }
+    KJ_REQUIRE(service.requests == 1);
+    if (failure) KJ_REQUIRE(std::filesystem::is_empty(settings.directory));
+    service.mode = Mode::GOOD;
+    KJ_REQUIRE(cache.read(key, 2000).wait(io.waitScope).bytes == "good");
+    KJ_REQUIRE(cache.read(key, 2000).wait(io.waitScope).bytes == "good");
+    KJ_REQUIRE(service.requests == (failure ? 2 : 1));
+    KJ_REQUIRE(number(cache.json(), "entries") == 1 && number(cache.json(), "fetchSucceeded") == 1);
+  }
 }
 
 void cacheCapacity() {
@@ -389,6 +439,7 @@ int main(int argc, char* argv[]) {
   else if (name == "cache-unavailable") cacheFaults(false);
   else if (name == "cache-deadline") cacheFaults(true);
   else if (name == "cache-capacity") cacheCapacity();
+  else if (name == "cache-single-flight") cacheSingleFlight();
   else if (name == "rejected-manifest") rejectedManifest();
   else KJ_FAIL_REQUIRE("unknown contract test", argv[1]);
 }
