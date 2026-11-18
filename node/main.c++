@@ -4067,17 +4067,11 @@ private:
       const std::string& platformCode = "") {
     auto code = limitCode();
     if (platformCode == "NOT_SUPPORTED") code = platformCode;
-    // A native invocation closes its connection when its absolute lease ends.
-    // The node owns the deadline, so this classification needs no tenant report
-    // and does not assert that the already-dispatched call never executed.
-    if (code.empty() && slot->process && slot->process->threadedServer() &&
-        slot->deadline > 0 && monotonicTimeMs() >= slot->deadline) code = "LEASE_EXPIRED";
     const bool unsupported = code == "NOT_SUPPORTED";
-    const auto status = unsupported ? 501u : code == "LEASE_EXPIRED" ? 410u : 503u;
-    slot->report(status, code.empty() ? "RESULT_UNCERTAIN" : code);
-    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, status, statusText(status),
-        rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code,
-            code == "LEASE_EXPIRED" ? "invocation lease expired" : failure, slot->deadline));
+    slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
+    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
+        unsupported ? "Not Implemented" : "Service Unavailable",
+        rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
     co_await rejection->respond(tracked);
   }
   // The limit that ended the call, if one did ("" otherwise).

@@ -1320,6 +1320,36 @@ bool ProcessCall::memoryLimitExceeded() const {
 template <typename T> const char* processClass(const T& p) { return p.durable ? "durable" : p.quarantine ? "quarantine" : "ordinary"; }
 template <typename T> uint32_t processClassCode(const T& p) { return p.durable ? 2 : p.quarantine ? 1 : 0; }
 
+// Validate both active and recently completed invocations before attribution.
+template <typename Limits, typename Labelled, typename Confirmed>
+std::string confirmedCpuCulprit(ProcessGeneration& p, Limits limits, Labelled labelled, Confirmed confirmed) {
+  p.pullEvents();
+  const auto row = p.culpritRow;
+  if (row.empty() || row.size() > 16384) return "null";
+  try {
+    capnp::MallocMessageBuilder message;
+    auto value = message.initRoot<v1::rpc::CpuReport>();
+    capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), value);
+    auto call = p.calls.find(value.getInvocationId().cStr());
+    // The limit this Worker's executions run under (its own where it names one): the row has to be
+    // against that limit, and to have spent it.
+    const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
+    const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
+      return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
+    });
+    const auto limit = call == p.calls.end() ? (recent ? limits(worker, p.durable).cpuMs : 0u) : limits(call->second->workerId, p.durable).cpuMs;
+    if (!limit) return "null";
+    if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
+        value.getCpuLimitMs() != limit ||
+        value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
+        (call == p.calls.end() ? !recent : (!call->second->dispatched ||
+        call->second->workerId != worker || call->second->versionId != version))) return "null";
+    if (!labelled(p, value.getIsolate().cStr(), worker, version)) return "null";
+    confirmed(worker);
+    return capnp::JsonCodec().encode(value.asReader()).cStr();
+  } catch (const kj::Exception&) { return "null"; }
+}
+
 class ProcessPool::Impl final: public kj::TaskSet::ErrorHandler {
 public:
   struct Slot {
@@ -2908,31 +2938,12 @@ public:
   }
   // The latest culprit row the watchdog thread wrote and no termination has withdrawn since.
   std::string culprit(ProcessGeneration& p) {
-    p.pullEvents();
-    const auto row = p.culpritRow;
-    if (row.empty() || row.size() > 16384) return "null";
-    try {
-      capnp::MallocMessageBuilder message;
-      auto value = message.initRoot<v1::rpc::CpuReport>();
-      capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), value);
-      auto call = p.calls.find(value.getInvocationId().cStr());
-      // The limit this Worker's executions run under (its own where it names one): the row has to be
-      // against that limit, and to have spent it.
-      const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
-      const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
-        return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
-      });
-      const auto limit = call == p.calls.end() ? (recent ? limitsOf(worker, p.durable).cpuMs : 0u) : limitsOf(call->second->workerId, p.durable).cpuMs;
-      if (!limit) return "null";
-      if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
-          value.getCpuLimitMs() != limit ||
-          value.getCpuUsedNs() < uint64_t(limit) * 1000000 ||
-          (call == p.calls.end() ? !recent : (!call->second->dispatched ||
-          call->second->workerId != worker || call->second->versionId != version))) return "null";
-      if (!labelledIsolate(p, value.getIsolate().cStr(), call->second->workerId, call->second->versionId)) return "null";
-      ++workerCpuStats[worker].culprit;
-      return capnp::JsonCodec().encode(value.asReader()).cStr();
-    } catch (const kj::Exception&) { return "null"; }
+    return confirmedCpuCulprit(p,
+        [this](const std::string& worker, bool durable) { return limitsOf(worker, durable); },
+        [this](ProcessGeneration& process, const std::string& isolate, const std::string& worker, const std::string& version) {
+          return labelledIsolate(process, isolate, worker, version);
+        },
+        [this](const std::string& worker) { ++workerCpuStats[worker].culprit; });
   }
   void killProcess(ProcessGeneration& p, const std::string& reason, double duration) {
     if (p.pid == 0 || p.state == "killed") return;

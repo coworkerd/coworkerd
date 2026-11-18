@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 23:49:12 +0800
+Date: Thu, 19 Nov 2026 00:22:11 +0800
 Subject: [PATCH] Native threaded execution, channels, limits and lifecycle
 
 
@@ -599,10 +599,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..4cbed756eeba147532bc008adf9ad429f2eacfb2
+index 0000000000000000000000000000000000000000..697e6e9f30cfcb1c3e5283370265bada52672168
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3268 @@
+@@ -0,0 +1,3269 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2201,6 +2201,7 @@ index 0000000000000000000000000000000000000000..4cbed756eeba147532bc008adf9ad429
 +        uint growing = 0;
 +        for (auto& item: threads) {
 +          if (item->control || item->descriptor.load() != STOPPED || growing == 16) continue;
++          if (item->thread.joinable()) item->thread.join();
 +          item->descriptor.store(-2);
 +          liveThreads.fetch_add(1);
 +          try {
