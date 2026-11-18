@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..b683fd358711c5f096bec599e16d56d5941241fe
+index 0000000000000000000000000000000000000000..655996140a4ea0945e4dfe7b87560e35ef71d053
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,452 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1069,19 +1069,6 @@ index 0000000000000000000000000000000000000000..b683fd358711c5f096bec599e16d56d5
 +  KJ_EXPECT(rejected);
 +}
 +
-+KJ_TEST("legacy RPC rejects before a tenant method with its existing TypeError") {
-+  requireRpcEntrypoint("v2");
-+  bool refused = false;
-+  try {
-+    requireRpcEntrypoint("v1");
-+  } catch (const kj::Exception& error) {
-+    refused = true;
-+    KJ_EXPECT(error.getDescription() ==
-+        "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".");
-+  }
-+  KJ_EXPECT(refused);
-+}
-+
 +KJ_TEST("compatibility refusals are tenant validation before package decoding") {
 +  Slot slot;
 +  Reporter reporter;
@@ -1104,10 +1091,10 @@ index 0000000000000000000000000000000000000000..b683fd358711c5f096bec599e16d56d5
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..ad18c94c3eed054c16afb5eda74e71302576aa9e
+index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7236783a6
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3706 @@
+@@ -0,0 +1,3696 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -4385,15 +4372,6 @@ index 0000000000000000000000000000000000000000..ad18c94c3eed054c16afb5eda74e7130
 +  return {kj::mv(entry), kj::mv(invocation)};
 +}
 +
-+void requireRpcEntrypoint(std::string_view format) {
-+  if (format == "v1") {
-+    // Legacy service-worker scripts never supported the entrypoint RPC
-+    // handshake. Retain its public TypeError across the backend switch.
-+    kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
-+        kj::str(
-+            "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".")));
-+  }
-+}
 +
 +kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
 +  KJ_REQUIRE(!used, "one event per invocation");
@@ -4430,7 +4408,6 @@ index 0000000000000000000000000000000000000000..ad18c94c3eed054c16afb5eda74e7130
 +    co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
 +    kj::throwRecoverableException(error.clone());
 +  }
-+  requireRpcEntrypoint(str(input, "format"));
 +  auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
 +      descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
 +  auto event = kj::heap<api::JsRpcSessionCustomEvent>(
