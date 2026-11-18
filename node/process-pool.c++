@@ -967,6 +967,7 @@ struct ProcessGeneration {
   std::string eventTail;
   bool fatalMemoryEventPending = false;
   std::vector<LimitEvent> unappliedEvents;
+  std::array<std::deque<std::pair<std::string, std::string>>, 3> terminatedCallOrder;
   std::array<std::set<std::string>, 3> terminatedCalls;  // CPU, isolate memory, process pressure: pid, invocation, Worker, version
   // A durable process's limit rows name the request that started the object's context (workerd keeps one per object),
   // not the request that hit the limit: by pid, Worker and version, when each was last read.
@@ -1178,8 +1179,19 @@ struct ProcessGeneration {
         const std::string event = report.getEvent().cStr();
         if (event == "terminated" || event == "memory-terminated" || (threaded && event == "process-memory-pressure")) {
           const auto cause = event == "terminated" ? 0 : event == "memory-terminated" ? 1 : 2;
-          terminatedCalls[cause].insert(callKey(report.getPid(), report.getInvocationId().cStr(),
-              report.getWorkerId().cStr(), report.getVersionId().cStr()));
+          auto key = callKey(report.getPid(), report.getInvocationId().cStr(),
+              report.getWorkerId().cStr(), report.getVersionId().cStr());
+          if (terminatedCalls[cause].insert(key).second) {
+            auto& order = terminatedCallOrder[cause];
+            order.emplace_back(std::move(key), report.getInvocationId().cStr());
+            // Retain all active calls and at most 4096 completed identities.
+            auto remaining = order.size();
+            while (order.size() > 4096 && remaining-- > 0) {
+              auto oldest = std::move(order.front()); order.pop_front();
+              if (calls.contains(oldest.second)) order.push_back(std::move(oldest));
+              else terminatedCalls[cause].erase(oldest.first);
+            }
+          }
           if (durable && cause < 2) terminatedWorkers[cause][callKey(report.getPid(), "", report.getWorkerId().cStr(),
               report.getVersionId().cStr())] = mono();
         }

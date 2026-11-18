@@ -54,7 +54,7 @@ Stateless placement is decided per call. An operator's static entry in `placemen
 
 ## 5. Isolation
 
-Tenants share workerd processes: the V8 isolate is the boundary between tenants, and the process is the unit of enforcement. CPU defaults to 200 ms per event and memory to 128 MiB per version isolate. Ordinary and quarantine processes run stateless calls; durable processes (`d0` by default) run objects. Idle Workers and object trees are evicted; processes rotate on a binary change, a manual request or a memory threshold. Age and request-count rotation are off by default and never rotate durable processes. A durable rotation drains and exits before its replacement starts, avoiding two writers of the same SQLite files. [Process isolation](process-isolation.md) describes limits, facets, logs and the sandbox.
+Tenants share workerd processes: the V8 isolate is the boundary between tenants, and the process is the unit of enforcement. CPU defaults to 30,000 ms per stateless event (configurable per Worker up to 300,000 ms), 200 ms per durable event, and memory to 128 MiB per version isolate. Ordinary and quarantine processes use the native threaded server; durable processes retain the Rust backend. Ordinary and quarantine processes run stateless calls; durable processes (`d0` by default) run objects. Idle Workers and object trees are evicted; processes rotate on a binary change, a manual request or a memory threshold. Age and request-count rotation are off by default and never rotate durable processes. A durable rotation drains and exits before its replacement starts, avoiding two writers of the same SQLite files. [Process isolation](process-isolation.md) describes limits, facets, logs and the sandbox.
 
 ## 6. Control plane and state
 

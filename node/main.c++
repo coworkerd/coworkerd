@@ -2984,15 +2984,22 @@ public:
   coworkerd::WorkerLimits effectiveLimits(const std::string& workerId) const { return runtime.effectiveLimits(workerId); }
   // A trial's process: the tenant's quarantine shard, never an ordinary process.
   std::shared_ptr<coworkerd::ProcessCall> trialProcess(const std::string& worker) { return runtime.selectTrial(worker); }
+  std::shared_ptr<coworkerd::ProcessCall> rootTrialProcess(const std::string& worker) {
+    return runtime.selectDurable("root-trial/" + worker);
+  }
   bool quarantined(const std::string& worker) const { return runtime.quarantined(worker); }
   bool trialsQuarantined() const { return serverConfig.processPool.quarantineProcesses > 0; }
   std::string nextTrialInvocationId() {
     return serverConfig.serverId + "." + epoch() + "-trial-" + std::to_string(nextTrialSequence++);
   }
   OpenEvent openTrial(const VersionDefinition& version, const std::shared_ptr<coworkerd::ProcessCall>& process,
-      const std::string& invocationId, double deadline) {
+      const std::string& invocationId, double deadline, bool rootTrial = false) {
     auto descriptor = encodeDescriptor(version, invocationId, invocationId, 0, 0, 0, 0, deadline,
         std::make_shared<const VersionPins>(), *process, serverConfig.serverId, "", true);
+    if (rootTrial) {
+      std::string encoded(descriptor.cStr()); encoded.pop_back(); encoded += ",\"rootTrial\":true}";
+      descriptor = kj::str(encoded.c_str());
+    }
     process->workerId = version.workerId; process->versionId = version.versionId;
     process->invocationId = invocationId; process->treeId = invocationId;
     return runtime.open(process, descriptor, version.definitionHash);
@@ -7609,6 +7616,26 @@ private:
   static int64_t micros(double ms) { return static_cast<int64_t>(std::max(0.0, ms) * 1000); }
   static constexpr double VIEW_WAIT_MS = 1000;
 
+  kj::Promise<std::string> probe(const VersionDefinition& version,
+      const std::shared_ptr<coworkerd::ProcessCall>& process, const std::string& invocationId,
+      double deadline, bool rootTrial = false) {
+    auto opened = server.openTrial(version, process, invocationId, deadline, rootTrial);
+    auto ready = kj::mv(opened.ready);
+    auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
+    auto service = factory.capnpToKj(getHttp.getHttp());
+    auto client = kj::newHttpClient(*service);
+    kj::HttpHeaders requestHeaders(headers);
+    auto call = client->request(kj::HttpMethod::GET, "http://coworkerd-trial/", requestHeaders, uint64_t(0));
+    auto exit = process->onExit().then([]() -> kj::HttpClient::Response { KJ_UNREACHABLE; });
+    auto response = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
+        kj::mv(call.response).exclusiveJoin(kj::mv(exit)));
+    auto body = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
+        response.body->readAllText(65536));
+    KJ_REQUIRE(response.statusCode == 200, "the runtime answered the trial with an HTTP error", response.statusCode);
+    co_return std::string(body.cStr());
+  }
+
+
   kj::Promise<std::string> run(TrialRequest request) {
     const auto started = monotonicTimeMs();
     const auto startedAtUnixMs = wallTimeMsForTest();
@@ -7686,24 +7713,43 @@ private:
         generation = process->generation;
         dispatched = true;
         const auto probeStarted = monotonicTimeMs();
-        auto opened = server.openTrial(*version, process, invocationId, deadline);
-        // Kept until the probe ends: dropping it would cancel the dispatch.
-        auto ready = kj::mv(opened.ready);
         std::string report, failure;
-        bool timedOut = false;
+        bool timedOut = false, rootCpuExceeded = false, rootMemoryExceeded = false;
+        auto probeProcess = process;
+        auto probeInvocation = invocationId;
         try {
-          auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
-          auto service = factory.capnpToKj(getHttp.getHttp());
-          auto client = kj::newHttpClient(*service);
-          kj::HttpHeaders requestHeaders(headers);
-          auto call = client->request(kj::HttpMethod::GET, "http://coworkerd-trial/", requestHeaders, uint64_t(0));
-          auto exit = process->onExit().then([]() -> kj::HttpClient::Response { KJ_UNREACHABLE; });
-          auto response = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
-              kj::mv(call.response).exclusiveJoin(kj::mv(exit)));
-          auto body = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
-              response.body->readAllText(65536));
-          KJ_REQUIRE(response.statusCode == 200, "the runtime answered the trial with an HTTP error", response.statusCode);
-          report = body.cStr();
+          report = co_await probe(*version, process, invocationId, deadline);
+          if (process->threadedServer() && version->format == "v2" && !version->declaredClasses.empty()) {
+            capnp::MallocMessageBuilder message;
+            auto json = message.initRoot<capnp::JsonValue>();
+            capnp::JsonCodec().decodeRaw(kj::arrayPtr(report.data(), report.size()), json);
+            auto ok = coworkerd::json::field(json, "ok");
+            auto classes = coworkerd::json::field(json, "durableObjectClasses");
+            bool usable = classes.isArray() && classes.getArray().size() == version->declaredClasses.size();
+            if (usable) for (auto entry: classes.getArray()) {
+              auto value = coworkerd::json::field(entry, "usable");
+              if (!value.isBoolean() || !value.getBoolean()) usable = false;
+            }
+            if (ok.isBoolean() && ok.getBoolean() && usable) {
+              auto root = server.rootTrialProcess(version->workerId);
+              if (!root) {
+                verdict = {"UNAVAILABLE", "", "no ready durable process for the root trial"};
+              } else {
+                probeProcess = root; probeInvocation = invocationId + "-root";
+                KJ_DEFER({
+                  rootCpuExceeded = root->cpuLimitExceeded();
+                  rootMemoryExceeded = root->memoryLimitExceeded();
+                  root->finish();
+                });
+                auto rootReport = co_await probe(*version, root, probeInvocation, deadline, true);
+                capnp::MallocMessageBuilder rootMessage;
+                auto rootJson = rootMessage.initRoot<capnp::JsonValue>();
+                capnp::JsonCodec().decodeRaw(kj::arrayPtr(rootReport.data(), rootReport.size()), rootJson);
+                auto rootOk = coworkerd::json::field(rootJson, "ok");
+                if (!rootOk.isBoolean() || !rootOk.getBoolean()) report = std::move(rootReport);
+              }
+            }
+          }
         } catch (const kj::Exception& error) {
           failure = error.getDescription().cStr();
           timedOut = monotonicTimeMs() >= deadline;
@@ -7713,14 +7759,15 @@ private:
           // The connection to workerd failed: let the pool observe the exit
           // (it reads the culprit then), bounded.
           std::string ended;
-          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, process->onExit()); }
+          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, probeProcess->onExit()); }
           catch (const kj::Exception& error) { ended = error.getDescription().cStr(); }
           exited = ended.find("exited") != std::string::npos;
-          if (exited) culprit = server.culpritOf(invocationId);
+          if (exited) culprit = server.culpritOf(probeInvocation);
         }
         // The probe ends here, whatever happened: its process call is released,
         // and on a timeout the request into workerd is cancelled.
-        const bool cpuExceeded = process->cpuLimitExceeded(), memoryExceeded = process->memoryLimitExceeded();
+        const bool cpuExceeded = rootCpuExceeded || process->cpuLimitExceeded(),
+            memoryExceeded = rootMemoryExceeded || process->memoryLimitExceeded();
         process->finish();
         probeMs = monotonicTimeMs() - probeStarted;
         if (timedOut) {
@@ -7742,7 +7789,9 @@ private:
           auto string = [&](const char* name) { auto value = field(json, name); return value.isString() ? std::string(value.getString().cStr()) : std::string(); };
           coldLoad = flag("coldLoad");
           if (auto value = field(json, "loadMs"); value.isNumber()) loadMs = value.getNumber();
-          if (flag("ok")) {
+          if (!verdict.category.empty()) {
+            // The durable half could not be admitted; retain the retryable verdict.
+          } else if (flag("ok")) {
             const auto kind = string("defaultKind");
             std::vector<std::string> named;
             if (auto list = field(json, "namedEntrypoints"); list.isArray())
@@ -8635,14 +8684,31 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
     const auto required = std::max(childRequired, nodeRequired);
     const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
-        (uint64_t(pool.inFlightLimit) + 12) + uint64_t(pool.durableProcesses) * 8;
+        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+    uint64_t uidThreads = 0;
+#ifdef __linux__
+    // RLIMIT_NPROC counts every existing thread of the real UID, including
+    // this node and unrelated processes, rather than just our child pool.
+    for (const auto& entry: fs::directory_iterator("/proc")) {
+      auto name = entry.path().filename().string();
+      if (name.empty() || !std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c); })) continue;
+      std::ifstream status(entry.path() / "status");
+      uint64_t uid = UINT64_MAX, threads = 0; std::string line;
+      while (std::getline(status, line)) {
+        if (line.starts_with("Uid:")) std::istringstream(line.substr(4)) >> uid;
+        else if (line.starts_with("Threads:")) std::istringstream(line.substr(8)) >> threads;
+      }
+      if (uid == getuid()) uidThreads += threads;
+    }
+#endif
+    const auto uidRequired = uidThreads + threadsRequired;
     rlimit processLimit;
     KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
-    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= threadsRequired,
-        "insufficient host thread hard limit", threadsRequired, processLimit.rlim_max);
-    if (processLimit.rlim_cur < threadsRequired) {
-      processLimit.rlim_cur = threadsRequired;
-      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", threadsRequired);
+    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= uidRequired,
+        "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
+    if (processLimit.rlim_cur < uidRequired) {
+      processLimit.rlim_cur = uidRequired;
+      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
     }
 #ifdef __linux__
     auto cgroup = fs::path("/sys/fs/cgroup");
@@ -8662,7 +8728,7 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     }
 #endif
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
-    KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, 64ull << 20) > minimumMemory,
+    KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
     rlimit inherited;
     KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");

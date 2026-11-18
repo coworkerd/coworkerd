@@ -1494,6 +1494,44 @@ function rootFailureReason(error) {
     /COWORKERD_ROOT_PREPARATION:[^:\s]+:(?:platform|plan-missing|tenant-code):\s*/g, "");
 }
 
+// Deployment validation runs the same generated root module as an object,
+// on a durable process. It creates no object, namespace, or storage facet.
+async function trialRoot(descriptor, env, ctx) {
+  const started = performance.now();
+  let report, stage = "load", codeStage = null;
+  try {
+    const base = descriptor.rootPlan;
+    if (descriptor.trial !== true || descriptor.rootTrial !== true || descriptor.format !== "v2" ||
+        base?.kind !== "tenant" || !Array.isArray(base.namespaces) || base.namespaces.length ||
+        descriptor.rootSelection?.kind !== "plain" || descriptor.rootSelection.dispatchChecked !== true)
+      throw new Error("Missing trusted root trial plan");
+    const code = await makeWorkerCode(descriptor, env, ctx);
+    const names = [code.mainModule, ...Object.keys(code.modules).filter(name => name !== code.mainModule)];
+    const response = await env.ROOTS.fetch("http://roots/install", {method:"POST", body:JSON.stringify({
+      ...base, mainModule:code.mainModule, compatibilityDate:code.compatibilityDate,
+      compatibilityFlags:code.compatibilityFlags, environment:code.env,
+      startupIdentity:JSON.stringify({workerId:descriptor.workerId, versionId:descriptor.versionId,
+        invocationId:descriptor.invocationId}),
+      modules:names.map(name => rootModule(name, code.modules[name]))})});
+    const reply = await response.json();
+    if (!response.ok || typeof reply?.plan !== "string") {
+      const error = new Error(reply?.error?.message || "Root trial installation failed");
+      if (typeof reply?.error?.name === "string") error.name = reply.error.name;
+      if (reply?.error?.kind !== "tenant-code") throw staged("package", error);
+      throw error;
+    }
+    const root = env.ROOTS.getPlain(JSON.stringify({...descriptor.rootSelection, plan:reply.plan,
+      activePlan:false, trial:true, rootTrial:true, entrypoint:descriptor.entrypoint || "default",
+      classes:descriptor.durableObjectClasses ?? []}));
+    report = await (await root.fetch("http://coworkerd-root-trial/", {cf:tenantCf(descriptor, env)})).json();
+  } catch (error) {
+    if (typeof error?.coworkerdStage === "string") {stage = "code"; codeStage = stageOf(error);}
+    report = {ok:false, stage, codeStage, name:typeof error?.name === "string" ? error.name : typeof error,
+      message:typeof error?.message === "string" ? error.message : String(error)};
+  }
+  return Response.json({...report, rootBridgeChecked:true, loadMs:performance.now()-started});
+}
+
 async function serveRoot(request, descriptor, env, ctx) {
   const target = descriptor.durableObject;
   const preparationNonce = crypto.randomUUID();
@@ -1568,6 +1606,7 @@ async function serve(request, env, ctx) {
     return new Response(`${env.PROCESS_ID}:${env.PROCESS_GENERATION}`);
   }
   const descriptor = descriptorFrom(request);
+  if (descriptor.trial === true && descriptor.rootTrial === true) return trialRoot(descriptor, env, ctx);
   if (descriptor.durableObject) return serveRoot(request, descriptor, env, ctx);
   return Response.json({code: "DO_UNAVAILABLE", error: "a durable process requires a Durable Object target"}, {status: 400});
 }
