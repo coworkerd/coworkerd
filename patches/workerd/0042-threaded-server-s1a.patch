@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e5d972c3889ff23ac5ee1db1fecc97361bec09b
+index 0000000000000000000000000000000000000000..b683fd358711c5f096bec599e16d56d5941241fe
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,465 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1082,14 +1082,32 @@ index 0000000000000000000000000000000000000000..0e5d972c3889ff23ac5ee1db1fecc973
 +  KJ_EXPECT(refused);
 +}
 +
++KJ_TEST("compatibility refusals are tenant validation before package decoding") {
++  Slot slot;
++  Reporter reporter;
++  JsonDoc invalid(kj::str(
++      "{\"compatibilityDate\":\"2026-11-01\",\"compatibilityFlags\":[\"no_such_threaded_test_flag\"]}"));
++  bool rejected = false;
++  try {
++    compileTenantFlags(slot, invalid.get(), reporter);
++  } catch (const kj::Exception&) {
++    rejected = true;
++  }
++  KJ_EXPECT(rejected && slot.loadStage == threaded::LoadStage::EVALUATION);
++  Slot validSlot;
++  Reporter validReporter;
++  JsonDoc valid(kj::str("{\"compatibilityDate\":\"2026-11-01\",\"compatibilityFlags\":[]}"));
++  KJ_EXPECT(!compileTenantFlags(validSlot, valid.get(), validReporter).getPreciseTimers());
++}
++
 +}  // namespace
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..1ca55a53292149514adc8b81323502ec50f9b23d
+index 0000000000000000000000000000000000000000..ad18c94c3eed054c16afb5eda74e71302576aa9e
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3698 @@
+@@ -0,0 +1,3706 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2305,6 +2323,31 @@ index 0000000000000000000000000000000000000000..1ca55a53292149514adc8b81323502ec
 +      slot.isolateLabel.c_str(), "\",");
 +}
 +
++CompatibilityFlags::Builder compileTenantFlags(
++    Slot &slot, Json::Reader descriptor, Reporter &reporter) {
++  // Compatibility flags are tenant validation, before package decoding.
++  slot.loadStage = threaded::LoadStage::EVALUATION;
++  auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
++  capnp::MallocMessageBuilder flagMessage;
++  auto given = field(descriptor, "compatibilityFlags");
++  auto list =
++      flagMessage.initRoot<capnp::List<capnp::Text>>(given.isArray() ? given.getArray().size() : 0);
++  if (given.isArray()) {
++    uint i = 0;
++    for (auto item: given.getArray()) {
++      KJ_REQUIRE(item.isString(), "invalid compatibility flag");
++      if (item.getString() == "precise_timers")
++        unsupported("precise_timers is disabled for tenants");
++      list.set(i++, item.getString());
++    }
++  }
++  compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags, reporter,
++      false, CompatibilityDateValidation::CODE_VERSION, {});
++  reporter.requireValid();
++  if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
++  return flags;
++}
++
 +void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
 +  JsonDoc document(descriptor);
 +  auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
@@ -3117,24 +3160,7 @@ index 0000000000000000000000000000000000000000..1ca55a53292149514adc8b81323502ec
 +  kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
 +    slot.loadStage = threaded::LoadStage::PACKAGE;
 +    Reporter reporter;
-+    slot.loadStage = threaded::LoadStage::LOAD;
-+    auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
-+    capnp::MallocMessageBuilder flagMessage;
-+    auto given = field(descriptor, "compatibilityFlags");
-+    auto list = flagMessage.initRoot<capnp::List<capnp::Text>>(
-+        given.isArray() ? given.getArray().size() : 0);
-+    if (given.isArray()) {
-+      uint i = 0;
-+      for (auto item: given.getArray()) {
-+        KJ_REQUIRE(item.isString(), "invalid compatibility flag");
-+        if (item.getString() == "precise_timers")
-+          unsupported("precise_timers is disabled for tenants");
-+        list.set(i++, item.getString());
-+      }
-+    }
-+    compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags,
-+        reporter, false, CompatibilityDateValidation::CODE_VERSION, {});
-+    if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
++    auto flags = compileTenantFlags(slot, descriptor, reporter);
 +    auto config = slot.configArena.initRoot<server::config::Worker>();
 +    auto main = text(descriptor, "mainModule");
 +    if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {
