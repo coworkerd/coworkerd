@@ -32,6 +32,7 @@ public:
   // Exceptional completion only: capture a dying generation before its calls are released.
   void snapshotAfterFailure() noexcept;
   kj::Promise<void> onExit();
+  bool threadedServer() const;
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;
   const std::string processId;

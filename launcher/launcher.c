@@ -83,7 +83,7 @@ struct bind {
 };
 
 static struct {
-  int status_fd, program_fd, check;
+  int status_fd, program_fd, check, threaded;
   pid_t parent_pid;
   const char *root, *hostname;
   int user_ns, mount_ns, net, ipc, uts, drop_caps, no_new_privs, non_dumpable;
@@ -217,6 +217,7 @@ static void parse(int argc, char **argv) {
     else if (!strcmp(word, "--drop-caps")) options.drop_caps = 1;
     else if (!strcmp(word, "--no-new-privs")) options.no_new_privs = 1;
     else if (!strcmp(word, "--non-dumpable")) options.non_dumpable = 1;
+    else if (!strcmp(word, "--threaded")) options.threaded = 1;
     else if (!strcmp(word, "--check")) options.check = 1;
     else { errno = EINVAL; fail("unknown option %s", word); }
 #undef TAKE
@@ -315,6 +316,20 @@ static int build_filter(struct sock_filter *program, __u32 action) {
   program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 #endif
+  if (options.threaded) {
+    const __u32 thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, thread_flags, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+  }
   const int allow_slot = at + allowed_count + 1;
   for (int i = 0; i < allowed_count; ++i)
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (__u32)allowed[i], (__u8)(allowed_count - i), 0);
@@ -330,7 +345,7 @@ static void install_filter(void) {
   if (!strcmp(options.seccomp_mode, "off")) return;
   step = "seccomp";
   const int observe = !strcmp(options.seccomp_mode, "observe");
-  struct sock_filter program[MAX_ALLOWED + 8];
+  struct sock_filter program[MAX_ALLOWED + 24];
   const int length = build_filter(program, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS);
   struct sock_fprog filter = {.len = (unsigned short)length, .filter = program};
   // no_new_privs is a precondition of seccomp(2) for an unprivileged process; set it either way.

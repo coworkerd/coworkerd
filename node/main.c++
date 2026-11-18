@@ -3374,6 +3374,7 @@ std::string rejectionJson(
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
+           code == "NOT_SUPPORTED" ? "operation is not supported" :
            code == "RESULT_UNCERTAIN" ? "execution result uncertain" :
            "execution rejected before start") << "\","
        << "\"reason\":\"" << jsonEscape(cleanReason(reason)) << "\",\"code\":\""
@@ -3885,6 +3886,7 @@ public:
     auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing, slot);
     auto started = monotonicTimeMs();
     std::string failure;
+    std::string platformCode;
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
@@ -3903,8 +3905,9 @@ public:
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
+      if (slot->process && slot->process->threadedServer()) platformCode = rpcFailureCode(error);
     }
-    co_await refuse(*tracked, failure);
+    co_await refuse(*tracked, failure, platformCode);
   }
 private:
   // An ingress root that asks for a WebSocket. Once the Worker answered 101 the connection is the response: when the request
@@ -3931,14 +3934,18 @@ private:
     }
     KJ_IF_SOME(error, failed) {
       if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
-      co_await refuse(*tracked, failure);
+      co_await refuse(*tracked, failure, slot->process && slot->process->threadedServer() ? rpcFailureCode(error) : "");
     }
   }
   // A failure before the response started: the code the call's limits or its process say.
-  kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure) {
-    const auto code = limitCode();
-    slot->report(503, code.empty() ? "RESULT_UNCERTAIN" : code);
-    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, 503, "Service Unavailable",
+  kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
+      const std::string& platformCode = "") {
+    auto code = limitCode();
+    if (platformCode == "NOT_SUPPORTED") code = platformCode;
+    const bool unsupported = code == "NOT_SUPPORTED";
+    slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
+    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
+        unsupported ? "Not Implemented" : "Service Unavailable",
         rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
     co_await rejection->respond(tracked);
   }
@@ -7576,7 +7583,9 @@ private:
             entrypoint = out.str();
             std::string names;
             for (const auto& name : named) names += (names.empty() ? "" : ", ") + name;
-            if (kind == "class" || kind == "object") {
+            if (kind == "class" || kind == "object" ||
+                (process->threadedServer() && flag("nativeHttpValidated") &&
+                    flag("hasDefault") && flag("entrypointUsable"))) {
               verdict.message = "the default export serves fetch (" + kind + ")";
               // The isolate stays for the next call; the load check before it need not load again.
               server.confirmLoaded(*process, server.loadRevision(*version), "");

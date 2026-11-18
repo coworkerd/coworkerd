@@ -45,6 +45,10 @@ void DurableLogConfig::validate() const {
 
 void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
+  KJ_REQUIRE(ordinaryServer == "upstream" || ordinaryServer == "threaded",
+      "processPool.ordinaryServer must be upstream or threaded");
+  KJ_REQUIRE(ordinaryServer != "threaded" || inFlightLimit <= 16384,
+      "threaded process inFlightLimit must not exceed 16384");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
   KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
   KJ_REQUIRE(sqlCpuLimitMs > 0 && sqlCpuLimitMs <= 60000,
@@ -189,6 +193,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();
+  result.processPool.ordinaryServer = pool.getOrdinaryServer().cStr();
+  result.processPool.threadedExecutable = pool.getThreadedExecutable().cStr();
   result.processPool.cpuLimitMs = root.getCpuLimitMs();
   result.processPool.memoryLimitMiB = root.getMemoryLimitMiB();
   // A limit of 0 leaves the isolates of this node without one, and with it the culprit a stuck or exhausted process

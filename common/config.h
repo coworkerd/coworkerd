@@ -85,6 +85,9 @@ struct ProcessPoolConfig {
   // COWORKERD_SANDBOX_STEADY_ALLOWLIST override them.
   std::string steadySyscallsMode = "off";
   std::string steadyAllowlistPath;
+  // S1a keeps the ordinary process implementation opt-in; other classes stay upstream.
+  std::string ordinaryServer = "upstream";
+  std::string threadedExecutable;
   void validate() const;
 };
 

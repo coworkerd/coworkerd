@@ -1,0 +1,1197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 18 Nov 2026 12:57:09 +0800
+Subject: [PATCH] Add threaded C++ HTTP server for ordinary workers
+
+
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index d34e4a75c69d0366d2b786fd97ebf7b2269ef5bd..dc3de8a916f4d151c825bf0c7815ccbccdb5a266 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -368,7 +368,7 @@ wd_cc_library(
+     hdrs = [
+         "v8-platform-impl.h",
+     ],
+-    visibility = [":__subpackages__"],
++    visibility = [":__subpackages__", "//src/workerd/threaded:__pkg__"],
+     deps = [
+         "//src/workerd/io",
+         "//src/workerd/jsg",
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 27ead7ad05c3ce86c9476b81bb717914c2e304e5..a6ae671461633de4f44a27e2133ddf95e7a1e49d 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -125,3 +125,12 @@ wd_cc_library(
+     # of libc++'s std::regex parser aborts where workerd's throws.
+     alwayslink = True,
+ )
++
++# Standalone C++ servers use the same process-level narrowing, without the Rust factory.
++wd_cc_library(
++    name = "coworkerd-steady",
++    srcs = ["coworkerd-steady.c++"],
++    hdrs = ["coworkerd-steady.h"],
++    deps = ["@capnp-cpp//src/kj"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++)
+diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
+index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..37233fe36b488c92e1db6f80bf202704dfdfda99 100644
+--- a/src/workerd/server/factory/coworkerd-steady.c++
++++ b/src/workerd/server/factory/coworkerd-steady.c++
+@@ -20,6 +20,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/prctl.h>
+ #include <sys/syscall.h>
++#include <sched.h>
+ #include <thread>
+ #include <vector>
+ #endif
+@@ -87,10 +88,11 @@ size_t readTable(const char* path, int numbers[MAX_CALLS], int& failure) {
+ }
+ 
+ size_t programLength(size_t count) {
++  const bool threaded = std::getenv("COWORKERD_THREADED") != nullptr;
+ #if defined(__x86_64__)
+-  return count + 9;
++  return count + 9 + (threaded ? 10 : 0);
+ #elif defined(__aarch64__)
+-  return count + 6;
++  return count + 6 + (threaded ? 10 : 0);
+ #else
+ #error "the steady-state system call filter needs this architecture's audit arch"
+ #endif
+@@ -119,6 +121,20 @@ size_t buildFilter(const int* numbers, size_t count, __u32 action, struct sock_f
+   program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
+   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+ #endif
++  if (std::getenv("COWORKERD_THREADED") != nullptr) {
++    constexpr __u32 threadFlags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
++        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
++    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
++    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
++    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, threadFlags, 1, 0);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
++    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
++  }
+   for (size_t i = 0; i < count; ++i)
+     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<__u32>(numbers[i]),
+         static_cast<__u8>(count - i), 0);
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6923379438c6c88224ae236d1a1df2a70e1d1c9
+--- /dev/null
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -0,0 +1,26 @@
++load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
++
++wd_cc_binary(
++    name = "coworkerd-threaded",
++    srcs = ["threaded-server.c++"],
++    malloc = "//src/workerd/server:malloc",
++    target_compatible_with = ["@platforms//os:linux"],
++    deps = [
++        "//src/workerd/api:memory-cache",
++        "//src/workerd/io",
++        "//src/workerd/io:compatibility-date",
++        "//src/workerd/io:worker-entrypoint",
++        "//src/workerd/jsg",
++        "//src/workerd/server:v8-platform-impl",
++        "//src/workerd/server:workerd-api",
++        "//src/workerd/server/factory:coworkerd-steady",
++        "//src/workerd/util:autogate",
++        "//src/workerd/util:entropy",
++        "@capnp-cpp//src/capnp:capnp-rpc",
++        "@capnp-cpp//src/capnp/compat:http-over-capnp",
++        "@capnp-cpp//src/capnp/compat:json",
++        "@capnp-cpp//src/kj:kj-async",
++        "@capnp-cpp//src/kj/compat:kj-http",
++        "@ssl",
++    ],
++)
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..31d944c3f634860857de2420df39cc8c9c3bc038
+--- /dev/null
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -0,0 +1,1076 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include <workerd/api/memory-cache.h>
++#include <workerd/io/actor-cache.h>
++#include <workerd/io/compatibility-date.h>
++#include <workerd/io/io-channels.h>
++#include <workerd/io/io-context.h>
++#include <workerd/io/io-thread-context.h>
++#include <workerd/io/limit-enforcer.h>
++#include <workerd/io/observer.h>
++#include <workerd/io/tracked-wasm-instance.h>
++#include <workerd/io/worker-entrypoint.h>
++#include <workerd/io/worker-interface.h>
++#include <workerd/jsg/setup.h>
++#include <workerd/server/factory/coworkerd-steady.h>
++#include <workerd/server/v8-platform-impl.h>
++#include <workerd/server/workerd-api.h>
++#include <workerd/util/autogate.h>
++#include <workerd/util/entropy.h>
++#include <workerd/util/stream-utils.h>
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netinet/tcp.h>
++#include <openssl/evp.h>
++#include <openssl/sha.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/epoll.h>
++#include <sys/eventfd.h>
++#include <sys/socket.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <capnp/compat/json.h>
++#include <capnp/message.h>
++#include <capnp/rpc-twoparty.h>
++#include <kj/async-io.h>
++#include <kj/compat/http.h>
++#include <kj/debug.h>
++#include <kj/encoding.h>
++#include <kj/mutex.h>
++#include <kj/thread.h>
++#include <kj/vector.h>
++
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace workerd {
++namespace {
++
++uint64_t nowNs(clockid_t clock = CLOCK_MONOTONIC) {
++  timespec t;
++  KJ_SYSCALL(clock_gettime(clock, &t));
++  return uint64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
++}
++
++struct Entropy final: kj::EntropySource {
++  void generate(kj::ArrayPtr<kj::byte> bytes) override {
++    getEntropy(bytes);
++  }
++};
++
++// KJ's native timer advances at event-port polls, never while JavaScript runs.
++struct Timer final: TimerChannel {
++  explicit Timer(kj::Timer& timer)
++      : timer(timer),
++        originMono(timer.now()),
++        originWall(kj::systemPreciseCalendarClock().now()),
++        observed(originWall) {}
++  void syncTime() override {
++    observed = originWall + (timer.now() - originMono);
++  }
++  kj::Date now(kj::Maybe<kj::Date> clamp) override {
++    KJ_IF_SOME(deadline, clamp) {
++      return kj::min(observed, deadline);
++    }
++    return observed;
++  }
++  kj::Promise<void> atTime(kj::Date when) override {
++    return timer.atTime(originMono + (when - originWall));
++  }
++  kj::Promise<void> afterLimitTimeout(kj::Duration delay) override {
++    return timer.afterDelay(delay);
++  }
++  kj::Timer& timer;
++  kj::TimePoint originMono;
++  kj::Date originWall, observed;
++};
++
++void noteUnsupported(kj::StringPtr feature);
++
++kj::Exception unsupportedError(kj::StringPtr feature) {
++  auto error = KJ_EXCEPTION(UNIMPLEMENTED, "jsg.Error: NOT_SUPPORTED: ", feature);
++  error.setDetail(0xc6f4a09d8b3e2175ull, kj::heapArray("NOT_SUPPORTED"_kj.asBytes()));
++  return error;
++}
++
++[[noreturn]] void unsupported(kj::StringPtr feature) {
++  noteUnsupported(feature);
++  kj::throwRecoverableException(unsupportedError(feature));
++  KJ_UNREACHABLE;
++}
++
++struct Cache final: CacheClient {
++  kj::Own<kj::HttpClient> getDefault(SubrequestMetadata) override {
++    unsupported("cache");
++  }
++  kj::Own<kj::HttpClient> getNamespace(kj::StringPtr, SubrequestMetadata) override {
++    unsupported("cache namespace");
++  }
++};
++
++struct Channels final: IoChannelFactory {
++  explicit Channels(TimerChannel& timer): timer(timer) {}
++  void abortIsolate(kj::StringPtr) override {
++    KJ_FAIL_REQUIRE("isolate abort");
++  }
++  kj::Own<WorkerInterface> startSubrequest(uint, SubrequestMetadata) override {
++    unsupported("outbound");
++  }
++  kj::Rc<SubrequestChannel> getSubrequestChannelResolved(
++      uint, kj::Maybe<Frankenvalue>, kj::Maybe<VersionRequest>, Persistent) override {
++    unsupported("outbound channel");
++  }
++  kj::Rc<ActorClassChannel> getActorClassResolved(
++      uint, kj::Maybe<Frankenvalue>, Persistent) override {
++    unsupported("actor class");
++  }
++  capnp::Capability::Client getCapability(uint) override {
++    unsupported("capability");
++  }
++  kj::Own<CacheClient> getCache() override {
++    return kj::heap<Cache>();
++  }
++  TimerChannel& getTimer() override {
++    return timer;
++  }
++  kj::Promise<void> writeLogfwdr(
++      uint, kj::FunctionParam<void(capnp::AnyPointer::Builder)>) override {
++    unsupported("log forwarding");
++  }
++  kj::Rc<ActorChannel> getGlobalActor(uint,
++      const ActorIdFactory::ActorId&,
++      kj::Maybe<kj::String>,
++      ActorGetMode,
++      bool,
++      ActorRoutingMode,
++      SpanParent,
++      kj::Maybe<ActorVersion>,
++      Persistent) override {
++    unsupported("actor");
++  }
++  kj::Rc<ActorChannel> getColoLocalActor(uint, kj::StringPtr, SpanParent) override {
++    unsupported("local actor");
++  }
++  TimerChannel& timer;
++};
++
++struct IsolateLimits final: IsolateLimitEnforcer {
++  v8::Isolate::CreateParams getCreateParams() override {
++    return {};
++  }
++  void customizeIsolate(v8::Isolate*) override {}
++  ActorCacheSharedLruOptions getActorCacheLruOptions() override {
++    return {};
++  }
++  kj::Own<void> enterStartupJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++    return {};
++  }
++  kj::Own<void> enterStartupPython(
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    return enterStartupJs(js, result);
++  }
++  kj::Own<void> enterDynamicImportJs(
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    return enterStartupJs(js, result);
++  }
++  kj::Own<void> enterLoggingJs(
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    return enterStartupJs(js, result);
++  }
++  kj::Own<void> enterInspectorJs(
++      jsg::Lock& js, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    return enterStartupJs(js, result);
++  }
++  void completedRequest(kj::StringPtr) const override {}
++  bool exitJs(jsg::Lock&) const override {
++    return false;
++  }
++  void reportMetrics(IsolateObserver&) const override {}
++  bool hasExcessivelyExceededHeapLimit() const override {
++    return false;
++  }
++  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
++    return instances;
++  }
++  TrackedWasmInstanceList instances;
++};
++
++struct Reporter final: Worker::ValidationErrorReporter {
++  std::set<std::string> httpEntrypoints;
++  void addError(kj::String error) override {
++    KJ_FAIL_REQUIRE("invalid Worker", error);
++  }
++  void addEntrypoint(kj::Maybe<kj::StringPtr> name, kj::Array<kj::String> handlers) override {
++    std::string key = "default";
++    KJ_IF_SOME(value, name) {
++      key = value.cStr();
++    }
++    for (auto& handler: handlers)
++      if (handler == "fetch") httpEntrypoints.insert(key);
++  }
++  void addActorClass(kj::StringPtr) override {}
++  void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
++};
++
++struct Slot {
++  capnp::MallocMessageBuilder configArena, flagsArena;
++  api::MemoryCacheProvider cache;
++  std::mutex mutex;
++  bool complete = false;
++  kj::Maybe<kj::Own<Worker>> worker;
++  kj::Maybe<kj::Exception> error;
++  std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
++  std::set<std::string> httpEntrypoints;
++  std::atomic<uint> active{0}, maxActive{0}, creates{0};
++};
++
++struct Entry {
++  uint64_t startNs, endNs, cpuNs;
++  uintptr_t isolate;
++};
++
++struct Measurement {
++  kj::Vector<Entry> entries;
++  uint64_t totalCpu = 0;
++  kj::Maybe<kj::String> unsupportedFeature;
++};
++
++struct RequestLimits final: LimitEnforcer {
++  RequestLimits(Slot& slot, Measurement& measurement, Timer& timer)
++      : slot(slot),
++        measurement(measurement),
++        timer(timer) {}
++  struct Scope {
++    Scope(Slot& slot, Measurement& measurement, v8::Isolate* isolate)
++        : slot(slot),
++          measurement(measurement),
++          isolate(isolate),
++          start(nowNs()),
++          cpu(nowNs(CLOCK_THREAD_CPUTIME_ID)) {
++      auto active = slot.active.fetch_add(1) + 1;
++      KJ_REQUIRE(active == 1, "overlapping JS entries");
++      slot.maxActive.store(active);
++    }
++    ~Scope() noexcept(false) {
++      auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
++      measurement.totalCpu += used;
++      if (getenv("COWORKERD_THREADED_TRACE_FOR_TEST") != nullptr) {
++        char row[320];
++        int size = snprintf(row, sizeof(row),
++            "[threaded-js] {\"tid\":%ld,\"isolate\":%llu,\"startNs\":%llu,\"endNs\":%llu,\"cpuNs\":%llu}\n",
++            syscall(SYS_gettid), (unsigned long long)reinterpret_cast<uintptr_t>(isolate),
++            (unsigned long long)start, (unsigned long long)nowNs(), (unsigned long long)used);
++        if (size > 0) (void)!write(STDERR_FILENO, row, size);
++      }
++      slot.active.fetch_sub(1);
++    }
++    Slot& slot;
++    Measurement& measurement;
++    v8::Isolate* isolate;
++    uint64_t start, cpu;
++  };
++  kj::Own<void> enterJs(jsg::Lock& js, IoContext&) override {
++    // runImpl synchronizes before waiting for the isolate; sample again after
++    // that wait, while its lock is held and before this turn enters JavaScript.
++    timer.syncTime();
++    return kj::heap<Scope>(slot, measurement, js.v8Isolate);
++  }
++  void topUpActor() override {}
++  void newSubrequest(bool) override {
++    unsupported("subrequest");
++  }
++  void newKvRequest(KvOpType) override {
++    unsupported("kv");
++  }
++  void newAnalyticsEngineRequest() override {
++    unsupported("analytics");
++  }
++  kj::Promise<void> limitDrain() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Promise<void> limitScheduled() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Duration getAlarmLimit() override {
++    return 0 * kj::SECONDS;
++  }
++  size_t getBufferingLimit() override {
++    return 1 << 20;
++  }
++  kj::Maybe<EventOutcome> getLimitsExceeded() override {
++    return kj::none;
++  }
++  kj::Promise<void> onLimitsExceeded() override {
++    return kj::NEVER_DONE;
++  }
++  void setCpuLimitNearlyExceededCallback(kj::Function<void()>) override {}
++  void requireLimitsNotExceeded() override {}
++  void reportMetrics(RequestObserver&) override {}
++  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
++    return 0 * kj::SECONDS;
++  }
++  size_t getSqliteMemoryUsage() const override {
++    return 0;
++  }
++  Slot& slot;
++  Measurement& measurement;
++  Timer& timer;
++};
++
++void noteUnsupported(kj::StringPtr feature) {
++  if (IoContext::hasCurrent()) {
++    auto& limits = static_cast<RequestLimits&>(IoContext::current().getLimitEnforcer());
++    limits.measurement.unsupportedFeature = kj::str(feature);
++  }
++}
++
++struct Errors final: kj::TaskSet::ErrorHandler {
++  void taskFailed(kj::Exception&& error) override {
++    KJ_LOG(ERROR, "threaded background task failed");
++  }
++};
++
++struct ThreadState {
++  kj::AsyncIoContext io = kj::setupAsyncIo();
++  Entropy entropy;
++  capnp::ByteStreamFactory bytes;
++  kj::HttpHeaderTable::Builder headerBuilder;
++  ThreadContext::HeaderIdBundle ids{headerBuilder};
++  capnp::HttpOverCapnpFactory http{bytes,
++    capnp::HttpOverCapnpFactory::HeaderIdBundle(headerBuilder),
++    capnp::HttpOverCapnpFactory::LEVEL_2};
++  kj::Own<kj::HttpHeaderTable> headers = headerBuilder.build();
++  ThreadContext context{io.provider->getTimer(), entropy, ids, http, bytes};
++  Timer timer{io.provider->getTimer()};
++  Errors errors;
++  kj::TaskSet tasks{errors};
++};
++
++using Json = capnp::JsonValue;
++Json::Reader field(Json::Reader value, kj::StringPtr name) {
++  if (value.isObject())
++    for (auto member: value.getObject()) {
++      if (member.getName() == name) return member.getValue();
++    }
++  return {};
++}
++kj::String text(Json::Reader value, kj::StringPtr name) {
++  auto item = field(value, name);
++  KJ_REQUIRE(item.isString(), "missing descriptor field", name);
++  return kj::str(item.getString());
++}
++std::string str(Json::Reader value, kj::StringPtr name) {
++  return text(value, name).cStr();
++}
++bool flag(Json::Reader value, kj::StringPtr name) {
++  auto item = field(value, name);
++  return item.isBoolean() && item.getBoolean();
++}
++kj::String encode(Json::Reader value) {
++  return capnp::JsonCodec().encodeRaw(value);
++}
++struct JsonDoc {
++  capnp::MallocMessageBuilder arena;
++  explicit JsonDoc(kj::StringPtr input) {
++    capnp::JsonCodec().decodeRaw(input.asArray(), arena.initRoot<Json>());
++  }
++  Json::Reader get() {
++    return arena.getRoot<Json>();
++  }
++};
++std::string digest(kj::ArrayPtr<const kj::byte> value) {
++  kj::byte result[SHA256_DIGEST_LENGTH];
++  SHA256(value.begin(), value.size(), result);
++  return kj::encodeHex(result).cStr();
++}
++std::string decode64(kj::StringPtr input) {
++  KJ_REQUIRE(input.size() % 4 == 0, "invalid module encoding");
++  std::string value(input.size() / 4 * 3, '\0');
++  int size = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(value.data()),
++      reinterpret_cast<const unsigned char*>(input.begin()), input.size());
++  KJ_REQUIRE(size >= 0, "invalid module encoding");
++  if (input.size() && input.endsWith("=")) --size;
++  if (input.size() > 1 && input.endsWith("==")) --size;
++  value.resize(size);
++  return value;
++}
++
++// Raw descriptors and atomic queue positions are the accept loop's only shared state.
++class DescriptorQueue {
++ public:
++  explicit DescriptorQueue(size_t limit): entries(limit + 1) {}
++  bool push(int fd) {
++    auto position = tail.load(std::memory_order_relaxed);
++    auto next = (position + 1) % entries.size();
++    if (next == head.load(std::memory_order_acquire)) return false;
++    entries[position] = fd;
++    tail.store(next, std::memory_order_release);
++    return true;
++  }
++  int pop() {
++    auto position = head.load(std::memory_order_relaxed);
++    if (position == tail.load(std::memory_order_acquire)) return -1;
++    auto fd = entries[position];
++    head.store((position + 1) % entries.size(), std::memory_order_release);
++    return fd;
++  }
++
++ private:
++  std::vector<int> entries;
++  std::atomic<size_t> head{0}, tail{0};
++};
++
++struct ThreadedServer;
++struct InvocationState: kj::Refcounted {
++  explicit InvocationState(std::shared_ptr<Slot> slot): slot(std::move(slot)) {}
++  std::shared_ptr<Slot> slot;
++  Measurement measurement;
++};
++
++class Invocation final: public kj::HttpService {
++ public:
++  Invocation(ThreadedServer& server, ThreadState& state, kj::String descriptor)
++      : server(server),
++        state(state),
++        descriptor(kj::mv(descriptor)) {}
++  kj::Promise<void> request(kj::HttpMethod method,
++      kj::StringPtr url,
++      const kj::HttpHeaders& headers,
++      kj::AsyncInputStream& body,
++      Response& response) override;
++
++ private:
++  ThreadedServer& server;
++  ThreadState& state;
++  kj::String descriptor;
++  bool used = false;
++};
++
++class Dispatcher final: public rpc::EventDispatcher::Server {
++ public:
++  Dispatcher(ThreadedServer& server, ThreadState& state, kj::String descriptor)
++      : server(server),
++        state(state),
++        descriptor(kj::mv(descriptor)) {}
++  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
++    KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
++    used = true;
++    context.initResults().setHttp(
++        state.http.kjToCapnp(kj::heap<Invocation>(server, state, kj::mv(descriptor))));
++    return kj::READY_NOW;
++  }
++  kj::Promise<void> jsRpcSession(JsRpcSessionContext) override {
++    unsupported("JS RPC is not available in S1a");
++  }
++
++ private:
++  ThreadedServer& server;
++  ThreadState& state;
++  kj::String descriptor;
++  bool used = false;
++};
++
++class Bootstrap final: public rpc::WorkerdBootstrap::Server {
++ public:
++  Bootstrap(ThreadedServer& server, ThreadState& state): server(server), state(state) {}
++  kj::Promise<void> startEvent(StartEventContext context) override {
++    KJ_REQUIRE(!used, "NOT_SUPPORTED: one startEvent per connection");
++    used = true;
++    auto params = context.getParams();
++    KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
++        "NOT_SUPPORTED: persistent objects and handoff");
++    context.initResults().setDispatcher(
++        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson())));
++    return kj::READY_NOW;
++  }
++
++ private:
++  ThreadedServer& server;
++  ThreadState& state;
++  bool used = false;
++};
++
++struct ThreadedServer {
++  kj::Own<v8::Platform> basePlatform = jsg::defaultPlatform(16);
++  server::WorkerdPlatform platform{*basePlatform};
++  jsg::V8System v8{platform, {}, basePlatform.get()};
++  const std::string sourceAddress, identity;
++  std::mutex registryMutex;
++  std::map<std::string, std::shared_ptr<Slot>> registry;
++  DescriptorQueue pending;
++  const uint limit;
++  struct Thread {
++    int wake;
++    std::atomic<int> descriptor{-2};  // -2 initializes/runs; -1 is idle
++    std::thread thread;
++    Thread(): wake(eventfd(0, EFD_CLOEXEC)) {
++      KJ_REQUIRE(wake >= 0);
++    }
++  };
++  std::vector<std::unique_ptr<Thread>> threads;
++  int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++  std::atomic<bool> ready{false};
++  std::atomic<uint> compilations{0};
++  std::thread manager;
++
++  ThreadedServer(uint limit, std::string sourceAddress, std::string identity)
++      : sourceAddress(std::move(sourceAddress)),
++        identity(std::move(identity)),
++        pending(limit * 2),
++        limit(limit) {
++    KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
++    server::coworkerdServing();
++    fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
++    manager = std::thread([this]() { manage(); });
++  }
++  static void wake(int fd) {
++    uint64_t one = 1;
++    ssize_t n;
++    do {
++      n = write(fd, &one, sizeof(one));
++    } while (n < 0 && errno == EINTR);
++    KJ_REQUIRE(n == sizeof(one) || (n < 0 && errno == EAGAIN));
++  }
++  bool enqueue(int fd) {
++    if (!pending.push(fd)) return false;
++    wake(managerWake);
++    return true;
++  }
++  void manage() {
++    pthread_setname_np(pthread_self(), "cwkd-pool");
++    // The initial high watermark is the in-flight limit. Readiness waits for all
++    // native loops, so a cold burst never makes the accept thread initialize one.
++    for (uint i = 0; i < limit; ++i) {
++      auto item = std::make_unique<Thread>();
++      auto* pointer = item.get();
++      item->thread = std::thread([this, pointer]() { runThread(*pointer); });
++      threads.push_back(std::move(item));
++    }
++    for (auto& item: threads)
++      while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
++    ready.store(true, std::memory_order_release);
++    int held = -1;
++    for (;;) {
++      if (held < 0) held = pending.pop();
++      if (held >= 0) {
++        bool assigned = false;
++        for (auto& item: threads) {
++          int idle = -1;
++          if (item->descriptor.compare_exchange_strong(idle, held)) {
++            wake(item->wake);
++            held = -1;
++            assigned = true;
++            break;
++          }
++        }
++        if (assigned) continue;
++      }
++      pollfd wait{managerWake, POLLIN, 0};
++      int result;
++      do {
++        result = poll(&wait, 1, -1);
++      } while (result < 0 && errno == EINTR);
++      KJ_REQUIRE(result > 0);
++      uint64_t count;
++      while (read(managerWake, &count, sizeof(count)) > 0) {}
++    }
++  }
++  void runThread(Thread& thread) {
++    pthread_setname_np(pthread_self(), "cwkd-call");
++    ThreadState state;
++    thread.descriptor.store(-1, std::memory_order_release);
++    for (;;) {
++      uint64_t count;
++      ssize_t n;
++      do {
++        n = read(thread.wake, &count, sizeof(count));
++      } while (n < 0 && errno == EINTR);
++      KJ_REQUIRE(n == sizeof(count));
++      auto fd = thread.descriptor.exchange(-2);
++      KJ_REQUIRE(fd >= 0);
++      auto error = kj::runCatchingExceptions([&]() {
++        auto stream = state.io.lowLevelProvider->wrapSocketFd(
++            fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
++        capnp::TwoPartyServer session(kj::heap<Bootstrap>(*this, state));
++        session.accept(*stream).wait(state.io.waitScope);
++      });
++      KJ_IF_SOME(exception, error) {
++        // Never print the descriptor, variables, secret values, or request body.
++        if (exception.getType() != kj::Exception::Type::DISCONNECTED)
++          KJ_LOG(INFO, "threaded invocation connection failed");
++      }
++      auto backgroundError = kj::runCatchingExceptions([&]() {
++        state.io.provider->getTimer()
++            .timeoutAfter(30 * kj::SECONDS, state.tasks.onEmpty())
++            .wait(state.io.waitScope);
++      });
++      if (backgroundError != kj::none) state.tasks.clear();
++      thread.descriptor.store(-1, std::memory_order_release);
++      wake(managerWake);
++    }
++  }
++
++  kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState& state) {
++    auto invocation = text(descriptor, "invocationId");
++    auto forInvocation = field(descriptor, "sourceInvocationId");
++    if (forInvocation.isString() && forInvocation.getString().size() > 0)
++      invocation = kj::str(forInvocation.getString());
++    auto url = kj::str("http://coworkerd-source/v1/source?workerId=",
++        kj::encodeUriComponent(text(descriptor, "workerId")),
++        "&versionId=", kj::encodeUriComponent(text(descriptor, "versionId")),
++        "&contentHash=", text(descriptor, "contentHash"),
++        "&definitionHash=", text(descriptor, "definitionHash"),
++        "&invocationId=", kj::encodeUriComponent(invocation),
++        "&processId=", kj::encodeUriComponent(text(descriptor, "processId")), "&processGeneration=",
++        field(descriptor, "processGeneration").isString()
++            ? kj::str(field(descriptor, "processGeneration").getString())
++            : kj::str(field(descriptor, "processGeneration").getNumber()));
++    auto address = co_await state.io.provider->getNetwork().parseAddress(sourceAddress.c_str());
++    auto client = kj::newHttpClient(state.io.provider->getTimer(), *state.headers, *address);
++    kj::HttpHeaders headers(*state.headers);
++    auto request = client->request(kj::HttpMethod::GET, url, headers);
++    auto response = co_await request.response;
++    KJ_REQUIRE(response.statusCode == 200, "Trusted source unavailable");
++    auto content = co_await response.body->readAllText(256u << 20);
++    JsonDoc source(content);
++    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
++            text(source.get(), "versionId") == text(descriptor, "versionId") &&
++            text(source.get(), "contentHash") == text(descriptor, "contentHash"),
++        "Trusted source identity mismatch");
++    co_return text(source.get(), "source");
++  }
++
++  kj::Own<Worker> compile(Slot& slot, Json::Reader descriptor, kj::StringPtr source) {
++    for (auto name: {"bindings", "durableObjects"}) {
++      auto values = field(descriptor, name);
++      if (values.isArray() && values.getArray().size() != 0)
++        unsupported("service bindings and object stubs require S1b");
++    }
++    Reporter reporter;
++    auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
++    capnp::MallocMessageBuilder flagMessage;
++    auto given = field(descriptor, "compatibilityFlags");
++    auto list = flagMessage.initRoot<capnp::List<capnp::Text>>(
++        given.isArray() ? given.getArray().size() : 0);
++    if (given.isArray()) {
++      uint i = 0;
++      for (auto item: given.getArray()) {
++        KJ_REQUIRE(item.isString(), "invalid compatibility flag");
++        if (item.getString() == "precise_timers")
++          unsupported("precise_timers is disabled for tenants");
++        list.set(i++, item.getString());
++      }
++    }
++    compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags,
++        reporter, false, CompatibilityDateValidation::CODE_VERSION, {});
++    if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
++    auto config = slot.configArena.initRoot<server::config::Worker>();
++    auto main = text(descriptor, "mainModule");
++    if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {
++      JsonDoc payload(source);
++      auto manifestText = text(payload.get(), "manifest");
++      KJ_REQUIRE(digest(manifestText.asBytes()) == str(descriptor, "contentHash"),
++          "Trusted manifest hash mismatch");
++      JsonDoc manifest(manifestText);
++      auto declarations = field(manifest.get(), "modules");
++      KJ_REQUIRE(declarations.isArray(), "invalid module manifest");
++      auto modules = config.initModules(declarations.getArray().size());
++      uint next = 1;
++      bool foundMain = false;
++      for (auto declaration: declarations.getArray()) {
++        auto name = text(declaration, "name");
++        uint index = name == main ? 0 : next++;
++        if (name == main) foundMain = true;
++        KJ_REQUIRE(index < modules.size(), "missing main module");
++        auto hash = text(declaration, "sha256");
++        auto encoded = field(field(payload.get(), "modules"), hash);
++        KJ_REQUIRE(encoded.isString(), "missing module bytes");
++        auto bytes = decode64(encoded.getString());
++        auto view = kj::arrayPtr(reinterpret_cast<const kj::byte*>(bytes.data()), bytes.size());
++        KJ_REQUIRE(
++            digest(view) == hash.cStr() && bytes.size() == field(declaration, "bytes").getNumber(),
++            "Trusted module hash or length mismatch");
++        auto module = modules[index];
++        module.setName(name);
++        auto type = text(declaration, "type");
++        auto content = kj::StringPtr(bytes.data(), bytes.size());
++        if (type == "esm")
++          module.setEsModule(content);
++        else if (type == "cjs")
++          module.setCommonJsModule(content);
++        else if (type == "text")
++          module.setText(content);
++        else if (type == "json")
++          module.setJson(content);
++        else if (type == "data")
++          module.setData(view);
++        else if (type == "wasm")
++          module.setWasm(view);
++        else
++          KJ_FAIL_REQUIRE("NOT_SUPPORTED: module type");
++      }
++      KJ_REQUIRE(foundMain, "missing main module");
++    } else {
++      KJ_REQUIRE(digest(source.asBytes()) == str(descriptor, "contentHash"),
++          "Trusted source hash mismatch");
++      auto module = config.initModules(1)[0];
++      module.setName(main);
++      module.setEsModule(source);
++    }
++    auto limits = kj::refcounted<IsolateLimits>();
++    auto group = jsg::newIsolateGroup();
++    const api::pyodide::PythonConfig python{
++      .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
++    auto api = kj::heap<server::WorkerdApi>(v8, flags.asReader(),
++        capnp::List<server::config::Extension>::Reader(), limits->getCreateParams(), group,
++        kj::atomicRefcounted<JsgIsolateObserver>(), slot.cache, python);
++    auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
++    auto isolate =
++        kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
++            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW);
++    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
++        server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
++        IsolateObserver::StartType::COLD, kj::none, kj::none, SpanParent(nullptr),
++        newWorkerFileSystem(kj::heap<FsMap>(), getTmpDirectoryImpl()), kj::none);
++    auto worker =
++        kj::atomicRefcounted<Worker>(kj::mv(compiled), kj::atomicRefcounted<WorkerObserver>(),
++            [&](jsg::Lock& lock, const Worker::Api&, v8::Local<v8::Object> target,
++                v8::Local<v8::Object>) {
++      auto context = lock.v8Context();
++      for (auto section: {"variables", "secrets"}) {
++        auto values = field(descriptor, section);
++        if (!values.isArray()) continue;
++        for (auto variable: values.getArray()) {
++          auto value = field(variable, "value");
++          KJ_REQUIRE(value.isString(), "missing environment value");
++          v8::Local<v8::Value> item = lock.str(value.getString());
++          if (field(variable, "type").isString() && text(variable, "type") == "json")
++            item = jsg::check(v8::JSON::Parse(context, lock.str(value.getString())));
++          KJ_REQUIRE(
++              jsg::check(target->DefineOwnProperty(context,
++                  static_cast<v8::Local<v8::String>>(lock.str(text(variable, "name"))), item)),
++              "invalid environment property");
++        }
++      }
++      auto console = v8::Object::New(lock.v8Isolate);
++      auto denied = jsg::check(
++          v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value>& args) {
++        noteUnsupported("tenant logging requires S1b");
++        jsg::throwInternalError(args.GetIsolate(), unsupportedError("tenant logging requires S1b"));
++      }));
++      for (auto method: {"log", "info", "warn", "error", "debug", "trace", "table", "assert",
++             "count", "time", "timeEnd", "timeLog", "countReset", "group", "groupCollapsed",
++             "groupEnd", "clear", "dir", "dirxml", "profile", "profileEnd", "timeStamp"})
++        jsg::check(console->Set(context, lock.str(kj::StringPtr(method)), denied));
++      KJ_REQUIRE(jsg::check(context->Global()->DefineOwnProperty(
++                     context, static_cast<v8::Local<v8::String>>(lock.str("console"_kj)), console)),
++          "NOT_SUPPORTED: console override unavailable");
++    },
++            IsolateObserver::StartType::COLD, SpanParent(nullptr),
++            Worker::Lock::TakeSynchronously(kj::none), reporter);
++    uintptr_t isolateAddress = 0;
++    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
++      lock.validateHandlers(reporter);
++      isolateAddress = reinterpret_cast<uintptr_t>(lock.getIsolate());
++    });
++    slot.httpEntrypoints = std::move(reporter.httpEntrypoints);
++    slot.creates.fetch_add(1);
++    compilations.fetch_add(1);
++    auto row = kj::str("[threaded-worker] {\"workerId\":", encode(field(descriptor, "workerId")),
++        ",\"definitionHash\":", encode(field(descriptor, "definitionHash")),
++        ",\"tid\":", syscall(SYS_gettid), ",\"isolate\":", (uint64_t)isolateAddress,
++        ",\"compilations\":1}\n");
++    (void)!write(STDERR_FILENO, row.begin(), row.size());
++    return worker;
++  }
++
++  kj::Promise<std::shared_ptr<Slot>> getWorker(
++      Json::Reader descriptor, ThreadState& state, bool& coldLoaded) {
++    auto fingerprint = field(field(descriptor, "rootPlan"), "versionFingerprint");
++    auto key = str(descriptor, "workerId") + "@" + str(descriptor, "versionId") + ":" +
++        str(descriptor, "definitionHash") + ":" +
++        (fingerprint.isString() ? std::string(fingerprint.getString().cStr())
++                                : digest(kj::str(encode(field(descriptor, "variables")),
++                                      encode(field(descriptor, "secrets")))
++                                             .asBytes()));
++    std::shared_ptr<Slot> slot;
++    bool creator;
++    {
++      std::lock_guard lock(registryMutex);
++      auto [iterator, inserted] = registry.try_emplace(key);
++      creator = inserted;
++      if (inserted) iterator->second = std::make_shared<Slot>();
++      slot = iterator->second;
++    }
++    if (creator) {
++      try {
++        auto source = co_await fetchSource(descriptor, state);
++        slot->worker = compile(*slot, descriptor, source);
++      } catch (kj::Exception& error) {
++        slot->error = kj::mv(error);
++      }
++      std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
++      {
++        std::lock_guard lock(slot->mutex);
++        slot->complete = true;
++        waiters.swap(slot->waiters);
++      }
++      for (auto& waiter: waiters) waiter->fulfill();
++    } else {
++      auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
++      bool wait;
++      {
++        std::lock_guard lock(slot->mutex);
++        wait = !slot->complete;
++        if (wait) slot->waiters.push_back(kj::mv(signal.fulfiller));
++      }
++      if (wait) co_await signal.promise;
++    }
++    KJ_IF_SOME(error, slot->error) {
++      kj::throwRecoverableException(error.clone());
++    }
++    coldLoaded = creator;
++    co_return slot;
++  }
++};
++
++kj::Promise<void> Invocation::request(kj::HttpMethod method,
++    kj::StringPtr url,
++    const kj::HttpHeaders& headers,
++    kj::AsyncInputStream& body,
++    Response& response) {
++  KJ_REQUIRE(!used, "NOT_SUPPORTED: one request per invocation");
++  used = true;
++  JsonDoc document(descriptor);
++  auto input = document.get();
++  const bool trial = flag(input, "trial");
++  std::shared_ptr<Slot> slot;
++  kj::Maybe<kj::String> loadError;
++  bool coldLoaded = false;
++  try {
++    for (auto name: {"bindings", "durableObjects"}) {
++      auto values = field(input, name);
++      if (values.isArray() && values.getArray().size() != 0)
++        unsupported("service bindings and object stubs require S1b");
++    }
++    for (auto name: {"cpuLimitMs", "memoryLimitMiB"}) {
++      auto value = field(input, name);
++      if (value.isNumber() && value.getNumber() != 0)
++        unsupported("tenant limit overrides require S1b");
++    }
++    slot = co_await server.getWorker(input, state, coldLoaded);
++  } catch (const kj::Exception& error) {
++    if (!trial) throw;
++    loadError = kj::str(error.getDescription());
++  }
++  KJ_IF_SOME(message, loadError) {
++    capnp::MallocMessageBuilder arena;
++    auto value = arena.initRoot<Json>();
++    value.setString(message);
++    auto report =
++        kj::str("{\"ok\":false,\"stage\":\"evaluation\",\"message\":", encode(value), "}");
++    auto output = response.send(200, "OK", kj::HttpHeaders(*state.headers), report.size());
++    co_await output->write(report.asBytes());
++    co_return;
++  }
++  auto entrypoint =
++      field(input, "entrypoint").isString() ? str(input, "entrypoint") : std::string();
++  if (entrypoint.empty()) entrypoint = "default";
++  if (trial) {
++    auto names = kj::str("[");
++    bool first = true;
++    for (auto& name: slot->httpEntrypoints) {
++      if (name == "default") continue;
++      capnp::MallocMessageBuilder arena;
++      auto value = arena.initRoot<Json>();
++      value.setString(name.c_str());
++      names = kj::str(names, first ? "" : ",", encode(value));
++      first = false;
++    }
++    names = kj::str(names, "]");
++    auto report = kj::str("{\"ok\":true,\"nativeHttpValidated\":true,\"coldLoad\":",
++        coldLoaded ? "true" : "false", ",\"defaultKind\":\"native\",\"namedEntrypoints\":", names,
++        ",\"hasDefault\":", slot->httpEntrypoints.contains("default") ? "true" : "false",
++        ",\"entrypointUsable\":", slot->httpEntrypoints.contains(entrypoint) ? "true" : "false",
++        "}");
++    auto output = response.send(200, "OK", kj::HttpHeaders(*state.headers), report.size());
++    co_await output->write(report.asBytes());
++    co_return;
++  }
++  auto invocation = kj::refcounted<InvocationState>(slot);
++  auto worker = kj::atomicAddRef(*KJ_REQUIRE_NONNULL(slot->worker));
++  auto cf = kj::str("{\"nodeId\":", encode(field(input, "serverId")),
++      ",\"serverId\":", encode(field(input, "serverId")));
++  for (auto name: {"processId", "workerId", "versionId", "contentHash", "invocationId", "treeId",
++         "ingressServerId", "lease", "orderSequence", "depth"})
++    cf = kj::str(cf, ",\"", name, "\":", encode(field(input, name)));
++  auto generation = field(input, "processGeneration");
++  cf = kj::str(cf, ",\"processGeneration\":",
++      generation.isString() ? kj::str(generation.getString()) : encode(generation), "}");
++  auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
++      entrypoint == "default" ? kj::Maybe<kj::String>(kj::none)
++                              : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
++      Frankenvalue(), kj::none,
++      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer), kj::addRef(*invocation),
++      kj::rc<Channels>(state.timer), kj::refcounted<RequestObserver>(), state.tasks, true, kj::none,
++      kj::mv(cf), kj::none);
++  kj::Maybe<kj::Exception> failure;
++  try {
++    co_await entry->request(method, url, headers, body, response);
++  } catch (const kj::Exception& error) {
++    failure = error.clone();
++  }
++  KJ_IF_SOME(error, failure) {
++    // The library converts native refusals to JS errors. Preserve the refusal
++    // recorded by our own channels, without interpreting application messages.
++    KJ_IF_SOME(feature, invocation->measurement.unsupportedFeature) {
++      unsupported(feature);
++    }
++    kj::throwRecoverableException(kj::mv(error));
++  }
++  co_await state.io.provider->getTimer().timeoutAfter(30 * kj::SECONDS, state.tasks.onEmpty());
++}
++
++void acceptLoop(ThreadedServer& server, int listener, int parent) {
++  int epoll = epoll_create1(EPOLL_CLOEXEC);
++  KJ_REQUIRE(epoll >= 0);
++  auto add = [&](int fd) {
++    epoll_event event{};
++    event.events = EPOLLIN | EPOLLRDHUP;
++    event.data.fd = fd;
++    KJ_SYSCALL(epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &event));
++  };
++  fcntl(listener, F_SETFL, fcntl(listener, F_GETFL) | O_NONBLOCK);
++  add(listener);
++  if (parent >= 0) add(parent);
++  struct Connection {
++    std::string input, output;
++    size_t sent = 0;
++  };
++  std::map<int, Connection> connections;
++  for (;;) {
++    epoll_event events[256];
++    int count;
++    KJ_SYSCALL(count = epoll_wait(epoll, events, 256, -1));
++    for (int i = 0; i < count; ++i) {
++      auto fd = events[i].data.fd;
++      if (fd == parent) {
++        char bytes[64];
++        if (read(parent, bytes, sizeof(bytes)) == 0) _exit(0);
++        continue;
++      }
++      if (fd == listener) {
++        for (;;) {
++          auto accepted = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
++          if (accepted < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
++          if (accepted < 0 && errno == EINTR) continue;
++          KJ_REQUIRE(accepted >= 0);
++          connections.emplace(accepted, Connection{});
++          add(accepted);
++        }
++        continue;
++      }
++      auto found = connections.find(fd);
++      if (found == connections.end()) continue;
++      auto& connection = found->second;
++      bool close = false;
++      if (connection.input.empty() && connection.output.empty()) {
++        char prefix;
++        auto size = recv(fd, &prefix, 1, MSG_PEEK | MSG_DONTWAIT);
++        if (size == 1 && prefix == 'T') {
++          (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
++          epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
++          connections.erase(found);
++          if (!server.enqueue(fd)) ::close(fd);
++          continue;
++        }
++        if (size == 0) close = true;
++      }
++      if (connection.output.empty() && !close) {
++        char bytes[2048];
++        auto size = recv(fd, bytes, sizeof(bytes), MSG_DONTWAIT);
++        if (size > 0)
++          connection.input.append(bytes, size);
++        else if (size == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
++          close = true;
++        if (connection.input.size() > 4096) close = true;
++        if (connection.input.find("\r\n\r\n") != std::string::npos) {
++          auto body = server.identity;
++          if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
++            uint busy = 0;
++            if (server.ready.load(std::memory_order_acquire))
++              for (auto& thread: server.threads)
++                if (thread->descriptor.load() != -1) ++busy;
++            body = "{\"threadLimit\":" + std::to_string(server.limit) +
++                ",\"busyThreads\":" + std::to_string(busy) +
++                ",\"idleConnections\":" + std::to_string(connections.size() - 1) +
++                ",\"compilations\":" + std::to_string(server.compilations.load()) + "}";
++          }
++          auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
++          if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
++              !connection.input.starts_with("GET /__coworkerd/threaded ")) {
++            status = "501 Not Implemented";
++            body =
++                "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded lifecycle controls require S1c\"}";
++          }
++          connection.output = "HTTP/1.1 " + std::string(status) +
++              "\r\nContent-Length: " + std::to_string(body.size()) +
++              "\r\nConnection: close\r\n\r\n" + body;
++        }
++      }
++      if (!connection.output.empty() && !close) {
++        auto size = send(fd, connection.output.data() + connection.sent,
++            connection.output.size() - connection.sent, MSG_DONTWAIT | MSG_NOSIGNAL);
++        if (size > 0)
++          connection.sent += size;
++        else if (size == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
++          close = true;
++        if (connection.sent == connection.output.size())
++          close = true;
++        else {
++          epoll_event event{};
++          event.events = EPOLLOUT | EPOLLRDHUP;
++          event.data.fd = fd;
++          epoll_ctl(epoll, EPOLL_CTL_MOD, fd, &event);
++        }
++      }
++      if (close || (events[i].events & EPOLLRDHUP)) {
++        epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
++        ::close(fd);
++        connections.erase(fd);
++      }
++    }
++  }
++}
++}  // namespace
++}  // namespace workerd
++
++int main(int argc, char** argv) {
++  using namespace workerd;
++  KJ_REQUIRE(argc == 5, "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS IDENTITY INFLIGHT");
++  signal(SIGPIPE, SIG_IGN);
++  util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
++  setenv("COWORKERD_THREADED", "1", 1);
++  auto* server = new ThreadedServer(strtoul(argv[4], nullptr, 10), argv[2], argv[3]);
++  const char* parent = getenv("COWORKERD_PARENT_FD");
++  acceptLoop(
++      *server, strtol(argv[1], nullptr, 10), parent == nullptr ? -1 : strtol(parent, nullptr, 10));
++}

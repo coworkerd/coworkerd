@@ -6,6 +6,7 @@
 #include "async-log.h"
 #include "memory-watermark.h"
 #include <capnp/rpc-twoparty.h>
+#include <capnp/membrane.h>
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <openssl/evp.h>
@@ -116,7 +117,7 @@ std::string escape(const std::string& value) {
 bool workerdInherits(std::string_view name) {
   static constexpr std::string_view NAMES[] = {"PATH", "TZ", "LANG", "LANGUAGE", "TMPDIR", "NO_COLOR", "FORCE_COLOR",
       "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST",
-      "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK"};
+      "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK", "COWORKERD_THREADED_TRACE_FOR_TEST"};
   return name.starts_with("LC_") || std::find(std::begin(NAMES), std::end(NAMES), name) != std::end(NAMES);
 }
 // Descriptor numbers each workerd inherits (see process-pool.h); the launcher's own two, which it
@@ -272,8 +273,24 @@ std::string hex(const unsigned char* bytes, unsigned int length) {
   for (unsigned int i = 0; i < length; ++i) out << std::hex << std::setw(2) << std::setfill('0') << int(bytes[i]);
   return out.str();
 }
-class RuntimeConnection final {
+class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
+    public std::enable_shared_from_this<RuntimeConnection> {
 public:
+  RuntimeConnection(): tasks(*this) {}
+  bool threaded = false;
+  kj::TaskSet* deferredDeletes = nullptr;
+  static constexpr size_t IDLE_CONNECTIONS = 32;
+  std::vector<kj::Own<kj::AsyncIoStream>> idle;
+  bool filling = false;
+  kj::Promise<void> fill() {
+    filling = true;
+    auto done = kj::defer([this] { filling = false; });
+    while (!disconnected && idle.size() < IDLE_CONNECTIONS) idle.push_back(co_await address->connect());
+  }
+  void replenish() {
+    if (!filling && !disconnected) tasks.add(fill());
+  }
+  kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
@@ -281,12 +298,50 @@ public:
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor) {
+    if (threaded) return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor))), kj::READY_NOW};
     auto request = bootstrap.startEventRequest();
     request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
     auto response = request.send();
     return {response.getDispatcher(), response.ignoreResult()};
   }
+private:
+  void taskFailed(kj::Exception&&) override { filling = false; }
+  kj::TaskSet tasks;
 };
+
+// This policy stays on the node's event loop. Every returned stream/capability
+// holds the invocation's own connection until its last reference is gone.
+class InvocationConnection final: public capnp::MembranePolicy, public kj::Refcounted {
+public:
+  explicit InvocationConnection(std::shared_ptr<RuntimeConnection> connection): connection(std::move(connection)) {}
+  kj::Maybe<capnp::Capability::Client> inboundCall(uint64_t, uint16_t, capnp::Capability::Client) override { return kj::none; }
+  kj::Maybe<capnp::Capability::Client> outboundCall(uint64_t, uint16_t, capnp::Capability::Client) override { return kj::none; }
+  kj::Own<capnp::MembranePolicy> addRef() override { return kj::addRef(*this); }
+private:
+  std::shared_ptr<RuntimeConnection> connection;
+};
+
+kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor) {
+  auto lifetime = shared_from_this();
+  KJ_REQUIRE(deferredDeletes != nullptr);
+  auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
+      [tasks = deferredDeletes](RuntimeConnection* raw) {
+    // An export can release its last membrane while RpcSystem::messageLoop is
+    // executing. Destroy the RPC system on a later event, including cancellation.
+    tasks->add(kj::evalLater([owned = std::unique_ptr<RuntimeConnection>(raw)] {}));
+  });
+  if (idle.empty()) connection->stream = co_await address->connect();
+  else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
+  replenish();
+  // No Cap'n Proto bytes may precede this raw routing prefix.
+  co_await connection->stream->write(kj::StringPtr("T").asBytes());
+  connection->rpc = kj::heap<capnp::TwoPartyClient>(*connection->stream);
+  connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
+  auto request = connection->bootstrap.startEventRequest();
+  request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+  auto response = request.send();
+  co_return capnp::membrane(response.getDispatcher(), kj::refcounted<InvocationConnection>(connection));
+}
 
 // The identity of an executable file as stat() sees it; content hashes are keyed by it.
 struct BinarySignature {
@@ -808,6 +863,7 @@ std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCal
 
 struct ProcessGeneration {
   std::string id;
+  bool threaded = false;
   bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
   uint64_t generation;
@@ -1203,6 +1259,7 @@ kj::Promise<void> ProcessCall::onExit() {
 }
 // A failed call is classified against this generation's events: a matching
 // row whose pid is the generation's current pid (none once the exit was observed).
+bool ProcessCall::threadedServer() const { return process->threaded; }
 bool ProcessCall::cpuLimitExceeded() const {
   if (process->durable) return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(0, invocationId, workerId, versionId);
@@ -1503,6 +1560,8 @@ public:
     if (auto* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) this->config.allowlistPath = path;
     if (auto* bind = std::getenv("COWORKERD_SANDBOX_BIND_FOR_TEST")) sandbox.bindForTest = bind;
     this->config.validate();
+    if (this->config.threadedExecutable.empty())
+      this->config.threadedExecutable = (std::filesystem::path(this->executable).parent_path() / "coworkerd-threaded").string();
     KJ_REQUIRE(access(this->executable.c_str(), X_OK) == 0, "workerd executable is required");
     KJ_REQUIRE(std::filesystem::is_regular_file(this->runtimeFile), "runtime module is required");
     std::filesystem::create_directories(this->directory + "/logs");
@@ -1686,7 +1745,9 @@ public:
   // showed once it was ready.
   std::string generationSandboxJson(const ProcessGeneration& p) const {
     std::ostringstream out;
-    out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false");
+    out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false")
+        << ",\"ordinaryServer\":\"" << (p.threaded ? "threaded" : "upstream")
+        << "\",\"limitsEnforced\":" << (p.threaded ? "false" : "true");
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -1723,9 +1784,11 @@ public:
   // the spawn goes ahead and the launcher reports the pair it was given.
   bool launchReady(Slot& s) {
     if (!sandbox.active || !sandbox.syscalls.active) return true;
-    const auto signature = statSignature(executable);
+    const auto& program = !s.quarantine && !s.durable && config.ordinaryServer == "threaded"
+        ? config.threadedExecutable : executable;
+    const auto signature = statSignature(program);
     if (!signature.valid || !programDigest(signature).empty()) { s.digestWaitSince = 0; return true; }
-    hasher.request(executable, signature);
+    hasher.request(program, signature);
     const auto now = mono();
     if (s.digestWaitSince == 0) s.digestWaitSince = now;
     return now - s.digestWaitSince > 5000;
@@ -1754,6 +1817,7 @@ public:
       // launcher refuses the pair and reports it as a launch failure (PROTOCOL.md, step `allowlist`).
       args.push_back(programSha256.empty() ? "unknown" : programSha256);
     }
+    if (!check && !program.empty() && program.front() == config.threadedExecutable) args.push_back("--threaded");
     auto bind = [&](const char* option, const std::string& path) { args.push_back(option); args.push_back(path); };
     for (const auto& path : sandbox.sharedObjects) bind("--bind", path);
     bind("--bind-rw", "/dev/null");
@@ -2112,6 +2176,8 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
+    p->threaded = !s.quarantine && !s.durable && config.ordinaryServer == "threaded";
+    const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
     p->socketName = p->id + "-" + std::to_string(p->generation) + ".sock";
@@ -2122,7 +2188,7 @@ public:
     p->eventFd = eventRead;
     auto closeEventWrite = kj::defer([fd = eventWrite] { ::close(fd); });
     p->eventChannel = true;
-    p->contextsVisible = true;
+    p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
     const int listener = listenUnix(p->socketPath);
@@ -2311,6 +2377,8 @@ public:
     // workerd's command line; with the sandbox, the launcher's options before it (PROTOCOL.md), and the
     // launcher itself executed through the descriptor this Server pinned at startup.
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
+    if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
+        p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
     std::string file = executable;
     bool thpResetViaLauncher = false;
 #ifdef __linux__
@@ -2467,16 +2535,22 @@ public:
         auto r = std::make_shared<RuntimeConnection>();
         r->address = co_await provider.getNetwork().parseAddress(text.c_str());
         r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
+        if (p->threaded) {
+          r->threaded = true;
+          r->deferredDeletes = &tasks;
+          co_await r->fill();
+        } else {
         auto tunnel = r->connector->connect("coworkerd-runtime", kj::HttpHeaders(headers), {});
         auto status = co_await provider.getTimer().timeoutAfter(500 * kj::MILLISECONDS, kj::mv(tunnel.status));
         KJ_REQUIRE(status.statusCode == 200, "workerd rejected CONNECT");
         r->stream = kj::mv(tunnel.connection); r->rpc = kj::heap<capnp::TwoPartyClient>(*r->stream);
         r->bootstrap = r->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
+        }
         if (p->pid == 0) co_return;
         p->runtime = r;
         // Weak: closing a generation releases its connection; a destroyed RPC system
         // rejects this promise, which is expected.
-        tasks.add(r->rpc->onDisconnect().then([weak = std::weak_ptr<RuntimeConnection>(r)] {
+        if (!p->threaded) tasks.add(r->rpc->onDisconnect().then([weak = std::weak_ptr<RuntimeConnection>(r)] {
           if (auto connection = weak.lock()) connection->disconnected = true;
         }, [](kj::Exception&&) {}));
         p->state = "ready"; p->readyAt = mono(); p->readyAtUnixMs = wall(); p->nextProbeAt = mono();
@@ -2898,6 +2972,8 @@ public:
     return id;
   }
   void enqueueAutomatic(size_t slot, const std::string& reason) {
+    const auto& target = slots[slot];
+    if (config.ordinaryServer == "threaded" && !target.quarantine && !target.durable) return;
     if (!queuedOrActive(slot)) enqueue(slot, reason);
   }
   // The slot's current generation runs other bytes than the configured executable.
@@ -3787,6 +3863,8 @@ void ProcessPool::requestAutomaticRotation(const std::string& processId, const s
   KJ_REQUIRE(!impl->shuttingDown, "the Server is draining for its exit; no rotation starts");
   auto found = std::find_if(impl->slots.begin(), impl->slots.end(), [&](const auto& slot) { return slot.id == processId; });
   KJ_REQUIRE(found != impl->slots.end(), "unknown process slot", processId.c_str());
+  KJ_REQUIRE(impl->config.ordinaryServer != "threaded" || found->quarantine || found->durable,
+      "NOT_SUPPORTED: threaded process rotation requires S1c");
   impl->enqueueAutomatic(size_t(found - impl->slots.begin()), reason);
 }
 
@@ -3799,6 +3877,11 @@ std::string ProcessPool::requestRotation(const std::vector<std::string>& process
     KJ_REQUIRE(found != impl->slots.end(), "unknown process slot", id.c_str());
     if (std::find(targets.begin(), targets.end(), size_t(found - impl->slots.begin())) == targets.end())
       targets.push_back(found - impl->slots.begin());
+  }
+  for (auto index: targets) {
+    const auto& slot = impl->slots[index];
+    KJ_REQUIRE(impl->config.ordinaryServer != "threaded" || slot.quarantine || slot.durable,
+        "NOT_SUPPORTED: threaded process rotation requires S1c");
   }
   std::ostringstream out;
   out << "{\"requests\":[";

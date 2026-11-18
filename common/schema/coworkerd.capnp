@@ -587,6 +587,10 @@ struct ProcessPoolConfig {
   # Process-wide cumulative SQL CPU and active-SQL wall limits per event. Independent of tenant CPU limits.
   sqlCpuLimitMs @10 :UInt32 = 200;
   sqlWallLimitMs @11 :UInt32 = 800;
+  # HTTP backend for ordinary processes. Durable and quarantine processes stay upstream.
+  ordinaryServer @12 :Text = "upstream";
+  # Empty: coworkerd-threaded beside workerdPath.
+  threadedExecutable @13 :Text;
 }
 
 struct RotationConfig {

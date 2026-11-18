@@ -75,6 +75,22 @@ operations validate the series before mutating a checkout or exporting files.
 
 ## Rust server port (v1.20261114.1)
 
+### 0042: Ordinary threaded HTTP server
+
+`src/workerd/threaded/{BUILD.bazel,threaded-server.c++}` adds the opt-in
+`coworkerd-threaded` executable over the C++ worker and I/O libraries. Its accept
+loop hands raw descriptors to a native thread pool; each invocation owns its KJ
+loop and RPC connection on one thread. Worker versions share an isolate and enter
+it under the library's lock. `WorkerdPlatform` supplies the frozen request clock.
+The target links no Rust server crate, and the upstream executable remains the
+default for ordinary, durable and quarantine processes.
+
+The path exception is limited to those two new files. Existing server files expose
+the V8 platform library to that package and build the serving filter separately.
+In the threaded executable the filter permits only the exact pthread `clone`
+flags and answers `clone3` with `ENOSYS`; other syscall rules retain their tables.
+The node selects this target with `processPool.ordinaryServer = "threaded"`.
+
 ### 0041: Exact ordinary call deadlines
 
 The private ordinary selection carries the lease deadline's original decimal text.
