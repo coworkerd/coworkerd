@@ -108,7 +108,7 @@ public:
   // increment foreign, rather than evidence against a workerd SIGKILL exit.
   void setHostCheckOomGuard(std::function<bool()> guard);
   // The limits in force for one Worker here: what it names, else this node's own.
-  WorkerLimits effectiveLimits(const std::string& workerId) const;
+  WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.

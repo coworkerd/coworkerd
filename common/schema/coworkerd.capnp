@@ -239,7 +239,7 @@ struct ServerConfig {
   placement @10 :PlacementConfig;
   processPool @11 :ProcessPoolConfig;
   ingressPlacement @12 :Bool = true;
-  cpuLimitMs @13 :UInt32 = 200;
+  cpuLimitMs @13 :UInt32 = 30000;
   # Quarantine processes; suspects are tenants, sharded over these processes by the tenant's
   # rendezvous hash, and trial loads run here too.
   quarantineProcesses @14 :UInt32 = 2;
@@ -599,7 +599,7 @@ struct ProcessPoolConfig {
   sqlCpuLimitMs @10 :UInt32 = 200;
   sqlWallLimitMs @11 :UInt32 = 800;
   # Backend for ordinary and quarantine processes. Durable processes stay upstream.
-  ordinaryServer @12 :Text = "upstream";
+  ordinaryServer @12 :Text = "threaded";
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
   # Per-tenant calls in each native ordinary or quarantine generation.

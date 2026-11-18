@@ -467,9 +467,9 @@ struct AdmissionSlot {
   std::function<void(uint status, const std::string& code)> outcome;
   // Only the platform runtime receives this receipt. A tenant response cannot
   // turn an uncertain execution into a refusal that placement may retry.
-  std::string dispatchReceipt, preparationReason;
+  std::string dispatchReceipt, rejectionReason;
   double deadline = 0;
-  bool decided = false, notExecuted = false, preparationLimit = false, capacityRejected = false;
+  bool decided = false, notExecuted = false, capacityRejected = false;
   std::function<void(bool)> executionDecision;
   void decide(bool executed) {
     if (decided) return;
@@ -900,8 +900,8 @@ public:
   // tenant's default, else this node's).
   // What one Worker's executions are limited to, as the control plane stored it: the Worker's own
   // value, else its tenant's default, and 0 for each limit neither names -- this node's own value applies
-  // there. The processes apply exactly this: it goes in the invocation descriptor, the runtime bridge
-  // puts it in the loader key, and the isolate is created under it.
+  // there. The invocation descriptor applies the ordinary CPU ceiling; durable
+  // processes retain the declared limits and their own node default.
   coworkerd::WorkerLimits namedLimits(const std::string& workerId) const {
     coworkerd::WorkerLimits named;
     const auto* record = tenants ? tenants->tenant(coworkerd::tenantOf(workerId)) : nullptr;
@@ -1028,7 +1028,8 @@ public:
     return found != pins->end() && found->second == value;
   }
 
-  kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline) {
+  kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline, bool durable = false) {
+    if (!durable) return desiredState.ensureCode(version, deadline - monotonicTimeMs());
     if (auto known = preparationBytes.find(version.contentHash); known != preparationBytes.end()) {
       known->second.used = ++preparationByteSequence;
       preparationByteFlights.erase(version.contentHash);
@@ -1548,8 +1549,10 @@ public:
   }
 
   InvocationRejection processRefusal(const ProcessUnavailable& error, bool root = false) {
-    return refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
+    auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
         error.quarantine ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch", 503, root);
+    value.notExecuted = value.retryable = true;
+    return value;
   }
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
@@ -1824,7 +1827,7 @@ public:
     loadConfirmed[loadKey(process, hash, entrypoint)] = monotonicTimeMs();
   }
   std::string beginThreadedColdRoute(const VersionDefinition& version) {
-    if (!version.hasCode() || !serverConfig.loadCheck || serverConfig.processPool.ordinaryServer != "threaded" ||
+    if (!version.hasCode() || !serverConfig.loadCheck ||
         runtime.quarantined(version.workerId)) return {};
     auto process = runtime.threadedGenerationHint(version.workerId);
     if (!process) return {};
@@ -1965,11 +1968,11 @@ public:
     const auto forInvocation = invocationId(result.sequence);
     const std::string entrypointName = entrypoint.empty() ? "default" : entrypoint;
     std::string category, detail, message;
-    bool coldLoad = false, preparationLimit = false;
+    bool coldLoad = false;
     LoadProbe probe;
     for (int attempt = 0;; ++attempt) {
       probe = co_await loadProbe(*version, std::move(process), entrypoint, deadline, forInvocation);
-      category.clear(); detail.clear(); message.clear(); coldLoad = false; preparationLimit = false; result.refusal.reset();
+      category.clear(); detail.clear(); message.clear(); coldLoad = false; result.refusal.reset();
       bool limitWithoutEvidence = false;
       if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
@@ -1999,8 +2002,6 @@ public:
         } else if (flag("capacityRejected")) {
           result.refusal = refusal("OVERLOADED", "process admission budget is full", 503, root);
           result.refusal->notExecuted = result.refusal->retryable = true;
-        } else if (flag("preparationLimit")) {
-          category = "limit"; detail = "PREPARATION_LIMIT"; message = string("message"); preparationLimit = true;
         } else if (string("stage") == "code") {
           const auto codeStage = string("codeStage"), text = string("message");
           if (codeStage == "secrets") { category = "secret-missing"; detail = "SECRET_MISSING"; message = text; }
@@ -2028,7 +2029,7 @@ public:
     }
     if (!category.empty()) {
       auto [secrets, variables] = trialRedactions(*version);
-      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), preparationLimit ? 409 : 503, root);
+      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), 503, root);
       value.category = category;
       result.refusal = std::move(value);
       ++loadFailures[category];
@@ -2552,16 +2553,15 @@ private:
                      ingress, peerIngress, deferredCpu](bool executed) {
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
-      pendingPreparations.erase(invocationId);
+      pendingDispatchDecisions.erase(invocationId);
       if (!executed) {
         for (auto& item : executions) if (item.invocationId == invocationId) item.dispatched = false;
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
-        const bool limited = current && current->preparationLimit;
         const bool capacity = current && current->capacityRejected;
-        const auto refusal = this->refusal(capacity ? "OVERLOADED" : limited ? "LOAD_FAILED" : "CODE_UNAVAILABLE",
-            capacity ? "process admission budget is full" : "Worker preparation unavailable before execution", limited ? 409 : 503, ingress);
+        const auto refusal = this->refusal(capacity ? "OVERLOADED" : "CODE_UNAVAILABLE",
+            capacity ? "process admission budget is full" : "Worker unavailable before execution", 503, ingress);
         observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
@@ -2573,7 +2573,7 @@ private:
     };
     if (slot && durable == nullptr) {
       slot->executionDecision = std::move(decision);
-      pendingPreparations[invocationId] = slot;
+      pendingDispatchDecisions[invocationId] = slot;
     } else {
       decision(true);
     }
@@ -2596,7 +2596,7 @@ private:
     pathMark(timing, "execution-logs");
     if (slot) process->onCapacityRejected = [this, lifetime = std::weak_ptr<int>(executionLifetime),
         invocation = invocationId, receipt = slot->dispatchReceipt] {
-      if (!lifetime.expired()) confirmPreparation(invocation, receipt, "capacity-rejected", "process admission budget is full");
+      if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
     auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
@@ -2614,26 +2614,19 @@ private:
 
 public:
 
-  std::optional<std::string> confirmPreparation(const std::string& invocation, const std::string& receipt,
+  std::optional<std::string> confirmCapacityRejection(const std::string& invocation, const std::string& receipt,
       const std::string& state, const std::string& reason) {
-    auto found = pendingPreparations.find(invocation);
-    if (found == pendingPreparations.end()) return std::nullopt;
+    auto found = pendingDispatchDecisions.find(invocation);
+    if (found == pendingDispatchDecisions.end()) return std::nullopt;
     auto slot = found->second.lock();
     if (!slot || slot->decided || receipt != slot->dispatchReceipt ||
-        (state != "rejected" && state != "load-failed" && state != "capacity-rejected")) return std::nullopt;
-    slot->preparationReason = cleanReason(reason).substr(0, 300);
-    slot->preparationLimit = state == "load-failed";
+        state != "capacity-rejected") return std::nullopt;
+    slot->rejectionReason = cleanReason(reason).substr(0, 300);
     slot->capacityRejected = state == "capacity-rejected";
     slot->decide(false);
-    auto refused = refusal(slot->capacityRejected ? "OVERLOADED" : slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE",
-        slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
-    if (slot->capacityRejected) refused.notExecuted = refused.retryable = true;
-    if (slot->preparationLimit) refused.category = "limit";
-    auto body = refusalBody(refused, slot->deadline);
-    if (!slot->preparationLimit && !slot->capacityRejected) {
-      body.pop_back(); body += ",\"dispatched\":false,\"retryable\":true}";
-    }
-    return body;
+    auto refused = refusal("OVERLOADED", slot->rejectionReason, 503, slot->root);
+    refused.notExecuted = refused.retryable = true;
+    return refusalBody(refused, slot->deadline);
   }
 
   void reload() {
@@ -3096,7 +3089,8 @@ private:
     // The limits this Worker names: the runtime bridge puts them in the loader key, so the version's
     // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
     // (and the loader key of a Worker that names none has no limits segment).
-    const auto limits = namedLimits(version.workerId);
+    auto limits = namedLimits(version.workerId);
+    if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
@@ -3114,8 +3108,6 @@ private:
       const coworkerd::VersionPins emptyPins;
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
       auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
-      const auto known = preparationBytes.find(version.contentHash);
-      encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
       encoded += '}';
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
@@ -3202,8 +3194,6 @@ private:
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
     auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
-    const auto known = preparationBytes.find(version.contentHash);
-    encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
     encoded += '}';
     return kj::str(plain.descriptor(std::move(encoded)).c_str());
@@ -3234,7 +3224,7 @@ private:
   coworkerd::ProcessPool& runtime;
   coworkerd::MemoryWatermark& memory;
   std::deque<ExecutionRecord> executions;
-  std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
+  std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingDispatchDecisions;
   struct PreparationBytes { uint64_t bytes, used; };
   std::map<std::string, PreparationBytes> preparationBytes;
   mutable coworkerd::PlainPlanCache plainPlanCache;
@@ -6332,7 +6322,7 @@ private:
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
     if (!target.isDatabase()) {
-      auto unavailable = co_await server.ensureCode(*version, deadline);
+      auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
         server.rejectVersionUnavailable(unavailable);
         co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409));
@@ -7203,7 +7193,7 @@ private:
         capnp::MallocMessageBuilder message;
         auto json = message.initRoot<capnp::JsonValue>();
         capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
-        refused = server.confirmPreparation(coworkerd::json::text(json, "invocationId"),
+        refused = server.confirmCapacityRejection(coworkerd::json::text(json, "invocationId"),
             coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"));
       } catch (const kj::Exception&) {}
       const std::string text = refused ? "{\"accepted\":true,\"refusal\":" + *refused + "}" : "{\"accepted\":false}";
@@ -7780,8 +7770,7 @@ private:
             verdict = {"UNAVAILABLE", "", "native process admission budget is full; nothing executed"};
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
-            verdict = flag("preparationLimit") ? TrialVerdict{"LOAD_FAILED", "", string("message")}
-                : classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
+            verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
                     applied.cpuMs, applied.memoryMiB);
           }
         }
@@ -8612,9 +8601,12 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 // configuration a Server reports is the one it runs; the pool applies the same values again.
 void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
+  if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
+  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || pool.cpuLimitMs <= 300000,
+      "ordinary cpuLimitMs is at most 300000 milliseconds");
   pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
@@ -8623,9 +8615,9 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
   if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
-  KJ_REQUIRE(pool.ordinaryServer != "threaded" || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
+  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
-  if (pool.ordinaryServer == "threaded") {
+  if (pool.count + pool.quarantineProcesses > 0) {
     // Include a replacement generation, private channels and prepared sockets;
     // reject an insufficient host hard limit before starting any child process.
     const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
@@ -8690,13 +8682,15 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   // The steady-state table of the same build, beside it as well.
   if (pool.steadyAllowlistPath.empty()) pool.steadyAllowlistPath = (executableDirectory() / "coworkerd-syscalls-steady.txt").string();
   pool.validate();
-  const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
-  std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
-            << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-            << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
-  if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
-    std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
-  std::cout << '}' << std::endl;
+  if (pool.durableProcesses > 0) {
+    const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
+    std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
+              << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
+              << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
+    if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
+      std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
+    std::cout << '}' << std::endl;
+  }
 }
 
 // The shortest text that reads back as the same double (0.05, not 0.050000000000000003).
@@ -8828,10 +8822,8 @@ int run(Launch launch) {
 
   const auto& manifestPath = launch.manifestPath;
   auto serverConfig = std::move(launch.config);
-  if (serverConfig.processPool.ordinaryServer == "threaded") {
-    // Poll sockets during bursts of RPC continuations, before their queue drains.
-    waitScope.setBusyPollInterval(8);
-  }
+  // Poll sockets during bursts of RPC continuations, before their queue drains.
+  waitScope.setBusyPollInterval(8);
   serverConfig.drainTimeoutMs = static_cast<uint32_t>(
       environmentUnsigned("COWORKERD_DRAIN_TIMEOUT_MS", serverConfig.drainTimeoutMs, 86'400'000));
   serverConfig.drainAnnounceDelayMsForTest = static_cast<uint32_t>(
@@ -9154,8 +9146,7 @@ int run(Launch launch) {
   auto peerAddress = io.provider->getNetwork()
       .parseAddress(peerAddressText.c_str()).wait(waitScope);
   auto httpListener = httpAddress->listen();
-  if (server.placementConfig().processPool.ordinaryServer == "threaded")
-    httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener));
+  httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener));
   auto bindingListener = bindingAddress->listen();
   auto peerListener = peerAddress->listen();
   auto sourceListener = sourceAddress->listen();

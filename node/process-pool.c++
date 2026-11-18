@@ -350,7 +350,8 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   replenish();
   // No Cap'n Proto bytes may precede this raw routing prefix.
   co_await connection->stream->write(kj::StringPtr("T").asBytes());
-  if (threadedProtocol >= 3) {
+  KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
+  {
     char decision;
     auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
     KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
@@ -1551,6 +1552,7 @@ public:
       char* end = nullptr; auto parsed = std::strtoull(ms, &end, 10);
       KJ_REQUIRE(*ms && end && !*end && parsed <= UINT32_MAX, "invalid CPU limit override");
       this->config.cpuLimitMs = static_cast<uint32_t>(parsed);
+      this->config.durableCpuLimitMs = static_cast<uint32_t>(parsed);
     }
     if (auto* text = std::getenv("COWORKERD_MEMORY_LIMIT_MIB")) {
       char* end = nullptr; auto value = std::strtoull(text, &end, 10);
@@ -1683,13 +1685,14 @@ public:
     std::cerr << "[process-pool] task failed: " << error.getDescription().cStr() << std::endl;
   }
   // What a Worker's executions run under: the limits it names, else this node's own.
-  WorkerLimits limitsOf(const std::string& workerId) const {
-    WorkerLimits effective{config.cpuLimitMs, config.memoryLimitMiB};
+  WorkerLimits limitsOf(const std::string& workerId, bool durable = false) const {
+    WorkerLimits effective{durable ? config.durableCpuLimitMs : config.cpuLimitMs, config.memoryLimitMiB};
     if (workerLimits.of && !workerId.empty()) {
       const auto named = workerLimits.of(workerId);
       if (named.cpuMs) effective.cpuMs = named.cpuMs;
       if (named.memoryMiB) effective.memoryMiB = named.memoryMiB;
     }
+    if (!durable && effective.cpuMs > 300000) effective.cpuMs = 300000;
     return effective;
   }
   // A new generation's WebAssembly memory cap: a process-wide V8 flag, so it is the largest limit any Worker
@@ -1798,7 +1801,8 @@ public:
     out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false")
         << ",\"ordinaryServer\":\"" << (p.threaded ? "threaded" : "upstream")
         << "\",\"threadedProtocol\":" << p.threadedProtocol
-        << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol >= 2 ? "true" : "false");
+        << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
+        << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol == 3 ? "true" : "false");
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -1835,7 +1839,7 @@ public:
   // the spawn goes ahead and the launcher reports the pair it was given.
   bool launchReady(Slot& s) {
     if (!sandbox.active || !sandbox.syscalls.active) return true;
-    const auto& program = !s.durable && config.ordinaryServer == "threaded"
+    const auto& program = !s.durable
         ? config.threadedExecutable : executable;
     const auto signature = statSignature(program);
     if (!signature.valid || !programDigest(signature).empty()) { s.digestWaitSince = 0; return true; }
@@ -1858,7 +1862,7 @@ public:
     std::vector<std::string> args = {sandbox.launcherPath, "--status-fd", std::to_string(LAUNCHER_STATUS_FD), "--program-fd",
         std::to_string(LAUNCHER_PROGRAM_FD), "--parent-pid", std::to_string(getpid()), "--root", sandbox.root,
         "--user", "--net", "--ipc", "--uts", "--drop-caps", "--no-new-privs", "--non-dumpable"};
-    if (!durable && config.ordinaryServer == "threaded") {
+    if (!durable) {
       args.push_back("--nofile");
       args.push_back(std::to_string(uint64_t(config.inFlightLimit) * 8 + 256));
     }
@@ -2231,7 +2235,7 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
-    p->threaded = !s.durable && config.ordinaryServer == "threaded";
+    p->threaded = !s.durable;
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -2260,48 +2264,55 @@ public:
       static const char* digits = "0123456789abcdef";
       for (auto byte : random) { p->egressToken.push_back(digits[byte >> 4]); p->egressToken.push_back(digits[byte & 15]); }
     }
-    std::filesystem::copy_file(runtimeFile, directory + "/processes/" + p->id + ".runtime.js",
-        std::filesystem::copy_options::overwrite_existing);
-    std::ofstream configFile(path);
-    configFile << "using Workerd = import \"/workerd/workerd.capnp\";\nconst config :Workerd.Config = (\n";
     p->wasmMemoryCapMiB = wasmMemoryCapMiB();
-    std::vector<std::string> v8Flags;
-    if (p->wasmMemoryCapMiB) v8Flags = {"--wasm-max-mem-pages=" + std::to_string(uint64_t(p->wasmMemoryCapMiB) * 16),
-        "--enforce-global-heap-limit", "--maximum-global-heap-limit-factor=1"};
-    // Every isolate's old generation starts this small, so its first full collection comes early and is small
-    // (gc.initialOldSpaceMiB); V8 grows it from there.
-    if (config.gcInitialOldSpaceMiB) v8Flags.push_back("--initial-old-space-size=" + std::to_string(config.gcInitialOldSpaceMiB));
-    if (!v8Flags.empty()) {
-      configFile << "v8Flags = [";
-      for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
-      configFile << "],\n";
+    if (p->durable) {
+      std::filesystem::copy_file(runtimeFile, directory + "/processes/" + p->id + ".runtime.js",
+          std::filesystem::copy_options::overwrite_existing);
+      std::ofstream configFile(path);
+      configFile << "using Workerd = import \"/workerd/workerd.capnp\";\nconst config :Workerd.Config = (\n";
+      std::vector<std::string> v8Flags;
+      if (p->wasmMemoryCapMiB) v8Flags = {"--wasm-max-mem-pages=" + std::to_string(uint64_t(p->wasmMemoryCapMiB) * 16),
+          "--enforce-global-heap-limit", "--maximum-global-heap-limit-factor=1"};
+      // Every isolate's old generation starts this small, so its first full collection comes early and is small
+      // (gc.initialOldSpaceMiB); V8 grows it from there.
+      if (config.gcInitialOldSpaceMiB) v8Flags.push_back("--initial-old-space-size=" + std::to_string(config.gcInitialOldSpaceMiB));
+      if (!v8Flags.empty()) {
+        configFile << "v8Flags = [";
+        for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
+        configFile << "],\n";
+      }
+      // A durable process selects tenant and platform roots through its private root loader. The runtime runs with
+      // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
+      // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
+      configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
+          "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
+          << p->id << ".runtime.js\")], bindings = [\n"
+          "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
+          "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
+          << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
+              p->egressToken + "\"),\n")
+          << rootLoaderBinding(p->durable)
+          << "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
+          << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
+          << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
+          << rootLoaderService(p->durable, durableDirectory())
+          << "(name = \"server\", external = (address = \"" << escape(bindingAddress)
+          << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
+          "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
+          // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).
+          << (egressAddress.empty() ? std::string() : "(name = \"egress\", external = (address = \"" + escape(egressAddress) +
+              "\", http = (style = proxy))),\n") <<
+          "(name = \"internet\", network = (allow = [], deny = [])),\n"
+          "(name = \"none\", network = (allow = [], deny = []))],\n"
+          // No address: the listening socket is the descriptor given with --socket-fd.
+          "sockets = [(name = \"rpc\", service = \"runtime\", http = (capnpConnectHost = \"coworkerd-runtime\"))]);\n";
+      configFile.close(); KJ_REQUIRE(configFile.good(), "cannot write process configuration");
+    } else {
+      // Remove only the generated configuration of this ordinary slot.
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
+      std::filesystem::remove(directory + "/processes/" + p->id + ".runtime.js", ignored);
     }
-    // A durable process selects tenant and platform roots through its private root loader. The runtime runs with
-    // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
-    // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
-    configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
-        "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
-        << p->id << ".runtime.js\")], bindings = [\n"
-        "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
-        "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
-        << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
-            p->egressToken + "\"),\n")
-        << rootLoaderBinding(p->durable)
-        << "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
-        << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
-        << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
-        << rootLoaderService(p->durable, durableDirectory())
-        << "(name = \"server\", external = (address = \"" << escape(bindingAddress)
-        << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
-        "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
-        // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).
-        << (egressAddress.empty() ? std::string() : "(name = \"egress\", external = (address = \"" + escape(egressAddress) +
-            "\", http = (style = proxy))),\n") <<
-        "(name = \"internet\", network = (allow = [], deny = [])),\n"
-        "(name = \"none\", network = (allow = [], deny = []))],\n"
-        // No address: the listening socket is the descriptor given with --socket-fd.
-        "sockets = [(name = \"rpc\", service = \"runtime\", http = (capnpConnectHost = \"coworkerd-runtime\"))]);\n";
-    configFile.close(); KJ_REQUIRE(configFile.good(), "cannot write process configuration");
     posix_spawn_file_actions_t actions;
     KJ_REQUIRE(posix_spawn_file_actions_init(&actions) == 0);
     auto cleanupActions = kj::defer([&] { posix_spawn_file_actions_destroy(&actions); });
@@ -2389,7 +2400,7 @@ public:
       std::string value(*entry);
       if (workerdInherits(value.substr(0, value.find('=')))) childEnvironment.push_back(std::move(value));
     }
-    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(config.cpuLimitMs));
+    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(p->durable ? config.durableCpuLimitMs : config.cpuLimitMs));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
     childEnvironment.push_back("COWORKERD_SQL_CPU_LIMIT_MS=" + std::to_string(config.sqlCpuLimitMs));
     childEnvironment.push_back("COWORKERD_SQL_WALL_LIMIT_MS=" + std::to_string(config.sqlWallLimitMs));
@@ -2589,10 +2600,12 @@ public:
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
         if (p->threaded) response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && (value == "2" || value == "3"))
-            p->threadedProtocol = value == "3" ? 3 : 2;
+          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") p->threadedProtocol = 3;
         });
-        if (p->threaded && p->threadedProtocol >= 3) p->contextsVisible = true;
+        if (p->threaded) {
+          KJ_REQUIRE(p->threadedProtocol == 3, "native process protocol 3 is required");
+          p->contextsVisible = true;
+        }
         if (!p->binary.valid) {
           // The generation's identity attaches once it answered its probe: it is the workerd
           // file the Server opened for it at the spawn -- what the launcher bound, or what posix_spawn
@@ -2909,7 +2922,7 @@ public:
       const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
         return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
       });
-      const auto limit = call == p.calls.end() ? (recent ? limitsOf(worker).cpuMs : 0u) : limitsOf(call->second->workerId).cpuMs;
+      const auto limit = call == p.calls.end() ? (recent ? limitsOf(worker, p.durable).cpuMs : 0u) : limitsOf(call->second->workerId, p.durable).cpuMs;
       if (!limit) return "null";
       if (value.getEvent() != "culprit" || value.getPid() != static_cast<uint32_t>(p.pid) ||
           value.getCpuLimitMs() != limit ||
@@ -3713,7 +3726,7 @@ void ProcessPool::setRootMaintenance(std::function<std::shared_ptr<const std::ve
   impl->rootMaintenance = std::move(request);impl->rootMaintenanceCompleted = std::move(applied);
 }
 void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
-WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId) const { return impl->limitsOf(workerId); }
+WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId, bool durable) const { return impl->limitsOf(workerId, durable); }
 bool ProcessPool::hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const {
   const auto quarantine = quarantined(worker);
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) {
@@ -3742,7 +3755,6 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   return {};
 }
 std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
-  if (impl->config.ordinaryServer != "threaded") return std::nullopt;
   const auto quarantine = quarantined(worker);
   std::vector<std::string> ids;
   for (const auto& s : impl->slots)

@@ -12,7 +12,8 @@ coworkerd-launcher --version
 ```
 
 Everything after `--` is workerd's command line exactly as the Server would start it without the launcher
-(`<workerd> serve --experimental --socket-fd rpc=4 <stack>/processes/<slot>.capnp`). The options are read from
+(`<workerd> serve --experimental --socket-fd rpc=4 <stack>/processes/<slot>.capnp` for a durable process,
+or `<coworkerd-threaded> 4 <source-address> <slot>:<generation> <in-flight-limit>` for an ordinary process). The options are read from
 the command line only; the launcher reads no environment variable and changes none except `PWD` (set to `/`,
 the new working directory).
 

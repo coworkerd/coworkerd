@@ -77,7 +77,7 @@ operations validate the series before mutating a checkout or exporting files.
 
 ### 0042: Native threaded execution and lifecycle
 
-`src/workerd/threaded/{BUILD.bazel,threaded-server.c++,protocol.h,protocol.capnp}` adds the opt-in
+`src/workerd/threaded/{BUILD.bazel,threaded-server.c++,protocol.h,protocol.capnp}` adds the
 `coworkerd-threaded` executable over the C++ worker and I/O libraries. Its accept
 loop hands raw descriptors to a native thread pool; each invocation owns its KJ
 loop and RPC connection on one thread. Worker versions share an isolate and enter

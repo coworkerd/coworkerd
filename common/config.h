@@ -25,7 +25,8 @@ struct ProcessPoolConfig {
   uint32_t restartMaxMs = 2000;
   bool watchdog = true;
   uint32_t pausedAdmissionWaitMs = 1000;
-  uint32_t cpuLimitMs = 200;
+  uint32_t cpuLimitMs = 30000;
+  uint32_t durableCpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
   // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
@@ -86,7 +87,7 @@ struct ProcessPoolConfig {
   std::string steadySyscallsMode = "off";
   std::string steadyAllowlistPath;
   // Selects the ordinary and quarantine backend; durable processes use upstream.
-  std::string ordinaryServer = "upstream";
+  std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
   // Per-tenant concurrent invocations in each native process.
   uint32_t tenantInFlightLimit = 16;
