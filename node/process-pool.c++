@@ -117,7 +117,8 @@ std::string escape(const std::string& value) {
 bool workerdInherits(std::string_view name) {
   static constexpr std::string_view NAMES[] = {"PATH", "TZ", "LANG", "LANGUAGE", "TMPDIR", "NO_COLOR", "FORCE_COLOR",
       "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST",
-      "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK", "COWORKERD_THREADED_TRACE_FOR_TEST"};
+      "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK", "COWORKERD_THREADED_TRACE_FOR_TEST",
+      "COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST"};
   return name.starts_with("LC_") || std::find(std::begin(NAMES), std::end(NAMES), name) != std::end(NAMES);
 }
 // Descriptor numbers each workerd inherits (see process-pool.h); the launcher's own two, which it
@@ -328,7 +329,9 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       [tasks = deferredDeletes](RuntimeConnection* raw) {
     // An export can release its last membrane while RpcSystem::messageLoop is
     // executing. Destroy the RPC system on a later event, including cancellation.
-    tasks->add(kj::evalLater([owned = std::unique_ptr<RuntimeConnection>(raw)] {}));
+    auto next = kj::newPromiseAndFulfiller<void>();
+    tasks->add(kj::mv(next.promise).then([owned = std::unique_ptr<RuntimeConnection>(raw)] {}));
+    next.fulfiller->fulfill();
   });
   if (idle.empty()) connection->stream = co_await address->connect();
   else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
@@ -3625,6 +3628,21 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
     }
   }
   return {};
+}
+std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
+  if (impl->config.ordinaryServer != "threaded" || quarantined(worker)) return std::nullopt;
+  std::vector<std::string> ids;
+  for (const auto& s : impl->slots)
+    if (!s.durable && !s.quarantine && s.current && s.current->threaded && s.current->pid > 0) ids.push_back(s.id);
+  if (ids.size() == 1) {
+    for (const auto& s : impl->slots)
+      if (s.id == ids.front() && s.current && impl->admitted(*s.current)) return std::pair{s.id, s.current->generation};
+    return std::nullopt;
+  }
+  for (const auto& id : rendezvousOrder(placementKey(worker, false), ids)) for (const auto& s : impl->slots) {
+    if (s.id == id && s.current && impl->admitted(*s.current)) return std::pair{s.id, s.current->generation};
+  }
+  return std::nullopt;
 }
 // A trial load's process: the tenant's quarantine shard, never an ordinary process -- a version
 // that crashes its process while loading takes no ordinary request with it. Without quarantine processes (configured

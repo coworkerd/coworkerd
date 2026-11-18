@@ -484,6 +484,14 @@ struct LoadCheck {
   bool coldLoaded = false;  // the check loaded the version for that call
 };
 
+struct PendingThreadedLoad {
+  PendingThreadedLoad(kj::Promise<void> signal, kj::Own<kj::PromiseFulfiller<void>> fulfiller)
+      : done(kj::mv(signal).fork()), fulfiller(kj::mv(fulfiller)) {}
+  kj::ForkedPromise<void> done;
+  kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+  std::optional<LoadCheck> result;
+};
+
 // The trial load's verdict (defined with it below) and the cleaning of its message (trialClean,
 // log-cleaning.h); the load check before a dispatch classifies and cleans with them.
 struct TrialVerdict {
@@ -1797,6 +1805,34 @@ public:
   void confirmLoaded(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
     loadConfirmed[loadKey(process, hash, entrypoint)] = monotonicTimeMs();
   }
+  std::string beginThreadedColdRoute(const VersionDefinition& version) {
+    if (!version.hasCode() || !serverConfig.loadCheck || serverConfig.processPool.ordinaryServer != "threaded" ||
+        runtime.quarantined(version.workerId)) return {};
+    auto process = runtime.threadedGenerationHint(version.workerId);
+    if (!process) return {};
+    // A scheduling hint only. Actual confirmation and admission select and
+    // validate again; the hint itself consumes no process ticket.
+    const auto& catalog = desiredState.state();
+    auto revision = std::pair{catalog.generation(), catalog.revision()};
+    if (threadedHintRevision != revision) {
+      threadedHintRevision = revision;
+      threadedHintLoads.clear();
+    }
+    auto [hint, inserted] = threadedHintLoads.try_emplace(version.definitionHash);
+    if (inserted) hint->second = loadRevision(version);
+    auto key = process->first + ":" + std::to_string(process->second) + ":" + hint->second + "#default";
+    auto found = loadConfirmed.find(key);
+    if (!threadedColdRoutes.contains(key) && found != loadConfirmed.end() &&
+        monotonicTimeMs() - found->second <= loadCheckFreshMs()) return {};
+    ++threadedColdRoutes[key];
+    return key;
+  }
+  void endThreadedColdRoute(const std::string& key) {
+    if (key.empty()) return;
+    auto found = threadedColdRoutes.find(key);
+    KJ_ASSERT(found != threadedColdRoutes.end() && found->second > 0);
+    if (--found->second == 0) threadedColdRoutes.erase(found);
+  }
   // One load probe on a selected process: what the runtime reported, or how the probe failed.
   struct LoadProbe {
     std::string checkId, processId, report, failure, culprit, workerId;
@@ -1859,6 +1895,51 @@ public:
     auto key = loadKey(*process, loadRevision(*version), entrypoint);
     if (auto found = loadConfirmed.find(key); found != loadConfirmed.end() && monotonicTimeMs() - found->second <= loadCheckFreshMs())
       co_return LoadCheck{};
+    std::shared_ptr<PendingThreadedLoad> shared;
+    const auto pendingKey = key;
+    auto complete = kj::defer([this, &shared, &pendingKey] {
+      if (shared) {
+        threadedLoads.erase(pendingKey);
+        shared->fulfiller->fulfill();
+      }
+    });
+    if (process->threadedServer()) {
+      if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
+        auto pending = found->second;
+        // The shared check owns its own process admission. A waiter keeps no
+        // extra process ticket, invocation number, or another caller's deadline.
+        process.reset();
+        bool expired = false;
+        try {
+          auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
+          co_await timer.timeoutAfter(remaining, pending->done.addBranch());
+          // A completed load can release hundreds of waiters. Let ready I/O
+          // and existing RPC continuations run before opening their calls.
+          co_await kj::yieldUntilWouldSleep();
+        } catch (const kj::Exception&) { expired = true; }
+        if (expired || monotonicTimeMs() >= deadline) {
+          LoadCheck result;
+          result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+          co_return result;
+        }
+        if (pending->result) {
+          const auto& result = *pending->result;
+          if (!result.refusal) co_return LoadCheck{};
+          if (result.refusal->code != "LEASE_EXPIRED") {
+            LoadCheck failed;
+            failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
+            failed.refusal->category = result.refusal->category;
+            co_return failed;
+          }
+        }
+        // Cancellation or the initiating caller's deadline cannot poison a
+        // later caller's check. Select the current generation again.
+        co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
+      }
+      auto signal = kj::newPromiseAndFulfiller<void>();
+      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
+      threadedLoads.emplace(key, shared);
+    }
     LoadCheck result;
     result.sequence = nextSequence++;
     const auto forInvocation = invocationId(result.sequence);
@@ -1947,6 +2028,7 @@ public:
               << ",\"category\":" << quoted(category) << ",\"detail\":" << quoted(detail)
               << ",\"reasonBytes\":" << (result.refusal ? result.refusal->reason.size() : 0) << ",\"coldLoad\":" << (coldLoad ? "true" : "false")
               << ",\"elapsedMs\":" << probe.elapsedMs << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    if (shared) shared->result = result;
     co_return result;
   }
   // One line per load failure, on the Server that decided what follows: where it failed, its category
@@ -3132,6 +3214,10 @@ private:
   kj::Timer& timer;
   // The load check: when a version last loaded on a process (process:generation:hash#entrypoint).
   std::map<std::string, double> loadConfirmed;
+  std::map<std::string, std::shared_ptr<PendingThreadedLoad>> threadedLoads;
+  std::map<std::string, uint> threadedColdRoutes;
+  std::pair<uint64_t, uint64_t> threadedHintRevision{0, 0};
+  std::map<std::string, std::string> threadedHintLoads;
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
   std::set<std::string> rootNamespaces;
@@ -7878,6 +7964,15 @@ private:
       co_return co_await sendText(response, 503, "Service Unavailable",
           rejectionJson(failure.code, failure.reason, deadline), "application/json");
     }
+    // A burst of cold headers must not run every preparation chain before an
+    // established Worker's ready I/O. Admission remains per request.
+    auto coldRoute = server.beginThreadedColdRoute(*selected.version);
+    KJ_DEFER(server.endThreadedColdRoute(coldRoute));
+    if (!coldRoute.empty()) {
+      pathMark(timing, "cold-yield-start");
+      co_await kj::yieldUntilWouldSleep();
+      pathMark(timing, "cold-yield-end");
+    }
     if (selected.version->assets && co_await assets.serve(*selected.version, AssetLayer::Source::INGRESS, method, path, headers,
         response, deadline)) co_return;
     if (timing) timing->target = selected.version->key();
@@ -8583,6 +8678,27 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
   return out.str();
 }
 
+class FairConnectionReceiver final: public kj::ConnectionReceiver {
+public:
+  explicit FairConnectionReceiver(kj::Own<kj::ConnectionReceiver> inner): inner(kj::mv(inner)) {}
+  kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override {
+    auto connection = co_await inner->accept();
+    co_await kj::yieldUntilWouldSleep();
+    co_return kj::mv(connection);
+  }
+  kj::Promise<kj::AuthenticatedStream> acceptAuthenticated() override {
+    auto connection = co_await inner->acceptAuthenticated();
+    co_await kj::yieldUntilWouldSleep();
+    co_return kj::mv(connection);
+  }
+  uint getPort() override { return inner->getPort(); }
+  void getsockopt(int level, int option, void* value, uint* length) override { inner->getsockopt(level, option, value, length); }
+  void setsockopt(int level, int option, const void* value, uint length) override { inner->setsockopt(level, option, value, length); }
+  void getsockname(struct sockaddr* address, uint* length) override { inner->getsockname(address, length); }
+private:
+  kj::Own<kj::ConnectionReceiver> inner;
+};
+
 int run(Launch launch) {
   auto io = kj::setupAsyncIo();
   auto& waitScope = io.waitScope;
@@ -8598,6 +8714,10 @@ int run(Launch launch) {
 
   const auto& manifestPath = launch.manifestPath;
   auto serverConfig = std::move(launch.config);
+  if (serverConfig.processPool.ordinaryServer == "threaded") {
+    // Poll sockets during bursts of RPC continuations, before their queue drains.
+    waitScope.setBusyPollInterval(8);
+  }
   serverConfig.drainTimeoutMs = static_cast<uint32_t>(
       environmentUnsigned("COWORKERD_DRAIN_TIMEOUT_MS", serverConfig.drainTimeoutMs, 86'400'000));
   serverConfig.drainAnnounceDelayMsForTest = static_cast<uint32_t>(
@@ -8920,6 +9040,8 @@ int run(Launch launch) {
   auto peerAddress = io.provider->getNetwork()
       .parseAddress(peerAddressText.c_str()).wait(waitScope);
   auto httpListener = httpAddress->listen();
+  if (server.placementConfig().processPool.ordinaryServer == "threaded")
+    httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener));
   auto bindingListener = bindingAddress->listen();
   auto peerListener = peerAddress->listen();
   auto sourceListener = sourceAddress->listen();
