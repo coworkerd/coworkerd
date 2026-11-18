@@ -1011,7 +1011,7 @@ public:
     return ensurePreparationMemory(version, deadline);
   }
   kj::Promise<std::string> ensurePreparationMemory(VersionDefinition version, double deadline) {
-    if (deadline <= monotonicTimeMs()) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata wait timed out");
+    if (deadline <= monotonicTimeMs()) co_return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "fetch timed out (call deadline)");
     auto found = preparationByteFlights.find(version.contentHash);
     std::shared_ptr<kj::ForkedPromise<std::string>> shared;
     if (found == preparationByteFlights.end()) {
@@ -1029,7 +1029,7 @@ public:
     } else { shared = found->second; }
     co_return co_await shared->addBranch().exclusiveJoin(timer.afterDelay(
         static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS)
-        .then([] { return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "package metadata wait timed out"); }));
+        .then([] { return coworkerd::reasons::detail(coworkerd::reasons::CODE_UNAVAILABLE, "fetch timed out (call deadline)"); }));
   }
   kj::Promise<std::string> preparationMemory(VersionDefinition version, double deadline) {
     try {
