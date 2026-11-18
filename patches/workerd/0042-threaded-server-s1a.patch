@@ -619,7 +619,7 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..f2c9cc8b7e7bd93e05e0f2b604991efe55a7b34a
+index 0000000000000000000000000000000000000000..fa58d3226e77f66dea03c05dc7798bac9fa874ac
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -0,0 +1,327 @@
@@ -690,7 +690,7 @@ index 0000000000000000000000000000000000000000..f2c9cc8b7e7bd93e05e0f2b604991efe
 +  KJ_EXPECT(smaller->memoryMaximum - smaller->admissionMaximum == (16ull << 20));
 +  const auto baseline = budget->memoryReserved.load();
 +  {
-+    auto reservation = std::make_shared<ResourceReservation>(budget);
++    auto reservation = std::make_shared<ResourceReservation>(budget, 128);
 +    KJ_ASSERT(reservation->registerPreparation());
 +    auto seed = budget->memoryReserved.load();
 +    KJ_EXPECT(seed > baseline && budget->residents.load() == 1);
@@ -874,7 +874,7 @@ index 0000000000000000000000000000000000000000..f2c9cc8b7e7bd93e05e0f2b604991efe
 +  };
 +  checkNeighbor();
 +  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
-+  auto reservation = std::make_shared<ResourceReservation>(budget);
++  auto reservation = std::make_shared<ResourceReservation>(budget, 32);
 +  KJ_ASSERT(reservation->registerPreparation());
 +  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation);
 +  auto params = limits.getCreateParams();
