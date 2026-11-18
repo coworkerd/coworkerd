@@ -3975,6 +3975,7 @@ public:
       server.nextLogEvent(invocation);
     };
     hooks.limitCode = [process]() -> std::string {
+      if (process->processMemoryPressure()) return "PROCESS_MEMORY_PRESSURE";
       if (process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
       if (process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
       return {};
@@ -4089,6 +4090,7 @@ private:
   }
   // The limit that ended the call, if one did ("" otherwise).
   std::string limitCode() const {
+    if (slot->process && slot->process->processMemoryPressure()) return "PROCESS_MEMORY_PRESSURE";
     if (slot->process && slot->process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
     if (slot->process && slot->process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
     return {};

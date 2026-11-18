@@ -599,10 +599,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..3f21fbe635b4967e824eaf4ed808ea8596fc56cf
+index 0000000000000000000000000000000000000000..d927795a3e6cd4259277a6fb575463db9d50641c
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3412 @@
+@@ -0,0 +1,3415 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1074,6 +1074,7 @@ index 0000000000000000000000000000000000000000..3f21fbe635b4967e824eaf4ed808ea85
 +    if (isolate) isolate->TerminateExecution();
 +  }
 +  bool reserve(size_t size) {
++    if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return false;
 +    auto used = external.load();
 +    for (;;) {
 +      auto base = heap.load();
@@ -1128,6 +1129,7 @@ index 0000000000000000000000000000000000000000..3f21fbe635b4967e824eaf4ed808ea85
 +    if (reservation && !reservation->observe(stats, owned)) {
 +      pressure();
 +    }
++    if (currentCause && currentCause->load() == LimitCause::PROCESS_MEMORY) return;
 +    if (maximum != 0 && stats.used_heap_size() + other + owned >= maximum) {
 +      if (!afterGc) {
 +        isolate->LowMemoryNotification();
@@ -1142,7 +1144,8 @@ index 0000000000000000000000000000000000000000..3f21fbe635b4967e824eaf4ed808ea85
 +    isolate = value;
 +    value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t initial) {
 +      auto &self = *static_cast<MemoryBudget *>(opaque);
-+      self.cause->store(LimitCause::MEMORY);
++      if (!self.currentCause || self.currentCause->load() != LimitCause::PROCESS_MEMORY)
++        self.cause->store(LimitCause::MEMORY);
 +      self.isolate->TerminateExecution();
 +      if (self.reservation) self.reservation->heapEmergency(8u << 20);
 +      return current + (8u << 20);

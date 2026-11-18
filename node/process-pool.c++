@@ -967,7 +967,7 @@ struct ProcessGeneration {
   std::string eventTail;
   bool fatalMemoryEventPending = false;
   std::vector<LimitEvent> unappliedEvents;
-  std::array<std::set<std::string>, 2> terminatedCalls;  // CPU, memory: pid, invocation, Worker, version
+  std::array<std::set<std::string>, 3> terminatedCalls;  // CPU, isolate memory, process pressure: pid, invocation, Worker, version
   // A durable process's limit rows name the request that started the object's context (workerd keeps one per object),
   // not the request that hit the limit: by pid, Worker and version, when each was last read.
   std::array<std::map<std::string, double>, 2> terminatedWorkers;
@@ -1176,10 +1176,11 @@ struct ProcessGeneration {
         capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), report);
         if (report.getPid() != static_cast<uint32_t>(spawnPid)) continue;
         const std::string event = report.getEvent().cStr();
-        if (event == "terminated" || event == "memory-terminated") {
-          terminatedCalls[event == "terminated" ? 0 : 1].insert(callKey(report.getPid(), report.getInvocationId().cStr(),
+        if (event == "terminated" || event == "memory-terminated" || (threaded && event == "process-memory-pressure")) {
+          const auto cause = event == "terminated" ? 0 : event == "memory-terminated" ? 1 : 2;
+          terminatedCalls[cause].insert(callKey(report.getPid(), report.getInvocationId().cStr(),
               report.getWorkerId().cStr(), report.getVersionId().cStr()));
-          if (durable) terminatedWorkers[event == "terminated" ? 0 : 1][callKey(report.getPid(), "", report.getWorkerId().cStr(),
+          if (durable && cause < 2) terminatedWorkers[cause][callKey(report.getPid(), "", report.getWorkerId().cStr(),
               report.getVersionId().cStr())] = mono();
         }
         if (event == "completed" && !openContexts.empty()) {
@@ -1314,6 +1315,10 @@ bool ProcessCall::memoryLimitExceeded() const {
   if (process->durable) return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(1, invocationId, workerId, versionId);
 }
+bool ProcessCall::processMemoryPressure() const {
+  return process->threaded && process->terminated(2, invocationId, workerId, versionId);
+}
+
 
 // A slot's or a generation's class, as the state endpoint and the [process] lines name it, and its code for the output
 // drainer (WorkerdOutput::className).

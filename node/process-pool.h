@@ -37,6 +37,7 @@ public:
   bool threadedServer() const;
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;
+  bool processMemoryPressure() const;
   const std::string processId;
   const uint64_t generation;
   std::string invocationId, treeId, workerId, versionId;
