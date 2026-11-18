@@ -40,16 +40,19 @@ void eventLoopProgress() {
       atLastPoll = callbacks;
       return false;
     }
+    kj::Promise<void> burst(unsigned remaining) {
+      return kj::evalLater([this, remaining]() -> kj::Promise<void> {
+        ++callbacks;
+        if (remaining == 1) return kj::READY_NOW;
+        return burst(remaining - 1);
+      });
+    }
     unsigned callbacks = 0, polls = 0, atLastPoll = 0, largestBatch = 0;
   } port;
   kj::EventLoop loop(port);
   kj::WaitScope scope(loop);
   configureNodeEventLoop(scope);
-  kj::Promise<void> chain = kj::evalLater([&] { ++port.callbacks; });
-  for (unsigned i = 1; i < 1000; ++i) {
-    chain = chain.then([&] { ++port.callbacks; });
-  }
-  chain.wait(scope);
+  port.burst(1000).wait(scope);
   KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= 4,
       "ready I/O must be checked during a continuation burst", port.polls, port.largestBatch);
 }
