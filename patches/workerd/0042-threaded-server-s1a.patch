@@ -477,16 +477,17 @@ index 0000000000000000000000000000000000000000..53044781b353534a6fbabb5b07c42630
 +}
 diff --git a/src/workerd/threaded/protocol.h b/src/workerd/threaded/protocol.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa9b698643
+index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04694d787b
 --- /dev/null
 +++ b/src/workerd/threaded/protocol.h
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
 +#include <cctype>
 +#include <cstdint>
 +#include <initializer_list>
 +#include <stdexcept>
++#include <string>
 +#include <string_view>
 +
 +namespace workerd::threaded {
@@ -578,20 +579,33 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +  return value;
 +}
 +
++inline std::string normalizeEntrypoint(std::string_view format, std::string_view entrypoint) {
++  // A legacy service-worker script has only its global fetch handler. Named
++  // HTTP bindings historically select that handler as well.
++  return format == "v1" || entrypoint.empty() ? "default" : std::string(entrypoint);
++}
++
++inline std::string childOrderSequence(
++    bool required, std::string_view inherited, uint64_t generated) {
++  if (!required) return "0";
++  return inherited.empty() || inherited == "0" || inherited == "\"0\"" ? std::to_string(generated)
++                                                                       : std::string(inherited);
++}
++
 +enum class LoadStage { LOAD, PACKAGE, DECODE, EVALUATION };
 +struct LoadStageInfo {
-+  std::string_view stage, codeStage, category;
++  std::string_view stage, codeStage, category, name;
 +};
 +inline constexpr LoadStageInfo loadStageInfo(LoadStage stage) {
 +  switch (stage) {
 +    case LoadStage::LOAD:
-+      return {"load", "", "LOAD_FAILED"};
++      return {"bridge", "", "LOAD_FAILED", "Error"};
 +    case LoadStage::PACKAGE:
-+      return {"code", "package", "LOAD_FAILED"};
++      return {"code", "package", "LOAD_FAILED", "Error"};
 +    case LoadStage::DECODE:
-+      return {"code", "decode", "LOAD_FAILED"};
++      return {"code", "decode", "LOAD_FAILED", "SyntaxError"};
 +    case LoadStage::EVALUATION:
-+      return {"evaluation", "", "TOP_LEVEL_THROW"};
++      return {"evaluation", "", "TOP_LEVEL_THROW", "Error"};
 +  }
 +  throw std::invalid_argument("unknown load stage");
 +}
@@ -619,15 +633,17 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..866c42241636181bcd71cbc7317266a5076dd275
+index 0000000000000000000000000000000000000000..0e5d972c3889ff23ac5ee1db1fecc97361bec09b
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,447 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
 +#include "threaded-server.c++"
 +#undef main
++
++#include <sys/wait.h>
 +
 +#include <kj/test.h>
 +
@@ -991,14 +1007,89 @@ index 0000000000000000000000000000000000000000..866c42241636181bcd71cbc7317266a5
 +  fflush(stdout);
 +}
 +
++KJ_TEST("legacy named HTTP entrypoints select the global handler") {
++  KJ_EXPECT(threaded::normalizeEntrypoint("v1", "Named") == "default");
++  KJ_EXPECT(threaded::normalizeEntrypoint("v1", "") == "default");
++  KJ_EXPECT(threaded::normalizeEntrypoint("v2", "") == "default");
++  KJ_EXPECT(threaded::normalizeEntrypoint("v2", "Named") == "Named");
++}
++
++KJ_TEST("bridge and decode failures retain their distinct trial stages") {
++  using L = threaded::LoadStage;
++  auto bridge = threaded::loadStageInfo(L::LOAD);
++  auto package = threaded::loadStageInfo(L::PACKAGE);
++  auto decode = threaded::loadStageInfo(L::DECODE);
++  auto evaluation = threaded::loadStageInfo(L::EVALUATION);
++  KJ_EXPECT(bridge.stage == "bridge" && bridge.category == "LOAD_FAILED");
++  KJ_EXPECT(package.stage == "code" && package.codeStage == "package" && package.name == "Error");
++  KJ_EXPECT(decode.stage == "code" && decode.codeStage == "decode" && decode.name == "SyntaxError");
++  KJ_EXPECT(evaluation.stage == "evaluation" && evaluation.category == "TOP_LEVEL_THROW");
++}
++
++KJ_TEST("the naive ordering counterexample inherits the parent order") {
++  KJ_EXPECT(threaded::childOrderSequence(false, "9", 1) == "0");
++  KJ_EXPECT(threaded::childOrderSequence(true, "0", 7) == "7");
++  KJ_EXPECT(threaded::childOrderSequence(true, "\"0\"", 7) == "7");
++  KJ_EXPECT(threaded::childOrderSequence(true, "9", 1) == "9");
++  KJ_EXPECT(threaded::childOrderSequence(true, "\"9\"", 1) == "\"9\"");
++}
++
++KJ_TEST("descriptor preflight raises a low soft limit and rejects a low hard limit") {
++  for (bool hardLow: {false, true}) {
++    auto pid = fork();
++    KJ_REQUIRE(pid >= 0);
++    if (pid == 0) {
++      struct rlimit limits;
++      if (getrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(2);
++      limits.rlim_cur = hardLow ? 128 : 1024;
++      if (hardLow) limits.rlim_max = 128;
++      if (setrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(3);
++      auto accepted = prepareDescriptors(512);
++      if (getrlimit(RLIMIT_NOFILE, &limits) != 0) _exit(4);
++      _exit(hardLow ? (accepted ? 5 : 0) : (accepted && limits.rlim_cur >= 4352 ? 0 : 6));
++    }
++    int status;
++    KJ_REQUIRE(waitpid(pid, &status, 0) == pid);
++    KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++  }
++}
++
++KJ_TEST("validation reports retain the original JavaScript exception") {
++  Reporter reporter;
++  reporter.addError(kj::str("Uncaught SyntaxError: Unexpected token '='\nat index.js:1:6"));
++  reporter.addError(kj::str("a later validation error"));
++  bool rejected = false;
++  try {
++    reporter.requireValid();
++  } catch (const kj::Exception& error) {
++    rejected = true;
++    KJ_EXPECT(
++        error.getDescription() == "Uncaught SyntaxError: Unexpected token '='\nat index.js:1:6");
++  }
++  KJ_EXPECT(rejected);
++}
++
++KJ_TEST("legacy RPC rejects before a tenant method with its existing TypeError") {
++  requireRpcEntrypoint("v2");
++  bool refused = false;
++  try {
++    requireRpcEntrypoint("v1");
++  } catch (const kj::Exception& error) {
++    refused = true;
++    KJ_EXPECT(error.getDescription() ==
++        "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".");
++  }
++  KJ_EXPECT(refused);
++}
++
 +}  // namespace
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442aa262613
+index 0000000000000000000000000000000000000000..bdd25723f4b1f5b9dfbb4b27c79e5e5bca036cd7
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3669 @@
+@@ -0,0 +1,3698 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1923,8 +2014,15 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +
 +struct Reporter final: Worker::ValidationErrorReporter {
 +  std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
++  kj::Maybe<kj::String> failure;
 +  void addError(kj::String error) override {
-+    KJ_FAIL_REQUIRE("invalid Worker", error);
++    if (failure == kj::none) failure = kj::mv(error);
++  }
++  void requireValid() {
++    KJ_IF_SOME(error, failure) {
++      kj::throwRecoverableException(
++          kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str(error)));
++    }
 +  }
 +  void addEntrypoint(kj::Maybe<kj::StringPtr> name, kj::Array<kj::String> handlers) override {
 +    std::string key = "default";
@@ -2993,8 +3091,10 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    kj::HttpHeaders headers(*state.headers);
 +    auto request = client->request(kj::HttpMethod::GET, url, headers);
 +    auto response = co_await request.response;
-+    KJ_REQUIRE(
-+        response.statusCode == 200, kj::str("Trusted source fetch failed: ", response.statusCode));
++    if (response.statusCode != 200) {
++      kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
++          kj::str("Trusted source fetch failed: ", response.statusCode)));
++    }
 +    auto length =
 +        KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
 +    while (!slot.reservation->retainSource(length)) {
@@ -3004,7 +3104,9 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +      }
 +    }
 +    auto content = co_await response.body->readAllText(256u << 20);
++    slot.loadStage = threaded::LoadStage::DECODE;
 +    JsonDoc source(content);
++    slot.loadStage = threaded::LoadStage::PACKAGE;
 +    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
 +            text(source.get(), "versionId") == text(descriptor, "versionId") &&
 +            text(source.get(), "contentHash") == text(descriptor, "contentHash"),
@@ -3110,11 +3212,13 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +        kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
 +            name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
 +            Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
-+    slot.loadStage = threaded::LoadStage::LOAD;
-+    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name,
-+        server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter),
-+        IsolateObserver::StartType::COLD, kj::none, kj::none, SpanParent(nullptr),
++    slot.loadStage = threaded::LoadStage::EVALUATION;
++    auto extracted = server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter);
++    reporter.requireValid();
++    auto compiled = kj::atomicRefcounted<Worker::Script>(kj::mv(isolate), name, extracted,
++        IsolateObserver::StartType::COLD, reporter, kj::none, SpanParent(nullptr),
 +        newWorkerFileSystem(kj::heap<FsMap>(), getTmpDirectoryImpl()), kj::none);
++    reporter.requireValid();
 +    kj::Maybe<jsg::V8Ref<v8::Object>> exportsHandle;
 +    slot.loadStage = threaded::LoadStage::EVALUATION;
 +    auto worker =
@@ -3180,6 +3284,7 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    },
 +            IsolateObserver::StartType::COLD, SpanParent(nullptr),
 +            Worker::Lock::TakeSynchronously(kj::none), reporter);
++    reporter.requireValid();
 +    uintptr_t isolateAddress = 0;
 +    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
 +      lock.validateHandlers(reporter);
@@ -3226,6 +3331,7 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +      });
 +      isolateAddress = reinterpret_cast<uintptr_t>(lock.getIsolate());
 +    });
++    reporter.requireValid();
 +    slot.httpEntrypoints = std::move(reporter.httpEntrypoints);
 +    slot.entrypoints = std::move(reporter.entrypoints);
 +    slot.actorClasses = std::move(reporter.actorClasses);
@@ -3809,7 +3915,10 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    add("parentInvocationId", encode(field(input(), "invocationId")));
 +    auto next = flag(input(), "requiresChildSequence") && !assets ? ++sequence : 0;
 +    add("callSequence", kj::str(next));
-+    add("orderSequence", kj::str(next));
++    auto inherited = threaded::rawField(
++        std::string_view(document.original.begin(), document.original.size()), "orderSequence");
++    auto order = threaded::childOrderSequence(next != 0, inherited, next);
++    add("orderSequence", kj::str(order));
 +    add("sequenceMapSize", kj::str(next == 0 ? 0 : 1));
 +    auto deadline =
 +        threaded::rawPath(std::string_view(document.original.begin(), document.original.size()),
@@ -4231,7 +4340,8 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +  auto generation = field(input, "processGeneration");
 +  cf = kj::str(cf, ",\"processGeneration\":",
 +      generation.isString() ? kj::str(generation.getString()) : encode(generation), "}");
-+  auto entrypoint = field(input, "entrypoint").isString() ? str(input, "entrypoint") : "";
++  auto entrypoint = threaded::normalizeEntrypoint(
++      str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
 +  auto channels = kj::rc<Channels>(state, server, slot, raw);
 +  auto tracer = kj::rc<TenantTracer>(channels.addRef());
 +  auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
@@ -4247,6 +4357,16 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +      kj::addRef(*invocation), kj::mv(channels), kj::refcounted<RequestObserver>(), state.tasks,
 +      true, kj::mv(tracer), kj::mv(cf), kj::none);
 +  return {kj::mv(entry), kj::mv(invocation)};
++}
++
++void requireRpcEntrypoint(std::string_view format) {
++  if (format == "v1") {
++    // Legacy service-worker scripts never supported the entrypoint RPC
++    // handshake. Retain its public TypeError across the backend switch.
++    kj::throwRecoverableException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
++        kj::str(
++            "jsg.TypeError: The RPC receiver does not implement the method \"__coworkerdRpcTarget\".")));
++  }
 +}
 +
 +kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
@@ -4284,6 +4404,7 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
 +    kj::throwRecoverableException(error.clone());
 +  }
++  requireRpcEntrypoint(str(input, "format"));
 +  auto prepared = kj::heap<PreparedInvocation>(prepareInvocation(state, server, slot, input,
 +      descriptor, kj::mv(props), std::move(preparation), std::move(tenant)));
 +  auto event = kj::heap<api::JsRpcSessionCustomEvent>(
@@ -4373,10 +4494,10 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    auto value = arena.initRoot<Json>();
 +    value.setString(message);
 +    auto info = threaded::loadStageInfo(loadStage);
-+    auto report =
-+        kj::str("{\"ok\":false,\"stage\":\"", kj::heapString(info.stage.data(), info.stage.size()),
-+            "\",\"codeStage\":\"", kj::heapString(info.codeStage.data(), info.codeStage.size()),
-+            "\",\"name\":\"Error\",\"message\":", encode(value), "}");
++    auto report = kj::str("{\"ok\":false,\"stage\":\"",
++        kj::heapString(info.stage.data(), info.stage.size()), "\",\"codeStage\":\"",
++        kj::heapString(info.codeStage.data(), info.codeStage.size()), "\",\"name\":\"",
++        kj::heapString(info.name.data(), info.name.size()), "\",\"message\":", encode(value), "}");
 +    if (!trial)
 +      report = co_await server.confirmDecision(input, state, "load-rejected", message, loadStage);
 +    auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
@@ -4384,9 +4505,8 @@ index 0000000000000000000000000000000000000000..6ee1a916de780e5365be5ac58bc8f442
 +    co_await output->write(report.asBytes());
 +    co_return;
 +  }
-+  auto entrypoint =
-+      field(input, "entrypoint").isString() ? str(input, "entrypoint") : std::string();
-+  if (entrypoint.empty()) entrypoint = "default";
++  auto entrypoint = threaded::normalizeEntrypoint(
++      str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
 +  if (trial) {
 +    auto names = kj::str("[");
 +    bool first = true;

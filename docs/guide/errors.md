@@ -10,7 +10,7 @@
 
 ## 1. When calling a Worker (the ingress's answers)
 
-"Not executed" means the Worker's code certainly did not start, so it is safe to retry; "result uncertain" means part of it may have executed.
+"Not executed" means the Worker's code certainly did not start, so another attempt cannot execute it twice. A response with `retryable: false` means retrying the same request will not help. "Result uncertain" means part of the code may have executed.
 
 | HTTP | `code` | Meaning | Executed? | What to do |
 | --- | --- | --- | --- | --- |
@@ -18,7 +18,7 @@
 | 503 | `TENANT_UNAVAILABLE` | The tenant the route belongs to is being deleted or its record is gone; none of its Workers are served any more | Not executed | Once the deletion completes the route disappears with it (404 from then on) |
 | 503 | `ROUTE_INVALID` | The matching route is invalid in the deployment state (for example written badly bypassing the control plane) | Not executed | `cowctl deploy` again |
 | 503 | `WORKER_INVALID` | The Worker is invalid in the deployment state: a secret the active version declares has no value, a Binding's target is invalid, and so on; `reason` says which entry (names only); on a node whose secrets key does not open a value, that secret counts as missing too (`missing secret: NAME`) | Not executed | Supply what the reason names (for example `cowctl secret put`) or switch to another version; a secret missing on one node only means that node's `secrets-key.json` is not the cluster's |
-| 503 | `LOAD_FAILED` | The version cannot be loaded in the load check before dispatch, `category`: `package-unavailable` (no candidate node could fetch or verify the code package), `evaluation` (syntax, imports, throwing at the top level or a top-level `await` that never settles, a module that cannot be compiled or decoded, a missing entry point, compatibility flags), `limit` (exceeding the CPU or memory limit while loading), `secret-missing` | Not executed | `evaluation`, `limit`: fix the code and deploy again; `package-unavailable`: recovers by itself once object storage is back |
+| 503 | `LOAD_FAILED` | The version cannot be loaded in the load check before dispatch, `category`: `package-unavailable` (no candidate node could fetch or verify the code package), `evaluation` (syntax, imports, throwing at the top level or a top-level `await` that never settles, a module that cannot be compiled or decoded, a missing entry point, compatibility flags), `limit` (exceeding the CPU or memory limit while loading the Worker), `secret-missing` | Not executed | `evaluation`, `limit`: fix the code and deploy again; `package-unavailable`: recovers by itself once object storage is back |
 | 501 | `NOT_SUPPORTED` | The request called an operation unavailable on this backend | Partly executed | Use a supported operation; this call is not rerouted |
 | 503 | `CPU_LIMIT_EXCEEDED` | This request's CPU exceeded the limit (the Worker's own, else its tenant's default, else the node's: 30,000 ms by default for ordinary and quarantine processes, 200 ms for durable processes) and it was terminated | Partly executed | Do less computation per request; for intermittent failures of light requests, also [check host first-touch stalls](install.md#10-troubleshooting) |
 | 503 | `MEMORY_LIMIT_EXCEEDED` | The isolate's memory exceeded the limit (the Worker's own, else its tenant's default, else the node's: 128 MiB by default) and it was terminated | Partly executed | Use less memory |

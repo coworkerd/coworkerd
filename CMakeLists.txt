@@ -159,12 +159,17 @@ add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
-foreach(case deadlines leases tree-lease budget identity package module-types cache
-    rejected-manifest)
+foreach(case deadlines event-loop trial-verdicts leases tree-lease budget identity package module-types cache
+    cache-unavailable cache-deadline cache-capacity cache-single-flight rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
+set(COWORKERD_TEST_JUNIT "" CACHE FILEPATH "Optional JUnit result path for the check target")
+set(COWORKERD_TEST_REPORT_ARGS)
+if(COWORKERD_TEST_JUNIT)
+  list(APPEND COWORKERD_TEST_REPORT_ARGS --output-junit "${COWORKERD_TEST_JUNIT}")
+endif()
 add_custom_target(check
-  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
+  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
   DEPENDS coworkerd-node-contract-test coworkerd-process-culprit-test
   USES_TERMINAL)
 
@@ -176,6 +181,7 @@ endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
 endforeach()
+add_test(NAME node-error-contract COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/node/error-contract.test.mjs")
 
 set(COWORKERD_NATIVE_TEST_LOG "" CACHE FILEPATH "Output of the native KJ contract test")
 set(COWORKERD_NATIVE_TEST_RECEIPT "" CACHE FILEPATH "Native test source and result receipt")

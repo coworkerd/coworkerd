@@ -1,4 +1,6 @@
 #include "invocation-contract.h"
+#include "event-loop.h"
+#include "trial-verdict.h"
 #include "reasons.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
@@ -507,15 +509,10 @@ struct PendingThreadedLoad {
   std::optional<LoadCheck> result;
 };
 
-// The trial load's verdict (defined with it below) and the cleaning of its message (trialClean,
+// The shared trial verdict and the cleaning of its message (trialClean,
 // log-cleaning.h); the load check before a dispatch classifies and cleans with them.
-struct TrialVerdict {
-  std::string category;  // empty: the version loads
-  std::string limit;     // "cpu" or "memory" for LIMIT_EXCEEDED
-  std::string message;
-};
-TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& name, const std::string& raw,
-    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB);
+using coworkerd::TrialVerdict;
+using coworkerd::classifyTrialFailure;
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call = {});
 
@@ -2014,7 +2011,7 @@ public:
         } else {
           const auto applied = runtime.effectiveLimits(probe.workerId);
           auto verdict = classifyTrialFailure("load", string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
-              applied.cpuMs, applied.memoryMiB);
+              applied.cpuMs, applied.memoryMiB, process->threadedServer());
           category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
           detail = verdict.category.empty() ? "LOAD_FAILED" : verdict.category;
           message = verdict.message;
@@ -2614,7 +2611,7 @@ public:
         refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
       } else {
         auto limits = runtime.effectiveLimits(slot->process->workerId);
-        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
+        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB, slot->process->threadedServer());
         refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
         refused.reason = verdict.message;
       }
@@ -7466,68 +7463,6 @@ struct TrialRequest {
   bool routed = false;
 };
 
-// A failed load, as the runtime reported it ("Failed to start Worker:\n
-// Uncaught Error: No such module ...\n  at worker.js:1:7"), and what the
-// process's limit events say about this probe.
-TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& name, const std::string& raw,
-    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB) {
-  std::string text = raw;
-  for (const char* prefix : {"Failed to start Worker:", "\n", " ", "Uncaught "}) {
-    if (text.starts_with(prefix)) text = text.substr(std::string_view(prefix).size());
-  }
-  std::vector<std::string> lines;
-  for (size_t start = 0; start <= text.size();) {
-    auto end = text.find('\n', start);
-    if (end == std::string::npos) end = text.size();
-    auto line = text.substr(start, end - start);
-    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
-    if (!line.empty()) lines.push_back(line);
-    start = end + 1;
-  }
-  const std::string head = lines.empty() ? std::string() : lines.front();
-  // Where it happened: an import or the first frame in the version's own modules.
-  std::string where;
-  for (size_t i = 1; i < lines.size() && where.empty(); ++i) {
-    const auto& line = lines[i];
-    if (line.starts_with("imported from ")) where = line;
-    else if (line.starts_with("at ") && line.find("node-internal:") == std::string::npos &&
-        line.find("__coworkerd_entrypoint__.js") == std::string::npos) where = line;
-  }
-  auto colon = head.find(": ");
-  std::string error = colon == std::string::npos ? std::string() : head.substr(0, colon);
-  if (!std::all_of(error.begin(), error.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; })) error.clear();
-  const std::string detail = where.empty() ? head : head + " (" + where + ")";
-  if (memoryExceeded || head.find("MEMORY_LIMIT_EXCEEDED") != std::string::npos)
-    return {"LIMIT_EXCEEDED", "memory", "memory limit exceeded while loading (" + std::to_string(memoryLimitMiB) + " MiB per isolate)"};
-  if (cpuExceeded || head.find("CPU_LIMIT_EXCEEDED") != std::string::npos)
-    return {"LIMIT_EXCEEDED", "cpu", "CPU limit exceeded while loading (" + std::to_string(cpuLimitMs) + " ms)"};
-  if (stage == "code") {
-    // The runtime builds the modules from verified bytes: a JSON module that
-    // does not parse or a text module that is not UTF-8 is the version's
-    // fault; anything else is this Server failing to hand over the code.
-    if (name == "SyntaxError" || name == "TypeError") return {"INVALID_MODULE", "", "a module cannot be decoded: " + name + ": " + text};
-    return {"UNAVAILABLE", "", "the runtime could not read the code: " + text};
-  }
-  if (head.find("does not provide an export named 'default'") != std::string::npos &&
-      head.find("__coworkerd_tenant__.js") != std::string::npos)
-    return {"ENTRYPOINT_MISSING", "", "the script has no default export"};
-  const std::string missing = "Error: No such module \"";
-  if (head.starts_with(missing)) {
-    const auto module = head.substr(missing.size(), head.find('"', missing.size()) - missing.size());
-    if (module.starts_with("node:"))
-      return {"COMPATIBILITY_FLAG", "", detail + "; node:* modules need the nodejs_compat compatibility flag"};
-    return {"MISSING_MODULE", "", detail};
-  }
-  if (error == "SyntaxError") return {"SYNTAX_ERROR", "", detail};
-  if (error == "CompileError" || error == "LinkError" || head.find("WebAssembly") != std::string::npos ||
-      head.find("WasmModuleObject") != std::string::npos)
-    return {"INVALID_MODULE", "", detail};
-  if (head == "Error: Top-level await in module is unsettled.")
-    return {"TOP_LEVEL_AWAIT", "", "a top-level await never settles (workerd refuses the module while loading)"};
-  if (head.empty()) return {"LOAD_FAILED", "", text};
-  return {"TOP_LEVEL_THROW", "", detail};
-}
-
 class TrialService final {
 public:
   static constexpr const char* PATH = "/__coworkerd/trial-load";
@@ -7817,7 +7752,7 @@ private:
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
             verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
-                    applied.cpuMs, applied.memoryMiB);
+                    applied.cpuMs, applied.memoryMiB, probeProcess->threadedServer());
           }
         }
       }
@@ -8916,7 +8851,7 @@ int run(Launch launch) {
   const auto& manifestPath = launch.manifestPath;
   auto serverConfig = std::move(launch.config);
   // Poll sockets during bursts of RPC continuations, before their queue drains.
-  waitScope.setBusyPollInterval(8);
+  coworkerd::configureNodeEventLoop(waitScope);
   serverConfig.drainTimeoutMs = static_cast<uint32_t>(
       environmentUnsigned("COWORKERD_DRAIN_TIMEOUT_MS", serverConfig.drainTimeoutMs, 86'400'000));
   serverConfig.drainAnnounceDelayMsForTest = static_cast<uint32_t>(
