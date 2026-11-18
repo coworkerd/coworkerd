@@ -169,8 +169,8 @@ target_link_libraries(coworkerd-durable-channel-test PRIVATE common kj-tls-local
 enable_testing()
 add_executable(coworkerd-process-culprit-test EXCLUDE_FROM_ALL node/process-culprit-test.c++)
 target_link_libraries(coworkerd-process-culprit-test PRIVATE common)
-add_test(NAME node-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
-add_test(NAME node-memory-culprit COMMAND coworkerd-process-culprit-test memory)
+add_test(NAME node-threaded-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
+add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-test memory)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
