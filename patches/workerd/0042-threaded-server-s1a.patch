@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 18 Nov 2026 21:26:50 +0800
-Subject: [PATCH] Add native threaded server, channels, invocation limits and
- resource recovery
+Date: Wed, 18 Nov 2026 21:30:20 +0800
+Subject: [PATCH] Add native threaded server with bounded channels and resource
+ recovery
 
 
 diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
@@ -394,10 +394,10 @@ index 0000000000000000000000000000000000000000..952e9449f70883504f2659b25e330bfa
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..d6afee09a7d96d795dc81ca7d9ed9d19e037d31a
+index 0000000000000000000000000000000000000000..d49664236c978effc5a5629d3bf748d81ea9feb3
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,2489 @@
+@@ -0,0 +1,2497 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2097,29 +2097,37 @@ index 0000000000000000000000000000000000000000..d6afee09a7d96d795dc81ca7d9ed9d19
 +      const kj::HttpHeaders& headers,
 +      kj::AsyncInputStream& body,
 +      Response& response) override {
-+    return target->request(method, url, headers, body, response);
++    auto active = std::move(permit);
++    return target->request(method, url, headers, body, response).attach(std::move(active));
 +  }
 +  kj::Promise<void> connect(kj::StringPtr host,
 +      const kj::HttpHeaders& headers,
 +      kj::AsyncIoStream& connection,
 +      ConnectResponse& response,
 +      kj::HttpConnectSettings settings) override {
-+    return target->connect(host, headers, connection, response, kj::mv(settings));
++    auto active = std::move(permit);
++    return target->connect(host, headers, connection, response, kj::mv(settings))
++        .attach(std::move(active));
 +  }
 +  kj::Promise<void> prewarm(kj::StringPtr url) override {
-+    return target->prewarm(url);
++    auto active = std::move(permit);
++    return target->prewarm(url).attach(std::move(active));
 +  }
 +  kj::Promise<ScheduledResult> runScheduled(kj::Date time, kj::StringPtr cron) override {
-+    return target->runScheduled(time, cron);
++    auto active = std::move(permit);
++    return target->runScheduled(time, cron).attach(std::move(active));
 +  }
 +  kj::Promise<AlarmResult> runAlarm(kj::Date time, uint32_t retry) override {
-+    return target->runAlarm(time, retry);
++    auto active = std::move(permit);
++    return target->runAlarm(time, retry).attach(std::move(active));
 +  }
 +  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date time) override {
-+    return target->abandonAlarm(time);
++    auto active = std::move(permit);
++    return target->abandonAlarm(time).attach(std::move(active));
 +  }
 +  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
-+    return target->customEvent(kj::mv(event));
++    auto active = std::move(permit);
++    return target->customEvent(kj::mv(event)).attach(std::move(active));
 +  }
 +
 + private:
