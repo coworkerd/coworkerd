@@ -102,9 +102,10 @@ struct DurableLogSession {
 
 interface DurableLogSink {
   # One or more records of the owner's log, in sequence order, each prefixed with its length (UInt32, little endian).
-  # The answer is the highest sequence this node now holds of the stream, which is what lets the owner open its output
-  # gate; `refused` names the reason when the records were not taken (the buffer is full, or the shard's epoch is not
-  # the one this node knows: the owner has been fenced). `partial` carries a piece of what the next calls complete --
+  # The answer is the highest sequence this node now holds of the stream -- kept below a record it refused as fenced
+  # until the owner drops that record (r48) --, which is what lets the owner open its output gate; `refused` names
+  # the reason when the records were not taken (the buffer is full, or the shard's epoch is not the one this node
+  # knows: the owner has been fenced). `partial` carries a piece of what the next calls complete --
   # one transaction's frames can be larger than a message may be -- and holds the bytes until the call that is not
   # partial; nothing of a record is held until it is whole.
   append @0 (records :Data, partial :Bool) -> (accepted :UInt64, refused :Text);
