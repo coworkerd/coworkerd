@@ -423,7 +423,7 @@ void runCacheCase(unsigned seed) {
   // The cache destroyed while loads run, in both orders: the readers first (they go with the cache's scope), and the
   // cache first with the readers after it, which is what a node stopping in the middle of a rebuild does
   // (~DurableLog resets the cache before its rebuilds go). Either way the workers finish against nothing, and nothing
-  // touches the cache after it is gone (built with AddressSanitizer, the second order used to fail here).
+  // touches the cache after it is gone (before the fix, the second order wrote to the freed cache here).
   for (const bool cacheFirst : {false, true}) {
     std::atomic<bool> go{false};
     std::atomic<int> started{0}, finished{0};
