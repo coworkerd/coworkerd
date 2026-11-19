@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 namespace fs = std::filesystem;
@@ -87,6 +88,51 @@ void tenantBorrowConfiguration(Fixture& fixture) {
   catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
   KJ_REQUIRE(refusal.find("tenantBorrowBelowPercent") != std::string::npos);
 }
+
+// r46: with the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
+// refusal names every value. The defaults (15 s, 5 s, 10 s) and the small test configuration (5 s, 1 s, 3 s) start.
+void livenessGraceConfiguration(Fixture& fixture) {
+  const auto load = [&](const std::string& membership) {
+    return fixture.load(R"({"storage":{"endpoint":"http://127.0.0.1:9","bucket":"b"},"desiredState":{"backend":"file"})" +
+        (membership.empty() ? std::string() : ",\"membership\":" + membership) + "}");
+  };
+  // What a node does at startup: load, then its own lease's margin.
+  const auto with = [&](const std::string& membership) {
+    auto config = load(membership);
+    coworkerd::checkNodeLeaseMargin(config.membership);
+    return config;
+  };
+  const auto defaults = with("");
+  KJ_REQUIRE(defaults.membership.backend == "objectStore" && defaults.membership.ttlSeconds == 15 &&
+      defaults.membership.heartbeatIntervalMs == 5000 && defaults.membership.livenessGraceMs == 10000);
+  KJ_REQUIRE(with(R"({"ttlSeconds":5,"heartbeatIntervalMs":1000,"livenessGraceMs":3000})").membership.livenessGraceMs == 3000);
+  KJ_REQUIRE(with(R"({"ttlSeconds":5,"heartbeatIntervalMs":1000,"livenessGraceMs":2151})").membership.livenessGraceMs == 2151);
+  struct Refused { const char* membership; std::vector<std::string> named; };
+  for (const auto& row : {
+           Refused{R"({"ttlSeconds":5,"heartbeatIntervalMs":1000,"livenessGraceMs":2150})",
+               {"livenessGraceMs 2150", "heartbeatIntervalMs 1000", "ttlSeconds 5", "+ 1150 ms", "is 2151"}},
+           Refused{R"({"ttlSeconds":4,"heartbeatIntervalMs":500,"livenessGraceMs":750})",
+               {"livenessGraceMs 750", "heartbeatIntervalMs 500", "ttlSeconds 4", "is 1651"}}}) {
+    std::string refusal;
+    try { with(row.membership); } catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+    KJ_REQUIRE(refusal.rfind("membership.livenessGraceMs must be greater than", 0) == 0, "the refusal is the message itself",
+        refusal.c_str());
+    for (const auto& value : row.named)
+      KJ_REQUIRE(refusal.find(value) != std::string::npos, "the refusal must name the value", value.c_str(), refusal.c_str());
+  }
+  // The control plane loads the same file without the node's check: the install guide has it set only the TTL and
+  // the grace, so the interval stays the default 5000 ms, which a node with that grace would refuse.
+  const auto control = load(R"({"ttlSeconds":15,"livenessGraceMs":5000})");
+  KJ_REQUIRE(control.membership.heartbeatIntervalMs == 5000 && control.membership.livenessGraceMs == 5000);
+  std::string nodeRefusal;
+  try { coworkerd::checkNodeLeaseMargin(control.membership); }
+  catch (const kj::Exception& error) { nodeRefusal = error.getDescription().cStr(); }
+  KJ_REQUIRE(nodeRefusal.find("is 6151") != std::string::npos, nodeRefusal.c_str());
+  // The file membership has no lease: its timing is not checked.
+  const auto file = fixture.load(R"({"membership":{"backend":"file","heartbeatIntervalMs":500,"livenessGraceMs":750}})");
+  coworkerd::checkNodeLeaseMargin(file.membership);
+  KJ_REQUIRE(file.membership.backend == "file");
+}
 }
 
 int main(int argc, char** argv) {
@@ -97,6 +143,7 @@ int main(int argc, char** argv) {
     if (label == "idle") idleConfiguration(fixture);
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
+    else if (label == "liveness-grace") livenessGraceConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);
   } catch (const kj::Exception& error) {
     std::cerr << error.getDescription().cStr() << '\n';

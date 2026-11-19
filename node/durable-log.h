@@ -339,6 +339,18 @@ public:
   void setOwnerFenceHook(std::function<void(const std::string&, uint32_t, uint64_t)> hook) {
     ownerFenceHook = std::move(hook);
   }
+  // The membership lease of this log's epoch (r46, results/r45/DESIGN.md section 10). `check` judges it at a reading of
+  // the lease clock: every record is judged as it is taken and again just before its confirmation is answered, after
+  // any local flush, with nothing that waits in between. `lost` is called, synchronously and after the refused records
+  // were answered and excluded, when the lease is lost: the node stops holding its shards at once. Without the hooks
+  // (tests that build the log alone) the lease is held.
+  void setLeaseHooks(std::function<LeaseTracker::Judgment(uint64_t epoch, double nowMs)> check,
+      std::function<void(std::string reason)> lost) {
+    leaseCheck = std::move(check);
+    leaseLostHook = std::move(lost);
+  }
+  // A heartbeat of the current epoch settled: confirmations that waited for it are judged again.
+  void leaseSettled();
   // Reads this machine's Durable Object directory: the files are reused when the machine did not restart unclean
   // (the boot id beside them, and the marker a clean exit writes), and otherwise thrown away. Then this node's own
   // log files are read and the records no segment covers are replayed into the files they belong to, so that what a
@@ -658,6 +670,23 @@ private:
   uint32_t peerCount() const;
   void onPeerAck(const std::string& nodeId, uint64_t accepted);
   void checkConfirmations();
+  LeaseTracker::Judgment leaseOf(double nowMs);
+  void loseLease(const LeaseTracker::Judgment& judgment);
+  void wakeForLease(double untilMs);
+  // COWORKERD_SLOW_FLUSH_FOR_TEST names a file; a confirmation flush that finds it sleeps the milliseconds it holds,
+  // once, and removes it (r46 case 2). Without the variable nothing is read.
+  void slowFlushOnceForTest();
+  // Before a cut without a complete owner proof (fetchTails), each silent previous owner's heartbeat of that node epoch
+  // is read once: shared by every recovery that asks about the same epoch within OWNER_REREAD_MS.
+  enum class OwnerHeartbeat : uint8_t { GONE, LIVE, UNKNOWN };
+  static constexpr double OWNER_REREAD_MS = 1000;
+  struct CutHold {
+    bool holding = false;
+    double sinceMs = 0;
+  };
+  kj::Promise<bool> previousOwnersMayBeCut(std::string objectName, std::vector<std::pair<std::string, uint64_t>> owners,
+      CutHold& hold);
+  kj::Promise<OwnerHeartbeat> readOwnerHeartbeat(std::string nodeId, uint64_t epoch);
   void isolate(const std::string& objectKey, uint64_t fromSeq, const std::string& reason);
   void isolateRecords(const std::vector<uint64_t>& dropped, const std::string& key, const std::string& reason);
   void isolateObjectPending(Object& object, const std::string& reason);
@@ -880,6 +909,17 @@ private:
   uint32_t alarmRebuildWaiting = 0, peakAlarmRebuildWaiting = 0;
   uint64_t alarmAttempts = 0, alarmPumpCpuNs = 0;
   unsigned alarmCpuDepth = 0;bool measureAlarmCpu = false;
+  std::function<LeaseTracker::Judgment(uint64_t epoch, double nowMs)> leaseCheck;
+  std::function<void(std::string reason)> leaseLostHook;
+  // The log epoch whose lease was lost (its records are refused), and the pending wake of a WAIT.
+  uint64_t leaseLostEpoch = 0, leaseWakeGeneration = 0;
+  double leaseWakeAtMs = 0;
+  std::string slowFlushForTest;
+  struct OwnerRead {
+    kj::ForkedPromise<OwnerHeartbeat> answer;
+    double atMs;
+  };
+  std::map<std::pair<std::string, uint64_t>, OwnerRead> ownerReads;
   std::function<AlarmNamespace(const std::string&)> alarmNamespace;
   std::function<std::string(const DurableAlarm&)> alarmDestination;
   kj::Promise<void> alarmTimer = nullptr;double alarmTimerAt = 0;
@@ -949,6 +989,10 @@ private:
   uint64_t rebuilds = 0, rebuildFailures = 0, repairs = 0, filesDropped = 0, peerSwitches = 0, tailFetches = 0;
   uint64_t recordsTaken = 0, framesTaken = 0, bytesTaken = 0, overLimitAnswers = 0, recoverTimeouts = 0;
   uint64_t tailRecoveryBounded = 0, ownerSilentRecoveries = 0, lateTailRecords = 0;
+  // r46: records refused by the lease, confirmations that waited for a heartbeat in flight, epochs whose lease was
+  // lost here; cuts held back because a silent previous owner's heartbeat was still live or could not be judged.
+  uint64_t leaseRefusals = 0, leaseWaits = 0, leaseLosses = 0;
+  uint64_t cutsHeldOwnerLive = 0, cutsHeldOwnerUnknown = 0, ownerHeartbeatReads = 0;
   uint64_t transferredTailRecords = 0, unaccountedTailRecords = 0, unaccountedTailBytes = 0;
   uint64_t restoredUnaccountedRecords = 0, restoredUnaccountedBytes = 0;
   uint64_t restoredEmptyAnswers = 0, restoredLogUnavailableAnswers = 0, localLogEmptyClosures = 0;
