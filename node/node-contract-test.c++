@@ -189,7 +189,7 @@ void eventLoopProgress() {
   port.burst(1000).wait(scope);
   KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= 4,
       "ready I/O must be checked during a continuation burst", port.polls, port.largestBatch);
-  KJ_REQUIRE(port.polls <= 500, "continuation batches must amortize I/O polls", port.polls);
+  KJ_REQUIRE(port.polls <= 400, "continuation batches must amortize I/O polls", port.polls);
 }
 
 void trialVerdicts() {

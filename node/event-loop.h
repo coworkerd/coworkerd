@@ -9,7 +9,7 @@ namespace coworkerd {
 // Polling after almost every continuation also reads the kernel clock and is
 // expensive on hosts whose monotonic clock cannot use the vDSO fast path.
 inline void configureNodeEventLoop(kj::WaitScope& scope) {
-  scope.setBusyPollInterval(7);
+  scope.setBusyPollInterval(3);
 }
 
 }  // namespace coworkerd
