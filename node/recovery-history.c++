@@ -276,11 +276,16 @@ SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, doub
       decodedHook(std::move(decoded)), slots(std::make_shared<LoadSlots>()) {
   slots->limit = std::max<uint32_t>(1, maxLoadsParam);
 }
+SegmentDecodeCache::~SegmentDecodeCache() noexcept(false) {
+  // First, while every member is still here: destroy the frame of every load, running or waiting for a slot. A
+  // reader still waiting for a segment fails with this instead of keeping the load alive.
+  loads.cancel("the segment cache was destroyed");
+}
 void SegmentDecodeCache::taskFailed(kj::Exception&&) {}
 kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std::string key) {
   // At most slots->limit loads at once. A finishing load wakes every waiting one and each checks again, so a waiter
-  // that is gone never holds a slot. The frame keeps the slots alive: when a node stops, its rebuilds (which wait for
-  // loads) are destroyed after the cache, and destroying this frame must then not touch the cache.
+  // that is gone never holds a slot. The frame holds the slots too, though the cache's destructor destroys it first
+  // (see ~SegmentDecodeCache()).
   auto slots = this->slots;
   while (slots->running >= slots->limit) {
     ++loadWaits;
@@ -331,7 +336,7 @@ kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(c
   if (entry == table.end()) {
     ++misses;
     if (source) *source = SegmentSource::LOAD;
-    auto forked = load(std::move(storeKey)).fork();
+    auto forked = loads.wrap(load(std::move(storeKey))).fork();
     // Finish the entry even when every reader that waited for it was canceled: its bytes are counted once, and a
     // failure is not kept.
     tasks.add(forked.addBranch().then([this, key](std::shared_ptr<const DecodedSegment> value) {

@@ -420,11 +420,14 @@ void runCacheCase(unsigned seed) {
     KJ_REQUIRE(cache.entries() > 0 && cache.failures == 0, "a canceled reader's loads are kept", cache.entries(), cache.failures);
     same(first, readNew(cache, get, fixture.manifests.at(first), first).wait(io.waitScope), "a read after a canceled one matches");
   }
-  // The cache destroyed while loads run, in both orders: the readers first (they go with the cache's scope), and the
-  // cache first with the readers after it, which is what a node stopping in the middle of a rebuild does
-  // (~DurableLog resets the cache before its rebuilds go). Either way the workers finish against nothing, and nothing
-  // touches the cache after it is gone (before the fix, the second order wrote to the freed cache here).
-  for (const bool cacheFirst : {false, true}) {
+  // The cache destroyed while loads run: the readers first (they go with the cache's scope); the cache first and the
+  // readers right after it, which is what a node stopping in the middle of a rebuild does (~DurableLog resets the
+  // cache before its rebuilds go); and the cache first with the event loop running before the readers go. The cache
+  // takes its loads with it, so a reader fails at once while the workers' GETs are still held; the workers finish
+  // against nothing, and nothing touches the cache after it is gone (before 6c39454 the second order wrote to the
+  // freed cache here; CTest runs this with MALLOC_PERTURB_ set so that such a write fails).
+  enum class Gone { READERS_FIRST, CACHE_FIRST, CACHE_FIRST_LOOP_RUNS };
+  for (const auto order : {Gone::READERS_FIRST, Gone::CACHE_FIRST, Gone::CACHE_FIRST_LOOP_RUNS}) {
     std::atomic<bool> go{false};
     std::atomic<int> started{0}, finished{0};
     HistoryBlockingGet held = [fetchOn, &go, &started, &finished](const std::string& key) {
@@ -441,12 +444,17 @@ void runCacheCase(unsigned seed) {
       // One load runs and the other waits for the slot: both kinds of load frame outlive the cache below.
       KJ_REQUIRE(cache->loadsRunning() == 1 && cache->loadsWaiting() > 0, "loads are running and waiting when the cache goes",
           cache->loadsRunning(), cache->loadsWaiting());
-      if (cacheFirst) {
-        cache = nullptr;
+      if (order == Gone::READERS_FIRST) {
         { auto gone = kj::mv(reading); }
+        cache = nullptr;
       } else {
-        { auto gone = kj::mv(reading); }
         cache = nullptr;
+        if (order == Gone::CACHE_FIRST_LOOP_RUNS) {
+          KJ_REQUIRE(reading.poll(io.waitScope), "a reader of a destroyed cache fails at once", started.load());
+          KJ_REQUIRE(kj::runCatchingExceptions([&]() { reading.wait(io.waitScope); }) != kj::none,
+              "a reader of a destroyed cache fails at once");
+        }
+        { auto gone = kj::mv(reading); }
       }
     }
     go = true;

@@ -64,13 +64,15 @@ constexpr uint32_t SEGMENT_DECODE_THREADS = 16;
 // pass `limitBytes`; a just decoded segment counts as just used. `limitBytes` covers the decoded entries in the
 // table only: segments being loaded and evicted ones a reader still holds are not counted. A failed download or
 // decode is not kept, so the next read tries again. A segment never changes once written (a second write of the
-// same key is refused), so a held entry cannot be stale.
+// same key is refused), so a held entry cannot be stale. Destroying the cache destroys its loads with it (a worker
+// thread may still finish a download or decode, against nothing): a reader still waiting for one fails.
 class SegmentDecodeCache final: private kj::TaskSet::ErrorHandler {
 public:
   using Decoded = std::function<void(const std::string& key, const DecodedSegment& segment)>;
   // With `blockingGet`, the download runs on the decoding worker thread too; without it, on the event loop.
   SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded = {},
       HistoryBlockingGet blockingGet = {}, uint32_t maxLoads = SEGMENT_DECODE_THREADS);
+  ~SegmentDecodeCache() noexcept(false);
   // `source` (optional) says whether the segment was decoded already, joined a load in progress, or loaded now.
   kj::Promise<std::shared_ptr<const DecodedSegment>> segment(const ManifestSegment& ref, SegmentSource* source = nullptr);
   // Drops the entries no read has used for idleMs; whether any entry is left.
@@ -99,14 +101,15 @@ private:
   uint64_t limit, held = 0;
   double idle;
   Decoded decodedHook;
-  // The load slots, shared with every load's coroutine: a reader can keep a load alive after the cache is gone (a
-  // node stopping in the middle of a rebuild destroys the cache before the rebuilds), and that load still gives its
-  // slot back when it is destroyed.
+  // The load slots, shared with every load's coroutine: a load's frame gives its slot back whichever goes first.
   struct LoadSlots {
     uint32_t limit = 1, running = 0;
     std::deque<kj::Own<kj::PromiseFulfiller<void>>> waiting;
   };
   std::shared_ptr<LoadSlots> slots;
+  // Every load runs inside `loads`, which the destructor cancels first: the load frames go while the cache is whole,
+  // also those a reader still waits for (a node destroys its cache before its rebuilds), so none resumes later.
+  kj::Canceler loads;
   std::map<std::string, Entry> table;
   kj::TaskSet tasks{*this};
 };
