@@ -137,6 +137,24 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(silent.judge(2, 21000.299).verdict == V::WAIT && silent.judge(2, 21000.300).verdict == V::EXPIRED);
     }
     {
+      // slotFor, the computation writeHeartbeat uses, with jittered readings: the renewing heartbeat's send reading is
+      // 0.604 ms after its slot and the one on the TTL is read 0.890 ms late, the one later than the other. Its slot
+      // must still be D + T exactly (a slot from the readings, sent - late, lands 0.006 ms past it and never qualifies).
+      LeaseTracker lease(15000, 5000);
+      lease.begin(3);
+      KJ_REQUIRE(lease.slotFor(true, 1000.300, 0.000, 0) == 1000.300, "an epoch's first heartbeat takes its reading");
+      KJ_REQUIRE(lease.settled(lease.sent(3, 1000.300, lease.slotFor(false, 1000.300, 0, 0)), true, 1000.400));
+      KJ_REQUIRE(lease.settled(lease.sent(3, 6000.904, lease.slotFor(true, 6000.904, 0.600, 5000)), true, 6001.000));
+      // The distances are counted from the renewing heartbeat's own slot (writeHeartbeat: due - lastHeartbeatOkDue).
+      KJ_REQUIRE(!lease.settled(lease.sent(3, 11000.801, lease.slotFor(true, 11000.801, 0.497, 5000)), false, 11010));
+      KJ_REQUIRE(!lease.settled(lease.sent(3, 16000.950, lease.slotFor(true, 16000.950, 0.646, 10000)), false, 16010));
+      const auto slot = lease.slotFor(true, 21001.200, 0.890, 15000);
+      KJ_REQUIRE(std::abs(slot - 21000.300) < 1e-6, slot);
+      const auto boundary = lease.sent(3, 21001.200, slot);
+      KJ_REQUIRE(lease.judge(3, 21001.500).verdict == V::WAIT, "the heartbeat on the TTL must keep the answer back");
+      KJ_REQUIRE(lease.settled(boundary, true, 21050) && lease.judge(3, 26000).verdict == V::HELD);
+    }
+    {
       // A clock that cannot be read, or goes back, fences.
       LeaseTracker unread(5000, 1000), back(5000, 1000);
       unread.begin(1);

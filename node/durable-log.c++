@@ -5098,6 +5098,13 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     nextDiscovery = monotonicTimeMs() + 1000;
   };
   CutHold cutHold;
+  // A held cut that ends without this decision: the old owner answered in full, or the ownership changed.
+  const char* cutHoldEnd = "ownership changed";
+  const auto cutHoldEnded = kj::defer([&]() {
+    if (cutHold.holding)
+      log("cut-hold-ended", "\"object\":" + quote(object.objectName) + ",\"reason\":" + quote(cutHoldEnd) +
+          ",\"waitedMs\":" + std::to_string(uint64_t(monotonicTimeMs() - cutHold.sinceMs)));
+  });
   for (;;) {
     checkIdentity();refreshMemory();
     kj::Vector<kj::Promise<void>> ownerCalls;
@@ -5157,6 +5164,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     }
     co_await timer.afterDelay(uint32_t(std::max(1.0, std::min(200.0, deadline - monotonicTimeMs()))) * kj::MILLISECONDS);
   }
+  cutHoldEnd = "the previous owner answered in full";
   checkIdentity();
   TailRecovery out;
   out.collectionMs = monotonicTimeMs() - startedMs;
@@ -5228,9 +5236,11 @@ kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
     }
     co_return false;
   }
-  if (hold.holding)
-    log("cut-hold-ended", "\"object\":" + quote(objectName) + ",\"waitedMs\":" +
-        std::to_string(uint64_t(monotonicTimeMs() - hold.sinceMs)));
+  if (hold.holding) {
+    hold.holding = false;
+    log("cut-hold-ended", "\"object\":" + quote(objectName) + ",\"reason\":\"the previous owner's heartbeat is old "
+        "enough\",\"waitedMs\":" + std::to_string(uint64_t(monotonicTimeMs() - hold.sinceMs)));
+  }
   co_return true;
 }
 

@@ -568,8 +568,9 @@ private:
     // of the interval), not a fresh reading -- the slot on the TTL is then exactly D + T.
     bool onCadence = false;
     KJ_IF_SOME(given, due) { onCadence = given >= lastHeartbeatOkDue; }
-    const auto leaseSlot = onCadence && lease.renewed()
-        ? lease.cadenceSlot(double((slot - lastHeartbeatOkDue) / kj::MICROSECONDS) / 1000) : leaseSent;
+    const auto lateMs = slot < sent ? double((sent - slot) / kj::MICROSECONDS) / 1000 : 0.;
+    const auto leaseSlot = lease.slotFor(onCadence, leaseSent, lateMs,
+        onCadence ? double((slot - lastHeartbeatOkDue) / kj::MICROSECONDS) / 1000 : 0.);
     const auto beatId = lease.sent(epoch, leaseSent, leaseSlot);
     KJ_REQUIRE(beatId != 0, "the epoch's lease is fenced: no heartbeat goes out for it", epoch);
     const auto number = ++heartbeatsSent;
@@ -958,8 +959,9 @@ void LeaseTracker::begin(uint64_t epoch) {
 
 uint64_t LeaseTracker::sent(uint64_t epoch, double nowMs, double slotMs) {
   if (!epoch || epoch != current || currentFenced || !(nowMs >= 0)) return 0;
-  slotMs = std::min(slotMs, nowMs);
+  // The slot as computed: the last slot within the TTL counts as sent even if a reading put it a hair after now.
   lastSentSlotMs = std::max(lastSentSlotMs, slotMs);
+  slotMs = std::min(slotMs, nowMs);
   pending[++nextId] = {epoch, nowMs, slotMs, slotMs + intervalMs};
   return nextId;
 }

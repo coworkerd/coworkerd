@@ -65,6 +65,14 @@ public:
   // The lease-clock slot of a heartbeat `sinceRenewedSlotMs` after the slot of the heartbeat that last renewed the
   // lease, on the cadence (only meaningful once renewed()).
   double cadenceSlot(double sinceRenewedSlotMs) const { return okSlotMs + sinceRenewedSlotMs; }
+  // The slot writeHeartbeat sends a heartbeat for: once the epoch was renewed, a heartbeat on the cadence is the
+  // renewing slot plus the cadence's distance (an exact multiple of the interval), never a reading -- `sentMs` and
+  // `lateMs` (how late the event loop's timer fired) carry the readings' jitter and are not used for it. The epoch's
+  // first heartbeat, and one off the cadence, take their send reading.
+  double slotFor(bool onCadence, double sentMs, double lateMs, double sinceRenewedSlotMs) const {
+    (void)lateMs;
+    return onCadence && held ? cadenceSlot(sinceRenewedSlotMs) : sentMs;
+  }
   bool renewed() const { return held; }
   // A heartbeat abandoned without an answer (its request was canceled): it keeps nothing back any more.
   void forget(uint64_t id) { pending.erase(id); }
