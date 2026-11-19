@@ -1,6 +1,7 @@
 #pragma once
 
 #include "durable-log.h"
+#include <deque>
 #include <functional>
 
 namespace coworkerd {
@@ -40,32 +41,49 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
     const std::string& objectName, uint32_t parallelism, HistoryCheck check = {}, HistoryLog log = {},
     HistoryBudget* budget = nullptr, HistoryYield yield = {}, SegmentReadStats* stats = nullptr);
 // One segment of the store, downloaded once, its digest and records checked and decoded on a worker thread, and its
-// records grouped by object in segment order. Shared read-only by every rebuild that names the segment.
+// records grouped by object in segment order. Shared read-only by every rebuild that names the segment. Whoever
+// drops the last reference (an eviction, an idle sweep, the last reader of an evicted entry), the segment is freed
+// on a background thread: it holds up to ~10^5 records, and freeing them on the event loop would stall it.
 struct DecodedSegment {
   SegmentHeader header;
   std::map<std::string, std::vector<LogRecord>, std::less<>> byObject;
   uint64_t encodedBytes = 0, bytes = 0, records = 0;
   double downloadMs = 0, decodeMs = 0, groupMs = 0;
 };
+// How many decoded segments the background thread has freed so far (for tests).
+uint64_t segmentsReleasedOffLoop();
+// Where a read's segment came from: decoded already, a load another read had started, or a load this read started.
+enum class SegmentSource : uint8_t { HIT, JOIN, LOAD };
+// At most this many segments are downloaded and decoded at once, each on a worker thread of its own; further loads
+// wait until one finishes. The default rebuildConcurrency x recoverParallelism (4 x 4) never waits.
+constexpr uint32_t SEGMENT_DECODE_THREADS = 16;
 // The segments a node's rebuilds read, each downloaded and decoded once while rebuilds still need it, instead of once
 // per object. Readers waiting for the same segment share one download and one decode. An entry is dropped when no
 // read has used it for `idleMs` (see sweep()), and the least recently used go first when the decoded records held
-// pass `limitBytes`. A failed download or decode is not kept, so the next read tries again. A segment never changes
-// once written (a second write of the same key is refused), so a held entry cannot be stale.
+// pass `limitBytes`; a just decoded segment counts as just used. `limitBytes` covers the decoded entries in the
+// table only: segments being loaded and evicted ones a reader still holds are not counted. A failed download or
+// decode is not kept, so the next read tries again. A segment never changes once written (a second write of the
+// same key is refused), so a held entry cannot be stale.
 class SegmentDecodeCache final: private kj::TaskSet::ErrorHandler {
 public:
   using Decoded = std::function<void(const std::string& key, const DecodedSegment& segment)>;
   // With `blockingGet`, the download runs on the decoding worker thread too; without it, on the event loop.
   SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded = {},
-      HistoryBlockingGet blockingGet = {});
-  // `loaded` (optional) is set when this call started the download and decode.
-  kj::Promise<std::shared_ptr<const DecodedSegment>> segment(const ManifestSegment& ref, bool* loaded = nullptr);
+      HistoryBlockingGet blockingGet = {}, uint32_t maxLoads = SEGMENT_DECODE_THREADS);
+  // `source` (optional) says whether the segment was decoded already, joined a load in progress, or loaded now.
+  kj::Promise<std::shared_ptr<const DecodedSegment>> segment(const ManifestSegment& ref, SegmentSource* source = nullptr);
   // Drops the entries no read has used for idleMs; whether any entry is left.
   bool sweep();
   uint64_t heldBytes() const { return held; }
   uint64_t limitBytes() const { return limit; }
   size_t entries() const { return table.size(); }
-  uint64_t decodes = 0, hits = 0, misses = 0, joins = 0, evictions = 0, failures = 0;
+  uint32_t loadLimit() const { return maxLoads; }
+  uint32_t loadsRunning() const { return loading; }
+  size_t loadsWaiting() const { return waiting.size(); }
+  uint64_t decodes = 0, hits = 0, misses = 0, joins = 0, evictions = 0, failures = 0, loadWaits = 0;
+  // Tests only: the table key of a segment (default: its store key). A negative control keys by less than the
+  // segment's identity to show that the equivalence checks catch a cache that hands out the wrong segment.
+  std::function<std::string(const ManifestSegment&)> keyForTest;
 private:
   struct Entry {
     std::optional<kj::ForkedPromise<std::shared_ptr<const DecodedSegment>>> pending;
@@ -80,6 +98,9 @@ private:
   uint64_t limit, held = 0;
   double idle;
   Decoded decodedHook;
+  // Before `table` and `tasks`: a load's coroutine, destroyed with them, still gives its slot back here.
+  uint32_t maxLoads, loading = 0;
+  std::deque<kj::Own<kj::PromiseFulfiller<void>>> waiting;
   std::map<std::string, Entry> table;
   kj::TaskSet tasks{*this};
 };

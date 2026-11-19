@@ -183,6 +183,7 @@ add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test ta
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
 add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)
 add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
+add_test(NAME durable-segment-cache COMMAND coworkerd-durable-channel-test segment-cache)
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight
     cpu-culprit-current-behavior memory-culprit rejected-manifest)

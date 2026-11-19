@@ -7020,7 +7020,9 @@ std::string DurableLog::json() const {
         << ",\"limitBytes\":" << segmentCache->limitBytes() << ",\"decodes\":" << segmentCache->decodes
         << ",\"hits\":" << segmentCache->hits << ",\"misses\":" << segmentCache->misses << ",\"joins\":"
         << segmentCache->joins << ",\"evictions\":" << segmentCache->evictions << ",\"failures\":"
-        << segmentCache->failures << "}";
+        << segmentCache->failures << ",\"loadLimit\":" << segmentCache->loadLimit() << ",\"loadsRunning\":"
+        << segmentCache->loadsRunning() << ",\"loadsWaiting\":" << segmentCache->loadsWaiting() << ",\"loadWaits\":"
+        << segmentCache->loadWaits << ",\"releasedOffLoop\":" << segmentsReleasedOffLoop() << "}";
   }
   out << ",\"lastError\":"
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"

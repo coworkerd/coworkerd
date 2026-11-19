@@ -1,20 +1,28 @@
 // b57: reading an object's segments through the shared decode cache gives each object exactly what the old
 // per-object reader gave it -- the same records, order, exclusion evidence, log lines and errors -- while each
-// segment is downloaded and decoded once. The negative controls check that these assertions catch a wrong answer.
+// segment is downloaded and decoded once. The negative controls check that these assertions catch a wrong answer:
+// most change the answer, two change the implementation (the cache keys a segment without its node epoch, or the
+// download fetches the same-numbered segment of another epoch). The cache tests check its own behaviour: joins
+// counted apart from hits, a just decoded segment not dropped as idle, at most a given number of loads at once,
+// decoded segments freed on the background thread, a reader canceled or the cache destroyed while a load runs, and
+// concurrent readers when no entry fits.
 #include "durable-log.h"
 #include "durable-shards.h"
 #include "recovery-history.h"
 #include <kj/async-io.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <random>
+#include <thread>
 #include <unistd.h>
 
 namespace coworkerd {
 namespace {
 
 enum class SegmentControl { NONE, DROP_RECORD, SWAP_RECORDS, CLEAR_OWNER_SEALED, LEAK_OTHER_OBJECT, DECODE_PER_READ,
-    REVERSE_SEGMENTS };
+    REVERSE_SEGMENTS, KEY_WITHOUT_EPOCH, FETCH_WITHOUT_EPOCH };
 
 struct Fixture {
   std::string ns = std::string(64, 'a');
@@ -62,7 +70,7 @@ kj::Promise<Fixture> prepare(ObjectStore& store, std::mt19937& random) {
       unsigned obj = random() % objectCount;
       if (obj == skipped) obj = (obj + 1) % objectCount;
       LogRecord record;
-      record.kind = (r % 3) ? LogRecordKind::RESET : LogRecordKind::DELETED;
+      record.kind = r % 3 == 0 ? LogRecordKind::DELETED : r % 3 == 1 ? LogRecordKind::RESET : LogRecordKind::FRAMES;
       record.nodeSeq = sequence++;
       record.nodeEpoch = (random() % 7 == 0) ? writer.nodeEpoch + 1 : writer.nodeEpoch;
       record.shardEpoch = 1 + random() % 4;
@@ -73,6 +81,21 @@ kj::Promise<Fixture> prepare(ObjectStore& store, std::mt19937& random) {
       record.facetName = record.facetId ? "facet-" + std::to_string(record.facetId) : std::string();
       record.txn = record.nodeSeq;
       record.dataEpoch = record.shardEpoch;
+      if (record.kind == LogRecordKind::FRAMES) {
+        // Frames and an optional WAL header from a generator of their own, so the rest of the fixture (and what
+        // each seed covers) is the same as without them.
+        std::mt19937 bytes(uint32_t(record.nodeSeq * 2654435761u) ^ uint32_t(record.shardEpoch << 20) ^
+            uint32_t(record.nodeEpoch << 8) ^ uint32_t(record.storageId.size()));
+        record.generation = 1 + bytes() % 5;
+        record.salt1 = bytes(); record.salt2 = bytes();
+        record.pageSize = 512u << (bytes() % 2);
+        record.firstFrame = 1 + bytes() % 50;
+        record.frames = 1 + bytes() % 3;
+        record.commits = 1;
+        if (bytes() % 2) { record.header.resize(32); for (auto& c : record.header) c = char(bytes()); }
+        record.frameBytes.resize(size_t(record.frames) * (24 + record.pageSize));
+        for (auto& c : record.frameBytes) c = char(bytes());
+      }
       encoded.push_back(encodeLogRecord(record));
       positions[record.objectName].emplace_back(record.shardEpoch, record.nodeSeq);
       auto& entry = index[record.objectName];
@@ -117,16 +140,19 @@ kj::Promise<Read> readOld(HistoryGet get, const ObjectManifest& manifest, std::s
   co_return read;
 }
 
-kj::Promise<Read> readNew(SegmentDecodeCache& cache, HistoryGet get, const ObjectManifest& manifest, std::string name) {
+kj::Promise<Read> readNew(SegmentDecodeCache& cache, HistoryGet get, const ObjectManifest& manifest, std::string name,
+    SegmentReadStats* stats = nullptr, uint32_t parallelism = 2) {
   Read read;
-  read.records = co_await readRecoverySegmentsDecoded(cache, get, manifest, name, 2,
-      [&read](const std::string& event, const std::string& fields) { read.lines.push_back(event + " " + fields); });
+  read.records = co_await readRecoverySegmentsDecoded(cache, get, manifest, name, parallelism,
+      [&read](const std::string& event, const std::string& fields) { read.lines.push_back(event + " " + fields); }, stats);
   co_return read;
 }
 
 void compare(const Fixture& fixture, const std::map<std::string, Read>& before, std::map<std::string, Read> after,
     SegmentControl control, uint64_t decodes, uint64_t expectedDecodes) {
-  if (control != SegmentControl::NONE && control != SegmentControl::DECODE_PER_READ) {
+  const bool changesAnswer = control != SegmentControl::NONE && control != SegmentControl::DECODE_PER_READ &&
+      control != SegmentControl::KEY_WITHOUT_EPOCH && control != SegmentControl::FETCH_WITHOUT_EPOCH;
+  if (changesAnswer) {
     for (auto& [name, read] : after) {
       if (read.records.size() < 2) continue;
       if (control == SegmentControl::DROP_RECORD) read.records.pop_back();
@@ -188,7 +214,26 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   // All objects at once, as concurrent rebuilds would: they share each segment's download and decode. The
   // DECODE_PER_READ control gives every read a cache of its own, which is what decoding per object amounts to.
   const uint64_t limit = 256ull << 20;
-  SegmentDecodeCache cache(get, limit, 30000, {}, blocking);
+  // FETCH_WITHOUT_EPOCH: the download asks for the same-numbered segment of the node's first epoch, which the
+  // fixture always has (node-a writes epochs 1 and 2) -- valid segments with the wrong records.
+  HistoryBlockingGet fetch = blocking;
+  if (control == SegmentControl::FETCH_WITHOUT_EPOCH) {
+    std::map<std::string, std::string> wrong;
+    for (const auto& ref : fixture.segments) {
+      const auto first = nodeSegmentKey(ref.nodeId, 1, ref.segment);
+      for (const auto& other : fixture.segments)
+        if (nodeSegmentKey(other.nodeId, other.nodeEpoch, other.segment) == first)
+          wrong[nodeSegmentKey(ref.nodeId, ref.nodeEpoch, ref.segment)] = first;
+    }
+    fetch = [blocking, wrong](const std::string& key) {
+      auto at = wrong.find(key);
+      return blocking(at == wrong.end() ? key : at->second);
+    };
+  }
+  SegmentDecodeCache cache(get, limit, 30000, {}, fetch);
+  // KEY_WITHOUT_EPOCH: the cache keys a segment by node and number only, so two epochs' segment 1 share an entry.
+  if (control == SegmentControl::KEY_WITHOUT_EPOCH)
+    cache.keyForTest = [](const ManifestSegment& ref) { return nodeSegmentKey(ref.nodeId, 0, ref.segment); };
   std::vector<std::unique_ptr<SegmentDecodeCache>> own;
   kj::Vector<kj::Promise<Read>> reads;
   for (const auto& name : fixture.objects) {
@@ -254,7 +299,157 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   expectSame(broken, fixture.objects.front(), "does not add up");
 }
 
+// The cache's own behaviour (b57 §6.1), on one seed's fixture. Each step names what it would catch.
+void runCacheCase(unsigned seed) {
+  auto temp = (std::filesystem::temp_directory_path() / "b57-cache-XXXXXX").string();
+  KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+  KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+  auto io = kj::setupAsyncIo();
+  auto& timer = io.provider->getTimer();
+  ObjectStoreConfig config;
+  config.backend = "directory"; config.directory = temp; config.endpoint = "unused";
+  ObjectStore store(config, io.provider->getNetwork(), timer);
+  HistoryGet get = [&store](std::string key) { return store.get(std::move(key)); };
+  auto fetchOn = [config](const std::string& key) {
+    auto threadIo = kj::setupAsyncIo();
+    ObjectStore threadStore(config, threadIo.provider->getNetwork(), threadIo.provider->getTimer());
+    return threadStore.get(key).wait(threadIo.waitScope);
+  };
+  HistoryBlockingGet blocking = fetchOn;
+  std::mt19937 random(seed);
+  auto fixture = prepare(store, random).wait(io.waitScope);
+  std::map<std::string, Read> before;
+  for (const auto& name : fixture.objects) before.emplace(name, readOld(get, fixture.manifests.at(name), name).wait(io.waitScope));
+  auto same = [&](const std::string& name, const Read& read, const char* what) {
+    const auto& old = before.at(name);
+    KJ_REQUIRE(read.lines == old.lines && read.records.size() == old.records.size(), what, name.c_str());
+    for (size_t i = 0; i < old.records.size(); ++i)
+      KJ_REQUIRE(encodeLogRecord(read.records[i]) == encodeLogRecord(old.records[i]) &&
+          read.records[i].ownerSealed == old.records[i].ownerSealed, what, name.c_str(), i);
+  };
+  auto readAll = [&](SegmentDecodeCache& cache, std::vector<SegmentReadStats>* stats, uint32_t parallelism,
+      const char* what) {
+    if (stats) stats->assign(fixture.objects.size(), SegmentReadStats());
+    kj::Vector<kj::Promise<Read>> reads;
+    for (size_t i = 0; i < fixture.objects.size(); ++i)
+      reads.add(readNew(cache, get, fixture.manifests.at(fixture.objects[i]), fixture.objects[i],
+          stats ? &(*stats)[i] : nullptr, parallelism));
+    auto results = kj::joinPromises(reads.releaseAsArray()).wait(io.waitScope);
+    for (size_t i = 0; i < fixture.objects.size(); ++i) same(fixture.objects[i], results[i], what);
+  };
+  auto until = [&](auto done, const char* what) {
+    for (int i = 0; i < 500 && !done(); ++i) timer.afterDelay(10 * kj::MILLISECONDS).wait(io.waitScope);
+    KJ_REQUIRE(done(), what);
+  };
+  const auto& first = fixture.objects.front();
+
+  // Joins: every reader starts at once, so the first of each segment loads it and the others join the load. The
+  // per-read counts add up to the cache's own (a join counted as a hit would show no joins at all).
+  {
+    SegmentDecodeCache cache(get, 256ull << 20, 30000, {}, blocking);
+    std::vector<SegmentReadStats> stats;
+    readAll(cache, &stats, 2, "joined reads match");
+    uint64_t loads = 0, joins = 0, hits = 0;
+    for (const auto& s : stats) { loads += s.cacheMisses; joins += s.cacheJoins; hits += s.cacheHits; }
+    KJ_REQUIRE(loads == fixture.segments.size() && loads == cache.misses, "each segment is loaded once", loads, cache.misses);
+    KJ_REQUIRE(joins > 0 && joins == cache.joins && hits == cache.hits, "joins are counted apart from hits", joins,
+        cache.joins, hits, cache.hits);
+  }
+  // A load slower than the idle time is still there right after it finishes (its readers read it now).
+  {
+    HistoryBlockingGet slow = [fetchOn](const std::string& key) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      return fetchOn(key);
+    };
+    SegmentDecodeCache cache(get, 256ull << 20, 150, {}, slow);
+    auto one = fixture.manifests.at(first);
+    one.segments.resize(1);
+    readNew(cache, get, one, first).wait(io.waitScope);
+    KJ_REQUIRE(cache.sweep() && cache.entries() == 1, "a just decoded segment is not dropped as idle");
+    timer.afterDelay(200 * kj::MILLISECONDS).wait(io.waitScope);
+    KJ_REQUIRE(!cache.sweep() && cache.entries() == 0, "an idle segment is dropped");
+  }
+  // At most maxLoads loads at once: wide readers ask for every segment together.
+  {
+    std::atomic<int> inside{0}, most{0};
+    HistoryBlockingGet counted = [fetchOn, &inside, &most](const std::string& key) {
+      const int now = inside.fetch_add(1) + 1;
+      for (int seen = most.load(); now > seen && !most.compare_exchange_weak(seen, now);) {}
+      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      auto response = fetchOn(key);
+      inside.fetch_sub(1);
+      return response;
+    };
+    SegmentDecodeCache cache(get, 256ull << 20, 30000, {}, counted, 2);
+    readAll(cache, nullptr, 8, "reads with two loads at once match");
+    KJ_REQUIRE(most.load() <= 2 && cache.loadWaits > 0 && cache.loadsRunning() == 0 && cache.loadsWaiting() == 0,
+        "at most two loads at once", most.load(), cache.loadWaits);
+    KJ_REQUIRE(cache.decodes == fixture.segments.size(), "a waiting load still decodes once", cache.decodes);
+  }
+  // Decoded segments are freed on the background thread, not where the last reference is dropped.
+  {
+    const auto released = segmentsReleasedOffLoop();
+    {
+      SegmentDecodeCache cache(get, 256ull << 20, 0, {}, blocking);
+      readNew(cache, get, fixture.manifests.at(first), first).wait(io.waitScope);
+      KJ_REQUIRE(!cache.sweep() && cache.entries() == 0, "an idle cache is emptied");
+    }
+    until([&]() { return segmentsReleasedOffLoop() >= released + fixture.segments.size(); },
+        "decoded segments are freed off the calling thread");
+  }
+  // A reader canceled while its segments load: the loads finish, stay in the cache, and the next read matches.
+  {
+    std::atomic<bool> go{false};
+    HistoryBlockingGet held = [fetchOn, &go](const std::string& key) {
+      while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      return fetchOn(key);
+    };
+    SegmentDecodeCache cache(get, 256ull << 20, 30000, {}, held);
+    {
+      auto canceled = readNew(cache, get, fixture.manifests.at(first), first).eagerlyEvaluate(nullptr);
+      timer.afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(cache.loadsRunning() > 0, "the reader is waiting for its loads");
+    }
+    go = true;
+    until([&]() { return cache.loadsRunning() == 0; }, "a canceled reader's loads finish");
+    KJ_REQUIRE(cache.entries() > 0 && cache.failures == 0, "a canceled reader's loads are kept", cache.entries(), cache.failures);
+    same(first, readNew(cache, get, fixture.manifests.at(first), first).wait(io.waitScope), "a read after a canceled one matches");
+  }
+  // The cache destroyed while loads run: the workers finish against nothing, and nothing is touched after it.
+  {
+    std::atomic<bool> go{false};
+    std::atomic<int> started{0}, finished{0};
+    HistoryBlockingGet held = [fetchOn, &go, &started, &finished](const std::string& key) {
+      started.fetch_add(1);
+      while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      auto response = fetchOn(key);
+      finished.fetch_add(1);
+      return response;
+    };
+    {
+      SegmentDecodeCache cache(get, 256ull << 20, 30000, {}, held);
+      auto reading = readNew(cache, get, fixture.manifests.at(first), first).eagerlyEvaluate(nullptr);
+      timer.afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(cache.loadsRunning() > 0, "loads are running when the cache goes");
+    }
+    go = true;
+    until([&]() { return started.load() > 0 && finished.load() == started.load(); }, "the orphaned loads finish");
+    timer.afterDelay(50 * kj::MILLISECONDS).wait(io.waitScope);
+  }
+  // Concurrent readers when no entry fits: each load is evicted as it lands, and every read still matches.
+  {
+    SegmentDecodeCache tiny(get, 1, 30000, {}, blocking);
+    readAll(tiny, nullptr, 2, "concurrent reads through a full cache match");
+    KJ_REQUIRE(tiny.heldBytes() <= 1 && tiny.evictions > 0 && tiny.entries() == 0, "the bound is kept under concurrency",
+        tiny.heldBytes(), tiny.evictions, tiny.entries());
+  }
+}
+
 }  // namespace
+
+void runDurableSegmentCacheTests() {
+  for (unsigned seed = 201; seed < 205; ++seed) runCacheCase(seed);
+}
 
 void runDurableSegmentTests(bool negativeControls) {
   if (!negativeControls) {
@@ -268,6 +463,8 @@ void runDurableSegmentTests(bool negativeControls) {
     {SegmentControl::LEAK_OTHER_OBJECT, "records match the per-object decode"},
     {SegmentControl::CLEAR_OWNER_SEALED, "owner evidence matches"},
     {SegmentControl::DECODE_PER_READ, "each segment decoded once"},
+    {SegmentControl::KEY_WITHOUT_EPOCH, "records match the per-object decode"},
+    {SegmentControl::FETCH_WITHOUT_EPOCH, "records match the per-object decode"},
   };
   for (const auto& [control, expected] : controls) {
     bool rejected = false;

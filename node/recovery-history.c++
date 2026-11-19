@@ -13,10 +13,48 @@
 #include <tuple>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <system_error>
 namespace coworkerd {
 using json::quote;
 namespace {
+// The last reference to a decoded segment hands it to this thread, which frees it. One thread for the process,
+// started on first use and never stopped; without it (it could not start) a segment is freed where it is dropped.
+class SegmentReleaser {
+public:
+  static SegmentReleaser& instance() { static auto* releaser = new SegmentReleaser(); return *releaser; }
+  void release(const DecodedSegment* segment) {
+    if (!started) { delete segment; return; }
+    { std::lock_guard<std::mutex> lock(mutex); queue.push_back(segment); }
+    wake.notify_one();
+  }
+  std::atomic<uint64_t> released{0};
+private:
+  SegmentReleaser() {
+    try { std::thread([this]() { loop(); }).detach(); started = true; } catch (const std::system_error&) {}
+  }
+  void loop() {
+    for (;;) {
+      const DecodedSegment* next;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        wake.wait(lock, [this]() { return !queue.empty(); });
+        next = queue.front(); queue.pop_front();
+      }
+      delete next;
+      released.fetch_add(1);
+    }
+  }
+  bool started = false;
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::deque<const DecodedSegment*> queue;
+};
+std::shared_ptr<DecodedSegment> newDecodedSegment() {
+  return std::shared_ptr<DecodedSegment>(new DecodedSegment(),
+      [](DecodedSegment* segment) { SegmentReleaser::instance().release(segment); });
+}
 constexpr uint32_t RECOVERY_SYNC_THREADS = 128;
 auto recoverySyncThreads = std::make_shared<std::atomic<uint32_t>>(0);
 struct SegmentDecodeResult { std::optional<SegmentContents> contents; std::string error; };
@@ -43,7 +81,7 @@ GroupedDecode decodeGrouped(std::string bytes) {
   auto contents = decodeSegment(bytes, &result.error);
   const auto decoded = monotonicTimeMs();
   if (contents) {
-    auto segment = std::make_shared<DecodedSegment>();
+    auto segment = newDecodedSegment();
     segment->encodedBytes = bytes.size();
     segment->header = std::move(contents->header);
     segment->records = contents->records.size();
@@ -91,6 +129,7 @@ kj::Promise<GroupedDecode> decodeGroupedSegmentAsync(std::string bytes, HistoryB
   co_return co_await kj::mv(pair.promise);
 }
 } // namespace
+uint64_t segmentsReleasedOffLoop() { return SegmentReleaser::instance().released.load(); }
 kj::Promise<bool> synchronizeRecoveryFile(int fd) {
   auto counter = recoverySyncThreads;
   if (counter->fetch_add(1) >= RECOVERY_SYNC_THREADS) { counter->fetch_sub(1); co_return false; }
@@ -232,11 +271,26 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
   co_return out;
 }
 SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded,
-    HistoryBlockingGet blockingGet)
+    HistoryBlockingGet blockingGet, uint32_t maxLoadsParam)
     : get(std::move(get)), blockingGet(std::move(blockingGet)), limit(limitBytes), idle(idleMs),
-      decodedHook(std::move(decoded)) {}
+      decodedHook(std::move(decoded)), maxLoads(std::max<uint32_t>(1, maxLoadsParam)) {}
 void SegmentDecodeCache::taskFailed(kj::Exception&&) {}
 kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std::string key) {
+  // At most maxLoads loads at once. A finishing load wakes every waiting one and each checks again, so a waiter that
+  // is gone never holds a slot.
+  while (loading >= maxLoads) {
+    ++loadWaits;
+    auto turn = kj::newPromiseAndFulfiller<void>();
+    waiting.push_back(kj::mv(turn.fulfiller));
+    co_await turn.promise;
+  }
+  ++loading;
+  KJ_DEFER({
+    --loading;
+    auto woken = std::move(waiting);
+    waiting.clear();
+    for (auto& next : woken) if (next->isWaiting()) next->fulfill();
+  });
   GroupedDecode decoded;
   if (blockingGet) {
     // Download, digest, decode and grouping all on one worker thread.
@@ -258,20 +312,22 @@ kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std:
   if (decodedHook) decodedHook(key, *decoded.segment);
   co_return std::shared_ptr<const DecodedSegment>(std::move(decoded.segment));
 }
-kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(const ManifestSegment& ref, bool* loaded) {
-  auto key = nodeSegmentKey(ref.nodeId, ref.nodeEpoch, ref.segment);
+kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(const ManifestSegment& ref,
+    SegmentSource* source) {
+  auto storeKey = nodeSegmentKey(ref.nodeId, ref.nodeEpoch, ref.segment);
+  auto key = keyForTest ? keyForTest(ref) : storeKey;
   const auto now = monotonicTimeMs();
-  if (loaded) *loaded = false;
   auto entry = table.find(key);
   if (entry != table.end() && entry->second.ready) {
     ++hits;
+    if (source) *source = SegmentSource::HIT;
     entry->second.lastUsedMs = now;
     return std::shared_ptr<const DecodedSegment>(entry->second.ready);
   }
   if (entry == table.end()) {
     ++misses;
-    if (loaded) *loaded = true;
-    auto forked = load(key).fork();
+    if (source) *source = SegmentSource::LOAD;
+    auto forked = load(std::move(storeKey)).fork();
     // Finish the entry even when every reader that waited for it was canceled: its bytes are counted once, and a
     // failure is not kept.
     tasks.add(forked.addBranch().then([this, key](std::shared_ptr<const DecodedSegment> value) {
@@ -279,6 +335,9 @@ kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(c
       if (at == table.end()) return;
       at->second.ready = std::move(value);
       at->second.pending.reset();
+      // Just decoded counts as just used: the readers that waited read it now, and a load can take longer than
+      // the idle time or than the gap to the next batch of rebuilds that need the segment.
+      at->second.lastUsedMs = monotonicTimeMs();
       held += at->second.ready->bytes;
       trim();
     }, [this, key](kj::Exception&&) {
@@ -289,6 +348,7 @@ kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(c
     entry->second.pending.emplace(kj::mv(forked));
   } else {
     ++joins;
+    if (source) *source = SegmentSource::JOIN;
   }
   entry->second.lastUsedMs = now;
   return entry->second.pending->addBranch();
@@ -331,8 +391,8 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegmentsDecoded(SegmentDecodeCac
   for (size_t at = 0; at < wanted.size();) {
     kj::Vector<kj::Promise<std::shared_ptr<const DecodedSegment>>> running;
     const size_t until = std::min<size_t>(wanted.size(), at + width);
-    auto loaded = std::make_unique<bool[]>(until - at);
-    for (size_t i = at; i < until; ++i) running.add(cache.segment(wanted[i], &loaded[i - at]));
+    auto sources = std::make_unique<SegmentSource[]>(until - at);
+    for (size_t i = at; i < until; ++i) running.add(cache.segment(wanted[i], &sources[i - at]));
     const auto waitBegan = monotonicTimeMs();
     auto segments = co_await kj::joinPromises(running.releaseAsArray());
     if (stats) stats->waitMs += monotonicTimeMs() - waitBegan;
@@ -340,9 +400,11 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegmentsDecoded(SegmentDecodeCac
       const auto& contents = *segments[i];
       if (stats) {
         ++stats->segments;
-        if (loaded[i]) {
+        if (sources[i] == SegmentSource::LOAD) {
           ++stats->cacheMisses; stats->bytes += contents.encodedBytes;
           stats->downloadMs += contents.downloadMs; stats->decodeMs += contents.decodeMs; stats->groupMs += contents.groupMs;
+        } else if (sources[i] == SegmentSource::JOIN) {
+          ++stats->cacheJoins;
         } else {
           ++stats->cacheHits;
         }
