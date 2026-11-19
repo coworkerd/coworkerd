@@ -400,7 +400,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
             ", heartbeatIntervalMs " + std::to_string(m.heartbeatIntervalMs) + ", ttlSeconds " + std::to_string(m.ttlSeconds) +
             " (the smallest livenessGraceMs for this interval is " +
             std::to_string(uint64_t(m.heartbeatIntervalMs) + LIVENESS_GRACE_MARGIN_MS + 1) + ")";
-        KJ_FAIL_REQUIRE(values.c_str());
+        kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(values.c_str())));
       }
       KJ_REQUIRE(m.listIntervalMs > 0, "membership.listIntervalMs must be positive");
       KJ_REQUIRE(m.clockSkewToleranceMs > 0, "membership.clockSkewToleranceMs must be positive");

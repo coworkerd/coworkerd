@@ -109,6 +109,8 @@ void livenessGraceConfiguration(Fixture& fixture) {
                {"livenessGraceMs 750", "heartbeatIntervalMs 500", "ttlSeconds 4", "is 1651"}}}) {
     std::string refusal;
     try { with(row.membership); } catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+    KJ_REQUIRE(refusal.rfind("membership.livenessGraceMs must be greater than", 0) == 0, "the refusal is the message itself",
+        refusal.c_str());
     for (const auto& value : row.named)
       KJ_REQUIRE(refusal.find(value) != std::string::npos, "the refusal must name the value", value.c_str(), refusal.c_str());
   }
