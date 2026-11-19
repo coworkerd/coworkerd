@@ -891,6 +891,13 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
               std::to_string(segment.encodedBytes) + ",\"heldBytes\":" + std::to_string(segment.bytes) +
               ",\"downloadMs\":" + std::to_string(segment.downloadMs) + ",\"decodeMs\":" +
               std::to_string(segment.decodeMs) + ",\"groupMs\":" + std::to_string(segment.groupMs));
+        },
+        // The download runs on the decoder's worker thread, with an event loop and a connection of its own: a
+        // segment can be close to 64 MiB, and the event loop's reader copies every chunk of it.
+        [storeConfig](const std::string& key) {
+          auto io = kj::setupAsyncIo();
+          ObjectStore threadStore(storeConfig, io.provider->getNetwork(), io.provider->getTimer());
+          return threadStore.get(key).wait(io.waitScope);
         });
     alarmPublication = std::make_unique<AlarmPublication>(*store, timer, this->settings.nodeId,
         [this](const std::string& ns, uint32_t shard, uint64_t epoch, uint64_t memberEpoch) {

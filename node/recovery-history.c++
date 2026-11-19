@@ -34,41 +34,56 @@ kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {
   } catch (const std::system_error&) { KJ_FAIL_REQUIRE("cannot start recovery segment decoder"); }
   co_return co_await kj::mv(pair.promise);
 }
-// The digest check, the decode and the grouping by object, all on a worker thread: the node's event loop only gets
-// the result. The encoded copy is released on that thread too.
-struct GroupedDecode { std::shared_ptr<DecodedSegment> segment; std::string error; };
-kj::Promise<GroupedDecode> decodeGroupedSegmentAsync(std::string bytes) {
+// The digest check, the decode and the grouping by object, on the calling (worker) thread. The encoded copy is
+// released there too.
+struct GroupedDecode { std::shared_ptr<DecodedSegment> segment; std::string error; uint status = 200; double downloadMs = 0; };
+GroupedDecode decodeGrouped(std::string bytes) {
+  GroupedDecode result;
+  const auto began = monotonicTimeMs();
+  auto contents = decodeSegment(bytes, &result.error);
+  const auto decoded = monotonicTimeMs();
+  if (contents) {
+    auto segment = std::make_shared<DecodedSegment>();
+    segment->encodedBytes = bytes.size();
+    segment->header = std::move(contents->header);
+    segment->records = contents->records.size();
+    for (auto& record : contents->records) {
+      segment->bytes += sizeof(LogRecord) + record.frameBytes.size() + record.header.size() +
+          record.objectName.size() + record.storageId.size() + record.facetName.size();
+      auto group = segment->byObject.find(record.objectName);
+      if (group == segment->byObject.end()) {
+        group = segment->byObject.emplace(record.objectName, std::vector<LogRecord>()).first;
+        segment->bytes += group->first.size() + 64;
+      }
+      group->second.push_back(std::move(record));
+    }
+    segment->decodeMs = decoded - began;
+    segment->groupMs = monotonicTimeMs() - decoded;
+    result.segment = std::move(segment);
+  }
+  contents.reset();
+  std::string().swap(bytes);
+  return result;
+}
+// `fetch` (optional) downloads on the worker thread first; otherwise `bytes` is what the event loop downloaded.
+kj::Promise<GroupedDecode> decodeGroupedSegmentAsync(std::string bytes, HistoryBlockingGet fetch = {}, std::string key = {}) {
   auto pair = kj::newPromiseAndCrossThreadFulfiller<GroupedDecode>();
   auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<GroupedDecode>>>(kj::mv(pair.fulfiller));
   try {
-    std::thread([bytes = std::move(bytes), fulfiller]() mutable {
+    std::thread([bytes = std::move(bytes), fetch = std::move(fetch), key = std::move(key), fulfiller]() mutable {
       try {
-        GroupedDecode result;
-        const auto began = monotonicTimeMs();
-        auto contents = decodeSegment(bytes, &result.error);
-        const auto decoded = monotonicTimeMs();
-        if (contents) {
-          auto segment = std::make_shared<DecodedSegment>();
-          segment->encodedBytes = bytes.size();
-          segment->header = std::move(contents->header);
-          segment->records = contents->records.size();
-          for (auto& record : contents->records) {
-            segment->bytes += sizeof(LogRecord) + record.frameBytes.size() + record.header.size() +
-                record.objectName.size() + record.storageId.size() + record.facetName.size();
-            auto group = segment->byObject.find(record.objectName);
-            if (group == segment->byObject.end()) {
-              group = segment->byObject.emplace(record.objectName, std::vector<LogRecord>()).first;
-              segment->bytes += group->first.size() + 64;
-            }
-            group->second.push_back(std::move(record));
-          }
-          segment->decodeMs = decoded - began;
-          segment->groupMs = monotonicTimeMs() - decoded;
-          result.segment = std::move(segment);
+        if (fetch) {
+          const auto began = monotonicTimeMs();
+          auto response = fetch(key);
+          const auto downloadMs = monotonicTimeMs() - began;
+          GroupedDecode result;
+          if (response.status == 200) result = decodeGrouped(std::move(response.bytes));
+          result.status = response.status;
+          result.downloadMs = downloadMs;
+          (*fulfiller)->fulfill(kj::mv(result));
+        } else {
+          (*fulfiller)->fulfill(decodeGrouped(std::move(bytes)));
         }
-        contents.reset();
-        std::string().swap(bytes);
-        (*fulfiller)->fulfill(kj::mv(result));
       } catch (kj::Exception& error) { (*fulfiller)->reject(kj::mv(error)); }
       catch (const std::exception&) { (*fulfiller)->reject(KJ_EXCEPTION(FAILED, "cannot decode recovery segment")); }
     }).detach();
@@ -216,18 +231,29 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
   }
   co_return out;
 }
-SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded)
-    : get(std::move(get)), limit(limitBytes), idle(idleMs), decodedHook(std::move(decoded)) {}
+SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded,
+    HistoryBlockingGet blockingGet)
+    : get(std::move(get)), blockingGet(std::move(blockingGet)), limit(limitBytes), idle(idleMs),
+      decodedHook(std::move(decoded)) {}
 void SegmentDecodeCache::taskFailed(kj::Exception&&) {}
 kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std::string key) {
-  const auto began = monotonicTimeMs();
-  auto response = co_await get(key);
-  KJ_REQUIRE(response.status == 200, "a segment of a Durable Object's log is not on the store", key.c_str(),
-      response.status);
-  const auto downloadMs = monotonicTimeMs() - began;
-  auto decoded = co_await decodeGroupedSegmentAsync(std::move(response.bytes));
+  GroupedDecode decoded;
+  if (blockingGet) {
+    // Download, digest, decode and grouping all on one worker thread.
+    decoded = co_await decodeGroupedSegmentAsync({}, blockingGet, key);
+    KJ_REQUIRE(decoded.status == 200, "a segment of a Durable Object's log is not on the store", key.c_str(),
+        decoded.status);
+  } else {
+    const auto began = monotonicTimeMs();
+    auto response = co_await get(key);
+    KJ_REQUIRE(response.status == 200, "a segment of a Durable Object's log is not on the store", key.c_str(),
+        response.status);
+    const auto downloadMs = monotonicTimeMs() - began;
+    decoded = co_await decodeGroupedSegmentAsync(std::move(response.bytes));
+    decoded.downloadMs = downloadMs;
+  }
   KJ_REQUIRE(decoded.segment != nullptr, "a segment of a Durable Object's log does not add up", decoded.error.c_str());
-  decoded.segment->downloadMs = downloadMs;
+  decoded.segment->downloadMs = decoded.downloadMs;
   ++decodes;
   if (decodedHook) decodedHook(key, *decoded.segment);
   co_return std::shared_ptr<const DecodedSegment>(std::move(decoded.segment));

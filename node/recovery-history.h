@@ -11,6 +11,9 @@ using HistoryGet = std::function<kj::Promise<ObjectResponse>(std::string)>;
 using HistoryYield = std::function<kj::Promise<void>()>;
 using HistoryCheck = std::function<void()>;
 using HistoryLog = std::function<void(const std::string&, const std::string&)>;
+// A GET that runs to completion on the calling worker thread (with an event loop and connection of its own), so a
+// download does not touch the node's event loop.
+using HistoryBlockingGet = std::function<ObjectResponse(const std::string&)>;
 struct HistoryBudget {
   uint64_t payloadLimit = 128ull << 20, recordLimit = 100000, memoryLimit = 512ull << 20;
   uint64_t transientLimit = 384ull << 20, transientHighWater = 0;
@@ -52,7 +55,9 @@ struct DecodedSegment {
 class SegmentDecodeCache final: private kj::TaskSet::ErrorHandler {
 public:
   using Decoded = std::function<void(const std::string& key, const DecodedSegment& segment)>;
-  SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded = {});
+  // With `blockingGet`, the download runs on the decoding worker thread too; without it, on the event loop.
+  SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded = {},
+      HistoryBlockingGet blockingGet = {});
   // `loaded` (optional) is set when this call started the download and decode.
   kj::Promise<std::shared_ptr<const DecodedSegment>> segment(const ManifestSegment& ref, bool* loaded = nullptr);
   // Drops the entries no read has used for idleMs; whether any entry is left.
@@ -71,6 +76,7 @@ private:
   kj::Promise<std::shared_ptr<const DecodedSegment>> load(std::string key);
   void trim();
   HistoryGet get;
+  HistoryBlockingGet blockingGet;
   uint64_t limit, held = 0;
   double idle;
   Decoded decodedHook;

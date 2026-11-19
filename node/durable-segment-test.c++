@@ -175,6 +175,12 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   ObjectStore store(config, io.provider->getNetwork(), io.provider->getTimer());
   uint64_t gets = 0;
   HistoryGet get = [&store, &gets](std::string key) { ++gets; return store.get(std::move(key)); };
+  // The node's way: the download runs on the decoder's worker thread with a store client of its own.
+  HistoryBlockingGet blocking = [config](const std::string& key) {
+    auto threadIo = kj::setupAsyncIo();
+    ObjectStore threadStore(config, threadIo.provider->getNetwork(), threadIo.provider->getTimer());
+    return threadStore.get(key).wait(threadIo.waitScope);
+  };
   std::mt19937 random(seed);
   auto fixture = prepare(store, random).wait(io.waitScope);
   std::map<std::string, Read> before;
@@ -182,12 +188,13 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   // All objects at once, as concurrent rebuilds would: they share each segment's download and decode. The
   // DECODE_PER_READ control gives every read a cache of its own, which is what decoding per object amounts to.
   const uint64_t limit = 256ull << 20;
-  SegmentDecodeCache cache(get, limit, 30000);
+  SegmentDecodeCache cache(get, limit, 30000, {}, blocking);
   std::vector<std::unique_ptr<SegmentDecodeCache>> own;
   kj::Vector<kj::Promise<Read>> reads;
   for (const auto& name : fixture.objects) {
     auto* used = &cache;
-    if (control == SegmentControl::DECODE_PER_READ) used = own.emplace_back(std::make_unique<SegmentDecodeCache>(get, limit, 30000)).get();
+    if (control == SegmentControl::DECODE_PER_READ)
+      used = own.emplace_back(std::make_unique<SegmentDecodeCache>(get, limit, 30000, SegmentDecodeCache::Decoded(), blocking)).get();
     reads.add(readNew(*used, get, fixture.manifests.at(name), name));
   }
   auto results = kj::joinPromises(reads.releaseAsArray()).wait(io.waitScope);
@@ -207,7 +214,7 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   KJ_REQUIRE(cache.decodes == fixture.segments.size() && gets - getsBefore <= fixture.objects.size() * 4,
       "cached reads decode nothing again", cache.decodes, gets - getsBefore);
   KJ_REQUIRE(cache.heldBytes() > 0 && cache.heldBytes() <= limit, "held bytes are counted and bounded", cache.heldBytes());
-  // A tiny bound evicts between readers; the answers stay the same.
+  // A tiny bound evicts between readers; the answers stay the same. This one downloads on the event loop.
   SegmentDecodeCache tiny(get, 1, 30000);
   for (const auto& name : fixture.objects) {
     auto read = readNew(tiny, get, fixture.manifests.at(name), name).wait(io.waitScope);
@@ -226,7 +233,7 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   auto expectSame = [&](const ObjectManifest& manifest, const std::string& name, const char* expected) {
     std::string oldError, newError;
     try { readOld(get, manifest, name).wait(io.waitScope); } catch (const kj::Exception& e) { oldError = e.getDescription().cStr(); }
-    SegmentDecodeCache fresh(get, 256ull << 20, 30000);
+    SegmentDecodeCache fresh(get, 256ull << 20, 30000, {}, blocking);
     for (int round = 0; round < 2; ++round) {
       try { readNew(fresh, get, manifest, name).wait(io.waitScope); } catch (const kj::Exception& e) { newError = e.getDescription().cStr(); }
       KJ_REQUIRE(oldError.find(expected) != std::string::npos && newError.find(expected) != std::string::npos,
