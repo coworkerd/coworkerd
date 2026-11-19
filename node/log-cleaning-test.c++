@@ -140,7 +140,8 @@ struct Child {
       for (auto end = partial.find('\n'); end != std::string::npos; end = partial.find('\n')) {
         capnp::MallocMessageBuilder message;
         capnp::JsonCodec codec;
-        codec.decode(kj::StringPtr(partial.data(), end), message.initRoot<capnp::JsonValue>());
+        const auto line = partial.substr(0, end);
+        codec.decodeRaw(kj::StringPtr(line.c_str(), line.size()), message.initRoot<capnp::JsonValue>());
         const auto record = message.getRoot<capnp::JsonValue>().asReader();
         if (json::text(record, "event") == "listen" && json::text(record, "socket") == "http")
           return static_cast<uint16_t>(json::field(record, "port").getNumber());
