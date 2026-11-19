@@ -430,6 +430,9 @@ public:
   // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
   // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
   kj::Promise<void> raisePeerFence(DurableTailAsk ask);
+  // r49: the floor of one shard raised to `epoch` once the object store shows that epoch (shared with raisePeerFence:
+  // one read at a time per epoch, failures kept and read again in the background). `reason` names what asked.
+  kj::Promise<void> raiseFloor(std::string namespaceId, uint32_t shard, uint64_t epoch, std::string reason);
   static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
   // r48: a check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
   // most this many times, while the epoch is still not known.
@@ -735,7 +738,10 @@ private:
   // The epochs with background rereads under way: one chain each, however many requests failed meanwhile.
   std::set<std::tuple<std::string, uint32_t, uint64_t>> fenceRereading;
   // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
-  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread);
+  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread,
+      std::string reason);
+  // r49: a peer refused one of this node's records as fenced -- check whether the record's shard is lost.
+  void checkFencedShard(uint64_t sequence);
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {
@@ -1041,6 +1047,7 @@ private:
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
   uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0, fullRetriesSent = 0;
+  uint64_t ownerProofsUnverified = 0, fencedShardChecks = 0, fencedShardsLost = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;

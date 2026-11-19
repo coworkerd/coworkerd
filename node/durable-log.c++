@@ -2565,6 +2565,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         ++current->refusals;
         current->lastRefusal = accepted.refusal;
         if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
+        if (accepted.refusal.starts_with("fenced:")) checkFencedShard(sequence);
         // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
         // peer takes it; a full buffer is tried again on this session after a growing wait.
         current->refusedSeqs.insert(sequence);
@@ -2606,6 +2607,30 @@ void DurableLog::pumpPeer(PeerStream& peer) {
               "\",\"error\":" + quote(std::string(error.getDescription().cStr())));
     }).attach(sink.addRef()));
   }
+}
+
+// r49: a peer refused a record as fenced: it knows a newer epoch of the record's shard. That is believed once the object
+// store shows the next epoch after the record's (an epoch object is created only by the node that takes the shard),
+// and then this node has lost the shard: raising its own floor to that epoch (fenceOwner) refuses the shard's
+// pending and later writes at once, closes its objects here and drops it from the shards this node holds, so that
+// requests go to the newer owner -- instead of each write waiting for confirmTimeoutMs. Only the fence does this; a
+// full buffer or any other refusal does not. The read is shared with the peer floor's (raiseFloor).
+void DurableLog::checkFencedShard(uint64_t sequence) {
+  const auto record = parsed.find(sequence);
+  if (record == parsed.end() || !record->second.shardEpoch) return;
+  const auto& name = record->second.objectName;
+  const auto namespaceId = name.substr(0, name.find('/'));
+  const auto shard = record->second.shard;
+  const auto epoch = record->second.shardEpoch;
+  if (ownerFenced(namespaceId, shard, epoch)) return;
+  ++fencedShardChecks;
+  tasks.add(raiseFloor(namespaceId, shard, epoch + 1, "a peer refused this node's append as fenced")
+                .then([this, namespaceId, shard, epoch]() {
+    if (!ownerFenced(namespaceId, shard, epoch)) return;
+    ++fencedShardsLost;
+    log("shard-lost-fenced", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+        ",\"shardEpoch\":\"" + std::to_string(epoch) + "\"");
+  }));
 }
 
 // r48: a record the peer refused because its buffer was full, sent again on the same session while it still waits.
@@ -6919,20 +6944,26 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
 // epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
+// r49: a request for this node's own older tail (an owner proof) is checked the same way; tailForPage gives the proof
+// only for an epoch this node then knows.
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
-  if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
-  if (ask.shardEpoch <= knownEpoch(ask.namespaceId, ask.shard)) co_return;
+  if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty()) co_return;
+  co_await raiseFloor(ask.namespaceId, ask.shard, ask.shardEpoch, "a newer epoch of the shard asked for a tail");
+}
+
+kj::Promise<void> DurableLog::raiseFloor(std::string namespaceId, uint32_t shard, uint64_t epoch, std::string reason) {
+  if (!enabled() || epoch < 2 || epoch <= knownEpoch(namespaceId, shard)) co_return;
   const auto now = timer.now();
   for (auto it = fenceChecks.begin(); it != fenceChecks.end();)
     it = it->second.settled && now - it->second.at >= int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS ? fenceChecks.erase(it)
                                                                                                     : std::next(it);
-  const auto key = std::make_tuple(ask.namespaceId, ask.shard, ask.shardEpoch);
+  const auto key = std::make_tuple(namespaceId, shard, epoch);
   auto found = fenceChecks.find(key);
   // A check of this epoch that failed within OWNER_REREAD_MS: answered at once, as before (a background read follows).
   if (found != fenceChecks.end() && found->second.settled) co_return;
   if (found == fenceChecks.end()) {
     ++peerFenceChecks;
-    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, 0).fork();
+    auto check = checkPeerFence(namespaceId, shard, epoch, 0, std::move(reason)).fork();
     found = fenceChecks.emplace(key, FenceCheck{kj::mv(check), now, false}).first;
   }
   co_await found->second.done.addBranch();
@@ -6947,7 +6978,8 @@ kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
 // the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, and the epoch is read again
 // in the background -- after OWNER_REREAD_MS, doubled each time, at most FENCE_REREADS times, while it is still not
 // known -- so that the floor goes up soon after the store answers again.
-kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread) {
+kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread,
+    std::string reason) {
   std::string failure;
   try {
     const auto waitMs = std::max<uint32_t>(1, settings.peerTimeoutMs / 2);
@@ -6958,7 +6990,7 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
       if (record && record->epoch == epoch && record->namespaceId == namespaceId && record->shard == shard) {
         if (epoch > knownEpoch(namespaceId, shard)) {
           ++peerFenceRaises;
-          fenceOwner(namespaceId, shard, epoch - 1, "a newer epoch of the shard asked for a tail", true);
+          fenceOwner(namespaceId, shard, epoch - 1, reason, true);
         }
         if (reread) fenceRereading.erase({namespaceId, shard, epoch});
         co_return;
@@ -6981,8 +7013,8 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
     co_return;
   }
   const auto waitMs = int64_t(OWNER_REREAD_MS) << reread;
-  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread]() {
-    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1);
+  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread, reason]() {
+    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1, reason);
     fenceRereading.erase({namespaceId, shard, epoch});
     return kj::Promise<void>(kj::READY_NOW);
   }));
@@ -6998,6 +7030,17 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
     answer.refusal = "the requesting shard epoch has been fenced";
     return answer;
   }
+  // r49: an owner proof fences this node's older ownerships of the shard, so a remote one is given only for an epoch
+  // this node knows by now -- the object store has shown it (raisePeerFence runs before the answer), or its own view
+  // of the shard has it. A number the store does not show gets no proof and fences nothing; the asker keeps asking.
+  const auto ownerProofUnshown = [&]() {
+    if (!remote || ask.shardEpoch <= 1 || knownEpoch(ask.namespaceId, ask.shard) >= ask.shardEpoch) return false;
+    ++ownerProofsUnverified;
+    answer.refusal = "the requesting shard epoch is not shown by the object store; no owner proof";
+    log("owner-proof-unverified", "\"namespaceId\":" + quote(ask.namespaceId) + ",\"shard\":" +
+        std::to_string(ask.shard) + ",\"shardEpoch\":\"" + std::to_string(ask.shardEpoch) + "\"");
+    return true;
+  };
   const auto sourceEpoch = std::to_string(ask.ownerNodeEpoch);
   if (ask.ownerNodeId == settings.nodeId && ask.ownerNodeEpoch && ask.ownerNodeEpoch != nodeEpoch &&
       !membership.heldEpochs.contains(sourceEpoch)) {
@@ -7017,6 +7060,7 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
           sourceEpoch + "\",\"records\":" + std::to_string(pending->second));
       return answer;
     }
+    if (ownerProofUnshown()) return answer;
     if (remote && ask.shardEpoch > 1)
       fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a remote complete owner proof", true);
     ++tailAnswers;++restoredEmptyAnswers;
@@ -7025,6 +7069,7 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
         ",\"shard\":" + std::to_string(ask.shard) + ",\"sourceNodeEpoch\":\"" + sourceEpoch + "\"");
     return answer;
   }
+  if (ask.ownerNodeId == settings.nodeId && ownerProofUnshown()) return answer;
   if (remote && ask.ownerNodeId == settings.nodeId && ask.shardEpoch > 1)
     fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a remote complete owner proof", true);
   ++tailAnswers;
@@ -7269,7 +7314,8 @@ std::string DurableLog::json() const {
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
       << fencedRecords << ",\"peerFenceChecks\":" << peerFenceChecks << ",\"peerFenceRaises\":" << peerFenceRaises
       << ",\"peerFenceUnverified\":" << peerFenceUnverified << ",\"ownerFences\":" << ownerFenceThrough.size()
-      << ",\"fullRetriesSent\":" << fullRetriesSent
+      << ",\"fullRetriesSent\":" << fullRetriesSent << ",\"ownerProofsUnverified\":" << ownerProofsUnverified
+      << ",\"fencedShardChecks\":" << fencedShardChecks << ",\"fencedShardsLost\":" << fencedShardsLost
       << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
   first = true;
   for (const auto& [streamId, buffer] : incoming) {

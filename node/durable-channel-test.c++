@@ -453,6 +453,37 @@ struct DurableLogChannelTest {
       // A newer epoch the store does not show is read on its own.
       raise(9);
       KJ_REQUIRE(log.peerFenceChecks == 3 && log.knownEpoch(ns, 1) == 6);
+    } else if (name == "owner-proof" || name == "owner-proof-restored") {
+      // r49: a request for this node's own older tail (an owner proof) gets the proof, which fences this node's older
+      // ownerships, only for an epoch the store shows. "-restored": the tail of a previous incarnation of this node.
+      const bool restored = name == "owner-proof-restored";
+      if (restored) {
+        log.diskTrusted = true;
+        log.sameBootCache = true;
+        log.predecessorLogs[3].complete = true;
+      }
+      auto own = [&](uint64_t shardEpoch) {
+        auto out = ask(shardEpoch);
+        out.ownerNodeId = "peer";
+        out.ownerNodeEpoch = restored ? 3 : 9;
+        return out;
+      };
+      auto proof = [&](uint64_t shardEpoch) {
+        log.raisePeerFence(own(shardEpoch)).wait(io.waitScope);
+        return log.tailFor(own(shardEpoch));
+      };
+      // No object at epoch 4; at epoch 5 an object that names another shard: no proof, nothing fenced.
+      auto none = proof(4);
+      epochObject(1, 5, 2);
+      auto other = proof(5);
+      KJ_REQUIRE(none.refusal.find("no owner proof") != std::string::npos && !none.ownerConfirmed &&
+          other.refusal.find("no owner proof") != std::string::npos && log.ownerFenceThrough.empty() &&
+          log.ownerProofsUnverified == 2, "an owner proof of an epoch the store does not show", none.refusal.c_str());
+      // The store shows epoch 6: the proof is given and this node's older ownerships are fenced.
+      epochObject(1, 6);
+      auto shown = proof(6);
+      KJ_REQUIRE(shown.refusal.empty() && shown.ownerConfirmed && log.ownerFenceThrough.at({ns, 1}) == 5,
+          "an owner proof of an epoch the store shows", shown.refusal.c_str());
     } else if (name == "outage") {
       // The store never shows epoch 6 and a request of it comes every second for 40 s: about one read a second in
       // all -- the request's own once the failure kept for a second has expired, and one chain of background rereads
@@ -653,6 +684,14 @@ struct DurableLogChannelTest {
       hosts.push_back(host);
     }
     if (name == "pair-fenced") peer.fenceOwner(ns, log.objects.at(hosts[1]).shard, 1, "test", false);
+    const bool drop = name == "fenced-drop" || name == "fenced-unshown" || name == "full-keeps";
+    if (name == "fenced-drop" || name == "full-keeps") {
+      // r49: the store shows the next epoch of record 2's shard (4): another node has taken it.
+      ShardEpoch next;
+      next.namespaceId = ns; next.shard = 4; next.epoch = 2; next.nodeId = "node-3"; next.nodeEpoch = 7;
+      next.dataEpoch = 1; next.reason = "timeout"; next.instance = "i"; next.nonce = "n"; next.acquiredAtUnixMs = 1;
+      log.store->put(shardEpochKey(ns, 4, 2), shardEpochJson(next)).wait(io.waitScope);
+    }
     for (size_t i = 0; i < hosts.size(); ++i) {
       LogRecord record;
       record.kind = LogRecordKind::RESET;
@@ -687,7 +726,44 @@ struct DurableLogChannelTest {
       clock.advanceTo(clock.now() + ms * kj::MILLISECONDS);
       answers();
     };
-    if (name == "pair-full") {
+    if (drop) {
+      // r49: "fenced-drop": a peer refuses record 2 as fenced and the store shows epoch 2 of its shard -- this node
+      // gives the shard up at once: record 2 fails now (not at confirmTimeoutMs), a later write to that object is
+      // refused at once, the other shards are untouched. "fenced-unshown": the store does not show it -- nothing is
+      // given up. "full-keeps": a full buffer gives nothing up and reads nothing, the next epoch shown or not.
+      calls[0].fulfiller->fulfill({1, ""});
+      calls[1].fulfiller->fulfill({1, name == "full-keeps" ?
+          "full: this node buffers durableObjects.peerBufferBytes for the owners it is a peer of" :
+          "fenced: this node knows a newer epoch of the shard"});
+      calls[2].fulfiller->fulfill({3, ""});
+      answers();
+      answers();
+      KJ_REQUIRE(acks.at(101) == 0 && acks.at(103) == 0, "the other shards' records are confirmed");
+      const bool lost = log.ownerFenced(ns, 4, 1);
+      if (name == "fenced-drop") {
+        KJ_REQUIRE(lost && log.fencedShardsLost == 1 && acks.contains(102) && acks.at(102) != 0 &&
+            !log.inFlight.contains(2) && log.objects.at(hosts[1]).state == DurableLog::ObjectState::GONE,
+            "a shard the store shows lost is given up at once", log.fencedShardsLost);
+        KJ_REQUIRE(!log.ownerFenced(ns, 3, 1) && !log.ownerFenced(ns, 5, 1), "only that shard is given up");
+        for (size_t i : {1u, 2u}) {
+          LogRecord record;
+          record.kind = LogRecordKind::RESET;
+          record.objectName = hosts[i];
+          record.storageId = log.objects.at(hosts[i]).storageId;
+          record.dataEpoch = 1;
+          log.takeRecord(channel, std::move(record), 104 + i);
+        }
+        answers();
+        KJ_REQUIRE(acks.contains(105) && acks.at(105) != 0 && !acks.contains(106) && log.inFlight.size() == 1,
+            "a later write to the lost shard is refused at once; another shard's waits for its peer");
+      } else if (name == "fenced-unshown") {
+        KJ_REQUIRE(!lost && log.fencedShardChecks == 1 && log.fencedShardsLost == 0 && !acks.contains(102) &&
+            log.inFlight.contains(2) && log.peerFenceUnverified == 1, "nothing is given up on an unshown epoch");
+      } else {
+        KJ_REQUIRE(!lost && log.fencedShardChecks == 0 && log.peerFenceChecks == 0 && !acks.contains(102) &&
+            log.inFlight.contains(2), "a full buffer gives nothing up");
+      }
+    } else if (name == "pair-full") {
       answers();
       KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
           log.inFlight.contains(2), "record 2 refused (full) is not counted; 3 is not held up", log.confirmations);
