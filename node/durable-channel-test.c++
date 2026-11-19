@@ -367,9 +367,12 @@ struct DurableLogChannelTest {
 
 }  // namespace coworkerd
 
+namespace coworkerd { void runDurableTailTests(bool negativeControls); }
+
 int main(int argc, char* argv[]) {
   const std::string_view mode = argc >= 2 ? argv[1] : "";
-  if (mode == "lease-tracker") coworkerd::DurableLogChannelTest::leaseTracker();
+  if (mode == "tail" || mode == "tail-negative") coworkerd::runDurableTailTests(mode == "tail-negative");
+  else if (mode == "lease-tracker") coworkerd::DurableLogChannelTest::leaseTracker();
   else if (mode == "lease-confirm") coworkerd::DurableLogChannelTest::leaseConfirm(argc == 3 ? argv[2] : "");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
 }

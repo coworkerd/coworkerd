@@ -242,6 +242,7 @@ struct DurableTailAsk {
   std::string namespaceId, ownerNodeId;
   uint32_t shard = 0;
   uint64_t shardEpoch = 0, ownerNodeEpoch = 0, afterSeq = 0;
+  std::string objectId;  // Empty means the legacy shard-wide request.
 };
 struct DurableTailAnswer {
   std::vector<LogRecord> records;
@@ -590,12 +591,14 @@ private:
     std::string fragment;                  // the pieces of a record whose last call has not come yet
     std::map<uint64_t, std::string> held;  // nodeSeq -> the encoded record
     std::map<uint64_t, LogRecord> positions;  // validated metadata without frame/header bytes
+    std::map<std::string, std::set<uint64_t>, std::less<>> byObject;
+    void forgetPosition(uint64_t sequence);
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
   };
 
   void taskFailed(kj::Exception&& error) override;
   void log(const std::string& event, const std::string& fields) const;
-  std::vector<std::filesystem::path> objectDirectories(std::error_code& code) const;
+  kj::Promise<std::vector<std::filesystem::path>> objectDirectories(std::error_code& code, bool slice);
   std::filesystem::path logDirectory() const;       // <stack>/do/log
   std::filesystem::path databasePath(const RootStorageRef& ref, uint32_t facetId,
       const char* suffix = "", const std::string& staging = "") const;
@@ -625,7 +628,7 @@ private:
     bool modern = false, complete = false, crossedBoot = false, present = false;
   };
   bool initializeRecovery();
-  void readRecovery();
+  kj::Promise<void> readRecovery(bool slice);
   void applyRecovery(const RecoveryEvent& event);
   bool appendRecovery(const std::vector<RecoveryEvent>& events, bool sync);
   bool beginRepair(Object& object);
@@ -633,13 +636,15 @@ private:
   void failRecovery(const std::string& reason);
   bool markCrossedBoot(uint64_t epoch);
   // The records this node's own log files hold, and each database cut back to the position they name.
-  kj::Promise<void> readOwnLog();
-  kj::Promise<void> classifyEarlier();
+  kj::Promise<void> readOwnLog(bool slice);
+  kj::Promise<void> classifyEarlier(bool slice);
   std::optional<std::string> cutBackWal(const Object& object, uint32_t facetId, uint32_t salt1, uint32_t salt2, uint32_t pageSize,
       uint32_t lastFrame);
 
   // ---- the channel to a durable process ----
   friend struct DurableLogChannelTest;
+  friend struct DurableTailTest;
+  DurableTailAnswer tailForPage(const DurableTailAsk& ask, bool remote, size_t pageBytes);
   kj::Promise<void> readChannel(Channel& channel);
   bool consumeChannelInbox(Channel& channel, bool sliced);
   void onMessage(Channel& channel, std::string_view message);
@@ -755,7 +760,7 @@ private:
 
   // ---- what this machine's files are at, so the same boot reuses them ----
   bool writePosition(const Object& object);
-  void readPositions();
+  kj::Promise<void> readPositions(bool slice);
   std::optional<std::string> prepareOpen(Object& object, const std::string* targetChannel = nullptr);
   bool hasLiveOpenFacets(const Object& object) const;
   bool channelHasOpenObject(const Channel& channel, const Object& object) const;

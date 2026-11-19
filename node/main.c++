@@ -4492,6 +4492,7 @@ public:
     parameters.setOwnerNodeId(ask.ownerNodeId.c_str());
     parameters.setOwnerNodeEpoch(ask.ownerNodeEpoch);
     parameters.setAfterSeq(ask.afterSeq);
+    parameters.setObjectId(ask.objectId.c_str());
     parameters.setDestinationEpoch(epoch.c_str());
     auto response = co_await request.send();
     auto result = response.getResult();
@@ -5164,6 +5165,7 @@ public:
     ask.ownerNodeId = parameters.getOwnerNodeId().cStr();
     ask.ownerNodeEpoch = parameters.getOwnerNodeEpoch();
     ask.afterSeq = parameters.getAfterSeq();
+    ask.objectId = parameters.getObjectId().cStr();
     std::string refusal;
     if (!destination.empty() && !server.holdsEpoch(destination) &&
         !durableLog.canAnswerRestoredTail(ask, destination, &refusal)) {
