@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..de39d10e1c1426221480c3bb8ff59385d04b8869
+index 0000000000000000000000000000000000000000..d2433de41cd493edc088e0e0577856effed0400f
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,526 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1115,14 +1115,60 @@ index 0000000000000000000000000000000000000000..de39d10e1c1426221480c3bb8ff59385
 +  KJ_EXPECT(!compileTenantFlags(validSlot, valid.get(), validReporter).getPreciseTimers());
 +}
 +
++KJ_TEST("waitUntil drain preserves work after child-call authority expires") {
++  initializeV8();
++  auto io = kj::setupAsyncIo();
++  Timer timer(io.provider->getTimer());
++  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
++  Slot slot;
++  slot.limits = &isolateLimits;
++  Measurement measurement;
++  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/background\","));
++  auto drain = limits.limitDrain();
++  io.provider->getTimer().afterDelay(2 * kj::MILLISECONDS).wait(io.waitScope);
++  KJ_EXPECT(!drain.poll(io.waitScope));
++}
++
++KJ_TEST("HTTP entry evidence comes from delivered requests, not canceled probes") {
++  int fds[2];
++  KJ_ASSERT(pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0);
++  KJ_DEFER(close(fds[0]); close(fds[1]));
++  kj::HttpHeaderTable::Builder builder;
++  auto callId = builder.add("x-placement-call-id");
++  auto table = builder.build();
++  kj::HttpHeaders headers(*table);
++  JsonDoc input(kj::str("{\"serverId\":\"s2\",\"processId\":\"p1\","
++                        "\"processGeneration\":\"3\",\"workerId\":\"caller\",\"versionId\":\"v1\","
++                        "\"invocationId\":\"i7\",\"treeId\":\"t1\"}"));
++  char buffer[2048];
++  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
++  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
++  headers.set(callId, "probe-7");
++  { auto canceled = httpEntryObserver(input.get(), "", headers, callId, fds[1]); }
++  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
++  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
++  auto count = read(fds[0], buffer, sizeof(buffer));
++  KJ_ASSERT(count > 0);
++  auto line = kj::StringPtr(buffer, count);
++  KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
++  JsonDoc row(line.slice(strlen("[tenant-entry] "), line.size() - 1));
++  KJ_EXPECT(text(row.get(), "serverId") == "s2");
++  KJ_EXPECT(text(row.get(), "processId") == "p1");
++  KJ_EXPECT(field(row.get(), "processGeneration").getNumber() == 3);
++  KJ_EXPECT(text(row.get(), "invocationId") == "i7");
++  KJ_EXPECT(text(row.get(), "target") == "caller@v1");
++  KJ_EXPECT(text(row.get(), "entrypoint") == "default");
++  KJ_EXPECT(text(row.get(), "callId") == "probe-7");
++}
++
 +}  // namespace
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2d93ec344
+index 0000000000000000000000000000000000000000..a0d10646a250c993ab63adf026cebda9449a43a9
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3777 @@
+@@ -0,0 +1,3796 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1303,7 +1349,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +
 +enum class LimitCause { NONE, CPU, MEMORY, PROCESS_MEMORY };
 +using LimitState = std::shared_ptr<std::atomic<LimitCause>>;
-+thread_local uint64_t callDeadlineNs = 0;
 +constexpr uint64_t MAX_FIXED_ARRAY_ELEMENTS = 128ull * 1024 * 1024;
 +constexpr uint64_t MAX_SINGLE_HEAP_OBJECT =
 +    (uint64_t(v8::String::kMaxLength) * sizeof(uint16_t) > MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)
@@ -2194,10 +2239,9 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    unsupported("analytics");
 +  }
 +  kj::Promise<void> limitDrain() override {
-+    auto remaining = callDeadlineNs == 0
-+        ? uint64_t(30000000000)
-+        : std::min<uint64_t>(30000000000, callDeadlineNs > nowNs() ? callDeadlineNs - nowNs() : 0);
-+    return timer.timer.afterDelay(int64_t(remaining) * kj::NANOSECONDS);
++    // A lease expires the authority to make child calls. It does not cancel
++    // this invocation's waitUntil work, which still has its CPU/heap limits.
++    return kj::NEVER_DONE;
 +  }
 +  kj::Promise<void> limitScheduled() override {
 +    return kj::NEVER_DONE;
@@ -2285,6 +2329,7 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +  kj::HttpHeaderId egressSource = headerBuilder.add("x-coworkerd-egress-source");
 +  kj::HttpHeaderId egressError = headerBuilder.add("x-coworkerd-egress-error");
 +  ThreadContext::HeaderIdBundle ids{headerBuilder};
++  kj::HttpHeaderId placementCallId = headerBuilder.add("x-placement-call-id");
 +  capnp::HttpOverCapnpFactory http{bytes,
 +    capnp::HttpOverCapnpFactory::HeaderIdBundle(headerBuilder),
 +    capnp::HttpOverCapnpFactory::LEVEL_2};
@@ -2298,14 +2343,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    if (decisionSpare >= 0) close(decisionSpare);
 +  }
 +  bool rejectOnly = false;
-+  uint64_t deadlineNs = 0;
-+  void acceptDeadline(kj::StringPtr descriptor);
-+  kj::Duration backgroundAllowance() {
-+    auto remaining = deadlineNs == 0
-+        ? uint64_t(30000000000)
-+        : std::min<uint64_t>(30000000000, deadlineNs > nowNs() ? deadlineNs - nowNs() : 0);
-+    return int64_t(remaining) * kj::NANOSECONDS;
-+  }
 +};
 +
 +Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
@@ -2413,16 +2450,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +  }
 +  execution.finish();
 +  return failure;
-+}
-+
-+void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
-+  JsonDoc document(descriptor);
-+  auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
-+  if (!value.isNumber() || !(value.getNumber() > 0) ||
-+      value.getNumber() > double(UINT64_MAX / 1000000))
-+    return;
-+  deadlineNs = uint64_t(value.getNumber() * 1000000);
-+  callDeadlineNs = deadlineNs;
 +}
 +
 +// The existing node lifecycle wire layout, with one native writer. No KJ
@@ -2679,7 +2706,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    auto params = context.getParams();
 +    KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
 +        "NOT_SUPPORTED: persistent objects and handoff");
-+    state.acceptDeadline(params.getCfBlobJson());
 +    context.initResults().setDispatcher(
 +        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue()));
 +    return kj::READY_NOW;
@@ -2689,7 +2715,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    KJ_REQUIRE(!used, "one startEvent per connection");
 +    used = true;
 +    auto params = context.getParams();
-+    state.acceptDeadline(params.getCfBlobJson());
 +    context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
 +        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
 +    return kj::READY_NOW;
@@ -3144,7 +3169,6 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +        continue;
 +      }
 +      KJ_REQUIRE(fd >= 0);
-+      state.deadlineNs = callDeadlineNs = 0;
 +      // The idle mailbox wait is outside KJ. Refresh its cached I/O time before
 +      // an already-buffered RPC can enter JavaScript without another OS poll.
 +      state.io.unixEventPort.poll();
@@ -3160,13 +3184,9 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +        if (exception.getType() != kj::Exception::Type::DISCONNECTED)
 +          KJ_LOG(INFO, "threaded invocation connection failed");
 +      }
-+      auto backgroundError = kj::runCatchingExceptions([&]() {
-+        state.io.provider->getTimer()
-+            .timeoutAfter(state.backgroundAllowance(), state.tasks.onEmpty())
-+            .wait(state.io.waitScope);
-+      });
++      auto backgroundError =
++          kj::runCatchingExceptions([&]() { state.tasks.onEmpty().wait(state.io.waitScope); });
 +      if (backgroundError != kj::none) state.tasks.clear();
-+      state.deadlineNs = callDeadlineNs = 0;
 +      thread.invocation.store(false);
 +      thread.idleSince.store(nowNs());
 +      thread.descriptor.store(-1, std::memory_order_release);
@@ -4427,6 +4447,51 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +  bool bound = false;
 +};
 +
++class HttpEntryObserver final: public RequestObserver {
++ public:
++  HttpEntryObserver(kj::String fields, int output): fields(kj::mv(fields)), output(output) {}
++  void delivered() override {
++    auto row = kj::str("[tenant-entry] {", fields,
++        ",\"observedAtUnixMs\":", nowNs(CLOCK_REALTIME) / 1000000, "}\n");
++    (void)!write(output, row.begin(), row.size());
++  }
++
++ private:
++  kj::String fields;
++  int output;
++};
++
++kj::Own<RequestObserver> httpEntryObserver(Json::Reader input,
++    kj::StringPtr entrypoint,
++    const kj::HttpHeaders &headers,
++    kj::HttpHeaderId callIdHeader,
++    int output = STDERR_FILENO) {
++  // Placement probes ask for process-side delivery evidence. Ordinary requests
++  // do not format or write this diagnostic. The node cleans child output with
++  // the same known-secret dictionary as every other platform log stream.
++  KJ_IF_SOME(callId, headers.get(callIdHeader)) {
++    if (callId.size() > 128) return kj::refcounted<RequestObserver>();
++    auto fields = kj::str("\"serverId\":", encode(field(input, "serverId")));
++    for (auto name: {"processId", "processGeneration", "invocationId", "treeId"}) {
++      auto value = field(input, name);
++      fields = kj::str(fields, ",\"", name, "\":",
++          kj::StringPtr(name) == "processGeneration" && value.isString()
++              ? kj::str(value.getString())
++              : encode(value));
++    }
++    capnp::MallocMessageBuilder arena;
++    auto value = arena.initRoot<Json>();
++    value.setString(kj::str(text(input, "workerId"), "@", text(input, "versionId")));
++    fields = kj::str(fields, ",\"target\":", encode(value));
++    value.setString(entrypoint.size() ? entrypoint : "default");
++    fields = kj::str(fields, ",\"entrypoint\":", encode(value));
++    value.setString(callId);
++    fields = kj::str(fields, ",\"callId\":", encode(value));
++    return kj::refcounted<HttpEntryObserver>(kj::mv(fields), output);
++  }
++  return kj::refcounted<RequestObserver>();
++}
++
 +PreparedInvocation prepareInvocation(ThreadState &state,
 +    ThreadedServer &server,
 +    std::shared_ptr<Slot> slot,
@@ -4434,7 +4499,8 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    kj::StringPtr raw,
 +    Frankenvalue props,
 +    std::shared_ptr<ResourcePreparation> preparation,
-+    std::shared_ptr<TenantPermit> tenant) {
++    std::shared_ptr<TenantPermit> tenant,
++    kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>()) {
 +  if (!preparation) preparation = server.prepareSlot(slot);
 +  auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
 +  invocation->measurement.preparation = std::move(preparation);
@@ -4465,8 +4531,8 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +              ",\"versionId\":", encode(field(input, "versionId")),
 +              ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
 +              slot->isolateLabel.c_str(), "\",")),
-+      kj::addRef(*invocation), kj::mv(channels), kj::refcounted<RequestObserver>(), state.tasks,
-+      true, kj::mv(tracer), kj::mv(cf), kj::none);
++      kj::addRef(*invocation), kj::mv(channels), kj::mv(observer), state.tasks, true,
++      kj::mv(tracer), kj::mv(cf), kj::none);
 +  return {kj::mv(entry), kj::mv(invocation)};
 +}
 +
@@ -4656,7 +4722,8 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    co_return;
 +  }
 +  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
-+      std::move(preparation), std::move(tenant));
++      std::move(preparation), std::move(tenant),
++      httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
 +  auto &invocation = prepared.invocation;
 +  auto &entry = prepared.entry;
 +  kj::Maybe<kj::Exception> failure;
@@ -4674,9 +4741,7 @@ index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2
 +    }
 +    kj::throwRecoverableException(kj::mv(error));
 +  }
-+  co_await state.io.provider->getTimer()
-+      .timeoutAfter(state.backgroundAllowance(), state.tasks.onEmpty())
-+      .catch_([&state = this->state](kj::Exception &&) { state.tasks.clear(); });
++  co_await state.tasks.onEmpty();
 +}
 +
 +void acceptLoop(ThreadedServer &server, int listener, int parent) {
