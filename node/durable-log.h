@@ -732,6 +732,8 @@ private:
     bool settled = false;
   };
   std::map<std::tuple<std::string, uint32_t, uint64_t>, FenceCheck> fenceChecks;
+  // The epochs with background rereads under way: one chain each, however many requests failed meanwhile.
+  std::set<std::tuple<std::string, uint32_t, uint64_t>> fenceRereading;
   // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
   kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread);
 

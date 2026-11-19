@@ -434,18 +434,36 @@ struct DurableLogChannelTest {
           "concurrent requests of one epoch share one read", log.peerFenceChecks, log.peerFenceUnverified);
       raise(6);
       KJ_REQUIRE(log.peerFenceChecks == 1 && log.peerFenceUnverified == 1, "a failure is kept for a second");
-      // The first background read, a second later, still finds nothing; the next one, two seconds after it, does.
+      // The first background read, a second later, still finds nothing (the next is due two seconds after it).
       clock.advanceTo(clock.now() + 1001 * kj::MILLISECONDS);
       io.waitScope.poll();
       KJ_REQUIRE(log.peerFenceUnverified == 2 && log.knownEpoch(ns, 1) == 0, log.peerFenceUnverified);
+      // Past the second, a request of the epoch reads again and fails again, but starts no second chain of rereads:
+      // the store showing the epoch now, nothing reads it before the one chain's next read.
+      raise(6);
+      KJ_REQUIRE(log.peerFenceChecks == 2 && log.peerFenceUnverified == 3, log.peerFenceChecks);
       epochObject(1, 6);
-      clock.advanceTo(clock.now() + 2001 * kj::MILLISECONDS);
+      clock.advanceTo(clock.now() + 1001 * kj::MILLISECONDS);
       io.waitScope.poll();
-      KJ_REQUIRE(log.knownEpoch(ns, 1) == 6 && log.peerFenceRaises == 1, "a background read raises the floor",
-          log.knownEpoch(ns, 1));
-      // After the second, a new request of an epoch the store does not show is read again.
+      KJ_REQUIRE(log.knownEpoch(ns, 1) == 0, "one chain of background rereads per epoch");
+      clock.advanceTo(clock.now() + 1001 * kj::MILLISECONDS);
+      io.waitScope.poll();
+      KJ_REQUIRE(log.knownEpoch(ns, 1) == 6 && log.peerFenceRaises == 1 && log.fenceRereading.empty(),
+          "a background read raises the floor", log.knownEpoch(ns, 1));
+      // A newer epoch the store does not show is read on its own.
       raise(9);
-      KJ_REQUIRE(log.peerFenceChecks == 2 && log.knownEpoch(ns, 1) == 6);
+      KJ_REQUIRE(log.peerFenceChecks == 3 && log.knownEpoch(ns, 1) == 6);
+    } else if (name == "outage") {
+      // The store never shows epoch 6 and a request of it comes every second for 40 s: about one read a second in
+      // all -- the request's own once the failure kept for a second has expired, and one chain of background rereads
+      // (1, 2, 4, 8, 16 s), started again only after it ends. Here: 40 + 5 + 3 = 48.
+      for (int second = 0; second < 40; ++second) {
+        raise(6);
+        clock.advanceTo(clock.now() + 1000 * kj::MILLISECONDS);
+        io.waitScope.poll();
+      }
+      KJ_REQUIRE(log.peerFenceUnverified <= 50 && log.knownEpoch(ns, 1) == 0, "the reads of one epoch are bounded",
+          log.peerFenceUnverified);
     } else {
       KJ_FAIL_REQUIRE("unknown peer-fence scenario", scenario);
     }

@@ -6960,6 +6960,7 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
           ++peerFenceRaises;
           fenceOwner(namespaceId, shard, epoch - 1, "a newer epoch of the shard asked for a tail", true);
         }
+        if (reread) fenceRereading.erase({namespaceId, shard, epoch});
         co_return;
       }
       failure = "the object at that epoch's key is not that epoch";
@@ -6973,11 +6974,17 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
   log("peer-fence-unverified", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
       ",\"shardEpoch\":\"" + std::to_string(epoch) + "\",\"reread\":" + std::to_string(reread) +
       ",\"reason\":" + quote(failure));
-  if (reread >= FENCE_REREADS) co_return;
+  const auto key = std::make_tuple(namespaceId, shard, epoch);
+  if (reread == 0 && !fenceRereading.insert(key).second) co_return;  // a chain of rereads is already under way
+  if (reread >= FENCE_REREADS) {
+    fenceRereading.erase(key);
+    co_return;
+  }
   const auto waitMs = int64_t(OWNER_REREAD_MS) << reread;
   tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread]() {
-    return epoch > knownEpoch(namespaceId, shard) ? checkPeerFence(namespaceId, shard, epoch, reread + 1)
-                                                  : kj::Promise<void>(kj::READY_NOW);
+    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1);
+    fenceRereading.erase({namespaceId, shard, epoch});
+    return kj::Promise<void>(kj::READY_NOW);
   }));
 }
 
