@@ -128,6 +128,9 @@ struct WorkerLogSettings {
   // all. 0 bytes: no rotation. A sink that is not a regular file (a FIFO) never rotates.
   uint64_t sinkMaxBytes = 256ull << 20;
   uint32_t sinkFiles = 4;
+  // Not configurable (no field in the schema): a queued line older than this is dropped, not cleaned late
+  // (LOG_LINE_STALE_MS, common/log-cleaning.h). Tests set it shorter.
+  uint32_t staleLineMs = 50000;
 };
 
 // Per-tenant usage (ServerConfig.usage): counted on the node, the hours that changed written to its own objects on the

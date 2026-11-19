@@ -3891,6 +3891,7 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
     auto& entry = result.emplace_back();
     entry.processId = p->id;
     entry.generation = p->generation;
+    entry.current = p == s.current;
     if (!p->threaded) return;
     const auto snapshot = p->lifecycle.read();
     if (snapshot.empty() || snapshot.front() != '{') return;

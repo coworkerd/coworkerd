@@ -263,7 +263,10 @@ struct PlacementDefinition {
 };
 
 using coworkerd::OpenEvent;
-struct ProcessUnavailable { bool quarantine = false; };
+// `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
+struct ProcessUnavailable { bool quarantine = false; std::string reason; };
+// A trial probe that was never sent (TrialService::probe()).
+constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
 
 // Capture request stages without writing a log line at each measurement point.
@@ -1592,7 +1595,7 @@ public:
   }
 
   InvocationRejection processRefusal(const ProcessUnavailable& error, bool root = false) {
-    auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
+    auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE", !error.reason.empty() ? error.reason :
         error.quarantine ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch", 503, root);
     value.notExecuted = value.retryable = true;
     return value;
@@ -2029,6 +2032,7 @@ public:
   // One load probe on a selected process: what the runtime reported, or how the probe failed.
   struct LoadProbe {
     std::string checkId, processId, report, failure, culprit, workerId;
+    std::string notSent;  // why the probe was not sent (nothing reached the process)
     uint64_t generation = 0;
     bool timedOut = false, exited = false, cpuExceeded = false, memoryExceeded = false;
     double elapsedMs = 0;
@@ -2042,8 +2046,16 @@ public:
     process->invocationId = probe.checkId; process->treeId = probe.checkId;
     probe.processId = process->processId;
     probe.generation = process->generation;
-    auto descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
-        *process, serverConfig.serverId, entrypoint, true, true, forInvocation);
+    kj::String descriptor;
+    try {
+      descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
+          *process, serverConfig.serverId, entrypoint, true, true, forInvocation);
+    } catch (const ProcessUnavailable& error) {
+      // The secret dictionary could not take the values: nothing is sent, the call may go elsewhere.
+      probe.notSent = error.reason;
+      process->finish();
+      co_return probe;
+    }
     const auto started = monotonicTimeMs();
     auto opened = runtime.open(process, descriptor, version.definitionHash);
     // Kept until the probe ends: dropping it would cancel the dispatch.
@@ -2153,7 +2165,9 @@ public:
       probe = co_await loadProbe(*version, std::move(process), entrypoint, deadline, forInvocation);
       category.clear(); detail.clear(); message.clear(); coldLoad = false; result.refusal.reset();
       bool limitWithoutEvidence = false;
-      if (probe.timedOut) {
+      if (!probe.notSent.empty()) {
+        result.refusal = processRefusal(ProcessUnavailable{false, probe.notSent}, root);
+      } else if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
       } else if (!probe.culprit.empty()) {
         category = "limit"; detail = "LIMIT_EXCEEDED";
@@ -3347,9 +3361,10 @@ private:
         }
         if (revision.empty()) revision = version.definitionHash;
       }
-      KJ_REQUIRE(secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
-          process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs),
-          "the secret dictionary cannot hold this descriptor's values", version.workerId.c_str());
+      // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
+      if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
+              process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
+        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now"};
     };
     if (!version.secrets.empty()) {
       const auto& state = desiredState.state();
@@ -3537,7 +3552,14 @@ private:
     coworkerd::SecretDictionary::Limits limits;
     limits.idleEvictMs = serverConfig.processPool.idleEvictMs;
     return limits;
-  }(), {coworkerd::appendPlatformLogRedactions, coworkerd::replacePlatformLogRedactions}};
+  }(), {coworkerd::appendPlatformLogRedactions, coworkerd::replacePlatformLogRedactions,
+      [this](const std::string& processId, uint64_t generation, const std::string& reason) {
+        // The ordinary rotation of that slot: a new generation takes its calls, the old one drains and exits.
+        auto failed = kj::runCatchingExceptions([&] { runtime.requestAutomaticRotation(processId, reason); });
+        std::cout << "[secret-dictionary] {\"event\":\"rotation-requested\",\"processId\":\"" << jsonEscape(processId)
+                  << "\",\"generation\":" << generation << ",\"queued\":" << (failed == kj::none ? "true" : "false")
+                  << ",\"reason\":\"" << jsonEscape(reason) << "\",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+      }}};
   mutable std::pair<uint64_t, uint64_t> secretDictionaryView{UINT64_MAX, UINT64_MAX};
   double secretDictionaryCollectedMs = 0;
   coworkerd::Membership& membership;
@@ -7847,7 +7869,16 @@ private:
   kj::Promise<std::string> probe(const VersionDefinition& version,
       const std::shared_ptr<coworkerd::ProcessCall>& process, const std::string& invocationId,
       double deadline, bool rootTrial = false) {
-    auto opened = server.openTrial(version, process, invocationId, deadline, rootTrial);
+    auto opened = [&] {
+      try {
+        return server.openTrial(version, process, invocationId, deadline, rootTrial);
+      } catch (const ProcessUnavailable& error) {
+        // Nothing was sent (the secret dictionary could not take the values): this node's condition, not the code's.
+        auto failure = KJ_EXCEPTION(DISCONNECTED, "not sent", error.reason.c_str());
+        failure.setDetail(TRIAL_NOT_SENT_DETAIL, kj::heapArray<kj::byte>(0));
+        kj::throwFatalException(kj::mv(failure));
+      }
+    }();
     auto ready = kj::mv(opened.ready);
     auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
     auto service = factory.capnpToKj(getHttp.getHttp());
@@ -7945,7 +7976,7 @@ private:
         generation = process->generation;
         dispatched = true;
         const auto probeStarted = monotonicTimeMs();
-        std::string report, failure;
+        std::string report, failure, notSent;
         bool timedOut = false, rootCpuExceeded = false, rootMemoryExceeded = false;
         auto probeProcess = process;
         auto probeInvocation = invocationId;
@@ -7983,7 +8014,8 @@ private:
             }
           }
         } catch (const kj::Exception& error) {
-          failure = error.getDescription().cStr();
+          if (error.getDetail(TRIAL_NOT_SENT_DETAIL) != kj::none) notSent = "this node's secret dictionary cannot take the version's secret values now";
+          else failure = error.getDescription().cStr();
           timedOut = monotonicTimeMs() >= deadline;
         }
         bool exited = false;
@@ -8002,7 +8034,10 @@ private:
             memoryExceeded = rootMemoryExceeded || process->memoryLimitExceeded();
         process->finish();
         probeMs = monotonicTimeMs() - probeStarted;
-        if (timedOut) {
+        if (!notSent.empty()) {
+          dispatched = false;
+          verdict = {"UNAVAILABLE", "", notSent};
+        } else if (timedOut) {
           verdict = {"TIMEOUT", "", "timed out while loading (" + std::to_string(request.timeoutMs) + " ms); the probe was cancelled"};
         } else if (!culprit.empty()) {
           quarantined = server.quarantined(version->workerId);

@@ -45,6 +45,13 @@ size_t SecretDictionary::earlierBytes(const std::string& tenant) const {
   return bytes;
 }
 
+size_t SecretDictionary::tenantBytes(const std::string& tenant) const {
+  size_t bytes = 0;
+  for (auto at = held.lower_bound({tenant, std::string()}); at != held.end() && at->first.first == tenant; ++at)
+    bytes += at->second.bytes;
+  return bytes;
+}
+
 std::vector<std::string> SecretDictionary::earlierValues() const {
   std::vector<std::string> values;
   for (const auto& [pair, entry] : held) {
@@ -133,21 +140,24 @@ bool SecretDictionary::compact(double nowMs) {
     ++sinkFailures;
     return false;
   }
+  // The region now holds exactly what is held, the needles this call adds included.
   std::erase_if(published, [&](const auto& needle) { return !needleRefs.contains(needle); });
+  for (auto& needle : live) published.insert(std::move(needle));
   publishedBytes = liveBytes;
   lastCompactMs = nowMs;
   ++compactions;
   return true;
 }
 
-void SecretDictionary::countRefusal(const std::string& tenant, bool full) {
-  ++(full ? refusedFull : refusedEarlier);
+void SecretDictionary::countRefusal(const std::string& tenant, Refusal kind) {
+  ++(kind == Refusal::FULL ? refusedFull : kind == Refusal::SHARE ? refusedShare : refusedEarlier);
   auto found = refusedByTenant.find(tenant);
   if (found == refusedByTenant.end()) {
     if (refusedByTenant.size() >= 256) return;
-    found = refusedByTenant.emplace(tenant, std::pair<uint64_t, uint64_t>{0, 0}).first;
+    found = refusedByTenant.emplace(tenant, Refused{}).first;
   }
-  ++(full ? found->second.first : found->second.second);
+  auto& row = found->second;
+  ++(kind == Refusal::FULL ? row.full : kind == Refusal::SHARE ? row.share : row.earlier);
 }
 
 // When the tenant's earlier values are all released if their isolates get no
@@ -176,23 +186,31 @@ std::optional<std::string> SecretDictionary::admit(const std::string& tenant, co
     double nowMs, double untilMs) {
   if (values.empty()) return std::nullopt;
   if (const auto earlier = earlierBytes(tenant); earlier > limits.tenantEarlierBytes) {
-    countRefusal(tenant, false);
+    countRefusal(tenant, Refusal::EARLIER);
     return "this node still holds " + kib(earlier) + " of this tenant's earlier secret values for isolates that may "
         "still use them (at most " + kib(limits.tenantEarlierBytes) + " per tenant): its calls with secrets are refused "
         "here until they are released, " + recovery(tenant, nowMs);
   }
-  size_t addBytes = 0, addPatterns = 0;
+  size_t addBytes = 0, addPatterns = 0, tenantAdd = 0;
   std::set<std::string> counted;
   for (const auto& value : values) {
     if (held.contains({tenant, value})) continue;
+    tenantAdd += bytesOf(value);
     for (auto& needle : needlesOf(value)) {
       if (needleRefs.contains(needle) || !counted.insert(needle).second) continue;
       addBytes += platformLogNeedleBytes(needle.size());
       ++addPatterns;
     }
   }
+  // A tenant's share comes before its current values: no tenant fills the node alone.
+  if (const auto would = tenantBytes(tenant) + tenantAdd; would > shareBytes()) {
+    countRefusal(tenant, Refusal::SHARE);
+    return "this tenant's secret values on this node would take " + kib(would) + ", " + kib(would - shareBytes()) +
+        " more than its share of " + kib(shareBytes()) + " (a quarter of the node's " + kib(limits.nodeBytes) +
+        " dictionary): use fewer or smaller secrets";
+  }
   const auto full = [&] {
-    countRefusal(tenant, true);
+    countRefusal(tenant, Refusal::FULL);
     return "this node's secret dictionary is full (" + kib(liveBytes) + " of " + kib(limits.nodeBytes) + ", " +
         std::to_string(livePatterns) + " of " + std::to_string(limits.nodePatterns) + " values): this tenant's calls "
         "with secrets are refused here, and another node may take them";
@@ -263,10 +281,46 @@ void SecretDictionary::collect(double nowMs, const std::vector<Residents>& resid
   }
   if (changed) ++revision;
   if (publishedBytes > liveBytes && nowMs - lastCompactMs >= limits.compactEveryMs) compact(nowMs);
+  rotatePinned(nowMs, residents);
+}
+
+// A current generation that names no isolates, where one tenant's earlier values
+// passed rotateEarlierBytes: the node rotates it (once for that generation, at
+// most once every rotationIntervalMs per slot); its values go after the grace.
+void SecretDictionary::rotatePinned(double nowMs, const std::vector<Residents>& residents) {
+  std::erase_if(rotated, [&](const auto& entry) {
+    return std::none_of(residents.begin(), residents.end(), [&](const auto& r) {
+      return r.processId == entry.first.first && r.generation == entry.first.second;
+    });
+  });
+  if (!sink.rotate) return;
+  for (const auto& generation : residents) {
+    if (generation.known || !generation.current || rotated.contains({generation.processId, generation.generation})) continue;
+    const auto last = lastRotationMs.find(generation.processId);
+    if (last != lastRotationMs.end() && nowMs - last->second < limits.rotationIntervalMs) continue;
+    std::map<std::string, std::set<std::string>> pinned;
+    for (const auto& [key, holder] : holders) {
+      if (holder.processId != generation.processId || holder.generation != generation.generation) continue;
+      const auto now = current.find(holder.tenant);
+      for (const auto& value : holder.values)
+        if (now == current.end() || !now->second.contains(value)) pinned[holder.tenant].insert(value);
+    }
+    for (const auto& [tenant, values] : pinned) {
+      size_t bytes = 0;
+      for (const auto& value : values) bytes += bytesOf(value);
+      if (bytes <= limits.rotateEarlierBytes) continue;
+      rotated[{generation.processId, generation.generation}] = nowMs;
+      lastRotationMs[generation.processId] = nowMs;
+      ++rotationsRequested;
+      sink.rotate(generation.processId, generation.generation, "secret dictionary: " + kib(bytes) +
+          " of a tenant's earlier secret values pinned in a generation that names no isolates");
+      break;
+    }
+  }
 }
 
 std::string SecretDictionary::json(double nowMs) const {
-  struct Row { std::string tenant; size_t bytes = 0, earlier = 0; uint64_t full = 0, refusedEarlier = 0; };
+  struct Row { std::string tenant; size_t bytes = 0, earlier = 0; uint64_t full = 0, share = 0, refusedEarlier = 0; };
   std::map<std::string, Row> rows;
   for (const auto& [pair, entry] : held) {
     auto& row = rows[pair.first];
@@ -279,30 +333,34 @@ std::string SecretDictionary::json(double nowMs) const {
   for (const auto& [tenant, counts] : refusedByTenant) {
     auto& row = rows[tenant];
     row.tenant = tenant;
-    row.full = counts.first;
-    row.refusedEarlier = counts.second;
+    row.full = counts.full;
+    row.share = counts.share;
+    row.refusedEarlier = counts.earlier;
   }
   std::vector<Row> ordered;
   for (auto& [tenant, row] : rows) ordered.push_back(std::move(row));
   std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-    return std::tie(b.bytes, b.full, b.refusedEarlier, a.tenant) < std::tie(a.bytes, a.full, a.refusedEarlier, b.tenant);
+    return std::tie(b.bytes, b.full, b.share, b.refusedEarlier, a.tenant) <
+        std::tie(a.bytes, a.full, a.share, a.refusedEarlier, b.tenant);
   });
   size_t earlier = 0;
   for (const auto& row : ordered) earlier += row.earlier;
   const auto usage = platformLogRedactionUsage();
   std::ostringstream out;
   out << "{\"bytes\":" << liveBytes << ",\"values\":" << livePatterns << ",\"limitBytes\":" << limits.nodeBytes
-      << ",\"limitValues\":" << limits.nodePatterns << ",\"tenantEarlierLimitBytes\":" << limits.tenantEarlierBytes
+      << ",\"limitValues\":" << limits.nodePatterns << ",\"tenantShareBytes\":" << shareBytes()
+      << ",\"tenantEarlierLimitBytes\":" << limits.tenantEarlierBytes << ",\"rotateEarlierBytes\":" << limits.rotateEarlierBytes
       << ",\"earlierBytes\":" << earlier << ",\"holders\":" << holders.size() << ",\"heldValues\":" << held.size()
       << ",\"publishedBytes\":" << publishedBytes << ",\"compactions\":" << compactions
       << ",\"sharedGeneration\":" << usage.generation << ",\"sharedBytes\":" << usage.bytes
-      << ",\"sinkFailures\":" << sinkFailures << ",\"refused\":{\"full\":" << refusedFull << ",\"earlier\":"
-      << refusedEarlier << "},\"tenants\":[";
+      << ",\"sinkFailures\":" << sinkFailures << ",\"rotationsRequested\":" << rotationsRequested
+      << ",\"refused\":{\"full\":" << refusedFull << ",\"share\":" << refusedShare << ",\"earlier\":" << refusedEarlier
+      << "},\"tenants\":[";
   for (size_t i = 0; i < ordered.size() && i < 16; ++i) {
     const auto& row = ordered[i];
     out << (i ? "," : "") << "{\"tenant\":\"" << jsonEscape(row.tenant) << "\",\"bytes\":" << row.bytes
-        << ",\"earlierBytes\":" << row.earlier << ",\"refusedFull\":" << row.full << ",\"refusedEarlier\":"
-        << row.refusedEarlier << "}";
+        << ",\"earlierBytes\":" << row.earlier << ",\"refusedFull\":" << row.full << ",\"refusedShare\":" << row.share
+        << ",\"refusedEarlier\":" << row.refusedEarlier << "}";
   }
   out << "],\"tenantCount\":" << ordered.size() << ",\"observedAtMonotonicMs\":" << static_cast<uint64_t>(nowMs) << "}";
   return out.str();

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "log-cleaning.h"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -26,13 +28,20 @@ namespace coworkerd {
 // that left the view while no isolate here had it is gone at once, and one that
 // a still-running isolate holds stays until that isolate is gone.
 //
-// Two bounds. The dictionary's total (nodeBytes, nodePatterns) is the node's
-// safety limit: a call whose values do not fit is refused here
-// (SECRET_UNAVAILABLE: nothing executed, another node may take it). A tenant's
-// earlier values -- held, no longer in its current view -- are bounded by
+// Three bounds, each refusing a call here with SECRET_UNAVAILABLE (nothing
+// executed, another node may take it). The dictionary's total (nodeBytes,
+// nodePatterns) is the node's safety limit. A tenant's share -- its current and
+// earlier values, at their actual size with the escaped forms -- is at most a
+// quarter of the total, so no tenant fills the node alone. A tenant's earlier
+// values -- held, no longer in its current view -- are bounded by
 // tenantEarlierBytes: past it, that tenant's calls with secrets are refused here
-// until the isolates that hold them are gone. A tenant's current values have no
-// per-tenant bound (the deployment quotas bound them).
+// until the isolates that hold them are gone.
+//
+// A process that names no isolates keeps what it got until its generation is
+// gone; when one tenant's earlier values pinned there pass rotateEarlierBytes,
+// that generation (if it is its slot's current one) is rotated by the node's
+// ordinary rotation, at most once every rotationIntervalMs per slot, so a
+// tenant that changes its secrets is never refused on that node for good.
 //
 // Used on the node's event loop only.
 class SecretDictionary {
@@ -41,15 +50,19 @@ public:
     size_t nodeBytes = size_t(16) << 20;
     size_t nodePatterns = 65536;
     size_t tenantEarlierBytes = size_t(1) << 20;
-    double graceMs = 60000;
+    size_t rotateEarlierBytes = size_t(512) << 10;
+    double rotationIntervalMs = 600000;
+    double graceMs = SECRET_RELEASE_GRACE_MS;
     // The native processes evict an isolate after this long without a call (0: never).
     double idleEvictMs = 300000;
     double compactEveryMs = 1000;
   };
   // The shared dictionary: append adds needles, replace rebuilds it as exactly
-  // the given ones; both false when the region cannot take them.
+  // the given ones; both false when the region cannot take them. rotate asks
+  // the node to rotate a process generation.
   struct Sink {
     std::function<bool(const std::vector<std::string>&)> append, replace;
+    std::function<void(const std::string& processId, uint64_t generation, const std::string& reason)> rotate;
   };
   // One live process generation: whether its resident isolates are known (a
   // native snapshot was read), and their plan revisions.
@@ -58,6 +71,7 @@ public:
     uint64_t generation = 0;
     bool known = false;
     std::set<std::string> revisions;
+    bool current = false;  // its slot's current generation
   };
 
   SecretDictionary(Limits limits, Sink sink);
@@ -85,6 +99,8 @@ public:
   bool holds(const std::string& value) const;
   size_t bytes() const { return liveBytes; }
   size_t earlierBytes(const std::string& tenant) const;
+  size_t tenantBytes(const std::string& tenant) const;
+  size_t shareBytes() const { return limits.nodeBytes / 4; }
   std::string json(double nowMs) const;
 
 private:
@@ -106,7 +122,9 @@ private:
   bool publish(const std::vector<std::string>& needles, double nowMs);
   bool compact(double nowMs);
   std::string recovery(const std::string& tenant, double nowMs) const;
-  void countRefusal(const std::string& tenant, bool full);
+  enum class Refusal { FULL, SHARE, EARLIER };
+  void countRefusal(const std::string& tenant, Refusal kind);
+  void rotatePinned(double nowMs, const std::vector<Residents>& residents);
 
   Limits limits;
   Sink sink;
@@ -121,8 +139,12 @@ private:
   std::set<std::string> published;                                // in the shared dictionary, garbage included
   size_t liveBytes = 0, livePatterns = 0, publishedBytes = 0;
   double lastCompactMs = -1e300;
-  uint64_t revision = 0, compactions = 0, refusedFull = 0, refusedEarlier = 0, sinkFailures = 0;
-  std::map<std::string, std::pair<uint64_t, uint64_t>> refusedByTenant;  // (full, earlier), at most 256 tenants
+  uint64_t revision = 0, compactions = 0, refusedFull = 0, refusedShare = 0, refusedEarlier = 0, sinkFailures = 0;
+  uint64_t rotationsRequested = 0;
+  struct Refused { uint64_t full = 0, share = 0, earlier = 0; };
+  std::map<std::string, Refused> refusedByTenant;  // at most 256 tenants
+  std::map<std::pair<std::string, uint64_t>, double> rotated;  // generation -> when its rotation was asked
+  std::map<std::string, double> lastRotationMs;                // slot -> the last time one of its was asked
 };
 
 }  // namespace coworkerd

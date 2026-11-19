@@ -188,9 +188,13 @@ add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-valu
 add_test(NAME node-log-generations COMMAND coworkerd-log-cleaning-test generations)
 add_test(NAME node-secret-rotations COMMAND coworkerd-log-cleaning-test secret-rotations)
 add_test(NAME node-secret-limits COMMAND coworkerd-log-cleaning-test secret-limits)
+add_test(NAME node-secret-share COMMAND coworkerd-log-cleaning-test secret-share)
+add_test(NAME node-secret-pinned-rotation COMMAND coworkerd-log-cleaning-test secret-pinned-rotation)
+add_test(NAME node-log-stale COMMAND coworkerd-log-cleaning-test stale-lines)
 add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
 set_tests_properties(node-log-stream node-log-many-values node-log-redaction PROPERTIES TIMEOUT 30)
-set_tests_properties(node-log-generations node-secret-rotations node-secret-limits PROPERTIES TIMEOUT 60)
+set_tests_properties(node-log-generations node-secret-rotations node-secret-limits node-secret-share
+  node-secret-pinned-rotation node-log-stale PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")

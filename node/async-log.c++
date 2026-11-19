@@ -67,8 +67,9 @@ constexpr int OUTPUT_SEND_FLAGS = MSG_DONTWAIT | MSG_NOSIGNAL;
 #else
 constexpr int OUTPUT_SEND_FLAGS = MSG_DONTWAIT;
 #endif
-enum DropReason { DROP_BACKLOG, DROP_OVERSIZED, DROP_PARTIAL, DROP_SINK, DROP_REDACTION, DROP_REASONS };
-constexpr std::array DROP_NAMES = {"backlog", "oversized", "partial", "sink", "redaction"};
+static_assert(WorkerLogSettings{}.staleLineMs == LOG_LINE_STALE_MS);
+enum DropReason { DROP_BACKLOG, DROP_OVERSIZED, DROP_PARTIAL, DROP_SINK, DROP_REDACTION, DROP_STALE, DROP_REASONS };
+constexpr std::array DROP_NAMES = {"backlog", "oversized", "partial", "sink", "redaction", "stale"};
 static_assert(DROP_NAMES.size() == DROP_REASONS);
 
 // Per process slot. The drainer's reader thread accepts and drops lines, its
@@ -483,7 +484,8 @@ public:
 private:
   struct Stream { int fd = -1; std::string partial; uint64_t discarded = 0; bool discarding = false; };
   struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId; };
-  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; };
+  // `queuedMs`: when the reader took the lines from the pipe (the monotonic clock).
+  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; };
 
   // Reader thread: keeps every pipe empty whatever the sink does.
   void readLoop() {
@@ -617,7 +619,7 @@ private:
   // larger than the whole backlog budget can never be queued.
   void consume(Source& source, Stream& stream, const char* data, size_t size) {
     auto& slot = shared.slots[source.slot];
-    Batch batch{source.slot, 0, {}};
+    Batch batch{source.slot, 0, {}, monotonicMs()};
     batch.bytes.reserve(size + stream.partial.size());
     bool dropped = false;
     for (size_t at = 0; at < size;) {
@@ -918,12 +920,16 @@ private:
     auto& slot = shared.slots[batch.slot];
     // This runs on the writer, never on the pipe reader or the node's loop.
     // Queue/counters measure original lines; sinkBytes measures cleaned bytes.
+    // A batch that waited longer than LOG_LINE_STALE_MS (a stuck sink) is
+    // dropped: a secret value it holds may have left the dictionary since. It
+    // still passes the cleaner, which keeps its state across blocks.
+    const bool stale = monotonicMs() - batch.queuedMs > settings.staleLineMs;
     const auto text = cleaner.append(batch.bytes);
     const auto* data = text.data();
     const size_t size = text.size(), originalSize = batch.bytes.size();
-    if (cleaner.suppressed()) {
+    if (stale || cleaner.suppressed()) {
       drop(batch.slot, slot.generation.load(std::memory_order_relaxed), slot.pid.load(std::memory_order_relaxed),
-          batch.lines, originalSize, DROP_REDACTION);
+          batch.lines, originalSize, stale ? DROP_STALE : DROP_REDACTION);
       slot.backlogLines.fetch_sub(batch.lines, std::memory_order_acq_rel);
       slot.backlogBytes.fetch_sub(originalSize, std::memory_order_acq_rel);
       return;

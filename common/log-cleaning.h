@@ -35,6 +35,14 @@ struct PlatformLogRedactionUsage {
 PlatformLogRedactionUsage platformLogRedactionUsage();
 // What one needle takes in a region.
 constexpr size_t platformLogNeedleBytes(size_t size) { return size + sizeof(uint32_t); }
+// A value leaves the shared dictionary this long after nothing on the node can
+// print it any more (node/secret-dictionary.h). A writer drops a queued line
+// older than LOG_LINE_STALE_MS instead of cleaning it late, counted as stale:
+// the margin covers the time between a process printing a line and the node
+// queuing it.
+constexpr double SECRET_RELEASE_GRACE_MS = 60000;
+constexpr uint32_t LOG_LINE_STALE_MS = 50000;
+static_assert(LOG_LINE_STALE_MS + 10000 <= SECRET_RELEASE_GRACE_MS);
 
 // Used only by the log writers, never by the pipe reader or request threads.
 // Keep possible secret prefixes across records, pipe chunks and newlines.
