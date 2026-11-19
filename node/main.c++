@@ -1949,8 +1949,11 @@ public:
   std::string loadRevision(const VersionDefinition& version) const {
     return version.definitionHash + ":" + coworkerd::plainEnvironmentRevision(desiredState.state(), version);
   }
+  static std::string loadKey(const std::string& processId, uint64_t generation, const std::string& hash, const std::string& entrypoint) {
+    return processId + ":" + std::to_string(generation) + ":" + hash + "#" + (entrypoint.empty() ? "default" : entrypoint);
+  }
   static std::string loadKey(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
-    return process.processId + ":" + std::to_string(process.generation) + ":" + hash + "#" + (entrypoint.empty() ? "default" : entrypoint);
+    return loadKey(process.processId, process.generation, hash, entrypoint);
   }
   void confirmLoaded(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
     loadConfirmed[loadKey(process, hash, entrypoint)] = monotonicTimeMs();
@@ -2038,6 +2041,13 @@ public:
   }
   kj::Promise<LoadCheck> loadCheck(std::shared_ptr<const VersionDefinition> version, std::string entrypoint, double deadline, bool root) {
     if (!serverConfig.loadCheck || !version->hasCode()) co_return LoadCheck{};
+    if (const auto hint = runtime.threadedGenerationHint(version->workerId)) {
+      const auto key = loadKey(hint->first, hint->second, loadRevision(*version), entrypoint);
+      // A cached check sends nothing to the process. It must not acquire and
+      // immediately release a call ticket, which would wake its tenant queue.
+      if (const auto found = loadConfirmed.find(key); found != loadConfirmed.end() &&
+          monotonicTimeMs() - found->second <= loadCheckFreshMs()) co_return LoadCheck{};
+    }
     // The process the dispatch will select (the same selection, made again there); none: the
     // dispatch refuses.
     auto process = runtime.select(version->workerId);
