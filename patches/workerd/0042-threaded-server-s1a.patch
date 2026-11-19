@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7f8cd04b5192108d3f6cea2a8d88d3e9f1403c0
+index 0000000000000000000000000000000000000000..cc4db37f5fd2ae8fb0dfac8f75121f3c3ce46f59
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,527 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1149,7 +1149,8 @@ index 0000000000000000000000000000000000000000..e7f8cd04b5192108d3f6cea2a8d88d3e
 +  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
 +  auto count = read(fds[0], buffer, sizeof(buffer));
 +  KJ_ASSERT(count > 0);
-+  auto line = kj::StringPtr(buffer, count);
++  auto stored = kj::str(kj::arrayPtr(buffer, count));
++  auto line = stored.asPtr();
 +  KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
 +  JsonDoc row(kj::str(line.slice(strlen("[tenant-entry] "), line.size() - 1)));
 +  KJ_EXPECT(text(row.get(), "serverId") == "s2");
