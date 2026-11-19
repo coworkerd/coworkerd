@@ -1027,10 +1027,14 @@ struct DurableLogChannelTest {
 }  // namespace coworkerd
 
 namespace coworkerd { void runDurableTailTests(bool negativeControls); }
+namespace coworkerd { void runDurableSegmentTests(bool negativeControls); }
+namespace coworkerd { void runDurableSegmentCacheTests(); }
 
 int main(int argc, char* argv[]) {
   const std::string_view mode = argc >= 2 ? argv[1] : "";
   if (mode == "tail" || mode == "tail-negative") coworkerd::runDurableTailTests(mode == "tail-negative");
+  else if (mode == "segment" || mode == "segment-negative") coworkerd::runDurableSegmentTests(mode == "segment-negative");
+  else if (mode == "segment-cache") coworkerd::runDurableSegmentCacheTests();
   else if (mode == "lease-tracker") coworkerd::DurableLogChannelTest::leaseTracker();
   else if (mode == "lease-confirm") coworkerd::DurableLogChannelTest::leaseConfirm(argc == 3 ? argv[2] : "");
   else if (mode == "peer-fence") coworkerd::DurableLogChannelTest::peerFence(argc == 3 ? argv[2] : "");

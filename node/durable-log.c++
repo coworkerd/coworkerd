@@ -791,6 +791,10 @@ constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALA
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
 // How many of this node's unsealed records one answer to another node's rebuild carries.
 constexpr size_t TAIL_ANSWER_BYTES = 32u << 20;
+// The decoded segments a node keeps for its rebuilds, and how long one stays without a reader (b57).
+constexpr uint64_t SEGMENT_CACHE_BYTES = 384ull << 20;
+constexpr double SEGMENT_CACHE_IDLE_MS = 30000;
+constexpr uint32_t SEGMENT_CACHE_SWEEP_MS = 5000;
 // The largest record this node takes from another's replicator: a durable process cuts its messages at 8 MiB of
 // frames (workerd's COWORKERD_DO_RECORD_BYTES), so anything far above that is not one of ours.
 constexpr size_t RECORD_BYTES_LIMIT = 256u << 20;
@@ -881,6 +885,21 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
   if (const auto* v = std::getenv("COWORKERD_SLOW_FLUSH_FOR_TEST"); v != nullptr && *v != '\0') slowFlushForTest = v;
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
+    segmentCache = std::make_unique<SegmentDecodeCache>([this](std::string key) { return store->get(std::move(key)); },
+        SEGMENT_CACHE_BYTES, SEGMENT_CACHE_IDLE_MS, [this](const std::string& key, const DecodedSegment& segment) {
+          log("segment-decoded", "\"key\":" + quote(key) + ",\"records\":" + std::to_string(segment.records) +
+              ",\"objects\":" + std::to_string(segment.byObject.size()) + ",\"encodedBytes\":" +
+              std::to_string(segment.encodedBytes) + ",\"heldBytes\":" + std::to_string(segment.bytes) +
+              ",\"downloadMs\":" + std::to_string(segment.downloadMs) + ",\"decodeMs\":" +
+              std::to_string(segment.decodeMs) + ",\"groupMs\":" + std::to_string(segment.groupMs));
+        },
+        // The download runs on the decoder's worker thread, with an event loop and a connection of its own: a
+        // segment can be close to 64 MiB, and the event loop's reader copies every chunk of it.
+        [storeConfig](const std::string& key) {
+          auto io = kj::setupAsyncIo();
+          ObjectStore threadStore(storeConfig, io.provider->getNetwork(), io.provider->getTimer());
+          return threadStore.get(key).wait(io.waitScope);
+        });
     alarmPublication = std::make_unique<AlarmPublication>(*store, timer, this->settings.nodeId,
         [this](const std::string& ns, uint32_t shard, uint64_t epoch, uint64_t memberEpoch) {
           if (stopped || memberEpoch != nodeEpoch || membership.selfExpired || membership.identityTaken) return false;
@@ -927,6 +946,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
 
 DurableLog::~DurableLog() noexcept(false) {
   stopped = true;
+  segmentCache.reset();
   alarmDiscovery.reset();
   alarmPublication.reset();
   if (logFd >= 0) ::close(logFd);
@@ -4418,7 +4438,9 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   const auto ticket = ++rebuildWaitSerial;
   queue.push_back({kj::mv(available.fulfiller), &active, &background, objectName, ticket});
   queuedRebuildIndex.insert_or_assign(objectName, QueuedRebuild{background, ticket, std::prev(queue.end())});
+  const auto queuedAt = monotonicTimeMs();
   pumpRebuilds();co_await kj::mv(available.promise);
+  const auto queuedMs = monotonicTimeMs() - queuedAt;
   if (background) ++backgroundRebuilds;else ++foregroundRebuilds;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
@@ -4426,7 +4448,7 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   for (uint32_t attempt = 1; attempt <= MANIFEST_ATTEMPTS; ++attempt) {
     object->recoveryRevisionChanged = false;
     try {
-      co_await rebuildAttempt(objectName, reason);
+      co_await rebuildAttempt(objectName, reason, attempt == 1 ? queuedMs : 0);
       co_return;
     } catch (const kj::Exception& error) {
       object = objectOf(objectName);
@@ -4462,8 +4484,15 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
 }
 
-kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason) {
+kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason, double queuedMs) {
   const auto start = monotonicTimeMs();
+  // Where this attempt's time goes, consecutive laps of the same clock (logged with `rebuilt`).
+  struct Laps { double setup = 0, manifest = 0, snapshot = 0, segments = 0, local = 0, tailWait = 0, latest = 0,
+      prepare = 0, replay = 0, files = 0, publish = 0, markers = 0; };
+  Laps laps;
+  SegmentReadStats segmentStats;
+  auto lapMark = start;
+  auto lap = [&lapMark](double& slot) { const auto now = monotonicTimeMs(); slot += now - lapMark; lapMark = now; };
   auto loopDelay = std::make_shared<double>(0);
   recoveryLoopObservers.insert(loopDelay);
   auto stopMeasuring = kj::defer([this, loopDelay]() { recoveryLoopObservers.erase(loopDelay); });
@@ -4526,10 +4555,12 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       } catch (...) {}
     }
   });
+  lap(laps.setup);
   auto manifest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   const auto initialLowerBound = co_await recoveryLowerBound(objectName, manifest);
   check();
+  lap(laps.manifest);
   std::vector<ManifestFacet> facets;
   uint64_t fromSeq = 0;
   object->recoveryManifestRevision = manifest ? manifest->revision : 0;
@@ -4558,9 +4589,11 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       for (const auto& facet : facets) fromSeq = std::max(fromSeq, facet.upToSeq);
     }
   }
+  lap(laps.snapshot);
   std::vector<LogRecord> history;
-  if (manifest) history = co_await readSegments(*manifest, object->namespaceId + "/" + object->objectId);
+  if (manifest) history = co_await readSegments(*manifest, object->namespaceId + "/" + object->objectId, &segmentStats);
   check();
+  lap(laps.segments);
   std::set<std::pair<uint64_t, uint64_t>> durableRecords;
   for (const auto& record : history) durableRecords.emplace(record.shardEpoch, record.nodeSeq);
   object = objectOf(objectName);
@@ -4600,8 +4633,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       }
     }
   }
+  lap(laps.local);
   auto tails = co_await kj::mv(collecting);
   check();
+  lap(laps.tailWait);
   auto latest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   if (latest && (!manifest || latest->revision > manifest->revision)) {
@@ -4619,13 +4654,14 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       check();
       facets = manifest->facets;
     }
-    auto published = co_await readSegments(*manifest, historyName);
+    auto published = co_await readSegments(*manifest, historyName, &segmentStats);
     check();
     for (auto& record : published) {
       durableRecords.emplace(record.shardEpoch, record.nodeSeq);
       history.push_back(std::move(record));
     }
   }
+  lap(laps.latest);
   object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
   const auto lowerBound = co_await recoveryLowerBound(objectName, manifest);
@@ -4677,11 +4713,13 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   }
   // Finish and synchronize the new image before touching any original file or facet entry.
   for (const auto& record : history) stagingFacets.insert(record.facetId);
+  lap(laps.prepare);
   auto rebuilt = co_await replayToAsync(storage, objectName, targetEpoch, staging, std::move(history), facets,
       snapshotShardEpoch, drop, {}, check, [this, objectName](double ms) {
         log("recovery-fsync", "\"object\":" + quote(objectName) + ",\"stage\":\"replay\",\"ms\":" + std::to_string(ms));
       });
   check();
+  lap(laps.replay);
   KJ_REQUIRE(!recoveryWriteFailed, "a held or unfenced local image cannot be deleted");
   object->facets.clear();
   auto removeFile = [&](const std::filesystem::path& path) {
@@ -4712,10 +4750,12 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   writeFacetIndex(*object, index);
   object->facets = std::move(rebuilt);
   dirtyCacheSizes.insert(objectName);
+  lap(laps.files);
   const auto publishingStarted = monotonicTimeMs();
   if (tails.cut) co_await forceRecoverySnapshot(objectName);
   else co_await publishRecovery(objectName, adopted);
   check();
+  lap(laps.publish);
   std::vector<RecoveryEvent> completed;
   completed.push_back(recoveryEvent(RecoveryKind::PUBLISHED, *object, object->rebuildGeneration));
   completed.push_back(recoveryEvent(RecoveryKind::REBUILD_DONE, *object, object->rebuildGeneration));
@@ -4762,9 +4802,24 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lastRebuildLoopDelayMs = *loopDelay;
   object->lastRebuildMs = lastRebuildMs;
   writePosition(*object);
+  lap(laps.markers);
   log("rebuilt", "\"object\":" + quote(objectName) + ",\"ms\":" + std::to_string(lastRebuildMs) + ",\"manifest\":\"" +
           std::to_string(object->manifestRevision) + "\",\"snapshot\":\"" + std::to_string(object->snapshotSequence) +
-          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\"");
+          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\",\"queueMs\":" + std::to_string(queuedMs) +
+          ",\"loopDelayMs\":" + std::to_string(lastRebuildLoopDelayMs) +
+          ",\"laps\":{\"setupMs\":" + std::to_string(laps.setup) + ",\"manifestMs\":" + std::to_string(laps.manifest) +
+          ",\"snapshotMs\":" + std::to_string(laps.snapshot) + ",\"segmentsMs\":" + std::to_string(laps.segments) +
+          ",\"localMs\":" + std::to_string(laps.local) + ",\"tailWaitMs\":" + std::to_string(laps.tailWait) +
+          ",\"latestMs\":" + std::to_string(laps.latest) + ",\"prepareMs\":" + std::to_string(laps.prepare) +
+          ",\"replayMs\":" + std::to_string(laps.replay) + ",\"filesMs\":" + std::to_string(laps.files) +
+          ",\"publishMs\":" + std::to_string(laps.publish) + ",\"markersMs\":" + std::to_string(laps.markers) +
+          "},\"tailCollectionMs\":" + std::to_string(tails.collectionMs) +
+          ",\"segments\":{\"read\":" + std::to_string(segmentStats.segments) + ",\"bytes\":" + std::to_string(segmentStats.bytes) +
+          ",\"records\":" + std::to_string(segmentStats.records) + ",\"hits\":" + std::to_string(segmentStats.cacheHits) +
+          ",\"misses\":" + std::to_string(segmentStats.cacheMisses) + ",\"joins\":" + std::to_string(segmentStats.cacheJoins) +
+          ",\"downloadMs\":" + std::to_string(segmentStats.downloadMs) + ",\"decodeMs\":" + std::to_string(segmentStats.decodeMs) +
+          ",\"groupMs\":" + std::to_string(segmentStats.groupMs) + ",\"waitMs\":" + std::to_string(segmentStats.waitMs) +
+          ",\"selectMs\":" + std::to_string(segmentStats.selectMs) + "}");
 }
 
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
@@ -4784,10 +4839,21 @@ kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifes
 
 // The segments a manifest names, in order, at most recoverParallelism downloads at a time; only the records of this
 // object are kept.
+// Each segment is downloaded and decoded once per node, off the event loop, and shared by the rebuilds that name it
+// (b57: one segment of a restarted owner's earlier epoch held every object of the shard, and each object's rebuild
+// decoded all of it on the loop again).
 kj::Promise<std::vector<LogRecord>> DurableLog::readSegments(const ObjectManifest& manifest,
-    const std::string& objectName) {
-  return readRecoverySegments([this](std::string key) { return store->get(std::move(key)); }, manifest, objectName,
-      settings.config.recoverParallelism, {}, [this](const std::string& event, const std::string& fields) { log(event, fields); });
+    const std::string& objectName, SegmentReadStats* stats) {
+  if (!sweepingSegments) { sweepingSegments = true; tasks.add(sweepSegmentCache()); }
+  return readRecoverySegmentsDecoded(*segmentCache, [this](std::string key) { return store->get(std::move(key)); },
+      manifest, objectName, settings.config.recoverParallelism,
+      [this](const std::string& event, const std::string& fields) { log(event, fields); }, stats);
+}
+
+kj::Promise<void> DurableLog::sweepSegmentCache() {
+  do co_await timer.afterDelay(SEGMENT_CACHE_SWEEP_MS * kj::MILLISECONDS);
+  while (segmentCache->sweep());
+  sweepingSegments = false;
 }
 
 void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch) {
@@ -7320,7 +7386,17 @@ std::string DurableLog::json() const {
       << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
       << ",\"recoverTimeouts\":" << recoverTimeouts << ",\"lastRebuildMs\":" << lastRebuildMs
-      << ",\"lastRebuildLoopDelayMs\":" << lastRebuildLoopDelayMs << ",\"lastError\":"
+      << ",\"lastRebuildLoopDelayMs\":" << lastRebuildLoopDelayMs;
+  if (segmentCache) {
+    out << ",\"segmentCache\":{\"entries\":" << segmentCache->entries() << ",\"heldBytes\":" << segmentCache->heldBytes()
+        << ",\"limitBytes\":" << segmentCache->limitBytes() << ",\"decodes\":" << segmentCache->decodes
+        << ",\"hits\":" << segmentCache->hits << ",\"misses\":" << segmentCache->misses << ",\"joins\":"
+        << segmentCache->joins << ",\"evictions\":" << segmentCache->evictions << ",\"failures\":"
+        << segmentCache->failures << ",\"loadLimit\":" << segmentCache->loadLimit() << ",\"loadsRunning\":"
+        << segmentCache->loadsRunning() << ",\"loadsWaiting\":" << segmentCache->loadsWaiting() << ",\"loadWaits\":"
+        << segmentCache->loadWaits << ",\"releasedOffLoop\":" << segmentsReleasedOffLoop() << "}";
+  }
+  out << ",\"lastError\":"
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"
       << (diskTrusted ? "true" : "false") << ",\"note\":" << quote(startupNote) << ",\"limitBytes\":\""
       << diskLimitBytes << "\",\"usedBytes\":\"" << diskUsedBytes << "\",\"filesDropped\":" << filesDropped

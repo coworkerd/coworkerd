@@ -154,6 +154,7 @@ capnp_generate_cpp(DURABLE_TAIL_TEST_SOURCES DURABLE_TAIL_TEST_HEADERS
 add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
   node/durable-channel-test.c++
   node/durable-tail-test.c++
+  node/durable-segment-test.c++
   ${DURABLE_TAIL_TEST_SOURCES}
   ${DURABLE_TAIL_TEST_HEADERS}
   node/memory-watermark.c++
@@ -180,6 +181,11 @@ add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
+add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)
+add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
+add_test(NAME durable-segment-cache COMMAND coworkerd-durable-channel-test segment-cache)
+# Freed memory is overwritten, so that a load touching its destroyed cache fails this test instead of passing by luck.
+set_tests_properties(durable-segment-cache PROPERTIES ENVIRONMENT "MALLOC_PERTURB_=165")
 add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
 foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
