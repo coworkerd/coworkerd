@@ -2,6 +2,7 @@
 #include "durable-shards.h"
 
 #include "support.h"
+#include "json.h"
 
 #include <kj/async-io.h>
 #include <kj/timer.h>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <random>
 
 namespace coworkerd {
 
@@ -882,6 +884,298 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(wake > clock.now() + 1 * kj::MICROSECONDS, "close must cancel the suspended reader");
     }
   }
+
+  // b58: the restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The
+  // reference is the 42af4392 selection, which encoded every record on the loop; it runs on a copy of what is left
+  // before each segment, then selectEarlier (sizes computed, records copied in slices) and buildEarlierSegment run on
+  // the log itself, and the segment's objects are retired the way a published manifest retires them.
+  struct EarlierReference {
+    SegmentHeader header;
+    std::string body;
+    std::set<std::string> touched;
+    std::map<std::string, uint64_t> sourceEpochs;
+  };
+  static EarlierReference earlierReference(const std::map<uint64_t, LogRecord>& held, SegmentHeader header,
+      uint64_t segmentBytes, const std::string& nodeId) {
+    // 42af4392's constants and budgets (durable-log.c++): the store's read limit, the envelope and an index entry.
+    constexpr uint64_t STORE_SEGMENT_BYTES = 64u << 20;
+    const auto host = [](const LogRecord& record) { return record.objectName + "/" + std::to_string(record.dataEpoch); };
+    EarlierReference out;
+    std::vector<std::string> encoded;
+    std::map<std::pair<std::string, uint32_t>, SegmentIndexEntry> index;
+    uint64_t wireBytes = 1024 + json::quote(nodeId).size() + json::quote("earlier-epoch").size();
+    for (const auto& [sequence, record] : held) {
+      auto bytes = encodeLogRecord(record);
+      const auto extra = bytes.size() + 4 +
+          (index.contains({record.objectName, record.facetId}) ? 0 : 256 + json::quote(record.objectName).size());
+      if (!encoded.empty() && (header.bytes + bytes.size() > segmentBytes || wireBytes + extra > STORE_SEGMENT_BYTES)) break;
+      KJ_REQUIRE(wireBytes + extra <= STORE_SEGMENT_BYTES);
+      wireBytes += extra;
+      header.bytes += bytes.size();
+      encoded.push_back(std::move(bytes));
+      ++header.records;
+      if (!header.firstSeq) header.firstSeq = sequence;
+      header.lastSeq = sequence;
+      auto& entry = index[{record.objectName, record.facetId}];
+      entry.objectName = record.objectName;
+      entry.facetId = record.facetId;
+      if (!entry.records) entry.firstTxn = record.txn;
+      entry.lastTxn = record.txn;
+      ++entry.records;
+      out.touched.insert(host(record));
+      out.sourceEpochs[host(record)] = std::max(out.sourceEpochs[host(record)], record.shardEpoch);
+    }
+    for (auto& [key, entry] : index) header.objects.push_back(entry);
+    out.body = encodeSegment(header, encoded);
+    out.header = header;
+    return out;
+  }
+
+  static void earlierSegment() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-earlier-segment-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    const std::string ns(64, 'a');
+    constexpr uint64_t EPOCH = 3;
+    std::mt19937 random(58);
+    auto text = [&](size_t size) {
+      std::string out(size, '\0');
+      for (auto& c : out) c = char('a' + random() % 26);
+      return out;
+    };
+    uint32_t segmentsSeen = 0, yieldsSeen = 0;
+    for (int round = 0; round < 8; ++round) {
+      DurableLog log({"peer", "instance", temp + "/" + std::to_string(round), {}}, store, io.provider->getNetwork(), clock,
+          *io.lowLevelProvider, membership, {});
+      log.nodeEpoch = 9;
+      const uint64_t sizes[] = {12u << 10, 96u << 10, 16u << 20};
+      log.settings.config.segmentBytes = sizes[round % 3];
+      log.earlierSliceBytes = round % 2 ? 1 : 32u << 10;
+      std::map<uint64_t, LogRecord> model;
+      const int count = 150 + int(random() % 250);
+      uint64_t sequence = 1 + random() % 5;
+      for (int i = 0; i < count; ++i) {
+        LogRecord r;
+        r.kind = random() % 5 == 0 ? LogRecordKind::RESET : LogRecordKind::FRAMES;
+        r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shardEpoch = 1 + random() % 2; r.shard = 0;
+        char id[65];
+        std::snprintf(id, sizeof(id), "%016llx%048x", (unsigned long long) (1 + random() % 24) * 1024, 0);
+        r.objectName = ns + "/" + id;
+        r.dataEpoch = 1 + random() % 2;
+        r.storageId = text(random() % 20);
+        r.facetId = random() % 3; r.parentFacetId = 0; r.facetName = text(random() % 12);
+        r.txn = uint64_t(i + 1); r.generation = random() % 4; r.salt1 = random(); r.salt2 = random();
+        r.pageSize = 4096; r.firstFrame = random() % 100; r.frames = 1 + random() % 3; r.commits = 1;
+        if (random() % 3 == 0) r.header = text(32);
+        if (r.kind == LogRecordKind::FRAMES) r.frameBytes = text(random() % 3 == 0 ? random() % 40000 : random() % 3000);
+        KJ_REQUIRE(encodedLogRecordSize(r) == encodeLogRecord(r).size(), "the computed size is the encoded size",
+            encodedLogRecordSize(r), encodeLogRecord(r).size());
+        model[sequence] = r;
+        sequence += 1 + random() % 3;
+      }
+      if (round % 4 == 3) {
+        // A segment that ends exactly at segmentBytes: the record that fills it is kept.
+        uint64_t sum = 0;
+        const int fill = 2 + int(random() % 5);
+        int taken = 0;
+        for (const auto& [seq, record] : model) {
+          if (taken++ == fill) break;
+          sum += encodedLogRecordSize(record);
+        }
+        log.settings.config.segmentBytes = sum;
+      }
+      auto& held = log.earlier[EPOCH];
+      held = model;
+      auto& info = log.predecessorLogs[EPOCH];
+      for (const auto& [seq, record] : held) {
+        log.indexEarlierRecord({EPOCH, seq}, record);
+        log.noteEarlierUnpublished(info, record);
+      }
+      SegmentHeader base;
+      base.nodeId = "peer"; base.nodeEpoch = EPOCH; base.sealedAtUnixMs = 1234; base.reason = "earlier-epoch";
+      for (uint32_t segment = 1;; ++segment) {
+        auto found = log.earlier.find(EPOCH);
+        if (found == log.earlier.end()) break;
+        KJ_REQUIRE(segment < 10000, "the reseal makes progress");
+        auto expectedHeader = base;
+        expectedHeader.segment = segment;
+        const auto expected = earlierReference(found->second, expectedHeader, log.settings.config.segmentBytes, "peer");
+        auto promise = log.selectEarlier(EPOCH, std::nullopt);
+        while (!promise.poll(io.waitScope)) { clock.advanceTo(clock.now() + 1 * kj::MICROSECONDS); ++yieldsSeen; }
+        auto selection = promise.wait(io.waitScope);
+        KJ_REQUIRE(!selection.aborted && !selection.input.records.empty(), "a segment is chosen", round, segment);
+        auto header = base;
+        header.segment = segment;
+        auto built = buildEarlierSegment(header, std::move(selection.input));
+        KJ_REQUIRE(built.body == expected.body, "the segment's bytes are the event loop's", round, segment,
+            built.body.size(), expected.body.size());
+        KJ_REQUIRE(built.sha256 == objectSha256(expected.body), "the digest is the event loop's", round, segment);
+        KJ_REQUIRE(built.header.records == expected.header.records && built.header.bytes == expected.header.bytes &&
+            built.header.firstSeq == expected.header.firstSeq && built.header.lastSeq == expected.header.lastSeq,
+            "the segment's header is the event loop's", round, segment);
+        KJ_REQUIRE(built.touched == expected.touched && built.sourceEpochs == expected.sourceEpochs,
+            "the segment names the same objects", round, segment);
+        ++segmentsSeen;
+        // The manifests are written: every object of the segment gives up its records in the segment's range.
+        for (const auto& host : built.touched)
+          log.retireEarlierObject(EPOCH, host, built.header.firstSeq, built.header.lastSeq);
+        std::erase_if(model, [&](const auto& entry) {
+          return entry.first >= built.header.firstSeq && entry.first <= built.header.lastSeq;
+        });
+        const auto left = log.earlier.find(EPOCH);
+        KJ_REQUIRE((left == log.earlier.end() ? model.empty() : left->second.size() == model.size()),
+            "retiring takes exactly the segment's records", round, segment);
+        uint64_t counted = 0;
+        for (const auto& [name, records] : info.unpublishedObjects) counted += records;
+        KJ_REQUIRE(counted == model.size(), "the per-object counts follow the retired records", counted, model.size());
+        for (const auto& [name, positions] : log.earlierByObject)
+          for (const auto& position : positions)
+            KJ_REQUIRE(position.first != EPOCH || model.contains(position.second), "no index entry outlives its record");
+      }
+      KJ_REQUIRE(model.empty());
+    }
+    KJ_REQUIRE(segmentsSeen > 16 && yieldsSeen > 100, "several segments per round and slices that yield",
+        segmentsSeen, yieldsSeen);
+  }
+
+  // b58: a restored holder answers a tail request naming its object for that object. Random objects in two shards of
+  // one earlier epoch, each published, partly published, being published (a manifest write in flight) or untouched,
+  // some with an excluded record; every per-object and per-shard answer against the truth computed from what was
+  // generated. With a deliberately wrong decision (shard-wide only, or a write in flight taken for done) some answer
+  // must differ, or the test would not see that bug.
+  static bool restoredTailCase(unsigned seed, DurableLog::RestoredTailControl control) {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-restored-tail-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    DurableLog log({"peer", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
+        membership, {});
+    log.nodeEpoch = 9;
+    log.diskTrusted = true;
+    log.sameBootCache = true;
+    log.restoredTailControlForTest = control;
+    constexpr uint64_t EPOCH = 3;
+    auto& info = log.predecessorLogs[EPOCH];
+    info.complete = true;
+    const std::string ns(64, 'b');
+    std::mt19937 random(seed);
+    enum State { UNTOUCHED, PUBLISHED, PARTIAL, PUBLISHING };
+    struct Object { std::string id, name; uint32_t shard; State state; std::vector<uint64_t> sequences; bool excluded; };
+    std::vector<Object> objects;
+    uint64_t sequence = 1;
+    const int count = 12 + int(random() % 20);
+    for (int i = 0; i < count; ++i) {
+      char id[65];
+      std::snprintf(id, sizeof(id), "%016llx%048x", (unsigned long long) (i + 1) * 1024, i);
+      Object object{id, ns + "/" + id, uint32_t(i % 2), State(random() % 4), {}, random() % 6 == 0};
+      // At least one published object in each shard beside unpublished ones, one write in flight, and one object
+      // whose records are all named but for an excluded one.
+      if (i < 2) object.state = PUBLISHED;
+      if (i == 2 || i == 3) object.state = UNTOUCHED;
+      if (i == 4) object.state = PUBLISHING;
+      if (i == 5) { object.state = PUBLISHED; object.excluded = true; }
+      objects.push_back(object);
+    }
+    std::map<uint64_t, std::pair<size_t, LogRecord>> excludedRecords;
+    // Interleaved records, as the fixture's writes are.
+    for (int round = 0; round < 6; ++round) {
+      for (size_t i = 0; i < objects.size(); ++i) {
+        if (random() % 3 == 0) continue;
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlier[EPOCH][sequence] = r;
+        log.indexEarlierRecord({EPOCH, sequence}, r);
+        log.noteEarlierUnpublished(info, r);
+        objects[i].sequences.push_back(sequence++);
+      }
+    }
+    for (size_t i = 0; i < objects.size(); ++i) {
+      if (objects[i].sequences.empty()) {  // every object has a record
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlier[EPOCH][sequence] = r;
+        log.indexEarlierRecord({EPOCH, sequence}, r);
+        log.noteEarlierUnpublished(info, r);
+        objects[i].sequences.push_back(sequence++);
+      }
+      if (objects[i].excluded) {
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlierExcluded[EPOCH][sequence] = r;
+        log.noteEarlierUnpublished(info, r);
+        excludedRecords[sequence++] = {i, r};
+      }
+    }
+    std::vector<bool> truth(objects.size()), excludedLeft(objects.size());
+    for (size_t i = 0; i < objects.size(); ++i) {
+      auto& object = objects[i];
+      const auto host = object.name + "/1";
+      if (object.state == PUBLISHED || object.state == PARTIAL) {
+        const auto upTo = object.state == PUBLISHED ? object.sequences.back()
+            : object.sequences[object.sequences.size() / 2] - 1;
+        log.retireEarlierObject(EPOCH, host, 0, upTo);
+        if (object.state == PARTIAL && upTo < object.sequences.front()) object.state = UNTOUCHED;
+      }
+      if (object.state == PUBLISHED && object.excluded && (i == 5 || random() % 2 == 0)) excludedLeft[i] = true;
+      else if (object.state == PUBLISHED && object.excluded) {
+        for (auto it = log.earlierExcluded[EPOCH].begin(); it != log.earlierExcluded[EPOCH].end();) {
+          if (it->second.objectName == object.name) { log.noteEarlierRetired(EPOCH, it->second); it = log.earlierExcluded[EPOCH].erase(it); }
+          else ++it;
+        }
+      }
+      if (object.state == PUBLISHING) log.earlierPublishing.insert(object.name);
+      truth[i] = object.state != PUBLISHED || excludedLeft[i];
+    }
+    auto ask = [&](uint32_t shard, const std::string& id) {
+      DurableTailAsk out;
+      out.namespaceId = ns; out.shard = shard; out.shardEpoch = 2; out.ownerNodeId = "peer"; out.ownerNodeEpoch = EPOCH;
+      out.objectId = id;
+      return log.tailFor(out, false);
+    };
+    auto pending = [](const DurableTailAnswer& answer) {
+      if (answer.refusal == "the restored owner shard still has unpublished records") return true;
+      KJ_REQUIRE(answer.refusal.empty() && answer.ownerConfirmed && answer.records.empty(),
+          "an answer is either pending or an owner's empty tail", answer.refusal.c_str());
+      return false;
+    };
+    bool matched = true;
+    for (size_t i = 0; i < objects.size(); ++i)
+      if (pending(ask(objects[i].shard, objects[i].id)) != truth[i]) matched = false;
+    for (uint32_t shard = 0; shard < 2; ++shard) {
+      bool any = false;
+      for (size_t i = 0; i < objects.size(); ++i) any = any || (objects[i].shard == shard && truth[i]);
+      if (pending(ask(shard, "")) != any) matched = false;
+    }
+    return matched;
+  }
+
+  static void restoredTail(bool negativeControls) {
+    using Control = DurableLog::RestoredTailControl;
+    if (!negativeControls) {
+      for (unsigned seed = 1; seed <= 40; ++seed)
+        KJ_REQUIRE(restoredTailCase(seed, Control::NONE), "per-object answers match the generated truth", seed);
+      return;
+    }
+    for (const auto control : {Control::SHARD_ONLY, Control::IGNORE_PUBLISHING}) {
+      bool caught = false;
+      for (unsigned seed = 1; seed <= 40 && !caught; ++seed) caught = !restoredTailCase(seed, control);
+      KJ_REQUIRE(caught, "a wrong per-object decision is detected", int(control));
+    }
+  }
 };
 
 }  // namespace coworkerd
@@ -900,5 +1194,8 @@ int main(int argc, char* argv[]) {
   else if (mode == "peer-fence") coworkerd::DurableLogChannelTest::peerFence(argc == 3 ? argv[2] : "");
   else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
+  else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
+  else if (mode == "restored-tail" || mode == "restored-tail-negative")
+    coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
 }
