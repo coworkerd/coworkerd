@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4402089ed
+index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f70a5e2b98
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,804 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1097,12 +1097,24 @@ index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4
 +  fflush(stdout);
 +}
 +
-+int runAllocationChild(kj::StringPtr spec) {
++struct ChildResult {
++  int status;
++  std::string events;  // the rows the child wrote to its limit event descriptor
++};
++ChildResult runAllocationChild(kj::StringPtr spec) {
 +  auto filter = kj::str("--filter=threaded-server-test.c++:", ALLOCATION_CHILD_LINE);
 +  auto selector = kj::str("COWORKERD_THREADED_ALLOCATION_CHILD=", spec);
++  // The child's limit event descriptor, as the node passes one to the server.
++  int events[2];
++  KJ_REQUIRE(pipe2(events, O_CLOEXEC) == 0);
++  int childEvents = fcntl(events[1], F_DUPFD, 100);
++  KJ_REQUIRE(childEvents >= 0);
++  auto eventFd = kj::str("COWORKERD_EVENT_FD=", childEvents);
 +  kj::Vector<char*> env;
-+  for (char** at = environ; *at != nullptr; ++at) env.add(*at);
++  for (char** at = environ; *at != nullptr; ++at)
++    if (!kj::StringPtr(*at).startsWith("COWORKERD_EVENT_FD=")) env.add(*at);
 +  env.add(selector.begin());
++  env.add(eventFd.begin());
 +  env.add(nullptr);
 +  char program[] = "/proc/self/exe";
 +  char* argv[] = {program, filter.begin(), nullptr};
@@ -1110,6 +1122,8 @@ index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4
 +  fflush(stderr);
 +  pid_t pid;
 +  KJ_REQUIRE(posix_spawn(&pid, program, nullptr, nullptr, argv, env.begin()) == 0);
++  close(childEvents);
++  close(events[1]);
 +  // A child that neither finishes nor exits within a minute is a failure of
 +  // its own kind (reported as killed by SIGKILL), never a silent pass.
 +  int status = 0;
@@ -1121,16 +1135,26 @@ index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4
 +    if (waited == 600) kill(pid, SIGKILL);
 +    usleep(100000);
 +  }
++  std::string rows;
++  char buffer[4096];
++  for (ssize_t n; (n = read(events[0], buffer, sizeof(buffer))) != 0;) {
++    if (n < 0 && errno == EINTR) continue;
++    KJ_REQUIRE(n > 0);
++    rows.append(buffer, n);
++  }
++  close(events[0]);
 +  fprintf(stdout, "ALLOCATION_CHILD spec=%s exited=%d code=%d signal=%d\n", spec.cStr(),
 +      WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
 +      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
++  fprintf(stdout, "ALLOCATION_CHILD_EVENTS %zu bytes\n%s", rows.size(), rows.c_str());
 +  fflush(stdout);
-+  return status;
++  return {status, kj::mv(rows)};
 +}
 +
 +KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
-+  auto status = runAllocationChild("1:string");
-+  KJ_EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, status);
++  auto child = runAllocationChild("1:string");
++  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
++  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 +}
 +
 +// KNOWN FAILURE until each isolate has its own pointer cage (S3): every heap
@@ -1139,11 +1163,24 @@ index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4
 +// V8's fatal OOM then ends the process (exit 74). This test passes while the
 +// failure reproduces and fails when it stops, so the status is updated.
 +KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure until S3)") {
-+  auto status = runAllocationChild("4:string");
-+  bool reproduced = WIFEXITED(status) && WEXITSTATUS(status) == 74;
++  auto child = runAllocationChild("4:string");
++  bool reproduced = WIFEXITED(child.status) && WEXITSTATUS(child.status) == 74;
 +  fprintf(stdout, "KNOWN_FAILURE four-simultaneous-near-GiB reproduced=%d\n", reproduced);
 +  fflush(stdout);
-+  KJ_EXPECT(reproduced, "the known failure changed; update its status", status);
++  KJ_EXPECT(reproduced, "the known failure changed; update its status", child.status);
++  // The OOM row names the execution whose allocation failed and carries its
++  // isolate's heap: far below that Worker's 128 MiB limit, because the other
++  // isolates filled the shared cage. The node must not blame it.
++  if (reproduced) {
++    auto at = child.events.find("\"event\":\"memory-culprit\"");
++    KJ_ASSERT(child.events.find("\"event\":\"memory-oom-undetermined\"") != std::string::npos);
++    KJ_ASSERT(at != std::string::npos, "the OOM thread was executing a Worker");
++    auto line = child.events.substr(at, child.events.find('\n', at) - at);
++    auto field = line.find("\"oomIsolateHeapBytes\":");
++    KJ_ASSERT(field != std::string::npos, line.c_str());
++    auto heap = strtoull(line.c_str() + field + strlen("\"oomIsolateHeapBytes\":"), nullptr, 10);
++    KJ_EXPECT(heap > 0 && heap < (128ull << 20), heap, line.c_str());
++  }
 +}
 +
 +KJ_TEST("deadline decimal spelling and native refusal mappings") {
@@ -1406,10 +1443,10 @@ index 0000000000000000000000000000000000000000..6b52afd4184e3027ad48c6167b99c0d4
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a79809c2a949
+index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230620fa4cc
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3818 @@
+@@ -0,0 +1,3842 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1604,9 +1641,14 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +
 +int limitEventFd();
 +thread_local const char *currentOomReport = nullptr;
++// The executing isolate's heap at its last collection. V8 collects before a
++// fatal OOM, so this is the heap of the isolate whose allocation failed.
++thread_local const std::atomic<uint64_t> *currentOomHeap = nullptr;
 +struct OomReportScope {
-+  explicit OomReportScope(kj::StringPtr identity, uint32_t memoryMiB)
++  explicit OomReportScope(
++      kj::StringPtr identity, uint32_t memoryMiB, const std::atomic<uint64_t> *heap = nullptr)
 +      : previous(currentOomReport),
++        previousHeap(currentOomHeap),
 +        report(kj::str("{\"event\":\"memory-culprit\",\"pid\":",
 +            getpid(),
 +            ",",
@@ -1616,11 +1658,14 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +            "}\n")) {
 +    (void)limitEventFd();
 +    currentOomReport = report.cStr();
++    currentOomHeap = heap;
 +  }
 +  ~OomReportScope() {
 +    currentOomReport = previous;
++    currentOomHeap = previousHeap;
 +  }
 +  const char *previous;
++  const std::atomic<uint64_t> *previousHeap;
 +  kj::String report;
 +};
 +
@@ -1966,7 +2011,21 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +    }
 +  };
 +  if (length > 0 && size_t(length) < sizeof(unknown)) emit(unknown, size_t(length));
-+  if (currentOomReport) emit(currentOomReport, strlen(currentOomReport));
++  if (currentOomReport) {
++    // Every isolate's heap shares one pointer cage: the isolate whose
++    // allocation failed may be far below its own limit while others filled the
++    // cage. The node attributes the exit only to an isolate at its limit.
++    auto size = strlen(currentOomReport);
++    char row[4096];
++    int written = currentOomHeap && size >= 2 && size < sizeof(row) - 64
++        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
++              currentOomReport, (unsigned long long)currentOomHeap->load())
++        : -1;
++    if (written > 0 && size_t(written) < sizeof(row))
++      emit(row, size_t(written));
++    else
++      emit(currentOomReport, size);
++  }
 +  _exit(74);
 +}
 +
@@ -2190,7 +2249,7 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +      : cause(cause),
 +        memory(std::move(memory)),
 +        previousCause(this->memory ? this->memory->currentCause : nullptr),
-+        oom(identity, memoryMiB),
++        oom(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr),
 +        entry{.isolate = isolate,
 +          .cause = cause,
 +          .memory = std::move(memoryState),
@@ -2677,7 +2736,7 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +  // Run the same JSON decoder as a Worker, only after the protocol decoder
 +  // rejected the source response. Its temporary validation isolate belongs
 +  // to this load and uses its CPU, heap and process reservation.
-+  OomReportScope oom(limits.identity, limits.memoryMiB);
++  OomReportScope oom(limits.identity, limits.memoryMiB, limits.memory ? &limits.memory->heap : nullptr);
 +  auto *isolate = v8::Isolate::New(limits.getCreateParams());
 +  KJ_DEFER(isolate->Dispose());
 +  limits.customizeIsolate(isolate);
@@ -3591,7 +3650,8 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +        slot.reservation);
 +    slot.limits = limits.get();
 +    slot.limitsOwner = kj::addRef(*limits);
-+    OomReportScope oom(limits->identity, limits->memoryMiB);
++    OomReportScope oom(
++        limits->identity, limits->memoryMiB, limits->memory ? &limits->memory->heap : nullptr);
 +    isolateCreationAttempts.fetch_add(1);
 +    auto group = jsg::newIsolateGroup();
 +    const api::pyodide::PythonConfig python{
@@ -4685,7 +4745,8 @@ index 0000000000000000000000000000000000000000..0c450eea9dc59d958302ba14ed07a798
 +    auto results = context.getResults().initAs<rpc::JsRpcTarget::CallResults>();
 +    auto &worker = *KJ_REQUIRE_NONNULL(slot->worker);
 +    auto asyncLock = co_await worker.takeAsyncLockWithoutRequest(SpanParent(nullptr));
-+    OomReportScope oom(identity, slot->limits->memoryMiB);
++    OomReportScope oom(identity, slot->limits->memoryMiB,
++        slot->limits->memory ? &slot->limits->memory->heap : nullptr);
 +    worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
 +      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
 +        auto placeholder = jsg::check(

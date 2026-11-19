@@ -338,6 +338,22 @@ void memoryCulprit() {
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/other", "v1"));
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "not-dispatched", "tenant/worker", "v1"));
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
+  // The native OOM row's isolate heap: an isolate far below its own limit did not
+  // cause the exit (other isolates filled the shared pointer cage). Rows without
+  // the field (stock workerd) keep their attribution.
+  KJ_REQUIRE(memoryCulpritOwnsOom(0, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(110 * 1024, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom((uint64_t(128) << 20) - 1, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(uint64_t(128) << 20, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(uint64_t(1100) << 20, 128));
+  // The production decoder reads the field the native server writes.
+  capnp::MallocMessageBuilder message;
+  auto report = message.initRoot<v1::rpc::CpuReport>();
+  capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"workerId\":\"tenant/worker\","
+      "\"versionId\":\"v1\",\"invocationId\":\"in-flight\",\"isolate\":\"i\",\"memoryLimitMiB\":128,"
+      "\"oomIsolateHeapBytes\":110592}"), report);
+  KJ_REQUIRE(report.getOomIsolateHeapBytes() == 110592 &&
+      !memoryCulpritOwnsOom(report.getOomIsolateHeapBytes(), report.getMemoryLimitMiB()));
 }
 void package() {
   TempDir path;

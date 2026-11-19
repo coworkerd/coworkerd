@@ -2881,6 +2881,7 @@ public:
     const auto& row = p.oomCulpritRow;
     std::string offender = "null";
     bool v8Oom = p.oomSignalled;
+    uint64_t oomIsolateHeap = 0;
     if (!row.empty() && row.size() <= 16384) try {
       capnp::MallocMessageBuilder message;
       auto report = message.initRoot<v1::rpc::CpuReport>();
@@ -2889,7 +2890,9 @@ public:
           (report.getEvent() == "memory-culprit" || report.getEvent() == "memory-oom-undetermined");
       v8Oom = v8Oom || stateOom;
       const std::string rowWorker = report.getWorkerId().cStr();
-      if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB) {
+      oomIsolateHeap = report.getOomIsolateHeapBytes();
+      if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB &&
+          memoryCulpritOwnsOom(oomIsolateHeap, report.getMemoryLimitMiB())) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
         const auto dispatched = memoryCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
@@ -2916,7 +2919,8 @@ public:
     out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"observedAtUnixMs\":" << wall()
         << ",\"reason\":\"" << p.lastReason << "\",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
-        << "\",\"culprit\":" << offender << ",\"inFlight\":" << p.memoryCrashInFlight.value_or(p.inFlightJson()) << "}";
+        << "\",\"culprit\":" << offender << ",\"oomIsolateHeapBytes\":" << oomIsolateHeap
+        << ",\"inFlight\":" << p.memoryCrashInFlight.value_or(p.inFlightJson()) << "}";
     if (memoryCrashes.size() == 32) memoryCrashes.pop_front();
     memoryCrashes.push_back(out.str());
     std::cout << "[process-memory-crash] " << out.str() << std::endl;

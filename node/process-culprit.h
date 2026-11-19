@@ -49,6 +49,13 @@ std::string confirmedCpuCulprit(Process& p, Limits limits, Labelled labelled, Co
   } catch (const kj::Exception&) { return "null"; }
 }
 
+// A native memory-culprit row carries the heap of the isolate whose allocation failed. Below that
+// Worker's own limit the isolate cannot have used up its own V8 headroom (its limit plus one maximum
+// object): other isolates filled the shared pointer cage, so the row names no culprit. 0: not reported.
+inline bool memoryCulpritOwnsOom(uint64_t oomIsolateHeapBytes, uint32_t memoryLimitMiB) {
+  return oomIsolateHeapBytes == 0 || oomIsolateHeapBytes >= (uint64_t(memoryLimitMiB) << 20);
+}
+
 // An OOM row can match a completed dispatch in the same process generation.
 template<class Calls, class Recent>
 bool memoryCulpritDispatch(const Calls& live, const Recent& recent, const std::string& invocation,
