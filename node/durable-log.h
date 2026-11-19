@@ -742,6 +742,8 @@ private:
       std::string reason);
   // r49: a peer refused one of this node's records as fenced -- check whether the record's shard is lost.
   void checkFencedShard(uint64_t sequence);
+  // r49: the shards such a refusal is being checked for, (namespace, shard) -> the refused record's epoch.
+  std::map<std::pair<std::string, uint32_t>, uint64_t> lostShardChecks;
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {
