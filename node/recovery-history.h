@@ -55,7 +55,8 @@ uint64_t segmentsReleasedOffLoop();
 // Where a read's segment came from: decoded already, a load another read had started, or a load this read started.
 enum class SegmentSource : uint8_t { HIT, JOIN, LOAD };
 // At most this many segments are downloaded and decoded at once, each on a worker thread of its own; further loads
-// wait until one finishes. The default rebuildConcurrency x recoverParallelism (4 x 4) never waits.
+// wait until one finishes. With rebuild readers only, the default rebuildConcurrency x recoverParallelism (4 x 4)
+// never waits; readers that retire old tails read segments too.
 constexpr uint32_t SEGMENT_DECODE_THREADS = 16;
 // The segments a node's rebuilds read, each downloaded and decoded once while rebuilds still need it, instead of once
 // per object. Readers waiting for the same segment share one download and one decode. An entry is dropped when no
@@ -77,9 +78,9 @@ public:
   uint64_t heldBytes() const { return held; }
   uint64_t limitBytes() const { return limit; }
   size_t entries() const { return table.size(); }
-  uint32_t loadLimit() const { return maxLoads; }
-  uint32_t loadsRunning() const { return loading; }
-  size_t loadsWaiting() const { return waiting.size(); }
+  uint32_t loadLimit() const { return slots->limit; }
+  uint32_t loadsRunning() const { return slots->running; }
+  size_t loadsWaiting() const { return slots->waiting.size(); }
   uint64_t decodes = 0, hits = 0, misses = 0, joins = 0, evictions = 0, failures = 0, loadWaits = 0;
   // Tests only: the table key of a segment (default: its store key). A negative control keys by less than the
   // segment's identity to show that the equivalence checks catch a cache that hands out the wrong segment.
@@ -98,9 +99,14 @@ private:
   uint64_t limit, held = 0;
   double idle;
   Decoded decodedHook;
-  // Before `table` and `tasks`: a load's coroutine, destroyed with them, still gives its slot back here.
-  uint32_t maxLoads, loading = 0;
-  std::deque<kj::Own<kj::PromiseFulfiller<void>>> waiting;
+  // The load slots, shared with every load's coroutine: a reader can keep a load alive after the cache is gone (a
+  // node stopping in the middle of a rebuild destroys the cache before the rebuilds), and that load still gives its
+  // slot back when it is destroyed.
+  struct LoadSlots {
+    uint32_t limit = 1, running = 0;
+    std::deque<kj::Own<kj::PromiseFulfiller<void>>> waiting;
+  };
+  std::shared_ptr<LoadSlots> slots;
   std::map<std::string, Entry> table;
   kj::TaskSet tasks{*this};
 };

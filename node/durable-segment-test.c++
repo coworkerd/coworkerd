@@ -386,8 +386,13 @@ void runCacheCase(unsigned seed) {
         "at most two loads at once", most.load(), cache.loadWaits);
     KJ_REQUIRE(cache.decodes == fixture.segments.size(), "a waiting load still decodes once", cache.decodes);
   }
-  // Decoded segments are freed on the background thread, not where the last reference is dropped.
+  // Decoded segments are freed on the background thread, not where the last reference is dropped. The baseline is
+  // taken once the frees of the caches above have stopped arriving.
   {
+    for (uint64_t last = ~0ull, rounds = 0; rounds < 200 && segmentsReleasedOffLoop() != last; ++rounds) {
+      last = segmentsReleasedOffLoop();
+      timer.afterDelay(25 * kj::MILLISECONDS).wait(io.waitScope);
+    }
     const auto released = segmentsReleasedOffLoop();
     {
       SegmentDecodeCache cache(get, 256ull << 20, 0, {}, blocking);
@@ -415,8 +420,11 @@ void runCacheCase(unsigned seed) {
     KJ_REQUIRE(cache.entries() > 0 && cache.failures == 0, "a canceled reader's loads are kept", cache.entries(), cache.failures);
     same(first, readNew(cache, get, fixture.manifests.at(first), first).wait(io.waitScope), "a read after a canceled one matches");
   }
-  // The cache destroyed while loads run: the workers finish against nothing, and nothing is touched after it.
-  {
+  // The cache destroyed while loads run, in both orders: the readers first (they go with the cache's scope), and the
+  // cache first with the readers after it, which is what a node stopping in the middle of a rebuild does
+  // (~DurableLog resets the cache before its rebuilds go). Either way the workers finish against nothing, and nothing
+  // touches the cache after it is gone (built with AddressSanitizer, the second order used to fail here).
+  for (const bool cacheFirst : {false, true}) {
     std::atomic<bool> go{false};
     std::atomic<int> started{0}, finished{0};
     HistoryBlockingGet held = [fetchOn, &go, &started, &finished](const std::string& key) {
@@ -427,10 +435,19 @@ void runCacheCase(unsigned seed) {
       return response;
     };
     {
-      SegmentDecodeCache cache(get, 256ull << 20, 30000, {}, held);
-      auto reading = readNew(cache, get, fixture.manifests.at(first), first).eagerlyEvaluate(nullptr);
+      auto cache = std::make_unique<SegmentDecodeCache>(get, 256ull << 20, 30000, SegmentDecodeCache::Decoded(), held, 1);
+      auto reading = readNew(*cache, get, fixture.manifests.at(first), first).eagerlyEvaluate(nullptr);
       timer.afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
-      KJ_REQUIRE(cache.loadsRunning() > 0, "loads are running when the cache goes");
+      // One load runs and the other waits for the slot: both kinds of load frame outlive the cache below.
+      KJ_REQUIRE(cache->loadsRunning() == 1 && cache->loadsWaiting() > 0, "loads are running and waiting when the cache goes",
+          cache->loadsRunning(), cache->loadsWaiting());
+      if (cacheFirst) {
+        cache = nullptr;
+        { auto gone = kj::mv(reading); }
+      } else {
+        { auto gone = kj::mv(reading); }
+        cache = nullptr;
+      }
     }
     go = true;
     until([&]() { return started.load() > 0 && finished.load() == started.load(); }, "the orphaned loads finish");

@@ -273,22 +273,26 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
 SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded,
     HistoryBlockingGet blockingGet, uint32_t maxLoadsParam)
     : get(std::move(get)), blockingGet(std::move(blockingGet)), limit(limitBytes), idle(idleMs),
-      decodedHook(std::move(decoded)), maxLoads(std::max<uint32_t>(1, maxLoadsParam)) {}
+      decodedHook(std::move(decoded)), slots(std::make_shared<LoadSlots>()) {
+  slots->limit = std::max<uint32_t>(1, maxLoadsParam);
+}
 void SegmentDecodeCache::taskFailed(kj::Exception&&) {}
 kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std::string key) {
-  // At most maxLoads loads at once. A finishing load wakes every waiting one and each checks again, so a waiter that
-  // is gone never holds a slot.
-  while (loading >= maxLoads) {
+  // At most slots->limit loads at once. A finishing load wakes every waiting one and each checks again, so a waiter
+  // that is gone never holds a slot. The frame keeps the slots alive: when a node stops, its rebuilds (which wait for
+  // loads) are destroyed after the cache, and destroying this frame must then not touch the cache.
+  auto slots = this->slots;
+  while (slots->running >= slots->limit) {
     ++loadWaits;
     auto turn = kj::newPromiseAndFulfiller<void>();
-    waiting.push_back(kj::mv(turn.fulfiller));
+    slots->waiting.push_back(kj::mv(turn.fulfiller));
     co_await turn.promise;
   }
-  ++loading;
+  ++slots->running;
   KJ_DEFER({
-    --loading;
-    auto woken = std::move(waiting);
-    waiting.clear();
+    --slots->running;
+    auto woken = std::move(slots->waiting);
+    slots->waiting.clear();
     for (auto& next : woken) if (next->isWaiting()) next->fulfill();
   });
   GroupedDecode decoded;
