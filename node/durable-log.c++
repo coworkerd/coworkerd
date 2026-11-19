@@ -2502,7 +2502,8 @@ void DurableLog::retirePeer(PeerStream& peer) {
   peer.queue.clear();
   peer.queuedBytes = peer.inFlightBytes = 0;
   peer.firstSeq = peer.ackedSeq = peer.sentSeq = 0;
-  peer.fencedSeqs.clear();
+  peer.refusedSeqs.clear();
+  peer.fullRetries.clear();
 }
 
 // One scheduler per peer, independent of business writes. A confirmed but unsealed tail also needs replication
@@ -2545,6 +2546,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
     peer.queue.pop_front();
     const auto size = item.bytes.size();
     const auto sequence = item.sequence;
+    const bool partial = item.partial;
     peer.queuedBytes -= std::min(peer.queuedBytes, uint64_t(size));
     if (isolated.contains(item.sequence)) continue;
     peer.inFlightBytes += size;
@@ -2554,7 +2556,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
     const auto session = peer.session;
     auto& sink = KJ_ASSERT_NONNULL(peer.sink);
     tasks.add(sink->value->append(std::move(item.bytes), item.partial)
-                  .then([this, nodeId, session, size, sequence](PeerSink::Accepted accepted) {
+                  .then([this, nodeId, session, size, sequence, partial](PeerSink::Accepted accepted) {
       auto* current = currentPeer(nodeId, session);
       if (current == nullptr) return;
       current->inFlightBytes -= std::min(current->inFlightBytes, uint64_t(size));
@@ -2562,20 +2564,36 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         ++refusals;
         ++current->refusals;
         current->lastRefusal = accepted.refusal;
-        if (accepted.refusal.find("fenced") != std::string::npos) {
-          ++fencedRecords;
-          // r48: a record the peer refused as fenced never counts as held there (checkConfirmations).
-          current->fencedSeqs.insert(sequence);
+        if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
+        // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
+        // peer takes it; a full buffer is tried again on this session after a growing wait.
+        current->refusedSeqs.insert(sequence);
+        if (accepted.refusal.starts_with("full")) {
+          auto& retry = current->fullRetries[sequence];
+          if (!retry.pending && retry.attempts < FULL_RETRIES) {
+            retry.pending = true;
+            const auto waitMs = uint64_t(FULL_RETRY_FIRST_MS) << retry.attempts++;
+            tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, nodeId, session, sequence]() {
+              retryRefused(nodeId, session, sequence);
+            }));
+          }
         }
-        log("peer-refused", "\"peer\":" + quote(nodeId) + ",\"reason\":" + quote(accepted.refusal));
+        log("peer-refused", "\"peer\":" + quote(nodeId) + ",\"reason\":" + quote(accepted.refusal) +
+            ",\"seq\":\"" + std::to_string(sequence) + "\"");
         pumpPeer(*current);
         return;
       }
       current->lastRefusal.clear();
       current->lastAckMs = monotonicTimeMs();
       // r48: an answer accounts for its own record and those before it -- not for one sent after it whose own answer,
-      // possibly a refusal, has not come back yet (the peer's highest sequence can come from an earlier stream).
-      onPeerAck(nodeId, std::min(accepted.sequence, sequence));
+      // possibly a refusal, has not come back yet (the peer's highest sequence can come from an earlier stream). A
+      // piece that is not a record's last accounts only for the records before it: the record is held once its last
+      // piece is taken.
+      onPeerAck(nodeId, std::min(accepted.sequence, partial ? sequence - 1 : sequence));
+      if (!partial && !current->refusedSeqs.empty() && current->refusedSeqs.erase(sequence)) {
+        current->fullRetries.erase(sequence);
+        checkConfirmations();
+      }
       pumpPeer(*current);
     }).catch_([this, nodeId, session](kj::Exception&& error) {
       auto* current = currentPeer(nodeId, session);
@@ -2586,6 +2604,18 @@ void DurableLog::pumpPeer(PeerStream& peer) {
               "\",\"error\":" + quote(std::string(error.getDescription().cStr())));
     }).attach(sink.addRef()));
   }
+}
+
+// r48: a record the peer refused because its buffer was full, sent again on the same session while it still waits.
+void DurableLog::retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence) {
+  auto* current = currentPeer(nodeId, session);
+  if (current == nullptr) return;
+  if (auto retry = current->fullRetries.find(sequence); retry != current->fullRetries.end()) retry->second.pending = false;
+  const auto record = records.find(sequence);
+  if (!current->refusedSeqs.contains(sequence) || isolated.contains(sequence) || !inFlight.contains(sequence) ||
+      record == records.end()) return;
+  ++fullRetriesSent;
+  sendOne(*current, sequence, record->second);
 }
 
 // The open floor is captured before awaiting the connection. If sealing moves it meanwhile, discard this
@@ -2683,7 +2713,7 @@ void DurableLog::checkConfirmations() {
       if (currentPeer(peer, found->second.session) == nullptr) continue;
       if (found->second.sink != kj::none && !found->second.broken) ++reachable;
       if (found->second.ackedSeq >= sequence &&
-          (found->second.fencedSeqs.empty() || !found->second.fencedSeqs.contains(sequence))) ++held;
+          (found->second.refusedSeqs.empty() || !found->second.refusedSeqs.contains(sequence))) ++held;
     }
     // A nonempty selected peer list waits when none is reachable. Only an empty list uses the local disk.
     const auto want = std::min(configured, reachable);
@@ -6870,24 +6900,48 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // request is believed only once the object store shows that epoch: an epoch object is created by the node that takes
 // the shard, only if absent, so every owner of a lower epoch has been replaced, and the newest owner, whose epoch is
 // at least this one, is never fenced by it. The answer is computed after the raise: an append taken before it is in
-// the answer; one after it is refused. A request this node cannot check (store error,
-// no such object, an object that is another epoch) is answered as before and raises nothing; the floor only grows.
+// the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
+// object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
+// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
   if (ask.shardEpoch <= knownEpoch(ask.namespaceId, ask.shard)) co_return;
-  ++peerFenceChecks;
+  const auto now = timer.now();
+  for (auto it = fenceChecks.begin(); it != fenceChecks.end();)
+    it = it->second.settled && now - it->second.at >= int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS ? fenceChecks.erase(it)
+                                                                                                    : std::next(it);
+  const auto key = std::make_tuple(ask.namespaceId, ask.shard, ask.shardEpoch);
+  auto found = fenceChecks.find(key);
+  // A check of this epoch that failed within OWNER_REREAD_MS: answered at once, as before (a background read follows).
+  if (found != fenceChecks.end() && found->second.settled) co_return;
+  if (found == fenceChecks.end()) {
+    ++peerFenceChecks;
+    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, false).fork();
+    found = fenceChecks.emplace(key, FenceCheck{kj::mv(check), now, false}).first;
+  }
+  co_await found->second.done.addBranch();
+  // Settled: kept for OWNER_REREAD_MS (a failure is not read again meanwhile; a success is past the early return).
+  if (auto settled = fenceChecks.find(key); settled != fenceChecks.end() && !settled->second.settled) {
+    settled->second.settled = true;
+    settled->second.at = timer.now();
+  }
+}
+
+// The read behind raisePeerFence, shared by every request of the same epoch of the shard meanwhile. A success raises
+// the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, then read once more in the
+// background, so that the floor goes up soon after the store answers again.
+kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, bool background) {
   std::string failure;
   try {
     const auto waitMs = std::max<uint32_t>(1, settings.peerTimeoutMs / 2);
     auto object = co_await timer.timeoutAfter(waitMs * kj::MILLISECONDS,
-        store->get(shardEpochKey(ask.namespaceId, ask.shard, ask.shardEpoch)));
+        store->get(shardEpochKey(namespaceId, shard, epoch)));
     if (object.status == 200) {
       const auto record = parseShardEpoch(object.bytes);
-      if (record && record->epoch == ask.shardEpoch && record->namespaceId == ask.namespaceId &&
-          record->shard == ask.shard) {
-        if (ask.shardEpoch > knownEpoch(ask.namespaceId, ask.shard)) {
+      if (record && record->epoch == epoch && record->namespaceId == namespaceId && record->shard == shard) {
+        if (epoch > knownEpoch(namespaceId, shard)) {
           ++peerFenceRaises;
-          fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a newer epoch of the shard asked for a tail", true);
+          fenceOwner(namespaceId, shard, epoch - 1, "a newer epoch of the shard asked for a tail", true);
         }
         co_return;
       }
@@ -6899,8 +6953,14 @@ kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
     failure = error.getDescription().cStr();
   }
   ++peerFenceUnverified;
-  log("peer-fence-unverified", "\"namespaceId\":" + quote(ask.namespaceId) + ",\"shard\":" + std::to_string(ask.shard) +
-      ",\"shardEpoch\":\"" + std::to_string(ask.shardEpoch) + "\",\"reason\":" + quote(failure));
+  log("peer-fence-unverified", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+      ",\"shardEpoch\":\"" + std::to_string(epoch) + "\",\"background\":" + (background ? "true" : "false") +
+      ",\"reason\":" + quote(failure));
+  if (background) co_return;
+  tasks.add(timer.afterDelay(int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS).then([this, namespaceId, shard, epoch]() {
+    return epoch > knownEpoch(namespaceId, shard) ? checkPeerFence(namespaceId, shard, epoch, true)
+                                                  : kj::Promise<void>(kj::READY_NOW);
+  }));
 }
 
 DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote, size_t pageBytes) {
@@ -7184,6 +7244,7 @@ std::string DurableLog::json() const {
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
       << fencedRecords << ",\"peerFenceChecks\":" << peerFenceChecks << ",\"peerFenceRaises\":" << peerFenceRaises
       << ",\"peerFenceUnverified\":" << peerFenceUnverified << ",\"ownerFences\":" << ownerFenceThrough.size()
+      << ",\"fullRetriesSent\":" << fullRetriesSent
       << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
   first = true;
   for (const auto& [streamId, buffer] : incoming) {

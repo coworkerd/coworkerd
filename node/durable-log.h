@@ -430,6 +430,7 @@ public:
   // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
   // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
   kj::Promise<void> raisePeerFence(DurableTailAsk ask);
+  static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
       std::string* refusal = nullptr);
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
@@ -586,9 +587,14 @@ private:
     double openedAtMs = 0, lastAckMs = 0, attemptedAtMs = 0;
     std::deque<Queued> queue;
     uint64_t inFlightBytes = 0, queuedBytes = 0;
-    // r48: the records this session's peer refused as fenced. An answer to a later append carries the peer's highest
-    // sequence, which can be above them (an older peer does not hold its answers below them): they never count as held.
-    std::set<uint64_t> fencedSeqs;
+    // r48: the records this session's peer refused, for any reason, and has not taken since. An answer to a later
+    // append carries the peer's highest sequence, which can be above them: a record counts as held by a peer only
+    // when the peer took it -- the answer to its last (or only) piece.
+    std::set<uint64_t> refusedSeqs;
+    // r48: a record refused because the peer's buffer was full is sent again on the same session after a growing
+    // wait (FULL_RETRY_FIRST_MS, doubled, at most FULL_RETRIES times) until it is taken or no longer waits.
+    struct Retry { uint32_t attempts = 0; bool pending = false; };
+    std::map<uint64_t, Retry> fullRetries;
   };
   // What this node buffers for one owner it is a peer of.
   struct PeerBuffer {
@@ -603,7 +609,9 @@ private:
     void forgetPosition(uint64_t sequence);
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
     // r48: records refused as fenced that no drop or trim has covered. The sequence answered stays below the lowest of
-    // them, so no later record of the owner makes the refused one count as held.
+    // them, so no later record makes the refused one count as held at an owner that reads the answers cumulatively
+    // (one without r48). Only the fence holds answers back: a full buffer does not, or one refusal would stall every
+    // later record of the stream until the owner gives the refused one up.
     std::set<uint64_t> fencedSeqs;
     uint64_t answeredSeq() const {
       return fencedSeqs.empty() ? acceptedSeq : std::min(acceptedSeq, *fencedSeqs.begin() - 1);
@@ -711,6 +719,16 @@ private:
   void fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through,
       const std::string& reason, bool notifyShard);
   kj::Promise<void> openPeer(std::string nodeId);
+  void retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence);
+  // r48: one read of a shard epoch's object at a time for each (namespace, shard, epoch); a failure is kept for
+  // OWNER_REREAD_MS (the tail is answered at once meanwhile) and read once more in the background.
+  struct FenceCheck {
+    kj::ForkedPromise<void> done;
+    kj::TimePoint at;
+    bool settled = false;
+  };
+  std::map<std::tuple<std::string, uint32_t, uint64_t>, FenceCheck> fenceChecks;
+  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, bool background);
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {
@@ -1015,7 +1033,7 @@ private:
   uint64_t ownerLogUnavailableRecoveries = 0;
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
-  uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0;
+  uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0, fullRetriesSent = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;

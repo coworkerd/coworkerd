@@ -317,8 +317,7 @@ struct DurableLogChannelTest {
   // r48: a peer that answers a newer epoch's tail request raises its floor for the shard (results/r45/DESIGN.md 10.4).
   // "raise": a verified newer epoch fences older appends; what was held stays and is answered; the sequence answered
   // stays below the refused record until the owner drops it. "unverified": numbers the store does not show raise
-  // nothing, and the real newer owner still gets in. "old-ask": an older request lowers nothing. "owner-refused": on
-  // the owner, a record a peer refused as fenced never counts as held, whatever later answers say.
+  // nothing, and the real newer owner still gets in. "old-ask": an older request lowers nothing.
   static void peerFence(const char* scenario) {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-peer-fence-test-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
@@ -332,10 +331,6 @@ struct DurableLogChannelTest {
     const std::string_view name(scenario);
     const std::string ns(64, '1');
     auto objectName = [&](unsigned n) { return ns + "/" + std::string(63, '2') + char('0' + n); };
-    if (name == "owner-refused") {
-      ownerRefused(io, clock, store, temp, ns);
-      return;
-    }
     MembershipView membership;
     membership.heldEpochs.insert("9");
     DurableLog log({"peer", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
@@ -428,22 +423,110 @@ struct DurableLogChannelTest {
       auto tail = log.tailFor(ask(3));
       KJ_REQUIRE(!tail.refusal.empty(), "an older epoch gets no tail once a newer one asked");
       KJ_REQUIRE(append(1, 1, 4).refusal.starts_with("fenced"), "an append below the floor stays refused");
+    } else if (name == "coalesce") {
+      // The store does not show epoch 6 yet: requests of it meanwhile share one read, a failure is kept for a
+      // second (answered at once, no read), and a background read raises the floor once the store shows it.
+      auto first = log.raisePeerFence(ask(6));
+      auto second = log.raisePeerFence(ask(6));
+      first.wait(io.waitScope);
+      second.wait(io.waitScope);
+      KJ_REQUIRE(log.peerFenceChecks == 1 && log.peerFenceUnverified == 1 && log.knownEpoch(ns, 1) == 0,
+          "concurrent requests of one epoch share one read", log.peerFenceChecks, log.peerFenceUnverified);
+      raise(6);
+      KJ_REQUIRE(log.peerFenceChecks == 1 && log.peerFenceUnverified == 1, "a failure is kept for a second");
+      epochObject(1, 6);
+      clock.advanceTo(clock.now() + 1001 * kj::MILLISECONDS);
+      io.waitScope.poll();
+      KJ_REQUIRE(log.knownEpoch(ns, 1) == 6 && log.peerFenceRaises == 1, "the background read raises the floor",
+          log.knownEpoch(ns, 1));
+      // After the second, a new request of an epoch the store does not show is read again.
+      raise(9);
+      KJ_REQUIRE(log.peerFenceChecks == 2 && log.knownEpoch(ns, 1) == 6);
     } else {
       KJ_FAIL_REQUIRE("unknown peer-fence scenario", scenario);
     }
   }
 
+  // r48 sections 6.1-6.2: an owner reads a peer's answer as covering every record up to it. A record the peer refused
+  // -- fenced, its buffer full, or anything else -- must never count as held there unless the peer takes it later.
+  // The rule is the owner's (it knows the record of every call); the peer holds its answers back for the fence only.
+  static LogRecord testRecord(const std::string& ns, uint64_t ownerEpoch, uint64_t seq, uint32_t shard,
+      uint64_t shardEpoch, size_t padding = 0) {
+    LogRecord r;
+    r.nodeEpoch = ownerEpoch; r.nodeSeq = seq; r.shard = shard; r.shardEpoch = shardEpoch;
+    r.objectName = ns + "/" + std::string(63, '2') + char('0' + shard); r.dataEpoch = 1;
+    r.kind = LogRecordKind::RESET; r.txn = seq; r.facetName = std::string(padding, 'p');
+    return r;
+  }
+
+  // Peer side, this node running r48. "fenced" (an owner of the older version, which reads answers cumulatively):
+  // record 1 taken, record 2 refused as fenced, record 3 (another shard) taken -- every answer stays below 2, through
+  // a reconnect too, until a trim covers 2. "full": a full buffer does not hold the answers back (that would stall
+  // every later record of the stream until the owner gives 2 up); the owner of this version does not count 2 anyway.
+  static void refusedPeer(const char* scenario) {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-refused-peer-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    const std::string_view name(scenario);
+    const std::string ns(64, '1');
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    DurableLog log({"peer", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
+        membership, {});
+    log.nodeEpoch = 9;
+    log.settings.config.peerBufferBytes = 32768;
+    uint64_t stream = 0;
+    KJ_REQUIRE(log.openIncoming("owner", 2, "old", "9", 1, stream).empty());
+    uint64_t oldOwnerAcked = 0;  // what an owner without r48 counts: the highest answer it saw
+    auto send = [&](const LogRecord& r) {
+      auto result = log.appendIncoming(stream, frameRecords({encodeLogRecord(r)}));
+      oldOwnerAcked = std::max(oldOwnerAcked, result.accepted);
+      return result;
+    };
+    const auto one = testRecord(ns, 2, 1, 2, 3), three = testRecord(ns, 2, 3, 2, 3), four = testRecord(ns, 2, 4, 2, 3);
+    auto two = testRecord(ns, 2, 2, 1, 3);
+    KJ_REQUIRE(send(one).accepted == 1);
+    if (name == "fenced") {
+      log.fenceOwner(ns, 1, 3, "test", false);
+      KJ_REQUIRE(send(two).refusal.starts_with("fenced"));
+      const auto later = send(three);
+      KJ_REQUIRE(later.refusal.empty() && log.incoming.at(stream).held.contains(3) && later.accepted == 1,
+          "a later record is taken, but the answer must not reach the refused one", later.accepted);
+      uint64_t again = 0;
+      KJ_REQUIRE(log.openIncoming("owner", 2, "old", "9", 1, again).empty() && again == stream);
+      KJ_REQUIRE(send(one).accepted == 1 && send(three).accepted == 1 && send(two).refusal.starts_with("fenced"),
+          "after a reconnect");
+      KJ_REQUIRE(oldOwnerAcked < 2, "an owner reading the answers cumulatively would count the refused record");
+      log.trimIncoming(stream, 2);
+      KJ_REQUIRE(send(four).accepted == 4, "a trim covering the refused record releases the answer");
+    } else if (name == "full") {
+      two.facetName = std::string(40000, 'p');
+      KJ_REQUIRE(send(two).refusal.starts_with("full"));
+      const auto later = send(three);
+      KJ_REQUIRE(later.refusal.empty() && later.accepted == 3 && log.incoming.at(stream).fencedSeqs.empty(),
+          "a full buffer does not hold the answers back", later.accepted);
+    } else {
+      KJ_FAIL_REQUIRE("unknown refused-peer scenario", scenario);
+    }
+  }
+
   struct FakeSink final: DurableLog::PeerSink {
     struct Call {
-      uint64_t sequence = 0;
+      uint64_t sequence = 0;  // 0: a piece that does not begin the record
+      bool partial = false;
       kj::Own<kj::PromiseFulfiller<Accepted>> fulfiller;
     };
     explicit FakeSink(std::deque<Call>& calls): calls(calls) {}
-    kj::Promise<Accepted> append(std::string records, bool) override {
-      auto split = splitRecords(records);
-      KJ_REQUIRE(split.size() == 1);
+    kj::Promise<Accepted> append(std::string records, bool partial) override {
+      uint64_t sequence = 0;
+      if (records.size() >= 13 && records[4] >= 1 && records[4] <= 4)
+        for (int i = 0; i < 8; ++i) sequence |= uint64_t(uint8_t(records[5 + i])) << (8 * i);
       auto paf = kj::newPromiseAndFulfiller<Accepted>();
-      calls.push_back({decodeLogRecord(split[0])->nodeSeq, kj::mv(paf.fulfiller)});
+      calls.push_back({sequence, partial, kj::mv(paf.fulfiller)});
       return kj::mv(paf.promise);
     }
     kj::Promise<void> trim(uint64_t) override { return kj::READY_NOW; }
@@ -451,19 +534,71 @@ struct DurableLogChannelTest {
     std::deque<Call>& calls;
   };
 
-  // The owner sends records 1, 2, 3 (three objects) to its one peer. The peer, an older version without r48, answers
-  // 1 with its highest sequence (3), refuses 2 as fenced, and takes 3 (answering 3). Only 1 and 3 may be confirmed.
-  static void ownerRefused(kj::AsyncIoContext& io, kj::TimerImpl& clock, const ObjectStoreConfig& store,
-      const std::string& temp, const std::string& ns) {
+  // A peer in this process for the "pair" scenarios: the real append path of another DurableLog (r48 on both ends).
+  struct LocalSink final: DurableLog::PeerSink {
+    LocalSink(DurableLog& peer, uint64_t stream): peer(peer), stream(stream) {}
+    kj::Promise<Accepted> append(std::string records, bool partial) override {
+      auto result = peer.appendIncoming(stream, records, partial);
+      return Accepted{result.accepted, result.refusal};
+    }
+    kj::Promise<void> trim(uint64_t upTo) override { peer.trimIncoming(stream, upTo); return kj::READY_NOW; }
+    kj::Promise<void> drop(std::vector<uint64_t> sequences) override {
+      peer.dropIncoming(stream, sequences);
+      return kj::READY_NOW;
+    }
+    DurableLog& peer;
+    uint64_t stream;
+  };
+
+  // Owner side, this node running r48. "<reason>" and "<reason>-reconnect" (reason: fenced, full, cut-short, limit,
+  // corrupt), with a peer of the older version that answers with its highest sequence: records 1, 2, 3 (three
+  // objects) go out; the peer answers 1 with 3, refuses 2 for the reason and takes 3. Only 1 and 3 may be confirmed;
+  // with "-reconnect" the session is then replaced and everything sent again, the peer answering as before. A full
+  // buffer is tried again on the same session after FULL_RETRY_FIRST_MS: taken then, 2 is confirmed. "chunk": record
+  // 2 is larger than APPEND_CHUNK_BYTES, its first piece answered with 3 and its last refused as fenced: 2 must not
+  // count from its first piece's answer. "pair-full", "pair-fenced": the peer is a real r48 DurableLog, its buffer too
+  // small for 2, or its floor above 2's shard epoch. Full: 3 is confirmed at once, 2 after a retry once the buffer
+  // has room. Fenced: the peer holds its answers back, 3 waits until the owner gives 2 up (the stream is opened again
+  // without it), then 3 is confirmed.
+  static void refusedOwner(const char* scenario) {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-refused-owner-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    const auto peerTemp = temp + "/peer";
+    std::filesystem::create_directories(peerTemp);
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    ObjectStoreConfig peerStore = store;
+    peerStore.directory = peerTemp;
+    std::string name(scenario);
+    const bool reconnect = name.ends_with("-reconnect");
+    if (reconnect) name.resize(name.size() - 10);
+    const bool pair = name.starts_with("pair-"), chunk = name == "chunk";
+    const std::string ns(64, '1');
     MembershipView membership;
     membership.epoch = "1";
-    Member peer;
-    peer.id = "peer"; peer.address = "unused:1"; peer.epoch = "5"; peer.startedAtUnixMs = 1; peer.durableProcesses = 1;
-    membership.members["peer"] = peer;
+    Member member;
+    member.id = "peer"; member.address = "unused:1"; member.epoch = "5"; member.startedAtUnixMs = 1;
+    member.durableProcesses = 1;
+    membership.members["peer"] = member;
+    MembershipView peerMembership;
+    peerMembership.heldEpochs.insert("5");
+    DurableLog peer({"peer", "instance", peerTemp, {}}, peerStore, io.provider->getNetwork(), clock,
+        *io.lowLevelProvider, peerMembership, {});
+    peer.nodeEpoch = 5;
+    peer.settings.config.peerBufferBytes = 32768;
     std::deque<FakeSink::Call> calls;
+    uint32_t opened = 0;
     DurableLog::Hooks hooks;
-    hooks.openStream = [&](std::string, uint64_t, uint64_t) -> kj::Promise<kj::Own<DurableLog::PeerSink>> {
-      return kj::Own<DurableLog::PeerSink>(kj::heap<FakeSink>(calls));
+    hooks.openStream = [&](std::string, uint64_t ownerEpoch, uint64_t firstSeq)
+        -> kj::Promise<kj::Own<DurableLog::PeerSink>> {
+      ++opened;
+      if (!pair) return kj::Own<DurableLog::PeerSink>(kj::heap<FakeSink>(calls));
+      uint64_t stream = 0;
+      KJ_REQUIRE(peer.openIncoming("node", ownerEpoch, "instance", "5", firstSeq, stream).empty());
+      return kj::Own<DurableLog::PeerSink>(kj::heap<LocalSink>(peer, stream));
     };
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, std::move(hooks));
@@ -482,20 +617,22 @@ struct DurableLogChannelTest {
       object.objectName = host;
       object.state = DurableLog::ObjectState::LOCAL;
       object.shardEpoch = 1;
+      object.shard = uint32_t(c - '0');  // three shards: a fence of one leaves the others
       std::filesystem::create_directories(object.positionPath(temp).parent_path());
       hosts.push_back(host);
     }
+    if (name == "pair-fenced") peer.fenceOwner(ns, log.objects.at(hosts[1]).shard, 1, "test", false);
     for (size_t i = 0; i < hosts.size(); ++i) {
       LogRecord record;
       record.kind = LogRecordKind::RESET;
       record.objectName = hosts[i];
       record.storageId = log.objects.at(hosts[i]).storageId;
       record.dataEpoch = 1;
+      if (i == 1 && name == "pair-full") record.facetName = std::string(40000, 'p');  // too large for the peer
+      if (i == 1 && chunk) record.frameBytes = std::string(5u << 20, 'f');  // two pieces
       log.takeRecord(channel, std::move(record), 101 + i);
     }
     io.waitScope.poll();
-    KJ_REQUIRE(calls.size() == 3 && calls[0].sequence == 1 && calls[2].sequence == 3, "the backlog went to the peer",
-        calls.size());
     std::map<uint64_t, uint8_t> acks;
     auto answers = [&]() {
       io.waitScope.poll();
@@ -515,16 +652,89 @@ struct DurableLogChannelTest {
       }
       return acks;
     };
-    calls[0].fulfiller->fulfill({3, ""});
-    answers();
-    KJ_REQUIRE(log.confirmations == 1 && acks.contains(101) && !acks.contains(102),
-        "an answer to record 1 must not account for record 2, whose own answer has not come", log.confirmations);
-    calls[1].fulfiller->fulfill({1, "fenced: this node knows a newer epoch of the shard"});
-    calls[2].fulfiller->fulfill({3, ""});
-    answers();
-    KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
-        log.inFlight.contains(2) && log.fencedRecords == 1,
-        "a record the peer refused as fenced must never count as held there", log.confirmations);
+    auto later = [&](int64_t ms) {
+      clock.advanceTo(clock.now() + ms * kj::MILLISECONDS);
+      answers();
+    };
+    if (name == "pair-full") {
+      answers();
+      KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
+          log.inFlight.contains(2), "record 2 refused (full) is not counted; 3 is not held up", log.confirmations);
+      peer.settings.config.peerBufferBytes = 1u << 20;
+      later(DurableLog::FULL_RETRY_FIRST_MS);
+      KJ_REQUIRE(log.confirmations == 3 && acks.at(102) == 0 && log.fullRetriesSent == 1 && opened == 1,
+          "record 2, sent again on the same session and taken, is confirmed", log.confirmations);
+    } else if (name == "pair-fenced") {
+      answers();
+      KJ_REQUIRE(log.confirmations == 1 && acks.at(101) == 0 && !acks.contains(102) && !acks.contains(103),
+          "the peer holds its answers back below the fenced record", log.confirmations);
+      // The write of record 2 is given up (what confirmTimeoutMs does): isolated, dropped, the stream opened again.
+      log.isolateObjectPending(log.objects.at(hosts[1]), "test: not confirmed in time");
+      log.peers.at("peer").attemptedAtMs = 0;
+      log.drivePeers();
+      answers();
+      KJ_REQUIRE(opened == 2 && acks.at(102) != 0 && acks.at(103) == 0 && log.confirmations == 2 && log.inFlight.empty(),
+          "after record 2 is dropped, record 3 is confirmed", opened, log.confirmations);
+    } else if (chunk) {
+      KJ_REQUIRE(calls.size() == 4 && calls[1].sequence == 2 && calls[1].partial && !calls[2].partial &&
+          calls[3].sequence == 3, "record 2 went in two pieces", calls.size());
+      calls[0].fulfiller->fulfill({3, ""});
+      calls[1].fulfiller->fulfill({3, ""});
+      answers();
+      KJ_REQUIRE(log.confirmations == 1 && !acks.contains(102), "the answer to a record's first piece does not hold "
+          "the record", log.confirmations);
+      calls[2].fulfiller->fulfill({3, "fenced: this node knows a newer epoch of the shard"});
+      calls[3].fulfiller->fulfill({3, ""});
+      answers();
+      KJ_REQUIRE(log.confirmations == 2 && !acks.contains(102) && acks.at(103) == 0 && log.inFlight.contains(2));
+    } else {
+      const std::string reason = name == "fenced" ? "fenced: this node knows a newer epoch of the shard" :
+          name == "full" ? "full: this node buffers durableObjects.peerBufferBytes for the owners it is a peer of" :
+          name == "cut-short" ? "the records are cut short: a record is cut short" :
+          name == "limit" ? "a record exceeds the recoverable RPC limit" :
+          name == "corrupt" ? "a record does not add up: checksum" : "";
+      KJ_REQUIRE(!reason.empty(), "unknown refused-owner scenario", scenario);
+      KJ_REQUIRE(calls.size() == 3 && calls[0].sequence == 1 && calls[2].sequence == 3, "the backlog went to the peer",
+          calls.size());
+      calls[0].fulfiller->fulfill({3, ""});
+      answers();
+      KJ_REQUIRE(log.confirmations == 1 && acks.contains(101) && !acks.contains(102),
+          "an answer to record 1 must not account for record 2, whose own answer has not come", log.confirmations);
+      calls[1].fulfiller->fulfill({1, reason});
+      calls[2].fulfiller->fulfill({3, ""});
+      answers();
+      KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
+          log.inFlight.contains(2), "a record the peer refused must never count as held there", scenario,
+          log.confirmations);
+      if (reconnect) {
+        // The session is replaced (a broken connection): everything not sealed goes out again; the older peer
+        // answers record 1 with its highest sequence before its refusal of 2 comes back.
+        calls.clear();
+        log.retirePeer(log.peers.at("peer"));
+        log.peers.at("peer").attemptedAtMs = 0;
+        log.drivePeers();
+        io.waitScope.poll();
+        KJ_REQUIRE(opened == 2 && calls.size() == 3 && calls[1].sequence == 2, calls.size());
+        calls[0].fulfiller->fulfill({3, ""});
+        answers();
+        KJ_REQUIRE(log.confirmations == 2 && !acks.contains(102), "after a reconnect an old answer covers nothing new");
+        calls[1].fulfiller->fulfill({3, reason});
+        calls[2].fulfiller->fulfill({3, ""});
+        answers();
+        KJ_REQUIRE(log.confirmations == 2 && !acks.contains(102) && log.inFlight.contains(2),
+            "a record refused again after a reconnect is not held", scenario);
+      } else if (name == "full") {
+        // Tried again on the same session after FULL_RETRY_FIRST_MS; taken this time.
+        later(DurableLog::FULL_RETRY_FIRST_MS);
+        KJ_REQUIRE(calls.size() == 4 && calls[3].sequence == 2 && log.fullRetriesSent == 1, calls.size());
+        calls[3].fulfiller->fulfill({3, ""});
+        answers();
+        KJ_REQUIRE(log.confirmations == 3 && acks.at(102) == 0, "the record taken on its retry is confirmed");
+      } else {
+        later(10 * DurableLog::FULL_RETRY_FIRST_MS);
+        KJ_REQUIRE(calls.size() == 3 && log.fullRetriesSent == 0, "only a full buffer is tried again");
+      }
+    }
     log.closeChannel("d0");
   }
 
@@ -653,5 +863,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "lease-tracker") coworkerd::DurableLogChannelTest::leaseTracker();
   else if (mode == "lease-confirm") coworkerd::DurableLogChannelTest::leaseConfirm(argc == 3 ? argv[2] : "");
   else if (mode == "peer-fence") coworkerd::DurableLogChannelTest::peerFence(argc == 3 ? argv[2] : "");
+  else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
+  else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
 }
