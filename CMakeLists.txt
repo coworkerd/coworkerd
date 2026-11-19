@@ -185,10 +185,15 @@ target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
-foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
+add_executable(coworkerd-config-test EXCLUDE_FROM_ALL common/config-test.c++)
+target_link_libraries(coworkerd-config-test PRIVATE common)
+add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
+add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
+add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
 set(COWORKERD_TEST_JUNIT "" CACHE FILEPATH "Optional JUnit result path for the check target")
 set(COWORKERD_TEST_REPORT_ARGS)
 if(COWORKERD_TEST_JUNIT)
@@ -196,13 +201,30 @@ if(COWORKERD_TEST_JUNIT)
 endif()
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
-  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test coworkerd-config-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.
 find_program(COWORKERD_TEST_NODE NAMES node)
 if(NOT COWORKERD_TEST_NODE)
   set(COWORKERD_TEST_NODE node)
+endif()
+# A configured patched Workerd is external to the CMake targets. This component
+# starts a single process on a loopback port, with no node, control plane, or storage.
+if(COWORKERD_TEST_WORKERD)
+  if(NOT EXISTS "${COWORKERD_TEST_WORKERD}")
+    message(FATAL_ERROR "COWORKERD_TEST_WORKERD does not exist: ${COWORKERD_TEST_WORKERD}")
+  endif()
+  add_test(NAME workerd-configuration COMMAND "${COWORKERD_TEST_NODE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/node/workerd-configuration.test.mjs" "${COWORKERD_TEST_WORKERD}")
+  set_tests_properties(workerd-configuration PROPERTIES TIMEOUT 15)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME node-child-memory COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/node-child-memory.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
+    set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
+    add_dependencies(check coworkerd)
+  endif()
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")

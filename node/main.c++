@@ -2,6 +2,7 @@
 #include "tenant-execution.h"
 #include "event-loop.h"
 #include "trial-verdict.h"
+#include "placement-contract.h"
 #include "reasons.h"
 #include "r47-trace.h"
 #include "background-value.h"
@@ -452,9 +453,9 @@ bool pausedRefusal(const InvocationRejection& refusal) {
 
 // A load failure is the version's own and the same everywhere -- except a code package
 // this Server could not get or verify, which another Server (another cache) may have.
-constexpr const char* PACKAGE_UNAVAILABLE = "package-unavailable";
+using coworkerd::PACKAGE_UNAVAILABLE;
 bool rerouteAfter(const InvocationRejection& refusal) {
-  return refusal.code != "RESULT_UNCERTAIN" && refusal.code != "PROCESS_MEMORY_PRESSURE" && (refusal.code != "LOAD_FAILED" || refusal.category == PACKAGE_UNAVAILABLE);
+  return refusal.code != "PROCESS_MEMORY_PRESSURE" && coworkerd::placementRetryable(refusal.code, refusal.category);
 }
 
 uint64_t preparationLargeBudget(uint32_t heapMiB) {
@@ -1217,22 +1218,9 @@ public:
   }
 
   std::vector<std::string> candidates(const std::string& workerId) const {
-    std::vector<std::string> ids;
-    bool self = false;
-    // A member that announced its exit takes no new work. This Server, once draining,
-    // ranks after every other candidate: only the trees it still runs place work here, and
-    // only when no other Server takes it.
-    // (objectStore) So does this Server once its epoch expired by its own clock: the others drop it; it still serves
-    // the calls at its ingress when no other member takes them, and the calls from the others addressed to an epoch
-    // it held.
-    const bool lastResort = this->lastResort();
-    for (const auto& [id, member] : membership.view().members) {
-      if (id == serverConfig.serverId && lastResort) self = true;
-      else if (id == serverConfig.serverId || member.state != "draining") ids.push_back(id);
-    }
-    auto order = coworkerd::rendezvousOrder(workerId, ids);
-    if (self) order.push_back(serverConfig.serverId);
-    return order;
+    // Draining peers take no new work. If we are draining or our epoch expired,
+    // rank this node last so the trees and ingress it still serves can finish.
+    return coworkerd::rankPlacementMembers(workerId, membership.view().members, serverConfig.serverId, lastResort());
   }
 
   // This Server places work on itself only when no other member takes it: draining, or its epoch expired by its own
@@ -1577,18 +1565,22 @@ public:
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return std::optional<InvocationRejection>(std::move(value));
     };
-    if (remainingLeaseMs(deadline) == 0) {
+    const auto initial = coworkerd::initialPlacementAdmission(remainingLeaseMs(deadline), inFlightRoots,
+        inFlightNested, reserved, root, serverConfig.rootLimit, serverConfig.nestedLimit);
+    if (initial == coworkerd::InitialPlacementAdmission::Expired) {
       if (record) rejectExpiredLease("lease expired before admission");
       return rejected("LEASE_EXPIRED", "lease expired before admission", 410);
     }
-    if (inFlightRoots + inFlightNested - (reserved ? 1 : 0) >= (root ? serverConfig.rootLimit : serverConfig.nestedLimit))
+    if (initial == coworkerd::InitialPlacementAdmission::Saturated)
       return rejected("OVERLOADED", "concurrency limit reached");
     if (auto limit = root ? serverConfig.tenantRootLimit : serverConfig.tenantNestedLimit; checkTenant && limit) {
       auto found = tenantAdmissions.find(admissionTenant(worker, durable));
       if (found != tenantAdmissions.end()) {
         const auto count = found->second.active(root);
         KJ_ASSERT(!reserved || count > 0, "reserved admission must belong to the same tenant");
-        if (coworkerd::tenantAtLimit(count, limit, reserved)) {
+        if (coworkerd::tenantAdmission(count, limit, reserved, inFlightRoots, inFlightNested,
+                root ? serverConfig.rootLimit : serverConfig.nestedLimit,
+                serverConfig.tenantBorrowBelowPercent) == coworkerd::TenantAdmission::Refused) {
           auto value = refusal("OVERLOADED", "tenant ingress concurrency limit reached", 503, root);
           value.inFlight = count;
           value.limit = limit;
@@ -1603,10 +1595,9 @@ public:
       }
     }
     const auto band = memory.effectiveBand();
-    if (checkMemoryBand && (!root || forwardedRoot) && (band == "red" ||
-        (band == "yellow" && !(durable ? runtime.durableHot(hash) : hot(hash)))))
-      return rejected("LOAD_BAND_REJECTED", band == "red" ?
-          (forwardedRoot ? "red band rejects forwarded roots" : "red band rejects nested invocations") : "yellow band rejects cold version");
+    if (const auto* reason = coworkerd::placementBandRefusal(checkMemoryBand, root, forwardedRoot, band,
+        [&] { return durable ? runtime.durableHot(hash) : hot(hash); }))
+      return rejected("LOAD_BAND_REJECTED", reason);
     if (!checkProcess || (durable ? runtime.durableAvailable(durable->key()) : runtime.available(worker))) return std::nullopt;
     if (!durable) if (const auto limited = runtime.tenantExecutionLimit(worker)) {
       auto value = refusal("OVERLOADED", PROCESS_TENANT_REASON, 503, root);
@@ -1772,6 +1763,8 @@ public:
     auto found = tenantAdmissions.find(admissionTenant(worker, durable));
     KJ_ASSERT(found != tenantAdmissions.end());
     ++(root ? found->second.rootRejections : found->second.nestedRejections);
+    if (serverConfig.tenantBorrowBelowPercent != 0)
+      ++(root ? found->second.rootBusyRejections : found->second.nestedBusyRejections);
   }
 
   std::shared_ptr<AdmissionSlot> reserve(bool root, const std::string& worker, const DurableTarget* durable = nullptr) {
@@ -1865,7 +1858,7 @@ public:
   std::string tenantAdmissionJson() const {
     std::ostringstream out;
     out << "{\"rootLimit\":" << serverConfig.tenantRootLimit << ",\"nestedLimit\":" << serverConfig.tenantNestedLimit
-        << ",\"tenants\":[";
+        << ",\"borrowBelowPercent\":" << serverConfig.tenantBorrowBelowPercent << ",\"tenants\":[";
     bool first = true;
     for (const auto& [id, count] : tenantAdmissions) {
       if (count.empty()) continue;
@@ -1873,7 +1866,11 @@ public:
       first = false;
       out << "{\"tenant\":\"" << jsonEscape(id) << "\",\"inFlight\":{\"roots\":" << count.roots
           << ",\"nested\":" << count.nested << "},\"rejections\":{\"roots\":" << count.rootRejections
-          << ",\"nested\":" << count.nestedRejections << "}}";
+          << ",\"nested\":" << count.nestedRejections
+          << "},\"borrowed\":{\"roots\":" << count.borrowed(true, serverConfig.tenantRootLimit)
+          << ",\"nested\":" << count.borrowed(false, serverConfig.tenantNestedLimit)
+          << "},\"busyRejections\":{\"roots\":" << count.rootBusyRejections
+          << ",\"nested\":" << count.nestedBusyRejections << "}}";
     }
     out << "]}";
     return out.str();
@@ -4952,24 +4949,20 @@ public:
     // others, then itself.
     const bool lastResort = server.lastResort();
     const bool selfRanked = std::find(ranked.begin(), ranked.end(), config.serverId) != ranked.end();
-    std::vector<std::string> ordered;
-    if (!home.empty()) ordered.push_back(home);
-    if (!lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
-    for (const auto& id : ranked) if (id != home && id != config.serverId) ordered.push_back(id);
-    if (lastResort && home != config.serverId && selfRanked) ordered.push_back(config.serverId);
+    auto ordered = coworkerd::placementOrder(ranked, config.serverId, lastResort, home, selfRanked);
     if (forwarded) *forwarded = false;
     auto avoidedHome = avoidance.find(home);
     bool homeFailed = avoidedHome != avoidance.end() && avoidedHome->second.until > monotonicTimeMs();
-    bool localFirst = !lastResort && selfRanked &&
-        server.hot(version->definitionHash) &&
-        !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot,
-            allocation.expiresAtMonotonicMs, false, false, nullptr, false, true, true, false);
+    bool localFirst = coworkerd::chooseHotLocalPlacement(lastResort, selfRanked,
+        [&] { return server.hot(version->definitionHash); }, [&] {
+          return !server.admission(version->workerId, version->definitionHash, allocation.ingressRoot,
+              allocation.expiresAtMonotonicMs, false, false, nullptr, false, true, true, false);
+        });
     if (localFirst && home != config.serverId && server.drawHome()) {
       localFirst = false; server.decision("probabilityHome", allocation.ingressRoot);
     } else if (localFirst) {
       server.decision(home == config.serverId ? "localHome" : "localHot", allocation.ingressRoot);
-      ordered.erase(std::remove(ordered.begin(), ordered.end(), config.serverId), ordered.end());
-      ordered.insert(ordered.begin(), config.serverId);
+      coworkerd::prioritizePlacementNode(ordered, config.serverId);
     }
     // The policy point for where a stateless subcall executes (placement.subcalls, docs/architecture.md, section 4):
     // it is given the caller's node -- this one, since a Binding call is allocated where its caller runs -- and the
@@ -4979,8 +4972,7 @@ public:
     if (!allocation.ingressRoot) ordered = server.subcallOrder({config.serverId, version->workerId}, std::move(ordered));
     // Preserve Home -> local -> ranked order within both avoidance partitions.
     // A hot, admitted local version stays first; no candidate is removed.
-    auto first = ordered.begin(); if (localFirst && first != ordered.end()) ++first;
-    std::stable_partition(first, ordered.end(), [this](const auto& id) {
+    coworkerd::orderByPlacementAvoidance(ordered, localFirst, [this](const auto& id) {
       auto found = avoidance.find(id); return found == avoidance.end() || found->second.until <= monotonicTimeMs();
     });
     server.decisionTiming(decisionStart);
@@ -5061,8 +5053,7 @@ public:
     std::optional<InvocationRejection> tenantRefusal;
     std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
-      if (hops == 0) break;
-      --hops;
+      if (!coworkerd::consumePlacementHop(hops)) break;
       InvocationAttempt result;
       const auto startedAt = wallTimeMsForTest();
       if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1);
@@ -5122,11 +5113,8 @@ public:
       } else {
         allTenantLimited = false;
         auto& avoid = avoidance[id];
-        auto delay = std::min(result.failure->avoidMs, config.avoidMaxMs);
-        if (result.connectionFailure) {
-          avoid.failures = std::min<uint32_t>(avoid.failures + 1, 32);
-          delay = std::min<uint64_t>(uint64_t(config.connectBackoffMs) << (avoid.failures - 1), config.avoidMaxMs);
-        } else avoid.failures = 0;
+        const auto delay = coworkerd::advancePlacementAvoidance(avoid.failures, result.failure->avoidMs,
+            result.connectionFailure, config.connectBackoffMs, config.avoidMaxMs);
         avoid.until = monotonicTimeMs() + delay;
       }
       if (attempted < ordered.size() && hops > 0) server.reroute(result.failure->code);
@@ -5154,7 +5142,7 @@ public:
     if (allTenantLimited && tenantRefusal)
       co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
     failures += ']';
-    auto refusal = server.refusal("PLACEMENT_EXHAUSTED", hops == 0 ? "placement hops exhausted" : "all candidates rejected or unavailable", 503, allocation.ingressRoot);
+    auto refusal = server.refusal("PLACEMENT_EXHAUSTED", coworkerd::placementExhaustionReason(hops), 503, allocation.ingressRoot);
     // Preserve explicit pre-execution proof through placement aggregation. A failed
     // connection alone is insufficient evidence that another node did not execute.
     if (attempted > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
@@ -9013,6 +9001,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
       << ",\"tenantRootLimit\":" << c.tenantRootLimit << ",\"tenantNestedLimit\":" << c.tenantNestedLimit
+      << ",\"tenantBorrowBelowPercent\":" << c.tenantBorrowBelowPercent
       << ",\"subcalls\":" << q(c.subcalls)
       << ",\"idleMs\":" << c.idleMs << ",\"homeProbability\":" << shortestNumber(c.homeProbability) << ",\"avoidMaxMs\":" << c.avoidMaxMs
       << ",\"rejectionAvoidMs\":" << c.rejectionAvoidMs << ",\"connectBackoffMs\":" << c.connectBackoffMs

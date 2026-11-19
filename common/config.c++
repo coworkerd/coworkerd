@@ -173,6 +173,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.nestedLimit = placement.getNestedLimit();
   result.tenantRootLimit = placement.getTenantRootLimit();
   result.tenantNestedLimit = placement.getTenantNestedLimit();
+  result.tenantBorrowBelowPercent = placement.getTenantBorrowBelowPercent();
   result.idleMs = placement.getIdleMs();
   result.homeProbability = placement.getHomeProbability();
   result.avoidMaxMs = placement.getAvoidMaxMs();
@@ -189,6 +190,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       "nestedLimit must exceed rootLimit (equalLimitsForTest is only for the control)");
   KJ_REQUIRE(result.tenantRootLimit <= result.rootLimit && result.tenantNestedLimit <= result.nestedLimit,
       "per-tenant placement limits must not exceed their node-wide limits");
+  KJ_REQUIRE(result.tenantBorrowBelowPercent <= 100, "placement.tenantBorrowBelowPercent must be in [0, 100]");
   KJ_REQUIRE(result.idleMs > 0 && result.avoidMaxMs > 0 && result.connectBackoffMs > 0,
       "placement durations must be positive");
   KJ_REQUIRE(std::isfinite(result.homeProbability) && result.homeProbability >= 0 && result.homeProbability <= 1,

@@ -241,6 +241,7 @@ struct ServerConfig {
   uint32_t nestedLimit = 384;
   uint32_t tenantRootLimit = 0;
   uint32_t tenantNestedLimit = 0;
+  uint32_t tenantBorrowBelowPercent = 0;
   uint32_t idleMs = 30000;
   double homeProbability = 0.05;
   uint32_t avoidMaxMs = 2000;

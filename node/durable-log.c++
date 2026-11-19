@@ -921,7 +921,13 @@ void DurableLog::setNodeEpoch(uint64_t epoch) {
     auto record = decodeLogRecord(encoded);
     KJ_REQUIRE(record.has_value(), "a local record cannot be decoded");
     if (isolated.contains(sequence)) earlierExcluded[nodeEpoch][sequence] = std::move(*record);
-    else earlier[nodeEpoch][sequence] = std::move(*record);
+    else {
+      auto& pending = earlier[nodeEpoch];
+      if (auto prior = pending.find(sequence); prior != pending.end())
+        unindexEarlierRecord({nodeEpoch, sequence}, prior->second);
+      indexEarlierRecord({nodeEpoch, sequence}, *record);
+      pending[sequence] = std::move(*record);
+    }
   }
   if (nodeEpoch) {
     auto& info = predecessorLogs[nodeEpoch];
@@ -1436,6 +1442,10 @@ kj::Promise<void> DurableLog::readOwnLog() {
     kept += unsealed.size();
     if (!unsealed.empty()) {
       restoredEpochs.insert(epoch);
+      if (auto prior = earlier.find(epoch); prior != earlier.end()) {
+        for (const auto& [sequence, record] : prior->second) unindexEarlierRecord({epoch, sequence}, record);
+      }
+      for (const auto& [sequence, record] : unsealed) indexEarlierRecord({epoch, sequence}, record);
       earlier[epoch] = std::move(unsealed);
     }
   }
@@ -1586,7 +1596,9 @@ kj::Promise<void> DurableLog::classifyEarlier() {
       if (epoch == earlier.end()) continue;
       auto record = epoch->second.find(candidate.sequence);
       if (record == epoch->second.end()) continue;
-      noteEarlierRetired(candidate.epoch, record->second);epoch->second.erase(record);
+      noteEarlierRetired(candidate.epoch, record->second);
+      unindexEarlierRecord({candidate.epoch, candidate.sequence}, record->second);
+      epoch->second.erase(record);
       if (epoch->second.empty()) earlier.erase(epoch);
     }
     for (const auto& [key, summary] : summaries) {
@@ -3197,6 +3209,18 @@ void DurableLog::forgetParsedRecord(uint64_t sequence) {
   parsed.erase(metadata);
 }
 
+void DurableLog::indexEarlierRecord(EarlierPosition position, const LogRecord& record) {
+  earlierByObject[record.objectName].insert(position);
+}
+
+void DurableLog::unindexEarlierRecord(EarlierPosition position, const LogRecord& record) {
+  auto indexed = earlierByObject.find(record.objectName);
+  KJ_DASSERT(indexed != earlierByObject.end() && indexed->second.contains(position));
+  if (indexed == earlierByObject.end()) return;
+  indexed->second.erase(position);
+  if (indexed->second.empty()) earlierByObject.erase(indexed);
+}
+
 // A newer snapshot is a cut, not a per-record receipt. Report unaccounted
 // confirmed bytes distinctly from a proven transfer and keep the old segment.
 kj::Promise<void> DurableLog::retireFencedTails(Object& object, const ObjectManifest& manifest) {
@@ -3212,13 +3236,16 @@ kj::Promise<void> DurableLog::retireFencedTails(Object& object, const ObjectMani
     held.emplace(Position{record.shardEpoch, record.nodeSeq},
         Held{record.nodeEpoch, encoded.size(), sha256Hex(encoded), restoredEpochs.contains(record.nodeEpoch)});
   };
-  for (const auto& [sequence, encoded] : records) {
-    if (!confirmed.contains(sequence) || isolated.contains(sequence)) continue;
-    auto record = decodeLogRecord(encoded);
-    if (record) take(*record);
+  if (auto local = unsealedByObject.find(wanted); local != unsealedByObject.end()) {
+    for (auto sequence : local->second) {
+      if (!confirmed.contains(sequence) || isolated.contains(sequence)) continue;
+      auto entry = records.find(sequence);
+      if (entry == records.end()) continue;
+      if (auto record = decodeLogRecord(entry->second)) take(*record);
+    }
   }
-  for (const auto& [epoch, pending] : earlier) {
-    for (const auto& [sequence, record] : pending) take(record);
+  if (auto old = earlierByObject.find(wanted); old != earlierByObject.end()) {
+    for (auto [epoch, sequence] : old->second) take(earlier.at(epoch).at(sequence));
   }
   if (held.empty()) co_return;
   std::set<Position> transferred, excluded;
@@ -3269,30 +3296,41 @@ kj::Promise<void> DurableLog::retireFencedTails(Object& object, const ObjectMani
         "\",\"sha256\":" + quote(sha256Hex(summary.digests)) + ",\"revision\":\"" +
         std::to_string(manifest.revision) + "\",\"newOwner\":" + quote(manifest.writerNodeId));
   }
-  for (auto entry = records.begin(); entry != records.end();) {
+  // readSegments can suspend: select against the live index again, just as
+  // the old erase scan selected against the live maps. Copy the keys before
+  // erasing the last entry of an object's index. No yield during retirement.
+  std::vector<uint64_t> localSequences;
+  if (auto local = unsealedByObject.find(wanted); local != unsealedByObject.end())
+    localSequences.assign(local->second.begin(), local->second.end());
+  for (auto sequence : localSequences) {
+    auto entry = records.find(sequence);
+    if (entry == records.end()) continue;
     auto record = decodeLogRecord(entry->second);
-    if (!record || record->objectName != wanted || !released.contains({record->shardEpoch, record->nodeSeq})) {
-      ++entry;
-      continue;
-    }
+    // Selection requires confirmed and non-isolated, but erasure is by
+    // released position and object alone, including duplicate positions.
+    if (!record || record->objectName != wanted || !released.contains({record->shardEpoch, record->nodeSeq})) continue;
     recordBytes -= std::min<uint64_t>(recordBytes, entry->second.size());
     noteEarlierRetired(record->nodeEpoch, *record);
-    forgetParsedRecord(entry->first);
-    confirmed.erase(entry->first);
+    forgetParsedRecord(sequence);
+    confirmed.erase(sequence);
     ++sealSelectionRevision;
-    entry = records.erase(entry);
+    records.erase(entry);
   }
-  for (auto epoch = earlier.begin(); epoch != earlier.end();) {
-    std::erase_if(epoch->second, [&](const auto& entry) {
-      const auto& record = entry.second;
-      if (record.objectName != wanted || !released.contains({record.shardEpoch, record.nodeSeq})) return false;
-      noteEarlierRetired(epoch->first, record);
-      return true;
-    });
+  std::vector<EarlierPosition> precedingSequences;
+  if (auto old = earlierByObject.find(wanted); old != earlierByObject.end())
+    precedingSequences.assign(old->second.begin(), old->second.end());
+  for (auto position : precedingSequences) {
+    auto epoch = earlier.find(position.first);
+    auto entry = epoch->second.find(position.second);
+    const auto& record = entry->second;
+    if (record.objectName != wanted || !released.contains({record.shardEpoch, record.nodeSeq})) continue;
+    noteEarlierRetired(epoch->first, record);
+    unindexEarlierRecord(position, record);
+    epoch->second.erase(entry);
     if (epoch->second.empty()) {
       earlierUploads.erase(epoch->first);
-      epoch = earlier.erase(epoch);
-    } else ++epoch;
+      earlier.erase(epoch);
+    }
   }
   if (released.size() < held.size())
     log("fenced-tail-pending", "\"object\":" + quote(object.objectName) + ",\"revision\":\"" +
@@ -3658,7 +3696,12 @@ kj::Promise<void> DurableLog::resealEarlier() {
     header.lastSeq = cached->lastSeq;
   }
   if (recoveryPublishWaiters) co_return;
+  unsigned visited = 0;
   for (const auto& objectName : touched) {
+    if (visited++ == 8) {
+      co_await timer.afterDelay(1 * kj::MICROSECONDS);
+      visited = 1;
+    }
     auto* object = objectOf(objectName);
     if (object == nullptr) {
       const auto identity = parseDurableHostName(objectName);
@@ -3700,6 +3743,7 @@ kj::Promise<void> DurableLog::resealEarlier() {
           const auto& record = entry.second;
           if (entry.first < header.firstSeq || entry.first > header.lastSeq || hostNameOf(record) != objectName) return false;
           noteEarlierRetired(epoch, record);
+          unindexEarlierRecord({epoch, entry.first}, record);
           return true;
         });
         if (held->second.empty()) earlier.erase(held);
@@ -4429,18 +4473,20 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   object->cacheOpen = false;object->repairGeneration = {};
   std::set<std::pair<uint64_t, uint64_t>> publishedPositions = durableRecords;
   for (const auto& record : adopted) publishedPositions.emplace(record.shardEpoch, record.nodeSeq);
-  auto retire = [&](auto& epochs) {
+  auto retire = [&](auto& epochs, bool indexed) {
     for (auto epoch = epochs.begin(); epoch != epochs.end();) {
       std::erase_if(epoch->second, [&](const auto& entry) {
         const auto& record = entry.second;
         if (record.objectName != historyName || (!publishedPositions.contains({record.shardEpoch, record.nodeSeq}) &&
             !drop.contains({record.shardEpoch, record.nodeSeq}) && record.shardEpoch >= lowerBound && !coveredBySnapshot(record))) return false;
-        noteEarlierRetired(epoch->first, record);return true;
+        noteEarlierRetired(epoch->first, record);
+        if (indexed) unindexEarlierRecord({epoch->first, entry.first}, record);
+        return true;
       });
       if (epoch->second.empty()) epoch = epochs.erase(epoch);else ++epoch;
     }
   };
-  retire(earlier);retire(earlierExcluded);persistEarlierSeals();
+  retire(earlier, true);retire(earlierExcluded, false);persistEarlierSeals();
   log("recovery-published", "\"object\":" + quote(objectName) + ",\"collectionMs\":" +
       std::to_string(tails.collectionMs) + ",\"writeMs\":" +
       std::to_string(monotonicTimeMs() - publishingStarted) + ",\"cut\":" + (tails.cut ? "true" : "false") +

@@ -705,6 +705,9 @@ struct PlacementConfig {
   # Zero keeps the corresponding per-tenant limit disabled.
   tenantRootLimit @10 :UInt32 = 0;
   tenantNestedLimit @11 :UInt32 = 0;
+  # Below this percentage of the corresponding node-wide limit, a tenant can borrow beyond its limit.
+  # Zero preserves hard per-tenant limits.
+  tenantBorrowBelowPercent @12 :UInt32 = 0;
 }
 
 struct MembershipConfig {
