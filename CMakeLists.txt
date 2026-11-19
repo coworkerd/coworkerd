@@ -150,8 +150,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # A component test against the actual durable log and reader, without running a cluster.
+capnp_generate_cpp(DURABLE_TAIL_TEST_SOURCES DURABLE_TAIL_TEST_HEADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/common/schema/durable-tail-legacy-test.capnp")
 add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
   node/durable-channel-test.c++
+  node/durable-tail-test.c++
+  ${DURABLE_TAIL_TEST_SOURCES}
+  ${DURABLE_TAIL_TEST_HEADERS}
   node/memory-watermark.c++
   node/durable-log.c++
   node/alarm-publication.c++
@@ -186,6 +191,8 @@ target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
+add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
+add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
 foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
