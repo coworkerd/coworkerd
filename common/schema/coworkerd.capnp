@@ -602,8 +602,7 @@ struct ProcessPoolConfig {
   ordinaryServer @12 :Text = "threaded";
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
-  # Per-tenant calls while another tenant is in flight. The JSON loader derives
-  # an omitted value from affinity/cgroup CPUs; an explicit 0 disables it.
+  # Per-tenant calls while another tenant is in flight. Omitted or 0 disables it.
   tenantInFlightLimit @14 :UInt32 = 0;
   # 0 derives a safe share from the node's cgroup/configured memory budget.
   threadedMemoryBytes @15 :UInt64 = 0;

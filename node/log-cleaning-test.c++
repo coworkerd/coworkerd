@@ -90,6 +90,70 @@ void streams() {
   const bool discarded = exhausted.append("bounded diagnostic\n", true).empty() && exhausted.suppressed();
   KJ_REQUIRE(discarded, "a full dictionary must suppress output");
 }
+// No dictionary size may silence a writer: 130 values with one 64 KiB block of
+// ordinary output exhausted the old per-value work quota, and that writer then
+// stayed blocked until the node restarted. Only an oversized block is dropped
+// (and counted as suppressed), and only that block.
+void manyValues() {
+  std::vector<std::string> values, needles;
+  auto publish = [&](size_t count) {
+    needles.clear();
+    while (values.size() < count) {
+      values.push_back(syntheticValue());
+      addRedaction(needles, values.back());
+    }
+    sortRedactions(needles);
+    retainPlatformLogRedactions(needles);
+  };
+  publish(2);
+  {
+    PlatformLogCleaner cleaner;
+    std::string huge(8 * 1024 * 1024 + 1, 'y');
+    huge.replace(1024, values[0].size(), values[0]);
+    const auto dropped = cleaner.append(huge);
+    const bool discarded = dropped.empty() && cleaner.suppressed();
+    KJ_REQUIRE(discarded, "an oversized block must be dropped");
+    const auto after = cleaner.append("after:" + values[0] + "\n");
+    requireClean(after, values[0]);
+    const bool recovered = after == "after:[redacted]\n" && !cleaner.suppressed();
+    KJ_REQUIRE(recovered, "the writer must recover after a dropped block");
+    // The dropped block's tail never reappears: a value that began inside it
+    // and ends in the next append is still hidden as a whole.
+    std::string straddle(8 * 1024 * 1024 + 1, 'z');
+    straddle.replace(straddle.size() - 10, 10, values[1].substr(0, 10));
+    const auto first = cleaner.append(straddle);
+    const auto rest = cleaner.append(values[1].substr(10) + ":rest\n", true);
+    requireClean(first + rest, values[1]);
+    const bool hidden = first.empty() && rest == "[redacted]:rest\n";
+    KJ_REQUIRE(hidden, "a value straddling a dropped block must stay hidden");
+  }
+  publish(130);
+  std::string block;
+  while (block.size() < 64 * 1024) block += "an ordinary console line from any tenant, with no value in it\n";
+  // Both writer kinds: the node's own streams (final at stream end) and the
+  // child-output writer (never final).
+  for (const bool sink : {false, true}) {
+    PlatformLogCleaner cleaner;
+    for (int round = 0; round < 4; ++round) {
+      const auto text = cleaner.append(block, sink && round == 3);
+      const bool unchanged = text == block && !cleaner.suppressed();
+      KJ_REQUIRE(unchanged, "a 64 KiB block must pass a 130-value dictionary unchanged", sink, round);
+    }
+    for (const auto& value : values) {
+      const auto text = cleaner.append("later:" + value + ":tail\n", sink);
+      requireClean(text, value);
+      const bool cleaned = text == "later:[redacted]:tail\n" && !cleaner.suppressed();
+      KJ_REQUIRE(cleaned, "a value after the large blocks must still be cleaned", sink);
+    }
+    // A value split between two appends of the same stream is still found.
+    const auto& value = values[77];
+    auto split = cleaner.append("split:" + value.substr(0, 20));
+    split += cleaner.append(value.substr(20) + ":end\n", sink);
+    requireClean(split, value);
+    const bool joined = split == "split:[redacted]:end\n";
+    KJ_REQUIRE(joined, "a value split across appends must be cleaned", sink);
+  }
+}
 struct Child {
   pid_t pid = -1;
   int control = -1;
@@ -232,6 +296,7 @@ void workerDiagnostics(const char* workerd) {
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string_view(argv[1]) == "streams") coworkerd::streams();
+    else if (argc == 2 && std::string_view(argv[1]) == "many-values") coworkerd::manyValues();
     else { KJ_REQUIRE(argc == 2); coworkerd::workerDiagnostics(argv[1]); }
     return 0;
   } catch (const kj::Exception& error) {

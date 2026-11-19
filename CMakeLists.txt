@@ -177,8 +177,9 @@ target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
 set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd"
   CACHE FILEPATH "Built workerd for the real Worker diagnostic redaction test")
 add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
+add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
 add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
-set_tests_properties(node-log-stream node-log-redaction PROPERTIES TIMEOUT 30)
+set_tests_properties(node-log-stream node-log-many-values node-log-redaction PROPERTIES TIMEOUT 30)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")

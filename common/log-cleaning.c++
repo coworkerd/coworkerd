@@ -36,7 +36,7 @@ namespace {
 constexpr size_t LOG_REDACTION_BYTES = 16 * 1024 * 1024;
 constexpr size_t LOG_REDACTION_PATTERNS = 65536;
 constexpr size_t LOG_PENDING_BYTES = 64 * 1024;
-constexpr size_t LOG_MATCH_WORK = 8 * 1024 * 1024;
+constexpr size_t LOG_BLOCK_BYTES = 8 * 1024 * 1024;
 struct SharedLogRedactions {
   std::atomic<size_t> published{0};
   std::atomic<bool> overflow{false};
@@ -87,72 +87,79 @@ void retainPlatformLogRedactions(const std::vector<std::string>& needles) {
 }
 
 std::string PlatformLogCleaner::append(std::string_view input, bool final) {
+  blocked = false;
   auto* shared = logRedactions().shared;
-  if (blocked || shared->overflow.load(std::memory_order_acquire)) {
+  if (shared->overflow.load(std::memory_order_acquire)) {
     blocked = true;
     pending.clear();
+    marks.clear();
     return {};
   }
+  // Match against the original stream, including bytes suppressed by a block
+  // quota. KMP suffix states retain only prefixes that can still form a value.
+  auto scan = [&](size_t pattern, size_t begin) {
+    const auto& needle = needles[pattern];
+    const auto& failure = failures[pattern];
+    auto& state = states[pattern];
+    for (size_t at = begin; at < pending.size(); ++at) {
+      while (state && needle[state] != pending[at]) state = failure[state - 1];
+      if (needle[state] == pending[at]) ++state;
+      if (state == needle.size()) {
+        for (size_t pos = at + 1 - state; pos <= at; ++pos) marks[pos] |= 1;
+        state = failure[state - 1];
+      }
+    }
+  };
   const auto published = shared->published.load(std::memory_order_acquire);
-  bool changed = false;
   while (consumed < published) {
     uint32_t size;
     std::memcpy(&size, shared->bytes + consumed, sizeof(size));
     needles.emplace_back(shared->bytes + consumed + sizeof(size), size);
     consumed += sizeof(size) + size;
-    changed = true;
+    const auto& needle = needles.back();
+    auto& failure = failures.emplace_back(size, 0);
+    for (size_t at = 1, state = 0; at < size; ++at) {
+      while (state && needle[state] != needle[at]) state = failure[state - 1];
+      if (needle[state] == needle[at]) ++state;
+      failure[at] = state;
+    }
+    states.push_back(0);
+    scan(needles.size() - 1, 0);
   }
-  if (changed) sortRedactions(needles);
   if (needles.empty()) return std::string(input);
+  // Charge each block once, independent of the append-only dictionary's size.
+  // Mark dropped bytes so a retained prefix can never reappear in later output.
+  blocked = input.size() > LOG_BLOCK_BYTES;
   std::string output;
   do {
+    const auto begin = pending.size();
     const auto take = std::min(input.size(), LOG_PENDING_BYTES);
     pending.append(input.substr(0, take));
+    marks.resize(pending.size(), blocked ? 2 : 0);
     input.remove_prefix(take);
-    size_t hold = 0, work = 0;
-    auto charge = [&](size_t bytes) {
-      if (bytes > LOG_MATCH_WORK - std::min(work, LOG_MATCH_WORK)) return false;
-      work += bytes;
-      return true;
-    };
-    const bool finishing = final && input.empty();
-    if (!finishing) for (const auto& needle : needles) {
-      const auto possible = std::min(pending.size(), needle.size() - 1);
-      if (!charge(possible)) { blocked = true; break; }
-      for (auto at = pending.find(needle.front(), pending.size() - possible);
-           at != std::string::npos; at = pending.find(needle.front(), at + 1)) {
-        const auto length = pending.size() - at;
-        if (length <= hold) break;
-        if (!charge(length)) { blocked = true; break; }
-        if (std::string_view(needle).starts_with(std::string_view(pending).substr(at))) {
-          hold = length;
-          break;
-        }
-      }
-      if (blocked) break;
+    size_t hold = 0;
+    for (size_t pattern = 0; pattern < needles.size(); ++pattern) {
+      scan(pattern, begin);
+      hold = std::max(hold, states[pattern]);
     }
-    auto cut = pending.size() - hold;
-    // A complete match must not straddle the prefix retained for another
-    // pattern. Keep it whole until that prefix is resolved by the next chunk.
-    bool moved;
-    do {
-      moved = false;
-      for (const auto& needle : needles) {
-        if (!charge(pending.size())) { blocked = true; break; }
-        for (auto at = pending.find(needle); at != std::string::npos && at < cut;
-             at = pending.find(needle, at + 1)) {
-          if (at + needle.size() > cut) { cut = at; moved = true; break; }
-        }
+    const auto cut = final && input.empty() ? pending.size() : pending.size() - hold;
+    for (size_t at = 0; at < cut; ++at) {
+      if (marks[at] & 2) continue;
+      if (marks[at] & 1) {
+        if (!emittingRedaction && !blocked) output += "[redacted]";
+        emittingRedaction = true;
+      } else {
+        if (!blocked) output += pending[at];
+        emittingRedaction = false;
       }
-    } while (moved && !blocked);
-    if (blocked || pending.size() - cut > LOG_PENDING_BYTES) {
-      blocked = true;
-      pending.clear();
-      return {};
     }
-    output += redactNeedles(pending.substr(0, cut), needles);
     pending.erase(0, cut);
+    marks.erase(marks.begin(), marks.begin() + cut);
   } while (!input.empty());
+  if (final) {
+    std::fill(states.begin(), states.end(), 0);
+    emittingRedaction = false;
+  }
   return output;
 }
 

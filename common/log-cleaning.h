@@ -33,6 +33,10 @@ private:
   size_t consumed = 0;
   std::vector<std::string> needles;
   std::string pending;
+  std::vector<std::vector<uint32_t>> failures;
+  std::vector<size_t> states;
+  std::vector<uint8_t> marks;
+  bool emittingRedaction = false;
   bool blocked = false;
 };
 

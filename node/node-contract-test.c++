@@ -210,6 +210,15 @@ void trialVerdicts() {
   auto native = classifyTrialFailure("evaluation", "Error", "Uncaught Error: top-level failure\nat index.js:1:7", false, false, 30000, 128);
   KJ_REQUIRE(native.message == "Error: top-level failure (at index.js:1:7)");
   KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: failure\nat index.js:1:" + std::string(80, '9'), false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  // The call path classifies at the stage the native server reported: a bridge
+  // failure is not the tenant's top-level throw; a report without a stage keeps
+  // the general load classification.
+  auto bridged = classifyLoadRejection("bridge", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128);
+  KJ_REQUIRE(bridged.category == "LOAD_FAILED" && bridged.limit.empty() &&
+      bridged.message == "the trial could not reach the runtime: remote exception: remote.jsg.Error: Missing trusted ordinary worker plan");
+  KJ_REQUIRE(classifyLoadRejection("", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  KJ_REQUIRE(classifyLoadRejection("evaluation", "Error", "Error: tenant top-level throw", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  KJ_REQUIRE(classifyLoadRejection("code", "SyntaxError", "invalid JSON", false, false, 30000, 128).category == "INVALID_MODULE");
 }
 
 auto number(const std::string& bytes, const char* field) {

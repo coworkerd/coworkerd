@@ -528,6 +528,7 @@ struct PendingThreadedLoad {
 // log-cleaning.h); the load check before a dispatch classifies and cleans with them.
 using coworkerd::TrialVerdict;
 using coworkerd::classifyTrialFailure;
+using coworkerd::classifyLoadRejection;
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call = {});
 
@@ -2148,7 +2149,7 @@ public:
           category = PACKAGE_UNAVAILABLE; detail = "PACKAGE_UNAVAILABLE"; message = "the code package could not be fetched or verified: " + string("message");
         } else {
           const auto applied = runtime.effectiveLimits(probe.workerId);
-          auto verdict = classifyTrialFailure("load", string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
+          auto verdict = classifyLoadRejection(string("stage"), string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
               applied.cpuMs, applied.memoryMiB);
           category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
           detail = verdict.category.empty() ? "LOAD_FAILED" : verdict.category;
@@ -2756,7 +2757,7 @@ public:
         refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
       } else {
         auto limits = runtime.effectiveLimits(slot->process->workerId);
-        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
+        auto verdict = classifyLoadRejection(stage, "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
         refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
         refused.reason = verdict.message;
       }

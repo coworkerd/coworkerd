@@ -78,4 +78,14 @@ inline TrialVerdict classifyTrialFailure(const std::string& stage, const std::st
   return {"TOP_LEVEL_THROW", "", detail};
 }
 
+// A failed load on the call path (the load check, and a dispatch decision the
+// native server confirms): classified at the stage the runtime reported, so a
+// bridge failure is not a tenant's top-level throw. Without a reported stage
+// the general load classification applies.
+inline TrialVerdict classifyLoadRejection(const std::string& reportedStage, const std::string& name,
+    const std::string& raw, bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB) {
+  return classifyTrialFailure(reportedStage.empty() ? "load" : reportedStage, name, raw, cpuExceeded, memoryExceeded,
+      cpuLimitMs, memoryLimitMiB);
+}
+
 }  // namespace coworkerd
