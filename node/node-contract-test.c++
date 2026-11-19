@@ -5,6 +5,7 @@
 #include "event-loop.h"
 #include "trial-verdict.h"
 #include "tenant-execution.h"
+#include "process-heat.h"
 #include "cpu-capacity.h"
 #include "json.h"
 #include "process-culprit.h"
@@ -74,10 +75,10 @@ void tenantExecution() {
   KJ_REQUIRE(cpusWithinQuota(1, leaf, directory.path) == 1);
   write(leaf / "cpu.max", "100000 100000\n");
   KJ_REQUIRE(cpusWithinQuota(16, leaf, directory.path) == 1);
-  KJ_REQUIRE(!tenantExecutionLimited(100, 100, 13));
-  KJ_REQUIRE(tenantExecutionLimited(100, 101, 13));
-  KJ_REQUIRE(!tenantExecutionLimited(12, 101, 13));
-  KJ_REQUIRE(!tenantExecutionLimited(100, 101, 0));
+  KJ_REQUIRE(!tenantExecutionLimited(100, 1, 13));
+  KJ_REQUIRE(tenantExecutionLimited(100, 2, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(12, 2, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(100, 2, 0));
 #ifdef __linux__
   const auto child = fork(); KJ_REQUIRE(child >= 0);
   if (!child) {
@@ -96,21 +97,71 @@ void tenantExecution() {
   kj::EventLoop loop; kj::WaitScope scope(loop);
   kj::TimerImpl timer(kj::origin<kj::TimePoint>());
   TenantExecutionQueue queue;
-  bool blocked = true;
-  auto first = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
-  auto second = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
-  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope) && queue.active() == 2);
-  auto full = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
+  auto state = std::make_shared<TenantExecutionState>(2);
+  state->enter("x"); state->enter("x"); state->enter("y");
+  KJ_REQUIRE(state->active() == 2 && state->count("x") == 2 && state->limited("x"));
+  auto first = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
+  auto second = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope) && queue.active() == 2 && state->queued() == 2);
+  auto full = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
   KJ_REQUIRE(full.wait(scope) == TenantExecutionQueue::FULL && queue.active() == 2);
+  timer.advanceTo(timer.now() + 5 * kj::MILLISECONDS);
+  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope));
+  state->leave("x");
+  KJ_REQUIRE(first.poll(scope) && !second.poll(scope));
+  KJ_REQUIRE(first.wait(scope) == TenantExecutionQueue::READY && queue.active() == 1);
+  state->enter("x");
   second = nullptr;
-  KJ_REQUIRE(queue.active() == 1);
-  timer.advanceTo(timer.now() + 5 * kj::MILLISECONDS); blocked = false;
-  KJ_REQUIRE(first.wait(scope) == TenantExecutionQueue::READY && queue.active() == 0);
-  blocked = true;
-  auto expired = queue.wait(timer, 10 * kj::MILLISECONDS, 2, [&] { return blocked; });
-  KJ_REQUIRE(!expired.poll(scope));
-  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS); blocked = false;
-  KJ_REQUIRE(expired.wait(scope) == TenantExecutionQueue::EXPIRED && queue.active() == 0);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && state->count("x") == 2);
+
+  auto borrowed = std::make_shared<TenantExecutionState>(2);
+  for (unsigned i = 0; i < 4; ++i) borrowed->enter("x");
+  KJ_REQUIRE(borrowed->active() == 1 && !borrowed->limited("x"));
+  borrowed->enter("y");
+  auto allFirst = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {borrowed});
+  auto allSecond = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {borrowed});
+  KJ_REQUIRE(!allFirst.poll(scope) && !allSecond.poll(scope));
+  borrowed->leave("y");
+  KJ_REQUIRE(borrowed->active() == 1 && borrowed->count("x") == 4);
+  KJ_REQUIRE(allFirst.poll(scope) && allSecond.poll(scope));
+  KJ_REQUIRE(allFirst.wait(scope) == TenantExecutionQueue::READY && allSecond.wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && borrowed->queued() == 0);
+
+  auto other = std::make_shared<TenantExecutionState>(2);
+  other->enter("x"); other->enter("x"); other->enter("y");
+  auto either = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state, other});
+  KJ_REQUIRE(!either.poll(scope) && state->queued() == 1 && other->queued() == 1);
+  other->leave("x");
+  KJ_REQUIRE(either.poll(scope) && either.wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && other->queued() == 0);
+
+  auto expired = queue.wait(timer, 10 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!expired.poll(scope) && state->count("x") == 2);
+  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS);
+  KJ_REQUIRE(expired.poll(scope) && expired.wait(scope) == TenantExecutionQueue::EXPIRED);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && state->count("x") == 2);
+  auto late = queue.wait(timer, 10 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!late.poll(scope));
+  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS); state->leave("x");
+  KJ_REQUIRE(late.poll(scope) && late.wait(scope) == TenantExecutionQueue::EXPIRED);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0);
+
+  auto disabled = std::make_shared<TenantExecutionState>(0);
+  for (unsigned i = 0; i < 100; ++i) disabled->enter("x");
+  disabled->enter("y");
+  KJ_REQUIRE(disabled->active() == 2 && !disabled->limited("x"));
+  KJ_REQUIRE(queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {disabled}).wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && disabled->queued() == 0);
+
+  ProcessHeat heat;
+  heat.touch("a", 0); heat.touch("b", 1); heat.touch("c", 2); heat.touch("a", 3);
+  heat.expire(4, 2);
+  KJ_REQUIRE(heat.size() == 2 && heat.find("b") == heat.end() && heat.find("a")->second == 3);
+  heat.touch("c", 4); heat.expire(6, 2);
+  KJ_REQUIRE(heat.size() == 1 && heat.find("c") != heat.end());
+  heat.expire(6.001, 2); KJ_REQUIRE(heat.size() == 0);
+  for (unsigned i = 0; i < 1000; ++i) heat.touch("same", i);
+  KJ_REQUIRE(heat.size() == 1); heat.expire(1000, 0); KJ_REQUIRE(heat.size() == 0);
 }
 
 void eventLoopProgress() {

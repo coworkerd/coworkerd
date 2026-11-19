@@ -1,5 +1,6 @@
 #include "process-culprit.h"
 #include "process-pool.h"
+#include "process-heat.h"
 #include "root-objects.h"
 #include "memory-observation.h"
 #include "tenancy.h"
@@ -923,7 +924,7 @@ struct ProcessGeneration {
   double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, probeStartedAt = 0, exitedAt = 0;
   uint64_t spawnedAtUnixMs = wall(), readyAtUnixMs = 0, exitedAtUnixMs = 0;
   uint32_t inFlight = 0;
-  std::map<std::string, uint32_t> tenantInFlight;
+  std::shared_ptr<TenantExecutionState> tenantExecution;
   uint64_t dispatched = 0;
   std::map<std::string, ProcessCall*> calls;
   // RPC failure may finish the calls before waitpid observes the crash. This is
@@ -945,7 +946,7 @@ struct ProcessGeneration {
   }
   struct CompletedIdentity { std::string workerId, versionId, invocationId; };
   std::deque<CompletedIdentity> recentDispatched;
-  std::map<std::string, double> heat;
+  ProcessHeat heat;
   std::deque<double> probeDelays;
   bool probePending = false;
   double probeAttemptAt = 0;
@@ -1263,7 +1264,7 @@ ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string
     : processId(process->id), generation(process->generation), process(std::move(process)),
       tenant(this->process->threaded ? std::move(tenant) : std::string()) {
   ++this->process->inFlight;
-  if (!this->tenant.empty()) ++this->process->tenantInFlight[this->tenant];
+  if (!this->tenant.empty()) this->process->tenantExecution->enter(this->tenant);
 }
 ProcessCall::~ProcessCall() { finish(); }
 void ProcessCall::snapshotAfterFailure() noexcept {
@@ -1283,11 +1284,7 @@ void ProcessCall::finish() {
   finished = true;
   KJ_ASSERT(process->inFlight > 0);
   --process->inFlight;
-  if (!tenant.empty()) {
-    auto entry = process->tenantInFlight.find(tenant);
-    KJ_ASSERT(entry != process->tenantInFlight.end() && entry->second > 0);
-    if (--entry->second == 0) process->tenantInFlight.erase(entry);
-  }
+  if (!tenant.empty()) process->tenantExecution->leave(tenant);
   if (dispatched) {
     if (process->recentDispatched.size() == 4096) process->recentDispatched.pop_front();
     process->recentDispatched.push_back({workerId, versionId, invocationId});
@@ -2258,6 +2255,7 @@ public:
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
     p->threaded = !s.durable;
+    if (p->threaded) p->tenantExecution = std::make_shared<TenantExecutionState>(config.tenantInFlightLimit);
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -3032,11 +3030,7 @@ public:
   }
   // Process state for dispatch decisions; no file is opened or read here except at an exit.
   void refresh() {
-    // Queued admissions poll this path. Sample once per sweep, rather than
-    // once per hot Worker (clock reads can be real syscalls on this host).
-    const auto heatNow = mono();
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
-      std::erase_if(p->heat, [&](const auto& entry) { return heatNow - entry.second > config.heatIdleMs; });
 #ifdef __linux__
       drainSyscallObservations(*p);
 #endif
@@ -3054,9 +3048,7 @@ public:
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
     if (!p.threaded) return true;
-    const auto found = p.tenantInFlight.find(tenantOf(worker));
-    return found == p.tenantInFlight.end() ||
-        !tenantExecutionLimited(found->second, p.inFlight, config.tenantInFlightLimit);
+    return !p.tenantExecution->limited(tenantOf(worker));
   }
 
   // ---- Rotation ----
@@ -3579,6 +3571,10 @@ ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {
   while (true) {
     impl->refresh();
+    const auto heatNow = mono();
+    for (auto& slot : impl->slots) Impl::eachGeneration(slot, [&](const auto& process) {
+      process->heat.expire(heatNow, impl->config.heatIdleMs);
+    });
     impl->syncDueEvents();
     impl->rotationTick();
     for (size_t i = 0; i < impl->slots.size(); ++i) {
@@ -3611,14 +3607,19 @@ std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLim
   impl->refresh();
   const auto quarantine = quarantined(worker);
   const auto tenant = tenantOf(worker);
+  TenantExecutionLimit result;
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current &&
       s.current->threaded && impl->admitted(*s.current)) {
-    const auto found = s.current->tenantInFlight.find(tenant);
-    if (found != s.current->tenantInFlight.end() &&
-        tenantExecutionLimited(found->second, s.current->inFlight, impl->config.tenantInFlightLimit))
-      return TenantExecutionLimit{found->second, impl->config.tenantInFlightLimit};
+    if (s.current->tenantExecution->limited(tenant)) {
+      if (result.states.empty()) {
+        result.inFlight = s.current->tenantExecution->count(tenant);
+        result.limit = impl->config.tenantInFlightLimit;
+      }
+      result.states.push_back(s.current->tenantExecution);
+    }
   }
-  return std::nullopt;
+  if (result.states.empty()) return std::nullopt;
+  return result;
 }
 bool ProcessPool::PausedAdmission::alive() const {
   for (const auto& p : processes)
@@ -3879,7 +3880,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
-  p->calls.emplace(call->invocationId, call.get()); p->heat[hash] = mono();
+  p->calls.emplace(call->invocationId, call.get()); p->heat.touch(hash, mono());
   ++p->dispatched;
   // Object contexts outlive replies. Their instance labels and observed background
   // activity let rotation wait for remaining work without waiting for idle actors.
@@ -3925,6 +3926,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
     return result;
   });
   auto sampled = co_await kj::mv(result);
+  const auto stateHeatNow = mono();
   const auto& residentCounts = sampled.resident.counts;
   auto residentBytes = [&](int pid) -> uint64_t {
     if (auto found = sampled.rss.find(pid); found != sampled.rss.end()) return found->second;
@@ -3999,7 +4001,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
     }
     out << lifecycle << ",\"hotVersions\":[";
     size_t n = 0;
-    if (p && p->pid > 0) for (const auto& [hash, when] : p->heat) if (mono() - when <= idleMs) {
+    if (p && p->pid > 0) for (const auto& [hash, when] : p->heat) if (stateHeatNow - when <= idleMs) {
       if (n++) out << ',';
       out << "{\"definitionHash\":\"" << hash << "\",\"lastExecutionMonotonicMs\":" << when << "}";
     }

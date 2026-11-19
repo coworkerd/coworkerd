@@ -15,8 +15,8 @@ inline uint32_t quotaCpuCount(uint64_t quota, uint64_t period) {
 inline uint32_t tenantExecutionShare(uint32_t cpus) {
   return std::max({cpus > 3 ? cpus - 3 : 0, cpus / 2 + cpus % 2, 1u});
 }
-inline bool tenantExecutionLimited(uint32_t own, uint32_t total, uint32_t limit) {
-  return limit != 0 && total > own && own >= limit;
+inline bool tenantExecutionLimited(uint32_t own, uint32_t activeTenants, uint32_t limit) {
+  return limit != 0 && activeTenants > 1 && own >= limit;
 }
 
 // The affinity count, narrowed by every visible ancestor's cgroup v2 quota.

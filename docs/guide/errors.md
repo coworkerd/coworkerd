@@ -13,7 +13,7 @@
 
 "Not executed" means the Worker's code certainly did not start, so another attempt cannot execute it twice. A response with `retryable: false` means retrying the same request will not help. "Result uncertain" means part of the code may have executed.
 
-From 0.6.0, a native process's borrowable tenant execution share uses the reason `tenant execution concurrency limit reached in process`. A call waits on the node for `processPool.tenantAdmissionWaitMs` (1000 ms by default, within its lease), then receives not-executed, retryable `503 OVERLOADED` if there is still no slot. A full wait queue gives the same answer. The share applies while another tenant has calls in flight in that process; a sole tenant borrows the whole pool. This differs from the node ingress reason `tenant ingress concurrency limit reached`.
+From 0.6.0, a native process's borrowable tenant execution share uses the reason `tenant execution concurrency limit reached in process`. A call waits on the node for `processPool.tenantAdmissionWaitMs` (1000 ms by default, within its lease), then receives not-executed, retryable `503 OVERLOADED` if there is still no slot. A full wait queue gives the same answer. Waiting is notified by call release, in tenant FIFO order, with a single expiry timer rather than polling. The share applies while another tenant has calls in flight in that process; a sole tenant borrows the whole pool. This differs from the node ingress reason `tenant ingress concurrency limit reached`.
 
 | HTTP | `code` | Meaning | Executed? | What to do |
 | --- | --- | --- | --- | --- |

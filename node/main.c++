@@ -1657,16 +1657,26 @@ public:
       const auto id = beginAdmissionWait("tenant-execution");
       std::string outcome = "canceled";
       auto done = kj::defer([&] { endAdmissionWait("tenant-execution", id, began, outcome); });
-      auto limited = [&] {
-        const auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
-        return current && processTenantRefusal(*current);
-      };
-      const auto waited = co_await tenantExecutionQueue.wait(timer, static_cast<int64_t>(duration * 1000) * kj::MICROSECONDS,
-          static_cast<uint32_t>(std::min<uint64_t>(uint64_t(serverConfig.rootLimit) + serverConfig.nestedLimit, 16384)), limited);
-      auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
-      if (waited != coworkerd::TenantExecutionQueue::READY || current) {
-        outcome = waited == coworkerd::TenantExecutionQueue::FULL ? "full" : "expired";
-        co_return reject(current ? std::move(*current) : std::move(*failure));
+      const auto until = began + duration;
+      while (true) {
+        auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+        if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
+        if (!current) break;
+        if (!processTenantRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
+        const auto limited = runtime.tenantExecutionLimit(worker);
+        if (!limited) {
+          auto refreshed = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+          if (!refreshed) break;
+          outcome = "unavailable"; co_return reject(std::move(*refreshed));
+        }
+        const auto remaining = std::max(0.0, until - monotonicTimeMs());
+        const auto waited = co_await tenantExecutionQueue.wait(timer, static_cast<int64_t>(remaining * 1000) * kj::MICROSECONDS,
+            static_cast<uint32_t>(std::min<uint64_t>(uint64_t(serverConfig.rootLimit) + serverConfig.nestedLimit, 16384)),
+            coworkerd::tenantOf(worker), limited->states);
+        if (waited != coworkerd::TenantExecutionQueue::READY) {
+          outcome = waited == coworkerd::TenantExecutionQueue::FULL ? "full" : "expired";
+          co_return reject(std::move(*failure));
+        }
       }
       outcome = "resumed";
       if (!slot) slot = reserve(root, worker, durable);

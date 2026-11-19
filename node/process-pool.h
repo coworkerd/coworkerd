@@ -6,6 +6,7 @@
 #include "config.h"
 #include "suspects.h"
 #include "tenancy.h"
+#include "tenant-execution.h"
 #include <kj/async-io.h>
 #include <kj/async-unix.h>
 #include <kj/compat/http.h>
@@ -75,7 +76,10 @@ public:
   ~ProcessPool() noexcept(false);
   kj::Promise<void> run();
   bool available(const std::string& worker);
-  struct TenantExecutionLimit { uint32_t inFlight, limit; };
+  struct TenantExecutionLimit {
+    uint32_t inFlight = 0, limit = 0;
+    std::vector<std::shared_ptr<TenantExecutionState>> states;
+  };
   std::optional<TenantExecutionLimit> tenantExecutionLimit(const std::string& worker);
   // The original paused generations, only when none of this target's processes is admitted.
   // Retaining the snapshot never waits for a replacement generation after death or rotation.
