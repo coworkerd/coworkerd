@@ -3032,8 +3032,11 @@ public:
   }
   // Process state for dispatch decisions; no file is opened or read here except at an exit.
   void refresh() {
+    // Queued admissions poll this path. Sample once per sweep, rather than
+    // once per hot Worker (clock reads can be real syscalls on this host).
+    const auto heatNow = mono();
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
-      std::erase_if(p->heat, [&](const auto& entry) { return mono() - entry.second > config.heatIdleMs; });
+      std::erase_if(p->heat, [&](const auto& entry) { return heatNow - entry.second > config.heatIdleMs; });
 #ifdef __linux__
       drainSyscallObservations(*p);
 #endif
