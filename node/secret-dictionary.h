@@ -41,7 +41,10 @@ namespace coworkerd {
 // gone; when one tenant's earlier values pinned there pass rotateEarlierBytes,
 // that generation (if it is its slot's current one) is rotated by the node's
 // ordinary rotation, at most once every rotationIntervalMs per slot, so a
-// tenant that changes its secrets is never refused on that node for good.
+// tenant that changes its secrets is never refused on that node for good. A
+// tenant that triggers it again within tenantRotationCooldownMs rotates
+// nothing: its Durable Object calls with secrets are refused here instead
+// until the cooldown has passed (its earlier values grow too fast).
 //
 // Used on the node's event loop only.
 class SecretDictionary {
@@ -52,6 +55,7 @@ public:
     size_t tenantEarlierBytes = size_t(1) << 20;
     size_t rotateEarlierBytes = size_t(512) << 10;
     double rotationIntervalMs = 600000;
+    double tenantRotationCooldownMs = 3600000;
     double graceMs = SECRET_RELEASE_GRACE_MS;
     // The native processes evict an isolate after this long without a call (0: never).
     double idleEvictMs = 300000;
@@ -80,12 +84,14 @@ public:
   void setCurrent(std::map<std::string, std::set<std::string>> values);
   // Before a call of `tenant` that carries `values` starts here: nullopt (the
   // values are held until `untilMs`), or why it is refused on this node.
+  // `durable`: a Durable Object call (its process names no isolates).
   std::optional<std::string> admit(const std::string& tenant, const std::set<std::string>& values,
-      double nowMs, double untilMs);
+      double nowMs, double untilMs, bool durable = false);
   // A descriptor that carries `values` is about to go to (processId, generation)
   // for plan `revision`; `native`: a native server, whose isolates are idle-evicted.
-  // False when the shared dictionary cannot hold them: the descriptor must not
-  // be sent.
+  // False when the tenant's share or the node's total cannot take values not
+  // held yet (they changed since the call was admitted), or the shared
+  // dictionary cannot hold them: the descriptor must not be sent.
   bool sent(const std::string& tenant, const std::set<std::string>& values, const std::string& processId,
       uint64_t generation, const std::string& revision, bool native, double nowMs, double untilMs);
   // Releases what nothing has held for the grace, and rebuilds the shared
@@ -122,7 +128,8 @@ private:
   bool publish(const std::vector<std::string>& needles, double nowMs);
   bool compact(double nowMs);
   std::string recovery(const std::string& tenant, double nowMs) const;
-  enum class Refusal { FULL, SHARE, EARLIER };
+  enum class Refusal { FULL, SHARE, EARLIER, COOLED };
+  std::optional<std::string> capacityRefusal(const std::string& tenant, const std::set<std::string>& values);
   void countRefusal(const std::string& tenant, Refusal kind);
   void rotatePinned(double nowMs, const std::vector<Residents>& residents);
 
@@ -139,12 +146,15 @@ private:
   std::set<std::string> published;                                // in the shared dictionary, garbage included
   size_t liveBytes = 0, livePatterns = 0, publishedBytes = 0;
   double lastCompactMs = -1e300;
-  uint64_t revision = 0, compactions = 0, refusedFull = 0, refusedShare = 0, refusedEarlier = 0, sinkFailures = 0;
-  uint64_t rotationsRequested = 0;
-  struct Refused { uint64_t full = 0, share = 0, earlier = 0; };
+  uint64_t revision = 0, compactions = 0, refusedFull = 0, refusedShare = 0, refusedEarlier = 0, refusedCooled = 0;
+  uint64_t sinkFailures = 0, rotationsRequested = 0, rotationsSuppressed = 0;
+  struct Refused { uint64_t full = 0, share = 0, earlier = 0, cooled = 0; };
   std::map<std::string, Refused> refusedByTenant;  // at most 256 tenants
   std::map<std::pair<std::string, uint64_t>, double> rotated;  // generation -> when its rotation was asked
   std::map<std::string, double> lastRotationMs;                // slot -> the last time one of its was asked
+  std::map<std::string, double> tenantRotationMs;              // tenant -> the last rotation it caused
+  std::map<std::string, double> cooledUntilMs;                 // tenant -> its Durable Object calls refused until
+  std::map<std::string, size_t> pinnedUnknown;                 // tenant -> earlier bytes in current unknown generations
 };
 
 }  // namespace coworkerd

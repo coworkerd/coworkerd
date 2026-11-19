@@ -1137,11 +1137,12 @@ public:
   // The executing Server gives a version its secrets from its own deployment
   // view, whatever the caller saw: without a usable value for every declared
   // name nothing executes (explicit, retryable elsewhere). Names only.
-  std::optional<InvocationRejection> secretRefusal(const VersionDefinition& version, bool root) {
+  // `durable`: a call to a Durable Object (its process names no isolates).
+  std::optional<InvocationRejection> secretRefusal(const VersionDefinition& version, bool root, bool durable = false) {
     auto missing = desiredState.state().missingSecrets(version);
     if (missing.empty()) {
       // Its values must fit in this node's secret dictionary before any descriptor carries them.
-      auto refused = admitSecrets(version);
+      auto refused = admitSecrets(version, durable);
       if (!refused) return std::nullopt;
       auto reason = *refused + " (Worker " + version.workerId + ")";
       ++secretUnavailableRejections;
@@ -1175,12 +1176,12 @@ public:
   }
   // A call (or a trial) that carries the version's secrets may start here: nullopt, or why not on this node.
   // Its values are held until the lease's time to live has passed; the descriptor holds them from then on.
-  std::optional<std::string> admitSecrets(const VersionDefinition& version) {
+  std::optional<std::string> admitSecrets(const VersionDefinition& version, bool durable = false) {
     if (version.secrets.empty()) return std::nullopt;
     syncSecretDictionary();
     const auto now = monotonicTimeMs();
     auto refused = secretDictionary.admit(coworkerd::tenantOf(version.workerId), secretValues(version), now,
-        now + std::max<double>(leaseConfig.ttlMs, 30000));
+        now + std::max<double>(leaseConfig.ttlMs, 30000), durable);
     if (refused) ++secretDictionaryRefusals;
     return refused;
   }
@@ -2392,7 +2393,7 @@ public:
     if (!process) throw ProcessUnavailable{false};
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
-      if (auto missing = secretRefusal(*version, false))
+      if (auto missing = secretRefusal(*version, false, true))
         throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
     }
     const auto limits = namedLimits(version->workerId);
@@ -6655,7 +6656,7 @@ private:
         server.rejectVersionUnavailable(unavailable);
         co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409));
       }
-      if (auto missing = server.secretRefusal(*version, false)) co_return refused(*missing);
+      if (auto missing = server.secretRefusal(*version, false, true)) co_return refused(*missing);
     }
     // A call another node sent carries no lock table: its lease names the object's version here.
     if (request.allocation && !request.allocation->pins)
@@ -6683,8 +6684,9 @@ private:
       co_return Ran{std::nullopt, BindingDispatch::Dispatched{std::move(opened.dispatcher), std::move(opened.ready)}};
     } catch (const DurableDispatchRefused& failure) {
       co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
-    } catch (const ProcessUnavailable&) {
-      co_return refused(server.refusal("DO_UNAVAILABLE", "the durable process of this object (" +
+    } catch (const ProcessUnavailable& error) {
+      // Nothing was sent: the durable process is not ready, or the secret dictionary could not take the values.
+      co_return refused(server.refusal("DO_UNAVAILABLE", !error.reason.empty() ? error.reason : "the durable process of this object (" +
           server.durableProcessFor(target.key()) + ") is not ready", 503));
     }
   }

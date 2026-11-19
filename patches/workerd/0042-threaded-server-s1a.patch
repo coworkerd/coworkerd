@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..66a1ed7f8cc5a0131bff0c91925cf5c2b97038ca
+index 0000000000000000000000000000000000000000..8aaa6fd9132b8a38e41aec2600ace33516484ee8
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,905 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1006,6 +1006,14 @@ index 0000000000000000000000000000000000000000..66a1ed7f8cc5a0131bff0c91925cf5c2
 +constexpr kj::StringPtr LIVE126_86K_THEN_STRING =
 +    "globalThis.kept = []; for (let i = 0; i < 1501; ++i) kept.push(new Array(11000).fill(1.5));"
 +    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
++// A 500 MB one-byte string first: V8 takes the first object of the young
++// large-object space without checking its capacity or collecting, so the
++// tenant check (after a collection) does not see it; then one maximum string.
++// Before the near-heap-limit callback this ended the process (exit 74,
++// raw/s27-x500).
++constexpr kj::StringPtr YOUNG500_THEN_STRING =
++    "const a = ' '.repeat(5e8); a.indexOf('z'); globalThis.kept = a;"
++    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 +constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
 +    "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
 +    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
@@ -1124,16 +1132,18 @@ index 0000000000000000000000000000000000000000..66a1ed7f8cc5a0131bff0c91925cf5c2
 +  auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
 +  if (selected == nullptr) return;
 +  kj::StringPtr spec(selected);
-+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k>");
++  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k|young500>");
 +  auto count = kj::str(spec.first(colon)).parseAs<uint>();
 +  auto kind = spec.slice(colon + 1);
 +  KJ_REQUIRE(count > 0 && count <= 8 &&
-+      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k"));
++      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k" ||
++          kind == "young500"));
 +  simultaneousAllocations(count,
 +      kind == "array"          ? NEAR_GIB_ARRAY
 +          : kind == "live126"  ? LIVE126_THEN_STRING
 +          : kind == "live86k"  ? LIVE126_86K_THEN_STRING
 +          : kind == "live128k" ? LIVE126_128K_THEN_STRING
++          : kind == "young500" ? YOUNG500_THEN_STRING
 +                               : NEAR_GIB_STRING);
 +  fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
 +  fflush(stdout);
@@ -1211,6 +1221,12 @@ index 0000000000000000000000000000000000000000..66a1ed7f8cc5a0131bff0c91925cf5c2
 +
 +KJ_TEST("126 MiB live in objects near 128 KiB then one near-GiB object preserves the process") {
 +  auto child = runAllocationChild("1:live128k");
++  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
++  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
++}
++
++KJ_TEST("a 500 MB young object then one near-GiB object preserves the process") {
++  auto child = runAllocationChild("1:young500");
 +  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
 +  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
 +}
@@ -1528,10 +1544,10 @@ index 0000000000000000000000000000000000000000..66a1ed7f8cc5a0131bff0c91925cf5c2
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..6276d3054465bb91e99c3b623c172b2a67aed731
+index 0000000000000000000000000000000000000000..9e5db7888f2b74e154bce23cdac7fc3b123e8520
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3876 @@
+@@ -0,0 +1,3895 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2154,6 +2170,8 @@ index 0000000000000000000000000000000000000000..6276d3054465bb91e99c3b623c172b2a
 +  v8::ArrayBuffer::Allocator *inner;
 +  v8::Isolate *isolate = nullptr;
 +  std::atomic<bool> pendingPressure{false};
++  // Whether this isolate's ceiling was raised once already (install()).
++  std::atomic<bool> ceilingRaised{false};
 +  std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
 +  void pressure() {
 +    if (currentCause) {
@@ -2250,10 +2268,27 @@ index 0000000000000000000000000000000000000000..6276d3054465bb91e99c3b623c172b2a
 +  void install(v8::Isolate *value) {
 +    isolate = value;
 +    // Soft tenant checks run after collection. The fixed hard reserve covers
-+    // one maximum-sized V8 object; repeated callbacks never enlarge this limit.
++    // one maximum-sized V8 object.
 +    value->SetOOMErrorHandler(&nativeOom);
 +    value->AddGCEpilogueCallback([](v8::Isolate *, v8::GCType, v8::GCCallbackFlags, void *opaque) {
 +      static_cast<MemoryBudget *>(opaque)->observe(true);
++    }, this);
++    // V8 takes the first object of the young large-object space without a
++    // collection, so no tenant check sees it until the next one, and the next
++    // large allocation can then meet the fixed ceiling with that object live
++    // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
++    // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
++    // terminated as such, and its ceiling is raised once by one maximum
++    // object so that the allocation in progress finishes; its call ends with
++    // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
++    // its limit. A second time in the same isolate the ceiling stays and V8's
++    // OOM ends the process, as before.
++    value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t) -> size_t {
++      auto &budget = *static_cast<MemoryBudget *>(opaque);
++      budget.cause->store(LimitCause::MEMORY);
++      budget.isolate->TerminateExecution();
++      if (budget.ceilingRaised.exchange(true)) return current;
++      return current + MAX_SINGLE_HEAP_OBJECT;
 +    }, this);
 +  }
 +};

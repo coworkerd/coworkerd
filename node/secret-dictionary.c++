@@ -150,14 +150,45 @@ bool SecretDictionary::compact(double nowMs) {
 }
 
 void SecretDictionary::countRefusal(const std::string& tenant, Refusal kind) {
-  ++(kind == Refusal::FULL ? refusedFull : kind == Refusal::SHARE ? refusedShare : refusedEarlier);
+  ++(kind == Refusal::FULL ? refusedFull : kind == Refusal::SHARE ? refusedShare
+      : kind == Refusal::EARLIER ? refusedEarlier : refusedCooled);
   auto found = refusedByTenant.find(tenant);
   if (found == refusedByTenant.end()) {
     if (refusedByTenant.size() >= 256) return;
     found = refusedByTenant.emplace(tenant, Refused{}).first;
   }
   auto& row = found->second;
-  ++(kind == Refusal::FULL ? row.full : kind == Refusal::SHARE ? row.share : row.earlier);
+  ++(kind == Refusal::FULL ? row.full : kind == Refusal::SHARE ? row.share : kind == Refusal::EARLIER ? row.earlier : row.cooled);
+}
+
+// The tenant's share, then the node's total, for the values the tenant does not hold yet.
+std::optional<std::string> SecretDictionary::capacityRefusal(const std::string& tenant, const std::set<std::string>& values) {
+  size_t addBytes = 0, addPatterns = 0, tenantAdd = 0;
+  std::set<std::string> counted;
+  for (const auto& value : values) {
+    if (value.empty() || held.contains({tenant, value})) continue;
+    tenantAdd += bytesOf(value);
+    for (auto& needle : needlesOf(value)) {
+      if (needleRefs.contains(needle) || !counted.insert(needle).second) continue;
+      addBytes += platformLogNeedleBytes(needle.size());
+      ++addPatterns;
+    }
+  }
+  if (tenantAdd == 0) return std::nullopt;
+  // A tenant's share comes before its current values: no tenant fills the node alone.
+  if (const auto would = tenantBytes(tenant) + tenantAdd; would > shareBytes()) {
+    countRefusal(tenant, Refusal::SHARE);
+    return "this tenant's secret values on this node would take " + kib(would) + ", " + kib(would - shareBytes()) +
+        " more than its share of " + kib(shareBytes()) + " (a quarter of the node's " + kib(limits.nodeBytes) +
+        " dictionary): use fewer or smaller secrets";
+  }
+  if (liveBytes + addBytes > limits.nodeBytes || livePatterns + addPatterns > limits.nodePatterns) {
+    countRefusal(tenant, Refusal::FULL);
+    return "this node's secret dictionary is full (" + kib(liveBytes) + " of " + kib(limits.nodeBytes) + ", " +
+        std::to_string(livePatterns) + " of " + std::to_string(limits.nodePatterns) + " values): this tenant's calls "
+        "with secrets are refused here, and another node may take them";
+  }
+  return std::nullopt;
 }
 
 // When the tenant's earlier values are all released if their isolates get no
@@ -183,39 +214,32 @@ std::string SecretDictionary::recovery(const std::string& tenant, double nowMs) 
 }
 
 std::optional<std::string> SecretDictionary::admit(const std::string& tenant, const std::set<std::string>& values,
-    double nowMs, double untilMs) {
+    double nowMs, double untilMs, bool durable) {
   if (values.empty()) return std::nullopt;
+  if (const auto cooled = cooledUntilMs.find(tenant); durable && cooled != cooledUntilMs.end()) {
+    const auto pinned = pinnedUnknown.find(tenant);
+    if (nowMs < cooled->second && pinned != pinnedUnknown.end() && pinned->second > limits.rotateEarlierBytes) {
+      countRefusal(tenant, Refusal::COOLED);
+      return "this tenant's earlier secret values grow too fast on this node's Durable Object process (" + kib(pinned->second) +
+          " pinned; it was rotated for them less than an hour ago): its Durable Object calls with secrets are refused here "
+          "for about " + std::to_string(static_cast<uint64_t>(std::ceil((cooled->second - nowMs) / 1000))) + " s";
+    }
+    if (nowMs >= cooled->second || pinned == pinnedUnknown.end() || pinned->second <= limits.rotateEarlierBytes)
+      cooledUntilMs.erase(cooled);
+  }
   if (const auto earlier = earlierBytes(tenant); earlier > limits.tenantEarlierBytes) {
     countRefusal(tenant, Refusal::EARLIER);
     return "this node still holds " + kib(earlier) + " of this tenant's earlier secret values for isolates that may "
         "still use them (at most " + kib(limits.tenantEarlierBytes) + " per tenant): its calls with secrets are refused "
         "here until they are released, " + recovery(tenant, nowMs);
   }
-  size_t addBytes = 0, addPatterns = 0, tenantAdd = 0;
-  std::set<std::string> counted;
-  for (const auto& value : values) {
-    if (held.contains({tenant, value})) continue;
-    tenantAdd += bytesOf(value);
-    for (auto& needle : needlesOf(value)) {
-      if (needleRefs.contains(needle) || !counted.insert(needle).second) continue;
-      addBytes += platformLogNeedleBytes(needle.size());
-      ++addPatterns;
-    }
-  }
-  // A tenant's share comes before its current values: no tenant fills the node alone.
-  if (const auto would = tenantBytes(tenant) + tenantAdd; would > shareBytes()) {
-    countRefusal(tenant, Refusal::SHARE);
-    return "this tenant's secret values on this node would take " + kib(would) + ", " + kib(would - shareBytes()) +
-        " more than its share of " + kib(shareBytes()) + " (a quarter of the node's " + kib(limits.nodeBytes) +
-        " dictionary): use fewer or smaller secrets";
-  }
+  if (auto refused = capacityRefusal(tenant, values)) return refused;
   const auto full = [&] {
     countRefusal(tenant, Refusal::FULL);
     return "this node's secret dictionary is full (" + kib(liveBytes) + " of " + kib(limits.nodeBytes) + ", " +
         std::to_string(livePatterns) + " of " + std::to_string(limits.nodePatterns) + " values): this tenant's calls "
         "with secrets are refused here, and another node may take them";
   };
-  if (liveBytes + addBytes > limits.nodeBytes || livePatterns + addPatterns > limits.nodePatterns) return full();
   auto& holder = holders[Key{tenant, std::string(), 0, std::string()}];
   holder.tenant = tenant;
   if (pruneReservation(holder)) ++revision;
@@ -233,6 +257,8 @@ bool SecretDictionary::sent(const std::string& tenant, const std::set<std::strin
     const std::string& processId, uint64_t generation, const std::string& revision, bool native, double nowMs,
     double untilMs) {
   if (values.empty()) return true;
+  // Values that changed after the call was admitted are checked as an admission would.
+  if (capacityRefusal(tenant, values)) return false;
   const Key key{tenant, processId, generation, revision};
   auto [at, created] = holders.try_emplace(key);
   auto& holder = at->second;
@@ -261,9 +287,12 @@ void SecretDictionary::collect(double nowMs, const std::vector<Residents>& resid
     auto& holder = at->second;
     if (holder.processId.empty()) changed |= pruneReservation(holder);
     bool holding = nowMs < holder.untilMs && !holder.values.empty();
-    if (!holding && !holder.processId.empty()) {
+    if (!holder.processId.empty()) {
+      // A generation that is gone holds nothing any more, whatever its calls' deadlines; its output still queued
+      // is what the grace covers.
       const auto found = live.find({holder.processId, holder.generation});
-      holding = found != live.end() && (!found->second->known || found->second->revisions.contains(holder.revision));
+      holding = found != live.end() &&
+          (holding || !found->second->known || found->second->revisions.contains(holder.revision));
     }
     if (holding) {
       holder.releasedMs.reset();
@@ -293,11 +322,9 @@ void SecretDictionary::rotatePinned(double nowMs, const std::vector<Residents>& 
       return r.processId == entry.first.first && r.generation == entry.first.second;
     });
   });
-  if (!sink.rotate) return;
+  pinnedUnknown.clear();
   for (const auto& generation : residents) {
-    if (generation.known || !generation.current || rotated.contains({generation.processId, generation.generation})) continue;
-    const auto last = lastRotationMs.find(generation.processId);
-    if (last != lastRotationMs.end() && nowMs - last->second < limits.rotationIntervalMs) continue;
+    if (generation.known || !generation.current) continue;
     std::map<std::string, std::set<std::string>> pinned;
     for (const auto& [key, holder] : holders) {
       if (holder.processId != generation.processId || holder.generation != generation.generation) continue;
@@ -305,22 +332,36 @@ void SecretDictionary::rotatePinned(double nowMs, const std::vector<Residents>& 
       for (const auto& value : holder.values)
         if (now == current.end() || !now->second.contains(value)) pinned[holder.tenant].insert(value);
     }
+    bool requested = !sink.rotate || rotated.contains({generation.processId, generation.generation});
+    const auto last = lastRotationMs.find(generation.processId);
+    if (last != lastRotationMs.end() && nowMs - last->second < limits.rotationIntervalMs) requested = true;
     for (const auto& [tenant, values] : pinned) {
       size_t bytes = 0;
       for (const auto& value : values) bytes += bytesOf(value);
-      if (bytes <= limits.rotateEarlierBytes) continue;
+      pinnedUnknown[tenant] += bytes;
+      if (bytes <= limits.rotateEarlierBytes || requested) continue;
+      // The same tenant again within the cooldown: no rotation, its Durable Object calls wait instead.
+      if (const auto caused = tenantRotationMs.find(tenant);
+          caused != tenantRotationMs.end() && nowMs - caused->second < limits.tenantRotationCooldownMs) {
+        const auto until = caused->second + limits.tenantRotationCooldownMs;
+        if (cooledUntilMs[tenant] != until) ++rotationsSuppressed;
+        cooledUntilMs[tenant] = until;
+        continue;
+      }
+      requested = true;
       rotated[{generation.processId, generation.generation}] = nowMs;
       lastRotationMs[generation.processId] = nowMs;
+      tenantRotationMs[tenant] = nowMs;
+      cooledUntilMs.erase(tenant);
       ++rotationsRequested;
       sink.rotate(generation.processId, generation.generation, "secret dictionary: " + kib(bytes) +
           " of a tenant's earlier secret values pinned in a generation that names no isolates");
-      break;
     }
   }
 }
 
 std::string SecretDictionary::json(double nowMs) const {
-  struct Row { std::string tenant; size_t bytes = 0, earlier = 0; uint64_t full = 0, share = 0, refusedEarlier = 0; };
+  struct Row { std::string tenant; size_t bytes = 0, earlier = 0; uint64_t full = 0, share = 0, refusedEarlier = 0, cooled = 0; };
   std::map<std::string, Row> rows;
   for (const auto& [pair, entry] : held) {
     auto& row = rows[pair.first];
@@ -336,6 +377,7 @@ std::string SecretDictionary::json(double nowMs) const {
     row.full = counts.full;
     row.share = counts.share;
     row.refusedEarlier = counts.earlier;
+    row.cooled = counts.cooled;
   }
   std::vector<Row> ordered;
   for (auto& [tenant, row] : rows) ordered.push_back(std::move(row));
@@ -354,13 +396,14 @@ std::string SecretDictionary::json(double nowMs) const {
       << ",\"publishedBytes\":" << publishedBytes << ",\"compactions\":" << compactions
       << ",\"sharedGeneration\":" << usage.generation << ",\"sharedBytes\":" << usage.bytes
       << ",\"sinkFailures\":" << sinkFailures << ",\"rotationsRequested\":" << rotationsRequested
+      << ",\"rotationsSuppressed\":" << rotationsSuppressed << ",\"cooledTenants\":" << cooledUntilMs.size()
       << ",\"refused\":{\"full\":" << refusedFull << ",\"share\":" << refusedShare << ",\"earlier\":" << refusedEarlier
-      << "},\"tenants\":[";
+      << ",\"cooled\":" << refusedCooled << "},\"tenants\":[";
   for (size_t i = 0; i < ordered.size() && i < 16; ++i) {
     const auto& row = ordered[i];
     out << (i ? "," : "") << "{\"tenant\":\"" << jsonEscape(row.tenant) << "\",\"bytes\":" << row.bytes
         << ",\"earlierBytes\":" << row.earlier << ",\"refusedFull\":" << row.full << ",\"refusedShare\":" << row.share
-        << ",\"refusedEarlier\":" << row.refusedEarlier << "}";
+        << ",\"refusedEarlier\":" << row.refusedEarlier << ",\"refusedCooled\":" << row.cooled << "}";
   }
   out << "],\"tenantCount\":" << ordered.size() << ",\"observedAtMonotonicMs\":" << static_cast<uint64_t>(nowMs) << "}";
   return out.str();

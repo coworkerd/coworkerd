@@ -144,9 +144,10 @@ SecretDictionary::Residents residents(const std::string& process, uint64_t gener
 // One tenant changes the same secret 70,000 times, 256 bytes each (about
 // 18 MB of distinct values, more than the old append-only 16 MiB region held),
 // with a call after nearly every change, while its native process keeps its
-// last eight isolates. The dictionary stays bounded, the other tenant's and the
-// platform's lines are written as before, an earlier value goes once nothing
-// holds it, and the values the still-resident isolates hold stay hidden.
+// last eight isolates, and its first eight all along. The dictionary stays
+// bounded, the other tenant's and the platform's lines are written as before, an
+// earlier value goes once nothing holds it, and the values the still-resident
+// isolates hold stay hidden, long past their calls' deadlines and the grace.
 void secretRotations() {
   SecretDictionary dictionary({}, sharedSink());
   PlatformLogCleaner cleaner;
@@ -154,6 +155,8 @@ void secretRotations() {
   const std::string platform = "[server] an ordinary platform line\n";
   constexpr uint32_t ROTATIONS = 70000, RESIDENT = 8;
   std::deque<std::pair<std::string, std::string>> resident;  // (revision, value), newest last
+  std::vector<std::pair<std::string, std::string>> first;    // the first eight, resident all along
+  std::set<std::string> pinned;
   std::deque<std::string> history;
   double now = 0;
   size_t largest = 0, sharedLargest = 0;
@@ -169,6 +172,10 @@ void secretRotations() {
       KJ_REQUIRE(dictionary.sent("busy", {value}, "p0", 1, revision, true, now, now + 30000));
       resident.emplace_back(revision, value);
       if (resident.size() > RESIDENT) resident.pop_front();
+      if (first.size() < RESIDENT) {
+        first.emplace_back(revision, value);
+        pinned.insert(value);
+      }
       ++admitted;
     } else {
       KJ_REQUIRE(!dictionary.holds(value), "a value no call carried is not in the dictionary", rotation);
@@ -181,6 +188,7 @@ void secretRotations() {
     if (rotation % 10 == 9) {
       std::set<std::string> revisions{"quiet"};
       for (const auto& [revision, kept] : resident) revisions.insert(revision);
+      for (const auto& [revision, kept] : first) revisions.insert(revision);
       dictionary.collect(now, {residents("p0", 1, revisions)});
     }
     largest = std::max(largest, dictionary.bytes());
@@ -198,17 +206,25 @@ void secretRotations() {
         requireClean(text, kept);
         KJ_REQUIRE(text == "resident:[redacted]\n", "a value a resident isolate holds must stay hidden", rotation);
       }
+      for (const auto& [revision, kept] : first) {
+        const auto text = cleaner.append("first:" + kept + "\n");
+        requireClean(text, kept);
+        KJ_REQUIRE(dictionary.holds(kept) && text == "first:[redacted]\n",
+            "a value an isolate resident all along holds must stay hidden past its deadline and the grace", rotation);
+      }
       // 2,000 changes (200 s) ago: not resident, past its deadline and the grace.
       const auto& gone = history.front();
-      const auto text = cleaner.append("gone:" + gone + "\n");
-      KJ_REQUIRE(!dictionary.holds(gone) && text == "gone:" + gone + "\n", "an unused earlier value must leave", rotation);
+      if (!pinned.contains(gone)) {
+        const auto text = cleaner.append("gone:" + gone + "\n");
+        KJ_REQUIRE(!dictionary.holds(gone) && text == "gone:" + gone + "\n", "an unused earlier value must leave", rotation);
+      }
     }
   }
-  // Holders: at most 8 resident isolates, and the calls of the last 30 s plus
+  // Holders: at most 16 resident isolates, and the calls of the last 30 s plus
   // the 60 s grace (about 900 changes), each 2 x 260 bytes at most.
   const bool bounded = largest <= 1000 * 2 * 260 + 1024 && sharedLargest <= 2 * (1000 * 2 * 260 + 1024);
   const auto state = dictionary.json(now);
-  KJ_REQUIRE(bounded && admitted > 59000 && state.find("\"refused\":{\"full\":0,\"share\":0,\"earlier\":0}") != std::string::npos,
+  KJ_REQUIRE(bounded && admitted > 59000 && state.find("\"refused\":{\"full\":0,\"share\":0,\"earlier\":0,\"cooled\":0}") != std::string::npos,
       "the dictionary must stay bounded and never refuse", largest, sharedLargest);
 }
 // The two limits, with small values: a tenant past its earlier-value limit is
@@ -290,7 +306,7 @@ void secretLimits() {
       dictionary.bytes() <= limits.nodeBytes, "a call that does not fit must be refused", fitted);
   KJ_REQUIRE(!dictionary.admit("t0", {big[0]}, now, now + 1000), "a tenant already in keeps running");
   const auto state = dictionary.json(now);
-  KJ_REQUIRE(state.find("\"refused\":{\"full\":1,\"share\":0,\"earlier\":1}") != std::string::npos &&
+  KJ_REQUIRE(state.find("\"refused\":{\"full\":1,\"share\":0,\"earlier\":1,\"cooled\":0}") != std::string::npos &&
       state.find("\"limitBytes\":65536") != std::string::npos, "the node state shows usage and refusals");
   // The others' reservations end: after the grace the refused tenant fits.
   now += 1000;
@@ -299,20 +315,26 @@ void secretLimits() {
   dictionary.collect(now, {});
   const auto last = "t" + std::to_string(fitted);
   KJ_REQUIRE(!dictionary.admit(last, {big.back()}, now, now + 1000), "a refused tenant fits once others are gone");
-  // 3. A process that names no isolates keeps what it got until it is gone.
-  const auto durable = syntheticValue();
-  current["durable"] = {durable};
+  // 3. A process that names no isolates keeps what it got until it is gone: `durable` long past its call's
+  // deadline and the grace, `lasting` (its call's deadline an hour away) no longer once the generation is gone.
+  const auto durable = syntheticValue(), lasting = syntheticValue();
+  current["durable"] = {durable, lasting};
   dictionary.setCurrent(current);
-  KJ_REQUIRE(dictionary.sent("durable", {durable}, "d0", 4, "", false, now, now + 1000));
+  KJ_REQUIRE(dictionary.sent("durable", {durable}, "d0", 4, "a", false, now, now + 1000));
+  KJ_REQUIRE(dictionary.sent("durable", {lasting}, "d0", 4, "b", false, now, now + 3600000));
   current["durable"] = {syntheticValue()};
   dictionary.setCurrent(current);
-  now += 10 * limits.graceMs;
-  dictionary.collect(now, {residents("d0", 4, {}, false)});
-  KJ_REQUIRE(dictionary.holds(durable) && dictionary.earlierBytes("durable") > 0, "an unknown process keeps its values");
+  for (int pass = 0; pass < 2; ++pass) {
+    now += 10 * limits.graceMs;
+    dictionary.collect(now, {residents("d0", 4, {}, false)});
+    KJ_REQUIRE(dictionary.holds(durable) && dictionary.holds(lasting) && dictionary.earlierBytes("durable") > 0,
+        "an unknown process keeps its values past their calls' deadlines and the grace", pass);
+  }
   dictionary.collect(now, {residents("d0", 5, {}, false)});
   now += limits.graceMs + 1000;
   dictionary.collect(now, {residents("d0", 5, {}, false)});
-  KJ_REQUIRE(!dictionary.holds(durable), "a generation that is gone releases its values after the grace");
+  KJ_REQUIRE(!dictionary.holds(durable) && !dictionary.holds(lasting),
+      "a generation that is gone releases its values after the grace, before its calls' deadlines");
   // 4. A rebuild keeps the values it was rebuilt for (they count as published).
   {
     SecretDictionary::Limits small;
@@ -434,8 +456,75 @@ void secretShare() {
     KJ_REQUIRE(text == name + ":[redacted]\n");
   }
   const auto state = dictionary.json(now);
-  KJ_REQUIRE(state.find("\"refused\":{\"full\":0,\"share\":1,\"earlier\":0}") != std::string::npos &&
+  KJ_REQUIRE(state.find("\"refused\":{\"full\":0,\"share\":1,\"earlier\":0,\"cooled\":0}") != std::string::npos &&
       state.find("\"tenantShareBytes\":65536") != std::string::npos, "the node state shows the share refusal");
+  // Values that changed after the call was admitted are checked when its descriptor is built: past the share,
+  // nothing is sent and nothing is added.
+  const auto first = syntheticValue();
+  current["switcher"] = {first};
+  dictionary.setCurrent(current);
+  KJ_REQUIRE(!dictionary.admit("switcher", {first}, now, now + 60000));
+  std::set<std::string> changed;
+  for (int i = 0; i < 24; ++i) changed.insert(syntheticValue() + std::string(464, '\x01'));
+  current["switcher"] = changed;
+  dictionary.setCurrent(current);
+  const bool notSent = !dictionary.sent("switcher", changed, "p0", 1, "r", true, now, now + 60000) &&
+      std::none_of(changed.begin(), changed.end(), [&](const auto& value) { return dictionary.holds(value); }) &&
+      dictionary.tenantBytes("switcher") <= dictionary.shareBytes();
+  KJ_REQUIRE(notSent, "a descriptor whose new values pass the tenant's share is not sent");
+}
+
+// A Durable Object tenant whose 64 KiB secret changes every minute: past
+// 512 KiB the first time the node rotates the process; the second time within
+// the hour it rotates nothing and refuses that tenant's Durable Object calls
+// with secrets instead (its stateless calls, and another tenant's Durable
+// Object calls, go on); after the hour the next trigger rotates again and the
+// tenant recovers.
+void secretRotationCooldown() {
+  SecretDictionary::Limits limits;
+  std::vector<std::pair<std::string, uint64_t>> requests;
+  SecretDictionary::Sink sink = sharedSink();
+  sink.rotate = [&](const std::string& process, uint64_t generation, const std::string&) { requests.emplace_back(process, generation); };
+  SecretDictionary dictionary(limits, sink);
+  const auto calm = longValue(1024);
+  double now = 0;
+  uint64_t generation = 1, fastRefused = 0, calmRefused = 0, statelessRefused = 0;
+  std::optional<double> retireAt;
+  std::string reason;
+  int lastAdmitted = -1, firstRefused = -1;
+  for (int minute = 1; minute <= 150; ++minute) {
+    now += 60000;
+    const auto token = longValue(64 * 1024);
+    dictionary.setCurrent({{"fast", {token}}, {"calm", {calm}}});
+    if (auto refused = dictionary.admit("fast", {token}, now, now + 30000, true)) {
+      ++fastRefused;
+      reason = *refused;
+      if (firstRefused < 0) firstRefused = minute;
+    } else {
+      KJ_REQUIRE(dictionary.sent("fast", {token}, "d0", generation, "", false, now, now + 30000));
+      lastAdmitted = minute;
+    }
+    if (dictionary.admit("fast", {token}, now, now + 30000, false)) ++statelessRefused;
+    if (dictionary.admit("calm", {calm}, now, now + 30000, true)) ++calmRefused;
+    else KJ_REQUIRE(dictionary.sent("calm", {calm}, "d0", generation, "", false, now, now + 30000));
+    // The node's rotation: the requested generation goes a minute later.
+    if (!retireAt && !requests.empty() && requests.back().second == generation) retireAt = now + 60000;
+    std::vector<SecretDictionary::Residents> live{{"d0", generation, false, {}, true}};
+    if (retireAt && now >= *retireAt) {
+      ++generation;
+      retireAt.reset();
+      live = {{"d0", generation, false, {}, true}};
+    } else if (retireAt) {
+      live.push_back({"d0", generation + 1, false, {}, false});
+    }
+    dictionary.collect(now, live);
+  }
+  const auto state = dictionary.json(now);
+  const bool cooled = requests.size() == 3 && fastRefused > 0 && reason.find("grow too fast") != std::string::npos &&
+      calmRefused == 0 && statelessRefused == 0 && lastAdmitted > firstRefused &&
+      state.find("\"rotationsSuppressed\":") != std::string::npos;
+  KJ_REQUIRE(cooled, "one tenant must not rotate a durable process more than once an hour", requests.size(), fastRefused,
+      calmRefused, statelessRefused, firstRefused, lastAdmitted);
 }
 
 // A Durable Object tenant that changes a 1 KiB token every hour, on a process
@@ -519,14 +608,35 @@ void staleLines() {
         if (n > 0) text.append(buffer, n);
         else usleep(10000);
       }
+      // A line whose first half arrived while its value was held and whose end came after the value left:
+      // it is as old as its first byte, so it is dropped too.
+      const auto split = syntheticValue();
+      std::vector<std::string> splitNeedles;
+      addRedaction(splitNeedles, split);
+      KJ_REQUIRE(appendPlatformLogRedactions(splitNeedles));
+      line("half:" + split.substr(0, 20));
+      usleep(300000);
+      KJ_REQUIRE(replacePlatformLogRedactions({}));
+      usleep(2000000);
+      line(split.substr(20) + "\n");
+      line("tail: written\n");
+      const auto again = monotonicTimeMs() + 10000;
+      while (text.find("tail: written") == std::string::npos && monotonicTimeMs() < again) {
+        char buffer[4096];
+        const auto n = ::read(reader, buffer, sizeof buffer);
+        if (n > 0) text.append(buffer, n);
+        else usleep(10000);
+      }
+      requireClean(text, split);
       state = WorkerdOutput::processJson(0);
       close(writer);
     }
     close(reader);
     requireClean(text, value);
     const bool dropped = text.find("first: nothing secret") != std::string::npos && text.find("after: written") != std::string::npos &&
-        text.find("old:") == std::string::npos && state.find("\"stale\":1") != std::string::npos;
-    KJ_REQUIRE(dropped, "a workerd line queued past the stale limit must be dropped and counted");
+        text.find("old:") == std::string::npos && text.find("half:") == std::string::npos &&
+        text.find("tail: written") != std::string::npos && state.find("\"stale\":2") != std::string::npos;
+    KJ_REQUIRE(dropped, "a workerd line queued past the stale limit, or begun before it, must be dropped and counted");
   }
   {
     const auto value = syntheticValue();
@@ -733,6 +843,7 @@ int main(int argc, char** argv) {
     else if (argc == 2 && std::string_view(argv[1]) == "secret-limits") coworkerd::secretLimits();
     else if (argc == 2 && std::string_view(argv[1]) == "secret-share") coworkerd::secretShare();
     else if (argc == 2 && std::string_view(argv[1]) == "secret-pinned-rotation") coworkerd::secretPinnedRotation();
+    else if (argc == 2 && std::string_view(argv[1]) == "secret-rotation-cooldown") coworkerd::secretRotationCooldown();
     else if (argc == 2 && std::string_view(argv[1]) == "stale-lines") coworkerd::staleLines();
     else { KJ_REQUIRE(argc == 2); coworkerd::workerDiagnostics(argv[1]); }
     return 0;

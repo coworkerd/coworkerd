@@ -482,9 +482,11 @@ public:
   }
 
 private:
-  struct Stream { int fd = -1; std::string partial; uint64_t discarded = 0; bool discarding = false; };
+  // `partialSinceMs`: when the first byte of the unfinished line arrived.
+  struct Stream { int fd = -1; std::string partial; uint64_t discarded = 0; bool discarding = false; uint64_t partialSinceMs = 0; };
   struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId; };
-  // `queuedMs`: when the reader took the lines from the pipe (the monotonic clock).
+  // `queuedMs`: when the reader took the lines from the pipe (the monotonic clock); for a line begun in an
+  // earlier read, when its first byte was taken.
   struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; };
 
   // Reader thread: keeps every pipe empty whatever the sink does.
@@ -619,8 +621,9 @@ private:
   // larger than the whole backlog budget can never be queued.
   void consume(Source& source, Stream& stream, const char* data, size_t size) {
     auto& slot = shared.slots[source.slot];
-    Batch batch{source.slot, 0, {}, monotonicMs()};
-    batch.bytes.reserve(size + stream.partial.size());
+    const uint64_t readMs = monotonicMs();
+    Batch batch{source.slot, 0, {}, readMs};
+    batch.bytes.reserve(size);
     bool dropped = false;
     for (size_t at = 0; at < size;) {
       const auto* newline = static_cast<const char*>(std::memchr(data + at, '\n', size - at));
@@ -645,6 +648,7 @@ private:
           stream.discarded = length;
         }
       } else if (!newline) {
+        if (stream.partial.empty()) stream.partialSinceMs = readMs;
         stream.partial.append(data + at, piece);
       } else {
         const uint64_t length = stream.partial.size() + piece;
@@ -656,8 +660,15 @@ private:
         if (slot.backlogBytes.load(std::memory_order_acquire) + batch.bytes.size() + length > budget) {
           drop(source, 1, length, DROP_BACKLOG);
           dropped = true;
+        } else if (!stream.partial.empty()) {
+          // A line that began in an earlier read is as old as its first byte. It is this read's first line and
+          // goes alone, so the lines after it keep this read's time.
+          Batch line{source.slot, 1, {}, std::min(readMs, stream.partialSinceMs)};
+          line.bytes.reserve(length);
+          line.bytes.append(stream.partial);
+          line.bytes.append(data + at, piece);
+          enqueue(std::move(line));
         } else {
-          batch.bytes.append(stream.partial);
           batch.bytes.append(data + at, piece);
           ++batch.lines;
         }
