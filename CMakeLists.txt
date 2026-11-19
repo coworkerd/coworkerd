@@ -88,6 +88,7 @@ add_library(common STATIC
   common/deployment.c++
   common/tenancy.c++
   common/config.c++
+  common/cpu-capacity.c++
   common/support.c++
   common/log-cleaning.c++
   common/log-sink.c++
@@ -184,7 +185,7 @@ target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
-foreach(case native-config deadlines event-loop trial-verdicts leases tree-lease budget identity admission package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()

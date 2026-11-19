@@ -1,4 +1,5 @@
 #include "invocation-contract.h"
+#include "tenant-execution.h"
 #include "event-loop.h"
 #include "trial-verdict.h"
 #include "reasons.h"
@@ -433,6 +434,11 @@ struct InvocationRejection {
 };
 
 constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
+constexpr std::string_view PROCESS_TENANT_LIMIT = "process-tenant-concurrency";
+constexpr const char* PROCESS_TENANT_REASON = "tenant execution concurrency limit reached in process";
+bool processTenantRefusal(const InvocationRejection& refusal) {
+  return refusal.code == "OVERLOADED" && refusal.category == PROCESS_TENANT_LIMIT;
+}
 bool tenantLimitRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == TENANT_ADMISSION_LIMIT;
 }
@@ -469,6 +475,7 @@ struct AdmissionSlot {
   bool root = false;
   // Every pre-dispatch recheck shares this slot and the call's one paused-wait budget.
   double pausedWaitMs = 0;
+  double processTenantWaitMs = 0;
   std::string ingressNodeId;
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
@@ -1601,6 +1608,14 @@ public:
       return rejected("LOAD_BAND_REJECTED", band == "red" ?
           (forwardedRoot ? "red band rejects forwarded roots" : "red band rejects nested invocations") : "yellow band rejects cold version");
     if (!checkProcess || (durable ? runtime.durableAvailable(durable->key()) : runtime.available(worker))) return std::nullopt;
+    if (!durable) if (const auto limited = runtime.tenantExecutionLimit(worker)) {
+      auto value = refusal("OVERLOADED", PROCESS_TENANT_REASON, 503, root);
+      value.category = PROCESS_TENANT_LIMIT;
+      value.inFlight = limited->inFlight; value.limit = limited->limit;
+      value.notExecuted = value.retryable = true;
+      if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return value;
+    }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
     if (serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
@@ -1626,6 +1641,7 @@ public:
     if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root, worker, durable)};
     auto reject = [&](InvocationRejection value) {
       if (tenantLimitRefusal(value)) recordTenantLimitRefusal(worker, root, value, durable);
+      else if (processTenantRefusal(value)) value.avoidMs = 0;
       else {
         value.category.clear();
         value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
@@ -1633,6 +1649,30 @@ public:
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return Admission{std::move(value), {}};
     };
+    if (wait && processTenantRefusal(*failure)) {
+      const auto began = monotonicTimeMs();
+      const auto used = slot ? slot->processTenantWaitMs : 0;
+      const auto duration = std::max(0.0, std::min(deadline - began,
+          serverConfig.processPool.tenantAdmissionWaitMs - used));
+      const auto id = beginAdmissionWait("tenant-execution");
+      std::string outcome = "canceled";
+      auto done = kj::defer([&] { endAdmissionWait("tenant-execution", id, began, outcome); });
+      auto limited = [&] {
+        const auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+        return current && processTenantRefusal(*current);
+      };
+      const auto waited = co_await tenantExecutionQueue.wait(timer, static_cast<int64_t>(duration * 1000) * kj::MICROSECONDS,
+          static_cast<uint32_t>(std::min<uint64_t>(uint64_t(serverConfig.rootLimit) + serverConfig.nestedLimit, 16384)), limited);
+      auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+      if (waited != coworkerd::TenantExecutionQueue::READY || current) {
+        outcome = waited == coworkerd::TenantExecutionQueue::FULL ? "full" : "expired";
+        co_return reject(current ? std::move(*current) : std::move(*failure));
+      }
+      outcome = "resumed";
+      if (!slot) slot = reserve(root, worker, durable);
+      slot->processTenantWaitMs += monotonicTimeMs() - began;
+      co_return Admission{std::nullopt, std::move(slot)};
+    }
     if (!wait || !pausedRefusal(*failure)) {
       if (!wait && pausedRefusal(*failure)) co_return Admission{std::move(failure), {}};
       co_return reject(std::move(*failure));
@@ -1689,7 +1729,7 @@ public:
   std::string pausedAdmissionJson() const {
     std::ostringstream out; out << std::setprecision(17) << '{';
     bool first = true;
-    for (const auto* kind : {"ordinary", "quarantine", "durable"}) {
+    for (const auto* kind : {"ordinary", "quarantine", "durable", "tenant-execution"}) {
       auto found = pausedAdmissionCounts.find(kind);
       const auto count = found == pausedAdmissionCounts.end() ? PausedAdmissionCounts{} : found->second;
       out << (first ? "" : ",") << '"' << kind << "\":{\"count\":" << count.count << ",\"active\":" << count.active
@@ -1698,6 +1738,10 @@ public:
       for (const auto* outcome : {"resumed", "expired", "killed", "lease", "unavailable", "canceled"}) {
         auto value = count.outcomes.find(outcome);
         out << ",\"" << outcome << "\":" << (value == count.outcomes.end() ? 0 : value->second);
+      }
+      if (std::string_view(kind) == "tenant-execution") {
+        const auto full = count.outcomes.find("full");
+        out << ",\"full\":" << (full == count.outcomes.end() ? 0 : full->second);
       }
       out << '}';
     }
@@ -2684,6 +2728,10 @@ public:
     if (!slot || slot->decided || receipt != slot->dispatchReceipt ||
         (state != "capacity-rejected" && state != "load-rejected")) return std::nullopt;
     auto refused = refusal("OVERLOADED", "process admission budget is full", 503, slot->root);
+    if (state == "capacity-rejected" && reason == PROCESS_TENANT_REASON) {
+      refused.reason = PROCESS_TENANT_REASON;
+      refused.category = PROCESS_TENANT_LIMIT;
+    }
     if (state == "load-rejected") {
       refused.code = "LOAD_FAILED";
       if (stage == "code") {
@@ -3423,6 +3471,7 @@ private:
     std::map<std::string, uint64_t> outcomes;
   };
   std::map<std::string, PausedAdmissionCounts> pausedAdmissionCounts;
+  coworkerd::TenantExecutionQueue tenantExecutionQueue;
   uint64_t nextAdmissionWaitId = 1;
   uint64_t nextPlacementSequence = 1;
   uint64_t nextTreeSequence = 1;

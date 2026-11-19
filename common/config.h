@@ -1,6 +1,7 @@
 #pragma once
 
 #include "object-store.h"
+#include "cpu-capacity.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -89,8 +90,9 @@ struct ProcessPoolConfig {
   // Selects the ordinary and quarantine backend; durable processes use upstream.
   std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
-  // Per-tenant concurrent invocations in each native process.
-  uint32_t tenantInFlightLimit = 13;
+  // Borrowable per-tenant calls per native process; 0 disables the share.
+  uint32_t tenantInFlightLimit = tenantExecutionShare(availableProcessCpus());
+  uint32_t tenantAdmissionWaitMs = 1000;
   // 0 derives a process share from the node's actual memory budget, including a spare generation.
   uint64_t threadedMemoryBytes = 0;
   uint32_t threadedResidentLimit = 1840;

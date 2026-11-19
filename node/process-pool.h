@@ -75,6 +75,8 @@ public:
   ~ProcessPool() noexcept(false);
   kj::Promise<void> run();
   bool available(const std::string& worker);
+  struct TenantExecutionLimit { uint32_t inFlight, limit; };
+  std::optional<TenantExecutionLimit> tenantExecutionLimit(const std::string& worker);
   // The original paused generations, only when none of this target's processes is admitted.
   // Retaining the snapshot never waits for a replacement generation after death or rotation.
   struct PausedAdmission {

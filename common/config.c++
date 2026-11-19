@@ -49,8 +49,9 @@ void ProcessPoolConfig::validate() const {
       "processPool.ordinaryServer must be threaded; the ordinary upstream backend has been removed");
   KJ_REQUIRE(ordinaryServer != "threaded" || inFlightLimit <= 16384,
       "threaded process inFlightLimit must not exceed 16384");
-  KJ_REQUIRE(tenantInFlightLimit > 0 && tenantInFlightLimit <= 16384,
-      "processPool.tenantInFlightLimit must be between 1 and 16384");
+  KJ_REQUIRE(tenantInFlightLimit <= 16384,
+      "processPool.tenantInFlightLimit must be between 0 and 16384");
+  KJ_REQUIRE(tenantAdmissionWaitMs <= 60000, "processPool.tenantAdmissionWaitMs is at most 60000");
   KJ_REQUIRE(threadedResidentLimit > 0 && threadedResidentLimit <= 1840,
       "processPool.threadedResidentLimit must be between 1 and 1840");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
@@ -203,7 +204,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();
   result.processPool.ordinaryServer = pool.getOrdinaryServer().cStr();
   result.processPool.threadedExecutable = pool.getThreadedExecutable().cStr();
-  result.processPool.tenantInFlightLimit = pool.getTenantInFlightLimit();
+  if (given({"processPool", "tenantInFlightLimit"})) result.processPool.tenantInFlightLimit = pool.getTenantInFlightLimit();
+  result.processPool.tenantAdmissionWaitMs = pool.getTenantAdmissionWaitMs();
   result.processPool.threadedMemoryBytes = pool.getThreadedMemoryBytes();
   result.processPool.threadedResidentLimit = pool.getThreadedResidentLimit();
   result.processPool.threadedThreadIdleMs = pool.getThreadedThreadIdleMs();

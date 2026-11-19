@@ -13,6 +13,8 @@
 
 "Not executed" means the Worker's code certainly did not start, so another attempt cannot execute it twice. A response with `retryable: false` means retrying the same request will not help. "Result uncertain" means part of the code may have executed.
 
+From 0.6.0, a native process's borrowable tenant execution share uses the reason `tenant execution concurrency limit reached in process`. A call waits on the node for `processPool.tenantAdmissionWaitMs` (1000 ms by default, within its lease), then receives not-executed, retryable `503 OVERLOADED` if there is still no slot. A full wait queue gives the same answer. The share applies while another tenant has calls in flight in that process; a sole tenant borrows the whole pool. This differs from the node ingress reason `tenant ingress concurrency limit reached`.
+
 | HTTP | `code` | Meaning | Executed? | What to do |
 | --- | --- | --- | --- | --- |
 | 404 | `ROUTE_NOT_FOUND` | No route matches this host and path (`cowctl deploy` routes `/<tenant>/<Worker>` under the default host unless `--route`, or `route` in `cowctl.json`, names another: `/<prefix>` under `/<tenant>/` on the default host, or `<host>/<prefix>` on a hostname of the tenant); right after a deployment that did not wait for the nodes (`--no-wait`, or `/v1` directly), the node may not have read it yet (within 5 seconds) | Not executed | See the routes with `cowctl versions`; after such a deployment, retry a few seconds later |

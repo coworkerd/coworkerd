@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..917f4b3b33f99eb66308d973d04d610ae890c8f4
+index 0000000000000000000000000000000000000000..c8ab33cfb570ec07cdef3e7bd0675f9beb299510
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,478 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -755,19 +755,32 @@ index 0000000000000000000000000000000000000000..917f4b3b33f99eb66308d973d04d610a
 +  auto budget = std::make_shared<TenantBudget>(1);
 +  {
 +    TenantPermit active(budget, "a");
-+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
-+        "process admission budget is full", TenantPermit(budget, "a"));
++    TenantPermit borrowed(budget, "a");
++    KJ_EXPECT(budget->active["a"] == 2);
 +    {
 +      TenantPermit other(budget, "b");
 +      KJ_EXPECT(budget->active.size() == 2);
++      KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++          "tenant execution concurrency limit reached in process", TenantPermit(budget, "a"));
++      KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++          "tenant execution concurrency limit reached in process", TenantPermit(budget, "b"));
++      KJ_EXPECT(budget->active["a"] == 2 && budget->active["b"] == 1);
 +    }
 +    KJ_EXPECT(budget->active.size() == 1);
++    TenantPermit borrowedAgain(budget, "a");
++    KJ_EXPECT(budget->active["a"] == 3);
 +  }
 +  KJ_EXPECT(budget->active.empty());
 +  auto pair = kj::newPromiseAndFulfiller<void>();
 +  auto canceled = pair.promise.attach(std::make_shared<TenantPermit>(budget, "a"));
 +  canceled = nullptr;
 +  KJ_EXPECT(budget->active.empty());
++  auto disabled = std::make_shared<TenantBudget>(0);
++  TenantPermit a(disabled, "a"), b(disabled, "b"), a2(disabled, "a");
++  KJ_EXPECT(disabled->active["a"] == 2 && disabled->active["b"] == 1);
++  const auto refusal = capacityError(CapacityScope::TENANT);
++  const auto detail = KJ_REQUIRE_NONNULL(refusal.getDetail(CAPACITY_DETAIL));
++  KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
 +}
 +
 +KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation") {
@@ -1104,10 +1117,10 @@ index 0000000000000000000000000000000000000000..917f4b3b33f99eb66308d973d04d610a
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b7914ee020c
+index 0000000000000000000000000000000000000000..aa08a5dc82a29a8ec5778fbb12950b97490e7961
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3747 @@
+@@ -0,0 +1,3771 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1527,17 +1540,23 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +};
 +
 +constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
-+kj::Exception capacityError() {
-+  auto error = jsg::tagCoworkerdRpcError(
-+      KJ_EXCEPTION(OVERLOADED, "jsg.Error: OVERLOADED: process admission budget is full"),
++enum class CapacityScope { PROCESS, TENANT };
++kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
++  const auto tenant = scope == CapacityScope::TENANT;
++  auto error = jsg::tagCoworkerdRpcError(tenant
++          ? KJ_EXCEPTION(OVERLOADED,
++                "jsg.Error: OVERLOADED: tenant execution concurrency limit reached in process")
++          : KJ_EXCEPTION(OVERLOADED, "jsg.Error: OVERLOADED: process admission budget is full"),
 +      "OVERLOADED");
-+  error.setDetail(CAPACITY_DETAIL, kj::heapArray<kj::byte>(0));
++  auto detail = kj::heapArray<kj::byte>(tenant ? 1 : 0);
++  if (tenant) detail[0] = 1;
++  error.setDetail(CAPACITY_DETAIL, kj::mv(detail));
 +  return error;
 +}
 +
 +struct TenantBudget {
 +  explicit TenantBudget(uint32_t limit): limit(limit) {
-+    KJ_REQUIRE(limit > 0 && limit <= 16384, "invalid per-tenant in-flight limit");
++    KJ_REQUIRE(limit <= 16384, "invalid per-tenant in-flight limit");
 +  }
 +  const uint32_t limit;
 +  std::mutex mutex;
@@ -1550,9 +1569,10 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +        tenant(std::move(tenant)) {
 +    std::lock_guard lock(this->budget->mutex);
 +    auto found = this->budget->active.find(this->tenant);
-+    if (found != this->budget->active.end() && found->second >= this->budget->limit) {
++    if (this->budget->limit && this->budget->active.size() > 1 &&
++        found != this->budget->active.end() && found->second >= this->budget->limit) {
 +      this->budget->rejected.fetch_add(1);
-+      kj::throwRecoverableException(capacityError());
++      kj::throwRecoverableException(capacityError(CapacityScope::TENANT));
 +    }
 +    ++this->budget->active[this->tenant];
 +  }
@@ -2754,7 +2774,7 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +            configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
 +            limit)),
 +        tenantBudget(std::make_shared<TenantBudget>(
-+            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 13))),
++            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
 +        subrequestBudget(limit, tenantBudget->limit) {
 +    KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
 +    resources->reclaimWake = managerWake;
@@ -2940,8 +2960,11 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +    return state.io.provider->getTimer().timeoutAfter(
 +        250 * kj::MILLISECONDS, confirmDecisionImpl(input, state, decision, reason, stage));
 +  }
-+  kj::Promise<kj::String> confirmCapacity(Json::Reader input, ThreadState &state) {
-+    return confirmDecision(input, state, "capacity-rejected", "process admission budget is full");
++  kj::Promise<kj::String> confirmCapacity(
++      Json::Reader input, ThreadState &state, CapacityScope scope = CapacityScope::PROCESS) {
++    return confirmDecision(input, state, "capacity-rejected",
++        scope == CapacityScope::TENANT ? "tenant execution concurrency limit reached in process"
++                                       : "process admission budget is full");
 +  }
 +  static void wake(int fd) {
 +    uint64_t one = 1;
@@ -3824,7 +3847,9 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +        tenant(std::move(tenant)),
 +        tenantShare(tenantShare) {}
 +  bool acquireLocked() {
-+    auto perTenant = kj::min(budget.limit, kj::max<uint32_t>(1, budget.tenantLimit - 1));
++    auto perTenant = budget.tenantLimit == 0
++        ? budget.limit
++        : kj::min(budget.limit, kj::max<uint32_t>(1, budget.tenantLimit - 1));
 +    auto found = budget.tenants.find(tenant);
 +    if (*invocation >= 32 || budget.active.load() >= budget.limit ||
 +        (tenantShare && found != budget.tenants.end() && found->second >= perTenant))
@@ -4448,6 +4473,7 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +  std::shared_ptr<ResourcePreparation> preparation;
 +  std::shared_ptr<TenantPermit> tenant;
 +  bool capacity = false;
++  bool tenantCapacity = false;
 +  kj::Maybe<kj::Exception> loadFailure;
 +  try {
 +    if (state.rejectOnly) kj::throwRecoverableException(capacityError());
@@ -4455,14 +4481,17 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +    slot = co_await server.getWorker(input, state, coldLoaded);
 +    preparation = server.prepareSlot(slot);
 +  } catch (const kj::Exception &error) {
-+    if (error.getDetail(CAPACITY_DETAIL) != kj::none)
++    if (error.getDetail(CAPACITY_DETAIL) != kj::none) {
 +      capacity = true;
-+    else
++      const auto detail = KJ_REQUIRE_NONNULL(error.getDetail(CAPACITY_DETAIL));
++      tenantCapacity = detail.size() == 1 && detail[0] == 1;
++    } else
 +      loadFailure = error.clone();
 +  }
 +  if (capacity) {
-+    co_await server.confirmCapacity(input, state);
-+    kj::throwRecoverableException(capacityError());
++    const auto scope = tenantCapacity ? CapacityScope::TENANT : CapacityScope::PROCESS;
++    co_await server.confirmCapacity(input, state, scope);
++    kj::throwRecoverableException(capacityError(scope));
 +  }
 +  KJ_IF_SOME(error, loadFailure) {
 +    auto stage = threaded::LoadStage::LOAD;
@@ -4532,6 +4561,7 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +  auto loadStage = threaded::LoadStage::LOAD;
 +  bool coldLoaded = false;
 +  bool capacity = false;
++  bool tenantCapacity = false;
 +  std::shared_ptr<ResourcePreparation> preparation;
 +  std::shared_ptr<TenantPermit> tenant;
 +  try {
@@ -4540,7 +4570,10 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +    slot = co_await server.getWorker(input, state, coldLoaded);
 +    if (!trial) preparation = server.prepareSlot(slot);
 +  } catch (const kj::Exception &error) {
-+    if (error.getDetail(CAPACITY_DETAIL) != kj::none) capacity = true;
++    KJ_IF_SOME(detail, error.getDetail(CAPACITY_DETAIL)) {
++      capacity = true;
++      tenantCapacity = detail.size() == 1 && detail[0] == 1;
++    }
 +    loadError = kj::str(error.getDescription());
 +    KJ_IF_SOME(stage, error.getDetail(LOAD_STAGE_DETAIL)) {
 +      if (stage.size() == 1 && stage[0] <= static_cast<kj::byte>(threaded::LoadStage::EVALUATION))
@@ -4548,9 +4581,13 @@ index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b79
 +    }
 +  }
 +  if (capacity) {
-+    auto report = trial ? kj::str("{\"ok\":false,\"capacityRejected\":true,\"message\":"
-+                                  "\"process admission budget is full\"}")
-+                        : co_await server.confirmCapacity(input, state);
++    auto report = trial
++        ? kj::str("{\"ok\":false,\"capacityRejected\":true,\"message\":\"",
++              tenantCapacity ? "tenant execution concurrency limit reached in process"
++                             : "process admission budget is full",
++              "\"}")
++        : co_await server.confirmCapacity(
++              input, state, tenantCapacity ? CapacityScope::TENANT : CapacityScope::PROCESS);
 +    auto output = response.send(trial ? 200 : 503, trial ? "OK" : "Service Unavailable",
 +        kj::HttpHeaders(*state.headers), report.size());
 +    co_await output->write(report.asBytes());

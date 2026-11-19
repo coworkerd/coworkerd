@@ -602,13 +602,16 @@ struct ProcessPoolConfig {
   ordinaryServer @12 :Text = "threaded";
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
-  # Per-tenant calls in each native ordinary or quarantine generation.
-  tenantInFlightLimit @14 :UInt32 = 13;
+  # Per-tenant calls while another tenant is in flight. The JSON loader derives
+  # an omitted value from affinity/cgroup CPUs; an explicit 0 disables it.
+  tenantInFlightLimit @14 :UInt32 = 0;
   # 0 derives a safe share from the node's cgroup/configured memory budget.
   threadedMemoryBytes @15 :UInt64 = 0;
   # Shared-pointer-space budget, below the measured fatal boundary.
   threadedResidentLimit @16 :UInt32 = 1840;
   threadedThreadIdleMs @17 :UInt32 = 60000;
+  # Node-side wait for this tenant's process share, bounded by the call's lease.
+  tenantAdmissionWaitMs @18 :UInt32 = 1000;
 }
 
 struct RotationConfig {

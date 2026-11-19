@@ -4,6 +4,8 @@
 #include "invocation-contract.h"
 #include "event-loop.h"
 #include "trial-verdict.h"
+#include "tenant-execution.h"
+#include "cpu-capacity.h"
 #include "json.h"
 #include "process-culprit.h"
 #include "manifests.h"
@@ -17,6 +19,10 @@
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
+#include <sys/wait.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace coworkerd {
 namespace {
@@ -39,13 +45,72 @@ void nativeConfig() {
   const auto decoded = ServerConfig::load(directory / "default.json");
   for (const auto* config : {&direct, &decoded}) {
     KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
-    KJ_REQUIRE(config->processPool.tenantInFlightLimit == 13);
+    KJ_REQUIRE(config->processPool.tenantInFlightLimit == tenantExecutionShare(availableProcessCpus()));
+    KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
     KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
   }
   write(directory / "limits.json", "{\"cpuLimitMs\":200,\"memoryLimitMiB\":64}");
   const auto overridden = ServerConfig::load(directory / "limits.json");
   KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
       overridden.processPool.memoryLimitMiB == 64);
+  write(directory / "disabled.json", "{\"processPool\":{\"tenantInFlightLimit\":0,\"tenantAdmissionWaitMs\":25}}");
+  const auto disabled = ServerConfig::load(directory / "disabled.json");
+  KJ_REQUIRE(disabled.processPool.tenantInFlightLimit == 0 && disabled.processPool.tenantAdmissionWaitMs == 25);
+  disabled.processPool.validate();
+}
+
+void tenantExecution() {
+  for (const auto [cpus, expected] : {std::pair{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 2u}, {4u, 2u},
+      {5u, 3u}, {16u, 13u}, {64u, 61u}}) KJ_REQUIRE(tenantExecutionShare(cpus) == expected);
+  KJ_REQUIRE(quotaCpuCount(150000, 100000) == 2 && quotaCpuCount(200000, 100000) == 2);
+  KJ_REQUIRE(quotaCpuCount(UINT64_MAX, 1) == UINT32_MAX && quotaCpuCount(1, 0) == 0);
+  TempDir directory;
+  const auto leaf = std::filesystem::path(directory.path) / "parent/leaf";
+  std::filesystem::create_directories(leaf);
+  write(leaf / "cpu.max", "max 100000\n");
+  write(leaf.parent_path() / "cpu.max", "150000 100000\n");
+  write(std::filesystem::path(directory.path) / "cpu.max", "400000 100000\n");
+  KJ_REQUIRE(cpusWithinQuota(16, leaf, directory.path) == 2);
+  KJ_REQUIRE(cpusWithinQuota(1, leaf, directory.path) == 1);
+  write(leaf / "cpu.max", "100000 100000\n");
+  KJ_REQUIRE(cpusWithinQuota(16, leaf, directory.path) == 1);
+  KJ_REQUIRE(!tenantExecutionLimited(100, 100, 13));
+  KJ_REQUIRE(tenantExecutionLimited(100, 101, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(12, 101, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(100, 101, 0));
+#ifdef __linux__
+  const auto child = fork(); KJ_REQUIRE(child >= 0);
+  if (!child) {
+    cpu_set_t available, two;
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) _exit(1);
+    CPU_ZERO(&two); unsigned count = 0;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE && count < 2; ++cpu) if (CPU_ISSET(cpu, &available)) {
+      CPU_SET(cpu, &two); ++count;
+    }
+    if (sched_setaffinity(0, sizeof(two), &two) != 0) _exit(1);
+    const auto actual = availableProcessCpus();
+    _exit(actual >= 1 && actual <= count ? 0 : 1);
+  }
+  int status = 0; KJ_REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
+  kj::EventLoop loop; kj::WaitScope scope(loop);
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  TenantExecutionQueue queue;
+  bool blocked = true;
+  auto first = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
+  auto second = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
+  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope) && queue.active() == 2);
+  auto full = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, [&] { return blocked; });
+  KJ_REQUIRE(full.wait(scope) == TenantExecutionQueue::FULL && queue.active() == 2);
+  second = nullptr;
+  KJ_REQUIRE(queue.active() == 1);
+  timer.advanceTo(timer.now() + 5 * kj::MILLISECONDS); blocked = false;
+  KJ_REQUIRE(first.wait(scope) == TenantExecutionQueue::READY && queue.active() == 0);
+  blocked = true;
+  auto expired = queue.wait(timer, 10 * kj::MILLISECONDS, 2, [&] { return blocked; });
+  KJ_REQUIRE(!expired.poll(scope));
+  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS); blocked = false;
+  KJ_REQUIRE(expired.wait(scope) == TenantExecutionQueue::EXPIRED && queue.active() == 0);
 }
 
 void eventLoopProgress() {
@@ -490,6 +555,7 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
+  else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
   else if (name == "trial-verdicts") trialVerdicts();

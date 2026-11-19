@@ -3052,7 +3052,8 @@ public:
     if (!admitted(p)) return false;
     if (!p.threaded) return true;
     const auto found = p.tenantInFlight.find(tenantOf(worker));
-    return found == p.tenantInFlight.end() || found->second < config.tenantInFlightLimit;
+    return found == p.tenantInFlight.end() ||
+        !tenantExecutionLimited(found->second, p.inFlight, config.tenantInFlightLimit);
   }
 
   // ---- Rotation ----
@@ -3603,6 +3604,19 @@ bool ProcessPool::available(const std::string& worker) {
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && impl->admittedTenant(*s.current, worker)) return true;
   return false;
 }
+std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLimit(const std::string& worker) {
+  impl->refresh();
+  const auto quarantine = quarantined(worker);
+  const auto tenant = tenantOf(worker);
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current &&
+      s.current->threaded && impl->admitted(*s.current)) {
+    const auto found = s.current->tenantInFlight.find(tenant);
+    if (found != s.current->tenantInFlight.end() &&
+        tenantExecutionLimited(found->second, s.current->inFlight, impl->config.tenantInFlightLimit))
+      return TenantExecutionLimit{found->second, impl->config.tenantInFlightLimit};
+  }
+  return std::nullopt;
+}
 bool ProcessPool::PausedAdmission::alive() const {
   for (const auto& p : processes)
     if (p->pid > 0 && (p->state == "paused" || p->state == "ready") && p->runtime &&
@@ -3918,6 +3932,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"cpuLimitMs\":" << impl->config.cpuLimitMs
       << ",\"memoryLimitMiB\":" << impl->config.memoryLimitMiB
       << ",\"tenantInFlightLimit\":" << impl->config.tenantInFlightLimit
+      << ",\"tenantAdmissionWaitMs\":" << impl->config.tenantAdmissionWaitMs
       << ",\"threadedMemoryBytes\":" << impl->config.threadedMemoryBytes
       << ",\"threadedResidentLimit\":" << impl->config.threadedResidentLimit
       << ",\"threadedThreadIdleMs\":" << impl->config.threadedThreadIdleMs
