@@ -813,6 +813,11 @@ private:
   std::set<uint64_t> confirmed;
   std::set<uint64_t> isolated;
   // The records of earlier epochs of this node that no segment covers (read at startup), by epoch.
+  // Same order as earlier (node epoch, then node sequence) within each object.
+  using EarlierPosition = std::pair<uint64_t, uint64_t>;
+  std::map<std::string, std::set<EarlierPosition>, std::less<>> earlierByObject;
+  void indexEarlierRecord(EarlierPosition position, const LogRecord& record);
+  void unindexEarlierRecord(EarlierPosition position, const LogRecord& record);
   std::map<uint64_t, std::map<uint64_t, LogRecord>> earlier;
   std::map<uint64_t, std::map<uint64_t, LogRecord>> earlierExcluded;
   // Startup's old log has no per-record confirmation marker. It cannot certify
