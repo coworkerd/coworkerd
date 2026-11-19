@@ -2,7 +2,13 @@
 #include "support.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <new>
+#include <stdexcept>
 #include <string_view>
+#include <sys/mman.h>
+#include <unordered_set>
 
 namespace coworkerd {
 
@@ -24,6 +30,130 @@ std::string redactNeedles(std::string text, const std::vector<std::string>& need
     }
   }
   return text;
+}
+
+namespace {
+constexpr size_t LOG_REDACTION_BYTES = 16 * 1024 * 1024;
+constexpr size_t LOG_REDACTION_PATTERNS = 65536;
+constexpr size_t LOG_PENDING_BYTES = 64 * 1024;
+constexpr size_t LOG_MATCH_WORK = 8 * 1024 * 1024;
+struct SharedLogRedactions {
+  std::atomic<size_t> published{0};
+  std::atomic<bool> overflow{false};
+  char bytes[LOG_REDACTION_BYTES];
+};
+static_assert(std::atomic<size_t>::is_always_lock_free);
+static_assert(std::atomic<bool>::is_always_lock_free);
+struct LogRedactions {
+  SharedLogRedactions* shared;
+  std::unordered_set<std::string> retained;
+  LogRedactions() {
+    auto mapping = mmap(nullptr, sizeof(SharedLogRedactions), PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) throw std::runtime_error("could not create diagnostic redactions");
+    shared = new (mapping) SharedLogRedactions;
+  }
+};
+LogRedactions& logRedactions() {
+  // The mapping must outlive the daemon's log objects and their forked writers.
+  static auto* value = new LogRedactions;
+  return *value;
+}
+}
+
+void preparePlatformLogCleaning() { (void)logRedactions(); }
+
+void retainPlatformLogRedactions(const std::vector<std::string>& needles) {
+  auto& owner = logRedactions();
+  if (owner.shared->overflow.load(std::memory_order_acquire)) return;
+  try { for (const auto& needle : needles) {
+    if (needle.empty() || owner.retained.contains(needle)) continue;
+    const auto used = owner.shared->published.load(std::memory_order_relaxed);
+    const auto remaining = LOG_REDACTION_BYTES - used;
+    if (owner.retained.size() == LOG_REDACTION_PATTERNS || remaining < sizeof(uint32_t) ||
+        needle.size() > remaining - sizeof(uint32_t)) {
+      owner.shared->overflow.store(true, std::memory_order_release);
+      return;
+    }
+    const auto size = static_cast<uint32_t>(needle.size());
+    std::memcpy(owner.shared->bytes + used, &size, sizeof(size));
+    std::memcpy(owner.shared->bytes + used + sizeof(size), needle.data(), size);
+    owner.retained.insert(needle);
+    owner.shared->published.store(used + sizeof(size) + size, std::memory_order_release);
+  }} catch (...) {
+    owner.shared->overflow.store(true, std::memory_order_release);
+    throw;
+  }
+}
+
+std::string PlatformLogCleaner::append(std::string_view input, bool final) {
+  auto* shared = logRedactions().shared;
+  if (blocked || shared->overflow.load(std::memory_order_acquire)) {
+    blocked = true;
+    pending.clear();
+    return {};
+  }
+  const auto published = shared->published.load(std::memory_order_acquire);
+  bool changed = false;
+  while (consumed < published) {
+    uint32_t size;
+    std::memcpy(&size, shared->bytes + consumed, sizeof(size));
+    needles.emplace_back(shared->bytes + consumed + sizeof(size), size);
+    consumed += sizeof(size) + size;
+    changed = true;
+  }
+  if (changed) sortRedactions(needles);
+  if (needles.empty()) return std::string(input);
+  std::string output;
+  do {
+    const auto take = std::min(input.size(), LOG_PENDING_BYTES);
+    pending.append(input.substr(0, take));
+    input.remove_prefix(take);
+    size_t hold = 0, work = 0;
+    auto charge = [&](size_t bytes) {
+      if (bytes > LOG_MATCH_WORK - std::min(work, LOG_MATCH_WORK)) return false;
+      work += bytes;
+      return true;
+    };
+    const bool finishing = final && input.empty();
+    if (!finishing) for (const auto& needle : needles) {
+      const auto possible = std::min(pending.size(), needle.size() - 1);
+      if (!charge(possible)) { blocked = true; break; }
+      for (auto at = pending.find(needle.front(), pending.size() - possible);
+           at != std::string::npos; at = pending.find(needle.front(), at + 1)) {
+        const auto length = pending.size() - at;
+        if (length <= hold) break;
+        if (!charge(length)) { blocked = true; break; }
+        if (std::string_view(needle).starts_with(std::string_view(pending).substr(at))) {
+          hold = length;
+          break;
+        }
+      }
+      if (blocked) break;
+    }
+    auto cut = pending.size() - hold;
+    // A complete match must not straddle the prefix retained for another
+    // pattern. Keep it whole until that prefix is resolved by the next chunk.
+    bool moved;
+    do {
+      moved = false;
+      for (const auto& needle : needles) {
+        if (!charge(pending.size())) { blocked = true; break; }
+        for (auto at = pending.find(needle); at != std::string::npos && at < cut;
+             at = pending.find(needle, at + 1)) {
+          if (at + needle.size() > cut) { cut = at; moved = true; break; }
+        }
+      }
+    } while (moved && !blocked);
+    if (blocked || pending.size() - cut > LOG_PENDING_BYTES) {
+      blocked = true;
+      pending.clear();
+      return {};
+    }
+    output += redactNeedles(pending.substr(0, cut), needles);
+    pending.erase(0, cut);
+  } while (!input.empty());
+  return output;
 }
 
 SecretRedactions& secretRedactions() {

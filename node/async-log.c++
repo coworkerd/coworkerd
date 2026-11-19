@@ -1,5 +1,6 @@
 #include "async-log.h"
 
+#include "log-cleaning.h"
 #include "memory-observation.h"
 #include <kj/debug.h>
 
@@ -66,8 +67,8 @@ constexpr int OUTPUT_SEND_FLAGS = MSG_DONTWAIT | MSG_NOSIGNAL;
 #else
 constexpr int OUTPUT_SEND_FLAGS = MSG_DONTWAIT;
 #endif
-enum DropReason { DROP_BACKLOG, DROP_OVERSIZED, DROP_PARTIAL, DROP_SINK, DROP_REASONS };
-constexpr std::array DROP_NAMES = {"backlog", "oversized", "partial", "sink"};
+enum DropReason { DROP_BACKLOG, DROP_OVERSIZED, DROP_PARTIAL, DROP_SINK, DROP_REDACTION, DROP_REASONS };
+constexpr std::array DROP_NAMES = {"backlog", "oversized", "partial", "sink", "redaction"};
 static_assert(DROP_NAMES.size() == DROP_REASONS);
 
 // Per process slot. The drainer's reader thread accepts and drops lines, its
@@ -856,6 +857,12 @@ private:
       writeMarkers(reported);
       if (done) break;
     }
+    const auto tail = cleaner.append({}, true);
+    if (!tail.empty() && ensureSink(true)) {
+      const auto written = writeSome(sink, tail.data(), tail.size());
+      if (written != tail.size()) sinkFailed(errno);
+      else wrote(written);
+    }
     closeDescriptor(sink);
     shared.sinkOpen.store(0, std::memory_order_relaxed);
   }
@@ -909,25 +916,38 @@ private:
   }
   void write(Batch& batch) {
     auto& slot = shared.slots[batch.slot];
-    const auto* data = batch.bytes.data();
-    const size_t size = batch.bytes.size();
+    // This runs on the writer, never on the pipe reader or the node's loop.
+    // Queue/counters measure original lines; sinkBytes measures cleaned bytes.
+    const auto text = cleaner.append(batch.bytes);
+    const auto* data = text.data();
+    const size_t size = text.size(), originalSize = batch.bytes.size();
+    if (cleaner.suppressed()) {
+      drop(batch.slot, slot.generation.load(std::memory_order_relaxed), slot.pid.load(std::memory_order_relaxed),
+          batch.lines, originalSize, DROP_REDACTION);
+      slot.backlogLines.fetch_sub(batch.lines, std::memory_order_acq_rel);
+      slot.backlogBytes.fetch_sub(originalSize, std::memory_order_acq_rel);
+      return;
+    }
     const size_t written = ensureSink(true) ? writeSome(sink, data, size) : 0;
     const int writeError = errno;
-    uint64_t lines = batch.lines, bytes = size;
+    uint64_t lines = batch.lines, bytes = originalSize;
     if (written < size) {
       const int error = writeError;
       if (sink >= 0) sinkFailed(error);
       // Lines completed before the failure count as written; the rest as dropped.
-      bytes = written;
-      while (bytes && data[bytes - 1] != '\n') --bytes;
-      lines = std::count(data, data + bytes, '\n');
+      bytes = 0; lines = 0;
+      if (text == batch.bytes) {
+        bytes = written;
+        while (bytes && data[bytes - 1] != '\n') --bytes;
+        lines = std::count(data, data + bytes, '\n');
+      }
       drop(batch.slot, slot.generation.load(std::memory_order_relaxed), slot.pid.load(std::memory_order_relaxed),
-          batch.lines - lines, size - bytes, DROP_SINK);
+          batch.lines - lines, originalSize - bytes, DROP_SINK);
     }
     slot.writtenLines.fetch_add(lines, std::memory_order_relaxed);
     slot.writtenBytes.fetch_add(bytes, std::memory_order_relaxed);
     slot.backlogLines.fetch_sub(batch.lines, std::memory_order_acq_rel);
-    slot.backlogBytes.fetch_sub(size, std::memory_order_acq_rel);
+    slot.backlogBytes.fetch_sub(originalSize, std::memory_order_acq_rel);
     if (written == size) wrote(size);
   }
   void writeMarkers(std::array<uint64_t, OUTPUT_SLOTS>& reported) {
@@ -953,7 +973,7 @@ private:
         line << (r ? "," : "") << '"' << DROP_NAMES[r] << "\":" << slot.droppedBy[r].load();
       line << "},\"firstDroppedAtUnixMs\":" << slot.firstDropUnixMs.load()
            << ",\"lastDroppedAtUnixMs\":" << slot.lastDropUnixMs.load() << "}\n";
-      const auto text = line.str();
+      const auto text = cleaner.append(line.str());
       if (writeSome(sink, text.data(), text.size()) != text.size()) {
         sinkFailed(errno);
         return;
@@ -984,6 +1004,7 @@ private:
   std::array<std::string, OUTPUT_SLOTS> names;
   std::array<uint32_t, OUTPUT_SLOTS> classes{};
   // Writer thread only.
+  PlatformLogCleaner cleaner;
   int sink = -1;
   uint64_t failingSinceMs = 0;
   bool sinkRegular = false;
@@ -1028,6 +1049,7 @@ class WorkerdOutput::Impl {
 public:
   Impl(std::string sinkPath, WorkerLogSettings settings): sinkPath(std::move(sinkPath)), budget(outputBudget()),
       settings(settings) {
+    preparePlatformLogCleaning();
     if (settings.linesPerSecond == 0 || settings.maxLineBytes < 64 || settings.tenantBufferBytes < 4096 ||
         settings.totalBufferBytes < settings.tenantBufferBytes || settings.sinkFiles == 0 || settings.sinkFiles > 64 ||
         (settings.sinkMaxBytes && settings.sinkMaxBytes < 64 * 1024))

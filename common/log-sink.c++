@@ -1,4 +1,5 @@
 #include "log-sink.h"
+#include "log-cleaning.h"
 
 #include <kj/debug.h>
 
@@ -57,6 +58,7 @@ struct alignas(64) Shared {
   std::atomic<uint64_t> accepted{0}, written{0}, highWaterBytes{0};
   std::atomic<uint64_t> clockUnixMs{0};
   std::atomic<uint32_t> closed{0}, writerError{0}, ready{0};
+  std::atomic<uint64_t> redactionSuppressedLines{0};
   std::array<Drop, SOURCES.size()> drops;
 };
 struct Header { uint32_t size, descriptor; };
@@ -117,6 +119,9 @@ public:
       for (std::streamsize i = 0; i < size; ++i) {
         if (used < MAX_LINE) buffer[used++] = data[i]; else oversized = true;
         if (data[i] == '\n') {
+          // Refresh only on the event-loop thread. The writer reads the
+          // published dictionary, including revisions after its fork.
+          secretRedactions().needles();
           owner.enqueue(buffer, used, descriptor, oversized);
           used = 0; oversized = false;
         }
@@ -139,6 +144,7 @@ public:
   };
 
   Impl(): cap(capacity()), mappingBytes(sizeof(Shared) + cap + 2 * MAX_LINE) {
+    preparePlatformLogCleaning();
     mapping = mmap(nullptr, mappingBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (mapping == MAP_FAILED) throw std::runtime_error("async log mmap failed");
     std::memset(mapping, 0, mappingBytes);
@@ -238,7 +244,8 @@ public:
       if (i) output << ',';
       output << '"' << SOURCES[i] << "\":" << count;
     }
-    output << "},\"droppedLines\":" << dropped << "}";
+    output << "},\"droppedLines\":" << dropped
+      << ",\"redactionSuppressedLines\":" << shared->redactionSuppressedLines.load() << "}";
     return output.str();
   }
   Shared* shared;
@@ -247,6 +254,13 @@ private:
   void consume(int liveness) {
     shared->ready.store(1, std::memory_order_release);
     std::array<uint64_t, SOURCES.size()> reported{};
+    std::array<PlatformLogCleaner, 2> cleaners;
+    auto writeClean = [&](int fd, std::string_view bytes, bool final = false) {
+      auto& cleaner = cleaners[fd == STDOUT_FILENO ? 0 : 1];
+      const auto text = cleaner.append(bytes, final);
+      if (cleaner.suppressed()) shared->redactionSuppressedLines.fetch_add(1, std::memory_order_relaxed);
+      return writeAll(fd, text.data(), text.size());
+    };
     bool parentGone = false;
     for (;;) {
       pollfd descriptor{liveness, POLLIN | POLLHUP, 0};
@@ -260,8 +274,9 @@ private:
         Header header; copyOut(ring, cap, head, &header, sizeof(header));
         auto at = (head + sizeof(header)) % cap;
         auto first = std::min<size_t>(header.size, cap - at);
-        if (!writeAll(header.descriptor, ring + at, first) ||
-            !writeAll(header.descriptor, ring, header.size - first)) {
+        std::string record(ring + at, first);
+        record.append(ring, header.size - first);
+        if (!writeClean(header.descriptor, record)) {
           shared->writerError.store(1, std::memory_order_release); return;
         }
         shared->written.fetch_add(1, std::memory_order_relaxed);
@@ -279,13 +294,17 @@ private:
           << ",\"total\":" << count << ",\"firstDroppedAtUnixMs\":" << drop.firstUnixMs.load()
           << ",\"lastDroppedAtUnixMs\":" << drop.lastUnixMs.load() << "}\n";
         auto text = line.str();
-        if (!writeAll(STDOUT_FILENO, text.data(), text.size())) {
+        if (!writeClean(STDOUT_FILENO, text)) {
           shared->writerError.store(1, std::memory_order_release); return;
         }
         reported[i] = count;
       }
       if (head == tail) {
-        if (parentGone) return;
+        if (parentGone) {
+          if (!writeClean(STDOUT_FILENO, {}, true) || !writeClean(STDERR_FILENO, {}, true))
+            shared->writerError.store(1, std::memory_order_release);
+          return;
+        }
         // Idle writer polling is entirely outside the server event loop.
         poll(&descriptor, 1, 1);
       }

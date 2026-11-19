@@ -3211,6 +3211,9 @@ private:
     // (a RemoteInvocation never carries them). Every dispatch checks them first
     // (secretRefusal), synchronously before this point.
     if (!version.secrets.empty()) {
+      // Publish before the descriptor can reach either runtime. Both log
+      // writers fork before ServerCore, and retain older generations' values.
+      secretRedactions().needles();
       const auto& state = desiredState.state();
       auto secrets = descriptor.initSecrets(version.secrets.size());
       for (size_t i = 0; i < version.secrets.size(); ++i) {

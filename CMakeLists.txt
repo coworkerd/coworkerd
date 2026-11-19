@@ -171,6 +171,13 @@ add_executable(coworkerd-process-culprit-test EXCLUDE_FROM_ALL node/process-culp
 target_link_libraries(coworkerd-process-culprit-test PRIVATE common)
 add_test(NAME node-threaded-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
 add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-test memory)
+add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-test.c++ node/async-log.c++)
+target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
+set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd"
+  CACHE FILEPATH "Built workerd for the real Worker diagnostic redaction test")
+add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
+add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
+set_tests_properties(node-log-stream node-log-redaction PROPERTIES TIMEOUT 30)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
@@ -188,7 +195,7 @@ if(COWORKERD_TEST_JUNIT)
 endif()
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
-  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.

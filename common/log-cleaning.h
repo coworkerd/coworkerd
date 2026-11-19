@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -15,6 +16,25 @@ void addRedaction(std::vector<std::string>& needles, const std::string& value);
 void sortRedactions(std::vector<std::string>& needles);
 // Every occurrence of each needle (longest first) replaced.
 std::string redactNeedles(std::string text, const std::vector<std::string>& needles);
+
+// Create before the log writer/drainer forks. Publication is append-only for
+// this daemon's lifetime, so queued output and old generations keep coverage
+// after a secret changes. Capacity failure suppresses diagnostics.
+void preparePlatformLogCleaning();
+void retainPlatformLogRedactions(const std::vector<std::string>& needles);
+
+// Used only by the log writers, never by the pipe reader or request threads.
+// Keep possible secret prefixes across records, pipe chunks and newlines.
+class PlatformLogCleaner {
+public:
+  std::string append(std::string_view input, bool final = false);
+  bool suppressed() const { return blocked; }
+private:
+  size_t consumed = 0;
+  std::vector<std::string> needles;
+  std::string pending;
+  bool blocked = false;
+};
 
 // The values of every secret in this Server's deployment view, hidden by every cleaning;
 // ServerCore provides them (the tools have none). Rebuilt when the view's revision or generation
@@ -31,6 +51,7 @@ struct SecretRedactions {
       cached.clear();
       for (const auto& value : values()) if (!value.empty()) addRedaction(cached, value);
       sortRedactions(cached);
+      retainPlatformLogRedactions(cached);
       builtFor = now;
     }
     return cached;

@@ -74,6 +74,15 @@ STARTUP_ONLY_ALWAYS = {
     "sendmsg": "the launcher sends its record, and in the observe mode the notification listener, to the "
                "Server after the filter is in force",
 }
+# These can use vDSO on a profiling host but become real calls on another
+# amd64 host (for example an hpet clock source). V8 also queries CPU affinity
+# and sleeps between scheduler/worker turns after startup.
+AMD64_ALWAYS = {
+    "sched_getaffinity": "V8 queries the CPUs available to a serving process",
+    "clock_nanosleep": "a serving thread sleeps through glibc's clock API",
+    "clock_gettime": "monotonic/wall clocks use a system call when vDSO is unavailable",
+    "gettimeofday": "wall time uses a system call when vDSO is unavailable",
+}
 # Where the names come from: every call name these headers mention is offered to the compiler below, which
 # resolves the ones this architecture has (including a name the header defines through another macro,
 # __NR3264_*, and the multiarch location Debian puts the architecture's own header in). A name of another
@@ -196,7 +205,8 @@ def main() -> int:
                 evidence[call][key] = int(evidence[call].get(key, 0)) + int(count)
     if not startup and not steady:
         raise SystemExit("the profiles hold no call")
-    for call, reason in ALWAYS.items():
+    always = {**ALWAYS, **(AMD64_ALWAYS if platform.machine() in ("x86_64", "amd64") else {})}
+    for call, reason in always.items():
         startup.add(call)
         steady.add(call)
         evidence.setdefault(call, {})["always"] = reason
@@ -243,7 +253,7 @@ def main() -> int:
         "steady": {"count": len(steady), "file": files["steady"]["file"], "sha256": files["steady"]["sha256"],
                    "calls": {call: table[call] for call in sorted(steady, key=lambda c: table[c])}},
         "startupOnly": sorted(startup - steady, key=lambda c: table[c]),
-        "always": {**ALWAYS, **STARTUP_ONLY_ALWAYS},
+        "always": {**always, **STARTUP_ONLY_ALWAYS},
         "dropped": dropped,
         "relaxed": [call for call in filter(None, options.relax.split(","))],
         "evidence": evidence,
