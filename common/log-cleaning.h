@@ -17,11 +17,24 @@ void sortRedactions(std::vector<std::string>& needles);
 // Every occurrence of each needle (longest first) replaced.
 std::string redactNeedles(std::string text, const std::vector<std::string>& needles);
 
-// Create before the log writer/drainer forks. Publication is append-only for
-// this daemon's lifetime, so queued output and old generations keep coverage
-// after a secret changes. Capacity failure suppresses diagnostics.
+// The forked log writers' dictionary of secret values. Both daemons create it
+// before their log writers fork; the daemon's event loop is its only writer
+// (node/secret-dictionary.h decides what it holds). Two regions: an addition is
+// appended to the active one; a rebuild, which drops values, writes the other
+// one and then makes it active, and a sequence number tells a writer that
+// copied a region while it was rewritten to copy it again. A region that cannot
+// take an addition refuses it (false, nothing added): the caller then does not
+// send the value anywhere, so the dictionary's size never silences a writer.
 void preparePlatformLogCleaning();
-void retainPlatformLogRedactions(const std::vector<std::string>& needles);
+bool appendPlatformLogRedactions(const std::vector<std::string>& needles);
+bool replacePlatformLogRedactions(const std::vector<std::string>& needles);
+struct PlatformLogRedactionUsage {
+  size_t bytes = 0, patterns = 0, capacityBytes = 0;
+  uint64_t generation = 0;
+};
+PlatformLogRedactionUsage platformLogRedactionUsage();
+// What one needle takes in a region.
+constexpr size_t platformLogNeedleBytes(size_t size) { return size + sizeof(uint32_t); }
 
 // Used only by the log writers, never by the pipe reader or request threads.
 // Keep possible secret prefixes across records, pipe chunks and newlines.
@@ -30,6 +43,10 @@ public:
   std::string append(std::string_view input, bool final = false);
   bool suppressed() const { return blocked; }
 private:
+  bool refresh();
+  void addNeedle(std::string needle);
+  void scan(size_t pattern, size_t begin);
+  uint64_t generation = UINT64_MAX;
   size_t consumed = 0;
   std::vector<std::string> needles;
   std::string pending;
@@ -38,25 +55,33 @@ private:
   std::vector<uint8_t> marks;
   bool emittingRedaction = false;
   bool blocked = false;
+  bool rescanAll = false;
 };
 
 // The values of every secret in this Server's deployment view, hidden by every cleaning;
-// ServerCore provides them (the tools have none). Rebuilt when the view's revision or generation
-// changes. Used on the event loop's thread only.
+// ServerCore provides them (the tools have none), and the earlier values some
+// isolate on this node may still hold (node/secret-dictionary.h). Rebuilt when
+// the view's revision or generation, or the earlier values, change. Used on the
+// event loop's thread only. The forked log writers read the shared dictionary.
 struct SecretRedactions {
   std::function<std::pair<uint64_t, uint64_t>()> stamp;
   std::function<std::vector<std::string>()> values;
+  std::function<uint64_t()> earlierRevision;
+  std::function<std::vector<std::string>()> earlierValues;
   std::pair<uint64_t, uint64_t> builtFor{UINT64_MAX, UINT64_MAX};
+  uint64_t earlierFor = UINT64_MAX;
   std::vector<std::string> cached;
   const std::vector<std::string>& needles() {
-    if (!stamp) { cached.clear(); builtFor = {UINT64_MAX, UINT64_MAX}; return cached; }
+    if (!stamp) { cached.clear(); builtFor = {UINT64_MAX, UINT64_MAX}; earlierFor = UINT64_MAX; return cached; }
     const auto now = stamp();
-    if (now != builtFor) {
+    const auto earlier = earlierRevision ? earlierRevision() : 0;
+    if (now != builtFor || earlier != earlierFor) {
       cached.clear();
       for (const auto& value : values()) if (!value.empty()) addRedaction(cached, value);
+      if (earlierValues) for (const auto& value : earlierValues()) if (!value.empty()) addRedaction(cached, value);
       sortRedactions(cached);
-      retainPlatformLogRedactions(cached);
       builtFor = now;
+      earlierFor = earlier;
     }
     return cached;
   }

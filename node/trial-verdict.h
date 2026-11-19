@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,10 +79,25 @@ inline TrialVerdict classifyTrialFailure(const std::string& stage, const std::st
   return {"TOP_LEVEL_THROW", "", detail};
 }
 
+// The call path's answer when the native server failed a load at the bridge
+// stage: it could not get this call's trusted plan from the node, so nothing of
+// the version ran. That is the platform's failure: PROCESS_UNAVAILABLE, not
+// executed and retryable (placement tries the next node), and no load failure
+// of the tenant's version. Other stages are classified below.
+struct CallPathPlatformFailure {
+  std::string code, category, reason;
+};
+inline std::optional<CallPathPlatformFailure> callPathPlatformFailure(const std::string& reportedStage,
+    const std::string& raw) {
+  if (reportedStage != "bridge") return std::nullopt;
+  return CallPathPlatformFailure{"PROCESS_UNAVAILABLE", "bridge",
+      "the native process could not get this call's plan from the node: " + raw};
+}
+
 // A failed load on the call path (the load check, and a dispatch decision the
-// native server confirms): classified at the stage the runtime reported, so a
-// bridge failure is not a tenant's top-level throw. Without a reported stage
-// the general load classification applies.
+// native server confirms), other than a bridge failure: classified at the stage
+// the runtime reported. Without a reported stage the general load
+// classification applies.
 inline TrialVerdict classifyLoadRejection(const std::string& reportedStage, const std::string& name,
     const std::string& raw, bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB) {
   return classifyTrialFailure(reportedStage.empty() ? "load" : reportedStage, name, raw, cpuExceeded, memoryExceeded,

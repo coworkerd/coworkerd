@@ -2,6 +2,7 @@
 #include "json.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
+#include "secret-dictionary.h"
 #include "support.h"
 
 #include <capnp/message.h>
@@ -11,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <csignal>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <poll.h>
@@ -59,12 +61,18 @@ void requireClean(const std::string& text, const std::string& value) {
   const bool leaked = containsDigest(text, value.size(), digest);
   KJ_REQUIRE(!leaked, "diagnostic redaction failed; synthetic value SHA-256", digest.c_str());
 }
+std::string longValue(size_t size) {
+  std::string value;
+  while (value.size() < size) value += syntheticValue();
+  value.resize(size);
+  return value;
+}
 void streams() {
   const auto value = syntheticValue() + "\n\"\\" + syntheticValue();
   std::vector<std::string> needles;
   addRedaction(needles, value);
   sortRedactions(needles);
-  retainPlatformLogRedactions(needles);
+  KJ_REQUIRE(appendPlatformLogRedactions(needles));
   const auto escaped = jsonEscape(value);
   for (const auto& pattern : {value, escaped}) {
     for (size_t split = 0; split <= pattern.size(); ++split) {
@@ -76,19 +84,239 @@ void streams() {
       KJ_REQUIRE(exact, "stream split must preserve surrounding diagnostics", split);
     }
   }
-  // A value removed from the current deployment still cleans queued old output.
-  secretRedactions().stamp = nullptr;
-  secretRedactions().needles();
-  PlatformLogCleaner oldGeneration;
-  const auto old = oldGeneration.append(value, true);
+  // A value a rebuilt dictionary keeps still cleans queued output.
+  KJ_REQUIRE(replacePlatformLogRedactions(needles));
+  PlatformLogCleaner rebuilt;
+  const auto old = rebuilt.append(value, true);
   requireClean(old, value);
   const bool replaced = old == "[redacted]";
   KJ_REQUIRE(replaced);
-  // Exhaustion never falls back to writing raw diagnostics.
-  retainPlatformLogRedactions({std::string(16 * 1024 * 1024 + 1, 'x')});
-  PlatformLogCleaner exhausted;
-  const bool discarded = exhausted.append("bounded diagnostic\n", true).empty() && exhausted.suppressed();
-  KJ_REQUIRE(discarded, "a full dictionary must suppress output");
+  // A needle the region cannot take is refused (its caller never sends the
+  // value), and no writer is silenced by it.
+  const bool refused = !appendPlatformLogRedactions({std::string(64 * 1024 * 1024, 'x')});
+  PlatformLogCleaner after;
+  const auto text = after.append("bounded diagnostic:" + value + "\n", true);
+  requireClean(text, value);
+  const bool written = text == "bounded diagnostic:[redacted]\n" && !after.suppressed();
+  KJ_REQUIRE(refused && written, "a full region must refuse the addition, never silence a writer");
+}
+// A writer that keeps running across rebuilds: a removed value is written
+// again, a kept one stays hidden, and a value split across a rebuild is still
+// found in the bytes held back.
+void generations() {
+  const auto kept = syntheticValue(), removed = syntheticValue(), added = syntheticValue();
+  std::vector<std::string> first, second;
+  addRedaction(first, kept); addRedaction(first, removed);
+  addRedaction(second, kept); addRedaction(second, added);
+  KJ_REQUIRE(appendPlatformLogRedactions(first));
+  PlatformLogCleaner cleaner;
+  const auto before = cleaner.append("a:" + kept + " b:" + removed + "\n");
+  requireClean(before, kept); requireClean(before, removed);
+  KJ_REQUIRE(before == "a:[redacted] b:[redacted]\n");
+  const auto generation = platformLogRedactionUsage().generation;
+  const auto split = cleaner.append("split:" + kept.substr(0, 20));
+  KJ_REQUIRE(replacePlatformLogRedactions(second));
+  const auto joined = split + cleaner.append(kept.substr(20) + ":end\n");
+  requireClean(joined, kept);
+  KJ_REQUIRE(joined == "split:[redacted]:end\n", "a value split across a rebuild must stay hidden");
+  const auto after = cleaner.append("a:" + kept + " b:" + removed + " c:" + added + "\n");
+  requireClean(after, kept); requireClean(after, added);
+  const bool released = after == "a:[redacted] b:" + removed + " c:[redacted]\n";
+  KJ_REQUIRE(released && platformLogRedactionUsage().generation == generation + 1 && !cleaner.suppressed(),
+      "a rebuilt dictionary must drop removed values and keep the rest");
+  // Many rebuilds in a row, and appends between them, reach the same writer.
+  for (int round = 0; round < 64; ++round) {
+    const auto value = syntheticValue();
+    std::vector<std::string> needles;
+    addRedaction(needles, kept); addRedaction(needles, value);
+    KJ_REQUIRE(round % 2 ? replacePlatformLogRedactions(needles) : appendPlatformLogRedactions(needles));
+    const auto text = cleaner.append("r:" + value + ":" + kept + "\n");
+    requireClean(text, value); requireClean(text, kept);
+    KJ_REQUIRE(text == "r:[redacted]:[redacted]\n", round);
+  }
+}
+SecretDictionary::Sink sharedSink() { return {appendPlatformLogRedactions, replacePlatformLogRedactions}; }
+SecretDictionary::Residents residents(const std::string& process, uint64_t generation, std::set<std::string> revisions,
+    bool known = true) {
+  return {process, generation, known, std::move(revisions)};
+}
+// One tenant changes the same secret 70,000 times, 256 bytes each (about
+// 18 MB of distinct values, more than the old append-only 16 MiB region held),
+// with a call after nearly every change, while its native process keeps its
+// last eight isolates. The dictionary stays bounded, the other tenant's and the
+// platform's lines are written as before, an earlier value goes once nothing
+// holds it, and the values the still-resident isolates hold stay hidden.
+void secretRotations() {
+  SecretDictionary dictionary({}, sharedSink());
+  PlatformLogCleaner cleaner;
+  const auto quiet = syntheticValue();
+  const std::string platform = "[server] an ordinary platform line\n";
+  constexpr uint32_t ROTATIONS = 70000, RESIDENT = 8;
+  std::deque<std::pair<std::string, std::string>> resident;  // (revision, value), newest last
+  std::deque<std::string> history;
+  double now = 0;
+  size_t largest = 0, sharedLargest = 0;
+  uint64_t admitted = 0;
+  for (uint32_t rotation = 0; rotation < ROTATIONS; ++rotation) {
+    now += 100;
+    const auto value = longValue(256);
+    dictionary.setCurrent({{"busy", {value}}, {"quiet", {quiet}}});
+    const bool called = rotation % 7 != 3;  // every seventh value is never sent anywhere
+    if (called) {
+      KJ_REQUIRE(!dictionary.admit("busy", {value}, now, now + 30000), rotation);
+      const auto revision = "busy-" + std::to_string(rotation);
+      KJ_REQUIRE(dictionary.sent("busy", {value}, "p0", 1, revision, true, now, now + 30000));
+      resident.emplace_back(revision, value);
+      if (resident.size() > RESIDENT) resident.pop_front();
+      ++admitted;
+    } else {
+      KJ_REQUIRE(!dictionary.holds(value), "a value no call carried is not in the dictionary", rotation);
+    }
+    if (rotation % 50 == 0) {
+      KJ_REQUIRE(!dictionary.admit("quiet", {quiet}, now, now + 30000));
+      KJ_REQUIRE(dictionary.sent("quiet", {quiet}, "p0", 1, "quiet", true, now, now + 30000));
+    }
+    // The node collects once a second (every ten changes here).
+    if (rotation % 10 == 9) {
+      std::set<std::string> revisions{"quiet"};
+      for (const auto& [revision, kept] : resident) revisions.insert(revision);
+      dictionary.collect(now, {residents("p0", 1, revisions)});
+    }
+    largest = std::max(largest, dictionary.bytes());
+    sharedLargest = std::max(sharedLargest, platformLogRedactionUsage().bytes);
+    history.push_back(value);
+    if (history.size() > 2000) history.pop_front();
+    if (rotation % 1000 == 999) {
+      const auto line = cleaner.append(platform);
+      KJ_REQUIRE(line == platform && !cleaner.suppressed(), "a platform line must pass unchanged", rotation);
+      const auto other = cleaner.append("quiet:" + quiet + "\n");
+      requireClean(other, quiet);
+      KJ_REQUIRE(other == "quiet:[redacted]\n", "another tenant's value must stay hidden", rotation);
+      for (const auto& [revision, kept] : resident) {
+        const auto text = cleaner.append("resident:" + kept + "\n");
+        requireClean(text, kept);
+        KJ_REQUIRE(text == "resident:[redacted]\n", "a value a resident isolate holds must stay hidden", rotation);
+      }
+      // 2,000 changes (200 s) ago: not resident, past its deadline and the grace.
+      const auto& gone = history.front();
+      const auto text = cleaner.append("gone:" + gone + "\n");
+      KJ_REQUIRE(!dictionary.holds(gone) && text == "gone:" + gone + "\n", "an unused earlier value must leave", rotation);
+    }
+  }
+  // Holders: at most 8 resident isolates, and the calls of the last 30 s plus
+  // the 60 s grace (about 900 changes), each 2 x 260 bytes at most.
+  const bool bounded = largest <= 1000 * 2 * 260 + 1024 && sharedLargest <= 2 * (1000 * 2 * 260 + 1024);
+  const auto state = dictionary.json(now);
+  KJ_REQUIRE(bounded && admitted > 59000 && state.find("\"refused\":{\"full\":0,\"earlier\":0}") != std::string::npos,
+      "the dictionary must stay bounded and never refuse", largest, sharedLargest);
+}
+// The two limits, with small values: a tenant past its earlier-value limit is
+// refused (and recovers once its isolates are gone), a call that does not fit
+// in the node's total is refused while the tenants already in keep running,
+// what a process that names no isolates got stays until the generation is
+// gone, and a descriptor the region cannot hold is never sent.
+void secretLimits() {
+  SecretDictionary::Limits limits;
+  limits.nodeBytes = 64 * 1024;
+  limits.nodePatterns = 1000;
+  limits.tenantEarlierBytes = 10 * 1024;
+  SecretDictionary dictionary(limits, sharedSink());
+  PlatformLogCleaner cleaner;
+  double now = 1000;
+  std::map<std::string, std::set<std::string>> current;
+  // 1. Earlier values of one tenant.
+  const auto steady = longValue(512);
+  current["steady"] = {steady};
+  std::vector<std::string> rotated;
+  std::set<std::string> revisions;
+  for (int rotation = 0; rotation < 3; ++rotation) {
+    rotated.push_back(longValue(4096));
+    current["rotating"] = {rotated.back()};
+    dictionary.setCurrent(current);
+    KJ_REQUIRE(!dictionary.admit("rotating", {rotated.back()}, now, now + 1000), rotation);
+    const auto revision = "r" + std::to_string(rotation);
+    KJ_REQUIRE(dictionary.sent("rotating", {rotated.back()}, "p0", 1, revision, true, now, now + 1000));
+    revisions.insert(revision);
+    now += 2000;
+    dictionary.collect(now, {residents("p0", 1, revisions)});
+  }
+  rotated.push_back(longValue(4096));
+  current["rotating"] = {rotated.back()};
+  dictionary.setCurrent(current);
+  // Three earlier values of 4 KiB, all in resident isolates: past 10 KiB.
+  const auto refused = dictionary.admit("rotating", {rotated.back()}, now, now + 1000);
+  KJ_REQUIRE(refused.has_value() && refused->find("earlier secret values") != std::string::npos &&
+      refused->find("within about ") != std::string::npos && refused->find(rotated[0].substr(0, 16)) == std::string::npos,
+      "a tenant past its earlier-value limit must be refused, with the reason and when it recovers");
+  KJ_REQUIRE(!dictionary.admit("steady", {steady}, now, now + 1000), "another tenant must not be refused");
+  for (size_t i = 0; i < 3; ++i) {
+    const auto text = cleaner.append("held:" + rotated[i] + "\n");
+    requireClean(text, rotated[i]);
+    KJ_REQUIRE(text == "held:[redacted]\n", "values resident isolates hold stay hidden while refused", i);
+  }
+  // The in-process cleaning (reasons, the node's own lines) hides them too.
+  auto& redactions = secretRedactions();
+  redactions.stamp = [] { return std::pair<uint64_t, uint64_t>{1, 1}; };
+  redactions.values = [&] { return std::vector<std::string>{rotated.back()}; };
+  redactions.earlierRevision = [&] { return dictionary.earlierRevision(); };
+  redactions.earlierValues = [&] { return dictionary.earlierValues(); };
+  const auto reason = cleanReason("failed with " + rotated[1]);
+  requireClean(reason, rotated[1]);
+  KJ_REQUIRE(reason == "failed with [redacted]", "an earlier value a resident isolate holds is hidden in reasons");
+  // The isolates are evicted: after the grace the tenant may call again.
+  dictionary.collect(now, {residents("p0", 1, {})});
+  now += limits.graceMs;
+  dictionary.collect(now, {residents("p0", 1, {})});
+  KJ_REQUIRE(dictionary.earlierBytes("rotating") == 0 && !dictionary.admit("rotating", {rotated.back()}, now, now + 1000),
+      "a tenant must recover once nothing holds its earlier values");
+  const auto earlierReason = cleanReason("failed with " + rotated[1]);
+  KJ_REQUIRE(earlierReason.find(rotated[1].substr(0, 300)) != std::string::npos, "a released value is no longer hidden");
+  redactions.stamp = nullptr; redactions.values = nullptr; redactions.earlierRevision = nullptr; redactions.earlierValues = nullptr;
+  now += 2000;
+  dictionary.collect(now, {});
+  // 2. The node's total: 16 KiB values of new tenants until one does not fit.
+  std::vector<std::string> big;
+  std::optional<std::string> full;
+  size_t fitted = 0;
+  for (int tenant = 0; tenant < 8 && !full; ++tenant) {
+    big.push_back(longValue(16 * 1024));
+    current["t" + std::to_string(tenant)] = {big.back()};
+    dictionary.setCurrent(current);
+    full = dictionary.admit("t" + std::to_string(tenant), {big.back()}, now, now + 1000);
+    if (!full) ++fitted;
+  }
+  KJ_REQUIRE(full.has_value() && full->find("secret dictionary is full") != std::string::npos && fitted >= 2 &&
+      dictionary.bytes() <= limits.nodeBytes, "a call that does not fit must be refused", fitted);
+  KJ_REQUIRE(!dictionary.admit("t0", {big[0]}, now, now + 1000), "a tenant already in keeps running");
+  const auto state = dictionary.json(now);
+  KJ_REQUIRE(state.find("\"refused\":{\"full\":1,\"earlier\":1}") != std::string::npos &&
+      state.find("\"limitBytes\":65536") != std::string::npos, "the node state shows usage and refusals");
+  // The others' reservations end: after the grace the refused tenant fits.
+  now += 1000;
+  dictionary.collect(now, {});
+  now += limits.graceMs;
+  dictionary.collect(now, {});
+  const auto last = "t" + std::to_string(fitted);
+  KJ_REQUIRE(!dictionary.admit(last, {big.back()}, now, now + 1000), "a refused tenant fits once others are gone");
+  // 3. A process that names no isolates keeps what it got until it is gone.
+  const auto durable = syntheticValue();
+  current["durable"] = {durable};
+  dictionary.setCurrent(current);
+  KJ_REQUIRE(dictionary.sent("durable", {durable}, "d0", 4, "", false, now, now + 1000));
+  current["durable"] = {syntheticValue()};
+  dictionary.setCurrent(current);
+  now += 10 * limits.graceMs;
+  dictionary.collect(now, {residents("d0", 4, {}, false)});
+  KJ_REQUIRE(dictionary.holds(durable) && dictionary.earlierBytes("durable") > 0, "an unknown process keeps its values");
+  dictionary.collect(now, {residents("d0", 5, {}, false)});
+  now += limits.graceMs + 1000;
+  dictionary.collect(now, {residents("d0", 5, {}, false)});
+  KJ_REQUIRE(!dictionary.holds(durable), "a generation that is gone releases its values after the grace");
+  // 4. A region that cannot take a descriptor's values: it is not sent.
+  SecretDictionary refusing({}, {[](const auto&) { return false; }, [](const auto&) { return false; }});
+  const auto lost = syntheticValue();
+  KJ_REQUIRE(!refusing.sent("x", {lost}, "p0", 1, "r", true, now, now + 1000) && !refusing.holds(lost) &&
+      refusing.json(now).find("\"sinkFailures\":1") != std::string::npos);
 }
 // No dictionary size may silence a writer: 130 values with one 64 KiB block of
 // ordinary output exhausted the old per-value work quota, and that writer then
@@ -103,7 +331,7 @@ void manyValues() {
       addRedaction(needles, values.back());
     }
     sortRedactions(needles);
-    retainPlatformLogRedactions(needles);
+    KJ_REQUIRE(appendPlatformLogRedactions(needles));
   };
   publish(2);
   {
@@ -239,7 +467,7 @@ void request(uint16_t port) {
 void workerDiagnostics(const char* workerd) {
   KJ_REQUIRE(workerd && access(workerd, X_OK) == 0, "set COWORKERD_TEST_WORKERD to the built workerd");
   TempDir directory;
-  const auto value = syntheticValue();
+  const auto value = syntheticValue(), later = syntheticValue();
   const auto nodePath = directory.file("node.log"), workerdPath = directory.file("workerd.log");
   const auto savedOut = dup(STDOUT_FILENO), savedErr = dup(STDERR_FILENO);
   KJ_REQUIRE(savedOut >= 0 && savedErr >= 0);
@@ -255,14 +483,21 @@ void workerDiagnostics(const char* workerd) {
     AsyncLog nodeLog;
     WorkerdOutput output(workerdPath);
     // Both consumers already forked; production publication must reach them.
-    auto& redactions = secretRedactions();
-    redactions.stamp = [] { return std::pair<uint64_t, uint64_t>{1, 1}; };
-    redactions.values = [value] { return std::vector<std::string>{value}; };
-    redactions.needles();
+    std::vector<std::string> needles, rebuilt;
+    addRedaction(needles, value);
+    KJ_REQUIRE(appendPlatformLogRedactions(needles));
     std::cout << "node-out:" << value << '\n';
     std::cerr << "node-error:" << value << '\n';
     uint32_t slot = 0;
     for (const auto processClass : {0u, 2u}) for (const bool top : {true, false}) {
+      if (processClass == 2 && top) {
+        // A rebuild after both writers forked (it drops nothing they need and
+        // adds a value) reaches both of them as well.
+        addRedaction(rebuilt, value);
+        addRedaction(rebuilt, later);
+        KJ_REQUIRE(replacePlatformLogRedactions(rebuilt));
+        std::cout << "node-later:" << later << '\n';
+      }
       const auto stem = std::to_string(slot);
       const auto script = directory.path + '/' + stem + ".js";
       const auto config = directory.path + '/' + stem + ".capnp";
@@ -276,14 +511,14 @@ void workerDiagnostics(const char* workerd) {
       if (top) { const auto status = child.wait(); KJ_REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) != 0); }
       else { request(child.listenPort()); kill(child.pid, SIGTERM); child.wait(); }
     }
-    redactions.stamp = nullptr; redactions.values = nullptr;
   }
   // Stop capturing before hash assertions, including deliberately failing ones.
   dup2(savedOut, STDOUT_FILENO); dup2(savedErr, STDERR_FILENO);
   const auto node = readFile(nodePath), diagnostics = readFile(workerdPath);
-  requireClean(node, value); requireClean(diagnostics, value);
+  requireClean(node, value); requireClean(diagnostics, value); requireClean(node, later);
   KJ_REQUIRE(node.find("node-out:[redacted]") != std::string::npos &&
       node.find("node-error:[redacted]") != std::string::npos, "both node streams must be cleaned");
+  KJ_REQUIRE(node.find("node-later:[redacted]") != std::string::npos, "a rebuild must reach the forked node writer");
   for (const auto marker : {"top-diagnostic:[redacted]", "request-diagnostic:[redacted]"}) {
     const auto first = diagnostics.find(marker);
     KJ_REQUIRE(first != std::string::npos && diagnostics.find(marker, first + 1) != std::string::npos,
@@ -297,6 +532,9 @@ int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string_view(argv[1]) == "streams") coworkerd::streams();
     else if (argc == 2 && std::string_view(argv[1]) == "many-values") coworkerd::manyValues();
+    else if (argc == 2 && std::string_view(argv[1]) == "generations") coworkerd::generations();
+    else if (argc == 2 && std::string_view(argv[1]) == "secret-rotations") coworkerd::secretRotations();
+    else if (argc == 2 && std::string_view(argv[1]) == "secret-limits") coworkerd::secretLimits();
     else { KJ_REQUIRE(argc == 2); coworkerd::workerDiagnostics(argv[1]); }
     return 0;
   } catch (const kj::Exception& error) {

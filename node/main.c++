@@ -529,6 +529,7 @@ struct PendingThreadedLoad {
 using coworkerd::TrialVerdict;
 using coworkerd::classifyTrialFailure;
 using coworkerd::classifyLoadRejection;
+using coworkerd::callPathPlatformFailure;
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call = {});
 
@@ -884,6 +885,8 @@ public:
         for (const auto& [name, secret] : names) if (!secret.value.empty()) values.push_back(secret.value);
       return values;
     };
+    redactions.earlierRevision = [this]() { syncSecretDictionary(); return secretDictionary.earlierRevision(); };
+    redactions.earlierValues = [this]() { return secretDictionary.earlierValues(); };
     if (leaseConfig.naive()) {
       std::cout << "[server] {\"event\":\"experimental-naive-lease\",\"warning\":\"the naive lease is a test-only counterexample: "
                    "it does not conserve the subrequest budget across Servers\"}" << std::endl;
@@ -903,6 +906,8 @@ public:
     auto& redactions = secretRedactions();
     redactions.stamp = nullptr;
     redactions.values = nullptr;
+    redactions.earlierRevision = nullptr;
+    redactions.earlierValues = nullptr;
   }
 
   // ---- Tenants: their records (being deleted, or gone: not served) and their usage here ----
@@ -1131,13 +1136,50 @@ public:
   // name nothing executes (explicit, retryable elsewhere). Names only.
   std::optional<InvocationRejection> secretRefusal(const VersionDefinition& version, bool root) {
     auto missing = desiredState.state().missingSecrets(version);
-    if (missing.empty()) return std::nullopt;
+    if (missing.empty()) {
+      // Its values must fit in this node's secret dictionary before any descriptor carries them.
+      auto refused = admitSecrets(version);
+      if (!refused) return std::nullopt;
+      auto reason = *refused + " (Worker " + version.workerId + ")";
+      ++secretUnavailableRejections;
+      lastRejection = reason;
+      return refusal("SECRET_UNAVAILABLE", std::move(reason), 503, root);
+    }
     std::string reason = missing.size() == 1 ? "missing secret on this Server: " : "missing secrets on this Server: ";
     for (size_t i = 0; i < missing.size(); ++i) reason += (i ? ", " : "") + missing[i];
     reason += " (Worker " + version.workerId + ")";
     ++secretUnavailableRejections;
     lastRejection = reason;
     return refusal("SECRET_UNAVAILABLE", std::move(reason), 503, root);
+  }
+  // The current values of the version's secrets (each one has a value: missingSecrets() is empty).
+  std::set<std::string> secretValues(const VersionDefinition& version) const {
+    std::set<std::string> values;
+    const auto& state = desiredState.state();
+    for (const auto& name : version.secrets)
+      if (const auto* secret = state.secret(version.workerId, name); secret && !secret->value.empty()) values.insert(secret->value);
+    return values;
+  }
+  void syncSecretDictionary() const {
+    const auto& state = desiredState.state();
+    const std::pair<uint64_t, uint64_t> view{state.revision(), state.generation()};
+    if (view == secretDictionaryView) return;
+    std::map<std::string, std::set<std::string>> current;
+    for (const auto& [worker, names] : state.secrets())
+      for (const auto& [name, secret] : names) if (!secret.value.empty()) current[coworkerd::tenantOf(worker)].insert(secret.value);
+    secretDictionary.setCurrent(std::move(current));
+    secretDictionaryView = view;
+  }
+  // A call (or a trial) that carries the version's secrets may start here: nullopt, or why not on this node.
+  // Its values are held until the lease's time to live has passed; the descriptor holds them from then on.
+  std::optional<std::string> admitSecrets(const VersionDefinition& version) {
+    if (version.secrets.empty()) return std::nullopt;
+    syncSecretDictionary();
+    const auto now = monotonicTimeMs();
+    auto refused = secretDictionary.admit(coworkerd::tenantOf(version.workerId), secretValues(version), now,
+        now + std::max<double>(leaseConfig.ttlMs, 30000));
+    if (refused) ++secretDictionaryRefusals;
+    return refused;
   }
 
   // Static assets: answered by the asset layer without workerd, a lease or
@@ -2147,6 +2189,12 @@ public:
         } else if (string("message").starts_with("Trusted ")) {
           // Our own loader failed in a load another call started (they share the isolate): the package.
           category = PACKAGE_UNAVAILABLE; detail = "PACKAGE_UNAVAILABLE"; message = "the code package could not be fetched or verified: " + string("message");
+        } else if (auto platform = callPathPlatformFailure(string("stage"), string("message"))) {
+          // The process could not get the call's plan from this node: nothing ran, another node may take it, and
+          // it is no load failure of the version (no category, so not counted in loadFailures).
+          result.refusal = refusal(platform->code, platform->reason, 503, root);
+          result.refusal->category = platform->category;
+          result.refusal->notExecuted = result.refusal->retryable = true;
         } else {
           const auto applied = runtime.effectiveLimits(probe.workerId);
           auto verdict = classifyLoadRejection(string("stage"), string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
@@ -2755,13 +2803,15 @@ public:
       if (stage == "code") {
         refused.category = codeStage == "secrets" ? "secret-missing" : codeStage == "decode" ? "evaluation" : PACKAGE_UNAVAILABLE;
         refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
+      } else if (auto platform = callPathPlatformFailure(stage, reason)) {
+        refused.code = platform->code; refused.category = platform->category; refused.reason = platform->reason;
       } else {
         auto limits = runtime.effectiveLimits(slot->process->workerId);
         auto verdict = classifyLoadRejection(stage, "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
         refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
         refused.reason = verdict.message;
       }
-      refused.retryable = refused.category == PACKAGE_UNAVAILABLE;
+      refused.retryable = refused.category == PACKAGE_UNAVAILABLE || refused.code == "PROCESS_UNAVAILABLE";
     } else refused.retryable = true;
     refused.reason = cleanReason(refused.reason).substr(0, 1000);
     refused.notExecuted = true;
@@ -2834,6 +2884,11 @@ public:
 
   void reapExpiredLeases() {
     expireLeases(monotonicTimeMs());
+    if (const auto now = monotonicTimeMs(); now - secretDictionaryCollectedMs >= 1000) {
+      secretDictionaryCollectedMs = now;
+      syncSecretDictionary();
+      secretDictionary.collect(now, runtime.residentPlans());
+    }
     pruneLogEvents();
     pruneCounterEvents(monotonicTimeMs());
     std::erase_if(lastExecution, [&](const auto& entry) { return monotonicTimeMs() - entry.second > serverConfig.idleMs; });
@@ -2969,6 +3024,8 @@ public:
            << ",\"codeUnavailable\":" << versionCodeRejections << "}"
            << ",\"versionPinMismatchRejections\":" << versionPinMismatchRejections
            << ",\"secretUnavailableRejections\":" << secretUnavailableRejections
+           << ",\"secretDictionaryRefusals\":" << secretDictionaryRefusals
+           << ",\"secretDictionary\":" << secretDictionary.json(monotonicTimeMs())
            << ",\"placementHopRejections\":" << placementHopRejections
            << ",\"receivedPeerInvocations\":" << receivedPeerInvocations
            << ",\"lastRejection\":\"" << jsonEscape(cleanReason(lastRejection)) << "\""
@@ -3276,10 +3333,25 @@ private:
     // env when it loads the Worker: the values of this Server's deployment view
     // (a RemoteInvocation never carries them). Every dispatch checks them first
     // (secretRefusal), synchronously before this point.
+    // The shared dictionary holds every value a descriptor carries before the descriptor is returned (and so before
+    // it can reach a runtime), for as long as the process it goes to may hold them (node/secret-dictionary.h).
+    auto holdSecrets = [&](const std::string& plan) {
+      if (version.secrets.empty()) return;
+      syncSecretDictionary();
+      std::string revision;
+      if (process.threadedServer()) {
+        constexpr std::string_view field = "\"versionFingerprint\":\"";
+        if (const auto at = plan.find(field); at != std::string::npos) {
+          const auto begin = at + field.size();
+          revision = plan.substr(begin, plan.find('"', begin) - begin);
+        }
+        if (revision.empty()) revision = version.definitionHash;
+      }
+      KJ_REQUIRE(secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
+          process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs),
+          "the secret dictionary cannot hold this descriptor's values", version.workerId.c_str());
+    };
     if (!version.secrets.empty()) {
-      // Publish before the descriptor can reach either runtime. Both log
-      // writers fork before ServerCore, and retain older generations' values.
-      secretRedactions().needles();
       const auto& state = desiredState.state();
       auto secrets = descriptor.initSecrets(version.secrets.size());
       for (size_t i = 0; i < version.secrets.size(); ++i) {
@@ -3323,6 +3395,7 @@ private:
       auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
       encoded += '}';
+      holdSecrets(plain.plan);
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
     }
     // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
@@ -3372,6 +3445,7 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
+      holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
         const auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
         return kj::str(encoded.c_str());
@@ -3409,6 +3483,7 @@ private:
     auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
     encoded += '}';
+    holdSecrets(plain.plan);
     return kj::str(plain.descriptor(std::move(encoded)).c_str());
   }
 
@@ -3456,6 +3531,15 @@ private:
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
   WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerTenant};
+  // What the forked log writers hide on this node, and which calls with secrets it starts
+  // (node/secret-dictionary.h). Mutable: encodeDescriptor() records what each descriptor carries.
+  mutable coworkerd::SecretDictionary secretDictionary{[this] {
+    coworkerd::SecretDictionary::Limits limits;
+    limits.idleEvictMs = serverConfig.processPool.idleEvictMs;
+    return limits;
+  }(), {coworkerd::appendPlatformLogRedactions, coworkerd::replacePlatformLogRedactions}};
+  mutable std::pair<uint64_t, uint64_t> secretDictionaryView{UINT64_MAX, UINT64_MAX};
+  double secretDictionaryCollectedMs = 0;
   coworkerd::Membership& membership;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headers;
@@ -3552,6 +3636,7 @@ private:
   uint64_t peerUnavailableRejections = 0;
   uint64_t versionUnavailableRejections = 0;
   uint64_t secretUnavailableRejections = 0;
+  uint64_t secretDictionaryRefusals = 0;  // of them, refused by the secret dictionary's limits
   mutable std::map<coworkerd::DeploymentState::Selection::Kind, uint64_t> routeRejections;
   // The synthetic definition of each tenant's databases (databaseVersion), made once.
   mutable std::map<std::string, std::shared_ptr<const VersionDefinition>> databaseVersions;
@@ -7845,9 +7930,13 @@ private:
       const auto codeStarted = monotonicTimeMs();
       auto unavailable = co_await server.ensureCode(*version, deadline);
       codeMs = monotonicTimeMs() - codeStarted;
-      auto process = unavailable.empty() ? server.trialProcess(version->workerId) : nullptr;
+      // A trial carries the version's secrets as a call does: they must fit in this node's secret dictionary.
+      const auto secretsRefused = unavailable.empty() ? server.admitSecrets(*version) : std::nullopt;
+      auto process = unavailable.empty() && !secretsRefused ? server.trialProcess(version->workerId) : nullptr;
       if (!unavailable.empty()) {
         verdict = {"UNAVAILABLE", "", monotonicTimeMs() >= deadline ? "timed out before loading: fetching the code" : unavailable};
+      } else if (secretsRefused) {
+        verdict = {"UNAVAILABLE", "", *secretsRefused};
       } else if (!process) {
         verdict = {"UNAVAILABLE", "", server.trialsQuarantined() ? "no ready quarantine process" : "no ready workerd process"};
       } else {

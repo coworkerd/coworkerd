@@ -7,6 +7,7 @@
 #include "suspects.h"
 #include "tenancy.h"
 #include "tenant-execution.h"
+#include "secret-dictionary.h"
 #include <kj/async-io.h>
 #include <kj/async-unix.h>
 #include <kj/compat/http.h>
@@ -149,6 +150,10 @@ public:
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();
   std::map<std::string, uint64_t> residentIsolatesByTenant() const;
+  // Each live generation, for the secret dictionary: a native generation's lifecycle snapshot names the plan
+  // revision of every isolate it holds (loading and retired ones included); any other generation, or a snapshot
+  // that cannot be read, is not known.
+  std::vector<SecretDictionary::Residents> residentPlans() const;
   // The quarantine process a tenant's trials and (when it is a suspect) calls go to first; "" without one.
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,

@@ -210,15 +210,22 @@ void trialVerdicts() {
   auto native = classifyTrialFailure("evaluation", "Error", "Uncaught Error: top-level failure\nat index.js:1:7", false, false, 30000, 128);
   KJ_REQUIRE(native.message == "Error: top-level failure (at index.js:1:7)");
   KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: failure\nat index.js:1:" + std::string(80, '9'), false, false, 30000, 128).category == "TOP_LEVEL_THROW");
-  // The call path classifies at the stage the native server reported: a bridge
-  // failure is not the tenant's top-level throw; a report without a stage keeps
-  // the general load classification.
-  auto bridged = classifyLoadRejection("bridge", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128);
-  KJ_REQUIRE(bridged.category == "LOAD_FAILED" && bridged.limit.empty() &&
-      bridged.message == "the trial could not reach the runtime: remote exception: remote.jsg.Error: Missing trusted ordinary worker plan");
+  // The call path classifies other failures at the stage the native server
+  // reported; a report without a stage keeps the general load classification.
   KJ_REQUIRE(classifyLoadRejection("", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
   KJ_REQUIRE(classifyLoadRejection("evaluation", "Error", "Error: tenant top-level throw", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
   KJ_REQUIRE(classifyLoadRejection("code", "SyntaxError", "invalid JSON", false, false, 30000, 128).category == "INVALID_MODULE");
+  // Both call-path sites answer a bridge failure as the platform's: PROCESS_UNAVAILABLE, which placement
+  // retries on the next node, never a LOAD_FAILED of the version, and no word about a trial.
+  const auto platform = callPathPlatformFailure("bridge", "Missing trusted ordinary worker plan");
+  const bool mapped = platform.has_value() && platform->code == "PROCESS_UNAVAILABLE" && platform->category == "bridge" &&
+      platform->reason == "the native process could not get this call's plan from the node: Missing trusted ordinary worker plan" &&
+      platform->reason.find("trial") == std::string::npos;
+  KJ_REQUIRE(mapped);
+  KJ_REQUIRE(placementRetryable(platform->code, platform->category) && !placementRetryable("LOAD_FAILED", "evaluation"));
+  const bool tenantStages = !callPathPlatformFailure("evaluation", "Error: tenant top-level throw").has_value() &&
+      !callPathPlatformFailure("code", "x").has_value() && !callPathPlatformFailure("", "Missing trusted ordinary worker plan").has_value();
+  KJ_REQUIRE(tenantStages);
 }
 
 auto number(const std::string& bytes, const char* field) {
@@ -341,19 +348,26 @@ void memoryCulprit() {
   // The native OOM row's isolate heap: an isolate far below its own limit did not
   // cause the exit (other isolates filled the shared pointer cage). Rows without
   // the field (stock workerd) keep their attribution.
-  KJ_REQUIRE(memoryCulpritOwnsOom(0, 128));
-  KJ_REQUIRE(!memoryCulpritOwnsOom(110 * 1024, 128));
-  KJ_REQUIRE(!memoryCulpritOwnsOom((uint64_t(128) << 20) - 1, 128));
-  KJ_REQUIRE(memoryCulpritOwnsOom(uint64_t(128) << 20, 128));
-  KJ_REQUIRE(memoryCulpritOwnsOom(uint64_t(1100) << 20, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(false, 0, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 110 * 1024, 128));
+  // A reported 0 (an isolate that died in its first collection) is not an old row.
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 0, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, (uint64_t(128) << 20) - 1, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(128) << 20, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(1100) << 20, 128));
   // The production decoder reads the field the native server writes.
   capnp::MallocMessageBuilder message;
   auto report = message.initRoot<v1::rpc::CpuReport>();
   capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"workerId\":\"tenant/worker\","
       "\"versionId\":\"v1\",\"invocationId\":\"in-flight\",\"isolate\":\"i\",\"memoryLimitMiB\":128,"
-      "\"oomIsolateHeapBytes\":110592}"), report);
-  KJ_REQUIRE(report.getOomIsolateHeapBytes() == 110592 &&
-      !memoryCulpritOwnsOom(report.getOomIsolateHeapBytes(), report.getMemoryLimitMiB()));
+      "\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":110592}"), report);
+  KJ_REQUIRE(report.getOomIsolateHeapReported() && report.getOomIsolateHeapBytes() == 110592 &&
+      !memoryCulpritOwnsOom(report.getOomIsolateHeapReported(), report.getOomIsolateHeapBytes(), report.getMemoryLimitMiB()));
+  capnp::MallocMessageBuilder stock;
+  auto old = stock.initRoot<v1::rpc::CpuReport>();
+  capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"memoryLimitMiB\":128}"), old);
+  KJ_REQUIRE(!old.getOomIsolateHeapReported() &&
+      memoryCulpritOwnsOom(old.getOomIsolateHeapReported(), old.getOomIsolateHeapBytes(), old.getMemoryLimitMiB()));
 }
 void package() {
   TempDir path;

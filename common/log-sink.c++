@@ -119,9 +119,8 @@ public:
       for (std::streamsize i = 0; i < size; ++i) {
         if (used < MAX_LINE) buffer[used++] = data[i]; else oversized = true;
         if (data[i] == '\n') {
-          // Refresh only on the event-loop thread. The writer reads the
-          // published dictionary, including revisions after its fork.
-          secretRedactions().needles();
+          // The writer reads the shared dictionary, including what the node
+          // adds after its fork (node/secret-dictionary.h).
           owner.enqueue(buffer, used, descriptor, oversized);
           used = 0; oversized = false;
         }

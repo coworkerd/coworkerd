@@ -9,6 +9,7 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <unordered_set>
+#include <unistd.h>
 
 namespace coworkerd {
 
@@ -33,20 +34,28 @@ std::string redactNeedles(std::string text, const std::vector<std::string>& need
 }
 
 namespace {
-constexpr size_t LOG_REDACTION_BYTES = 16 * 1024 * 1024;
-constexpr size_t LOG_REDACTION_PATTERNS = 65536;
+// Each region holds at most twice the node's dictionary limit
+// (node/secret-dictionary.h): the limit is checked when a call is admitted, and
+// a value that changed before its descriptor was built is still added.
+constexpr size_t LOG_REDACTION_REGION_BYTES = 32 * 1024 * 1024;
 constexpr size_t LOG_PENDING_BYTES = 64 * 1024;
 constexpr size_t LOG_BLOCK_BYTES = 8 * 1024 * 1024;
 struct SharedLogRedactions {
-  std::atomic<size_t> published{0};
-  std::atomic<bool> overflow{false};
-  char bytes[LOG_REDACTION_BYTES];
+  // The active region is generation % 2. A region's sequence is odd while the
+  // writer rebuilds it; `published` bytes of it are complete.
+  std::atomic<uint64_t> generation{0};
+  struct Region {
+    std::atomic<uint64_t> sequence{0};
+    std::atomic<size_t> published{0};
+    char bytes[LOG_REDACTION_REGION_BYTES];
+  } regions[2];
 };
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 static_assert(std::atomic<size_t>::is_always_lock_free);
-static_assert(std::atomic<bool>::is_always_lock_free);
 struct LogRedactions {
   SharedLogRedactions* shared;
-  std::unordered_set<std::string> retained;
+  // The writer's own record of the active region (the daemon's event loop only).
+  std::unordered_set<std::string> active;
   LogRedactions() {
     auto mapping = mmap(nullptr, sizeof(SharedLogRedactions), PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_ANON, -1, 0);
@@ -59,76 +68,168 @@ LogRedactions& logRedactions() {
   static auto* value = new LogRedactions;
   return *value;
 }
+size_t writeNeedle(char* at, const std::string& needle) {
+  const auto size = static_cast<uint32_t>(needle.size());
+  std::memcpy(at, &size, sizeof(size));
+  std::memcpy(at + sizeof(size), needle.data(), size);
+  return platformLogNeedleBytes(size);
+}
 }
 
 void preparePlatformLogCleaning() { (void)logRedactions(); }
 
-void retainPlatformLogRedactions(const std::vector<std::string>& needles) {
+bool appendPlatformLogRedactions(const std::vector<std::string>& needles) {
   auto& owner = logRedactions();
-  if (owner.shared->overflow.load(std::memory_order_acquire)) return;
-  try { for (const auto& needle : needles) {
-    if (needle.empty() || owner.retained.contains(needle)) continue;
-    const auto used = owner.shared->published.load(std::memory_order_relaxed);
-    const auto remaining = LOG_REDACTION_BYTES - used;
-    if (owner.retained.size() == LOG_REDACTION_PATTERNS || remaining < sizeof(uint32_t) ||
-        needle.size() > remaining - sizeof(uint32_t)) {
-      owner.shared->overflow.store(true, std::memory_order_release);
-      return;
+  auto& region = owner.shared->regions[owner.shared->generation.load(std::memory_order_relaxed) % 2];
+  const auto used = region.published.load(std::memory_order_relaxed);
+  std::vector<const std::string*> added;
+  std::unordered_set<std::string_view> batch;
+  size_t bytes = 0;
+  for (const auto& needle : needles) {
+    if (needle.empty() || owner.active.contains(needle) || !batch.insert(needle).second) continue;
+    if (needle.size() > UINT32_MAX) return false;
+    bytes += platformLogNeedleBytes(needle.size());
+    added.push_back(&needle);
+  }
+  if (added.empty()) return true;
+  if (bytes > LOG_REDACTION_REGION_BYTES - used) return false;
+  size_t at = used;
+  for (const auto* needle : added) at += writeNeedle(region.bytes + at, *needle);
+  for (const auto* needle : added) owner.active.insert(*needle);
+  // Complete before a reader sees it, and before any descriptor carries it.
+  region.published.store(at, std::memory_order_release);
+  return true;
+}
+
+bool replacePlatformLogRedactions(const std::vector<std::string>& needles) {
+  auto& owner = logRedactions();
+  auto* shared = owner.shared;
+  std::unordered_set<std::string> kept;
+  size_t bytes = 0;
+  for (const auto& needle : needles) {
+    if (needle.empty() || needle.size() > UINT32_MAX || kept.contains(needle)) continue;
+    bytes += platformLogNeedleBytes(needle.size());
+    if (bytes > LOG_REDACTION_REGION_BYTES) return false;
+    kept.insert(needle);
+  }
+  const auto generation = shared->generation.load(std::memory_order_relaxed);
+  auto& region = shared->regions[(generation + 1) % 2];
+  const auto sequence = region.sequence.load(std::memory_order_relaxed);
+  region.sequence.store(sequence + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  size_t at = 0;
+  for (const auto& needle : kept) at += writeNeedle(region.bytes + at, needle);
+  region.published.store(at, std::memory_order_relaxed);
+  region.sequence.store(sequence + 2, std::memory_order_release);
+  shared->generation.store(generation + 1, std::memory_order_release);
+  owner.active = std::move(kept);
+  return true;
+}
+
+PlatformLogRedactionUsage platformLogRedactionUsage() {
+  auto& owner = logRedactions();
+  const auto generation = owner.shared->generation.load(std::memory_order_relaxed);
+  return {owner.shared->regions[generation % 2].published.load(std::memory_order_relaxed), owner.active.size(),
+      LOG_REDACTION_REGION_BYTES, generation};
+}
+
+void PlatformLogCleaner::addNeedle(std::string needle) {
+  needles.push_back(std::move(needle));
+  const auto& added = needles.back();
+  auto& failure = failures.emplace_back(added.size(), 0);
+  for (size_t at = 1, state = 0; at < added.size(); ++at) {
+    while (state && added[state] != added[at]) state = failure[state - 1];
+    if (added[state] == added[at]) ++state;
+    failure[at] = state;
+  }
+  states.push_back(0);
+}
+
+// The active region's needles, read under its sequence number. A rebuilt
+// dictionary replaces every needle; the bytes already marked stay hidden.
+// False only while the writer rebuilds faster than this copy completes.
+bool PlatformLogCleaner::refresh() {
+  auto* shared = logRedactions().shared;
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    const auto current = shared->generation.load(std::memory_order_acquire);
+    auto& region = shared->regions[current % 2];
+    const auto sequence = region.sequence.load(std::memory_order_acquire);
+    if (sequence & 1) { usleep(50); continue; }
+    const bool reload = current != generation;
+    const auto published = region.published.load(std::memory_order_acquire);
+    std::vector<std::string> loaded;
+    size_t at = reload ? 0 : consumed;
+    bool torn = published > LOG_REDACTION_REGION_BYTES;
+    while (!torn && at < published) {
+      uint32_t size;
+      if (published - at < sizeof(size)) { torn = true; break; }
+      std::memcpy(&size, region.bytes + at, sizeof(size));
+      if (size == 0 || size > published - at - sizeof(size)) { torn = true; break; }
+      loaded.emplace_back(region.bytes + at + sizeof(size), size);
+      at += platformLogNeedleBytes(size);
     }
-    const auto size = static_cast<uint32_t>(needle.size());
-    std::memcpy(owner.shared->bytes + used, &size, sizeof(size));
-    std::memcpy(owner.shared->bytes + used + sizeof(size), needle.data(), size);
-    owner.retained.insert(needle);
-    owner.shared->published.store(used + sizeof(size) + size, std::memory_order_release);
-  }} catch (...) {
-    owner.shared->overflow.store(true, std::memory_order_release);
-    throw;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (torn || region.sequence.load(std::memory_order_relaxed) != sequence ||
+        shared->generation.load(std::memory_order_acquire) != current) continue;
+    if (reload) {
+      needles.clear();
+      failures.clear();
+      states.clear();
+      generation = current;
+    }
+    consumed = at;
+    // A new needle is looked for in the bytes held back as well.
+    for (auto& needle : loaded) {
+      addNeedle(std::move(needle));
+      scan(needles.size() - 1, 0);
+    }
+    return true;
+  }
+  return false;
+}
+
+// Match against the original stream, including bytes suppressed by a block
+// quota. KMP suffix states retain only prefixes that can still form a value.
+void PlatformLogCleaner::scan(size_t pattern, size_t begin) {
+  const auto& needle = needles[pattern];
+  const auto& failure = failures[pattern];
+  auto& state = states[pattern];
+  for (size_t at = begin; at < pending.size(); ++at) {
+    while (state && needle[state] != pending[at]) state = failure[state - 1];
+    if (needle[state] == pending[at]) ++state;
+    if (state == needle.size()) {
+      for (size_t pos = at + 1 - state; pos <= at; ++pos) marks[pos] |= 1;
+      state = failure[state - 1];
+    }
   }
 }
 
 std::string PlatformLogCleaner::append(std::string_view input, bool final) {
   blocked = false;
-  auto* shared = logRedactions().shared;
-  if (shared->overflow.load(std::memory_order_acquire)) {
+  if (!refresh()) {
+    // No consistent copy of the dictionary now (the writer kept rebuilding it):
+    // this block is held back unwritten (counted as suppressed), and every
+    // needle looks at it again once a copy succeeds.
     blocked = true;
-    pending.clear();
-    marks.clear();
+    rescanAll = true;
+    pending.append(input);
+    marks.resize(pending.size(), 2);
     return {};
   }
-  // Match against the original stream, including bytes suppressed by a block
-  // quota. KMP suffix states retain only prefixes that can still form a value.
-  auto scan = [&](size_t pattern, size_t begin) {
-    const auto& needle = needles[pattern];
-    const auto& failure = failures[pattern];
-    auto& state = states[pattern];
-    for (size_t at = begin; at < pending.size(); ++at) {
-      while (state && needle[state] != pending[at]) state = failure[state - 1];
-      if (needle[state] == pending[at]) ++state;
-      if (state == needle.size()) {
-        for (size_t pos = at + 1 - state; pos <= at; ++pos) marks[pos] |= 1;
-        state = failure[state - 1];
-      }
+  if (rescanAll) {
+    rescanAll = false;
+    for (size_t pattern = 0; pattern < needles.size(); ++pattern) {
+      states[pattern] = 0;
+      scan(pattern, 0);
     }
-  };
-  const auto published = shared->published.load(std::memory_order_acquire);
-  while (consumed < published) {
-    uint32_t size;
-    std::memcpy(&size, shared->bytes + consumed, sizeof(size));
-    needles.emplace_back(shared->bytes + consumed + sizeof(size), size);
-    consumed += sizeof(size) + size;
-    const auto& needle = needles.back();
-    auto& failure = failures.emplace_back(size, 0);
-    for (size_t at = 1, state = 0; at < size; ++at) {
-      while (state && needle[state] != needle[at]) state = failure[state - 1];
-      if (needle[state] == needle[at]) ++state;
-      failure[at] = state;
-    }
-    states.push_back(0);
-    scan(needles.size() - 1, 0);
   }
-  if (needles.empty()) return std::string(input);
-  // Charge each block once, independent of the append-only dictionary's size.
-  // Mark dropped bytes so a retained prefix can never reappear in later output.
+  if (needles.empty() && pending.empty()) {
+    if (!input.empty()) emittingRedaction = false;
+    return std::string(input);
+  }
+
+  // Charge each block once, independent of the dictionary's size. Mark dropped
+  // bytes so a retained prefix can never reappear in later output.
   blocked = input.size() > LOG_BLOCK_BYTES;
   std::string output;
   do {

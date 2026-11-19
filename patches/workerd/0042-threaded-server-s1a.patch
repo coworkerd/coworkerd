@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f70a5e2b98
+index 0000000000000000000000000000000000000000..dbec045fae455c4078d4b17cba14e48bab16c894
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,804 @@
+@@ -0,0 +1,863 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -989,11 +989,17 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +
 +// One V8 heap object of about 1 GiB (a flattened two-byte string of the
 +// maximum length) with almost nothing else live, and the dictionary-to-array
-+// growth of a 128 Mi-element array (about 0.6 GiB live while it asks for 1 GiB).
++// growth of a 128 Mi-element array (the first reproduction's shape; one alone
++// peaks at about 1.75 GiB and survives).
 +constexpr kj::StringPtr NEAR_GIB_STRING =
 +    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 +constexpr kj::StringPtr NEAR_GIB_ARRAY =
 +    "globalThis.retained = new Array(128*1024*1024-8192).fill(1.5)"_kj;
++// About 126 MiB live in small arrays (old-space pages, with their
++// fragmentation), just under the 128 MiB limit, then one maximum string.
++constexpr kj::StringPtr LIVE126_THEN_STRING =
++    "globalThis.kept = []; for (let i = 0; i < 126 * 128; ++i) kept.push(new Array(1024).fill(1.5));"
++    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
 +
 +// `count` isolates allocate at the same moment while a neighbor isolate keeps
 +// answering. Every heap of this build shares one pointer cage.
@@ -1023,20 +1029,38 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +    }
 +  });
 +  KJ_DEFER(finished.store(true); maintenance.join());
-+  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
++  // The neighbor is an ordinary resident: its own reservation in the same
++  // budget and the default 128 MiB limit.
++  auto neighborReservation = std::make_shared<ResourceReservation>(budget, 128);
++  KJ_ASSERT(neighborReservation->registerPreparation());
++  IsolateLimits neighborLimits(
++      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation);
 +  auto* neighbor = v8::Isolate::New(jsg::newIsolateGroup(), neighborLimits.getCreateParams());
 +  KJ_DEFER(neighbor->Dispose());
 +  neighborLimits.customizeIsolate(neighbor);
-+  auto checkNeighbor = [&] {
++  auto runNeighbor = [&](kj::StringPtr code, int32_t expected) {
 +    v8::Locker lock(neighbor);
 +    v8::Isolate::Scope scope(neighbor);
 +    v8::HandleScope handles(neighbor);
 +    auto context = v8::Context::New(neighbor);
 +    v8::Context::Scope entered(context);
-+    auto source = v8::String::NewFromUtf8Literal(neighbor, "6 * 7");
-+    auto script = v8::Script::Compile(context, source).ToLocalChecked();
-+    KJ_EXPECT(script->Run(context).ToLocalChecked()->Int32Value(context).FromJust() == 42);
++    std::atomic<LimitCause> cause{LimitCause::NONE};
++    CpuExecution execution(neighbor, cause, neighborLimits.memoryState, neighborLimits.memory, 0,
++        10000, 128, neighborLimits.identity);
++    v8::TryCatch caught(neighbor);
++    auto source =
++        v8::String::NewFromUtf8(neighbor, code.begin(), v8::NewStringType::kNormal, code.size())
++            .ToLocalChecked();
++    auto result = v8::Script::Compile(context, source).ToLocalChecked()->Run(context);
++    bool answered =
++        !result.IsEmpty() && result.ToLocalChecked()->Int32Value(context).FromJust() == expected;
++    caught.Reset();
++    execution.finish();
++    KJ_EXPECT(answered && cause.load() == LimitCause::NONE &&
++            neighborLimits.memoryState->load() == LimitCause::NONE,
++        code);
 +  };
++  auto checkNeighbor = [&] { runNeighbor("6 * 7"_kj, 42); };
 +  checkNeighbor();
 +  const auto participants = static_cast<std::ptrdiff_t>(count + 1);
 +  std::barrier start(participants), completed(participants), release(participants);
@@ -1070,7 +1094,10 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  start.arrive_and_wait();
 +  checkNeighbor();
 +  completed.arrive_and_wait();
++  // While the large objects are alive the neighbor still allocates 32 MiB.
 +  checkNeighbor();
++  runNeighbor("globalThis.kept = new Array(4 * 1024 * 1024).fill(1.5); kept.length"_kj,
++      4 * 1024 * 1024);
 +  release.arrive_and_wait();
 +  for (auto& worker: workers) worker.join();
 +  for (size_t i = 0; i < count; ++i) {
@@ -1088,11 +1115,14 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
 +  if (selected == nullptr) return;
 +  kj::StringPtr spec(selected);
-+  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array>");
++  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126>");
 +  auto count = kj::str(spec.first(colon)).parseAs<uint>();
 +  auto kind = spec.slice(colon + 1);
-+  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array"));
-+  simultaneousAllocations(count, kind == "array" ? NEAR_GIB_ARRAY : NEAR_GIB_STRING);
++  KJ_REQUIRE(count > 0 && count <= 8 && (kind == "string" || kind == "array" || kind == "live126"));
++  simultaneousAllocations(count,
++      kind == "array"         ? NEAR_GIB_ARRAY
++          : kind == "live126" ? LIVE126_THEN_STRING
++                              : NEAR_GIB_STRING);
 +  fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
 +  fflush(stdout);
 +}
@@ -1151,6 +1181,14 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  return {status, kj::mv(rows)};
 +}
 +
++KJ_TEST("126 MiB live then one near-GiB object preserves the process and a neighboring Worker") {
++  // Without the fragmentation reserve this child ended with V8's fatal OOM
++  // (exit 74) at 1150.5 MiB live in 1154.8 MiB of pages.
++  auto child = runAllocationChild("1:live126");
++  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
++  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
++}
++
 +KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
 +  auto child = runAllocationChild("1:string");
 +  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
@@ -1178,6 +1216,7 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +    auto line = child.events.substr(at, child.events.find('\n', at) - at);
 +    auto field = line.find("\"oomIsolateHeapBytes\":");
 +    KJ_ASSERT(field != std::string::npos, line.c_str());
++    KJ_EXPECT(line.find("\"oomIsolateHeapReported\":true") != std::string::npos, line.c_str());
 +    auto heap = strtoull(line.c_str() + field + strlen("\"oomIsolateHeapBytes\":"), nullptr, 10);
 +    KJ_EXPECT(heap > 0 && heap < (128ull << 20), heap, line.c_str());
 +  }
@@ -1322,7 +1361,10 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  initializeV8();
 +  kj::EventLoop loop;
 +  kj::WaitScope waitScope(loop);
-+  kj::TimerImpl clock(kj::origin<kj::TimePoint>());
++  // The timer's cached time lags the monotonic clock by the last JavaScript
++  // turn; the deadline must come from the clock, not from the cached time.
++  auto lagging = kj::systemPreciseMonotonicClock().now() - 5 * kj::SECONDS;
++  kj::TimerImpl clock(lagging);
 +  Timer timer(clock);
 +  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
 +  Slot slot;
@@ -1332,12 +1374,17 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  KJ_EXPECT(WAIT_UNTIL_LIMIT == 30 * kj::SECONDS);
 +  // limitDrain() is called when the response has ended. A 2 s child-call
 +  // lease and later waitUntil work (the 2.4 s legacy trigger) stay inside it.
++  auto before = kj::systemPreciseMonotonicClock().now();
 +  auto drain = limits.limitDrain();
-+  clock.advanceTo(clock.now() + 2400 * kj::MILLISECONDS);
++  auto after = kj::systemPreciseMonotonicClock().now();
++  clock.advanceTo(before + 2400 * kj::MILLISECONDS);
 +  KJ_EXPECT(!drain.poll(waitScope));
-+  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT - 1 * kj::MILLISECONDS);
++  // A delay from the cached time would have ended here, 5 s early.
++  clock.advanceTo(lagging + WAIT_UNTIL_LIMIT);
++  KJ_EXPECT(!drain.poll(waitScope), "the deadline must not lose the last JavaScript turn");
++  clock.advanceTo(before + WAIT_UNTIL_LIMIT - 1 * kj::MILLISECONDS);
 +  KJ_EXPECT(!drain.poll(waitScope));
-+  clock.advanceTo(kj::origin<kj::TimePoint>() + WAIT_UNTIL_LIMIT);
++  clock.advanceTo(after + WAIT_UNTIL_LIMIT);
 +  bool ended = drain.poll(waitScope);
 +  KJ_EXPECT(ended, "waitUntil work must end at the drain limit");
 +  if (ended) drain.wait(waitScope);
@@ -1381,18 +1428,30 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +  auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
 +  std::promise<bool> result;
 +  auto future = result.get_future();
-+  // An eviction inside the pass can reach reserve()/observe(); simulate that
-+  // call on the maintenance thread itself.
++  // An eviction inside the pass can reach reserve()/observe(). The pass entry
++  // point the server's maintain() uses sets the flag itself.
 +  std::thread maintenance([&] {
-+    ResourceBudget::maintaining = true;
-+    result.set_value(budget->reclaim(1));
-+    ResourceBudget::maintaining = false;
++    KJ_EXPECT(!ResourceBudget::maintaining);
++    budget->runMaintenance([&] {
++      KJ_EXPECT(ResourceBudget::maintaining, "the maintenance pass must mark its own thread");
++      result.set_value(budget->reclaim(1));
++    });
++    KJ_EXPECT(!ResourceBudget::maintaining);
 +  });
 +  bool returned = future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
 +  KJ_EXPECT(returned, "the maintenance thread waited for its own reclaim pass");
 +  if (!returned) budget->finishReclaim(true);
 +  maintenance.join();
 +  KJ_EXPECT(!future.get() && budget->reclaimRequested.load());
++  // The server's own entry (ThreadedServer::maintain()) marks the pass it runs.
++  struct StandIn {
++    std::shared_ptr<ResourceBudget> resources;
++    bool marked = false;
++    void maintainPass() { marked = ResourceBudget::maintaining; }
++  } standIn{budget};
++  runMaintenanceOf(standIn);
++  KJ_EXPECT(standIn.marked, "the server's maintenance entry must mark its own pass");
++  KJ_EXPECT(!ResourceBudget::maintaining);
 +  // Any other thread still waits for a completed pass.
 +  std::atomic<bool> stop{false};
 +  std::thread pass([&] {
@@ -1443,10 +1502,10 @@ index 0000000000000000000000000000000000000000..b0a29fa64e0698a950959e2dcd22b2f7
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230620fa4cc
+index 0000000000000000000000000000000000000000..aa29a67c1a85ceed39d836a30752dc3ea93e00ed
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3842 @@
+@@ -0,0 +1,3873 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1599,6 +1658,13 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +  return enabled;
 +}
 +
++// Tests of the call threads' background backstop only: with the drain limit
++// off, nothing but the backstop ends waitUntil work that never finishes.
++bool drainLimitDisabledForTest() {
++  static const bool disabled = getenv("COWORKERD_THREADED_NO_DRAIN_LIMIT_FOR_TEST") != nullptr;
++  return disabled;
++}
++
 +void noteUnsupported(kj::StringPtr feature);
 +
 +kj::Exception unsupportedError(kj::StringPtr feature) {
@@ -1638,6 +1704,13 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +            : MAX_FIXED_ARRAY_ELEMENTS * sizeof(double)) +
 +    (1ull << 20);
 +static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
++// Old-space pages are not filled exactly: an isolate just under its limit can
++// hold several MiB more than its live bytes (4.3 MiB at 126 MiB live, measured
++// on cwkd-p40). Its V8 ceiling keeps a quarter of the limit, at least 32 MiB,
++// on top of one maximum object, so finishing that object never ends the process.
++constexpr uint64_t fragmentationReserve(uint64_t maximum) {
++  return maximum / 4 > (32ull << 20) ? maximum / 4 : (32ull << 20);
++}
 +
 +int limitEventFd();
 +thread_local const char *currentOomReport = nullptr;
@@ -1715,6 +1788,12 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +  // Set while this thread runs a maintenance pass, the only place a reclaim
 +  // completes. An eviction there can enter GC callbacks and the allocator.
 +  static inline thread_local bool maintaining = false;
++  template <typename Pass>
++  void runMaintenance(Pass &&pass) {
++    maintaining = true;
++    KJ_DEFER(maintaining = false);
++    pass();
++  }
 +  bool reclaim(uint64_t additionalMemory = 0) {
 +    std::unique_lock lock(mutex);
 +    auto epoch = reclaimEpoch;
@@ -2018,7 +2097,7 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +    auto size = strlen(currentOomReport);
 +    char row[4096];
 +    int written = currentOomHeap && size >= 2 && size < sizeof(row) - 64
-+        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
++        ? snprintf(row, sizeof(row), "%.*s,\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":%llu}\n", int(size - 2),
 +              currentOomReport, (unsigned long long)currentOomHeap->load())
 +        : -1;
 +    if (written > 0 && size_t(written) < sizeof(row))
@@ -2321,7 +2400,7 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +  v8::Isolate::CreateParams getCreateParams() override {
 +    v8::Isolate::CreateParams params;
 +    if (memory) {
-+      auto hard = memory->maximum + MAX_SINGLE_HEAP_OBJECT;
++      auto hard = memory->maximum + MAX_SINGLE_HEAP_OBJECT + fragmentationReserve(memory->maximum);
 +      params.constraints.ConfigureDefaultsFromHeapSize(0, hard);
 +      params.constraints.set_max_old_generation_size_in_bytes(hard);
 +      params.array_buffer_allocator_shared = memory;
@@ -2551,8 +2630,11 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +  kj::Promise<void> limitDrain() override {
 +    // Called when the response has ended. A lease expires the authority to
 +    // make child calls, not this invocation's waitUntil work, which keeps its
-+    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later.
-+    return timer.afterLimitTimeout(WAIT_UNTIL_LIMIT);
++    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later. KJ's timer
++    // does not advance while JavaScript runs, so the deadline is taken from the
++    // monotonic clock now, not as a delay from the timer's cached time.
++    if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
++    return timer.timer.atTime(kj::systemPreciseMonotonicClock().now() + WAIT_UNTIL_LIMIT);
 +  }
 +  kj::Promise<void> limitScheduled() override {
 +    return kj::NEVER_DONE;
@@ -2955,6 +3037,13 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +};
 +
 +struct ThreadedServer;
++
++// The server's maintenance entry: its pass runs inside the budget's maintenance
++// mark, so that a reclaim the pass itself triggers never waits for that pass.
++template <typename Server>
++void runMaintenanceOf(Server &server) {
++  server.resources->runMaintenance([&] { server.maintainPass(); });
++}
 +struct InvocationState: kj::Refcounted {
 +  explicit InvocationState(std::shared_ptr<Slot> slot, std::shared_ptr<TenantPermit> tenant)
 +      : slot(std::move(slot)),
@@ -3143,8 +3232,9 @@ index 0000000000000000000000000000000000000000..fa05db3c0f0e6e3708523c51ee48d230
 +  }
 +
 +  void maintain() {
-+    ResourceBudget::maintaining = true;
-+    KJ_DEFER(ResourceBudget::maintaining = false);
++    runMaintenanceOf(*this);
++  }
++  void maintainPass() {
 +    if (resources->reclaimRequested.exchange(false)) {
 +      bool noIdle = false;
 +      KJ_DEFER(resources->finishReclaim(noIdle));

@@ -687,8 +687,10 @@ struct CpuReport {
   # When the collection ended (gc-pause rows).
   observedAtUnixMs @23 :UInt64;
   # memory-culprit rows of the native server: the heap of the isolate whose allocation failed, at its last
-  # collection before V8's fatal OOM (0: not reported, as in the stock workerd rows).
+  # collection before V8's fatal OOM, and whether the row reports it (the stock workerd rows do not; a value
+  # of 0 is a reported heap, for example an isolate that died in its first collection).
   oomIsolateHeapBytes @24 :UInt64;
+  oomIsolateHeapReported @25 :Bool;
 }
 
 struct PlacementConfig {

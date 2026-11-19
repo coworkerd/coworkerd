@@ -2882,6 +2882,7 @@ public:
     std::string offender = "null";
     bool v8Oom = p.oomSignalled;
     uint64_t oomIsolateHeap = 0;
+    bool oomIsolateHeapReported = false;
     if (!row.empty() && row.size() <= 16384) try {
       capnp::MallocMessageBuilder message;
       auto report = message.initRoot<v1::rpc::CpuReport>();
@@ -2891,8 +2892,9 @@ public:
       v8Oom = v8Oom || stateOom;
       const std::string rowWorker = report.getWorkerId().cStr();
       oomIsolateHeap = report.getOomIsolateHeapBytes();
+      oomIsolateHeapReported = report.getOomIsolateHeapReported();
       if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB &&
-          memoryCulpritOwnsOom(oomIsolateHeap, report.getMemoryLimitMiB())) {
+          memoryCulpritOwnsOom(oomIsolateHeapReported, oomIsolateHeap, report.getMemoryLimitMiB())) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
         const auto dispatched = memoryCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
@@ -2919,7 +2921,8 @@ public:
     out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"observedAtUnixMs\":" << wall()
         << ",\"reason\":\"" << p.lastReason << "\",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
-        << "\",\"culprit\":" << offender << ",\"oomIsolateHeapBytes\":" << oomIsolateHeap
+        << "\",\"culprit\":" << offender << ",\"oomIsolateHeapReported\":" << (oomIsolateHeapReported ? "true" : "false")
+        << ",\"oomIsolateHeapBytes\":" << oomIsolateHeap
         << ",\"inFlight\":" << p.memoryCrashInFlight.value_or(p.inFlightJson()) << "}";
     if (memoryCrashes.size() == 32) memoryCrashes.pop_front();
     memoryCrashes.push_back(out.str());
@@ -3880,6 +3883,35 @@ std::map<std::string, uint64_t> ProcessPool::residentIsolatesByTenant() const {
     if (p->pid > 0) addLifecycle(p->lifecycle.read(), result);
   });
   return std::move(result.counts);
+}
+std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
+  std::vector<SecretDictionary::Residents> result;
+  for (const auto& s : impl->slots) Impl::eachGeneration(s, [&](const auto& p) {
+    if (p->pid <= 0) return;
+    auto& entry = result.emplace_back();
+    entry.processId = p->id;
+    entry.generation = p->generation;
+    if (!p->threaded) return;
+    const auto snapshot = p->lifecycle.read();
+    if (snapshot.empty() || snapshot.front() != '{') return;
+    try {
+      capnp::MallocMessageBuilder message;
+      auto value = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
+      const auto server = json::field(value, "ordinaryServer");
+      const auto list = json::field(value, "residentWorkers");
+      if (!server.isString() || std::string_view(server.getString().cStr()) != "threaded" || !list.isArray()) return;
+      for (auto row : list.getArray()) {
+        const auto revision = json::field(row, "planRevision");
+        if (!revision.isString() || revision.getString().size() == 0) { entry.revisions.clear(); return; }
+        entry.revisions.insert(revision.getString().cStr());
+      }
+      entry.known = true;
+    } catch (const kj::Exception&) {
+      entry.revisions.clear();
+    }
+  });
+  return result;
 }
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
