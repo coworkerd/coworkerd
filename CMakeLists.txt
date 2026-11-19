@@ -184,6 +184,9 @@ add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease
 foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
 endforeach()
+foreach(case raise unverified old-ask owner-refused)
+  add_test(NAME durable-peer-fence-${case} COMMAND coworkerd-durable-channel-test peer-fence ${case})
+endforeach()
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight
     cpu-culprit-current-behavior memory-culprit rejected-manifest)

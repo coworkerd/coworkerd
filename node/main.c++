@@ -5157,7 +5157,6 @@ public:
   kj::Promise<void> fetchDurableTail(FetchDurableTailContext context) override {
     auto parameters = context.getParams().getRequest();
     const auto destination = std::string(parameters.getDestinationEpoch().cStr());
-    auto result = context.getResults().initResult();
     coworkerd::DurableTailAsk ask;
     ask.namespaceId = parameters.getNamespaceId().cStr();
     ask.shard = parameters.getShard();
@@ -5169,13 +5168,18 @@ public:
     std::string refusal;
     if (!destination.empty() && !server.holdsEpoch(destination) &&
         !durableLog.canAnswerRestoredTail(ask, destination, &refusal)) {
-      result.setRefused(refusal.empty() ? "this node does not hold the epoch the request is for" : refusal.c_str());
-      return kj::READY_NOW;
+      context.getResults().initResult().setRefused(
+          refusal.empty() ? "this node does not hold the epoch the request is for" : refusal.c_str());
+      co_return;
     }
+    // r48: a request of a newer epoch of the shard than this node knows raises its peer floor first (checked against
+    // the object store); the answer is computed after the raise, so it has every append taken before it.
+    co_await durableLog.raisePeerFence(ask);
+    auto result = context.getResults().initResult();
     auto answer = durableLog.tailFor(ask);
     if (!answer.refusal.empty()) {
       result.setRefused(answer.refusal.c_str());
-      return kj::READY_NOW;
+      co_return;
     }
     std::vector<std::string> encoded;
     for (const auto& record : answer.records) encoded.push_back(coworkerd::encodeLogRecord(record));
@@ -5186,7 +5190,6 @@ public:
     result.setDroppedTo(answer.droppedTo);
     result.setCount(answer.count);
     result.setMore(answer.more);
-    return kj::READY_NOW;
   }
 
   // A request to a Durable Object whose shard this node is expected to own (DurableDispatch::receive).

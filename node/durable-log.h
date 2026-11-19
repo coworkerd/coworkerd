@@ -425,6 +425,11 @@ public:
   void closeIncoming(uint64_t streamId);
   // What this node holds of another node's log for one shard.
   DurableTailAnswer tailFor(const DurableTailAsk& ask, bool remote = true);
+  // r48: before a tail is answered, a newer epoch of the shard than this node knows raises the node's floor for the
+  // shard -- only once the object store shows that epoch (an epoch object is created by its owner alone, and only if
+  // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
+  // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
+  kj::Promise<void> raisePeerFence(DurableTailAsk ask);
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
       std::string* refusal = nullptr);
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
@@ -581,6 +586,9 @@ private:
     double openedAtMs = 0, lastAckMs = 0, attemptedAtMs = 0;
     std::deque<Queued> queue;
     uint64_t inFlightBytes = 0, queuedBytes = 0;
+    // r48: the records this session's peer refused as fenced. An answer to a later append carries the peer's highest
+    // sequence, which can be above them (an older peer does not hold its answers below them): they never count as held.
+    std::set<uint64_t> fencedSeqs;
   };
   // What this node buffers for one owner it is a peer of.
   struct PeerBuffer {
@@ -594,6 +602,12 @@ private:
     std::map<std::string, std::set<uint64_t>, std::less<>> byObject;
     void forgetPosition(uint64_t sequence);
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
+    // r48: records refused as fenced that no drop or trim has covered. The sequence answered stays below the lowest of
+    // them, so no later record of the owner makes the refused one count as held.
+    std::set<uint64_t> fencedSeqs;
+    uint64_t answeredSeq() const {
+      return fencedSeqs.empty() ? acceptedSeq : std::min(acceptedSeq, *fencedSeqs.begin() - 1);
+    }
   };
 
   void taskFailed(kj::Exception&& error) override;
@@ -692,6 +706,8 @@ private:
   void isolateObjectPending(Object& object, const std::string& reason);
   void markRepair(Object& object, const std::string& reason);
   bool ownerFenced(const std::string& namespaceId, uint32_t shard, uint64_t epoch) const;
+  // The newest epoch of the shard this node knows: the shards' view (hooks.knownShardEpoch) and this log's own fence.
+  uint64_t knownEpoch(const std::string& namespaceId, uint32_t shard) const;
   void fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through,
       const std::string& reason, bool notifyShard);
   kj::Promise<void> openPeer(std::string nodeId);
@@ -999,6 +1015,7 @@ private:
   uint64_t ownerLogUnavailableRecoveries = 0;
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
+  uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
