@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8ab33cfb570ec07cdef3e7bd0675f9beb299510
+index 0000000000000000000000000000000000000000..de39d10e1c1426221480c3bb8ff59385d04b8869
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,480 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -776,8 +776,10 @@ index 0000000000000000000000000000000000000000..c8ab33cfb570ec07cdef3e7bd0675f9b
 +  canceled = nullptr;
 +  KJ_EXPECT(budget->active.empty());
 +  auto disabled = std::make_shared<TenantBudget>(0);
-+  TenantPermit a(disabled, "a"), b(disabled, "b"), a2(disabled, "a");
-+  KJ_EXPECT(disabled->active["a"] == 2 && disabled->active["b"] == 1);
++  auto a = makeTenantPermit(disabled, "a");
++  auto b = makeTenantPermit(disabled, "b");
++  auto a2 = makeTenantPermit(disabled, "a");
++  KJ_EXPECT(!a && !b && !a2 && disabled->active.empty());
 +  const auto refusal = capacityError(CapacityScope::TENANT);
 +  const auto detail = KJ_REQUIRE_NONNULL(refusal.getDetail(CAPACITY_DETAIL));
 +  KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
@@ -1117,10 +1119,10 @@ index 0000000000000000000000000000000000000000..c8ab33cfb570ec07cdef3e7bd0675f9b
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa08a5dc82a29a8ec5778fbb12950b97490e7961
+index 0000000000000000000000000000000000000000..f233ec611fd3b24f4394b53f070b66d2d93ec344
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3771 @@
+@@ -0,0 +1,3777 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -1584,6 +1586,12 @@ index 0000000000000000000000000000000000000000..aa08a5dc82a29a8ec5778fbb12950b97
 +  std::shared_ptr<TenantBudget> budget;
 +  std::string tenant;
 +};
++
++std::shared_ptr<TenantPermit> makeTenantPermit(
++    const std::shared_ptr<TenantBudget> &budget, std::string_view tenant) {
++  if (budget->limit == 0) return nullptr;
++  return std::make_shared<TenantPermit>(budget, std::string(tenant));
++}
 +
 +uint64_t configuredCount(const char *name, uint64_t fallback) {
 +  auto text = getenv(name);
@@ -2787,7 +2795,7 @@ index 0000000000000000000000000000000000000000..aa08a5dc82a29a8ec5778fbb12950b97
 +    auto worker = str(descriptor, "workerId");
 +    auto separator = worker.find('/');
 +    KJ_REQUIRE(separator != std::string::npos && separator > 0, "invalid trusted Worker tenant");
-+    return std::make_shared<TenantPermit>(tenantBudget, worker.substr(0, separator));
++    return makeTenantPermit(tenantBudget, std::string_view(worker).substr(0, separator));
 +  }
 +
 +  void maintain() {

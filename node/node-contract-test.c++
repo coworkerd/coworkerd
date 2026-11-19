@@ -46,7 +46,7 @@ void nativeConfig() {
   const auto decoded = ServerConfig::load(directory / "default.json");
   for (const auto* config : {&direct, &decoded}) {
     KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
-    KJ_REQUIRE(config->processPool.tenantInFlightLimit == tenantExecutionShare(availableProcessCpus()));
+    KJ_REQUIRE(config->processPool.tenantInFlightLimit == 0);
     KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
     KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
   }
@@ -61,6 +61,8 @@ void nativeConfig() {
 }
 
 void tenantExecution() {
+  KJ_REQUIRE(makeTenantExecutionState(0) == nullptr);
+  KJ_REQUIRE(makeTenantExecutionState(2) != nullptr);
   for (const auto [cpus, expected] : {std::pair{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 2u}, {4u, 2u},
       {5u, 3u}, {16u, 13u}, {64u, 61u}}) KJ_REQUIRE(tenantExecutionShare(cpus) == expected);
   KJ_REQUIRE(quotaCpuCount(150000, 100000) == 2 && quotaCpuCount(200000, 100000) == 2);

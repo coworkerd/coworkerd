@@ -1262,7 +1262,7 @@ struct ProcessGeneration {
 };
 ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string tenant)
     : processId(process->id), generation(process->generation), process(std::move(process)),
-      tenant(this->process->threaded ? std::move(tenant) : std::string()) {
+      tenant(this->process->tenantExecution ? std::move(tenant) : std::string()) {
   ++this->process->inFlight;
   if (!this->tenant.empty()) this->process->tenantExecution->enter(this->tenant);
 }
@@ -2255,7 +2255,7 @@ public:
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
     p->threaded = !s.durable;
-    if (p->threaded) p->tenantExecution = std::make_shared<TenantExecutionState>(config.tenantInFlightLimit);
+    if (p->threaded) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -3047,7 +3047,7 @@ public:
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
-    if (!p.threaded) return true;
+    if (!p.tenantExecution) return true;
     return !p.tenantExecution->limited(tenantOf(worker));
   }
 
@@ -3604,6 +3604,7 @@ bool ProcessPool::available(const std::string& worker) {
   return false;
 }
 std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLimit(const std::string& worker) {
+  if (impl->config.tenantInFlightLimit == 0) return std::nullopt;
   impl->refresh();
   const auto quarantine = quarantined(worker);
   const auto tenant = tenantOf(worker);
@@ -3765,7 +3766,7 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
     if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) {
       if (quarantine) ++impl->quarantineDispatches;
-      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, tenantOf(worker)));
+      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, s.current->tenantExecution ? tenantOf(worker) : std::string()));
     }
   }
   return {};
@@ -3796,7 +3797,7 @@ std::shared_ptr<ProcessCall> ProcessPool::selectTrial(const std::string& worker)
   for (const auto& id : rendezvousOrder(placementKey(worker, true), ids)) for (const auto& s : impl->slots) {
     if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) {
       ++impl->trialDispatches;
-      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, tenantOf(worker)));
+      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, s.current->tenantExecution ? tenantOf(worker) : std::string()));
     }
   }
   return {};

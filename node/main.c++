@@ -1677,10 +1677,6 @@ public:
           outcome = waited == coworkerd::TenantExecutionQueue::FULL ? "full" : "expired";
           co_return reject(std::move(*failure));
         }
-        // A tenant becoming alone can wake every borrower at once. Let ready
-        // I/O and the other tenant's already-runnable admission finish before
-        // rechecking the share, just as for a completed shared cold load.
-        co_await kj::yieldUntilWouldSleep();
       }
       outcome = "resumed";
       if (!slot) slot = reserve(root, worker, durable);

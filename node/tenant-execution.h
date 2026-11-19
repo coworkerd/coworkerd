@@ -90,6 +90,10 @@ private:
   std::list<Tenant*> waitingTenants;
 };
 
+inline std::shared_ptr<TenantExecutionState> makeTenantExecutionState(uint32_t limit) {
+  return limit == 0 ? nullptr : std::make_shared<TenantExecutionState>(limit);
+}
+
 // A bounded node wait races release events against one deadline timer. It
 // reserves no process ticket, native call thread or Worker preparation memory.
 class TenantExecutionQueue {
