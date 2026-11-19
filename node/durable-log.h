@@ -631,6 +631,8 @@ private:
 
   // ---- the channel to a durable process ----
   friend struct DurableLogChannelTest;
+  friend struct DurableTailTest;
+  DurableTailAnswer tailForPage(const DurableTailAsk& ask, bool remote, size_t pageBytes);
   kj::Promise<void> readChannel(Channel& channel);
   bool consumeChannelInbox(Channel& channel, bool sliced);
   void onMessage(Channel& channel, std::string_view message);

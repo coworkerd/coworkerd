@@ -1530,11 +1530,13 @@ kj::Promise<void> DurableLog::readOwnLog(bool slice) {
       if (auto prior = earlier.find(epoch); prior != earlier.end()) {
         for (const auto& [sequence, record] : prior->second) unindexEarlierRecord({epoch, sequence}, record);
       }
-      for (const auto& [sequence, record] : unsealed) {
+      // At every yield, any indexed position must already name a stored record.
+      auto& held = earlier[epoch];
+      held = std::move(unsealed);
+      for (const auto& [sequence, record] : held) {
         if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
         indexEarlierRecord({epoch, sequence}, record);
       }
-      earlier[epoch] = std::move(unsealed);
     }
   }
   // Keep ownership identity for classifying and resealing predecessor records.
@@ -6671,6 +6673,10 @@ bool DurableLog::canAnswerRestoredTail(const DurableTailAsk& ask, const std::str
 // What this node holds of another node's log for one shard: the records above `afterSeq`, without a gap, so that the
 // new owner can tell how far the history reaches.
 DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
+  return tailForPage(ask, remote, TAIL_ANSWER_BYTES);
+}
+
+DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote, size_t pageBytes) {
   DurableTailAnswer answer;
   if (!enabled()) {
     answer.refusal = "this node keeps no Durable Object log";
@@ -6830,7 +6836,7 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
       answer.refusal = "a historical record exceeds the recoverable RPC limit";
       return answer;
     }
-    if (bytes && bytes + encoded.size() > TAIL_ANSWER_BYTES) {
+    if (bytes && bytes + encoded.size() > pageBytes) {
       answer.more = true;
       break;
     }
@@ -6841,7 +6847,7 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
     bytes += encoded.size();
     answer.records.push_back(std::move(*record));
     ++answer.count;
-    if (encoded.size() > TAIL_ANSWER_BYTES) {
+    if (encoded.size() > pageBytes) {
       answer.more = std::next(it) != ordered.end();
       break;  // One over-budget record occupies the page alone.
     }
