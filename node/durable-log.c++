@@ -4254,7 +4254,9 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   const auto ticket = ++rebuildWaitSerial;
   queue.push_back({kj::mv(available.fulfiller), &active, &background, objectName, ticket});
   queuedRebuildIndex.insert_or_assign(objectName, QueuedRebuild{background, ticket, std::prev(queue.end())});
+  const auto queuedAt = monotonicTimeMs();
   pumpRebuilds();co_await kj::mv(available.promise);
+  const auto queuedMs = monotonicTimeMs() - queuedAt;
   if (background) ++backgroundRebuilds;else ++foregroundRebuilds;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
@@ -4262,7 +4264,7 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   for (uint32_t attempt = 1; attempt <= MANIFEST_ATTEMPTS; ++attempt) {
     object->recoveryRevisionChanged = false;
     try {
-      co_await rebuildAttempt(objectName, reason);
+      co_await rebuildAttempt(objectName, reason, attempt == 1 ? queuedMs : 0);
       co_return;
     } catch (const kj::Exception& error) {
       object = objectOf(objectName);
@@ -4298,8 +4300,15 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
 }
 
-kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason) {
+kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason, double queuedMs) {
   const auto start = monotonicTimeMs();
+  // Where this attempt's time goes, consecutive laps of the same clock (logged with `rebuilt`).
+  struct Laps { double setup = 0, manifest = 0, snapshot = 0, segments = 0, local = 0, tailWait = 0, latest = 0,
+      prepare = 0, replay = 0, files = 0, publish = 0, markers = 0; };
+  Laps laps;
+  SegmentReadStats segmentStats;
+  auto lapMark = start;
+  auto lap = [&lapMark](double& slot) { const auto now = monotonicTimeMs(); slot += now - lapMark; lapMark = now; };
   auto loopDelay = std::make_shared<double>(0);
   recoveryLoopObservers.insert(loopDelay);
   auto stopMeasuring = kj::defer([this, loopDelay]() { recoveryLoopObservers.erase(loopDelay); });
@@ -4362,10 +4371,12 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       } catch (...) {}
     }
   });
+  lap(laps.setup);
   auto manifest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   const auto initialLowerBound = co_await recoveryLowerBound(objectName, manifest);
   check();
+  lap(laps.manifest);
   std::vector<ManifestFacet> facets;
   uint64_t fromSeq = 0;
   object->recoveryManifestRevision = manifest ? manifest->revision : 0;
@@ -4394,9 +4405,11 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       for (const auto& facet : facets) fromSeq = std::max(fromSeq, facet.upToSeq);
     }
   }
+  lap(laps.snapshot);
   std::vector<LogRecord> history;
-  if (manifest) history = co_await readSegments(*manifest, object->namespaceId + "/" + object->objectId);
+  if (manifest) history = co_await readSegments(*manifest, object->namespaceId + "/" + object->objectId, &segmentStats);
   check();
+  lap(laps.segments);
   std::set<std::pair<uint64_t, uint64_t>> durableRecords;
   for (const auto& record : history) durableRecords.emplace(record.shardEpoch, record.nodeSeq);
   object = objectOf(objectName);
@@ -4436,8 +4449,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       }
     }
   }
+  lap(laps.local);
   auto tails = co_await kj::mv(collecting);
   check();
+  lap(laps.tailWait);
   auto latest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   if (latest && (!manifest || latest->revision > manifest->revision)) {
@@ -4455,13 +4470,14 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       check();
       facets = manifest->facets;
     }
-    auto published = co_await readSegments(*manifest, historyName);
+    auto published = co_await readSegments(*manifest, historyName, &segmentStats);
     check();
     for (auto& record : published) {
       durableRecords.emplace(record.shardEpoch, record.nodeSeq);
       history.push_back(std::move(record));
     }
   }
+  lap(laps.latest);
   object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
   const auto lowerBound = co_await recoveryLowerBound(objectName, manifest);
@@ -4513,11 +4529,13 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   }
   // Finish and synchronize the new image before touching any original file or facet entry.
   for (const auto& record : history) stagingFacets.insert(record.facetId);
+  lap(laps.prepare);
   auto rebuilt = co_await replayToAsync(storage, objectName, targetEpoch, staging, std::move(history), facets,
       snapshotShardEpoch, drop, {}, check, [this, objectName](double ms) {
         log("recovery-fsync", "\"object\":" + quote(objectName) + ",\"stage\":\"replay\",\"ms\":" + std::to_string(ms));
       });
   check();
+  lap(laps.replay);
   KJ_REQUIRE(!recoveryWriteFailed, "a held or unfenced local image cannot be deleted");
   object->facets.clear();
   auto removeFile = [&](const std::filesystem::path& path) {
@@ -4548,10 +4566,12 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   writeFacetIndex(*object, index);
   object->facets = std::move(rebuilt);
   dirtyCacheSizes.insert(objectName);
+  lap(laps.files);
   const auto publishingStarted = monotonicTimeMs();
   if (tails.cut) co_await forceRecoverySnapshot(objectName);
   else co_await publishRecovery(objectName, adopted);
   check();
+  lap(laps.publish);
   std::vector<RecoveryEvent> completed;
   completed.push_back(recoveryEvent(RecoveryKind::PUBLISHED, *object, object->rebuildGeneration));
   completed.push_back(recoveryEvent(RecoveryKind::REBUILD_DONE, *object, object->rebuildGeneration));
@@ -4598,9 +4618,24 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lastRebuildLoopDelayMs = *loopDelay;
   object->lastRebuildMs = lastRebuildMs;
   writePosition(*object);
+  lap(laps.markers);
   log("rebuilt", "\"object\":" + quote(objectName) + ",\"ms\":" + std::to_string(lastRebuildMs) + ",\"manifest\":\"" +
           std::to_string(object->manifestRevision) + "\",\"snapshot\":\"" + std::to_string(object->snapshotSequence) +
-          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\"");
+          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\",\"queueMs\":" + std::to_string(queuedMs) +
+          ",\"loopDelayMs\":" + std::to_string(lastRebuildLoopDelayMs) +
+          ",\"laps\":{\"setupMs\":" + std::to_string(laps.setup) + ",\"manifestMs\":" + std::to_string(laps.manifest) +
+          ",\"snapshotMs\":" + std::to_string(laps.snapshot) + ",\"segmentsMs\":" + std::to_string(laps.segments) +
+          ",\"localMs\":" + std::to_string(laps.local) + ",\"tailWaitMs\":" + std::to_string(laps.tailWait) +
+          ",\"latestMs\":" + std::to_string(laps.latest) + ",\"prepareMs\":" + std::to_string(laps.prepare) +
+          ",\"replayMs\":" + std::to_string(laps.replay) + ",\"filesMs\":" + std::to_string(laps.files) +
+          ",\"publishMs\":" + std::to_string(laps.publish) + ",\"markersMs\":" + std::to_string(laps.markers) +
+          "},\"tailCollectionMs\":" + std::to_string(tails.collectionMs) +
+          ",\"segments\":{\"read\":" + std::to_string(segmentStats.segments) + ",\"bytes\":" + std::to_string(segmentStats.bytes) +
+          ",\"records\":" + std::to_string(segmentStats.records) + ",\"hits\":" + std::to_string(segmentStats.cacheHits) +
+          ",\"misses\":" + std::to_string(segmentStats.cacheMisses) + ",\"joins\":" + std::to_string(segmentStats.cacheJoins) +
+          ",\"downloadMs\":" + std::to_string(segmentStats.downloadMs) + ",\"decodeMs\":" + std::to_string(segmentStats.decodeMs) +
+          ",\"groupMs\":" + std::to_string(segmentStats.groupMs) + ",\"waitMs\":" + std::to_string(segmentStats.waitMs) +
+          ",\"selectMs\":" + std::to_string(segmentStats.selectMs) + "}");
 }
 
 // A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
@@ -4621,9 +4656,10 @@ kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifes
 // The segments a manifest names, in order, at most recoverParallelism downloads at a time; only the records of this
 // object are kept.
 kj::Promise<std::vector<LogRecord>> DurableLog::readSegments(const ObjectManifest& manifest,
-    const std::string& objectName) {
+    const std::string& objectName, SegmentReadStats* stats) {
   return readRecoverySegments([this](std::string key) { return store->get(std::move(key)); }, manifest, objectName,
-      settings.config.recoverParallelism, {}, [this](const std::string& event, const std::string& fields) { log(event, fields); });
+      settings.config.recoverParallelism, {}, [this](const std::string& event, const std::string& fields) { log(event, fields); },
+      nullptr, {}, stats);
 }
 
 void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch) {

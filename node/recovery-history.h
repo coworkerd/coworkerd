@@ -21,6 +21,13 @@ struct HistoryBudget {
   void add(const LogRecord& record);
 };
 
+// Where reading a manifest's segments spent its time, for the timing a rebuild logs. `downloadMs` and `decodeMs`
+// are this read's own work; `waitMs` is the time it waited for segment contents in all.
+struct SegmentReadStats {
+  uint64_t segments = 0, bytes = 0, records = 0, cacheHits = 0, cacheMisses = 0, cacheJoins = 0;
+  double downloadMs = 0, decodeMs = 0, groupMs = 0, waitMs = 0, selectMs = 0;
+};
+
 struct FileDigest { uint64_t bytes = 0; std::string sha256; };
 // Owns a duplicate until the worker finishes, even if its waiter is canceled.
 kj::Promise<bool> synchronizeRecoveryFile(int fd);
@@ -28,7 +35,7 @@ FileDigest recoveryFileDigest(const std::filesystem::path& path);
 kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& path, HistoryYield yield, HistoryCheck check = {});
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
     const std::string& objectName, uint32_t parallelism, HistoryCheck check = {}, HistoryLog log = {},
-    HistoryBudget* budget = nullptr, HistoryYield yield = {});
+    HistoryBudget* budget = nullptr, HistoryYield yield = {}, SegmentReadStats* stats = nullptr);
 kj::Promise<void> downloadRecoveryPart(HistoryGet get, const ObjectManifest& manifest,
     uint32_t facetId, uint64_t part, int fd, off_t offset, HistoryCheck check = {});
 kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest& manifest,

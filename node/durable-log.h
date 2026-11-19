@@ -38,6 +38,8 @@
 // unclean.
 namespace coworkerd {
 
+struct SegmentReadStats;  // node/recovery-history.h
+
 // ---- The objects of the store ----
 //   nodes/<nodeId>/wal/<nodeEpoch>/<segment>           a segment of the node's log (immutable, 20 digits wide)
 //   do/<ns>/objects/<id>/manifest/<rev> (+ /current)   the object's manifest (immutable revisions, created only if absent)
@@ -755,14 +757,15 @@ private:
   kj::Promise<void> rebuild(std::string objectName, std::string reason, bool background);
   void pumpRebuilds();
   void promoteRebuild(const std::string&);
-  kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason);
+  kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason, double queuedMs = 0);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
   kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
       const std::string& staging, std::function<void()> check = {}, std::function<void(double)> observeFsync = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
       off_t offset);
-  kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName);
+  kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName,
+      SegmentReadStats* stats = nullptr);
   struct TailRecovery {
     std::vector<LogRecord> records;
     bool cut = false, ownerSilent = false, sourceLogUnavailable = false;

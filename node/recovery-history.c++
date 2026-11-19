@@ -99,7 +99,8 @@ kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& pat
   constexpr char HEX[] = "0123456789abcdef"; for (auto byte : bytes) { result.sha256 += HEX[byte >> 4]; result.sha256 += HEX[byte & 15]; } co_return result;
 }
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
-    const std::string& objectName, uint32_t parallelism, HistoryCheck check, HistoryLog log, HistoryBudget* budget, HistoryYield yield) {
+    const std::string& objectName, uint32_t parallelism, HistoryCheck check, HistoryLog log, HistoryBudget* budget, HistoryYield yield,
+    SegmentReadStats* stats) {
   if (budget) parallelism = 1;
   std::vector<LogRecord> out;
   std::map<uint64_t, std::optional<ShardEpoch>> owners;
@@ -119,12 +120,16 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
         return std::move(response.bytes);
       }));
     }
+    const auto downloadBegan = monotonicTimeMs();
     auto bodies = co_await kj::joinPromises(running.releaseAsArray());
+    if (stats) { stats->downloadMs += monotonicTimeMs() - downloadBegan; stats->waitMs += monotonicTimeMs() - downloadBegan; }
     if (check) check();
     for (size_t i = 0; i < bodies.size(); ++i) {
       if (budget) budget->transient(bodies[i].size() * 6);
+      if (stats) { ++stats->segments; stats->bytes += bodies[i].size(); ++stats->cacheMisses; }
       std::string error;
       std::optional<SegmentContents> contents;
+      const auto decodeBegan = monotonicTimeMs();
       if (yield) {
         // The seed's existing one-segment budget covers the worker's owned input
         // and decoded records. Ordinary recovery keeps its original reader.
@@ -132,7 +137,9 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
         if (check) check();
         contents = std::move(decoded.contents); error = std::move(decoded.error);
       } else contents = decodeSegment(bodies[i], &error);
+      if (stats) { stats->decodeMs += monotonicTimeMs() - decodeBegan; stats->waitMs += monotonicTimeMs() - decodeBegan; }
       KJ_REQUIRE(contents.has_value(), "a segment of a Durable Object's log does not add up", error.c_str());
+      const auto selectBegan = monotonicTimeMs();
       auto began = monotonicTimeMs();
       for (auto& record : contents->records) {
         if (yield && monotonicTimeMs() - began >= 2) { co_await yield(); if (check) check(); began = monotonicTimeMs(); }
@@ -159,8 +166,10 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
               std::to_string(record.nodeSeq) + "\"");
         }
         if (budget) budget->add(record);
+        if (stats) ++stats->records;
         out.push_back(std::move(record));
       }
+      if (stats) stats->selectMs += monotonicTimeMs() - selectBegan;
     }
     at = until;
   }
