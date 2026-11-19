@@ -8386,18 +8386,24 @@ private:
 // WebSocket connections are told to go away (1001), the requests in flight get up to a second, and the durable processes
 // start again, empty -- every facet closed --, before another node can take a shard over (a TTL plus the grace after this
 // node's last heartbeat by the store's clock). Stateless calls go on as before.
+// `leaseDropped`: shards already given up synchronously when the lease ended at a confirmation or a heartbeat (r46);
+// their objects' facets are closed here the same way.
 kj::Promise<void> watchShardOwnership(ServerCore& server, coworkerd::ProcessPool& runtime, coworkerd::DurableShards& shards,
-    coworkerd::Membership& membership, kj::Timer& timer) {
+    coworkerd::Membership& membership, kj::Timer& timer, uint32_t& leaseDropped) {
   bool expired = false;
   while (true) {
     co_await timer.afterDelay(50 * kj::MILLISECONDS);
     const auto& view = membership.view();
     const bool now = view.selfExpired || view.identityTaken;
-    if (!now) { expired = false; continue; }
-    if (expired) continue;
-    expired = true;
     const auto started = monotonicTimeMs();
-    const auto held = shards.dropAll(view.identityTaken ? "identity-taken" : "membership-expired");
+    uint32_t held = 0;
+    if (!now) {
+      expired = false;
+    } else if (!expired) {
+      expired = true;
+      held = shards.dropAll(view.identityTaken ? "identity-taken" : "membership-expired");
+    }
+    held += std::exchange(leaseDropped, 0);
     if (held == 0) continue;
     const auto told = server.webSockets().goAwayDurable("owner-expired");
     const auto inFlight = runtime.durableInFlight();
@@ -8505,6 +8511,7 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   KJ_REQUIRE(!launch.configFile.empty(), "serve requires --config FILE");
   launch.configFile = fs::absolute(launch.configFile);
   auto& c = launch.config = ServerConfig::load(launch.configFile);
+  coworkerd::checkNodeLeaseMargin(c.membership);
   KJ_REQUIRE(c.serverIdGiven, "the configuration needs a nodeId");
   launch.stackDirectory = fs::absolute(c.stackDirectory.empty() ? "/var/lib/coworkerd" : c.stackDirectory).lexically_normal();
   launch.manifestPath = launch.stackDirectory / "workers" / "manifest.json";
@@ -8542,6 +8549,7 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   launch.ignoredSourceAddress = args[4];
   if (args.size() == 6) launch.configFile = args[5];
   launch.config = ServerConfig::load(launch.configFile);
+  coworkerd::checkNodeLeaseMargin(launch.config.membership);
   KJ_REQUIRE(!launch.config.servePathsGiven(),
       "stackDirectory, workerdPath, runtimePath and listenAddress are for `serve`; the positional form takes them as arguments");
   // <stack>/workers/manifest.json -> <stack>.
@@ -8929,6 +8937,21 @@ int run(Launch launch) {
   shards.onShardGone([&durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
     durableLog.shardGone(namespaceId, shard, reason);
   });
+  // The lease of this node's epoch is judged next to every confirmation (r46, node/durable-log.h). Once it ends --
+  // judged there, at a heartbeat or by the membership's expiry check -- the shards are given up at once, synchronously,
+  // after the refused records were answered; watchShardOwnership then closes their objects' facets.
+  uint32_t leaseDroppedShards = 0;
+  auto loseShards = [&shards, &membership, &leaseDroppedShards]() {
+    if (shards.heldCount() == 0) return;
+    leaseDroppedShards += shards.dropAll(membership->view().identityTaken ? "identity-taken" : "membership-expired");
+  };
+  durableLog.setLeaseHooks(
+      [&membership](uint64_t epoch, double nowMs) { return membership->checkLease(epoch, nowMs); },
+      [loseShards](std::string) { loseShards(); });
+  membership->onLease([&durableLog, loseShards](uint64_t, bool lost) {
+    if (lost) loseShards();
+    else durableLog.leaseSettled();
+  });
   // A shard taken: the alarms its objects had scheduled are read from their hints, so the node that lost it does not
   // take its objects' alarms with it (node/durable-log.h).
   shards.onShardTaken([&durableLog, &server](const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch,
@@ -9110,7 +9133,7 @@ int run(Launch launch) {
       .exclusiveJoin(runLeaseReaper(server, timer))
       .exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(membership->run())
-      .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer))
+      .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer, leaseDroppedShards))
       .exclusiveJoin(durableLog.run())
       .exclusiveJoin(coworkerd::r47::runTimer(timer))
       .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))

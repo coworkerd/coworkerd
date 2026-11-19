@@ -51,6 +51,11 @@ std::string jsonEscape(const std::string& value);
 kj::Promise<void> sendUnauthorized(kj::HttpService::Response& response, const kj::HttpHeaderTable& table);
 uint64_t wallTimeMsForTest();
 double monotonicTimeMs();
+// The clock of the membership lease (sending a heartbeat and judging the lease read the same one), in milliseconds.
+// On Linux CLOCK_BOOTTIME, read directly at every call: it does not depend on when the event loop last woke (KJ's
+// timer.now() does), and it counts the time a suspended system was stopped. Elsewhere the monotonic clock, for
+// development only. Negative when the clock could not be read; a caller treats that as an expired lease.
+double leaseClockMs();
 
 // The directory of this executable (the release keeps workerd beside it, the runtime in ../runtime).
 std::filesystem::path executableDirectory();

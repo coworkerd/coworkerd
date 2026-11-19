@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <strings.h>
+#include <time.h>
 
 namespace fs = std::filesystem;
 
@@ -118,6 +119,19 @@ double monotonicTimeMs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
   KJ_REQUIRE(std::isfinite(value) && value >= 0, "monotonic clock returned an invalid value");
   return value;
+}
+
+double leaseClockMs() {
+#ifdef __linux__
+  timespec now{};
+  if (::clock_gettime(CLOCK_BOOTTIME, &now) != 0) return -1;
+  return double(now.tv_sec) * 1000 + double(now.tv_nsec) / 1e6;
+#else
+  // Development platforms only: the monotonic clock may stop while the machine sleeps.
+  const auto value = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  return std::isfinite(value) && value >= 0 ? value : -1;
+#endif
 }
 
 // The directory of this executable (the release keeps workerd beside it, the runtime in ../runtime).

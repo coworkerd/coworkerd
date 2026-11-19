@@ -2,6 +2,7 @@
 #include "json.h"
 #include "object-state.h"
 #include "tenancy.h"
+#include "support.h"
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
@@ -108,7 +110,8 @@ public:
       kj::Network& network, kj::Timer& timer)
       : config(std::move(config)), serverId(std::move(serverId)), store(storeConfig, network, timer), timer(timer),
         startedAtUnixMs(nowUnixMs()), lastHeartbeatOk(timer.now()), lastHeartbeatOkDue(timer.now()), lastListOk(timer.now()),
-        startupDeadline(timer.now()) {
+        startupDeadline(timer.now()),
+        lease(double(uint64_t(this->config.ttlSeconds) * 1000), double(this->config.heartbeatIntervalMs)) {
     std::array<unsigned char, 16> random;
     KJ_REQUIRE(RAND_bytes(random.data(), random.size()) == 1, "cannot name this membership's instance");
     for (auto byte : random) { instance += "0123456789abcdef"[byte >> 4]; instance += "0123456789abcdef"[byte & 15]; }
@@ -122,9 +125,24 @@ public:
     state.livenessGraceMs = this->config.livenessGraceMs;
     state.clockSkewToleranceMs = this->config.clockSkewToleranceMs;
     state.createSettleMs = this->config.createSettleMs;
+#ifdef __linux__
+    state.leaseClock = "boottime";
+#else
+    state.leaseClock = "monotonic";
+#endif
   }
 
   const MembershipView& view() const override { return state; }
+
+  void onLease(std::function<void(uint64_t epoch, bool lost)> callback) override { leaseCallback = std::move(callback); }
+
+  // Judged by the caller's reading of the lease clock; an expired current epoch is fenced and marked, nothing is
+  // called back (the caller is in the middle of its own work: it acts on the verdict itself).
+  LeaseTracker::Judgment checkLease(uint64_t number, double nowMs) override {
+    auto judgment = lease.judge(number, nowMs);
+    if (judgment.verdict == LeaseTracker::Verdict::EXPIRED && number == epoch) markExpired();
+    return judgment;
+  }
 
   void onIdentityTaken(std::function<void(std::string)> callback) override {
     identityCallback = std::move(callback);
@@ -277,11 +295,10 @@ private:
   std::string instance;
   MembershipView state;
   uint64_t epoch = 0;
+  // The event loop's times of the last heartbeat that renewed the lease, sent and on the cadence: where the cadence
+  // goes on from. The lease itself is judged by `lease`, on the lease clock.
   kj::TimePoint lastHeartbeatOk;
-  // The cadence time of the last heartbeat the store took, and of every heartbeat in flight: one that went out, by the
-  // cadence, within the TTL of the last one taken decides the epoch's expiry (expireIfDue()).
   kj::TimePoint lastHeartbeatOkDue;
-  std::multiset<kj::TimePoint> dueInFlight;
   // The last listing of members/ that answered, and whether one failed since (the recovery anchor's blindness).
   kj::TimePoint lastListOk;
   bool listFailedSinceOk = false;
@@ -304,6 +321,8 @@ private:
   std::set<uint64_t> created;
   // (node, epoch) -> its heartbeat's record, read once for its address.
   std::map<std::pair<std::string, uint64_t>, MemberRecord> addresses;
+  LeaseTracker lease;
+  std::function<void(uint64_t epoch, bool lost)> leaseCallback;
   kj::TaskSet tasks{*this};
 
   void taskFailed(kj::Exception&& error) override { failed("background", error); }
@@ -391,10 +410,13 @@ private:
     state.identityTaken = true;
     state.identityTakenReason = reason;
     state.leaseStatus = "identity-taken";
+    lease.fence(epoch, "another process holds this node's id");
+    noteLease();
     std::cout << "[membership] {\"event\":\"identity-taken\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
               << "\",\"instance\":" << quote(instance) << ",\"reason\":" << quote(reason) << ",\"observedAtUnixMs\":" << nowUnixMs()
               << "}" << std::endl;
     if (identityCallback) identityCallback(reason);
+    if (leaseCallback && epoch) leaseCallback(epoch, true);
   }
 
   void conflict(bool starting, const std::string& reason) {
@@ -522,6 +544,8 @@ private:
     KJ_REQUIRE(!stopping, "membership stopped during registration");
     epoch = number;
     state.epoch = std::to_string(number);
+    lease.begin(number);
+    noteLease();
     // Beside the epochs this process held before: a stateless call addressed to an expired one is still served (an
     // expired epoch is never renewed; re-registration takes a new one).
     state.heldEpochs.insert(state.epoch);
@@ -532,37 +556,59 @@ private:
   }
 
   // `due`: the heartbeat's time on the cadence (start()'s and a re-registration's first heartbeat: when it is sent).
+  // On the lease clock the heartbeat goes out now, for its slot: as far before now as the event loop's clock says it
+  // is late (the loop's clock was just read when the cadence's timer fired). A fenced epoch sends none.
   kj::Promise<void> writeHeartbeat(kj::Maybe<kj::TimePoint> due = kj::none) {
     KJ_REQUIRE(epoch && !state.identityTaken && !stopping, "no epoch to write a heartbeat for");
     auto record = recordOf(state.draining ? "draining" : "active");
     const auto sent = timer.now();
     const auto slot = due.orDefault(sent);
+    const auto leaseSent = leaseClockMs();
+    // On the cadence: as far from the renewing heartbeat's slot as the event loop's cadence puts it (an exact multiple
+    // of the interval), not a fresh reading -- the slot on the TTL is then exactly D + T.
+    bool onCadence = false;
+    KJ_IF_SOME(given, due) { onCadence = given >= lastHeartbeatOkDue; }
+    const auto lateMs = slot < sent ? double((sent - slot) / kj::MICROSECONDS) / 1000 : 0.;
+    const auto leaseSlot = lease.slotFor(onCadence, leaseSent, lateMs,
+        onCadence ? double((slot - lastHeartbeatOkDue) / kj::MICROSECONDS) / 1000 : 0.);
+    const auto beatId = lease.sent(epoch, leaseSent, leaseSlot);
+    KJ_REQUIRE(beatId != 0, "the epoch's lease is fenced: no heartbeat goes out for it", epoch);
     const auto number = ++heartbeatsSent;
     ++writing;
     KJ_DEFER(--writing);
-    auto inFlight = dueInFlight.insert(slot);
     bool settled = false;
-    KJ_DEFER(if (!settled) dueInFlight.erase(inFlight));
+    KJ_DEFER(if (!settled) lease.forget(beatId));
     try {
       co_await bounded(store.put(memberHeartbeatKey(serverId, epoch), memberRecordJson(record)));
     } catch (const kj::Exception&) {
       settled = true;
-      dueInFlight.erase(inFlight);
+      lease.settled(beatId, false, leaseClockMs());
       ++state.heartbeatFailures;
       if (number > heartbeatsSettled) { heartbeatsSettled = number; state.leaseConnected = false; }
       // It may be the heartbeat the epoch's expiry waited for: judged now, not at the next check.
       expireIfDue();
+      noteLease();
+      if (leaseCallback && epoch) leaseCallback(epoch, false);
       throw;
     }
     settled = true;
-    dueInFlight.erase(inFlight);
-    // Two may be in flight (heartbeats()): one that finishes after a later one moves nothing back.
-    if (sent > lastHeartbeatOk) lastHeartbeatOk = sent;
-    if (slot > lastHeartbeatOkDue) lastHeartbeatOkDue = slot;
+    // Handled after its end, or for an epoch that changed or was fenced meanwhile, a success renews nothing.
+    if (lease.settled(beatId, true, leaseClockMs())) {
+      // Two may be in flight (heartbeats()): one that finishes after a later one moves nothing back.
+      if (sent > lastHeartbeatOk) lastHeartbeatOk = sent;
+      if (slot > lastHeartbeatOkDue) lastHeartbeatOkDue = slot;
+    } else {
+      std::cout << "[membership] {\"event\":\"late-heartbeat\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
+                << "\",\"reason\":\"its success was handled after its end or after the epoch was fenced: the lease is not "
+                   "renewed by it\",\"observedAtUnixMs\":" << nowUnixMs() << "}" << std::endl;
+    }
     ++state.heartbeatsWritten;
     state.lastHeartbeatAtUnixMs = std::max(state.lastHeartbeatAtUnixMs, record.writtenAtUnixMs);
     state.storeClient = store.stats().json();
     if (number > heartbeatsSettled) { heartbeatsSettled = number; state.leaseConnected = true; }
+    expireIfDue();
+    noteLease();
+    if (leaseCallback && epoch) leaseCallback(epoch, false);
   }
 
   // A member's suspects object, handed to the callback (Suspects adopts what it holds) once it reads; its ETag is
@@ -771,6 +817,12 @@ private:
       // After stop(), or once the id is another process's, nothing is written; the promise stays pending (it is joined
       // with the Server's other loops).
       if (stopping || state.identityTaken) co_await kj::Promise<void>(kj::NEVER_DONE);
+      // Woken late (a stalled loop): the heartbeat goes out for the latest slot that has come, not for one whose own
+      // interval is already over.
+      while (next + interval <= timer.now()) next += interval;
+      // By the lease clock before this slot goes out: an epoch already past its lease (and past the window its last
+      // slot within the TTL had) sends no heartbeat that could look like a renewal, it registers a new one.
+      expireIfDue();
       if (!state.selfExpired) {
         tasks.add(beat(next));
       } else if (!state.draining) {
@@ -830,15 +882,30 @@ private:
     }
   }
 
-  // The epoch's own deadline, by this node's monotonic clock: TTL after the last heartbeat the store took was sent --
-  // unless a heartbeat that went out, by the cadence, within that TTL is still in flight: its outcome decides then, and
-  // its failure expires the epoch at once (writeHeartbeat()). With a TTL of three intervals, the third heartbeat after
-  // two failed ones goes out at the deadline itself.
+  // The epoch's own deadline, judged by the lease clock (LeaseTracker): TTL after the last heartbeat that renewed it was
+  // sent -- unless a heartbeat that went out, by the cadence, within that TTL is still in flight before its own end: its
+  // outcome decides then, and its failure expires the epoch at once (writeHeartbeat()). With a TTL of three intervals,
+  // the third heartbeat after two failed ones goes out at the deadline itself. Serving without ever having held the
+  // epoch (its first success came too late) expires it as well: a new one is registered.
   void expireIfDue() {
     if (!serving || stopping || state.identityTaken || state.selfExpired || !epoch) return;
-    const auto ttl = config.ttlSeconds * kj::SECONDS;
-    if (timer.now() - lastHeartbeatOk <= ttl) return;
-    if (!dueInFlight.empty() && *dueInFlight.begin() <= lastHeartbeatOkDue + ttl) return;
+    const auto judgment = lease.judge(epoch, leaseClockMs());
+    if (judgment.verdict == LeaseTracker::Verdict::HELD || judgment.verdict == LeaseTracker::Verdict::WAIT) return;
+    lease.fence(epoch, judgment.reason);
+    markExpired();
+    if (leaseCallback) leaseCallback(epoch, true);
+  }
+
+  void noteLease() {
+    state.leaseFenceReason = lease.fenced(epoch) && epoch ? lease.fenceReason() : "";
+    state.leaseFences = lease.fences;
+    state.lateHeartbeats = lease.lateSuccesses;
+  }
+
+  // The current epoch's lease is fenced: marked once (the others drop this node once its heartbeat is TTL + grace old).
+  void markExpired() {
+    noteLease();
+    if (state.selfExpired || state.identityTaken || !epoch) return;
     state.selfExpired = true;
     ++state.selfExpiries;
     state.selfExpiredAtUnixMs = nowUnixMs();
@@ -848,8 +915,8 @@ private:
     // are served.
     std::cout << "[membership] lease expired node=" << serverId << " old-epoch=" << epoch << std::endl;
     std::cout << "[membership] {\"event\":\"self-expired\",\"nodeId\":" << quote(serverId) << ",\"epoch\":\"" << epoch
-              << "\",\"lastHeartbeatAtUnixMs\":" << state.lastHeartbeatAtUnixMs << ",\"observedAtUnixMs\":" << nowUnixMs()
-              << "}" << std::endl;
+              << "\",\"lastHeartbeatAtUnixMs\":" << state.lastHeartbeatAtUnixMs << ",\"reason\":" << quote(state.leaseFenceReason)
+              << ",\"observedAtUnixMs\":" << nowUnixMs() << "}" << std::endl;
   }
 
   // Whether the store's create-if-absent holds under concurrency (4 writers, 5 rounds, under members/<id>/probe/):
@@ -878,6 +945,87 @@ private:
 };
 
 }  // namespace
+
+// Slots compared on the cadence are equal by construction (cadenceSlot); this only absorbs floating-point rounding.
+constexpr double SLOT_ROUNDING_MS = 0.001;
+
+void LeaseTracker::begin(uint64_t epoch) {
+  current = epoch;
+  currentFenced = held = false;
+  okSentMs = okSlotMs = 0;
+  lastSentSlotMs = -1;
+  reason = "";
+}
+
+uint64_t LeaseTracker::sent(uint64_t epoch, double nowMs, double slotMs) {
+  if (!epoch || epoch != current || currentFenced || !(nowMs >= 0)) return 0;
+  // The slot as computed: the last slot within the TTL counts as sent even if a reading put it a hair after now.
+  lastSentSlotMs = std::max(lastSentSlotMs, slotMs);
+  slotMs = std::min(slotMs, nowMs);
+  pending[++nextId] = {epoch, nowMs, slotMs, slotMs + intervalMs};
+  return nextId;
+}
+
+bool LeaseTracker::settled(uint64_t id, bool ok, double nowMs) {
+  auto found = pending.find(id);
+  if (found == pending.end()) return false;
+  const auto beat = found->second;
+  if (!ok || beat.epoch != current) {
+    pending.erase(found);
+    if (ok) ++lateSuccesses;
+    return false;
+  }
+  // Judged first, with this heartbeat still in flight: if the lease had already lapsed without it (it did not qualify,
+  // or its end passed), the epoch is fenced now and this answer changes nothing.
+  const auto before = judge(current, nowMs);
+  pending.erase(id);
+  if (before.verdict == Verdict::EXPIRED || currentFenced || !(nowMs < beat.endMs)) {
+    ++lateSuccesses;
+    return false;
+  }
+  okSentMs = held ? std::max(okSentMs, beat.sentMs) : beat.sentMs;
+  okSlotMs = held ? std::max(okSlotMs, beat.slotMs) : beat.slotMs;
+  held = true;
+  return true;
+}
+
+void LeaseTracker::fence(uint64_t epoch, const char* why) {
+  if (epoch != current || currentFenced) return;
+  currentFenced = true;
+  reason = why;
+  ++fences;
+}
+
+LeaseTracker::Judgment LeaseTracker::judge(uint64_t epoch, double nowMs) {
+  if (!epoch || epoch != current) return {Verdict::EXPIRED, 0, "the epoch is not this process's current one"};
+  if (currentFenced) return {Verdict::EXPIRED, 0, reason};
+  if (!(nowMs >= 0)) {
+    fence(epoch, "the lease clock could not be read");
+    return {Verdict::EXPIRED, 0, reason};
+  }
+  if (nowMs < lastNowMs) {
+    fence(epoch, "the lease clock went back");
+    return {Verdict::EXPIRED, 0, reason};
+  }
+  lastNowMs = nowMs;
+  if (held && nowMs < okSentMs + ttlMs) return {Verdict::HELD, okSentMs + ttlMs, ""};
+  double until = 0;
+  for (const auto& [id, beat] : pending) {
+    if (beat.epoch != current || !(nowMs < beat.endMs) || (held && beat.slotMs > okSlotMs + ttlMs + SLOT_ROUNDING_MS)) continue;
+    until = until == 0 ? beat.endMs : std::min(until, beat.endMs);
+  }
+  if (held) {
+    // The last slot within the TTL has come (now >= S + T >= its slot) but its heartbeat has not gone out yet: it may
+    // still go out and settle before that slot's end.
+    const auto boundary = okSlotMs + std::floor(ttlMs / intervalMs) * intervalMs;
+    if (lastSentSlotMs < boundary - SLOT_ROUNDING_MS && nowMs < boundary + intervalMs)
+      until = until == 0 ? boundary + intervalMs : std::min(until, boundary + intervalMs);
+  }
+  if (until != 0) return {Verdict::WAIT, until, "a heartbeat in flight decides"};
+  if (!held) return {Verdict::NOT_HELD, 0, "no heartbeat of the epoch has renewed its lease yet"};
+  fence(epoch, "the lease expired");
+  return {Verdict::EXPIRED, 0, reason};
+}
 
 void MembershipView::rememberForRecovery(const Member& member) {
   if (member.id.empty() || member.epoch.empty() || member.address.empty()) return;
@@ -908,7 +1056,9 @@ std::string MembershipView::json() const {
            << ",\"recoveryHistoryIncomplete\":" << (recoveryHistoryIncomplete ? "true" : "false")
            << ",\"addressReads\":" << addressReads << ",\"ignoredKeys\":" << ignoredKeys
            << ",\"selfExpired\":" << (selfExpired ? "true" : "false") << ",\"selfExpiries\":" << selfExpiries
-           << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"recoveries\":" << recoveries
+           << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"leaseClock\":" << quote(leaseClock)
+           << ",\"leaseFenceReason\":" << quote(leaseFenceReason) << ",\"leaseFences\":" << leaseFences
+           << ",\"lateHeartbeats\":" << lateHeartbeats << ",\"recoveries\":" << recoveries
            << ",\"recoveredUntilUnixMs\":" << recoveredUntilUnixMs << ",\"keptMembers\":" << keptMembers
            << ",\"clockSkewMs\":" << clockSkewMs << ",\"clockSkewMinMs\":" << clockSkewMinMs << ",\"clockSkewMaxMs\":" << clockSkewMaxMs
            << ",\"clockSkewToleranceMs\":" << clockSkewToleranceMs << ",\"clockCheckedAtUnixMs\":" << clockCheckedAtUnixMs

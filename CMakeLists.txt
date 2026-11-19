@@ -184,6 +184,10 @@ add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-t
 add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)
 add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
 add_test(NAME durable-segment-cache COMMAND coworkerd-durable-channel-test segment-cache)
+add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
+foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
+  add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
+endforeach()
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight
     cpu-culprit-current-behavior memory-culprit rejected-manifest)
@@ -194,6 +198,7 @@ target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
 add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
+add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
   DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-config-test
