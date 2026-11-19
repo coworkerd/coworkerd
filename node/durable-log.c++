@@ -78,6 +78,23 @@ bool syncFile(int fd) {
 // A complete predecessor file can prove absence. A partial OS read ending on
 // a record boundary must not be mistaken for a complete log. Startup is the
 // only writer here, so the descriptor must name a stable regular file.
+// Yield only while the initial startup gate is closed to all listeners (see
+// main). A retry after serving started keeps its original synchronous slices.
+class StartupSlice {
+public:
+  explicit StartupSlice(bool enabled): enabled(enabled) {}
+  bool elapsed() {
+    if (!enabled) return false;
+    if (++items < 64 && monotonicTimeMs() < deadline) return false;
+    return true;
+  }
+  void reset() { items = 0; deadline = monotonicTimeMs() + 0.75; }
+private:
+  bool enabled;
+  unsigned items = 0;
+  double deadline = monotonicTimeMs() + 0.75;
+};
+
 std::optional<std::string> readLocalHistory(const std::filesystem::path& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) return std::nullopt;
@@ -95,6 +112,32 @@ std::optional<std::string> readLocalHistory(const std::filesystem::path& path) {
   if (::fstat(fd, &after) != 0 || after.st_size != before.st_size) return std::nullopt;
   return bytes;
 }
+// The same snapshot checks as readLocalHistory, without one large zero-fill
+// followed by the read. Checkpoints are between reads; a single syscall still
+// runs to completion, and a prefix from a changed file is never accepted.
+kj::Promise<std::optional<std::string>> readStartupHistory(const std::filesystem::path& path,
+    kj::Timer& timer, bool slice) {
+  if (!slice) co_return readLocalHistory(path);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0) co_return std::nullopt;
+  const auto close = kj::defer([fd]() { ::close(fd); });
+  struct stat before, after;
+  if (::fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_size < 0) co_return std::nullopt;
+  std::string bytes;
+  bytes.reserve(size_t(before.st_size));
+  auto chunk = kj::heapArray<char>(std::min<size_t>(size_t(before.st_size), 256u << 10));
+  StartupSlice budget(true);
+  while (bytes.size() < size_t(before.st_size)) {
+    const auto n = ::read(fd, chunk.begin(), std::min(chunk.size(), size_t(before.st_size) - bytes.size()));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) co_return std::nullopt;
+    bytes.append(chunk.begin(), size_t(n));
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
+  }
+  if (::fstat(fd, &after) != 0 || after.st_size != before.st_size) co_return std::nullopt;
+  co_return bytes;
+}
+
 uint64_t peakResidentBytes() {
   struct rusage usage;
   if (::getrusage(RUSAGE_SELF, &usage) != 0) return 0;
@@ -427,6 +470,29 @@ std::vector<std::string> splitRecords(std::string_view bytes, std::string* error
   if (at != bytes.size() && error != nullptr) *error = "trailing bytes";
   return out;
 }
+
+namespace {
+// Read the same framed prefix as splitRecords. The backing startup snapshot
+// stays alive, so a second copy of each payload is unnecessary.
+kj::Promise<std::vector<std::string_view>> startupFrames(std::string_view bytes, std::string& error,
+    kj::Timer& timer, bool slice) {
+  std::vector<std::string_view> out;
+  Reader reader{bytes};
+  StartupSlice budget(slice);
+  while (bytes.size() - reader.at >= 4) {
+    const size_t length = reader.u32();
+    if (!reader.need(length)) {
+      error = "a record is cut short";
+      co_return out;
+    }
+    out.emplace_back(bytes.substr(reader.at, length));
+    reader.at += length;
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
+  }
+  if (reader.at != bytes.size()) error = "trailing bytes";
+  co_return out;
+}
+}  // namespace
 
 std::string encodeSegment(const SegmentHeader& header, const std::vector<std::string>& records) {
   std::ostringstream index;
@@ -875,10 +941,12 @@ void DurableLog::log(const std::string& event, const std::string& fields) const 
             << nodeEpoch << "\"" << (fields.empty() ? "" : "," + fields) << "}" << std::endl;
 }
 
-std::vector<std::filesystem::path> DurableLog::objectDirectories(std::error_code& code) const {
+kj::Promise<std::vector<std::filesystem::path>> DurableLog::objectDirectories(std::error_code& code, bool slice) {
+  StartupSlice budget(slice);
   std::vector<std::filesystem::path> directories;
   for (std::filesystem::directory_iterator it(settings.stackDirectory / "do", code), end;
       !code && it != end; it.increment(code)) {
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
     const auto status = it->symlink_status(code);
     if (code) break;
     if (std::filesystem::is_directory(status) &&
@@ -886,7 +954,7 @@ std::vector<std::filesystem::path> DurableLog::objectDirectories(std::error_code
       directories.push_back(it->path());
   }
   std::sort(directories.begin(), directories.end());
-  return directories;
+  co_return directories;
 }
 
 void DurableLog::locate(Object& object, const std::string& namespaceId, const std::string& objectId,
@@ -1138,29 +1206,31 @@ bool DurableLog::markCrossedBoot(uint64_t epoch) {
   return true;
 }
 
-void DurableLog::readRecovery() {
+kj::Promise<void> DurableLog::readRecovery(bool slice) {
+  StartupSlice budget(slice);
   recoveryStates.clear();recoveryEpochs.clear();recoveryReadIncomplete = false;
   std::error_code code;
   std::vector<std::filesystem::path> files;
   for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code))
     if (entry.path().extension() == ".recovery") files.push_back(entry.path());
-  if (code) { recoveryReadIncomplete = true;failRecovery("the recovery directory could not be listed");return; }
+  if (code) { recoveryReadIncomplete = true;failRecovery("the recovery directory could not be listed");co_return; }
   std::sort(files.begin(), files.end());
   for (const auto& file : files) {
     const auto epoch = decimal(file.stem().string());
     auto& info = recoveryEpochs[epoch];
     info.present = true;
-    auto fileBytes = readLocalHistory(file);
+    auto fileBytes = co_await readStartupHistory(file, timer, slice);
     if (!fileBytes) {
       recoveryReadIncomplete = true;
       if (epoch == nodeEpoch) failRecovery("the active recovery sidecar could not be read");
       continue;
     }
     const auto& bytes = *fileBytes;
-    std::string error;const auto pieces = splitRecords(bytes, &error);
+    std::string error;const auto pieces = co_await startupFrames(bytes, error, timer, slice);
     info.complete = error.empty();
     bool header = false;
-    for (const auto& piece : pieces) {
+    for (const auto piece : pieces) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       if (piece.size() < 8) { info.complete = false; break; }
       Reader checksum{std::string_view(piece).substr(piece.size() - 4)};
       const auto body = std::string_view(piece).substr(0, piece.size() - 4);
@@ -1204,6 +1274,7 @@ void DurableLog::readRecovery() {
 kj::Promise<void> DurableLog::start() {
   if (!enabled()) co_return;
   if (startupReady || startupInitializing) co_return;
+  const bool slice = !startupAttempted;
   startupAttempted = true;startupInitializing = true;
   const auto initializing = kj::defer([this]() { startupInitializing = false; });
   std::error_code code;
@@ -1223,7 +1294,7 @@ kj::Promise<void> DurableLog::start() {
   std::filesystem::create_directories(settings.stackDirectory / "do", code);
   KJ_REQUIRE(!code, "the Durable Object cache directory could not be created");
   const auto readingStarted = monotonicTimeMs();
-  co_await readOwnLog();
+  co_await readOwnLog(slice);
   startupLogReadMs = monotonicTimeMs() - readingStarted;startupLogPeakRssBytes = peakResidentBytes();
   if (!diskTrusted) {
     // The machine restarted and nothing says it was clean: with synchronous=OFF the files may hold pages the kernel
@@ -1234,11 +1305,13 @@ kj::Promise<void> DurableLog::start() {
       info.complete = false;
     }
     uint64_t removed = 0;
-    const auto directories = objectDirectories(code);
+    const auto directories = co_await objectDirectories(code, slice);
+    StartupSlice cleanup(slice);
     for (const auto& directory : directories) {
       if (code) break;
       for (std::filesystem::directory_iterator entry(directory, code), end;
           !code && entry != end; entry.increment(code)) {
+        if (cleanup.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); cleanup.reset(); }
         std::filesystem::remove_all(entry->path(), code);
         if (code) break;
         ++removed;
@@ -1254,10 +1327,10 @@ kj::Promise<void> DurableLog::start() {
     filesDropped += removed;
     log("cache-dropped", "\"reason\":" + quote(reason) + ",\"entries\":" + std::to_string(removed));
   } else {
-    readPositions();
+    co_await readPositions(slice);
   }
   if (recoveryWriteFailed) co_return;
-  co_await classifyEarlier();
+  co_await classifyEarlier(slice);
   startupPeakRssBytes = peakResidentBytes();
   if (recoveryWriteFailed) co_return;
   if (!diskTrusted) {
@@ -1290,9 +1363,10 @@ kj::Promise<void> DurableLog::start() {
 // Reads the log files this node left and retains the possible writes after the last
 // segment marker. Cache admission runs before prepareOpen() may truncate a WAL:
 // unlogged frames may already have reached the database through a checkpoint.
-kj::Promise<void> DurableLog::readOwnLog() {
+kj::Promise<void> DurableLog::readOwnLog(bool slice) {
   predecessorLogs.clear();
-  readRecovery();
+  co_await readRecovery(slice);
+  StartupSlice budget(slice);
   std::error_code code;
   if (!std::filesystem::exists(logDirectory(), code)) {
     if (code) failRecovery("the append-log directory could not be inspected");
@@ -1300,11 +1374,13 @@ kj::Promise<void> DurableLog::readOwnLog() {
   }
   std::vector<std::filesystem::path> files;
   for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code)) {
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
     if (entry.path().extension() == ".log") files.push_back(entry.path());
     if (entry.path().extension() != ".closed") continue;
     const auto summaryEpoch = decimal(entry.path().stem().string());
     try {
-      auto fileBytes = readLocalHistory(entry.path());KJ_REQUIRE(fileBytes.has_value(), "unreadable closed summary");
+      auto fileBytes = co_await readStartupHistory(entry.path(), timer, slice);
+      KJ_REQUIRE(fileBytes.has_value(), "unreadable closed summary");
       const auto& bytes = *fileBytes;capnp::MallocMessageBuilder message;
       auto value = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().decodeRaw(kj::arrayPtr(bytes.data(), bytes.size()), value);
@@ -1358,7 +1434,7 @@ kj::Promise<void> DurableLog::readOwnLog() {
   std::string fileNames = "[";
   for (const auto& file : files) {
     const auto epoch = decimal(file.stem().string());
-    auto fileBytes = readLocalHistory(file);
+    auto fileBytes = co_await readStartupHistory(file, timer, slice);
     if (!fileBytes) {
       recoveryReadIncomplete = true;
       predecessorLogs[epoch].complete = false;
@@ -1371,10 +1447,11 @@ kj::Promise<void> DurableLog::readOwnLog() {
     uint64_t sealedTo = 0;
     std::map<uint64_t, LogRecord> unsealed;
     std::string splitError;
-    const auto pieces = splitRecords(bytes, &splitError);
+    const auto pieces = co_await startupFrames(bytes, splitError, timer, slice);
     bool complete = splitError.empty();
     if (!complete) ++broken;
-    for (const auto& encoded : pieces) {
+    for (const auto encoded : pieces) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       std::string error;
       auto record = decodeLogRecord(encoded, &error);
       if (!record || record->nodeEpoch != epoch) {
@@ -1389,7 +1466,6 @@ kj::Promise<void> DurableLog::readOwnLog() {
         sealedTo = std::max(sealedTo, record->nodeSeq);
         continue;
       }
-      unsealed[record->nodeSeq] = *record;
       metadata.objects.insert(hostNameOf(*record));
       metadata.objectEpochs[hostNameOf(*record)] = std::max(metadata.objectEpochs[hostNameOf(*record)], record->shardEpoch);
       metadata.shards.emplace(record->objectName.substr(0, record->objectName.find('/')), record->shard);
@@ -1417,8 +1493,13 @@ kj::Promise<void> DurableLog::readOwnLog() {
         position.generation = 0;
         position.lastFrame = 0;
       }
+      const auto sequence = record->nodeSeq;
+      unsealed[sequence] = std::move(*record);
     }
-    std::erase_if(unsealed, [&](const auto& entry) { return entry.first <= sealedTo; });
+    while (!unsealed.empty() && unsealed.begin()->first <= sealedTo) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
+      unsealed.erase(unsealed.begin());
+    }
     auto& info = predecessorLogs[epoch];
     auto& recovery = recoveryEpochs[epoch];
     recovery.crossedBoot = recovery.crossedBoot || std::filesystem::exists(logDirectory() / (wide(epoch) + ".crossed"), code);
@@ -1428,30 +1509,38 @@ kj::Promise<void> DurableLog::readOwnLog() {
     if (epoch == nodeEpoch && !complete) failRecovery("the active append log has an incomplete prefix");
     info.sealedTo = sealedTo;
     for (const auto& [sequence, record] : unsealed) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       info.startupUnsealed.emplace(record.objectName, record.shardEpoch);
       ++info.unpublishedShards[{record.objectName.substr(0, record.objectName.find('/')), record.shard}];
     }
-    std::erase_if(unsealed, [&](const auto& entry) {
-      const auto& record = entry.second;
+    for (auto entry = unsealed.begin(); entry != unsealed.end();) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
+      const auto& record = entry->second;
       auto state = recoveryStates.find(hostNameOf(record));
-      if (state == recoveryStates.end() || !state->second.exclusions.contains({record.shardEpoch, record.nodeSeq}))
-        return false;
-      earlierExcluded[epoch][entry.first] = record;
-      return true;
-    });
+      if (state == recoveryStates.end() || !state->second.exclusions.contains({record.shardEpoch, record.nodeSeq})) {
+        ++entry;
+      } else {
+        earlierExcluded[epoch][entry->first] = std::move(entry->second);
+        entry = unsealed.erase(entry);
+      }
+    }
     kept += unsealed.size();
     if (!unsealed.empty()) {
       restoredEpochs.insert(epoch);
       if (auto prior = earlier.find(epoch); prior != earlier.end()) {
         for (const auto& [sequence, record] : prior->second) unindexEarlierRecord({epoch, sequence}, record);
       }
-      for (const auto& [sequence, record] : unsealed) indexEarlierRecord({epoch, sequence}, record);
+      for (const auto& [sequence, record] : unsealed) {
+        if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
+        indexEarlierRecord({epoch, sequence}, record);
+      }
       earlier[epoch] = std::move(unsealed);
     }
   }
   // Keep ownership identity for classifying and resealing predecessor records.
   // Local database images are discarded at startup and rebuilt on first open.
   for (auto& [key, position] : positions) {
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
     const auto name = position.objectName + "/" + std::to_string(position.dataEpoch);
     auto reference = parseDurableHostName(name);
     if (!reference) continue;
@@ -1475,7 +1564,8 @@ kj::Promise<void> DurableLog::readOwnLog() {
   co_return;
 }
 
-kj::Promise<void> DurableLog::classifyEarlier() {
+kj::Promise<void> DurableLog::classifyEarlier(bool slice) {
+  StartupSlice budget(slice);
   const auto started = monotonicTimeMs();
   if (!store || earlier.empty()) co_return;
   using Position = std::pair<uint64_t, uint64_t>;
@@ -1486,6 +1576,7 @@ kj::Promise<void> DurableLog::classifyEarlier() {
   std::map<std::string, std::vector<Candidate>> groups;
   std::set<std::tuple<std::string, uint64_t, uint64_t>> targets;
   for (const auto& [epoch, pending] : earlier) for (const auto& [sequence, record] : pending) {
+    if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
     const auto bytes = encodeLogRecord(record);
     groups[record.objectName].push_back({hostNameOf(record), sha256Hex(bytes), epoch, sequence, record.shardEpoch, bytes.size(), record.facetId});
     targets.emplace(record.objectName, record.shardEpoch, record.nodeSeq);
@@ -4726,6 +4817,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         ask.ownerNodeId = source.epoch.nodeId;
         ask.ownerNodeEpoch = source.epoch.nodeEpoch;
         ask.afterSeq = probe.after;
+        ask.objectId = object.objectId;
         DurableTailAnswer answer;
         if (probe.target.nodeId == settings.nodeId) {
           std::string localRefusal;
@@ -6113,14 +6205,16 @@ void DurableLog::channelEnded(Channel& channel, const std::string& reason) {
   }
 }
 
-void DurableLog::readPositions() {
+kj::Promise<void> DurableLog::readPositions(bool slice) {
   std::error_code code;
-  const auto directories = objectDirectories(code);
+  const auto directories = co_await objectDirectories(code, slice);
+  StartupSlice budget(slice);
   uint64_t restored = 0, removed = 0;
   for (const auto& directory : directories) {
     if (code) break;
     for (std::filesystem::directory_iterator it(directory, code), end;
         !code && it != end; it.increment(code)) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       if (it->path().extension() != ".position") continue;
       if (!std::filesystem::is_regular_file(it->symlink_status(code))) continue;
       try {
@@ -6158,6 +6252,7 @@ void DurableLog::readPositions() {
     if (code) break;
     for (std::filesystem::directory_iterator it(directory, code), end;
         !code && it != end; it.increment(code)) {
+      if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       if (it->path().filename().string().ends_with(".position")) continue;
       std::error_code removal;
       std::filesystem::remove_all(it->path(), removal);
@@ -6497,6 +6592,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     if (added) {
       std::string().swap(record->frameBytes);
       std::string().swap(record->header);
+      buffer.byObject[record->objectName].insert(sequence);
       buffer.positions.emplace(sequence, std::move(*record));
     }
     buffer.acceptedSeq = std::max(buffer.acceptedSeq, sequence);
@@ -6504,6 +6600,16 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
   buffer.lastAppendMs = monotonicTimeMs();
   result.accepted = buffer.acceptedSeq;
   return result;
+}
+
+void DurableLog::PeerBuffer::forgetPosition(uint64_t sequence) {
+  auto position = positions.find(sequence);
+  if (position == positions.end()) return;
+  auto indexed = byObject.find(position->second.objectName);
+  KJ_DASSERT(indexed != byObject.end() && indexed->second.contains(sequence));
+  indexed->second.erase(sequence);
+  if (indexed->second.empty()) byObject.erase(indexed);
+  positions.erase(position);
 }
 
 void DurableLog::trimIncoming(uint64_t streamId, uint64_t upTo) {
@@ -6514,9 +6620,9 @@ void DurableLog::trimIncoming(uint64_t streamId, uint64_t upTo) {
     if (entry->first > upTo) break;
     incomingBytes -= std::min<uint64_t>(incomingBytes, entry->second.size());
     buffer.bytes -= std::min<uint64_t>(buffer.bytes, entry->second.size());
+    buffer.forgetPosition(entry->first);
     entry = buffer.held.erase(entry);
   }
-  buffer.positions.erase(buffer.positions.begin(), buffer.positions.upper_bound(upTo));
   buffer.droppedTo = std::max(buffer.droppedTo, upTo);
   buffer.isolated.erase(buffer.isolated.begin(), buffer.isolated.upper_bound(buffer.droppedTo));
 }
@@ -6527,7 +6633,7 @@ void DurableLog::dropIncoming(uint64_t streamId, const std::vector<uint64_t>& se
   auto& buffer = found->second;
   for (auto sequence : sequences) {
     buffer.isolated.insert(sequence);
-    buffer.positions.erase(sequence);
+    buffer.forgetPosition(sequence);
     auto entry = buffer.held.find(sequence);
     if (entry == buffer.held.end()) continue;
     incomingBytes -= std::min<uint64_t>(incomingBytes, entry->second.size());
@@ -6626,32 +6732,94 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
     auto [entry, added] = ordered.emplace(position, &encoded);
     if (!added && *entry->second != encoded) answer.refusal = "conflicting bytes for one tail record";
   };
+  const auto wanted = ask.objectId.empty() ? std::string() : ask.namespaceId + "/" + ask.objectId;
+  auto sourceMatches = [&](const PeerBuffer& buffer) {
+    return (ask.ownerNodeId.empty() || buffer.nodeId == ask.ownerNodeId) &&
+        (!ask.ownerNodeEpoch || buffer.nodeEpoch == ask.ownerNodeEpoch);
+  };
+  auto earlierMatches = [&](uint64_t epoch) {
+    return (!ask.ownerNodeEpoch || ask.ownerNodeEpoch == epoch) && !restoredEpochs.contains(epoch) &&
+        membership.heldEpochs.contains(std::to_string(epoch));
+  };
+  const bool own = ask.ownerNodeId.empty() || ask.ownerNodeId == settings.nodeId;
+  const bool current = own && (!ask.ownerNodeEpoch || ask.ownerNodeEpoch == nodeEpoch);
+  auto takePeer = [&](const PeerBuffer& buffer, uint64_t sequence, const std::string& bytes) {
+    if (buffer.isolated.contains(sequence)) return;
+    auto metadata = buffer.positions.find(sequence);
+    take(bytes, metadata == buffer.positions.end() ? nullptr : &metadata->second);
+  };
+  auto takeCurrent = [&](uint64_t sequence, const std::string& bytes) {
+    if (!confirmed.contains(sequence) || isolated.contains(sequence)) return;
+    auto metadata = parsed.find(sequence);
+    take(bytes, metadata == parsed.end() ? nullptr : &metadata->second);
+  };
+  auto takeEarlier = [&](const LogRecord& record) {
+    if (!matches(record)) return;
+    temporary.push_back(encodeLogRecord(record));
+    take(temporary.back(), &record);
+  };
   for (const auto& [streamId, buffer] : incoming) {
-    if (!ask.ownerNodeId.empty() && buffer.nodeId != ask.ownerNodeId) continue;
-    if (ask.ownerNodeEpoch && buffer.nodeEpoch != ask.ownerNodeEpoch) continue;
+    if (!sourceMatches(buffer)) continue;
+    // The drop watermark belongs to the source, even if it has no record of this object.
     answer.droppedTo = std::max(answer.droppedTo, buffer.droppedTo);
-    for (auto it = buffer.held.upper_bound(ask.afterSeq); it != buffer.held.end(); ++it) {
-      if (buffer.isolated.contains(it->first)) continue;
-      auto metadata = buffer.positions.find(it->first);
-      take(it->second, metadata == buffer.positions.end() ? nullptr : &metadata->second);
+    if (wanted.empty()) {
+      for (auto it = buffer.held.upper_bound(ask.afterSeq); it != buffer.held.end(); ++it)
+        takePeer(buffer, it->first, it->second);
+    } else if (auto index = buffer.byObject.find(wanted); index != buffer.byObject.end()) {
+      for (auto seq = index->second.upper_bound(ask.afterSeq); seq != index->second.end(); ++seq)
+        takePeer(buffer, *seq, buffer.held.at(*seq));
     }
   }
-  if (ask.ownerNodeId.empty() || ask.ownerNodeId == settings.nodeId) {
-    if (!ask.ownerNodeEpoch || ask.ownerNodeEpoch == nodeEpoch) {
-      for (auto it = records.upper_bound(ask.afterSeq); it != records.end(); ++it) {
-        if (!confirmed.contains(it->first) || isolated.contains(it->first)) continue;
-        auto metadata = parsed.find(it->first);
-        take(it->second, metadata == parsed.end() ? nullptr : &metadata->second);
+  if (current) {
+    if (wanted.empty()) {
+      for (auto it = records.upper_bound(ask.afterSeq); it != records.end(); ++it)
+        takeCurrent(it->first, it->second);
+    } else if (auto index = unsealedByObject.find(wanted); index != unsealedByObject.end()) {
+      for (auto seq = index->second.upper_bound(ask.afterSeq); seq != index->second.end(); ++seq)
+        takeCurrent(*seq, records.at(*seq));
+    }
+  }
+  if (own) {
+    if (wanted.empty()) {
+      for (const auto& [epoch, held] : earlier) {
+        if (!earlierMatches(epoch)) continue;
+        for (auto it = held.upper_bound(ask.afterSeq); it != held.end(); ++it) takeEarlier(it->second);
+      }
+    } else if (auto index = earlierByObject.find(wanted); index != earlierByObject.end()) {
+      const auto& positions = index->second;
+      auto position = ask.ownerNodeEpoch ? positions.upper_bound({ask.ownerNodeEpoch, ask.afterSeq}) : positions.begin();
+      for (; position != positions.end(); ++position) {
+        const auto [epoch, sequence] = *position;
+        if (ask.ownerNodeEpoch && epoch != ask.ownerNodeEpoch) break;
+        if (sequence > ask.afterSeq && earlierMatches(epoch)) takeEarlier(earlier.at(epoch).at(sequence));
       }
     }
-    for (const auto& [epoch, held] : earlier) {
-      if ((ask.ownerNodeEpoch && ask.ownerNodeEpoch != epoch) || restoredEpochs.contains(epoch)) continue;
-      if (!membership.heldEpochs.contains(std::to_string(epoch))) continue;
-      for (auto it = held.upper_bound(ask.afterSeq); it != held.end(); ++it) {
-        if (!matches(it->second)) continue;
-        temporary.push_back(encodeLogRecord(it->second));
-        take(temporary.back(), &it->second);
+  }
+  // Keep the old duplicate-identity check at the positions we give out. A second
+  // stream can claim the same position under a different object name; look up
+  // that position without scanning or adding the other object's tail to the page.
+  if (!wanted.empty() && answer.refusal.empty()) {
+    for (const auto& [position, bytes] : ordered) {
+      const auto [epoch, sequence, shardEpoch] = position;
+      auto conflict = [&](const LogRecord& record) {
+        return record.objectName != wanted && record.nodeEpoch == epoch && record.shardEpoch == shardEpoch && matches(record);
+      };
+      for (const auto& [streamId, buffer] : incoming) {
+        if (!sourceMatches(buffer) || buffer.nodeEpoch != epoch || buffer.isolated.contains(sequence)) continue;
+        auto at = buffer.positions.find(sequence);
+        if (at != buffer.positions.end() && conflict(at->second))
+          answer.refusal = "conflicting bytes for one tail record";
       }
+      if (current && epoch == nodeEpoch && confirmed.contains(sequence) && !isolated.contains(sequence)) {
+        auto at = parsed.find(sequence);
+        if (at != parsed.end() && conflict(at->second)) answer.refusal = "conflicting bytes for one tail record";
+      } else if (own && earlierMatches(epoch)) {
+        if (auto held = earlier.find(epoch); held != earlier.end()) {
+          auto at = held->second.find(sequence);
+          if (at != held->second.end() && conflict(at->second)) answer.refusal = "conflicting bytes for one tail record";
+        }
+      }
+      if (!answer.refusal.empty()) break;
     }
   }
   if (!answer.refusal.empty()) return answer;

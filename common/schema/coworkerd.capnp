@@ -118,6 +118,8 @@ struct DurableTailRequest {
   ownerNodeEpoch @4 :UInt64;
   afterSeq @5 :UInt64;
   destinationEpoch @6 :Text;
+  # Empty for old requesters, which still get a shard page.
+  objectId @7 :Text;
 }
 
 struct DurableTailResult {
