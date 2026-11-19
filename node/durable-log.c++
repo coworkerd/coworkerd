@@ -2522,6 +2522,8 @@ void DurableLog::retirePeer(PeerStream& peer) {
   peer.queue.clear();
   peer.queuedBytes = peer.inFlightBytes = 0;
   peer.firstSeq = peer.ackedSeq = peer.sentSeq = 0;
+  peer.refusedSeqs.clear();
+  peer.fullRetries.clear();
 }
 
 // One scheduler per peer, independent of business writes. A confirmed but unsealed tail also needs replication
@@ -2563,6 +2565,8 @@ void DurableLog::pumpPeer(PeerStream& peer) {
     auto item = std::move(peer.queue.front());
     peer.queue.pop_front();
     const auto size = item.bytes.size();
+    const auto sequence = item.sequence;
+    const bool partial = item.partial;
     peer.queuedBytes -= std::min(peer.queuedBytes, uint64_t(size));
     if (isolated.contains(item.sequence)) continue;
     peer.inFlightBytes += size;
@@ -2572,7 +2576,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
     const auto session = peer.session;
     auto& sink = KJ_ASSERT_NONNULL(peer.sink);
     tasks.add(sink->value->append(std::move(item.bytes), item.partial)
-                  .then([this, nodeId, session, size](PeerSink::Accepted accepted) {
+                  .then([this, nodeId, session, size, sequence, partial](PeerSink::Accepted accepted) {
       auto* current = currentPeer(nodeId, session);
       if (current == nullptr) return;
       current->inFlightBytes -= std::min(current->inFlightBytes, uint64_t(size));
@@ -2581,13 +2585,37 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         ++current->refusals;
         current->lastRefusal = accepted.refusal;
         if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
-        log("peer-refused", "\"peer\":" + quote(nodeId) + ",\"reason\":" + quote(accepted.refusal));
+        // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
+        // peer takes it; a full buffer is tried again on this session after a growing wait.
+        current->refusedSeqs.insert(sequence);
+        if (accepted.refusal.starts_with("full") && inFlight.contains(sequence) && !isolated.contains(sequence)) {
+          auto& retry = current->fullRetries[sequence];
+          if (!retry.pending && retry.attempts < FULL_RETRIES) {
+            retry.pending = true;
+            // Spread out: the records refused together are not all sent again at the same moment.
+            const auto step = uint64_t(FULL_RETRY_FIRST_MS) << retry.attempts++;
+            const auto waitMs = step + randomBelow(step / 2 + 1);
+            tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, nodeId, session, sequence]() {
+              retryRefused(nodeId, session, sequence);
+            }));
+          }
+        }
+        log("peer-refused", "\"peer\":" + quote(nodeId) + ",\"reason\":" + quote(accepted.refusal) +
+            ",\"seq\":\"" + std::to_string(sequence) + "\"");
         pumpPeer(*current);
         return;
       }
       current->lastRefusal.clear();
       current->lastAckMs = monotonicTimeMs();
-      onPeerAck(nodeId, std::min(accepted.sequence, current->sentSeq));
+      // r48: an answer accounts for its own record and those before it -- not for one sent after it whose own answer,
+      // possibly a refusal, has not come back yet (the peer's highest sequence can come from an earlier stream). A
+      // piece that is not a record's last accounts only for the records before it: the record is held once its last
+      // piece is taken.
+      onPeerAck(nodeId, std::min(accepted.sequence, partial ? sequence - 1 : sequence));
+      if (!partial && !current->refusedSeqs.empty() && current->refusedSeqs.erase(sequence)) {
+        current->fullRetries.erase(sequence);
+        checkConfirmations();
+      }
       pumpPeer(*current);
     }).catch_([this, nodeId, session](kj::Exception&& error) {
       auto* current = currentPeer(nodeId, session);
@@ -2598,6 +2626,18 @@ void DurableLog::pumpPeer(PeerStream& peer) {
               "\",\"error\":" + quote(std::string(error.getDescription().cStr())));
     }).attach(sink.addRef()));
   }
+}
+
+// r48: a record the peer refused because its buffer was full, sent again on the same session while it still waits.
+void DurableLog::retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence) {
+  auto* current = currentPeer(nodeId, session);
+  if (current == nullptr) return;
+  if (auto retry = current->fullRetries.find(sequence); retry != current->fullRetries.end()) retry->second.pending = false;
+  const auto record = records.find(sequence);
+  if (!current->refusedSeqs.contains(sequence) || isolated.contains(sequence) || !inFlight.contains(sequence) ||
+      record == records.end()) return;
+  ++fullRetriesSent;
+  sendOne(*current, sequence, record->second);
 }
 
 // The open floor is captured before awaiting the connection. If sealing moves it meanwhile, discard this
@@ -2694,7 +2734,8 @@ void DurableLog::checkConfirmations() {
       if (found == peers.end()) continue;
       if (currentPeer(peer, found->second.session) == nullptr) continue;
       if (found->second.sink != kj::none && !found->second.broken) ++reachable;
-      if (found->second.ackedSeq >= sequence) ++held;
+      if (found->second.ackedSeq >= sequence &&
+          (found->second.refusedSeqs.empty() || !found->second.refusedSeqs.contains(sequence))) ++held;
     }
     // A nonempty selected peer list waits when none is reachable. Only an empty list uses the local disk.
     const auto want = std::min(configured, reachable);
@@ -6640,6 +6681,15 @@ bool DurableLog::ownerFenced(const std::string& namespaceId, uint32_t shard, uin
   return epoch && found != ownerFenceThrough.end() && epoch <= found->second;
 }
 
+uint64_t DurableLog::knownEpoch(const std::string& namespaceId, uint32_t shard) const {
+  uint64_t known = hooks.knownShardEpoch ? hooks.knownShardEpoch(namespaceId, shard) : 0;
+  if (!ownerFenceThrough.empty()) {
+    if (const auto found = ownerFenceThrough.find({namespaceId, shard}); found != ownerFenceThrough.end())
+      known = std::max(known, found->second + 1);
+  }
+  return known;
+}
+
 void DurableLog::fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through,
     const std::string& reason, bool notifyShard) {
   if (!through) return;
@@ -6748,7 +6798,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
       incomingBytes -= std::min<uint64_t>(incomingBytes, buffer.fragment.size());
       buffer.bytes -= std::min<uint64_t>(buffer.bytes, buffer.fragment.size());
       buffer.fragment.clear();
-      result.accepted = buffer.acceptedSeq;
+      result.accepted = buffer.answeredSeq();
       result.refusal = tooLarge ? "a fragmented record exceeds the recoverable RPC limit"
           : "full: this node buffers durableObjects.peerBufferBytes for the owners it is a peer of";
       return result;
@@ -6756,7 +6806,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     buffer.fragment += std::string(bytes);
     buffer.bytes += bytes.size();
     incomingBytes += bytes.size();
-    result.accepted = buffer.acceptedSeq;
+    result.accepted = buffer.answeredSeq();
     return result;
   }
   std::string whole;
@@ -6768,24 +6818,26 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     whole += std::string(bytes);
     bytes = whole;
   }
-  if (incomingBytes + bytes.size() > settings.config.peerBufferBytes) {
+  // r48: a record this node already holds, sent again after a reconnect, is taken again (as a duplicate) rather than
+  // refused for room it does not need.
+  if (incomingBytes + bytes.size() > settings.config.peerBufferBytes && !buffer.holdsFramed(bytes)) {
     ++bufferRefusals;
     ++buffer.refusedRecords;
-    result.accepted = buffer.acceptedSeq;
+    result.accepted = buffer.answeredSeq();
     result.refusal = "full: this node buffers durableObjects.peerBufferBytes for the owners it is a peer of";
     return result;
   }
   std::string error;
   auto records = splitRecords(bytes, &error);
   if (!error.empty()) {
-    result.accepted = buffer.acceptedSeq;
+    result.accepted = buffer.answeredSeq();
     result.refusal = "the records are cut short: " + error;
     return result;
   }
   for (const auto& encoded : records) {
     if (encoded.size() > tailRecordBytes()) {
       ++recordLimitRefusals;
-      result.accepted = buffer.acceptedSeq;
+      result.accepted = buffer.answeredSeq();
       result.refusal = "a record exceeds the recoverable RPC limit";
       return result;
     }
@@ -6793,22 +6845,24 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     auto record = decodeLogRecord(encoded, &reason);
     if (!record) {
       // A record that does not add up is refused here rather than at a rebuild (experiment 25, B.7).
-      result.accepted = buffer.acceptedSeq;
+      result.accepted = buffer.answeredSeq();
       result.refusal = "a record does not add up: " + reason;
       log("record-refused", "\"owner\":" + quote(buffer.nodeId) + ",\"reason\":" + quote(reason));
       return result;
     }
     if (record->nodeEpoch != buffer.nodeEpoch) {
-      result.accepted = buffer.acceptedSeq;
+      result.accepted = buffer.answeredSeq();
       result.refusal = "a record of another epoch of the owner";
       return result;
     }
-    if (record->kind != LogRecordKind::SEAL && hooks.knownShardEpoch) {
-      const auto known = hooks.knownShardEpoch(record->objectName.substr(0, record->objectName.find('/')),
-          record->shard);
+    if (record->kind != LogRecordKind::SEAL) {
+      const auto known = knownEpoch(record->objectName.substr(0, record->objectName.find('/')), record->shard);
       if (known != 0 && record->shardEpoch < known) {
         ++fencedRecords;
-        result.accepted = buffer.acceptedSeq;
+        // r48: the refused record is not held, so no answer of this stream may reach it until the owner drops it.
+        if (record->nodeSeq > buffer.droppedTo && !buffer.isolated.contains(record->nodeSeq))
+          buffer.fencedSeqs.insert(record->nodeSeq);
+        result.accepted = buffer.answeredSeq();
         result.refusal = "fenced: this node knows a newer epoch of the shard";
         log("record-fenced", "\"owner\":" + quote(buffer.nodeId) + ",\"shard\":" + std::to_string(record->shard) +
                 ",\"theirs\":\"" + std::to_string(record->shardEpoch) + "\",\"known\":\"" + std::to_string(known) + "\"");
@@ -6832,8 +6886,20 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     buffer.acceptedSeq = std::max(buffer.acceptedSeq, sequence);
   }
   buffer.lastAppendMs = monotonicTimeMs();
-  result.accepted = buffer.acceptedSeq;
+  result.accepted = buffer.answeredSeq();
   return result;
+}
+
+// Whether framed bytes are exactly one record this buffer already holds (or has dropped): read from the record's
+// encoding (the kind byte, then the sequence, little endian); anything else is not.
+bool DurableLog::PeerBuffer::holdsFramed(std::string_view framed) const {
+  if (framed.size() < 13) return false;
+  uint32_t length = 0;
+  for (int i = 0; i < 4; i++) length |= uint32_t(uint8_t(framed[i])) << (8 * i);
+  if (framed.size() != size_t(length) + 4) return false;
+  uint64_t sequence = 0;
+  for (int i = 0; i < 8; ++i) sequence |= uint64_t(uint8_t(framed[5 + i])) << (8 * i);
+  return held.contains(sequence) || sequence <= droppedTo || isolated.contains(sequence);
 }
 
 void DurableLog::PeerBuffer::forgetPosition(uint64_t sequence) {
@@ -6859,6 +6925,7 @@ void DurableLog::trimIncoming(uint64_t streamId, uint64_t upTo) {
   }
   buffer.droppedTo = std::max(buffer.droppedTo, upTo);
   buffer.isolated.erase(buffer.isolated.begin(), buffer.isolated.upper_bound(buffer.droppedTo));
+  buffer.fencedSeqs.erase(buffer.fencedSeqs.begin(), buffer.fencedSeqs.upper_bound(buffer.droppedTo));
 }
 
 void DurableLog::dropIncoming(uint64_t streamId, const std::vector<uint64_t>& sequences) {
@@ -6867,6 +6934,7 @@ void DurableLog::dropIncoming(uint64_t streamId, const std::vector<uint64_t>& se
   auto& buffer = found->second;
   for (auto sequence : sequences) {
     buffer.isolated.insert(sequence);
+    buffer.fencedSeqs.erase(sequence);
     buffer.forgetPosition(sequence);
     auto entry = buffer.held.find(sequence);
     if (entry == buffer.held.end()) continue;
@@ -6908,14 +6976,91 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
   return tailForPage(ask, remote, TAIL_ANSWER_BYTES);
 }
 
+// r48 (results/r45/DESIGN.md 10.4): a peer answering a newer owner's tail request first raises its floor for the shard,
+// so that an older owner -- one whose clock stood still while its machine was frozen, or an older version without the
+// lease check -- cannot have an append confirmed here after the newer owner has cut its tail. The number in the
+// request is believed only once the object store shows that epoch: an epoch object is created by the node that takes
+// the shard, only if absent, so every owner of a lower epoch has been replaced, and the newest owner, whose epoch is
+// at least this one, is never fenced by it. The answer is computed after the raise: an append taken before it is in
+// the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
+// object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
+// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
+kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
+  if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
+  if (ask.shardEpoch <= knownEpoch(ask.namespaceId, ask.shard)) co_return;
+  const auto now = timer.now();
+  for (auto it = fenceChecks.begin(); it != fenceChecks.end();)
+    it = it->second.settled && now - it->second.at >= int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS ? fenceChecks.erase(it)
+                                                                                                    : std::next(it);
+  const auto key = std::make_tuple(ask.namespaceId, ask.shard, ask.shardEpoch);
+  auto found = fenceChecks.find(key);
+  // A check of this epoch that failed within OWNER_REREAD_MS: answered at once, as before (a background read follows).
+  if (found != fenceChecks.end() && found->second.settled) co_return;
+  if (found == fenceChecks.end()) {
+    ++peerFenceChecks;
+    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, 0).fork();
+    found = fenceChecks.emplace(key, FenceCheck{kj::mv(check), now, false}).first;
+  }
+  co_await found->second.done.addBranch();
+  // Settled: kept for OWNER_REREAD_MS (a failure is not read again meanwhile; a success is past the early return).
+  if (auto settled = fenceChecks.find(key); settled != fenceChecks.end() && !settled->second.settled) {
+    settled->second.settled = true;
+    settled->second.at = timer.now();
+  }
+}
+
+// The read behind raisePeerFence, shared by every request of the same epoch of the shard meanwhile. A success raises
+// the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, and the epoch is read again
+// in the background -- after OWNER_REREAD_MS, doubled each time, at most FENCE_REREADS times, while it is still not
+// known -- so that the floor goes up soon after the store answers again.
+kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread) {
+  std::string failure;
+  try {
+    const auto waitMs = std::max<uint32_t>(1, settings.peerTimeoutMs / 2);
+    auto object = co_await timer.timeoutAfter(waitMs * kj::MILLISECONDS,
+        store->get(shardEpochKey(namespaceId, shard, epoch)));
+    if (object.status == 200) {
+      const auto record = parseShardEpoch(object.bytes);
+      if (record && record->epoch == epoch && record->namespaceId == namespaceId && record->shard == shard) {
+        if (epoch > knownEpoch(namespaceId, shard)) {
+          ++peerFenceRaises;
+          fenceOwner(namespaceId, shard, epoch - 1, "a newer epoch of the shard asked for a tail", true);
+        }
+        if (reread) fenceRereading.erase({namespaceId, shard, epoch});
+        co_return;
+      }
+      failure = "the object at that epoch's key is not that epoch";
+    } else {
+      failure = "the store answered HTTP " + std::to_string(object.status);
+    }
+  } catch (const kj::Exception& error) {
+    failure = error.getDescription().cStr();
+  }
+  ++peerFenceUnverified;
+  log("peer-fence-unverified", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+      ",\"shardEpoch\":\"" + std::to_string(epoch) + "\",\"reread\":" + std::to_string(reread) +
+      ",\"reason\":" + quote(failure));
+  const auto key = std::make_tuple(namespaceId, shard, epoch);
+  if (reread == 0 && !fenceRereading.insert(key).second) co_return;  // a chain of rereads is already under way
+  if (reread >= FENCE_REREADS) {
+    fenceRereading.erase(key);
+    co_return;
+  }
+  const auto waitMs = int64_t(OWNER_REREAD_MS) << reread;
+  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread]() {
+    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1);
+    fenceRereading.erase({namespaceId, shard, epoch});
+    return kj::Promise<void>(kj::READY_NOW);
+  }));
+}
+
 DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote, size_t pageBytes) {
   DurableTailAnswer answer;
   if (!enabled()) {
     answer.refusal = "this node keeps no Durable Object log";
     return answer;
   }
-  if (hooks.knownShardEpoch && ask.shardEpoch &&
-      hooks.knownShardEpoch(ask.namespaceId, ask.shard) > ask.shardEpoch) {
+  if (ask.shardEpoch && knownEpoch(ask.namespaceId, ask.shard) > ask.shardEpoch) {
     answer.refusal = "the requesting shard epoch has been fenced";
     return answer;
   }
@@ -7198,14 +7343,18 @@ std::string DurableLog::json() const {
       << ",\"coldFilesSkippedLive\":" << coldFilesSkippedLive
       << "},\"buffer\":{\"bytes\":\"" << incomingBytes << "\",\"limitBytes\":\"" << settings.config.peerBufferBytes
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
-      << fencedRecords << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
+      << fencedRecords << ",\"peerFenceChecks\":" << peerFenceChecks << ",\"peerFenceRaises\":" << peerFenceRaises
+      << ",\"peerFenceUnverified\":" << peerFenceUnverified << ",\"ownerFences\":" << ownerFenceThrough.size()
+      << ",\"fullRetriesSent\":" << fullRetriesSent
+      << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
   first = true;
   for (const auto& [streamId, buffer] : incoming) {
     if (!first) out << ",";
     first = false;
     out << "{\"nodeId\":" << quote(buffer.nodeId) << ",\"nodeEpoch\":\"" << buffer.nodeEpoch << "\",\"records\":"
         << buffer.held.size() << ",\"bytes\":\"" << buffer.bytes << "\",\"acceptedSeq\":\"" << buffer.acceptedSeq
-        << "\",\"droppedTo\":\"" << buffer.droppedTo << "\"}";
+        << "\",\"answeredSeq\":\"" << buffer.answeredSeq() << "\",\"fencedHeldBack\":" << buffer.fencedSeqs.size()
+        << ",\"droppedTo\":\"" << buffer.droppedTo << "\"}";
   }
   out << "]},\"channels\":[";
   first = true;

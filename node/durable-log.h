@@ -428,6 +428,15 @@ public:
   void closeIncoming(uint64_t streamId);
   // What this node holds of another node's log for one shard.
   DurableTailAnswer tailFor(const DurableTailAsk& ask, bool remote = true);
+  // r48: before a tail is answered, a newer epoch of the shard than this node knows raises the node's floor for the
+  // shard -- only once the object store shows that epoch (an epoch object is created by its owner alone, and only if
+  // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
+  // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
+  kj::Promise<void> raisePeerFence(DurableTailAsk ask);
+  static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
+  // r48: a check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
+  // most this many times, while the epoch is still not known.
+  static constexpr uint32_t FENCE_REREADS = 5;
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
       std::string* refusal = nullptr);
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
@@ -584,6 +593,14 @@ private:
     double openedAtMs = 0, lastAckMs = 0, attemptedAtMs = 0;
     std::deque<Queued> queue;
     uint64_t inFlightBytes = 0, queuedBytes = 0;
+    // r48: the records this session's peer refused, for any reason, and has not taken since. An answer to a later
+    // append carries the peer's highest sequence, which can be above them: a record counts as held by a peer only
+    // when the peer took it -- the answer to its last (or only) piece.
+    std::set<uint64_t> refusedSeqs;
+    // r48: a record refused because the peer's buffer was full is sent again on the same session after a growing
+    // wait (FULL_RETRY_FIRST_MS, doubled, at most FULL_RETRIES times) until it is taken or no longer waits.
+    struct Retry { uint32_t attempts = 0; bool pending = false; };
+    std::map<uint64_t, Retry> fullRetries;
   };
   // What this node buffers for one owner it is a peer of.
   struct PeerBuffer {
@@ -597,6 +614,15 @@ private:
     std::map<std::string, std::set<uint64_t>, std::less<>> byObject;
     void forgetPosition(uint64_t sequence);
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
+    // r48: records refused as fenced that no drop or trim has covered. The sequence answered stays below the lowest of
+    // them, so no later record makes the refused one count as held at an owner that reads the answers cumulatively
+    // (one without r48). Only the fence holds answers back: a full buffer does not, or one refusal would stall every
+    // later record of the stream until the owner gives the refused one up.
+    std::set<uint64_t> fencedSeqs;
+    bool holdsFramed(std::string_view framed) const;
+    uint64_t answeredSeq() const {
+      return fencedSeqs.empty() ? acceptedSeq : std::min(acceptedSeq, *fencedSeqs.begin() - 1);
+    }
   };
 
   void taskFailed(kj::Exception&& error) override;
@@ -695,9 +721,24 @@ private:
   void isolateObjectPending(Object& object, const std::string& reason);
   void markRepair(Object& object, const std::string& reason);
   bool ownerFenced(const std::string& namespaceId, uint32_t shard, uint64_t epoch) const;
+  // The newest epoch of the shard this node knows: the shards' view (hooks.knownShardEpoch) and this log's own fence.
+  uint64_t knownEpoch(const std::string& namespaceId, uint32_t shard) const;
   void fenceOwner(const std::string& namespaceId, uint32_t shard, uint64_t through,
       const std::string& reason, bool notifyShard);
   kj::Promise<void> openPeer(std::string nodeId);
+  void retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence);
+  // r48: one read of a shard epoch's object at a time for each (namespace, shard, epoch); a failure is kept for
+  // OWNER_REREAD_MS (the tail is answered at once meanwhile) and read once more in the background.
+  struct FenceCheck {
+    kj::ForkedPromise<void> done;
+    kj::TimePoint at;
+    bool settled = false;
+  };
+  std::map<std::tuple<std::string, uint32_t, uint64_t>, FenceCheck> fenceChecks;
+  // The epochs with background rereads under way: one chain each, however many requests failed meanwhile.
+  std::set<std::tuple<std::string, uint32_t, uint64_t>> fenceRereading;
+  // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
+  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread);
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {
@@ -1004,6 +1045,7 @@ private:
   uint64_t ownerLogUnavailableRecoveries = 0;
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
+  uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0, fullRetriesSent = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;
