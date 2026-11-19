@@ -696,8 +696,8 @@ struct MembershipConfig {
   endpoint @1 :Text;
   advertisedAddress @2 :Text;
   # objectStore: how old a heartbeat may be before its identity is free again (and, with
-  # livenessGraceMs, before the other members drop it); a node that wrote none for that long by its own monotonic
-  # clock places calls on itself only when no other member takes them, keeps serving the stateless calls addressed to
+  # livenessGraceMs, before the other members drop it); a node that wrote none for that long by its own lease clock
+  # (CLOCK_BOOTTIME on Linux; the monotonic clock elsewhere, for development) places calls on itself only when no other member takes them, keeps serving the stateless calls addressed to
   # any epoch it held, and registers again with a new epoch.
   ttlSeconds @3 :UInt32 = 15;
   requestTimeoutMs @4 :UInt32 = 750;

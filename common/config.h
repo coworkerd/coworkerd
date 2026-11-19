@@ -108,6 +108,10 @@ struct MembershipConfig {
   uint32_t createSettleMs = 1000;
 };
 
+// A node's own lease needs livenessGraceMs > heartbeatIntervalMs + LIVENESS_GRACE_MARGIN_MS with the object store's
+// membership; refused (naming the values) otherwise. The node checks it at startup; the control plane does not.
+void checkNodeLeaseMargin(const MembershipConfig& membership);
+
 // The Workers' logs (ServerConfig.logs). The drainer keeps every tenant line it can attribute in
 // memory, per tenant, within the quota; the sink file keeps every line and rotates
 // by size. A tenant's own quota (its record's logLinesPerSecond and logBufferBytes) replaces the first two.

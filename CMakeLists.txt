@@ -181,7 +181,7 @@ add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
 add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
-foreach(case held expired stale-timer slow-flush wait wait-expired)
+foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
 endforeach()
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache

@@ -8511,6 +8511,7 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   KJ_REQUIRE(!launch.configFile.empty(), "serve requires --config FILE");
   launch.configFile = fs::absolute(launch.configFile);
   auto& c = launch.config = ServerConfig::load(launch.configFile);
+  coworkerd::checkNodeLeaseMargin(c.membership);
   KJ_REQUIRE(c.serverIdGiven, "the configuration needs a nodeId");
   launch.stackDirectory = fs::absolute(c.stackDirectory.empty() ? "/var/lib/coworkerd" : c.stackDirectory).lexically_normal();
   launch.manifestPath = launch.stackDirectory / "workers" / "manifest.json";
@@ -8548,6 +8549,7 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   launch.ignoredSourceAddress = args[4];
   if (args.size() == 6) launch.configFile = args[5];
   launch.config = ServerConfig::load(launch.configFile);
+  coworkerd::checkNodeLeaseMargin(launch.config.membership);
   KJ_REQUIRE(!launch.config.servePathsGiven(),
       "stackDirectory, workerdPath, runtimePath and listenAddress are for `serve`; the positional form takes them as arguments");
   // <stack>/workers/manifest.json -> <stack>.

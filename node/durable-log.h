@@ -680,7 +680,12 @@ private:
   // is read once: shared by every recovery that asks about the same epoch within OWNER_REREAD_MS.
   enum class OwnerHeartbeat : uint8_t { GONE, LIVE, UNKNOWN };
   static constexpr double OWNER_REREAD_MS = 1000;
-  kj::Promise<bool> previousOwnersMayBeCut(std::string objectName, std::vector<std::pair<std::string, uint64_t>> owners);
+  struct CutHold {
+    bool holding = false;
+    double sinceMs = 0;
+  };
+  kj::Promise<bool> previousOwnersMayBeCut(std::string objectName, std::vector<std::pair<std::string, uint64_t>> owners,
+      CutHold& hold);
   kj::Promise<OwnerHeartbeat> readOwnerHeartbeat(std::string nodeId, uint64_t epoch);
   void isolate(const std::string& objectKey, uint64_t fromSeq, const std::string& reason);
   void isolateRecords(const std::vector<uint64_t>& dropped, const std::string& key, const std::string& reason);

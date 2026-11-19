@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
@@ -563,8 +564,13 @@ private:
     const auto sent = timer.now();
     const auto slot = due.orDefault(sent);
     const auto leaseSent = leaseClockMs();
-    const auto late = slot < sent ? double((sent - slot) / kj::MICROSECONDS) / 1000 : 0.;
-    const auto beatId = lease.sent(epoch, leaseSent, leaseSent - late);
+    // On the cadence: as far from the renewing heartbeat's slot as the event loop's cadence puts it (an exact multiple
+    // of the interval), not a fresh reading -- the slot on the TTL is then exactly D + T.
+    bool onCadence = false;
+    KJ_IF_SOME(given, due) { onCadence = given >= lastHeartbeatOkDue; }
+    const auto leaseSlot = onCadence && lease.renewed()
+        ? lease.cadenceSlot(double((slot - lastHeartbeatOkDue) / kj::MICROSECONDS) / 1000) : leaseSent;
+    const auto beatId = lease.sent(epoch, leaseSent, leaseSlot);
     KJ_REQUIRE(beatId != 0, "the epoch's lease is fenced: no heartbeat goes out for it", epoch);
     const auto number = ++heartbeatsSent;
     ++writing;
@@ -810,8 +816,11 @@ private:
       // After stop(), or once the id is another process's, nothing is written; the promise stays pending (it is joined
       // with the Server's other loops).
       if (stopping || state.identityTaken) co_await kj::Promise<void>(kj::NEVER_DONE);
-      // By the lease clock before this slot goes out: an epoch already past its lease sends no heartbeat that could
-      // look like a renewal, it registers a new one.
+      // Woken late (a stalled loop): the heartbeat goes out for the latest slot that has come, not for one whose own
+      // interval is already over.
+      while (next + interval <= timer.now()) next += interval;
+      // By the lease clock before this slot goes out: an epoch already past its lease (and past the window its last
+      // slot within the TTL had) sends no heartbeat that could look like a renewal, it registers a new one.
       expireIfDue();
       if (!state.selfExpired) {
         tasks.add(beat(next));
@@ -936,16 +945,21 @@ private:
 
 }  // namespace
 
+// Slots compared on the cadence are equal by construction (cadenceSlot); this only absorbs floating-point rounding.
+constexpr double SLOT_ROUNDING_MS = 0.001;
+
 void LeaseTracker::begin(uint64_t epoch) {
   current = epoch;
   currentFenced = held = false;
   okSentMs = okSlotMs = 0;
+  lastSentSlotMs = -1;
   reason = "";
 }
 
 uint64_t LeaseTracker::sent(uint64_t epoch, double nowMs, double slotMs) {
   if (!epoch || epoch != current || currentFenced || !(nowMs >= 0)) return 0;
   slotMs = std::min(slotMs, nowMs);
+  lastSentSlotMs = std::max(lastSentSlotMs, slotMs);
   pending[++nextId] = {epoch, nowMs, slotMs, slotMs + intervalMs};
   return nextId;
 }
@@ -995,8 +1009,15 @@ LeaseTracker::Judgment LeaseTracker::judge(uint64_t epoch, double nowMs) {
   if (held && nowMs < okSentMs + ttlMs) return {Verdict::HELD, okSentMs + ttlMs, ""};
   double until = 0;
   for (const auto& [id, beat] : pending) {
-    if (beat.epoch != current || !(nowMs < beat.endMs) || (held && beat.slotMs > okSlotMs + ttlMs)) continue;
+    if (beat.epoch != current || !(nowMs < beat.endMs) || (held && beat.slotMs > okSlotMs + ttlMs + SLOT_ROUNDING_MS)) continue;
     until = until == 0 ? beat.endMs : std::min(until, beat.endMs);
+  }
+  if (held) {
+    // The last slot within the TTL has come (now >= S + T >= its slot) but its heartbeat has not gone out yet: it may
+    // still go out and settle before that slot's end.
+    const auto boundary = okSlotMs + std::floor(ttlMs / intervalMs) * intervalMs;
+    if (lastSentSlotMs < boundary - SLOT_ROUNDING_MS && nowMs < boundary + intervalMs)
+      until = until == 0 ? boundary + intervalMs : std::min(until, boundary + intervalMs);
   }
   if (until != 0) return {Verdict::WAIT, until, "a heartbeat in flight decides"};
   if (!held) return {Verdict::NOT_HELD, 0, "no heartbeat of the epoch has renewed its lease yet"};

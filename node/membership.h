@@ -38,8 +38,10 @@ struct Member {
 // S and D: the send time and the cadence slot of the last heartbeat whose success was handled before its end; T and I:
 // the TTL and the heartbeat interval. The epoch is HELD while now < S + T (equal is not). Past it, a heartbeat of the
 // same epoch still in flight whose slot is at most D + T keeps the answer back (WAIT), until it settles or until its
-// end, min(sent, slot) + I, which nothing moves; without one the epoch is EXPIRED and fenced: it never holds again in
-// this process, whatever answer comes later. A success counts only when it is handled before its heartbeat's end, for
+// end, min(sent, slot) + I, which nothing moves -- and so does the last slot within D + T while it has come but its
+// heartbeat has not gone out yet; without either the epoch is EXPIRED and fenced: it never holds again in this
+// process, whatever answer comes later. A heartbeat's slot after the epoch's first is D plus the cadence's own distance
+// from D's slot (cadenceSlot), so that the slot on the TTL is exactly D + T, whatever the clock readings' jitter. A success counts only when it is handled before its heartbeat's end, for
 // the epoch it was sent for, and never moves S or D back. Before the first success of an epoch nothing is held
 // (NOT_HELD), which fences nothing. A clock that cannot be read or goes back fences the epoch.
 class LeaseTracker {
@@ -60,6 +62,10 @@ public:
   uint64_t sent(uint64_t epoch, double nowMs, double slotMs);
   // The store's answer to heartbeat `id`, handled at `nowMs`. True when it renewed the lease.
   bool settled(uint64_t id, bool ok, double nowMs);
+  // The lease-clock slot of a heartbeat `sinceRenewedSlotMs` after the slot of the heartbeat that last renewed the
+  // lease, on the cadence (only meaningful once renewed()).
+  double cadenceSlot(double sinceRenewedSlotMs) const { return okSlotMs + sinceRenewedSlotMs; }
+  bool renewed() const { return held; }
   // A heartbeat abandoned without an answer (its request was canceled): it keeps nothing back any more.
   void forget(uint64_t id) { pending.erase(id); }
   // The lease of `epoch` at `nowMs`. EXPIRED for the current epoch fences it (the reason is kept).
@@ -77,7 +83,7 @@ private:
   double ttlMs, intervalMs;
   uint64_t current = 0, nextId = 0;
   bool currentFenced = false, held = false;
-  double okSentMs = 0, okSlotMs = 0, lastNowMs = 0;
+  double okSentMs = 0, okSlotMs = 0, lastNowMs = 0, lastSentSlotMs = -1;
   const char* reason = "";
   std::map<uint64_t, Pending> pending;
 };

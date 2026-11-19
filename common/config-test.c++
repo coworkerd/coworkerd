@@ -92,9 +92,15 @@ void tenantBorrowConfiguration(Fixture& fixture) {
 // r46: with the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
 // refusal names every value. The defaults (15 s, 5 s, 10 s) and the small test configuration (5 s, 1 s, 3 s) start.
 void livenessGraceConfiguration(Fixture& fixture) {
-  const auto with = [&](const std::string& membership) {
+  const auto load = [&](const std::string& membership) {
     return fixture.load(R"({"storage":{"endpoint":"http://127.0.0.1:9","bucket":"b"},"desiredState":{"backend":"file"})" +
         (membership.empty() ? std::string() : ",\"membership\":" + membership) + "}");
+  };
+  // What a node does at startup: load, then its own lease's margin.
+  const auto with = [&](const std::string& membership) {
+    auto config = load(membership);
+    coworkerd::checkNodeLeaseMargin(config.membership);
+    return config;
   };
   const auto defaults = with("");
   KJ_REQUIRE(defaults.membership.backend == "objectStore" && defaults.membership.ttlSeconds == 15 &&
@@ -114,9 +120,18 @@ void livenessGraceConfiguration(Fixture& fixture) {
     for (const auto& value : row.named)
       KJ_REQUIRE(refusal.find(value) != std::string::npos, "the refusal must name the value", value.c_str(), refusal.c_str());
   }
+  // The control plane loads the same file without the node's check: the install guide has it set only the TTL and
+  // the grace, so the interval stays the default 5000 ms, which a node with that grace would refuse.
+  const auto control = load(R"({"ttlSeconds":15,"livenessGraceMs":5000})");
+  KJ_REQUIRE(control.membership.heartbeatIntervalMs == 5000 && control.membership.livenessGraceMs == 5000);
+  std::string nodeRefusal;
+  try { coworkerd::checkNodeLeaseMargin(control.membership); }
+  catch (const kj::Exception& error) { nodeRefusal = error.getDescription().cStr(); }
+  KJ_REQUIRE(nodeRefusal.find("is 6151") != std::string::npos, nodeRefusal.c_str());
   // The file membership has no lease: its timing is not checked.
-  KJ_REQUIRE(fixture.load(R"({"membership":{"backend":"file","heartbeatIntervalMs":500,"livenessGraceMs":750}})")
-      .membership.backend == "file");
+  const auto file = fixture.load(R"({"membership":{"backend":"file","heartbeatIntervalMs":500,"livenessGraceMs":750}})");
+  coworkerd::checkNodeLeaseMargin(file.membership);
+  KJ_REQUIRE(file.membership.backend == "file");
 }
 }
 

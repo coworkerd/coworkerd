@@ -2760,7 +2760,10 @@ LeaseTracker::Judgment DurableLog::leaseOf(double nowMs) {
 }
 
 // Every record still waiting is refused (ACK_UNAVAILABLE, the write's STORAGE_UNAVAILABLE) and excluded the way any
-// unconfirmed write is; confirmed records and the peers' valid tails stay. Then the node stops holding its shards.
+// unconfirmed write is; confirmed records and the peers' valid tails stay. Then, once, the node stops holding its
+// shards -- only when the expired epoch is the membership's current one: an older epoch's shards were given up when it
+// expired, and the shards a newer epoch took before this log followed it (setNodeEpoch) are that epoch's. A current
+// epoch not held yet (NOT_HELD) gives up nothing here; the membership's expiry check decides it.
 void DurableLog::loseLease(const LeaseTracker::Judgment& judgment) {
   const bool first = leaseLostEpoch != nodeEpoch;
   if (judgment.verdict == LeaseTracker::Verdict::EXPIRED) leaseLostEpoch = nodeEpoch;
@@ -2778,7 +2781,9 @@ void DurableLog::loseLease(const LeaseTracker::Judgment& judgment) {
   }
   for (const auto& name : names)
     if (auto* object = objectOf(name)) isolateObjectPending(*object, "the node's membership lease ended before confirmation");
-  if ((first || judgment.verdict != LeaseTracker::Verdict::EXPIRED) && leaseLostHook) leaseLostHook(judgment.reason);
+  if (first && judgment.verdict == LeaseTracker::Verdict::EXPIRED && std::to_string(nodeEpoch) == membership.epoch &&
+      leaseLostHook)
+    leaseLostHook(judgment.reason);
 }
 
 // A WAIT is judged again when a heartbeat settles (leaseSettled) and at the earliest end it named.
@@ -5092,6 +5097,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     }
     nextDiscovery = monotonicTimeMs() + 1000;
   };
+  CutHold cutHold;
   for (;;) {
     checkIdentity();refreshMemory();
     kj::Vector<kj::Promise<void>> ownerCalls;
@@ -5142,7 +5148,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
       std::vector<std::pair<std::string, uint64_t>> silent;
       for (const auto& source : state->sources)
         if (!source.ownerComplete) silent.emplace_back(source.epoch.nodeId, source.epoch.nodeEpoch);
-      if (co_await previousOwnersMayBeCut(object.objectName, std::move(silent))) break;
+      if (co_await previousOwnersMayBeCut(object.objectName, std::move(silent), cutHold)) break;
       co_await timer.afterDelay(200 * kj::MILLISECONDS);
       checkIdentity();
     }
@@ -5205,18 +5211,26 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
 // before (that alone never proves the tail empty: the cut is what it was). The epochs this process held are its own
 // to judge: never read. This is not a barrier against a heartbeat that lands after the read; the writer's own lease
 // check is.
+// Counted once per recovery that has to wait (by why it first waited), logged when the wait starts and when it ends.
 kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
-    std::vector<std::pair<std::string, uint64_t>> owners) {
+    std::vector<std::pair<std::string, uint64_t>> owners, CutHold& hold) {
   for (const auto& [nodeId, epoch] : owners) {
     if (nodeId == settings.nodeId && membership.heldEpochs.contains(std::to_string(epoch))) continue;
     const auto answer = co_await readOwnerHeartbeat(nodeId, epoch);
     if (answer == OwnerHeartbeat::GONE) continue;
-    ++(answer == OwnerHeartbeat::LIVE ? cutsHeldOwnerLive : cutsHeldOwnerUnknown);
-    log(answer == OwnerHeartbeat::LIVE ? "cut-held-owner-live" : "cut-held-owner-unknown",
-        "\"object\":" + quote(objectName) + ",\"owner\":" + quote(nodeId) + ",\"nodeEpoch\":\"" +
-        std::to_string(epoch) + "\"");
+    if (!hold.holding) {
+      hold.holding = true;
+      hold.sinceMs = monotonicTimeMs();
+      ++(answer == OwnerHeartbeat::LIVE ? cutsHeldOwnerLive : cutsHeldOwnerUnknown);
+      log(answer == OwnerHeartbeat::LIVE ? "cut-held-owner-live" : "cut-held-owner-unknown",
+          "\"object\":" + quote(objectName) + ",\"owner\":" + quote(nodeId) + ",\"nodeEpoch\":\"" +
+          std::to_string(epoch) + "\"");
+    }
     co_return false;
   }
+  if (hold.holding)
+    log("cut-hold-ended", "\"object\":" + quote(objectName) + ",\"waitedMs\":" +
+        std::to_string(uint64_t(monotonicTimeMs() - hold.sinceMs)));
   co_return true;
 }
 

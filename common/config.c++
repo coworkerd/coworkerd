@@ -18,6 +18,22 @@ namespace coworkerd {
 namespace rpc = v1::rpc;
 namespace fs = std::filesystem;
 
+// A node stops confirming its Durable Object writes when its own lease ends, at the latest one heartbeat interval after
+// the TTL (a heartbeat in flight). The others must wait longer than that before they take its shards: the interval, the
+// expiry check (100 ms), the ownership watcher (50 ms) and the store's whole-second Date (1,000 ms). Nodes only: the
+// control plane holds no lease (it reads the TTL and the grace to judge the members).
+void checkNodeLeaseMargin(const MembershipConfig& m) {
+  if (m.backend != "objectStore") return;
+  if (uint64_t(m.livenessGraceMs) <= uint64_t(m.heartbeatIntervalMs) + LIVENESS_GRACE_MARGIN_MS) {
+    const auto values = "membership.livenessGraceMs must be greater than membership.heartbeatIntervalMs + " +
+        std::to_string(LIVENESS_GRACE_MARGIN_MS) + " ms: livenessGraceMs " + std::to_string(m.livenessGraceMs) +
+        ", heartbeatIntervalMs " + std::to_string(m.heartbeatIntervalMs) + ", ttlSeconds " + std::to_string(m.ttlSeconds) +
+        " (the smallest livenessGraceMs for this interval is " +
+        std::to_string(uint64_t(m.heartbeatIntervalMs) + LIVENESS_GRACE_MARGIN_MS + 1) + ")";
+    kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(values.c_str())));
+  }
+}
+
 void DurableLogConfig::validate() const {
   KJ_REQUIRE(alarmDiscoveryIntervalMs >= 200, "durableObjects.alarmDiscoveryIntervalMs is at least 200");
   KJ_REQUIRE(alarmTakeoverConcurrency > 0 && alarmTakeoverConcurrency <= 4, "durableObjects.alarmTakeoverConcurrency is between 1 and 4");
@@ -391,17 +407,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       KJ_REQUIRE(m.heartbeatIntervalMs > 0 && uint64_t(m.heartbeatIntervalMs) * 2 < uint64_t(m.ttlSeconds) * 1000,
           "membership.heartbeatIntervalMs must be positive and less than half of ttlSeconds");
       KJ_REQUIRE(m.livenessGraceMs >= m.heartbeatIntervalMs, "membership.livenessGraceMs must be at least heartbeatIntervalMs");
-      // A node stops confirming its Durable Object writes when its own lease ends, at the latest one heartbeat interval
-      // after the TTL (a heartbeat in flight). The others must wait longer than that before they take its shards: the
-      // interval, the expiry check (100 ms), the ownership watcher (50 ms) and the store's whole-second Date (1,000 ms).
-      if (uint64_t(m.livenessGraceMs) <= uint64_t(m.heartbeatIntervalMs) + LIVENESS_GRACE_MARGIN_MS) {
-        const auto values = "membership.livenessGraceMs must be greater than membership.heartbeatIntervalMs + " +
-            std::to_string(LIVENESS_GRACE_MARGIN_MS) + " ms: livenessGraceMs " + std::to_string(m.livenessGraceMs) +
-            ", heartbeatIntervalMs " + std::to_string(m.heartbeatIntervalMs) + ", ttlSeconds " + std::to_string(m.ttlSeconds) +
-            " (the smallest livenessGraceMs for this interval is " +
-            std::to_string(uint64_t(m.heartbeatIntervalMs) + LIVENESS_GRACE_MARGIN_MS + 1) + ")";
-        kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(values.c_str())));
-      }
       KJ_REQUIRE(m.listIntervalMs > 0, "membership.listIntervalMs must be positive");
       KJ_REQUIRE(m.clockSkewToleranceMs > 0, "membership.clockSkewToleranceMs must be positive");
       KJ_REQUIRE(m.createSettleMs <= 60000, "membership.createSettleMs must be at most 60000");
