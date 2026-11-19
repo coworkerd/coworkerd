@@ -1049,7 +1049,7 @@ private:
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
   uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0, fullRetriesSent = 0;
-  uint64_t ownerProofsUnverified = 0, fencedShardChecks = 0, fencedShardsLost = 0;
+  uint64_t fencedShardChecks = 0, fencedShardsLost = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;

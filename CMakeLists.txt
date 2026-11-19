@@ -184,7 +184,7 @@ add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease
 foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
 endforeach()
-foreach(case raise unverified old-ask coalesce outage owner-proof owner-proof-restored)
+foreach(case raise unverified old-ask coalesce outage)
   add_test(NAME durable-peer-fence-${case} COMMAND coworkerd-durable-channel-test peer-fence ${case})
 endforeach()
 foreach(case fenced full full-resend resend-held)

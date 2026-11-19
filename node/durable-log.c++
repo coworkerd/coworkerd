@@ -6838,9 +6838,11 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     }
     // r49: a record this node already holds, sent again after the owner reconnected, was taken before any floor that
     // would refuse it now and is in a newer owner's tail: it is taken again as a duplicate, not refused -- refusing it
-    // would hold back the owner's answers for its other shards until a trim.
+    // would hold back the owner's answers for its other shards until a trim. Only the same bytes are that record; a
+    // different record under a held sequence is checked like any new one.
     if (record->nodeSeq <= buffer.droppedTo || buffer.isolated.contains(record->nodeSeq)) continue;
-    const bool duplicate = buffer.held.contains(record->nodeSeq);
+    const auto heldAt = buffer.held.find(record->nodeSeq);
+    const bool duplicate = heldAt != buffer.held.end() && heldAt->second == encoded;
     if (record->kind != LogRecordKind::SEAL && !duplicate) {
       const auto known = knownEpoch(record->objectName.substr(0, record->objectName.find('/')), record->shard);
       if (known != 0 && record->shardEpoch < known) {
@@ -6969,11 +6971,11 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // at least this one, is never fenced by it. The answer is computed after the raise: an append taken before it is in
 // the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
-// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
-// r49: a request for this node's own older tail (an owner proof) is checked the same way; tailForPage gives the proof
-// only for an epoch this node then knows.
+// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS. A request
+// for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before (r49
+// section 6.3; the check needs a wire signal or a new rule, in the backlog).
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
-  if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty()) co_return;
+  if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
   co_await raiseFloor(ask.namespaceId, ask.shard, ask.shardEpoch, "a newer epoch of the shard asked for a tail");
 }
 
@@ -7056,17 +7058,6 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
     answer.refusal = "the requesting shard epoch has been fenced";
     return answer;
   }
-  // r49: an owner proof fences this node's older ownerships of the shard, so a remote one is given only for an epoch
-  // this node knows by now -- the object store has shown it (raisePeerFence runs before the answer), or its own view
-  // of the shard has it. For a number the store does not show, this node answers as a peer would: its records, but
-  // no proof (ownerConfirmed false) and no fence -- the asker gets the data and only loses the fast way out.
-  const auto proofShown = [&]() {
-    if (!remote || ask.shardEpoch <= 1 || knownEpoch(ask.namespaceId, ask.shard) >= ask.shardEpoch) return true;
-    ++ownerProofsUnverified;
-    log("owner-proof-unverified", "\"namespaceId\":" + quote(ask.namespaceId) + ",\"shard\":" +
-        std::to_string(ask.shard) + ",\"shardEpoch\":\"" + std::to_string(ask.shardEpoch) + "\"");
-    return false;
-  };
   const auto sourceEpoch = std::to_string(ask.ownerNodeEpoch);
   if (ask.ownerNodeId == settings.nodeId && ask.ownerNodeEpoch && ask.ownerNodeEpoch != nodeEpoch &&
       !membership.heldEpochs.contains(sourceEpoch)) {
@@ -7086,21 +7077,18 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
           sourceEpoch + "\",\"records\":" + std::to_string(pending->second));
       return answer;
     }
-    // Every record of the restored epoch is published already: the answer is empty either way, a proof or not.
-    const bool shown = proofShown();
-    if (shown && remote && ask.shardEpoch > 1)
+    if (remote && ask.shardEpoch > 1)
       fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a remote complete owner proof", true);
     ++tailAnswers;++restoredEmptyAnswers;
-    answer.ownerConfirmed = shown;
+    answer.ownerConfirmed = true;
     log("restored-owner-tail-empty", "\"namespaceId\":" + quote(ask.namespaceId) +
         ",\"shard\":" + std::to_string(ask.shard) + ",\"sourceNodeEpoch\":\"" + sourceEpoch + "\"");
     return answer;
   }
-  const bool proof = ask.ownerNodeId == settings.nodeId && proofShown();
-  if (proof && remote && ask.shardEpoch > 1)
+  if (remote && ask.ownerNodeId == settings.nodeId && ask.shardEpoch > 1)
     fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a remote complete owner proof", true);
   ++tailAnswers;
-  answer.ownerConfirmed = proof;
+  answer.ownerConfirmed = ask.ownerNodeId == settings.nodeId;
   std::map<std::tuple<uint64_t, uint64_t, uint64_t>, const std::string*> ordered;
   std::deque<std::string> temporary;
   auto matches = [&](const LogRecord& record) {
@@ -7341,8 +7329,7 @@ std::string DurableLog::json() const {
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
       << fencedRecords << ",\"peerFenceChecks\":" << peerFenceChecks << ",\"peerFenceRaises\":" << peerFenceRaises
       << ",\"peerFenceUnverified\":" << peerFenceUnverified << ",\"ownerFences\":" << ownerFenceThrough.size()
-      << ",\"fullRetriesSent\":" << fullRetriesSent << ",\"ownerProofsUnverified\":" << ownerProofsUnverified
-      << ",\"fencedShardChecks\":" << fencedShardChecks << ",\"fencedShardsLost\":" << fencedShardsLost
+      << ",\"fullRetriesSent\":" << fullRetriesSent << ",\"fencedShardChecks\":" << fencedShardChecks << ",\"fencedShardsLost\":" << fencedShardsLost
       << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
   first = true;
   for (const auto& [streamId, buffer] : incoming) {

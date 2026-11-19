@@ -453,49 +453,6 @@ struct DurableLogChannelTest {
       // A newer epoch the store does not show is read on its own.
       raise(9);
       KJ_REQUIRE(log.peerFenceChecks == 3 && log.knownEpoch(ns, 1) == 6);
-    } else if (name == "owner-proof" || name == "owner-proof-restored") {
-      // r49: a request for this node's own older tail (an owner proof) gets the proof, which fences this node's older
-      // ownerships, only for an epoch the store shows. "-restored": the tail of a previous incarnation of this node.
-      const bool restored = name == "owner-proof-restored";
-      if (restored) {
-        log.diskTrusted = true;
-        log.sameBootCache = true;
-        log.predecessorLogs[3].complete = true;
-      }
-      auto own = [&](uint64_t shardEpoch) {
-        auto out = ask(shardEpoch);
-        out.ownerNodeId = "peer";
-        out.ownerNodeEpoch = restored ? 3 : 9;
-        return out;
-      };
-      auto proof = [&](uint64_t shardEpoch) {
-        log.raisePeerFence(own(shardEpoch)).wait(io.waitScope);
-        return log.tailFor(own(shardEpoch));
-      };
-      // One confirmed record of this node's current log in shard 1: what an owner's answer carries.
-      const size_t expected = restored ? 0 : 1;
-      if (!restored) {
-        LogRecord mine;
-        mine.nodeEpoch = 9; mine.nodeSeq = 1; mine.shard = 1; mine.shardEpoch = 3; mine.objectName = ns + "/" +
-            std::string(64, '7'); mine.dataEpoch = 1; mine.kind = LogRecordKind::RESET; mine.txn = 1;
-        log.records.emplace(1, encodeLogRecord(mine));
-        log.rememberParsedRecord(mine);
-        log.confirmed.insert(1);
-      }
-      // No object at epoch 4; at epoch 5 an object that names another shard: answered as a peer would -- the records,
-      // no proof, nothing fenced.
-      auto none = proof(4);
-      epochObject(1, 5, 2);
-      auto other = proof(5);
-      KJ_REQUIRE(none.refusal.empty() && !none.ownerConfirmed && none.records.size() == expected &&
-          other.refusal.empty() && !other.ownerConfirmed && other.records.size() == expected &&
-          log.ownerFenceThrough.empty() && log.ownerProofsUnverified == 2,
-          "an epoch the store does not show: the records without the proof", none.refusal.c_str(), none.records.size());
-      // The store shows epoch 6: the proof is given and this node's older ownerships are fenced.
-      epochObject(1, 6);
-      auto shown = proof(6);
-      KJ_REQUIRE(shown.refusal.empty() && shown.ownerConfirmed && shown.records.size() == expected &&
-          log.ownerFenceThrough.at({ns, 1}) == 5, "an owner proof of an epoch the store shows", shown.refusal.c_str());
     } else if (name == "outage") {
       // The store never shows epoch 6 and a request of it comes every second for 40 s: about one read a second in
       // all -- the request's own once the failure kept for a second has expired, and one chain of background rereads
@@ -588,6 +545,10 @@ struct DurableLogChannelTest {
           "a held record below the floor is a duplicate, not refused", resent.refusal.c_str());
       auto five = testRecord(ns, 2, 5, 1, 3);
       KJ_REQUIRE(send(five).refusal.starts_with("fenced"), "a new record below the floor is refused");
+      // Other bytes under the held sequence 2 are not that record: checked like a new one, and refused.
+      auto changed = two;
+      changed.txn = 99;
+      KJ_REQUIRE(send(changed).refusal.starts_with("fenced"), "a different record under a held sequence is refused");
     } else if (name == "full-resend") {
       // At its limit, the peer still takes a record it already holds, sent again after a reconnect: that record needs
       // no room, and refusing it would fail a write the peer can confirm.
