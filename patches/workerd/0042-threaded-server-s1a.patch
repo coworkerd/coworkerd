@@ -633,7 +633,7 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2433de41cd493edc088e0e0577856effed0400f
+index 0000000000000000000000000000000000000000..e7f8cd04b5192108d3f6cea2a8d88d3e9f1403c0
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -0,0 +1,526 @@
@@ -1143,7 +1143,7 @@ index 0000000000000000000000000000000000000000..d2433de41cd493edc088e0e0577856ef
 +  char buffer[2048];
 +  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
 +  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
-+  headers.set(callId, "probe-7");
++  headers.setPtr(callId, "probe-7");
 +  { auto canceled = httpEntryObserver(input.get(), "", headers, callId, fds[1]); }
 +  KJ_EXPECT(read(fds[0], buffer, sizeof(buffer)) == -1 && errno == EAGAIN);
 +  httpEntryObserver(input.get(), "", headers, callId, fds[1])->delivered();
@@ -1151,7 +1151,7 @@ index 0000000000000000000000000000000000000000..d2433de41cd493edc088e0e0577856ef
 +  KJ_ASSERT(count > 0);
 +  auto line = kj::StringPtr(buffer, count);
 +  KJ_ASSERT(line.startsWith("[tenant-entry] ") && line.endsWith("\n"));
-+  JsonDoc row(line.slice(strlen("[tenant-entry] "), line.size() - 1));
++  JsonDoc row(kj::str(line.slice(strlen("[tenant-entry] "), line.size() - 1)));
 +  KJ_EXPECT(text(row.get(), "serverId") == "s2");
 +  KJ_EXPECT(text(row.get(), "processId") == "p1");
 +  KJ_EXPECT(field(row.get(), "processGeneration").getNumber() == 3);
