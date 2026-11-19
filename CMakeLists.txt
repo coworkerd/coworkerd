@@ -187,7 +187,7 @@ endforeach()
 foreach(case raise unverified old-ask coalesce)
   add_test(NAME durable-peer-fence-${case} COMMAND coworkerd-durable-channel-test peer-fence ${case})
 endforeach()
-foreach(case fenced full)
+foreach(case fenced full full-resend)
   add_test(NAME durable-refused-peer-${case} COMMAND coworkerd-durable-channel-test refused-peer ${case})
 endforeach()
 foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect cut-short-reconnect limit-reconnect

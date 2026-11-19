@@ -5102,6 +5102,9 @@ class DurableLogSinkServer final: public rpc::DurableLogSink::Server {
 public:
   DurableLogSinkServer(coworkerd::DurableLog& log, uint64_t streamId): log(log), streamId(streamId) {}
 
+  // Answered here, synchronously, in the order the calls arrive on the stream: the owner relies on getting the answers
+  // to one stream's appends in the order it sent them (r48: an answer then accounts only for its own record and those
+  // before it). Do not make this asynchronous without changing that accounting (DurableLog::pumpPeer).
   kj::Promise<void> append(AppendContext context) override {
     auto records = context.getParams().getRecords();
     auto result = log.appendIncoming(streamId,

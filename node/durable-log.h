@@ -431,6 +431,9 @@ public:
   // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
   kj::Promise<void> raisePeerFence(DurableTailAsk ask);
   static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
+  // r48: a check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
+  // most this many times, while the epoch is still not known.
+  static constexpr uint32_t FENCE_REREADS = 5;
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
       std::string* refusal = nullptr);
   void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
@@ -613,6 +616,7 @@ private:
     // (one without r48). Only the fence holds answers back: a full buffer does not, or one refusal would stall every
     // later record of the stream until the owner gives the refused one up.
     std::set<uint64_t> fencedSeqs;
+    bool holdsFramed(std::string_view framed) const;
     uint64_t answeredSeq() const {
       return fencedSeqs.empty() ? acceptedSeq : std::min(acceptedSeq, *fencedSeqs.begin() - 1);
     }
@@ -728,7 +732,8 @@ private:
     bool settled = false;
   };
   std::map<std::tuple<std::string, uint32_t, uint64_t>, FenceCheck> fenceChecks;
-  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, bool background);
+  // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
+  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread);
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {

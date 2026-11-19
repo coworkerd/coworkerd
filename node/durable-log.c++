@@ -2568,11 +2568,13 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
         // peer takes it; a full buffer is tried again on this session after a growing wait.
         current->refusedSeqs.insert(sequence);
-        if (accepted.refusal.starts_with("full")) {
+        if (accepted.refusal.starts_with("full") && inFlight.contains(sequence) && !isolated.contains(sequence)) {
           auto& retry = current->fullRetries[sequence];
           if (!retry.pending && retry.attempts < FULL_RETRIES) {
             retry.pending = true;
-            const auto waitMs = uint64_t(FULL_RETRY_FIRST_MS) << retry.attempts++;
+            // Spread out: the records refused together are not all sent again at the same moment.
+            const auto step = uint64_t(FULL_RETRY_FIRST_MS) << retry.attempts++;
+            const auto waitMs = step + randomBelow(step / 2 + 1);
             tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, nodeId, session, sequence]() {
               retryRefused(nodeId, session, sequence);
             }));
@@ -6750,7 +6752,9 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     whole += std::string(bytes);
     bytes = whole;
   }
-  if (incomingBytes + bytes.size() > settings.config.peerBufferBytes) {
+  // r48: a record this node already holds, sent again after a reconnect, is taken again (as a duplicate) rather than
+  // refused for room it does not need.
+  if (incomingBytes + bytes.size() > settings.config.peerBufferBytes && !buffer.holdsFramed(bytes)) {
     ++bufferRefusals;
     ++buffer.refusedRecords;
     result.accepted = buffer.answeredSeq();
@@ -6818,6 +6822,18 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
   buffer.lastAppendMs = monotonicTimeMs();
   result.accepted = buffer.answeredSeq();
   return result;
+}
+
+// Whether framed bytes are exactly one record this buffer already holds (or has dropped): read from the record's
+// encoding (the kind byte, then the sequence, little endian); anything else is not.
+bool DurableLog::PeerBuffer::holdsFramed(std::string_view framed) const {
+  if (framed.size() < 13) return false;
+  uint32_t length = 0;
+  for (int i = 0; i < 4; i++) length |= uint32_t(uint8_t(framed[i])) << (8 * i);
+  if (framed.size() != size_t(length) + 4) return false;
+  uint64_t sequence = 0;
+  for (int i = 0; i < 8; ++i) sequence |= uint64_t(uint8_t(framed[5 + i])) << (8 * i);
+  return held.contains(sequence) || sequence <= droppedTo || isolated.contains(sequence);
 }
 
 void DurableLog::PeerBuffer::forgetPosition(uint64_t sequence) {
@@ -6916,7 +6932,7 @@ kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (found != fenceChecks.end() && found->second.settled) co_return;
   if (found == fenceChecks.end()) {
     ++peerFenceChecks;
-    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, false).fork();
+    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, 0).fork();
     found = fenceChecks.emplace(key, FenceCheck{kj::mv(check), now, false}).first;
   }
   co_await found->second.done.addBranch();
@@ -6928,9 +6944,10 @@ kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
 }
 
 // The read behind raisePeerFence, shared by every request of the same epoch of the shard meanwhile. A success raises
-// the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, then read once more in the
-// background, so that the floor goes up soon after the store answers again.
-kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, bool background) {
+// the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, and the epoch is read again
+// in the background -- after OWNER_REREAD_MS, doubled each time, at most FENCE_REREADS times, while it is still not
+// known -- so that the floor goes up soon after the store answers again.
+kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread) {
   std::string failure;
   try {
     const auto waitMs = std::max<uint32_t>(1, settings.peerTimeoutMs / 2);
@@ -6954,11 +6971,12 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
   }
   ++peerFenceUnverified;
   log("peer-fence-unverified", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
-      ",\"shardEpoch\":\"" + std::to_string(epoch) + "\",\"background\":" + (background ? "true" : "false") +
+      ",\"shardEpoch\":\"" + std::to_string(epoch) + "\",\"reread\":" + std::to_string(reread) +
       ",\"reason\":" + quote(failure));
-  if (background) co_return;
-  tasks.add(timer.afterDelay(int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS).then([this, namespaceId, shard, epoch]() {
-    return epoch > knownEpoch(namespaceId, shard) ? checkPeerFence(namespaceId, shard, epoch, true)
+  if (reread >= FENCE_REREADS) co_return;
+  const auto waitMs = int64_t(OWNER_REREAD_MS) << reread;
+  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread]() {
+    return epoch > knownEpoch(namespaceId, shard) ? checkPeerFence(namespaceId, shard, epoch, reread + 1)
                                                   : kj::Promise<void>(kj::READY_NOW);
   }));
 }

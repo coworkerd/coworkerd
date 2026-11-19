@@ -434,10 +434,14 @@ struct DurableLogChannelTest {
           "concurrent requests of one epoch share one read", log.peerFenceChecks, log.peerFenceUnverified);
       raise(6);
       KJ_REQUIRE(log.peerFenceChecks == 1 && log.peerFenceUnverified == 1, "a failure is kept for a second");
-      epochObject(1, 6);
+      // The first background read, a second later, still finds nothing; the next one, two seconds after it, does.
       clock.advanceTo(clock.now() + 1001 * kj::MILLISECONDS);
       io.waitScope.poll();
-      KJ_REQUIRE(log.knownEpoch(ns, 1) == 6 && log.peerFenceRaises == 1, "the background read raises the floor",
+      KJ_REQUIRE(log.peerFenceUnverified == 2 && log.knownEpoch(ns, 1) == 0, log.peerFenceUnverified);
+      epochObject(1, 6);
+      clock.advanceTo(clock.now() + 2001 * kj::MILLISECONDS);
+      io.waitScope.poll();
+      KJ_REQUIRE(log.knownEpoch(ns, 1) == 6 && log.peerFenceRaises == 1, "a background read raises the floor",
           log.knownEpoch(ns, 1));
       // After the second, a new request of an epoch the store does not show is read again.
       raise(9);
@@ -509,6 +513,15 @@ struct DurableLogChannelTest {
       const auto later = send(three);
       KJ_REQUIRE(later.refusal.empty() && later.accepted == 3 && log.incoming.at(stream).fencedSeqs.empty(),
           "a full buffer does not hold the answers back", later.accepted);
+    } else if (name == "full-resend") {
+      // At its limit, the peer still takes a record it already holds, sent again after a reconnect: that record needs
+      // no room, and refusing it would fail a write the peer can confirm.
+      log.settings.config.peerBufferBytes = log.incomingBytes + 1;
+      uint64_t again = 0;
+      KJ_REQUIRE(log.openIncoming("owner", 2, "old", "9", 1, again).empty() && again == stream);
+      const auto resent = send(one);
+      KJ_REQUIRE(resent.refusal.empty() && resent.accepted == 1, "a held record sent again is taken", resent.refusal.c_str());
+      KJ_REQUIRE(send(three).refusal.starts_with("full"), "a new record is still refused");
     } else {
       KJ_FAIL_REQUIRE("unknown refused-peer scenario", scenario);
     }
@@ -661,7 +674,7 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
           log.inFlight.contains(2), "record 2 refused (full) is not counted; 3 is not held up", log.confirmations);
       peer.settings.config.peerBufferBytes = 1u << 20;
-      later(DurableLog::FULL_RETRY_FIRST_MS);
+      later(DurableLog::FULL_RETRY_FIRST_MS * 3 / 2 + 1);  // the first wait and its jitter
       KJ_REQUIRE(log.confirmations == 3 && acks.at(102) == 0 && log.fullRetriesSent == 1 && opened == 1,
           "record 2, sent again on the same session and taken, is confirmed", log.confirmations);
     } else if (name == "pair-fenced") {
@@ -725,7 +738,7 @@ struct DurableLogChannelTest {
             "a record refused again after a reconnect is not held", scenario);
       } else if (name == "full") {
         // Tried again on the same session after FULL_RETRY_FIRST_MS; taken this time.
-        later(DurableLog::FULL_RETRY_FIRST_MS);
+        later(DurableLog::FULL_RETRY_FIRST_MS * 3 / 2 + 1);  // the first wait and its jitter
         KJ_REQUIRE(calls.size() == 4 && calls[3].sequence == 2 && log.fullRetriesSent == 1, calls.size());
         calls[3].fulfiller->fulfill({3, ""});
         answers();
