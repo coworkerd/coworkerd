@@ -36,6 +36,52 @@ kj::Promise<FileDigest> recoveryFileDigestAsync(const std::filesystem::path& pat
 kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const ObjectManifest& manifest,
     const std::string& objectName, uint32_t parallelism, HistoryCheck check = {}, HistoryLog log = {},
     HistoryBudget* budget = nullptr, HistoryYield yield = {}, SegmentReadStats* stats = nullptr);
+// One segment of the store, downloaded once, its digest and records checked and decoded on a worker thread, and its
+// records grouped by object in segment order. Shared read-only by every rebuild that names the segment.
+struct DecodedSegment {
+  SegmentHeader header;
+  std::map<std::string, std::vector<LogRecord>, std::less<>> byObject;
+  uint64_t encodedBytes = 0, bytes = 0, records = 0;
+  double downloadMs = 0, decodeMs = 0, groupMs = 0;
+};
+// The segments a node's rebuilds read, each downloaded and decoded once while rebuilds still need it, instead of once
+// per object. Readers waiting for the same segment share one download and one decode. An entry is dropped when no
+// read has used it for `idleMs` (see sweep()), and the least recently used go first when the decoded records held
+// pass `limitBytes`. A failed download or decode is not kept, so the next read tries again. A segment never changes
+// once written (a second write of the same key is refused), so a held entry cannot be stale.
+class SegmentDecodeCache final: private kj::TaskSet::ErrorHandler {
+public:
+  using Decoded = std::function<void(const std::string& key, const DecodedSegment& segment)>;
+  SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded = {});
+  // `loaded` (optional) is set when this call started the download and decode.
+  kj::Promise<std::shared_ptr<const DecodedSegment>> segment(const ManifestSegment& ref, bool* loaded = nullptr);
+  // Drops the entries no read has used for idleMs; whether any entry is left.
+  bool sweep();
+  uint64_t heldBytes() const { return held; }
+  uint64_t limitBytes() const { return limit; }
+  size_t entries() const { return table.size(); }
+  uint64_t decodes = 0, hits = 0, misses = 0, joins = 0, evictions = 0, failures = 0;
+private:
+  struct Entry {
+    std::optional<kj::ForkedPromise<std::shared_ptr<const DecodedSegment>>> pending;
+    std::shared_ptr<const DecodedSegment> ready;
+    double lastUsedMs = 0;
+  };
+  void taskFailed(kj::Exception&& exception) override;
+  kj::Promise<std::shared_ptr<const DecodedSegment>> load(std::string key);
+  void trim();
+  HistoryGet get;
+  uint64_t limit, held = 0;
+  double idle;
+  Decoded decodedHook;
+  std::map<std::string, Entry> table;
+  kj::TaskSet tasks{*this};
+};
+// readRecoverySegments' records for one object -- the same records, in the same order, with the same exclusion
+// evidence and the same errors -- with each segment taken from `cache` instead of downloaded and decoded per object.
+kj::Promise<std::vector<LogRecord>> readRecoverySegmentsDecoded(SegmentDecodeCache& cache, HistoryGet get,
+    const ObjectManifest& manifest, const std::string& objectName, uint32_t parallelism, HistoryLog log = {},
+    SegmentReadStats* stats = nullptr);
 kj::Promise<void> downloadRecoveryPart(HistoryGet get, const ObjectManifest& manifest,
     uint32_t facetId, uint64_t part, int fd, off_t offset, HistoryCheck check = {});
 kj::Promise<void> downloadRecoverySnapshot(HistoryGet get, const ObjectManifest& manifest,

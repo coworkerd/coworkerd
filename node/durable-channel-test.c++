@@ -126,11 +126,14 @@ struct DurableLogChannelTest {
 }  // namespace coworkerd
 
 namespace coworkerd { void runDurableTailTests(bool negativeControls); }
+namespace coworkerd { void runDurableSegmentTests(bool negativeControls); }
 
 int main(int argc, char* argv[]) {
   const std::string_view mode = argc == 2 ? argv[1] : "";
   if (mode == "tail" || mode == "tail-negative") {
     coworkerd::runDurableTailTests(mode == "tail-negative");
+  } else if (mode == "segment" || mode == "segment-negative") {
+    coworkerd::runDurableSegmentTests(mode == "segment-negative");
   } else {
     coworkerd::DurableLogChannelTest::run(mode == "index");
   }

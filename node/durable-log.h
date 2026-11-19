@@ -39,6 +39,7 @@
 namespace coworkerd {
 
 struct SegmentReadStats;  // node/recovery-history.h
+class SegmentDecodeCache;  // node/recovery-history.h
 
 // ---- The objects of the store ----
 //   nodes/<nodeId>/wal/<nodeEpoch>/<segment>           a segment of the node's log (immutable, 20 digits wide)
@@ -785,6 +786,7 @@ private:
       std::set<std::pair<uint64_t, uint64_t>> drop, std::function<void(const LogRecord&)> beforeWrite,
       std::function<void()> check, std::function<void(double)> observeFsync = {});
   kj::Promise<void> measureRecoveryLoop();
+  kj::Promise<void> sweepSegmentCache();
   void writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets);
 
   Settings settings;
@@ -998,6 +1000,10 @@ private:
   uint64_t diskLimitBytes = 0;
   uint64_t coldFilesSkippedLive = 0;
   double lastColdFilesSkippedLogMs = 0;
+  // The segments this node's rebuilds read, decoded once each (node/recovery-history.h): after `store`, before
+  // `tasks`, so that it goes before the store and after the tasks that use it.
+  std::unique_ptr<SegmentDecodeCache> segmentCache;
+  bool sweepingSegments = false;
   kj::TaskSet tasks{*this};
 };
 

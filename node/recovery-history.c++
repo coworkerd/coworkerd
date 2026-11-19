@@ -34,6 +34,47 @@ kj::Promise<SegmentDecodeResult> decodeRecoverySegmentAsync(std::string bytes) {
   } catch (const std::system_error&) { KJ_FAIL_REQUIRE("cannot start recovery segment decoder"); }
   co_return co_await kj::mv(pair.promise);
 }
+// The digest check, the decode and the grouping by object, all on a worker thread: the node's event loop only gets
+// the result. The encoded copy is released on that thread too.
+struct GroupedDecode { std::shared_ptr<DecodedSegment> segment; std::string error; };
+kj::Promise<GroupedDecode> decodeGroupedSegmentAsync(std::string bytes) {
+  auto pair = kj::newPromiseAndCrossThreadFulfiller<GroupedDecode>();
+  auto fulfiller = std::make_shared<kj::Own<kj::CrossThreadPromiseFulfiller<GroupedDecode>>>(kj::mv(pair.fulfiller));
+  try {
+    std::thread([bytes = std::move(bytes), fulfiller]() mutable {
+      try {
+        GroupedDecode result;
+        const auto began = monotonicTimeMs();
+        auto contents = decodeSegment(bytes, &result.error);
+        const auto decoded = monotonicTimeMs();
+        if (contents) {
+          auto segment = std::make_shared<DecodedSegment>();
+          segment->encodedBytes = bytes.size();
+          segment->header = std::move(contents->header);
+          segment->records = contents->records.size();
+          for (auto& record : contents->records) {
+            segment->bytes += sizeof(LogRecord) + record.frameBytes.size() + record.header.size() +
+                record.objectName.size() + record.storageId.size() + record.facetName.size();
+            auto group = segment->byObject.find(record.objectName);
+            if (group == segment->byObject.end()) {
+              group = segment->byObject.emplace(record.objectName, std::vector<LogRecord>()).first;
+              segment->bytes += group->first.size() + 64;
+            }
+            group->second.push_back(std::move(record));
+          }
+          segment->decodeMs = decoded - began;
+          segment->groupMs = monotonicTimeMs() - decoded;
+          result.segment = std::move(segment);
+        }
+        contents.reset();
+        std::string().swap(bytes);
+        (*fulfiller)->fulfill(kj::mv(result));
+      } catch (kj::Exception& error) { (*fulfiller)->reject(kj::mv(error)); }
+      catch (const std::exception&) { (*fulfiller)->reject(KJ_EXCEPTION(FAILED, "cannot decode recovery segment")); }
+    }).detach();
+  } catch (const std::system_error&) { KJ_FAIL_REQUIRE("cannot start recovery segment decoder"); }
+  co_return co_await kj::mv(pair.promise);
+}
 } // namespace
 kj::Promise<bool> synchronizeRecoveryFile(int fd) {
   auto counter = recoverySyncThreads;
@@ -168,6 +209,146 @@ kj::Promise<std::vector<LogRecord>> readRecoverySegments(HistoryGet get, const O
         if (budget) budget->add(record);
         if (stats) ++stats->records;
         out.push_back(std::move(record));
+      }
+      if (stats) stats->selectMs += monotonicTimeMs() - selectBegan;
+    }
+    at = until;
+  }
+  co_return out;
+}
+SegmentDecodeCache::SegmentDecodeCache(HistoryGet get, uint64_t limitBytes, double idleMs, Decoded decoded)
+    : get(std::move(get)), limit(limitBytes), idle(idleMs), decodedHook(std::move(decoded)) {}
+void SegmentDecodeCache::taskFailed(kj::Exception&&) {}
+kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::load(std::string key) {
+  const auto began = monotonicTimeMs();
+  auto response = co_await get(key);
+  KJ_REQUIRE(response.status == 200, "a segment of a Durable Object's log is not on the store", key.c_str(),
+      response.status);
+  const auto downloadMs = monotonicTimeMs() - began;
+  auto decoded = co_await decodeGroupedSegmentAsync(std::move(response.bytes));
+  KJ_REQUIRE(decoded.segment != nullptr, "a segment of a Durable Object's log does not add up", decoded.error.c_str());
+  decoded.segment->downloadMs = downloadMs;
+  ++decodes;
+  if (decodedHook) decodedHook(key, *decoded.segment);
+  co_return std::shared_ptr<const DecodedSegment>(std::move(decoded.segment));
+}
+kj::Promise<std::shared_ptr<const DecodedSegment>> SegmentDecodeCache::segment(const ManifestSegment& ref, bool* loaded) {
+  auto key = nodeSegmentKey(ref.nodeId, ref.nodeEpoch, ref.segment);
+  const auto now = monotonicTimeMs();
+  if (loaded) *loaded = false;
+  auto entry = table.find(key);
+  if (entry != table.end() && entry->second.ready) {
+    ++hits;
+    entry->second.lastUsedMs = now;
+    return std::shared_ptr<const DecodedSegment>(entry->second.ready);
+  }
+  if (entry == table.end()) {
+    ++misses;
+    if (loaded) *loaded = true;
+    auto forked = load(key).fork();
+    // Finish the entry even when every reader that waited for it was canceled: its bytes are counted once, and a
+    // failure is not kept.
+    tasks.add(forked.addBranch().then([this, key](std::shared_ptr<const DecodedSegment> value) {
+      auto at = table.find(key);
+      if (at == table.end()) return;
+      at->second.ready = std::move(value);
+      at->second.pending.reset();
+      held += at->second.ready->bytes;
+      trim();
+    }, [this, key](kj::Exception&&) {
+      ++failures;
+      table.erase(key);
+    }));
+    entry = table.emplace(key, Entry{}).first;
+    entry->second.pending.emplace(kj::mv(forked));
+  } else {
+    ++joins;
+  }
+  entry->second.lastUsedMs = now;
+  return entry->second.pending->addBranch();
+}
+void SegmentDecodeCache::trim() {
+  while (held > limit) {
+    auto victim = table.end();
+    for (auto at = table.begin(); at != table.end(); ++at)
+      if (at->second.ready && (victim == table.end() || at->second.lastUsedMs < victim->second.lastUsedMs)) victim = at;
+    if (victim == table.end()) break;
+    held -= std::min(held, victim->second.ready->bytes);
+    table.erase(victim);
+    ++evictions;
+  }
+}
+bool SegmentDecodeCache::sweep() {
+  const auto now = monotonicTimeMs();
+  for (auto at = table.begin(); at != table.end();) {
+    if (at->second.ready && now - at->second.lastUsedMs >= idle) {
+      held -= std::min(held, at->second.ready->bytes);
+      at = table.erase(at);
+      ++evictions;
+    } else {
+      ++at;
+    }
+  }
+  return !table.empty();
+}
+kj::Promise<std::vector<LogRecord>> readRecoverySegmentsDecoded(SegmentDecodeCache& cache, HistoryGet get,
+    const ObjectManifest& manifest, const std::string& objectName, uint32_t parallelism, HistoryLog log,
+    SegmentReadStats* stats) {
+  std::vector<LogRecord> out;
+  std::map<uint64_t, std::optional<ShardEpoch>> owners;
+  const std::set<std::pair<uint64_t, uint64_t>> exclusions(manifest.isolated.begin(), manifest.isolated.end());
+  std::vector<ManifestSegment> wanted = manifest.segments;
+  std::sort(wanted.begin(), wanted.end(), [](const ManifestSegment& a, const ManifestSegment& b) {
+    return std::tie(a.shardEpoch, a.nodeEpoch, a.segment) < std::tie(b.shardEpoch, b.nodeEpoch, b.segment);
+  });
+  const size_t width = std::max<uint32_t>(1, parallelism);
+  for (size_t at = 0; at < wanted.size();) {
+    kj::Vector<kj::Promise<std::shared_ptr<const DecodedSegment>>> running;
+    const size_t until = std::min<size_t>(wanted.size(), at + width);
+    auto loaded = std::make_unique<bool[]>(until - at);
+    for (size_t i = at; i < until; ++i) running.add(cache.segment(wanted[i], &loaded[i - at]));
+    const auto waitBegan = monotonicTimeMs();
+    auto segments = co_await kj::joinPromises(running.releaseAsArray());
+    if (stats) stats->waitMs += monotonicTimeMs() - waitBegan;
+    for (size_t i = 0; i < segments.size(); ++i) {
+      const auto& contents = *segments[i];
+      if (stats) {
+        ++stats->segments;
+        if (loaded[i]) {
+          ++stats->cacheMisses; stats->bytes += contents.encodedBytes;
+          stats->downloadMs += contents.downloadMs; stats->decodeMs += contents.decodeMs; stats->groupMs += contents.groupMs;
+        } else {
+          ++stats->cacheHits;
+        }
+      }
+      const auto selectBegan = monotonicTimeMs();
+      auto group = contents.byObject.find(objectName);
+      if (group != contents.byObject.end()) {
+        for (const auto& kept : group->second) {
+          LogRecord record = kept;
+          const auto& header = contents.header;
+          const auto& ref = wanted[at + i];
+          if (exclusions.contains({record.shardEpoch, record.nodeSeq}) && header.reason != "earlier-epoch" &&
+              header.reason != "recovery-tail" && header.nodeId == ref.nodeId &&
+              header.nodeEpoch == ref.nodeEpoch && header.segment == ref.segment) {
+            auto [owner, fresh] = owners.try_emplace(record.shardEpoch);
+            if (fresh) {
+              auto response = co_await get(shardEpochKey(manifest.namespaceId, record.shard, record.shardEpoch));
+              requireStorage(response.status == 200, "an excluded record's original shard owner is unavailable");
+              owner->second = parseShardEpoch(response.bytes);
+              requireStorage(owner->second && owner->second->namespaceId == manifest.namespaceId &&
+                  owner->second->shard == record.shard && owner->second->epoch == record.shardEpoch,
+                  "an excluded record's original shard owner is invalid");
+            }
+            record.ownerSealed = owner->second && owner->second->nodeId == header.nodeId &&
+                owner->second->nodeEpoch == header.nodeEpoch && record.nodeEpoch == header.nodeEpoch;
+            if (record.ownerSealed) if (log) log("foreign-isolation-ignored", "\"object\":" + quote(objectName) +
+                ",\"shardEpoch\":\"" + std::to_string(record.shardEpoch) + "\",\"nodeSeq\":\"" +
+                std::to_string(record.nodeSeq) + "\"");
+          }
+          if (stats) ++stats->records;
+          out.push_back(std::move(record));
+        }
       }
       if (stats) stats->selectMs += monotonicTimeMs() - selectBegan;
     }

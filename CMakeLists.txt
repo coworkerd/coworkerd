@@ -154,6 +154,7 @@ capnp_generate_cpp(DURABLE_TAIL_TEST_SOURCES DURABLE_TAIL_TEST_HEADERS
 add_executable(coworkerd-durable-channel-test EXCLUDE_FROM_ALL
   node/durable-channel-test.c++
   node/durable-tail-test.c++
+  node/durable-segment-test.c++
   ${DURABLE_TAIL_TEST_SOURCES}
   ${DURABLE_TAIL_TEST_HEADERS}
   node/memory-watermark.c++
@@ -180,6 +181,8 @@ add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
+add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)
+add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight
     cpu-culprit-current-behavior memory-culprit rejected-manifest)

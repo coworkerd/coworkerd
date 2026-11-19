@@ -791,6 +791,10 @@ constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALA
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
 // How many of this node's unsealed records one answer to another node's rebuild carries.
 constexpr size_t TAIL_ANSWER_BYTES = 32u << 20;
+// The decoded segments a node keeps for its rebuilds, and how long one stays without a reader (b57).
+constexpr uint64_t SEGMENT_CACHE_BYTES = 384ull << 20;
+constexpr double SEGMENT_CACHE_IDLE_MS = 30000;
+constexpr uint32_t SEGMENT_CACHE_SWEEP_MS = 5000;
 // The largest record this node takes from another's replicator: a durable process cuts its messages at 8 MiB of
 // frames (workerd's COWORKERD_DO_RECORD_BYTES), so anything far above that is not one of ours.
 constexpr size_t RECORD_BYTES_LIMIT = 256u << 20;
@@ -880,6 +884,14 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureAlarmCpu = std::string_view(v) == "1";
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
+    segmentCache = std::make_unique<SegmentDecodeCache>([this](std::string key) { return store->get(std::move(key)); },
+        SEGMENT_CACHE_BYTES, SEGMENT_CACHE_IDLE_MS, [this](const std::string& key, const DecodedSegment& segment) {
+          log("segment-decoded", "\"key\":" + quote(key) + ",\"records\":" + std::to_string(segment.records) +
+              ",\"objects\":" + std::to_string(segment.byObject.size()) + ",\"encodedBytes\":" +
+              std::to_string(segment.encodedBytes) + ",\"heldBytes\":" + std::to_string(segment.bytes) +
+              ",\"downloadMs\":" + std::to_string(segment.downloadMs) + ",\"decodeMs\":" +
+              std::to_string(segment.decodeMs) + ",\"groupMs\":" + std::to_string(segment.groupMs));
+        });
     alarmPublication = std::make_unique<AlarmPublication>(*store, timer, this->settings.nodeId,
         [this](const std::string& ns, uint32_t shard, uint64_t epoch, uint64_t memberEpoch) {
           if (stopped || memberEpoch != nodeEpoch || membership.selfExpired || membership.identityTaken) return false;
@@ -926,6 +938,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
 
 DurableLog::~DurableLog() noexcept(false) {
   stopped = true;
+  segmentCache.reset();
   alarmDiscovery.reset();
   alarmPublication.reset();
   if (logFd >= 0) ::close(logFd);
@@ -4655,11 +4668,21 @@ kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifes
 
 // The segments a manifest names, in order, at most recoverParallelism downloads at a time; only the records of this
 // object are kept.
+// Each segment is downloaded and decoded once per node, off the event loop, and shared by the rebuilds that name it
+// (b57: one segment of a restarted owner's earlier epoch held every object of the shard, and each object's rebuild
+// decoded all of it on the loop again).
 kj::Promise<std::vector<LogRecord>> DurableLog::readSegments(const ObjectManifest& manifest,
     const std::string& objectName, SegmentReadStats* stats) {
-  return readRecoverySegments([this](std::string key) { return store->get(std::move(key)); }, manifest, objectName,
-      settings.config.recoverParallelism, {}, [this](const std::string& event, const std::string& fields) { log(event, fields); },
-      nullptr, {}, stats);
+  if (!sweepingSegments) { sweepingSegments = true; tasks.add(sweepSegmentCache()); }
+  return readRecoverySegmentsDecoded(*segmentCache, [this](std::string key) { return store->get(std::move(key)); },
+      manifest, objectName, settings.config.recoverParallelism,
+      [this](const std::string& event, const std::string& fields) { log(event, fields); }, stats);
+}
+
+kj::Promise<void> DurableLog::sweepSegmentCache() {
+  do co_await timer.afterDelay(SEGMENT_CACHE_SWEEP_MS * kj::MILLISECONDS);
+  while (segmentCache->sweep());
+  sweepingSegments = false;
 }
 
 void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch) {
@@ -6984,7 +7007,15 @@ std::string DurableLog::json() const {
       << ",\"activeRequests\":" << activeRequests << ",\"activeConnections\":" << activeConnections
       << ",\"rebuilds\":" << rebuilds << ",\"rebuildFailures\":" << rebuildFailures << ",\"repairs\":" << repairs
       << ",\"recoverTimeouts\":" << recoverTimeouts << ",\"lastRebuildMs\":" << lastRebuildMs
-      << ",\"lastRebuildLoopDelayMs\":" << lastRebuildLoopDelayMs << ",\"lastError\":"
+      << ",\"lastRebuildLoopDelayMs\":" << lastRebuildLoopDelayMs;
+  if (segmentCache) {
+    out << ",\"segmentCache\":{\"entries\":" << segmentCache->entries() << ",\"heldBytes\":" << segmentCache->heldBytes()
+        << ",\"limitBytes\":" << segmentCache->limitBytes() << ",\"decodes\":" << segmentCache->decodes
+        << ",\"hits\":" << segmentCache->hits << ",\"misses\":" << segmentCache->misses << ",\"joins\":"
+        << segmentCache->joins << ",\"evictions\":" << segmentCache->evictions << ",\"failures\":"
+        << segmentCache->failures << "}";
+  }
+  out << ",\"lastError\":"
       << quote(lastRebuildError) << ",\"tooLargeAnswers\":" << overLimitAnswers << "},\"disk\":{\"trusted\":"
       << (diskTrusted ? "true" : "false") << ",\"note\":" << quote(startupNote) << ",\"limitBytes\":\""
       << diskLimitBytes << "\",\"usedBytes\":\"" << diskUsedBytes << "\",\"filesDropped\":" << filesDropped
