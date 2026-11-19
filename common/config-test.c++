@@ -75,15 +75,28 @@ void memoryConfiguration(Fixture& fixture) {
   KJ_REQUIRE(fixture.load(R"({"memoryLimitMiB":0})").processPool.memoryLimitMiB == 0,
       "a deliberate environment override permits zero");
 }
+
+void tenantBorrowConfiguration(Fixture& fixture) {
+  const auto defaults = fixture.load("{}");
+  KJ_REQUIRE(defaults.tenantRootLimit == 0 && defaults.tenantNestedLimit == 0 && defaults.tenantBorrowBelowPercent == 0);
+  const auto explicitConfig = fixture.load(R"({"placement":{"tenantRootLimit":16,"tenantNestedLimit":16,"tenantBorrowBelowPercent":88}})");
+  KJ_REQUIRE(explicitConfig.tenantRootLimit == 16 && explicitConfig.tenantNestedLimit == 16 && explicitConfig.tenantBorrowBelowPercent == 88);
+  KJ_REQUIRE(fixture.load(R"({"placement":{"tenantBorrowBelowPercent":100}})").tenantBorrowBelowPercent == 100);
+  std::string refusal;
+  try { fixture.load(R"({"placement":{"tenantBorrowBelowPercent":101}})"); }
+  catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+  KJ_REQUIRE(refusal.find("tenantBorrowBelowPercent") != std::string::npos);
+}
 }
 
 int main(int argc, char** argv) {
   try {
-    KJ_REQUIRE(argc == 2, "select idle or memory");
+    KJ_REQUIRE(argc == 2, "select a configuration test case");
     Fixture fixture;
     const std::string_view label = argv[1];
     if (label == "idle") idleConfiguration(fixture);
     else if (label == "memory") memoryConfiguration(fixture);
+    else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);
   } catch (const kj::Exception& error) {
     std::cerr << error.getDescription().cStr() << '\n';

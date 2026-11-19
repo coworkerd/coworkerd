@@ -49,13 +49,24 @@ inline ChildBudget childBudget(uint16_t before, uint16_t cap, bool naive) {
 struct TenantAdmissionCounts {
   uint32_t roots = 0, nested = 0;
   uint64_t rootRejections = 0, nestedRejections = 0;
+  uint64_t rootBusyRejections = 0, nestedBusyRejections = 0;
   uint32_t& active(bool root) { return root ? roots : nested; }
   uint32_t active(bool root) const { return root ? roots : nested; }
+  uint32_t borrowed(bool root, uint32_t limit) const {
+    const auto count = active(root);
+    return limit != 0 && count > limit ? count - limit : 0;
+  }
   bool empty() const { return roots == 0 && nested == 0 && rootRejections == 0 && nestedRejections == 0; }
 };
 
-inline bool tenantAtLimit(uint32_t count, uint32_t limit, bool reserved) {
-  return count - (reserved ? 1 : 0) >= limit;
+enum class TenantAdmission { Allowed, Borrowed, Refused };
+inline TenantAdmission tenantAdmission(uint32_t count, uint32_t limit, bool reserved, uint32_t nodeRoots,
+    uint32_t nodeNested, uint32_t nodeLimit, uint32_t borrowBelowPercent) {
+  if (limit == 0 || reserved || count < limit) return TenantAdmission::Allowed;
+  // Use the same shared occupancy as the node-wide placement guard. Compare before reserving without rounding.
+  if ((uint64_t{nodeRoots} + nodeNested) * 100 < uint64_t{nodeLimit} * borrowBelowPercent)
+    return TenantAdmission::Borrowed;
+  return TenantAdmission::Refused;
 }
 
 }  // namespace coworkerd

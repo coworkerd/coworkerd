@@ -182,6 +182,7 @@ add_executable(coworkerd-config-test EXCLUDE_FROM_ALL common/config-test.c++)
 target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
+add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
   DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-config-test

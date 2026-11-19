@@ -1545,7 +1545,9 @@ public:
       if (found != tenantAdmissions.end()) {
         const auto count = found->second.active(root);
         KJ_ASSERT(!reserved || count > 0, "reserved admission must belong to the same tenant");
-        if (coworkerd::tenantAtLimit(count, limit, reserved)) {
+        if (coworkerd::tenantAdmission(count, limit, reserved, inFlightRoots, inFlightNested,
+                root ? serverConfig.rootLimit : serverConfig.nestedLimit,
+                serverConfig.tenantBorrowBelowPercent) == coworkerd::TenantAdmission::Refused) {
           auto value = refusal("OVERLOADED", "tenant ingress concurrency limit reached", 503, root);
           value.inFlight = count;
           value.limit = limit;
@@ -1681,6 +1683,8 @@ public:
     auto found = tenantAdmissions.find(admissionTenant(worker, durable));
     KJ_ASSERT(found != tenantAdmissions.end());
     ++(root ? found->second.rootRejections : found->second.nestedRejections);
+    if (serverConfig.tenantBorrowBelowPercent != 0)
+      ++(root ? found->second.rootBusyRejections : found->second.nestedBusyRejections);
   }
 
   std::shared_ptr<AdmissionSlot> reserve(bool root, const std::string& worker, const DurableTarget* durable = nullptr) {
@@ -1774,7 +1778,7 @@ public:
   std::string tenantAdmissionJson() const {
     std::ostringstream out;
     out << "{\"rootLimit\":" << serverConfig.tenantRootLimit << ",\"nestedLimit\":" << serverConfig.tenantNestedLimit
-        << ",\"tenants\":[";
+        << ",\"borrowBelowPercent\":" << serverConfig.tenantBorrowBelowPercent << ",\"tenants\":[";
     bool first = true;
     for (const auto& [id, count] : tenantAdmissions) {
       if (count.empty()) continue;
@@ -1782,7 +1786,11 @@ public:
       first = false;
       out << "{\"tenant\":\"" << jsonEscape(id) << "\",\"inFlight\":{\"roots\":" << count.roots
           << ",\"nested\":" << count.nested << "},\"rejections\":{\"roots\":" << count.rootRejections
-          << ",\"nested\":" << count.nestedRejections << "}}";
+          << ",\"nested\":" << count.nestedRejections
+          << "},\"borrowed\":{\"roots\":" << count.borrowed(true, serverConfig.tenantRootLimit)
+          << ",\"nested\":" << count.borrowed(false, serverConfig.tenantNestedLimit)
+          << "},\"busyRejections\":{\"roots\":" << count.rootBusyRejections
+          << ",\"nested\":" << count.nestedBusyRejections << "}}";
     }
     out << "]}";
     return out.str();
@@ -8667,6 +8675,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
       << ",\"tenantRootLimit\":" << c.tenantRootLimit << ",\"tenantNestedLimit\":" << c.tenantNestedLimit
+      << ",\"tenantBorrowBelowPercent\":" << c.tenantBorrowBelowPercent
       << ",\"subcalls\":" << q(c.subcalls)
       << ",\"idleMs\":" << c.idleMs << ",\"homeProbability\":" << shortestNumber(c.homeProbability) << ",\"avoidMaxMs\":" << c.avoidMaxMs
       << ",\"rejectionAvoidMs\":" << c.rejectionAvoidMs << ",\"connectBackoffMs\":" << c.connectBackoffMs
