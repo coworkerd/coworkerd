@@ -1,6 +1,7 @@
 #include "bundle-cache.h"
 #include "code-package.h"
 #include "invocation-contract.h"
+#include "placement-contract-test.h"
 #include "json.h"
 #include "process-culprit.h"
 #include "manifests.h"
@@ -431,6 +432,7 @@ int main(int argc, char* argv[]) {
   else if (name == "budget") budget();
   else if (name == "identity") identity();
   else if (name == "admission") admission();
+  else if (name == "placement") placementContracts();
   else if (name == "cpu-culprit-current-behavior") cpuCulpritCurrentBehavior();
   else if (name == "memory-culprit") memoryCulprit();
   else if (name == "package") package();
