@@ -32,6 +32,56 @@ struct Member {
   std::string instance = {};
 };
 
+// The lease of this process's membership epochs (objectStore), judged synchronously next to every confirmation of a
+// Durable Object write (results/r45/DESIGN.md section 10). All times are on the lease clock, leaseClockMs(), in ms.
+//
+// S and D: the send time and the cadence slot of the last heartbeat whose success was handled before its end; T and I:
+// the TTL and the heartbeat interval. The epoch is HELD while now < S + T (equal is not). Past it, a heartbeat of the
+// same epoch still in flight whose slot is at most D + T keeps the answer back (WAIT), until it settles or until its
+// end, min(sent, slot) + I, which nothing moves; without one the epoch is EXPIRED and fenced: it never holds again in
+// this process, whatever answer comes later. A success counts only when it is handled before its heartbeat's end, for
+// the epoch it was sent for, and never moves S or D back. Before the first success of an epoch nothing is held
+// (NOT_HELD), which fences nothing. A clock that cannot be read or goes back fences the epoch.
+class LeaseTracker {
+public:
+  enum class Verdict : uint8_t { HELD, WAIT, NOT_HELD, EXPIRED };
+  struct Judgment {
+    Verdict verdict = Verdict::NOT_HELD;
+    // HELD: S + T; WAIT: the earliest end of a heartbeat that keeps the answer back.
+    double untilMs = 0;
+    const char* reason = "";
+  };
+  LeaseTracker(double ttlMs, double intervalMs): ttlMs(ttlMs), intervalMs(intervalMs) {}
+  // A new epoch of this process (a registration): it holds nothing until one of its heartbeats succeeds in time. The
+  // answers of the earlier epochs' heartbeats no longer change anything.
+  void begin(uint64_t epoch);
+  // A heartbeat of the current epoch goes out at `nowMs` for the cadence slot `slotMs` (at most `nowMs`). Its id, or 0
+  // when the epoch is not the current one or is fenced: nothing is sent then.
+  uint64_t sent(uint64_t epoch, double nowMs, double slotMs);
+  // The store's answer to heartbeat `id`, handled at `nowMs`. True when it renewed the lease.
+  bool settled(uint64_t id, bool ok, double nowMs);
+  // A heartbeat abandoned without an answer (its request was canceled): it keeps nothing back any more.
+  void forget(uint64_t id) { pending.erase(id); }
+  // The lease of `epoch` at `nowMs`. EXPIRED for the current epoch fences it (the reason is kept).
+  Judgment judge(uint64_t epoch, double nowMs);
+  void fence(uint64_t epoch, const char* reason);
+  bool fenced(uint64_t epoch) const { return epoch != current || currentFenced; }
+  uint64_t epoch() const { return current; }
+  const char* fenceReason() const { return reason; }
+  size_t inFlight() const { return pending.size(); }
+  // Successes handled after their heartbeat's end (or for an epoch that changed or was fenced): counted, never renewing.
+  uint64_t lateSuccesses = 0, fences = 0;
+
+private:
+  struct Pending { uint64_t epoch; double sentMs, slotMs, endMs; };
+  double ttlMs, intervalMs;
+  uint64_t current = 0, nextId = 0;
+  bool currentFenced = false, held = false;
+  double okSentMs = 0, okSlotMs = 0, lastNowMs = 0;
+  const char* reason = "";
+  std::map<uint64_t, Pending> pending;
+};
+
 // All access takes place on the Server's KJ event loop. Request handling only
 // reads this local view; it never waits for the authority.
 struct MembershipView {
@@ -88,6 +138,10 @@ struct MembershipView {
   // registers a new epoch.
   bool selfExpired = false;
   uint64_t selfExpiries = 0, selfExpiredAtUnixMs = 0;
+  // The lease (LeaseTracker): the clock it is judged by ("boottime" on Linux, else "monotonic", for development), why
+  // the current epoch was fenced, and the heartbeat successes that came too late to renew it.
+  std::string leaseClock, leaseFenceReason;
+  uint64_t leaseFences = 0, lateHeartbeats = 0;
   // The recovery anchor: once this node could not list the store for longer than the TTL, the members it had whose
   // heartbeat objects are still listed stay in its table until recoveredUntilUnixMs (the store's clock: the recovery
   // + TTL + grace) unless a newer epoch of theirs appears. recoveries counts the anchors, keptMembers the members the
@@ -149,6 +203,15 @@ public:
   virtual void ownSuspects(std::function<std::string()> callback) {}
   // objectStore: the durable processes this node runs, announced in its heartbeats (set before start()).
   virtual void setDurableProcesses(uint32_t count) {}
+  // The lease of `epoch` at `nowMs` on the lease clock (LeaseTracker::judge; an EXPIRED current epoch is fenced and
+  // marked selfExpired). It calls nothing back, so a caller in the middle of its own work may use it. The file
+  // membership has no lease: HELD.
+  virtual LeaseTracker::Judgment checkLease(uint64_t epoch, double nowMs) {
+    return {LeaseTracker::Verdict::HELD, 0, ""};
+  }
+  // objectStore: called synchronously, from the membership's own tasks, when the current epoch stops being held
+  // (`lost`: it expired, or another process took the id) and whenever one of its heartbeats settles (a WAIT is decided).
+  virtual void onLease(std::function<void(uint64_t epoch, bool lost)> callback) {}
 };
 
 kj::Own<Membership> newMembership(

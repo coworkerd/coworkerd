@@ -812,6 +812,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
       hooks(std::move(hooksParam)) {
   settings.config.validate();
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureAlarmCpu = std::string_view(v) == "1";
+  if (const auto* v = std::getenv("COWORKERD_SLOW_FLUSH_FOR_TEST"); v != nullptr && *v != '\0') slowFlushForTest = v;
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
     alarmPublication = std::make_unique<AlarmPublication>(*store, timer, this->settings.nodeId,
@@ -2241,6 +2242,16 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
+  // r46: a record of an epoch whose lease is gone is refused before it enters the log (one that waits for a heartbeat
+  // in flight is taken; its confirmation waits). The same reading times the confirmation.
+  const auto takenAtMs = leaseClockMs();
+  if (const auto lease = leaseOf(takenAtMs);
+      lease.verdict == LeaseTracker::Verdict::EXPIRED || lease.verdict == LeaseTracker::Verdict::NOT_HELD) {
+    ++leaseRefusals;
+    if (request) answer(channel, request, ACK_UNAVAILABLE);
+    loseLease(lease);
+    return;
+  }
   record.nodeSeq = nextSeq + 1;
   record.nodeEpoch = nodeEpoch;
   record.shard = object->shard;
@@ -2316,7 +2327,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   flight.processId = channel.processId;
   flight.objectKey = record.key();
   flight.shipperKey = record.shipperKey();
-  flight.sentAtMs = monotonicTimeMs();
+  flight.sentAtMs = takenAtMs;
   flight.bytes = encoded.size();
   flight.endsAtFrame = record.kind == LogRecordKind::FRAMES ? record.firstFrame + record.frames - 1 : 0;
   flight.generation = record.generation;
@@ -2585,6 +2596,7 @@ void DurableLog::checkConfirmations() {
 #else
       const auto result = ::fdatasync(logFd);
 #endif
+      if (!slowFlushForTest.empty()) slowFlushOnceForTest();
       flushOk = result == 0;
       if (!flushOk) {
         logAppendFailed = true;
@@ -2619,11 +2631,18 @@ void DurableLog::checkConfirmations() {
     auto* object = objectOf(key.substr(0, key.rfind('/')));
     if (object != nullptr) markRepair(*object, "the local log could not be flushed");
   }
+  // r46: the lease, judged by a reading of its clock taken just before each answer -- after the local flush above, with
+  // nothing that waits between it and the answer. A peer's acknowledgement never overrides it. Waiting for a heartbeat
+  // in flight leaves the records unconfirmed until it settles or its end passes; a lost lease refuses them all.
+  LeaseTracker::Judgment lease{LeaseTracker::Verdict::HELD, 0, ""};
   for (auto sequence : done) {
     auto found = inFlight.find(sequence);
     if (found == inFlight.end()) continue;
+    const auto now = leaseClockMs();
+    lease = leaseOf(now);
+    if (lease.verdict != LeaseTracker::Verdict::HELD) break;
     const auto& flight = found->second;
-    const auto took = monotonicTimeMs() - flight.sentAtMs;
+    const auto took = now - flight.sentAtMs;
     ++confirmations;
     confirmMsTotal += took;
     if (confirmSamples.size() < CONFIRM_SAMPLES) confirmSamples.push_back(took);
@@ -2634,6 +2653,68 @@ void DurableLog::checkConfirmations() {
     confirmed.insert(sequence);
     inFlight.erase(found);
   }
+  if (lease.verdict == LeaseTracker::Verdict::WAIT) {
+    ++leaseWaits;
+    wakeForLease(lease.untilMs);
+  } else if (lease.verdict != LeaseTracker::Verdict::HELD) {
+    loseLease(lease);
+  }
+}
+
+LeaseTracker::Judgment DurableLog::leaseOf(double nowMs) {
+  if (!leaseCheck) return {LeaseTracker::Verdict::HELD, 0, ""};
+  return leaseCheck(nodeEpoch, nowMs);
+}
+
+// Every record still waiting is refused (ACK_UNAVAILABLE, the write's STORAGE_UNAVAILABLE) and excluded the way any
+// unconfirmed write is; confirmed records and the peers' valid tails stay. Then the node stops holding its shards.
+void DurableLog::loseLease(const LeaseTracker::Judgment& judgment) {
+  const bool first = leaseLostEpoch != nodeEpoch;
+  if (judgment.verdict == LeaseTracker::Verdict::EXPIRED) leaseLostEpoch = nodeEpoch;
+  std::set<std::string> names;
+  for (const auto& [sequence, flight] : inFlight) {
+    if (isolated.contains(sequence)) continue;
+    ++leaseRefusals;
+    if (auto record = parsed.find(sequence); record != parsed.end()) names.insert(hostNameOf(record->second));
+  }
+  if (first || !names.empty()) {
+    if (first && judgment.verdict == LeaseTracker::Verdict::EXPIRED) ++leaseLosses;
+    log("lease-refused", "\"objects\":" + std::to_string(names.size()) + ",\"verdict\":\"" +
+        (judgment.verdict == LeaseTracker::Verdict::EXPIRED ? "expired" : "not-held") + "\",\"reason\":" +
+        quote(judgment.reason));
+  }
+  for (const auto& name : names)
+    if (auto* object = objectOf(name)) isolateObjectPending(*object, "the node's membership lease ended before confirmation");
+  if ((first || judgment.verdict != LeaseTracker::Verdict::EXPIRED) && leaseLostHook) leaseLostHook(judgment.reason);
+}
+
+// A WAIT is judged again when a heartbeat settles (leaseSettled) and at the earliest end it named.
+void DurableLog::wakeForLease(double untilMs) {
+  if (leaseWakeAtMs != 0 && leaseWakeAtMs <= untilMs) return;
+  leaseWakeAtMs = untilMs;
+  const auto generation = ++leaseWakeGeneration;
+  const auto delayUs = int64_t(std::ceil(std::max(0.0, untilMs - leaseClockMs()) * 1000)) + 1000;
+  tasks.add(timer.afterDelay(delayUs * kj::MICROSECONDS).then([this, generation]() {
+    if (generation != leaseWakeGeneration) return;
+    leaseWakeAtMs = 0;
+    checkConfirmations();
+  }));
+}
+
+void DurableLog::leaseSettled() {
+  if (!inFlight.empty()) checkConfirmations();
+}
+
+void DurableLog::slowFlushOnceForTest() {
+  const std::filesystem::path trigger(slowFlushForTest);
+  std::error_code code;
+  if (!std::filesystem::exists(trigger, code)) return;
+  std::string text;
+  try { text = readFile(trigger); } catch (const kj::Exception&) { return; }
+  std::filesystem::remove(trigger, code);
+  const auto ms = std::strtoull(text.c_str(), nullptr, 10);
+  log("slow-flush-for-test", "\"ms\":" + std::to_string(ms));
+  ::usleep(useconds_t(std::min<uint64_t>(ms, 60000) * 1000));
 }
 
 // Records this node will never confirm and never put in a segment: the write was answered with a failure, so a
@@ -4962,7 +5043,15 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     if (ready || allOwners()) break;
     co_await owners.addBranch();if (allOwners()) break;
     co_await peersDone.addBranch();
-    if (state->discoveryAttempted && monotonicTimeMs() >= deadline) break;
+    if (state->discoveryAttempted && monotonicTimeMs() >= deadline) {
+      // r46: no cut while a silent previous owner's heartbeat shows its epoch still live, or cannot be judged.
+      std::vector<std::pair<std::string, uint64_t>> silent;
+      for (const auto& source : state->sources)
+        if (!source.ownerComplete) silent.emplace_back(source.epoch.nodeId, source.epoch.nodeEpoch);
+      if (co_await previousOwnersMayBeCut(object.objectName, std::move(silent))) break;
+      co_await timer.afterDelay(200 * kj::MILLISECONDS);
+      checkIdentity();
+    }
     if (!state->discoveryAttempted || monotonicTimeMs() >= nextDiscovery) {
       co_await discover();checkIdentity();continue;
     }
@@ -5013,6 +5102,59 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         std::to_string(out.records.size()));
   }
   co_return out;
+}
+
+// r46 (results/r45/DESIGN.md 10.4): one read of each silent previous owner's heartbeat of its node epoch before a cut.
+// Its epoch still live by the membership's rule (the answer's Date minus its Last-Modified within TTL + grace) means a
+// heartbeat reached the store late: no cut yet, the recovery keeps asking. A failed read, an answer without both times,
+// or a record that names another node or epoch cannot allow a cut either. A heartbeat that is gone allows it, as
+// before (that alone never proves the tail empty: the cut is what it was). The epochs this process held are its own
+// to judge: never read. This is not a barrier against a heartbeat that lands after the read; the writer's own lease
+// check is.
+kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
+    std::vector<std::pair<std::string, uint64_t>> owners) {
+  for (const auto& [nodeId, epoch] : owners) {
+    if (nodeId == settings.nodeId && membership.heldEpochs.contains(std::to_string(epoch))) continue;
+    const auto answer = co_await readOwnerHeartbeat(nodeId, epoch);
+    if (answer == OwnerHeartbeat::GONE) continue;
+    ++(answer == OwnerHeartbeat::LIVE ? cutsHeldOwnerLive : cutsHeldOwnerUnknown);
+    log(answer == OwnerHeartbeat::LIVE ? "cut-held-owner-live" : "cut-held-owner-unknown",
+        "\"object\":" + quote(objectName) + ",\"owner\":" + quote(nodeId) + ",\"nodeEpoch\":\"" +
+        std::to_string(epoch) + "\"");
+    co_return false;
+  }
+  co_return true;
+}
+
+kj::Promise<DurableLog::OwnerHeartbeat> DurableLog::readOwnerHeartbeat(std::string nodeId, uint64_t epoch) {
+  const auto key = std::make_pair(nodeId, epoch);
+  const auto now = monotonicTimeMs();
+  if (auto found = ownerReads.find(key); found != ownerReads.end() && now - found->second.atMs < OWNER_REREAD_MS)
+    return found->second.answer.addBranch();
+  for (auto it = ownerReads.begin(); it != ownerReads.end();)
+    it = now - it->second.atMs >= OWNER_REREAD_MS ? ownerReads.erase(it) : std::next(it);
+  ++ownerHeartbeatReads;
+  const auto limitMs = int64_t(membership.grantedTtlSeconds) * 1000 + membership.livenessGraceMs;
+  auto read = [](DurableLog& self, std::string nodeId, uint64_t epoch, int64_t limitMs) -> kj::Promise<OwnerHeartbeat> {
+    if (!self.store) co_return OwnerHeartbeat::UNKNOWN;
+    ObjectResponse response;
+    try {
+      response = co_await self.timer.timeoutAfter(std::max<uint32_t>(1, self.settings.peerTimeoutMs) * kj::MILLISECONDS,
+          self.store->get(memberHeartbeatKey(nodeId, epoch)));
+    } catch (const kj::Exception&) {
+      co_return OwnerHeartbeat::UNKNOWN;
+    }
+    if (response.status == 404) co_return OwnerHeartbeat::GONE;
+    if (response.status != 200 || !response.dateUnixMs || !response.lastModifiedUnixMs) co_return OwnerHeartbeat::UNKNOWN;
+    const auto record = parseMemberRecord(response.bytes);
+    if (!record || record->nodeId != nodeId || record->epoch != epoch) co_return OwnerHeartbeat::UNKNOWN;
+    const auto age = int64_t(response.dateUnixMs) - int64_t(response.lastModifiedUnixMs);
+    co_return age > limitMs ? OwnerHeartbeat::GONE : OwnerHeartbeat::LIVE;
+  };
+  auto fork = read(*this, nodeId, epoch, limitMs).fork();
+  auto branch = fork.addBranch();
+  ownerReads.insert_or_assign(key, OwnerRead{kj::mv(fork), now});
+  return branch;
 }
 
 // Recovered bytes are not part of this node's live append sequence. Publish
@@ -6751,6 +6893,7 @@ std::string DurableLog::json() const {
       << ",\"unconfirmed\":" << unconfirmed << ",\"unconfirmedBytes\":\"" << unconfirmedBytes
       << "\",\"meanMs\":" << (confirmations ? confirmMsTotal / double(confirmations) : 0) << ",\"p50Ms\":"
       << percentile(confirmSamples, 0.5) << ",\"p99Ms\":" << percentile(confirmSamples, 0.99)
+      << ",\"leaseRefusals\":" << leaseRefusals << ",\"leaseWaits\":" << leaseWaits << ",\"leaseLosses\":" << leaseLosses
       << "},\"log\":{\"records\":" << recordsTaken << ",\"frames\":" << framesTaken << ",\"bytes\":\"" << bytesTaken
       << "\",\"unsealed\":" << records.size() << ",\"unsealedBytes\":\"" << recordBytes << "\",\"nextSeq\":\""
       << nextSeq << "\",\"sealedSeq\":\"" << sealedSeq << "\",\"walCutBacks\":" << walCutBacks
@@ -6812,6 +6955,8 @@ std::string DurableLog::json() const {
         << (entry.wakes ? double(entry.wakeUsTotal) / double(entry.wakes) / 1000.0 : 0.0) << "}";
   }
   out << "],\"recovery\":{\"bounded\":" << tailRecoveryBounded << ",\"ownerSilent\":" << ownerSilentRecoveries
+      << ",\"cutsHeldOwnerLive\":" << cutsHeldOwnerLive << ",\"cutsHeldOwnerUnknown\":" << cutsHeldOwnerUnknown
+      << ",\"ownerHeartbeatReads\":" << ownerHeartbeatReads
       << ",\"lateRecords\":" << lateTailRecords << ",\"transferredRecords\":" << transferredTailRecords
       << ",\"unaccountedRecords\":" << unaccountedTailRecords << ",\"unaccountedBytes\":\""
       << unaccountedTailBytes << "\",\"restoredUnaccountedRecords\":" << restoredUnaccountedRecords
