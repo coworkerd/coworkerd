@@ -603,7 +603,7 @@ struct ProcessPoolConfig {
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
   # Per-tenant calls in each native ordinary or quarantine generation.
-  tenantInFlightLimit @14 :UInt32 = 16;
+  tenantInFlightLimit @14 :UInt32 = 13;
   # 0 derives a safe share from the node's cgroup/configured memory budget.
   threadedMemoryBytes @15 :UInt64 = 0;
   # Shared-pointer-space budget, below the measured fatal boundary.

@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <limits>
 #include <vector>
 
 namespace coworkerd {
@@ -17,8 +15,7 @@ struct TrialVerdict {
   std::string message;
 };
 inline TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& name, const std::string& raw,
-    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB,
-    bool nativeColumns = false) {
+    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB) {
   if (stage == "bridge") return {"LOAD_FAILED", "",
       "the trial could not reach the runtime: remote exception: remote.jsg.Error: " + raw};
   std::string text = raw;
@@ -42,21 +39,6 @@ inline TrialVerdict classifyTrialFailure(const std::string& stage, const std::st
     if (line.starts_with("imported from ")) where = line;
     else if (line.starts_with("at ") && line.find("node-internal:") == std::string::npos &&
         line.find("__coworkerd_entrypoint__.js") == std::string::npos) where = line;
-  }
-  if (nativeColumns && !where.empty()) {
-    // JsMessage reports zero-based columns; Error.stack used by the Rust
-    // loader reports one-based columns. Keep the public location unchanged.
-    auto end = where.size();
-    while (end > 0 && !std::isdigit(static_cast<unsigned char>(where[end - 1]))) --end;
-    auto begin = end;
-    while (begin > 0 && std::isdigit(static_cast<unsigned char>(where[begin - 1]))) --begin;
-    if (begin > 0 && begin < end && where[begin - 1] == ':') {
-      uint64_t column = 0;
-      auto parsed = std::from_chars(where.data() + begin, where.data() + end, column);
-      if (parsed.ec == std::errc{} && parsed.ptr == where.data() + end && column < std::numeric_limits<uint64_t>::max()) {
-        where.replace(begin, end - begin, std::to_string(column + 1));
-      }
-    }
   }
   auto colon = head.find(": ");
   std::string error = colon == std::string::npos ? std::string() : head.substr(0, colon);

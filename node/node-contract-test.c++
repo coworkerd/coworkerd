@@ -1,4 +1,5 @@
 #include "bundle-cache.h"
+#include "config.h"
 #include "code-package.h"
 #include "invocation-contract.h"
 #include "event-loop.h"
@@ -29,6 +30,22 @@ struct TempDir {
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
+}
+
+void nativeConfig() {
+  TempDir directory;
+  write(directory / "default.json", "{}");
+  const auto direct = ServerConfig::load({});
+  const auto decoded = ServerConfig::load(directory / "default.json");
+  for (const auto* config : {&direct, &decoded}) {
+    KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
+    KJ_REQUIRE(config->processPool.tenantInFlightLimit == 13);
+    KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
+  }
+  write(directory / "limits.json", "{\"cpuLimitMs\":200,\"memoryLimitMiB\":64}");
+  const auto overridden = ServerConfig::load(directory / "limits.json");
+  KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
+      overridden.processPool.memoryLimitMiB == 64);
 }
 
 void eventLoopProgress() {
@@ -71,9 +88,9 @@ void trialVerdicts() {
   auto memory = classifyTrialFailure("evaluation", "Error", "MEMORY_LIMIT_EXCEEDED", false, true, 30000, 128);
   KJ_REQUIRE(cpu.category == "LIMIT_EXCEEDED" && cpu.limit == "cpu" && memory.limit == "memory");
   KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: tenant top-level throw", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
-  auto native = classifyTrialFailure("evaluation", "Error", "Uncaught Error: top-level failure\nat index.js:1:6", false, false, 30000, 128, true);
+  auto native = classifyTrialFailure("evaluation", "Error", "Uncaught Error: top-level failure\nat index.js:1:7", false, false, 30000, 128);
   KJ_REQUIRE(native.message == "Error: top-level failure (at index.js:1:7)");
-  KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: failure\nat index.js:1:" + std::string(80, '9'), false, false, 30000, 128, true).category == "TOP_LEVEL_THROW");
+  KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: failure\nat index.js:1:" + std::string(80, '9'), false, false, 30000, 128).category == "TOP_LEVEL_THROW");
 }
 
 auto number(const std::string& bytes, const char* field) {
@@ -472,7 +489,8 @@ int main(int argc, char* argv[]) {
   using namespace coworkerd;
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
-  if (name == "deadlines") deadlines();
+  if (name == "native-config") nativeConfig();
+  else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
   else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();

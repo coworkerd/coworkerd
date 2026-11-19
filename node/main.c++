@@ -2088,7 +2088,7 @@ public:
         } else {
           const auto applied = runtime.effectiveLimits(probe.workerId);
           auto verdict = classifyTrialFailure("load", string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
-              applied.cpuMs, applied.memoryMiB, process->threadedServer());
+              applied.cpuMs, applied.memoryMiB);
           category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
           detail = verdict.category.empty() ? "LOAD_FAILED" : verdict.category;
           message = verdict.message;
@@ -2691,7 +2691,7 @@ public:
         refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
       } else {
         auto limits = runtime.effectiveLimits(slot->process->workerId);
-        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB, slot->process->threadedServer());
+        auto verdict = classifyTrialFailure("load", "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
         refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
         refused.reason = verdict.message;
       }
@@ -7911,7 +7911,7 @@ private:
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
             verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
-                    applied.cpuMs, applied.memoryMiB, probeProcess->threadedServer());
+                    applied.cpuMs, applied.memoryMiB);
           }
         }
       }

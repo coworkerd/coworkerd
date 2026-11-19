@@ -633,10 +633,10 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..655996140a4ea0945e4dfe7b87560e35ef71d053
+index 0000000000000000000000000000000000000000..917f4b3b33f99eb66308d973d04d610ae890c8f4
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,465 @@
 +// Test the production implementation, including its private ownership types.
 +// The executable's main is renamed; KJ supplies this target's test main.
 +#define main coworkerdThreadedExecutableMain
@@ -1069,6 +1069,19 @@ index 0000000000000000000000000000000000000000..655996140a4ea0945e4dfe7b87560e35
 +  KJ_EXPECT(rejected);
 +}
 +
++KJ_TEST("source JSON failures preserve the actual Worker decoder exception") {
++  initializeV8();
++  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
++  bool failed = false;
++  KJ_IF_SOME(error, sourceJsonFailure("not JSON", limits)) {
++    failed = true;
++    KJ_EXPECT(error == "SyntaxError: Unexpected token 'o', \"not JSON\" is not valid JSON");
++  }
++  KJ_EXPECT(failed);
++  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
++  KJ_EXPECT(sourceJsonFailure("{}", valid) == kj::none);
++}
++
 +KJ_TEST("compatibility refusals are tenant validation before package decoding") {
 +  Slot slot;
 +  Reporter reporter;
@@ -1091,10 +1104,10 @@ index 0000000000000000000000000000000000000000..655996140a4ea0945e4dfe7b87560e35
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7236783a6
+index 0000000000000000000000000000000000000000..7e96ad1db8ecb32d9d9adec98e0b9b7914ee020c
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -0,0 +1,3696 @@
+@@ -0,0 +1,3747 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -2335,6 +2348,45 @@ index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7
 +  return flags;
 +}
 +
++kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limits) {
++  // Run the same JSON decoder as a Worker, only after the protocol decoder
++  // rejected the source response. Its temporary validation isolate belongs
++  // to this load and uses its CPU, heap and process reservation.
++  OomReportScope oom(limits.identity, limits.memoryMiB);
++  auto *isolate = v8::Isolate::New(limits.getCreateParams());
++  KJ_DEFER(isolate->Dispose());
++  limits.customizeIsolate(isolate);
++  v8::Locker locker(isolate);
++  v8::Isolate::Scope entered(isolate);
++  v8::HandleScope handles(isolate);
++  auto context = v8::Context::New(isolate);
++  v8::Context::Scope inContext(context);
++  std::atomic<LimitCause> cause{LimitCause::NONE};
++  CpuExecution execution(isolate, cause, limits.memoryState, limits.memory, 0, limits.cpuMs,
++      limits.memoryMiB, limits.identity);
++  v8::TryCatch caught(isolate);
++  v8::Local<v8::String> text;
++  v8::Local<v8::Value> value;
++  kj::Maybe<kj::String> failure = kj::none;
++  if (!v8::String::NewFromUtf8(isolate, input.begin(), v8::NewStringType::kNormal, input.size())
++           .ToLocal(&text) ||
++      !v8::JSON::Parse(context, text).ToLocal(&value)) {
++    if (limits.memoryState->load() == LimitCause::MEMORY)
++      failure = kj::str("MEMORY_LIMIT_EXCEEDED");
++    else if (cause.load() == LimitCause::CPU)
++      failure = kj::str("CPU_LIMIT_EXCEEDED");
++    else if (cause.load() == LimitCause::PROCESS_MEMORY) {
++      execution.finish();
++      kj::throwRecoverableException(capacityError());
++    } else {
++      v8::String::Utf8Value description(isolate, caught.Exception());
++      if (*description) failure = kj::str(kj::StringPtr(*description, description.length()));
++    }
++  }
++  execution.finish();
++  return failure;
++}
++
 +void ThreadState::acceptDeadline(kj::StringPtr descriptor) {
 +  JsonDoc document(descriptor);
 +  auto value = field(field(document.get(), "lease"), "expiresAtMonotonicMs");
@@ -2702,7 +2754,7 @@ index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7
 +            configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
 +            limit)),
 +        tenantBudget(std::make_shared<TenantBudget>(
-+            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 16))),
++            configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 13))),
 +        subrequestBudget(limit, tenantBudget->limit) {
 +    KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
 +    resources->reclaimWake = managerWake;
@@ -3135,13 +3187,26 @@ index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7
 +    }
 +    auto content = co_await response.body->readAllText(256u << 20);
 +    slot.loadStage = threaded::LoadStage::DECODE;
-+    JsonDoc source(content);
++    std::unique_ptr<JsonDoc> source;
++    try {
++      source = std::make_unique<JsonDoc>(content);
++    } catch (kj::Exception &error) {
++      IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
++          workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
++          invocationIdentity(slot, descriptor), slot.reservation);
++      isolateCreationAttempts.fetch_add(1);
++      KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
++        kj::throwRecoverableException(
++            kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::mv(failure)));
++      }
++      kj::throwRecoverableException(kj::mv(error));
++    }
 +    slot.loadStage = threaded::LoadStage::PACKAGE;
-+    KJ_REQUIRE(text(source.get(), "workerId") == text(descriptor, "workerId") &&
-+            text(source.get(), "versionId") == text(descriptor, "versionId") &&
-+            text(source.get(), "contentHash") == text(descriptor, "contentHash"),
++    KJ_REQUIRE(text(source->get(), "workerId") == text(descriptor, "workerId") &&
++            text(source->get(), "versionId") == text(descriptor, "versionId") &&
++            text(source->get(), "contentHash") == text(descriptor, "contentHash"),
 +        "Trusted source identity mismatch");
-+    co_return text(source.get(), "source");
++    co_return text(source->get(), "source");
 +  }
 +
 +  kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
@@ -4371,7 +4436,6 @@ index 0000000000000000000000000000000000000000..50a2075bf29cf713c36db4e74b7caad7
 +      true, kj::mv(tracer), kj::mv(cf), kj::none);
 +  return {kj::mv(entry), kj::mv(invocation)};
 +}
-+
 +
 +kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
 +  KJ_REQUIRE(!used, "one event per invocation");

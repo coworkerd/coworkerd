@@ -90,7 +90,7 @@ struct ProcessPoolConfig {
   std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
   // Per-tenant concurrent invocations in each native process.
-  uint32_t tenantInFlightLimit = 16;
+  uint32_t tenantInFlightLimit = 13;
   // 0 derives a process share from the node's actual memory budget, including a spare generation.
   uint64_t threadedMemoryBytes = 0;
   uint32_t threadedResidentLimit = 1840;
