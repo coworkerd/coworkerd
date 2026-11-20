@@ -1,6 +1,7 @@
 #include "invocation-contract.h"
 #include "tenant-execution.h"
 #include "event-loop.h"
+#include "rpc-clock.h"
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
@@ -4494,7 +4495,7 @@ public:
       kj::Own<kj::NetworkAddress> address,
       kj::Own<kj::HttpClient> connector,
       kj::Own<kj::AsyncIoStream> stream,
-      kj::Own<capnp::TwoPartyClient> rpcSystem,
+      kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem,
       rpc::PeerServer::Client peer)
       : generation(generation),
         address(std::move(address)),
@@ -4532,7 +4533,7 @@ private:
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
-  kj::Own<capnp::TwoPartyClient> rpcSystem;
+  kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem;
   rpc::PeerServer::Client peer;
   bool disconnected = false;
   bool ownerTailSupport = false;
@@ -5369,7 +5370,7 @@ private:
       auto tunnel = connector->connect(
           "coworkerd-peer", connectHeaders, {});
       auto stream = std::move(tunnel.connection);
-      auto rpcSystem = kj::heap<capnp::TwoPartyClient>(*stream);
+      auto rpcSystem = kj::heap<coworkerd::CoarseTwoPartyClient>(*stream);
       auto peerClient = rpcSystem->bootstrap().castAs<rpc::PeerServer>();
       auto connection = kj::rc<PeerConnection>(
           generation,
@@ -6071,7 +6072,7 @@ public:
 private:
   ServerCore& server;
   const kj::HttpHeaderTable& headerTable;
-  capnp::TwoPartyServer rpcServer;
+  coworkerd::CoarseTwoPartyServer rpcServer;
   kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial;
   WorkerLogsEndpoint& logs;
   kj::Function<kj::Promise<std::string>()> state;
@@ -7427,7 +7428,7 @@ public:
 
 private:
   const kj::HttpHeaderTable& headerTable;
-  capnp::TwoPartyServer rpcServer;
+  coworkerd::CoarseTwoPartyServer rpcServer;
 };
 
 class SourceService final: public kj::HttpService, public kj::HttpServerCallbacks {

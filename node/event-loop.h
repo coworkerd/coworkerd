@@ -23,6 +23,24 @@ inline void configureNodeEventLoop(kj::WaitScope& scope) {
   scope.setBusyPollInterval(NODE_BUSY_POLL_INTERVAL);
 }
 
+// True for the first call in a turn of the event loop and false for the later ones of the same turn: work that
+// several callers of one turn ask for (the process pool's refresh(), several times a request) is done once. The
+// turn ends with the events queued so far (kj::evalLater).
+class OncePerTurn {
+public:
+  explicit OncePerTurn(kj::TaskSet& tasks): tasks(tasks) {}
+  bool first() {
+    if (done) return false;
+    done = true;
+    tasks.add(kj::evalLater([this]() { done = false; }));
+    return true;
+  }
+
+private:
+  kj::TaskSet& tasks;
+  bool done = false;
+};
+
 // SIGTERM and SIGINT for the node's exit, read from a signalfd in the event
 // loop. With UnixEventPort::onSignal() waiting, every poll of the loop also
 // called sigtimedwait(); a signalfd is one more descriptor in the same epoll.
