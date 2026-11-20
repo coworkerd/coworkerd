@@ -93,6 +93,13 @@ std::string memoryEventsPath() {
   }
   return "/sys/fs/cgroup/memory.events";
 }
+// The oom_kill counter of a memory.events text.
+uint64_t oomKillsIn(std::string_view text) {
+  std::istringstream input{std::string(text)};
+  std::string key; uint64_t value;
+  while (input >> key >> value) if (key == "oom_kill") return value;
+  return 0;
+}
 uint64_t kernelOomKills(const std::string& path) {
   std::ifstream input(path);
   std::string key; uint64_t value;
@@ -1421,13 +1428,22 @@ public:
   // with when it was seen (observeOomKills, at the supervisor cadence and at every exit).
   const std::string memoryEvents = memoryEventsPath();
   uint64_t lastOomKills = kernelOomKills(memoryEvents), foreignOomKills = 0, poolOomKills = 0;
+  // Read every 10 ms: kept open and read from its start (the kernel regenerates the text at offset 0), not reopened.
+  const int memoryEventsFd = ::open(memoryEvents.c_str(), O_RDONLY | O_CLOEXEC);
+  uint64_t currentOomKills() const {
+    if (memoryEventsFd < 0) return kernelOomKills(memoryEvents);
+    char text[512];
+    const auto n = pread(memoryEventsFd, text, sizeof(text) - 1, 0);
+    if (n <= 0) return kernelOomKills(memoryEvents);
+    return oomKillsIn(std::string_view(text, size_t(n)));
+  }
   uint64_t hostCheckOomUnattributed = 0;
   std::function<bool()> hostCheckOomGuard;
   std::deque<double> unattributedOomKills;
   void observeOomKills() {
     const auto now = mono();
     const bool exposed = hostCheckOomGuard && hostCheckOomGuard();
-    for (const auto count = kernelOomKills(memoryEvents); lastOomKills < count; ++lastOomKills) {
+    for (const auto count = currentOomKills(); lastOomKills < count; ++lastOomKills) {
       if (exposed) { ++foreignOomKills; ++hostCheckOomUnattributed; }
       else unattributedOomKills.push_back(now);
     }
@@ -1688,6 +1704,7 @@ public:
   }
   ~Impl() noexcept(false) {
     stopping = true;
+    if (memoryEventsFd >= 0) ::close(memoryEventsFd);
     // SIGKILL is deterministic even when a child is stuck in native or tenant code.
     for (auto& s : slots) eachGeneration(s, [](const auto& p) { if (p->pid > 0) kill(p->pid, SIGKILL); });
     for (auto& s : slots) eachGeneration(s, [](const auto& p) {
@@ -3035,8 +3052,16 @@ public:
     auto delay = std::min<uint64_t>(uint64_t(config.restartBackoffMs) << std::min(s.failures++, 16u), config.restartMaxMs);
     s.restartAt = mono() + delay;
   }
-  // Process state for dispatch decisions; no file is opened or read here except at an exit.
+  // Process state for dispatch decisions; no file is opened or read here except at an exit. One request asks
+  // several times in one turn of the event loop (available, select, pausedAdmission, ...); nothing this reads
+  // changes for the dispatch within that turn, so the first call of a turn refreshes and the others reuse it.
+  bool refreshedThisTurn = false;
+  uint64_t refreshes = 0;
   void refresh() {
+    if (refreshedThisTurn) return;
+    refreshedThisTurn = true;
+    ++refreshes;
+    tasks.add(kj::evalLater([this]() { refreshedThisTurn = false; }));
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
 #ifdef __linux__
       drainSyscallObservations(*p);

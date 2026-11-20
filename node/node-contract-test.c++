@@ -190,8 +190,26 @@ void eventLoopProgress() {
   kj::WaitScope scope(loop);
   configureNodeEventLoop(scope);
   port.burst(1000).wait(scope);
-  KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= 4,
-      "ready I/O must be checked during a continuation burst", port.polls, port.largestBatch);
+  // Ready I/O is checked during the burst, every NODE_BUSY_POLL_INTERVAL turns: not every other turn (each poll
+  // is system calls on the node's main thread), and not never.
+  KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= NODE_BUSY_POLL_INTERVAL + 1 &&
+      port.largestBatch >= NODE_BUSY_POLL_INTERVAL / 4,
+      "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
+}
+
+// SIGTERM and SIGINT reach the node through its signalfd: one raised before anyone waits is not lost, a wait
+// with nothing pending waits, and they arrive in order.
+void shutdownSignals() {
+  ShutdownSignals signals;
+  auto io = kj::setupAsyncIo();
+  KJ_REQUIRE(raise(SIGTERM) == 0);
+  KJ_REQUIRE(signals.next(io.unixEventPort).wait(io.waitScope) == SIGTERM);
+  auto later = signals.next(io.unixEventPort);
+  KJ_REQUIRE(!later.poll(io.waitScope), "no signal is pending yet");
+  KJ_REQUIRE(kill(getpid(), SIGINT) == 0);
+  KJ_REQUIRE(later.wait(io.waitScope) == SIGINT);
+  KJ_REQUIRE(kill(getpid(), SIGTERM) == 0);
+  KJ_REQUIRE(signals.next(io.unixEventPort).wait(io.waitScope) == SIGTERM);
 }
 
 void trialVerdicts() {
@@ -665,6 +683,7 @@ int main(int argc, char* argv[]) {
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
+  else if (name == "shutdown-signals") shutdownSignals();
   else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();
   else if (name == "tree-lease") treeLease();

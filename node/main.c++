@@ -4348,7 +4348,9 @@ public:
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
       if (slot->timing && slot->timing->kind == "binding") slot->timing->emit();
-      slot->report(tracked->status(), limitCode());
+      // Only a call with an outcome to report (a Durable Object's [do] line) needs its limit code: limitCode() reads the
+      // process's event pipe three times.
+      slot->report(tracked->status(), slot->outcome ? limitCode() : std::string());
       co_return;
     } catch (const kj::Exception& error) {
       if (slot->process) slot->process->snapshotAfterFailure();
@@ -8539,10 +8541,9 @@ public:
   kj::Promise<void> ingressClosed() { return ingress.addBranch(); }
 
   // The first signal starts the exit (or joins one already started); the next one is the emergency.
-  kj::Promise<void> signals(kj::Promise<int> first, kj::UnixEventPort& port) {
+  kj::Promise<void> signals(kj::Promise<int> first, coworkerd::ShutdownSignals& received, kj::UnixEventPort& port) {
     begin(signalName(co_await first));
-    auto next = co_await port.onSignal(SIGTERM).exclusiveJoin(port.onSignal(SIGINT));
-    emergency(signalName(next.si_signo));
+    emergency(signalName(co_await received.next(port)));
     co_await kj::Promise<void>(kj::NEVER_DONE);
   }
 
@@ -9199,7 +9200,11 @@ private:
   kj::Own<kj::ConnectionReceiver> inner;
 };
 
+// SIGTERM and SIGINT (main() sets this before run()).
+coworkerd::ShutdownSignals* shutdownSignals = nullptr;
+
 int run(Launch launch) {
+  KJ_REQUIRE(shutdownSignals != nullptr);
   auto io = kj::setupAsyncIo();
   const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
@@ -9346,9 +9351,8 @@ int run(Launch launch) {
       [&io]() { return coworkerd::WorkerdOutput::tenantLines(*io.lowLevelProvider); }});
   bool shuttingDown = false;
   int exitCode = 0;
-  auto shutdown = io.unixEventPort.onSignal(SIGTERM)
-      .exclusiveJoin(io.unixEventPort.onSignal(SIGINT))
-      .then([&shuttingDown](siginfo_t&& info) { shuttingDown = true; return int(info.si_signo); }).fork();
+  auto shutdown = shutdownSignals->next(io.unixEventPort)
+      .then([&shuttingDown](int signal) { shuttingDown = true; return signal; }).fork();
   try {
     desiredState->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     membership->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
@@ -9623,7 +9627,7 @@ int run(Launch launch) {
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())
           .then([]() -> kj::Promise<void> { return kj::NEVER_DONE; }))
-      .exclusiveJoin(drain.signals(shutdown.addBranch(), io.unixEventPort))
+      .exclusiveJoin(drain.signals(shutdown.addBranch(), *shutdownSignals, io.unixEventPort))
       .exclusiveJoin(drain.done().then([&exitCode](int code) { exitCode = code; }))
       .wait(waitScope);
   } catch (...) {
@@ -9866,8 +9870,8 @@ int main(int argc, char** argv) {
     logs.sinkMaxBytes = environmentUnsigned("COWORKERD_WORKERD_LOG_MAX_BYTES", logs.sinkMaxBytes, UINT64_MAX);
     logs.sinkFiles = static_cast<uint32_t>(environmentUnsigned("COWORKERD_WORKERD_LOG_FILES", logs.sinkFiles, 64));
     workerdOutput = std::make_unique<coworkerd::WorkerdOutput>((stack / "logs" / "workerd.log").string(), logs);
-    kj::UnixEventPort::captureSignal(SIGTERM);
-    kj::UnixEventPort::captureSignal(SIGINT);
+    coworkerd::ShutdownSignals signals;
+    shutdownSignals = &signals;
     AsyncLogCallback logCallback;
     return run(std::move(*launch));
   } catch (const kj::Exception& error) {
