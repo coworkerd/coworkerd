@@ -264,7 +264,12 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
     if (plan.refusal.empty()) {
       plan.refusal = "this machine's address space (" + std::to_string(machine.addressSpaceBytes >> 30) +
           " GiB) and vm.max_map_count (" + std::to_string(machine.maxMapCount) +
-          ") hold no Worker with one V8 sandbox per isolate";
+          ") hold no Worker with one V8 sandbox per isolate" +
+          (measured && plan.measuredLimit == 0
+              ? ": the probe (coworkerd-threaded --sandbox-facts) created no isolate group; besides the "
+                "address space this can be a commit limit (vm.overcommit_memory=2) or a data limit "
+                "(ulimit -d, systemd LimitDATA=), which each group's 2 GiB buffer pool counts against"
+              : "");
     }
     return plan;
   }

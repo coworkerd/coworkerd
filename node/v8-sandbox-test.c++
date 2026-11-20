@@ -142,6 +142,8 @@ void machineGaps() {
   none0.groupCapacity = 0;
   const auto zero = planV8Sandbox("auto", none0, noKeys(), machine48(), 1840, 1);
   KJ_REQUIRE(zero.refusal.find("hold no Worker") != std::string::npos, zero.refusal.c_str(), zero.perProcessLimit);
+  KJ_REQUIRE(zero.refusal.find("vm.overcommit_memory=2") != std::string::npos &&
+      zero.refusal.find("LimitDATA=") != std::string::npos, zero.refusal.c_str());
   // Nothing known at all: nothing is lowered, V8's fallible groups remain.
   auto unmeasured = sandboxBuild();
   unmeasured.capacityMeasured = false;
