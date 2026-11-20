@@ -244,13 +244,14 @@ void PlatformLogCleaner::rebuildMain() {
   mainBytes = 0;
   for (const auto& needle : needles) mainBytes += needle.size();
   recentBytes = 0;
-  mainState = recentState = 0;
+  ++mainBuilt;
+  ++recentBuilt;
 }
 
 void PlatformLogCleaner::rebuildRecent() {
   std::vector<std::string_view> added(needles.begin() + mainCount, needles.end());
   recent.build(added);
-  recentState = 0;
+  ++recentBuilt;
 }
 
 // The active region's needles, read under its sequence number. A rebuilt
@@ -284,7 +285,6 @@ bool PlatformLogCleaner::refresh() {
       needles = std::move(loaded);
       generation = current;
       rebuildMain();
-      scan(main, mainState, 0);
       return true;
     }
     if (loaded.empty()) return true;
@@ -292,25 +292,37 @@ bool PlatformLogCleaner::refresh() {
       recentBytes += needle.size();
       needles.push_back(std::move(needle));
     }
-    // A new needle is looked for in the bytes held back as well.
-    if (recentBytes > std::max<size_t>(64 * 1024, mainBytes / 4)) {
-      rebuildMain();
-      scan(main, mainState, 0);
-    } else {
-      rebuildRecent();
-      scan(recent, recentState, 0);
-    }
+    if (recentBytes > std::max<size_t>(64 * 1024, mainBytes / 4)) rebuildMain();
+    else rebuildRecent();
     return true;
   }
   return false;
+}
+
+// A stream whose states belong to automata rebuilt since looks at the bytes it
+// holds back again: a new needle is looked for there as well.
+void PlatformLogCleaner::bringUpToDate(Stream& stream) {
+  if (stream.rescanAll || stream.mainBuilt != mainBuilt) {
+    stream.mainState = 0;
+    scan(main, stream, stream.mainState, 0);
+    stream.mainBuilt = mainBuilt;
+  }
+  if (stream.rescanAll || stream.recentBuilt != recentBuilt) {
+    stream.recentState = 0;
+    scan(recent, stream, stream.recentState, 0);
+    stream.recentBuilt = recentBuilt;
+  }
+  stream.rescanAll = false;
 }
 
 // Match against the original stream, including bytes suppressed by a block
 // quota. An automaton's state retains only prefixes that can still form a
 // value. A match marks its bytes; the run the last match marked is kept so that
 // overlapping matches (a long periodic value) mark each byte once.
-void PlatformLogCleaner::scan(const NeedleAutomaton& automaton, uint32_t& state, size_t begin) {
+void PlatformLogCleaner::scan(const NeedleAutomaton& automaton, Stream& stream, uint32_t& state, size_t begin) {
   if (automaton.patterns() == 0) return;
+  auto& pending = stream.pending;
+  auto& marks = stream.marks;
   size_t runFrom = 0, runTo = 0;
   for (size_t at = begin; at < pending.size(); ++at) {
     state = automaton.step(state, static_cast<uint8_t>(pending[at]));
@@ -329,26 +341,23 @@ void PlatformLogCleaner::scan(const NeedleAutomaton& automaton, uint32_t& state,
   }
 }
 
-std::string PlatformLogCleaner::append(std::string_view input, bool final) {
+std::string PlatformLogCleaner::append(Stream& stream, std::string_view input, bool final) {
   blocked = false;
+  auto& pending = stream.pending;
+  auto& marks = stream.marks;
   if (!refresh()) {
     // No consistent copy of the dictionary now (the writer kept rebuilding it):
     // this block is held back unwritten (counted as suppressed), and every
     // needle looks at it again once a copy succeeds.
     blocked = true;
-    rescanAll = true;
+    stream.rescanAll = true;
     pending.append(input);
     marks.resize(pending.size(), 2);
     return {};
   }
-  if (rescanAll) {
-    rescanAll = false;
-    mainState = recentState = 0;
-    scan(main, mainState, 0);
-    scan(recent, recentState, 0);
-  }
+  bringUpToDate(stream);
   if (needles.empty() && pending.empty()) {
-    if (!input.empty()) emittingRedaction = false;
+    if (!input.empty()) stream.emittingRedaction = false;
     return std::string(input);
   }
 
@@ -362,26 +371,35 @@ std::string PlatformLogCleaner::append(std::string_view input, bool final) {
     pending.append(input.substr(0, take));
     marks.resize(pending.size(), blocked ? 2 : 0);
     input.remove_prefix(take);
-    scan(main, mainState, begin);
-    scan(recent, recentState, begin);
-    const size_t hold = std::max(main.patterns() ? main.depth(mainState) : 0, recent.patterns() ? recent.depth(recentState) : 0);
-    const auto cut = final && input.empty() ? pending.size() : pending.size() - hold;
+    scan(main, stream, stream.mainState, begin);
+    scan(recent, stream, stream.recentState, begin);
+    const size_t hold = std::max(main.patterns() ? main.depth(stream.mainState) : 0,
+        recent.patterns() ? recent.depth(stream.recentState) : 0);
+    auto cut = final && input.empty() ? pending.size() : pending.size() - hold;
+    // A line whose end is held back (it may continue into a value over several lines) is held back from its
+    // start, so that other streams' lines written meanwhile do not land in its middle; a line longer than the
+    // pending block is cut where the hold begins.
+    if (cut < pending.size()) {
+      const auto newline = std::string_view(pending).substr(0, cut).rfind('\n');
+      if (newline != std::string_view::npos && cut - newline - 1 <= LOG_PENDING_BYTES) cut = newline + 1;
+      else if (newline == std::string_view::npos && cut <= LOG_PENDING_BYTES) cut = 0;
+    }
     for (size_t at = 0; at < cut; ++at) {
       if (marks[at] & 2) continue;
       if (marks[at] & 1) {
-        if (!emittingRedaction && !blocked) output += "[redacted]";
-        emittingRedaction = true;
+        if (!stream.emittingRedaction && !blocked) output += "[redacted]";
+        stream.emittingRedaction = true;
       } else {
         if (!blocked) output += pending[at];
-        emittingRedaction = false;
+        stream.emittingRedaction = false;
       }
     }
     pending.erase(0, cut);
     marks.erase(marks.begin(), marks.begin() + cut);
   } while (!input.empty());
   if (final) {
-    mainState = recentState = 0;
-    emittingRedaction = false;
+    stream.mainState = stream.recentState = 0;
+    stream.emittingRedaction = false;
   }
   return output;
 }

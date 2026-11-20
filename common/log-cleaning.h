@@ -75,12 +75,29 @@ private:
 };
 
 // Used only by the log writers, never by the pipe reader or request threads.
-// Keep possible secret prefixes across records, pipe chunks and newlines. The needles are two automata: those of
-// the last full load, and those appended since (rebuilt with every addition, merged into the first once they
-// reach a quarter of it), so an addition never rebuilds the whole dictionary.
+// Keep possible secret prefixes across records, pipe chunks and newlines, per
+// stream: a writer of several processes' output keeps one Stream for each of
+// their streams, so a value printed over several lines (a PEM key) is still
+// found when other processes' lines come in between (v137 section 6.23). The
+// needles are two automata the writer's streams share: those of the last full
+// load, and those appended since (rebuilt with every addition, merged into the
+// first once they reach a quarter of it), so an addition never rebuilds the
+// whole dictionary.
 class PlatformLogCleaner {
 public:
-  std::string append(std::string_view input, bool final = false);
+  struct Stream {
+    std::string pending;
+    std::vector<uint8_t> marks;
+    uint32_t mainState = 0, recentState = 0;
+    uint64_t mainBuilt = 0, recentBuilt = 0;  // the automata its states belong to
+    bool emittingRedaction = false;
+    bool rescanAll = false;
+  };
+  // A stream's next bytes; `final` at its end (all held bytes are written).
+  std::string append(Stream& stream, std::string_view input, bool final = false);
+  // The cleaner's own stream (a writer of one stream).
+  std::string append(std::string_view input, bool final = false) { return append(own, input, final); }
+  // Whether the last append dropped its block.
   bool suppressed() const { return blocked; }
   // Readings: the needles held and the memory of their automata.
   size_t patterns() const { return main.patterns() + recent.patterns(); }
@@ -89,19 +106,16 @@ private:
   bool refresh();
   void rebuildRecent();
   void rebuildMain();
-  void scan(const NeedleAutomaton& automaton, uint32_t& state, size_t begin);
+  void scan(const NeedleAutomaton& automaton, Stream& stream, uint32_t& state, size_t begin);
+  void bringUpToDate(Stream& stream);
   uint64_t generation = UINT64_MAX;
   size_t consumed = 0;
   std::vector<std::string> needles;   // all of them: the first `mainCount` built into `main`, the rest into `recent`
   size_t mainCount = 0, mainBytes = 0, recentBytes = 0;
   NeedleAutomaton main, recent;
-  uint32_t mainState = 0, recentState = 0;
-  std::string pending;
-  std::vector<uint8_t> marks;
-  size_t markedFrom = 0, markedTo = 0;  // the marked run the last match extended, [from, to)
-  bool emittingRedaction = false;
+  uint64_t mainBuilt = 1, recentBuilt = 1;
+  Stream own;
   bool blocked = false;
-  bool rescanAll = false;
 };
 
 // The values of every secret in this Server's deployment view, hidden by every cleaning;

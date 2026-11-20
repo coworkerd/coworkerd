@@ -487,7 +487,9 @@ private:
   struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId; };
   // `queuedMs`: when the reader took the lines from the pipe (the monotonic clock); for a line begun in an
   // earlier read, when its first byte was taken.
-  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; };
+  // A process's stream's whole lines; `final` (no lines) when that stream ended, so that its cleaner state writes
+  // what it held back.
+  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; uint8_t stream = 0; bool final = false; };
 
   // Reader thread: keeps every pipe empty whatever the sink does.
   void readLoop() {
@@ -622,7 +624,8 @@ private:
   void consume(Source& source, Stream& stream, const char* data, size_t size) {
     auto& slot = shared.slots[source.slot];
     const uint64_t readMs = monotonicMs();
-    Batch batch{source.slot, 0, {}, readMs};
+    const auto streamIndex = static_cast<uint8_t>(&stream == &source.streams[0] ? 0 : 1);
+    Batch batch{source.slot, 0, {}, readMs, streamIndex};
     batch.bytes.reserve(size);
     bool dropped = false;
     for (size_t at = 0; at < size;) {
@@ -663,7 +666,7 @@ private:
         } else if (!stream.partial.empty()) {
           // A line that began in an earlier read is as old as its first byte. It is this read's first line and
           // goes alone, so the lines after it keep this read's time.
-          Batch line{source.slot, 1, {}, std::min(readMs, stream.partialSinceMs)};
+          Batch line{source.slot, 1, {}, std::min(readMs, stream.partialSinceMs), streamIndex};
           line.bytes.reserve(length);
           line.bytes.append(stream.partial);
           line.bytes.append(data + at, piece);
@@ -704,6 +707,8 @@ private:
     std::string().swap(stream.partial);
     stream.discarding = false;
     stream.discarded = 0;
+    // The writer writes what this stream's cleaner state held back (a prefix of a value that did not come).
+    enqueue(Batch{source.slot, 0, {}, monotonicMs(), static_cast<uint8_t>(&stream == &source.streams[0] ? 0 : 1), true});
     closeDescriptor(stream.fd);
     shared.slots[source.slot].openStreams.fetch_sub(1, std::memory_order_relaxed);
   }
@@ -870,7 +875,8 @@ private:
       writeMarkers(reported);
       if (done) break;
     }
-    const auto tail = cleaner.append({}, true);
+    std::string tail;
+    for (auto& pair : streams) for (auto& stream : pair) if (!stream.pending.empty()) tail += cleaner.append(stream, {}, true);
     if (!tail.empty() && ensureSink(true)) {
       const auto written = writeSome(sink, tail.data(), tail.size());
       if (written != tail.size()) sinkFailed(errno);
@@ -935,7 +941,7 @@ private:
     // dropped: a secret value it holds may have left the dictionary since. It
     // still passes the cleaner, which keeps its state across blocks.
     const bool stale = monotonicMs() - batch.queuedMs > settings.staleLineMs;
-    const auto text = cleaner.append(batch.bytes);
+    const auto text = cleaner.append(streams[batch.slot][batch.stream], batch.bytes, batch.final);
     const auto* data = text.data();
     const size_t size = text.size(), originalSize = batch.bytes.size();
     if (stale || cleaner.suppressed()) {
@@ -990,7 +996,7 @@ private:
         line << (r ? "," : "") << '"' << DROP_NAMES[r] << "\":" << slot.droppedBy[r].load();
       line << "},\"firstDroppedAtUnixMs\":" << slot.firstDropUnixMs.load()
            << ",\"lastDroppedAtUnixMs\":" << slot.lastDropUnixMs.load() << "}\n";
-      const auto text = cleaner.append(line.str());
+      const auto text = cleaner.append(markers, line.str(), true);
       if (writeSome(sink, text.data(), text.size()) != text.size()) {
         sinkFailed(errno);
         return;
@@ -1020,8 +1026,10 @@ private:
   bool readerDone = false;
   std::array<std::string, OUTPUT_SLOTS> names;
   std::array<uint32_t, OUTPUT_SLOTS> classes{};
-  // Writer thread only.
+  // Writer thread only: one cleaner, one state for each process's stream and one for the markers.
   PlatformLogCleaner cleaner;
+  std::vector<std::array<PlatformLogCleaner::Stream, 2>> streams = std::vector<std::array<PlatformLogCleaner::Stream, 2>>(OUTPUT_SLOTS);
+  PlatformLogCleaner::Stream markers;
   int sink = -1;
   uint64_t failingSinceMs = 0;
   bool sinkRegular = false;

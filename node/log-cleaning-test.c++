@@ -475,6 +475,48 @@ void manyValuesEquivalence() {
   }
 }
 
+// A value over several lines (a PEM key) printed by one process while another process's lines come in between:
+// the drainer keeps one cleaner state per process stream, so the value is still found whole and no line of it is
+// written (v137 section 6.23; with one state for all streams the other process's line broke the match).
+void multiLineValues() {
+  TempDir directory;
+  const auto body1 = syntheticValue(), body2 = syntheticValue();
+  const auto value = "-----BEGIN TEST KEY-----\n" + body1 + "\n" + body2 + "\n-----END TEST KEY-----";
+  std::vector<std::string> needles;
+  addRedaction(needles, value);
+  KJ_REQUIRE(appendPlatformLogRedactions(needles));
+  const auto sinkPath = directory.file("sink");
+  std::string text;
+  {
+    WorkerdOutput output(sinkPath, WorkerLogSettings{});
+    WorkerdOutput::Pipes first, second;
+    KJ_REQUIRE(WorkerdOutput::open(first) && WorkerdOutput::open(second));
+    const int a = dup(first.stdoutWrite), b = dup(second.stdoutWrite);
+    KJ_REQUIRE(a >= 0 && b >= 0);
+    WorkerdOutput::attach(first, 0, "p0", 0, 1, getpid());
+    WorkerdOutput::attach(second, 1, "p1", 0, 1, getpid());
+    auto line = [](int fd, const std::string& bytes) {
+      KJ_REQUIRE(::write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+      usleep(200000);  // read and queued before the next one
+    };
+    line(a, "key: -----BEGIN TEST KEY-----\n" + body1 + "\n");
+    line(b, "other: an unrelated line\n");
+    line(a, body2 + "\n-----END TEST KEY----- done\n");
+    line(b, "other: another line\n");
+    close(a); close(b);
+  }
+  const auto fd = open(sinkPath.c_str(), O_RDONLY | O_CLOEXEC);
+  KJ_REQUIRE(fd >= 0);
+  char buffer[4096];
+  for (ssize_t n; (n = ::read(fd, buffer, sizeof buffer)) > 0;) text.append(buffer, n);
+  close(fd);
+  requireClean(text, body1);
+  requireClean(text, body2);
+  const bool whole = text.find("key: [redacted] done\n") != std::string::npos &&
+      text.find("other: an unrelated line\n") != std::string::npos && text.find("other: another line\n") != std::string::npos;
+  KJ_REQUIRE(whole, "a value over several lines must be hidden whole when other processes' lines come between", text.size());
+}
+
 // Readings, not a test (not registered with CTest): seconds per MiB of ordinary output and the memory the cleaner
 // takes, with N values (48-byte tokens, one in ten with characters that JSON escapes) in the dictionary.
 void benchmark(size_t count, size_t mib) {
@@ -936,6 +978,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "streams") coworkerd::streams();
     else if (argc == 2 && std::string_view(argv[1]) == "many-values") coworkerd::manyValues();
     else if (argc == 2 && std::string_view(argv[1]) == "many-values-equivalence") coworkerd::manyValuesEquivalence();
+    else if (argc == 2 && std::string_view(argv[1]) == "multi-line-values") coworkerd::multiLineValues();
     else if (argc == 4 && std::string_view(argv[1]) == "bench") coworkerd::benchmark(std::stoul(argv[2]), std::stoul(argv[3]));
     else if (argc == 2 && std::string_view(argv[1]) == "generations") coworkerd::generations();
     else if (argc == 2 && std::string_view(argv[1]) == "secret-rotations") coworkerd::secretRotations();

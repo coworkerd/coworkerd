@@ -198,6 +198,13 @@ void eventLoopProgress() {
       "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
 }
 
+// A Durable Object call its node's secret dictionary could not take is SECRET_UNAVAILABLE, as at its admission,
+// whether admission or the descriptor finds it; a durable process not ready stays DO_UNAVAILABLE.
+void durableNotSent() {
+  KJ_REQUIRE(std::string_view(durableNotSentCode(true)) == "SECRET_UNAVAILABLE");
+  KJ_REQUIRE(std::string_view(durableNotSentCode(false)) == "DO_UNAVAILABLE");
+}
+
 // The process pool refreshes once per turn: the first call of a turn does the work, the later ones of that turn
 // do not, and the next turn does it again.
 void oncePerTurn() {
@@ -724,6 +731,7 @@ int main(int argc, char* argv[]) {
   else if (name == "event-loop") eventLoopProgress();
   else if (name == "shutdown-signals") shutdownSignals();
   else if (name == "once-per-turn") oncePerTurn();
+  else if (name == "durable-not-sent") durableNotSent();
   else if (name == "memory-events") memoryEvents();
   else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();

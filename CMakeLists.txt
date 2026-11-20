@@ -187,6 +187,7 @@ set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/wo
 add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
 add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
 add_test(NAME node-log-many-values-equivalence COMMAND coworkerd-log-cleaning-test many-values-equivalence)
+add_test(NAME node-log-multi-line-values COMMAND coworkerd-log-cleaning-test multi-line-values)
 add_test(NAME node-log-generations COMMAND coworkerd-log-cleaning-test generations)
 add_test(NAME node-secret-rotations COMMAND coworkerd-log-cleaning-test secret-rotations)
 add_test(NAME node-secret-limits COMMAND coworkerd-log-cleaning-test secret-limits)
@@ -230,7 +231,7 @@ foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect
     reacquired)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
-foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events trial-verdicts leases tree-lease budget identity admission placement package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent trial-verdicts leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()

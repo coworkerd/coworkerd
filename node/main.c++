@@ -265,7 +265,7 @@ struct PlacementDefinition {
 
 using coworkerd::OpenEvent;
 // `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
-struct ProcessUnavailable { bool quarantine = false; std::string reason; };
+struct ProcessUnavailable { bool quarantine = false; std::string reason; bool secretDictionary = false; };
 // A trial probe that was never sent (TrialService::probe()).
 constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
@@ -3366,7 +3366,7 @@ private:
       // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
       if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
               process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
-        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now"};
+        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now", true};
     };
     if (!version.secrets.empty()) {
       const auto& state = desiredState.state();
@@ -6695,7 +6695,7 @@ private:
       co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
     } catch (const ProcessUnavailable& error) {
       // Nothing was sent: the durable process is not ready, or the secret dictionary could not take the values.
-      co_return refused(server.refusal("DO_UNAVAILABLE", !error.reason.empty() ? error.reason : "the durable process of this object (" +
+      co_return refused(server.refusal(coworkerd::durableNotSentCode(error.secretDictionary), !error.reason.empty() ? error.reason : "the durable process of this object (" +
           server.durableProcessFor(target.key()) + ") is not ready", 503));
     }
   }
