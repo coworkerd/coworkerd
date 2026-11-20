@@ -397,7 +397,7 @@ index 0000000000000000000000000000000000000000..ea862c0d6fe68abfcef1b1f08a4df9ca
 + 
 +       if (element == TheHole) {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b0129ad0904 100644
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38bf9f82211 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -153,6 +153,34 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
@@ -483,7 +483,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
  KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
    initializeV8();
    IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
-@@ -379,6 +441,115 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -379,6 +441,117 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
      "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
      "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
  
@@ -552,8 +552,10 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
 +    "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 +// Loops that allocate nothing while they run: their interrupt checks are what
 +// lets a short CPU limit end the call (each takes about a second unchecked).
++// The numbers' fast path: long decimals, so that the unchecked parse (about 2 s on cwkd-p40) is far past the limit
++// (small integers parsed so fast that an unchecked parse still ended within it).
 +constexpr kj::StringPtr CPU_JSON_NUMBERS =
-+    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**25) + '1]'); retained.length"_kj;
++    "globalThis.retained = JSON.parse('[' + '1.2345678901234567890123e10,'.repeat(2**23) + '1]'); retained.length"_kj;
 +constexpr kj::StringPtr CPU_JSON_SLOW =
 +    "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]'); retained.length"_kj;
 +constexpr kj::StringPtr CPU_JSON_REVIVER =
@@ -599,7 +601,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
  // `count` isolates allocate at the same moment while a neighbor isolate keeps
  // answering. Every heap of this build shares one pointer cage.
  // `raised`: whether each isolate's ceiling must have been raised by the
-@@ -387,18 +558,21 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -387,18 +560,21 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
  // shapes never need the callback; only an object V8 placed without a
  // collection (the 500 MB young one) does. Without this check the callback
  // would hide a missing reserve.
@@ -627,7 +629,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
      isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
      limits[i]->customizeIsolate(isolates[i]);
    }
-@@ -457,16 +631,32 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -457,16 +633,32 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
        v8::HandleScope handles(isolate);
        auto context = v8::Context::New(isolate);
        v8::Context::Scope entered(context);
@@ -662,7 +664,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
        completed.arrive_and_wait();
        release.arrive_and_wait();
        caught.Reset();
-@@ -485,7 +675,13 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -485,7 +677,13 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
    release.arrive_and_wait();
    for (auto& worker: workers) worker.join();
    for (size_t i = 0; i < count; ++i) {
@@ -677,7 +679,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
      const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
      if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
      fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
-@@ -501,20 +697,73 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
+@@ -501,20 +699,73 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
    auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
    if (selected == nullptr) return;
    kj::StringPtr spec(selected);
@@ -763,7 +765,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
    fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
    fflush(stdout);
  }
-@@ -601,6 +850,123 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
+@@ -601,6 +852,123 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
  }
  
@@ -887,7 +889,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b01
  KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
    auto child = runAllocationChild("1:string");
    KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
-@@ -802,6 +1168,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
+@@ -802,6 +1170,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
    if (ended) drain.wait(waitScope);
  }
  
