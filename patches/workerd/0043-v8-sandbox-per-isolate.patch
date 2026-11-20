@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Fri, 20 Nov 2026 12:07:07 +0800
+Date: Sat, 21 Nov 2026 02:17:53 +0800
 Subject: [PATCH] Build the V8 sandbox with one 8 GiB sandbox per isolate group
 
 --config=coworkerd-sandbox (.bazelrc) builds V8 with its sandbox, one pointer-compression cage per
@@ -26,7 +26,7 @@ What the embedder needs with that build:
   sandbox-refused row on the event channel) and every isolate is refused unless V8 reports its
   sandbox as secure, laid out as configured, with the zero segment really held (probed) and a
   group of its own; one [coworkerd-sandbox] row per check. coworkerd-threaded --sandbox-facts
-  prints the process row for the node's plan. A sandbox build without libc++ hardening does not
+  prints the process row and how many isolate groups fit (measured) for the node's plan. A sandbox build without libc++ hardening does not
   compile.
 - Tests: coworkerd-sandbox-test (layout, secure modes, groups, allocation placement, pool, zero
   segment, refusals, exhaustion, a child refused for an occupied low 4 GiB) and the threaded
@@ -1849,7 +1849,7 @@ index 09ee81ac34bb1845ee1087b82075f1f984da081b..3267a65fd3ea297c261d61c3c965c818
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 2cac73c8b6ef474222a22f760dac058fdd3d932a..7437c7af7413021406babc98d30fef317e59c9da 100644
+index 2cac73c8b6ef474222a22f760dac058fdd3d932a..a9ea7a312afd18d6ffb1307c2c8372e3c8e478b2 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -12,6 +12,7 @@ THREADED_DEPS = [
@@ -1860,6 +1860,16 @@ index 2cac73c8b6ef474222a22f760dac058fdd3d932a..7437c7af7413021406babc98d30fef31
      "//src/workerd/server/factory:coworkerd-steady",
      "//src/workerd/util:autogate",
      "//src/workerd/util:entropy",
+@@ -52,6 +53,9 @@ wd_cc_library(
+ )
+ 
+ kj_test(
++    # About 20 s on cwkd-p40 (seven children that each make near-GiB allocations): over the 15 s
++    # that .bazelrc gives a medium test.
++    size = "large",
+     src = "threaded-server-test.c++",
+     malloc = "//src/workerd/server:malloc",
+     target_compatible_with = ["@platforms//os:linux"],
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c98b22e637 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
