@@ -3,6 +3,8 @@
 #include "code-package.h"
 #include "invocation-contract.h"
 #include "event-loop.h"
+#include "memory-events.h"
+#include "tenant-line.h"
 #include "trial-verdict.h"
 #include "tenant-execution.h"
 #include "process-heat.h"
@@ -190,8 +192,94 @@ void eventLoopProgress() {
   kj::WaitScope scope(loop);
   configureNodeEventLoop(scope);
   port.burst(1000).wait(scope);
-  KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= 4,
-      "ready I/O must be checked during a continuation burst", port.polls, port.largestBatch);
+  // Ready I/O is checked during the burst, every NODE_BUSY_POLL_INTERVAL turns: not every other turn (each poll
+  // is system calls on the node's main thread), and not never.
+  KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= NODE_BUSY_POLL_INTERVAL + 1 &&
+      port.largestBatch >= NODE_BUSY_POLL_INTERVAL / 4,
+      "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
+  // The interval itself: 32 to 128 turns (v138 section 1), not the old 1 (a poll every other turn).
+  KJ_REQUIRE(NODE_BUSY_POLL_INTERVAL >= 32 && NODE_BUSY_POLL_INTERVAL <= 128, NODE_BUSY_POLL_INTERVAL);
+  KJ_REQUIRE(port.largestBatch >= 8, "a poll every few turns is the waste v138 removed", port.largestBatch);
+}
+
+// A line its server already cut (the threaded server forwards at most 4,096 bytes of a message, and its size) is
+// marked truncated with its full size, as a line past the drainer's own limit is; a short line is not (b50's
+// log-quota-isolation: the threaded path lost the mark and the count).
+void tenantLineTruncation() {
+  auto parse = [](const std::string& text) { return parseTenantLine(std::string_view(text).substr(0, text.size() - 1)); };
+  const auto earlier = tenantLineText("acme/noisy", "v1", "log", std::string(4096, 'x'), 5000);
+  auto line = parse(earlier);
+  KJ_REQUIRE(line && line->messageBytes == 5000 && line->message.size() == 4096);
+  auto keep = tenantLineKeep(*line, 4096);
+  KJ_REQUIRE(keep.truncated && keep.bytes == 4096 && keep.messageBytes == 5000);
+  const auto own = tenantLineText("acme/noisy", "v1", "log", std::string(5000, 'y'));
+  line = parse(own);
+  KJ_REQUIRE(line && line->messageBytes == 0);
+  keep = tenantLineKeep(*line, 4096);
+  KJ_REQUIRE(keep.truncated && keep.bytes == 4096 && keep.messageBytes == 5000);
+  line = parse(tenantLineText("acme/quiet", "v1", "info", "hello"));
+  KJ_REQUIRE(line && !tenantLineKeep(*line, 4096).truncated && tenantLineKeep(*line, 4096).bytes == 5);
+  KJ_REQUIRE(!parseTenantLine("{\"workerId\":\"acme/quiet\",\"versionId\":\"v1\",\"level\":\"info\",\"message\":\"x\",\"messageBytes\":}"));
+}
+
+// A Durable Object call its node's secret dictionary could not take is SECRET_UNAVAILABLE, as at its admission,
+// whether admission or the descriptor finds it; a durable process not ready stays DO_UNAVAILABLE.
+void durableNotSent() {
+  KJ_REQUIRE(std::string_view(durableNotSentCode(true)) == "SECRET_UNAVAILABLE");
+  KJ_REQUIRE(std::string_view(durableNotSentCode(false)) == "DO_UNAVAILABLE");
+}
+
+// The process pool refreshes once per turn: the first call of a turn does the work, the later ones of that turn
+// do not, and the next turn does it again.
+void oncePerTurn() {
+  kj::EventLoop loop;
+  kj::WaitScope scope(loop);
+  struct Handler final: kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&& e) override { kj::throwFatalException(kj::mv(e)); } } handler;
+  kj::TaskSet tasks(handler);
+  OncePerTurn turn(tasks);
+  unsigned done = 0;
+  auto ask = [&]() { if (turn.first()) ++done; };
+  ask(); ask(); ask();
+  KJ_REQUIRE(done == 1, done);
+  kj::evalLater([&]() { ask(); ask(); }).wait(scope);
+  KJ_REQUIRE(done == 2, done);
+  kj::evalLater([&]() {}).wait(scope);
+  ask();
+  KJ_REQUIRE(done == 3, done);
+}
+
+// memory.events stays open and is read from its start: a counter rewritten in place after the file's name is gone
+// is still read.
+void memoryEvents() {
+  KJ_REQUIRE(oomKillsIn("low 0\nhigh 0\nmax 4\noom 2\noom_kill 3\noom_group_kill 0\n") == 3);
+  KJ_REQUIRE(oomKillsIn("low 0\n") == 0);
+  char path[] = "/tmp/coworkerd-memory-events-XXXXXX";
+  const int fd = mkstemp(path);
+  KJ_REQUIRE(fd >= 0);
+  const std::string first = "low 0\noom_kill 3\n";
+  KJ_REQUIRE(::write(fd, first.data(), first.size()) == ssize_t(first.size()));
+  MemoryEventsReader reader(path);
+  KJ_REQUIRE(reader.oomKills() == 3);
+  KJ_REQUIRE(unlink(path) == 0);
+  const std::string second = "low 0\noom_kill 12\n";
+  KJ_REQUIRE(pwrite(fd, second.data(), second.size(), 0) == ssize_t(second.size()));
+  KJ_REQUIRE(reader.oomKills() == 12, reader.oomKills());
+  close(fd);
+}
+
+// SIGTERM and SIGINT reach the node through its signalfd: one raised before anyone waits is not lost, a wait
+// with nothing pending waits, and they arrive in order.
+void shutdownSignals() {
+  ShutdownSignals signals;
+  auto io = kj::setupAsyncIo();
+  KJ_REQUIRE(raise(SIGTERM) == 0);
+  KJ_REQUIRE(signals.next(io.unixEventPort).wait(io.waitScope) == SIGTERM);
+  auto later = signals.next(io.unixEventPort);
+  KJ_REQUIRE(!later.poll(io.waitScope), "no signal is pending yet");
+  KJ_REQUIRE(kill(getpid(), SIGINT) == 0);
+  KJ_REQUIRE(later.wait(io.waitScope) == SIGINT);
+  KJ_REQUIRE(kill(getpid(), SIGTERM) == 0);
+  KJ_REQUIRE(signals.next(io.unixEventPort).wait(io.waitScope) == SIGTERM);
 }
 
 void trialVerdicts() {
@@ -665,6 +753,11 @@ int main(int argc, char* argv[]) {
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
+  else if (name == "shutdown-signals") shutdownSignals();
+  else if (name == "once-per-turn") oncePerTurn();
+  else if (name == "durable-not-sent") durableNotSent();
+  else if (name == "tenant-line-truncation") tenantLineTruncation();
+  else if (name == "memory-events") memoryEvents();
   else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();
   else if (name == "tree-lease") treeLease();

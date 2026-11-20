@@ -14,6 +14,7 @@
 #include <csignal>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <poll.h>
 #include <sys/socket.h>
@@ -420,6 +421,144 @@ void manyValues() {
     KJ_REQUIRE(joined, "a value split across appends must be cleaned", sink);
   }
 }
+// The multi-pattern cleaner against a direct reference: about 2,500 needles (values, their escaped forms, values
+// that are prefixes, suffixes and repetitions of others, a periodic one), random text with them inside, cut into
+// random chunks. Every byte any needle covers is hidden, adjacent hidden bytes give one marker, nothing else changes.
+std::string referenceClean(const std::string& text, const std::vector<std::string>& needles) {
+  std::vector<char> hidden(text.size());
+  for (const auto& needle : needles)
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+      std::fill(hidden.begin() + at, hidden.begin() + at + needle.size(), 1);
+  std::string out;
+  for (size_t at = 0; at < text.size(); ++at) {
+    if (!hidden[at]) out += text[at];
+    else if (at == 0 || !hidden[at - 1]) out += "[redacted]";
+  }
+  return out;
+}
+void manyValuesEquivalence() {
+  uint64_t seed = 0x9e3779b97f4a7c15ull;
+  auto next = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  auto word = [&](size_t size, const char* alphabet) {
+    std::string value;
+    const auto letters = strlen(alphabet);
+    for (size_t at = 0; at < size; ++at) value += alphabet[next() % letters];
+    return value;
+  };
+  std::vector<std::string> values;
+  for (int at = 0; at < 1000; ++at) values.push_back(word(8 + next() % 56, "abcdefghijklmnop0123456789"));
+  for (int at = 0; at < 100; ++at) values.push_back(values[next() % values.size()].substr(0, 5 + next() % 4));  // prefixes
+  for (int at = 0; at < 100; ++at) { auto& v = values[next() % 1000]; values.push_back(v.substr(v.size() / 2)); }  // suffixes
+  for (int at = 0; at < 30; ++at) values.push_back(values[next() % 1000] + values[next() % 1000]);  // concatenations
+  values.push_back(std::string(300, 'q'));  // periodic
+  values.push_back("quote\"and\nnewline");
+  std::vector<std::string> needles;
+  for (const auto& value : values) addRedaction(needles, value);
+  sortRedactions(needles);
+  KJ_REQUIRE(replacePlatformLogRedactions(needles));
+  std::string text;
+  while (text.size() < 512 * 1024) {
+    text += word(1 + next() % 80, "abcdefghijklmnopqrstuvwxyz0123456789 \"\\\n");
+    if (next() % 3 == 0) text += values[next() % values.size()];
+    if (next() % 50 == 0) text += std::string(100 + next() % 900, 'q');
+  }
+  const auto expected = referenceClean(text, needles);
+  for (int round = 0; round < 3; ++round) {
+    PlatformLogCleaner cleaner;
+    std::string out;
+    for (size_t at = 0; at < text.size();) {
+      const auto size = std::min<size_t>(text.size() - at, round == 0 ? 65536 : 1 + next() % (round == 1 ? 7 : 4096));
+      out += cleaner.append(std::string_view(text).substr(at, size), at + size == text.size());
+      at += size;
+    }
+    KJ_REQUIRE(out == expected, "the cleaner must hide exactly what the needles cover", round, out.size(), expected.size());
+  }
+}
+
+// A value over several lines (a PEM key) printed by one process while another process's lines come in between:
+// the drainer keeps one cleaner state per process stream, so the value is still found whole and no line of it is
+// written (v137 section 6.23; with one state for all streams the other process's line broke the match).
+void multiLineValues() {
+  TempDir directory;
+  const auto body1 = syntheticValue(), body2 = syntheticValue();
+  const auto value = "-----BEGIN TEST KEY-----\n" + body1 + "\n" + body2 + "\n-----END TEST KEY-----";
+  std::vector<std::string> needles;
+  addRedaction(needles, value);
+  KJ_REQUIRE(appendPlatformLogRedactions(needles));
+  const auto sinkPath = directory.file("sink");
+  std::string text;
+  {
+    WorkerdOutput output(sinkPath, WorkerLogSettings{});
+    WorkerdOutput::Pipes first, second;
+    KJ_REQUIRE(WorkerdOutput::open(first) && WorkerdOutput::open(second));
+    const int a = dup(first.stdoutWrite), b = dup(second.stdoutWrite);
+    KJ_REQUIRE(a >= 0 && b >= 0);
+    WorkerdOutput::attach(first, 0, "p0", 0, 1, getpid());
+    WorkerdOutput::attach(second, 1, "p1", 0, 1, getpid());
+    auto line = [](int fd, const std::string& bytes) {
+      KJ_REQUIRE(::write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+      usleep(200000);  // read and queued before the next one
+    };
+    line(a, "key: -----BEGIN TEST KEY-----\n" + body1 + "\n");
+    line(b, "other: an unrelated line\n");
+    line(a, body2 + "\n-----END TEST KEY----- done\n");
+    line(b, "other: another line\n");
+    close(a); close(b);
+  }
+  const auto fd = open(sinkPath.c_str(), O_RDONLY | O_CLOEXEC);
+  KJ_REQUIRE(fd >= 0);
+  char buffer[4096];
+  for (ssize_t n; (n = ::read(fd, buffer, sizeof buffer)) > 0;) text.append(buffer, n);
+  close(fd);
+  requireClean(text, body1);
+  requireClean(text, body2);
+  const bool whole = text.find("key: [redacted] done\n") != std::string::npos &&
+      text.find("other: an unrelated line\n") != std::string::npos && text.find("other: another line\n") != std::string::npos;
+  KJ_REQUIRE(whole, "a value over several lines must be hidden whole when other processes' lines come between", text.size());
+}
+
+// Readings, not a test (not registered with CTest): seconds per MiB of ordinary output and the memory the cleaner
+// takes, with N values (48-byte tokens, one in ten with characters that JSON escapes) in the dictionary.
+void benchmark(size_t count, size_t mib) {
+  auto resident = []() {
+    std::ifstream statm("/proc/self/statm"); size_t pages = 0, rss = 0; statm >> pages >> rss;
+    return rss * size_t(sysconf(_SC_PAGESIZE));
+  };
+  uint64_t seed = 42;
+  auto next = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  std::vector<std::string> values, needles;
+  for (size_t at = 0; at < count; ++at) {
+    std::string value;
+    for (int c = 0; c < 48; ++c) value += "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[next() % 62];
+    if (at % 10 == 0) value[at % 40] = '"';
+    values.push_back(value);
+    addRedaction(needles, value);
+  }
+  sortRedactions(needles);
+  KJ_REQUIRE(replacePlatformLogRedactions(needles));
+  std::string line = "[server] {\"event\":\"request\",\"worker\":\"acme/primary\",\"status\":200,\"elapsedMs\":3.41}\n";
+  std::string text;
+  for (size_t at = 0; text.size() < mib * 1024 * 1024; ++at) {
+    text += line;
+    if (at % 100 == 0) text += "token=" + values[next() % values.size()] + "\n";
+  }
+  const auto before = resident();
+  PlatformLogCleaner cleaner;
+  (void)cleaner.append("warm\n");
+  const auto built = resident();
+  const auto started = std::chrono::steady_clock::now();
+  size_t written = 0;
+  for (size_t at = 0; at < text.size(); at += 65536) written += cleaner.append(std::string_view(text).substr(at, 65536)).size();
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  size_t automaton = 0;
+#ifdef COWORKERD_CLEANER_AUTOMATON
+  automaton = cleaner.automatonBytes();
+#endif
+  std::cout << "{\"values\":" << count << ",\"needles\":" << needles.size() << ",\"mib\":" << mib
+            << ",\"secondsPerMiB\":" << seconds / double(mib) << ",\"residentDeltaBytes\":" << (built > before ? built - before : 0)
+            << ",\"automatonBytes\":" << automaton << ",\"writtenBytes\":" << written << "}" << std::endl;
+}
+
 // One tenant's share: at most a quarter of the node's dictionary, its current
 // values included, at their escaped size. A tenant whose secrets are mostly
 // control characters (each escapes to six bytes) fills its share and is
@@ -494,7 +633,9 @@ void secretRotationCooldown() {
   int lastAdmitted = -1, firstRefused = -1;
   for (int minute = 1; minute <= 150; ++minute) {
     now += 60000;
-    const auto token = longValue(64 * 1024);
+    // 60 KiB: the writers' cleaner takes needles of at most 65,535 bytes (a secret is at most 5 KiB, its escaped
+    // form six times that).
+    const auto token = longValue(60 * 1024);
     dictionary.setCurrent({{"fast", {token}}, {"calm", {calm}}});
     if (auto refused = dictionary.admit("fast", {token}, now, now + 30000, true)) {
       ++fastRefused;
@@ -838,6 +979,9 @@ int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string_view(argv[1]) == "streams") coworkerd::streams();
     else if (argc == 2 && std::string_view(argv[1]) == "many-values") coworkerd::manyValues();
+    else if (argc == 2 && std::string_view(argv[1]) == "many-values-equivalence") coworkerd::manyValuesEquivalence();
+    else if (argc == 2 && std::string_view(argv[1]) == "multi-line-values") coworkerd::multiLineValues();
+    else if (argc == 4 && std::string_view(argv[1]) == "bench") coworkerd::benchmark(std::stoul(argv[2]), std::stoul(argv[3]));
     else if (argc == 2 && std::string_view(argv[1]) == "generations") coworkerd::generations();
     else if (argc == 2 && std::string_view(argv[1]) == "secret-rotations") coworkerd::secretRotations();
     else if (argc == 2 && std::string_view(argv[1]) == "secret-limits") coworkerd::secretLimits();

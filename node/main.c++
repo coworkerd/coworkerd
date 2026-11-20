@@ -1,6 +1,8 @@
 #include "invocation-contract.h"
 #include "tenant-execution.h"
 #include "event-loop.h"
+#include "rpc-clock.h"
+#include "tenant-line.h"
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
@@ -264,7 +266,7 @@ struct PlacementDefinition {
 
 using coworkerd::OpenEvent;
 // `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
-struct ProcessUnavailable { bool quarantine = false; std::string reason; };
+struct ProcessUnavailable { bool quarantine = false; std::string reason; bool secretDictionary = false; };
 // A trial probe that was never sent (TrialService::probe()).
 constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
@@ -3365,7 +3367,7 @@ private:
       // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
       if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
               process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
-        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now"};
+        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now", true};
     };
     if (!version.secrets.empty()) {
       const auto& state = desiredState.state();
@@ -4348,7 +4350,9 @@ public:
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
       if (slot->timing && slot->timing->kind == "binding") slot->timing->emit();
-      slot->report(tracked->status(), limitCode());
+      // Only a call with an outcome to report (a Durable Object's [do] line) needs its limit code: limitCode() reads the
+      // process's event pipe three times.
+      slot->report(tracked->status(), slot->outcome ? limitCode() : std::string());
       co_return;
     } catch (const kj::Exception& error) {
       if (slot->process) slot->process->snapshotAfterFailure();
@@ -4492,7 +4496,7 @@ public:
       kj::Own<kj::NetworkAddress> address,
       kj::Own<kj::HttpClient> connector,
       kj::Own<kj::AsyncIoStream> stream,
-      kj::Own<capnp::TwoPartyClient> rpcSystem,
+      kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem,
       rpc::PeerServer::Client peer)
       : generation(generation),
         address(std::move(address)),
@@ -4530,7 +4534,7 @@ private:
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
-  kj::Own<capnp::TwoPartyClient> rpcSystem;
+  kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem;
   rpc::PeerServer::Client peer;
   bool disconnected = false;
   bool ownerTailSupport = false;
@@ -5367,7 +5371,7 @@ private:
       auto tunnel = connector->connect(
           "coworkerd-peer", connectHeaders, {});
       auto stream = std::move(tunnel.connection);
-      auto rpcSystem = kj::heap<capnp::TwoPartyClient>(*stream);
+      auto rpcSystem = kj::heap<coworkerd::CoarseTwoPartyClient>(*stream);
       auto peerClient = rpcSystem->bootstrap().castAs<rpc::PeerServer>();
       auto connection = kj::rc<PeerConnection>(
           generation,
@@ -6069,7 +6073,7 @@ public:
 private:
   ServerCore& server;
   const kj::HttpHeaderTable& headerTable;
-  capnp::TwoPartyServer rpcServer;
+  coworkerd::CoarseTwoPartyServer rpcServer;
   kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial;
   WorkerLogsEndpoint& logs;
   kj::Function<kj::Promise<std::string>()> state;
@@ -6692,7 +6696,7 @@ private:
       co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
     } catch (const ProcessUnavailable& error) {
       // Nothing was sent: the durable process is not ready, or the secret dictionary could not take the values.
-      co_return refused(server.refusal("DO_UNAVAILABLE", !error.reason.empty() ? error.reason : "the durable process of this object (" +
+      co_return refused(server.refusal(coworkerd::durableNotSentCode(error.secretDictionary), !error.reason.empty() ? error.reason : "the durable process of this object (" +
           server.durableProcessFor(target.key()) + ") is not ready", 503));
     }
   }
@@ -7425,7 +7429,7 @@ public:
 
 private:
   const kj::HttpHeaderTable& headerTable;
-  capnp::TwoPartyServer rpcServer;
+  coworkerd::CoarseTwoPartyServer rpcServer;
 };
 
 class SourceService final: public kj::HttpService, public kj::HttpServerCallbacks {
@@ -7484,9 +7488,10 @@ private:
     std::string lines;
     uint64_t kept = 0, cut = 0;
     ServerCore::LogBudget own;
-    auto append = [&](const std::string& name, std::string_view text) {
-      auto line = "{\"workerId\":\"" + workerId + "\",\"versionId\":\"" + versionId + "\",\"level\":\"" + name + "\",\"message\":\"" +
-          jsonEscape(std::string(text)) + "\"}\n";
+    // messageBytes: the full size of a message its server already cut (the drainer marks the line truncated).
+    auto append = [&](const std::string& name, std::string_view text, uint64_t messageBytes = 0) {
+      auto line = coworkerd::tenantLineText(workerId, versionId, name, jsonEscape(std::string(text)),
+          messageBytes > text.size() ? messageBytes : 0);
       if (lines.size() + line.size() > MAX_LOG_APPEND_BYTES) { ++cut; return; }
       lines += line;
       ++kept;
@@ -7503,7 +7508,8 @@ private:
         if (warn) append("warn", LOG_EVENT_EXCEEDED);
         continue;
       }
-      append(name, value);
+      const auto sent = coworkerd::json::field(entry, "messageBytes");
+      append(name, value, sent.isNumber() && sent.getNumber() > 0 ? uint64_t(sent.getNumber()) : 0);
     }
     ++logPosts;
     logLines += kept;
@@ -8539,10 +8545,9 @@ public:
   kj::Promise<void> ingressClosed() { return ingress.addBranch(); }
 
   // The first signal starts the exit (or joins one already started); the next one is the emergency.
-  kj::Promise<void> signals(kj::Promise<int> first, kj::UnixEventPort& port) {
+  kj::Promise<void> signals(kj::Promise<int> first, coworkerd::ShutdownSignals& received, kj::UnixEventPort& port) {
     begin(signalName(co_await first));
-    auto next = co_await port.onSignal(SIGTERM).exclusiveJoin(port.onSignal(SIGINT));
-    emergency(signalName(next.si_signo));
+    emergency(signalName(co_await received.next(port)));
     co_await kj::Promise<void>(kj::NEVER_DONE);
   }
 
@@ -9199,7 +9204,11 @@ private:
   kj::Own<kj::ConnectionReceiver> inner;
 };
 
+// SIGTERM and SIGINT (main() sets this before run()).
+coworkerd::ShutdownSignals* shutdownSignals = nullptr;
+
 int run(Launch launch) {
+  KJ_REQUIRE(shutdownSignals != nullptr);
   auto io = kj::setupAsyncIo();
   const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
@@ -9346,9 +9355,8 @@ int run(Launch launch) {
       [&io]() { return coworkerd::WorkerdOutput::tenantLines(*io.lowLevelProvider); }});
   bool shuttingDown = false;
   int exitCode = 0;
-  auto shutdown = io.unixEventPort.onSignal(SIGTERM)
-      .exclusiveJoin(io.unixEventPort.onSignal(SIGINT))
-      .then([&shuttingDown](siginfo_t&& info) { shuttingDown = true; return int(info.si_signo); }).fork();
+  auto shutdown = shutdownSignals->next(io.unixEventPort)
+      .then([&shuttingDown](int signal) { shuttingDown = true; return signal; }).fork();
   try {
     desiredState->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
     membership->start().exclusiveJoin(shutdown.addBranch().ignoreResult()).wait(waitScope);
@@ -9623,7 +9631,7 @@ int run(Launch launch) {
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())
           .then([]() -> kj::Promise<void> { return kj::NEVER_DONE; }))
-      .exclusiveJoin(drain.signals(shutdown.addBranch(), io.unixEventPort))
+      .exclusiveJoin(drain.signals(shutdown.addBranch(), *shutdownSignals, io.unixEventPort))
       .exclusiveJoin(drain.done().then([&exitCode](int code) { exitCode = code; }))
       .wait(waitScope);
   } catch (...) {
@@ -9866,8 +9874,8 @@ int main(int argc, char** argv) {
     logs.sinkMaxBytes = environmentUnsigned("COWORKERD_WORKERD_LOG_MAX_BYTES", logs.sinkMaxBytes, UINT64_MAX);
     logs.sinkFiles = static_cast<uint32_t>(environmentUnsigned("COWORKERD_WORKERD_LOG_FILES", logs.sinkFiles, 64));
     workerdOutput = std::make_unique<coworkerd::WorkerdOutput>((stack / "logs" / "workerd.log").string(), logs);
-    kj::UnixEventPort::captureSignal(SIGTERM);
-    kj::UnixEventPort::captureSignal(SIGINT);
+    coworkerd::ShutdownSignals signals;
+    shutdownSignals = &signals;
     AsyncLogCallback logCallback;
     return run(std::move(*launch));
   } catch (const kj::Exception& error) {
