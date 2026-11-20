@@ -18,29 +18,46 @@ index 7fc2ad403d7c32e633de20992654994d65a60a55..ddca78b2991b0eb0213b8709359de0c7
  http_archive(
 diff --git a/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch b/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch
 new file mode 100644
-index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e09862f2c8323
+index 0000000000000000000000000000000000000000..ea862c0d6fe68abfcef1b1f08a4df9cac200761a
 --- /dev/null
 +++ b/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,374 @@
 +From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 +From: maslow <wangfugen@126.com>
 +Date: Fri, 20 Nov 2026 12:00:00 +0800
-+Subject: Let JSON.parse and String.prototype.split take interrupts, and
-+ throw instead of ending the process past the largest array
++Subject: Let long allocating builtins take interrupts, and throw instead of
++ ending the process past the largest array
 +
 +JSON.parse only checked for stack overflow: a termination requested while
 +it parses (a CPU or memory limit of the embedder) took effect only after
 +the whole text, however much it allocated meanwhile. Handle interrupts
 +once per value, as JSON.stringify does. String.prototype.split creates
 +every part in one runtime call; handle interrupts every 1,024 parts.
++String.prototype.replaceAll with a string replacement builds a ConsString
++per match without calling JavaScript; check the stack (and so interrupts)
++per match. ValueSerializer checked for termination once per object only;
++check before each string it flattens as well.
 +
 +A JSON array or a split with more elements than FixedArray::kMaxLength,
 +and a JSON object with more properties than its dictionary can hold,
 +ended the process ("Fatal JavaScript invalid size error", "invalid array
 +length", "invalid table size"), reachable from a script with one text of
 +a few hundred megabytes. Throw a RangeError instead (Invalid array length,
-+Too many properties to enumerate). The split stops collecting indices one
-+past the maximum.
++Too many properties to enumerate); every element pushed counts, the first
++one after the numbers' fast path as well, and with a reviver the limit is
++half the largest array (its parse nodes take twice its length). The split
++stops collecting indices one past the maximum.
++
++Array.prototype.sort and toSorted sized their work array by the length
++alone when the receiver had no own elements (an array-like object, a
++string, a proxy): a length past the largest array ended the process
++before an element was read. Start such a work array at 1,024 entries and
++let it grow with the elements found; collecting them visits every index
++up to the length, so handle interrupts once per 1,024 indices there. A
++global regexp replace with a function collects every match first: handle
++interrupts every 1,024 matches, throw a RangeError before the builder
++outgrows the largest array. A global atom match throws a RangeError when
++it counts more matches than the largest array holds.
 +
 +diff --git a/src/builtins/builtins-string-gen.cc b/src/builtins/builtins-string-gen.cc
 +index d282fa8..570d937 100644
@@ -57,8 +74,23 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 + 
 +     ToDirectStringAssembler to_direct(state(), subject_string);
 +     to_direct.TryToDirect(&call_runtime);
++diff --git a/src/builtins/string-replaceall.tq b/src/builtins/string-replaceall.tq
++index 250aa88..ad2d7b2 100644
++--- a/src/builtins/string-replaceall.tq
+++++ b/src/builtins/string-replaceall.tq
++@@ -100,6 +100,10 @@ transitioning javascript builtin StringPrototypeReplaceAll(
++   let result: String = kEmptyString;
++   let position = AbstractStringIndexOf(string, searchString, 0);
++   while (position != -1) {
+++    // Every match allocates (a ConsString), and with a string replacement no
+++    // JavaScript runs: handle interrupts, so that a termination requested
+++    // meanwhile (a CPU or memory limit) takes effect.
+++    PerformStackCheck();
++     // a. If functionalReplace is true, then
++     // b. Else,
++     let replacement: String;
 +diff --git a/src/json/json-parser.cc b/src/json/json-parser.cc
-+index cc719ef..87d3f02 100644
++index cc719ef..66aec05 100644
 +--- a/src/json/json-parser.cc
 ++++ b/src/json/json-parser.cc
 +@@ -146,6 +146,26 @@ static const constexpr uint8_t character_json_scan_flags[256] = {
@@ -128,19 +160,38 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +     if (Check<JsonToken::COMMA>()) {
 +       GetNextNonWhitespaceToken();
 +       continue;
-+@@ -1456,6 +1495,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
++@@ -1439,9 +1478,20 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
++   }
++   double_elements_.resize(0);
++ 
+++  // Every element pushed is counted against the largest array, the first one
+++  // after the numbers above as well.
+++  auto push = [&](Handle<Object> element) {
+++    element_stack_.emplace_back(element);
+++    if (V8_LIKELY(element_stack_.size() - start <= kMaxJsonArrayLength)) {
+++      return true;
+++    }
+++    isolate_->Throw(
+++        *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
+++    return false;
+++  };
++   Handle<Object> value;
++   if (V8_UNLIKELY(!ParseJsonValueRecursive().ToHandle(&value))) return {};
++-  element_stack_.emplace_back(value);
+++  if (V8_UNLIKELY(!push(value))) return {};
++   while (Check<JsonToken::COMMA>()) {
++     Handle<Map> feedback;
++     if (IsJSObject(*value)) {
++@@ -1455,7 +1505,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
++     if (V8_UNLIKELY(!ParseJsonValueRecursive(feedback).ToHandle(&value))) {
 +       return {};
 +     }
-+     element_stack_.emplace_back(value);
-++    if (V8_UNLIKELY(element_stack_.size() - start > kMaxJsonArrayLength)) {
-++      isolate_->Throw(
-++          *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
-++      return {};
-++    }
++-    element_stack_.emplace_back(value);
+++    if (V8_UNLIKELY(!push(value))) return {};
 +   }
 + 
 +   EXPECT_RETURN_ON_ERROR(JsonToken::RBRACK,
-+@@ -1519,6 +1563,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++@@ -1519,6 +1569,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
 +     // objects and arrays will cause the loop to continue until a first member
 +     // is completed.
 +     while (true) {
@@ -148,7 +199,7 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +       GetNextNonWhitespaceToken();
 +       // The switch is immediately followed by 'break' so we can use 'break' to
 +       // break out of the loop, and 'continue' to continue the loop.
-+@@ -1668,6 +1713,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++@@ -1668,6 +1719,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
 +                 {});
 + 
 +             property_stack_.emplace_back(ScanJsonPropertyKey(&cont.current()));
@@ -160,12 +211,15 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +             if constexpr (should_track_json_source) {
 +               property_val_node_stack.emplace_back(Handle<Object>());
 +             }
-+@@ -1730,6 +1780,12 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++@@ -1730,6 +1786,15 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
 +         case JsonContinuation::kArrayElement: {
 +           // Store the previous element on the stack.
 +           element_stack_.emplace_back(value);
+++          // With the source tracked (a reviver), the array's parse nodes and
+++          // snapshots take twice its length.
 ++          if (V8_UNLIKELY(element_stack_.size() - cont.current().index() >
-++                          kMaxJsonArrayLength)) {
+++                          (should_track_json_source ? kMaxJsonArrayLength / 2
+++                                                    : kMaxJsonArrayLength))) {
 ++            isolate_->Throw(*factory()->NewRangeError(
 ++                MessageTemplate::kInvalidArrayLength));
 ++            return MaybeHandle<Object>();
@@ -173,8 +227,23 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +           if constexpr (should_track_json_source) {
 +             element_val_node_stack.emplace_back(val_node);
 +           }
++diff --git a/src/objects/value-serializer.cc b/src/objects/value-serializer.cc
++index 7175792..20813bc 100644
++--- a/src/objects/value-serializer.cc
+++++ b/src/objects/value-serializer.cc
++@@ -557,6 +557,10 @@ Maybe<bool> ValueSerializer::WriteObject(DirectHandle<Object> object) {
++ #endif  // V8_ENABLE_WEBASSEMBLY
++     default:
++       if (InstanceTypeChecker::IsString(instance_type)) {
+++        // Flattening a string allocates up to its length: a termination
+++        // requested meanwhile (a memory limit) takes effect before the next
+++        // one, as it does before the next object.
+++        STACK_CHECK(isolate_, Nothing<bool>());
++         WriteString(Cast<String>(object));
++         return ThrowIfOutOfMemory();
++       } else if (InstanceTypeChecker::IsJSReceiver(instance_type)) {
 +diff --git a/src/runtime/runtime-regexp.cc b/src/runtime/runtime-regexp.cc
-+index ec17453..edf9c70 100644
++index ec17453..7e13d4a 100644
 +--- a/src/runtime/runtime-regexp.cc
 ++++ b/src/runtime/runtime-regexp.cc
 +@@ -884,13 +884,23 @@ RUNTIME_FUNCTION(Runtime_StringSplit) {
@@ -220,6 +289,50 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +       int part_end = indices->at(i);
 +       DirectHandle<String> substring =
 +           isolate->factory()->NewProperSubString(subject, part_start, part_end);
++@@ -1410,9 +1430,29 @@ static Tagged<UnionOf<ExceptionHole, Null, FixedArray>> SearchRegExpMultiple(
++   const bool has_named_captures =
++       has_capture && re_data->has_capture_name_map();
++ 
+++  // Every match is collected before the replace function is first called:
+++  // handle interrupts every 1,024 matches, so that a termination requested
+++  // meanwhile (a CPU or memory limit) takes effect, and throw a RangeError
+++  // instead of growing the builder past the largest array (V8 would end the
+++  // process; the builder doubles from 16, so it reaches the largest exactly).
+++  uint32_t matches = 0;
++   while (true) {
++     int32_t* current_match = runner.FetchNext();
++     if (current_match == nullptr) break;
+++    if (V8_UNLIKELY((++matches & 0x3FF) == 0)) {
+++      StackLimitCheck interrupt_check(isolate);
+++      if (V8_UNLIKELY(interrupt_check.InterruptRequested()) &&
+++          IsExceptionHole(isolate->stack_guard()->HandleInterrupts())) {
+++        return ReadOnlyRoots(isolate).exception();
+++      }
+++    }
+++    if (V8_UNLIKELY(builder.length().value() +
+++                        kMaxBuilderEntriesPerRegExpMatch >
+++                    FixedArray::kMaxLength)) {
+++      isolate->Throw(*isolate->factory()->NewRangeError(
+++          MessageTemplate::kInvalidArrayLength));
+++      return ReadOnlyRoots(isolate).exception();
+++    }
++     match_start = current_match[0];
++     builder.EnsureCapacity(isolate, kMaxBuilderEntriesPerRegExpMatch);
++     if (match_end < match_start) {
++@@ -2542,7 +2582,12 @@ RUNTIME_FUNCTION(Runtime_RegExpMatchGlobalAtom) {
++   RegExp::SetLastMatchInfo(isolate, last_match_info, subject_handle,
++                            kNumberOfCaptures, match_indices);
++ 
++-  // Create the result array.
+++  // Create the result array. More matches than the largest array cannot be
+++  // stored (V8 would end the process): throw a RangeError instead.
+++  if (V8_UNLIKELY(number_of_matches > FixedArray::kMaxLength)) {
+++    THROW_NEW_ERROR_RETURN_FAILURE(
+++        isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
+++  }
++   auto elems = isolate->factory()->NewFixedArray(number_of_matches);
++   ObjectSlot dst_slot = elems->RawFieldOfFirstElement();
++   MemsetTagged(dst_slot, *pattern_handle, number_of_matches);
 +diff --git a/src/runtime/runtime-strings.cc b/src/runtime/runtime-strings.cc
 +index 9d2ef19..bc17198 100644
 +--- a/src/runtime/runtime-strings.cc
@@ -238,11 +351,139 @@ index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e0986
 +   s = String::Flatten(isolate, s);
 +   const int length =
 +       static_cast<int>(std::min(static_cast<uint32_t>(s->length()), limit));
++diff --git a/third_party/v8/builtins/array-sort.tq b/third_party/v8/builtins/array-sort.tq
++index 90e36b5..5b94c23 100644
++--- a/third_party/v8/builtins/array-sort.tq
+++++ b/third_party/v8/builtins/array-sort.tq
++@@ -123,6 +123,18 @@ macro ResetToGenericAccessor(
++ // The 'length' property is an upper bound (as per spec),
++ // while the actual size of the backing store is a good guess.
++ // After the pre-processing step, the workarray won't change in length.
+++// Without own elements the length is all there is to go by, and the length of
+++// an array-like object can be anything up to 2^53-1: allocating a work array
+++// of that length ends the process (past the largest FixedArray) or takes
+++// hundreds of MiB before a single element is read. Start with this many and
+++// let the work array grow with the elements actually found.
+++const kWorkArrayLengthWithoutElements: constexpr int31 = 1024;
+++// Collecting the elements of such a receiver visits every index up to the
+++// length (an absent index calls no JavaScript) and grows the work array:
+++// handle interrupts once per 1,024 indices, so that a termination requested
+++// meanwhile (a CPU or memory limit) takes effect.
+++const kSortInterruptMask: constexpr int31 = 0x3FF;
+++
++ macro CalculateWorkArrayLength(
++     receiver: JSReceiver, initialReceiverLength: Number): intptr {
++   // TODO(szuend): Implement full range sorting, not only up to MaxSmi.
++@@ -149,8 +161,12 @@ macro CalculateWorkArrayLength(
++     // {length} property.
++     if (elementsLength != 0) {
++       workArrayLength = IntPtrMin(workArrayLength, elementsLength);
+++    } else {
+++      workArrayLength = IntPtrMin(workArrayLength, kWorkArrayLengthWithoutElements);
++     }
++-  } label NoJsObject {}
+++  } label NoJsObject {
+++    workArrayLength = IntPtrMin(workArrayLength, kWorkArrayLengthWithoutElements);
+++  }
++ 
++   return workArrayLength;
++ }
++@@ -1461,6 +1477,7 @@ transitioning macro CompactReceiverElementsIntoWorkArray(
++     }
++ 
++     for (let i: Smi = 0; i < receiverLength; ++i) {
+++      if ((i & kSortInterruptMask) == kSortInterruptMask) PerformStackCheck();
++       const element: JSAny|TheHole = loadFn(context, sortState, i);
++ 
++       if (element == TheHole) {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a459fbe5a 100644
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..a917e02c3e3e9419ff97ab5b85d61b0129ad0904 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -379,6 +379,63 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -153,6 +153,34 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
+   KJ_EXPECT(detail.size() == 1 && detail[0] == 1);
+ }
+ 
++// A console line past 4,096 bytes reaches the node cut, with its size, so that
++// the node marks it truncated and counts it (b50 log-quota-isolation).
++KJ_TEST("a console line past 4,096 bytes carries its size to the node") {
++  auto longLine = consoleLogRow("log", kj::str(kj::repeat('x', 5000)));
++  KJ_EXPECT(longLine.endsWith(",\"messageBytes\":5000}"), longLine.slice(longLine.size() - 40));
++  KJ_EXPECT(longLine.size() == kj::str("{\"level\":\"log\",\"message\":\"\",\"messageBytes\":5000}").size() + 4096);
++  auto shortLine = consoleLogRow("warn", "hello");
++  KJ_EXPECT(shortLine == "{\"level\":\"warn\",\"message\":\"hello\"}", shortLine);
++}
++
++// The maintenance pass formats every resident into its lifecycle row outside
++// the registry lock; holding them meanwhile must not make an idle Worker look
++// in use, or a load past the resident limit is refused instead of evicting
++// one (r50's fill cells: about four loads in ten refused).
++KJ_TEST("the maintenance pass's snapshot leaves an idle resident evictable") {
++  std::map<std::string, std::shared_ptr<Slot>> registry;
++  auto idle = std::make_shared<Slot>();
++  idle->complete.store(true);
++  registry.emplace("a", idle);
++  std::vector<std::shared_ptr<Slot>> retired{std::make_shared<Slot>()};
++  idle.reset();
++  auto snapshot = residentSnapshot(registry, retired);
++  KJ_EXPECT(snapshot.size() == 2);
++  KJ_EXPECT(canEvict(registry.at("a"), nullptr), "a snapshot must not make an idle Worker look in use");
++  registry.clear();
++  KJ_EXPECT(snapshot[0].expired(), "an evicted resident leaves the snapshot");
++}
++
+ KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation") {
+   kj::EventLoop loop;
+   kj::WaitScope waitScope(loop);
+@@ -187,6 +215,13 @@ KJ_TEST("subrequest quotas, recursive bindings, release wakeup and cancellation"
+   abandoned = nullptr;
+   KJ_EXPECT(small.waiters.empty());
+ 
++  // Without a per-tenant limit no per-tenant count is kept (v138 section 1).
++  SubrequestBudget unlimited(512, 0);
++  auto calls = std::make_shared<uint32_t>(0);
++  SubrequestPermit egress(unlimited, calls, "a", true);
++  egress.acquire().wait(waitScope);
++  KJ_EXPECT(unlimited.tenants.empty() && unlimited.active.load() == 1 && egress.tenant.empty());
++
+   SubrequestBudget perCall(512, 128);
+   auto one = std::make_shared<uint32_t>(0);
+   std::vector<std::unique_ptr<SubrequestPermit>> held;
+@@ -222,6 +257,33 @@ KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
+   KJ_EXPECT(buffer.lines.size() == 1);
+ }
+ 
++// A call's JavaScript entries point at the OOM report its RequestLimits
++// formatted once (the row, the pid and the identity), instead of formatting
++// it again at every entry; the watchdog entry points at the owner's identity.
++KJ_TEST("JavaScript entries reuse the call's OOM report and identity") {
++  initializeV8();
++  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/oom-report\","), nullptr);
++  auto* isolate = v8::Isolate::New(limits.getCreateParams());
++  KJ_DEFER(isolate->Dispose());
++  limits.customizeIsolate(isolate);
++  v8::Locker locker(isolate);
++  v8::Isolate::Scope entered(isolate);
++  v8::HandleScope handles(isolate);
++  auto identity = kj::str("\"workerId\":\"a/oom-report\",\"invocationId\":\"i1\",");
++  auto report = oomReportText(identity, 32);
++  KJ_EXPECT(report == kj::str("{\"event\":\"memory-culprit\",\"pid\":", getpid(), ",", identity,
++      "\"memoryLimitMiB\":32}\n"));
++  for (int turn = 0; turn < 2; ++turn) {
++    std::atomic<LimitCause> cause{LimitCause::NONE};
++    CpuExecution execution(
++        isolate, cause, limits.memoryState, limits.memory, 0, 100, 32, identity, &report);
++    KJ_EXPECT(currentOomReport == report.cStr());
++    KJ_EXPECT(execution.entry.identity.begin() == identity.begin());
++    execution.finish();
++  }
++  KJ_EXPECT(currentOomReport == nullptr);
++}
++
+ KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
+   initializeV8();
+   IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
+@@ -379,6 +441,115 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
      "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
      "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
  
@@ -266,10 +507,15 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +    "const e = d + '4'; e.indexOf('z'); const f = e + '5'; f.indexOf('z');"
 +    "globalThis.kept = [a, b, c, d, e, f]; kept.length"_kj;
 +// A structured clone (ValueSerializer and ValueDeserializer, as
-+// jsg::structuredClone) of three maximum two-byte strings.
++// jsg::structuredClone) of four maximum two-byte strings: the serializer
++// flattens each, 4 GiB in all, more than the shared cage leaves.
 +constexpr kj::StringPtr CLONE_STRINGS =
-+    "globalThis.retained = clone([0, 1, 2].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
++    "globalThis.retained = clone([0, 1, 2, 3].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
 +    "retained.length"_kj;
++// replaceAll with a string replacement: a new ConsString per match and no
++// JavaScript call, 250 million matches (§8.2 of the v138 task).
++constexpr kj::StringPtr REPLACE_ALL =
++    "const s = 'a'.repeat(2.5e8); s.indexOf('z'); globalThis.retained = s.replaceAll('a', 'b'); retained.length"_kj;
 +// String.prototype.split into 120 million three-character strings (about
 +// 1.9 GB) and their array.
 +constexpr kj::StringPtr SPLIT_PARTS =
@@ -279,7 +525,47 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +constexpr kj::StringPtr SPLIT_TOO_MANY =
 +    "globalThis.retained = 'a,'.repeat(2**27).split(','); retained.length"_kj;
 +constexpr kj::StringPtr SPLIT_CHARACTERS =
-+    "const s = ' '.repeat(2**27 + 8); s.indexOf('z'); globalThis.retained = s.split(''); retained.length"_kj;
++    "const s = ' '.repeat(2**27 + 1); s.indexOf('z'); globalThis.retained = s.split(''); retained.length"_kj;
++// One element past the largest array after the numbers' fast path (the first
++// element it hands on was not counted), and past half of it with a reviver
++// (the parse nodes and snapshots take twice the array's length); one property
++// past the largest JSON object (2^24, by duplicate keys: no allocation).
++constexpr kj::StringPtr JSON_MIXED =
++    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**27) + '\"x\"]'); retained.length"_kj;
++constexpr kj::StringPtr JSON_REVIVER =
++    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**26) + '1]', (k, v) => v); retained.length"_kj;
++constexpr kj::StringPtr JSON_PROPERTIES =
++    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}'); 1"_kj;
++// The same object with a reviver takes the iterative parser and its own check.
++constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
++    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
++// The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
++// process on cwkd-p40: a sort of an array-like object or a string sized its
++// work array by the length; a global replace with a function collected every
++// match before the first call; a global atom match allocated one array for
++// every match it counted.
++constexpr kj::StringPtr SORT_STRING =
++    "Array.prototype.sort.call('x'.repeat(2**28)); 1"_kj;
++constexpr kj::StringPtr REPLACE_FUNCTION =
++    "globalThis.retained = 'x'.repeat(2**27 + 1).replace(/x/g, () => ''); retained.length"_kj;
++constexpr kj::StringPtr MATCH_ATOM =
++    "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
++// Loops that allocate nothing while they run: their interrupt checks are what
++// lets a short CPU limit end the call (each takes about a second unchecked).
++constexpr kj::StringPtr CPU_JSON_NUMBERS =
++    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**25) + '1]'); retained.length"_kj;
++constexpr kj::StringPtr CPU_JSON_SLOW =
++    "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]'); retained.length"_kj;
++constexpr kj::StringPtr CPU_JSON_REVIVER =
++    "globalThis.retained = JSON.parse('[' + '\"a\",'.repeat(2**24) + '\"a\"]', (k, v) => v); retained.length"_kj;
++// An array-like object's length alone: a work array of that length ended the
++// process at once; now the loop over its indices takes interrupts.
++constexpr kj::StringPtr CPU_SORT_LENGTH = "Array.prototype.sort.call({length: 2**30}); 1"_kj;
++constexpr kj::StringPtr CPU_TO_SORTED_LENGTH =
++    "Array.prototype.toSorted.call({length: 2**28}).length"_kj;
++// (split's check every 1,024 parts is in the loop that creates them, after
++// the search for the separators, which checks none: it is tested by the parts
++// outgrowing a 2 GiB budget, "split" above.)
 +
 +// structuredClone for the plain test contexts: V8's serializer and
 +// deserializer with the default delegate, as jsg::structuredClone uses them.
@@ -301,29 +587,47 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +// What a child's allocating call must end with: the memory limit, or the
 +// memory limit or a RangeError (an array V8 cannot allocate), or anything
 +// (an exploration run).
-+enum class Outcome { MEMORY, MEMORY_OR_RANGE, ANY };
++enum class Outcome { MEMORY, MEMORY_OR_RANGE, RANGE, CPU, ANY };
++// A child's limits: the process budget, each allocating isolate's memory and
++// CPU limits, and (CPU outcome) how long its call may run at most.
++struct ChildLimits {
++  uint64_t budgetBytes = 16ull << 30;
++  uint32_t memoryMiB = 128, cpuMs = 10000;
++  double maxSeconds = 0;
++};
 +
  // `count` isolates allocate at the same moment while a neighbor isolate keeps
  // answering. Every heap of this build shares one pointer cage.
  // `raised`: whether each isolate's ceiling must have been raised by the
-@@ -387,13 +444,14 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -387,18 +558,21 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
  // shapes never need the callback; only an object V8 placed without a
  // collection (the 500 MB young one) does. Without this check the callback
  // would hide a missing reserve.
 -void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) {
-+void simultaneousAllocations(
-+    size_t count, kj::StringPtr code, int raised = -1, Outcome outcome = Outcome::MEMORY) {
++void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1,
++    Outcome outcome = Outcome::MEMORY, ChildLimits childLimits = {}) {
    initializeV8();
-   auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
+-  auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
++  auto budget = std::make_shared<ResourceBudget>(childLimits.budgetBytes, 8, count + 1);
++  std::vector<double> seconds(count);
++  std::vector<char> cpuEnded(count);
    std::vector<kj::Own<IsolateLimits>> limits;
    std::vector<v8::Isolate*> isolates;
    std::vector<uint64_t> peaks(count);
 -  std::vector<char> refused(count);
 +  std::vector<char> refused(count), rangeError(count);
    for (size_t i = 0; i < count; ++i) {
-     auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+-    auto reservation = std::make_shared<ResourceReservation>(budget, 128);
++    auto reservation = std::make_shared<ResourceReservation>(budget, childLimits.memoryMiB);
      KJ_ASSERT(reservation->registerPreparation());
-@@ -457,6 +515,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+-    limits.push_back(kj::refcounted<IsolateLimits>(
+-        10000, 128, kj::str("\"workerId\":\"a/large-", i, "\","), reservation));
++    limits.push_back(kj::refcounted<IsolateLimits>(childLimits.cpuMs, childLimits.memoryMiB,
++        kj::str("\"workerId\":\"a/large-", i, "\","), reservation));
+     isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
+     limits[i]->customizeIsolate(isolates[i]);
+   }
+@@ -457,16 +631,32 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
        v8::HandleScope handles(isolate);
        auto context = v8::Context::New(isolate);
        v8::Context::Scope entered(context);
@@ -334,23 +638,31 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
        auto source =
            v8::String::NewFromUtf8(isolate, code.begin(), v8::NewStringType::kNormal, code.size())
                .ToLocalChecked();
-@@ -467,6 +529,15 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
-           128, limits[i]->identity);
+       auto script = v8::Script::Compile(context, source).ToLocalChecked();
+       start.arrive_and_wait();
+       std::atomic<LimitCause> cause{LimitCause::NONE};
+-      CpuExecution execution(isolate, cause, limits[i]->memoryState, limits[i]->memory, 0, 10000,
+-          128, limits[i]->identity);
++      CpuExecution execution(isolate, cause, limits[i]->memoryState, limits[i]->memory, 0,
++          childLimits.cpuMs, childLimits.memoryMiB, limits[i]->identity);
        v8::TryCatch caught(isolate);
++      const auto began = std::chrono::steady_clock::now();
        auto result = script->Run(context);
++      seconds[i] = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
++      cpuEnded[i] = cause.load() == LimitCause::CPU;
 +      std::string thrown;
 +      if (result.IsEmpty() && caught.HasCaught() && !caught.HasTerminated()) {
 +        v8::String::Utf8Value text(isolate, caught.Exception());
 +        if (*text != nullptr) thrown = *text;
 +      }
 +      rangeError[i] = thrown.starts_with("RangeError");
-+      fprintf(stdout, "ALLOCATION_RESULT worker=%zu completed=%d terminated=%d thrown=\"%s\"\n", i,
-+          !result.IsEmpty(), caught.HasTerminated(), thrown.c_str());
++      fprintf(stdout, "ALLOCATION_RESULT worker=%zu completed=%d terminated=%d cpu=%d seconds=%.3f thrown=\"%s\"\n", i,
++          !result.IsEmpty(), caught.HasTerminated(), int(cpuEnded[i]), seconds[i], thrown.c_str());
 +      fflush(stdout);
        completed.arrive_and_wait();
        release.arrive_and_wait();
        caught.Reset();
-@@ -485,7 +556,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -485,7 +675,13 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
    release.arrive_and_wait();
    for (auto& worker: workers) worker.join();
    for (size_t i = 0; i < count; ++i) {
@@ -359,10 +671,13 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +    if (outcome == Outcome::MEMORY) KJ_EXPECT(limited, i, peaks[i]);
 +    if (outcome == Outcome::MEMORY_OR_RANGE)
 +      KJ_EXPECT(limited || rangeError[i], i, peaks[i], int(refused[i]));
++    if (outcome == Outcome::RANGE) KJ_EXPECT(rangeError[i], i, peaks[i]);
++    if (outcome == Outcome::CPU)
++      KJ_EXPECT(cpuEnded[i] && seconds[i] <= childLimits.maxSeconds, i, seconds[i], int(cpuEnded[i]));
      const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
      if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
      fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
-@@ -501,20 +575,44 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
+@@ -501,20 +697,73 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
    auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
    if (selected == nullptr) return;
    kj::StringPtr spec(selected);
@@ -385,7 +700,11 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +    kj::StringPtr name, code;
 +    int raised;
 +    Outcome outcome;
++    ChildLimits limits = {};
 +  };
++  // The CPU shapes: a 50 ms limit and a 1 GiB heap (no memory limit gets in
++  // the way); the call must end within 0.4 s.
++  const ChildLimits cpu{.memoryMiB = 1024, .cpuMs = 50, .maxSeconds = 0.4};
 +  // `raised` only for one isolate: -1 is not checked.
 +  const Shape shapes[] = {
 +    {"string"_kj, NEAR_GIB_STRING, 0, Outcome::MEMORY},
@@ -398,9 +717,26 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +    {"json-numbers"_kj, JSON_NUMBERS, -1, Outcome::MEMORY_OR_RANGE},
 +    {"straight"_kj, STRAIGHT_LINE, -1, Outcome::MEMORY},
 +    {"clone"_kj, CLONE_STRINGS, -1, Outcome::MEMORY},
-+    {"split"_kj, SPLIT_PARTS, -1, Outcome::MEMORY},
++    // In a 2 GiB process budget: unchecked, the parts outgrow every raise.
++    {"split"_kj, SPLIT_PARTS, -1, Outcome::MEMORY, {.budgetBytes = 2ull << 30}},
 +    {"split-many"_kj, SPLIT_TOO_MANY, -1, Outcome::MEMORY_OR_RANGE},
 +    {"split-chars"_kj, SPLIT_CHARACTERS, -1, Outcome::MEMORY_OR_RANGE},
++    {"replace-all"_kj, REPLACE_ALL, -1, Outcome::MEMORY},
++    {"json-mixed"_kj, JSON_MIXED, -1, Outcome::MEMORY_OR_RANGE},
++    {"json-reviver"_kj, JSON_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
++    {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::MEMORY_OR_RANGE},
++    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
++    {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
++    {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
++    {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
++    {"sort-string"_kj, SORT_STRING, -1, Outcome::MEMORY},
++    {"replace-function"_kj, REPLACE_FUNCTION, -1, Outcome::MEMORY},
++    // About 8.5 s of CPU to collect 2^27 matches: a CPU limit well above it, so that only the RangeError ends it
++    // (a busy machine took it past the default 10 s once).
++    {"replace-function-high"_kj, REPLACE_FUNCTION, -1, Outcome::RANGE, {.memoryMiB = 1024, .cpuMs = 60000}},
++    {"match-atom"_kj, MATCH_ATOM, -1, Outcome::MEMORY_OR_RANGE},
++    {"cpu-sort-length"_kj, CPU_SORT_LENGTH, -1, Outcome::CPU, cpu},
++    {"cpu-to-sorted-length"_kj, CPU_TO_SORTED_LENGTH, -1, Outcome::CPU, cpu},
 +  };
 +  KJ_REQUIRE(count > 0 && count <= 8);
 +  if (kind == "code") {
@@ -408,18 +744,26 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +    // environment, the outcome is only printed.
 +    const char* code = getenv("COWORKERD_THREADED_ALLOCATION_CODE");
 +    KJ_REQUIRE(code != nullptr, "COWORKERD_THREADED_ALLOCATION_CODE is not set");
-+    simultaneousAllocations(count, kj::StringPtr(code), -1, Outcome::ANY);
++    ChildLimits explored;
++    auto number = [](const char* name, uint64_t fallback) {
++      const char* value = getenv(name);
++      return value ? std::strtoull(value, nullptr, 10) : fallback;
++    };
++    explored.budgetBytes = number("COWORKERD_THREADED_ALLOCATION_BUDGET_BYTES", explored.budgetBytes);
++    explored.memoryMiB = uint32_t(number("COWORKERD_THREADED_ALLOCATION_MEMORY_MIB", explored.memoryMiB));
++    explored.cpuMs = uint32_t(number("COWORKERD_THREADED_ALLOCATION_CPU_MS", explored.cpuMs));
++    simultaneousAllocations(count, kj::StringPtr(code), -1, Outcome::ANY, explored);
 +  } else {
 +    const Shape* found = nullptr;
 +    for (auto& shape: shapes)
 +      if (shape.name == kind) found = &shape;
 +    KJ_REQUIRE(found != nullptr, "unknown allocation shape", kind);
-+    simultaneousAllocations(count, found->code, count == 1 ? found->raised : -1, found->outcome);
++    simultaneousAllocations(count, found->code, count == 1 ? found->raised : -1, found->outcome, found->limits);
 +  }
    fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
    fflush(stdout);
  }
-@@ -601,6 +699,75 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
+@@ -601,6 +850,123 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
  }
  
@@ -460,6 +804,32 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +  const auto third = memory.raise(second);
 +  KJ_EXPECT(third == second, third, second);
 +  KJ_EXPECT(memory.ceilingRaised.load() == 2);
++  KJ_EXPECT(budget->lent.load() == left, budget->lent.load(), left);
++  // A second isolate of the same process, terminated at its ceiling too: its
++  // first raise is one maximum object as always, but what the first isolate
++  // was lent is not left for its later one, until that call's execution ends.
++  auto otherReservation = std::make_shared<ResourceReservation>(budget, 128);
++  KJ_ASSERT(otherReservation->registerPreparation());
++  IsolateLimits otherLimits(10000, 128, kj::str("\"workerId\":\"a/raise-other\","), otherReservation);
++  auto* other = v8::Isolate::New(otherLimits.getCreateParams());
++  KJ_DEFER(other->Dispose());
++  otherLimits.customizeIsolate(other);
++  {
++    v8::Locker otherLocker(other);
++    v8::Isolate::Scope otherEntered(other);
++    v8::HeapStatistics otherStats;
++    other->GetHeapStatistics(&otherStats);
++    const uint64_t otherUsed = otherStats.total_heap_size();
++    auto& otherMemory = *otherLimits.memory;
++    const auto otherFirst = otherMemory.raise(otherUsed / 2);
++    KJ_EXPECT(otherFirst == otherUsed + MAX_SINGLE_HEAP_OBJECT, otherFirst, otherUsed);
++    KJ_EXPECT(otherMemory.raise(otherFirst) == otherFirst, "the first isolate's lent headroom is not left");
++    memory.returnLent();
++    KJ_EXPECT(budget->lent.load() == MAX_SINGLE_HEAP_OBJECT);
++    KJ_EXPECT(otherMemory.raise(otherFirst) > otherFirst, "returned headroom is left again");
++    otherMemory.returnLent();
++    KJ_EXPECT(budget->lent.load() == 0);
++  }
 +  isolate->CancelTerminateExecution();
 +}
 +
@@ -481,8 +851,11 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +KJ_TEST("straight-line code making 500 MB strings one after another preserves the process") {
 +  expectChildSurvives("1:straight");
 +}
-+KJ_TEST("a structured clone of three maximum strings preserves the process") {
++KJ_TEST("a structured clone of four maximum strings preserves the process") {
 +  expectChildSurvives("1:clone");
++}
++KJ_TEST("replaceAll of 250 million matches ends at the memory limit and preserves the process") {
++  expectChildSurvives("1:replace-all");
 +}
 +KJ_TEST("splitting into 120 million strings ends at the memory limit and preserves the process") {
 +  expectChildSurvives("1:split");
@@ -491,15 +864,134 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a
 +  expectChildSurvives("1:split-many");
 +  expectChildSurvives("1:split-chars");
 +}
++KJ_TEST("JSON.parse one element past the largest array, with a reviver, or past the largest object") {
++  expectChildSurvives("1:json-mixed");
++  expectChildSurvives("1:json-reviver");
++  expectChildSurvives("1:json-properties");
++  expectChildSurvives("1:json-properties-reviver");
++}
++KJ_TEST("a short CPU limit ends JSON.parse loops that allocate nothing") {
++  expectChildSurvives("1:cpu-json-numbers");
++  expectChildSurvives("1:cpu-json-slow");
++  expectChildSurvives("1:cpu-json-reviver");
++}
++KJ_TEST("sort of an array-like object or a string, global replace with a function and global match") {
++  expectChildSurvives("1:sort-string");
++  expectChildSurvives("1:replace-function");
++  expectChildSurvives("1:replace-function-high");
++  expectChildSurvives("1:match-atom");
++  expectChildSurvives("1:cpu-sort-length");
++  expectChildSurvives("1:cpu-to-sorted-length");
++}
 +
  KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
    auto child = runAllocationChild("1:string");
    KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+@@ -802,6 +1168,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
+   if (ended) drain.wait(waitScope);
+ }
+ 
++// A streamed body keeps the call's response open: the 30 seconds of waitUntil
++// work start when it ends (or the client goes away), not when the handler
++// returned (Cloudflare's Context page; v138 section 4).
++KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handler returns") {
++  initializeV8();
++  kj::EventLoop loop;
++  kj::WaitScope waitScope(loop);
++  const auto start = kj::systemPreciseMonotonicClock().now();
++  kj::TimerImpl clock(start);
++  Timer timer(clock);
++  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/stream\","), nullptr);
++  Slot slot;
++  slot.limits = &isolateLimits;
++  Measurement measurement;
++  auto responseEnd = kj::newPromiseAndFulfiller<void>();
++  measurement.responseEnded = responseEnd.promise.fork();
++  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/stream\","));
++  auto drain = limits.limitDrain();  // the handler returned; the body streams for 40 s
++  clock.advanceTo(start + 35 * kj::SECONDS);
++  KJ_EXPECT(!drain.poll(waitScope), "a 35 s waitUntil task must outlive the handler while the body streams");
++  clock.advanceTo(start + 40 * kj::SECONDS);
++  responseEnd.fulfiller->fulfill();
++  KJ_EXPECT(!drain.poll(waitScope));
++  clock.advanceTo(start + 70 * kj::SECONDS - 1 * kj::MILLISECONDS);
++  KJ_EXPECT(!drain.poll(waitScope), "the 30 s start at the response's end");
++  clock.advanceTo(start + 70 * kj::SECONDS + 1 * kj::MILLISECONDS);
++  bool ended = drain.poll(waitScope);
++  KJ_EXPECT(ended, "waitUntil work must end 30 s after the response ended");
++  if (ended) drain.wait(waitScope);
++}
++
+ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
+   kj::EventLoop loop;
+   kj::WaitScope waitScope(loop);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..0809579d5fa853c7797f3c5865c0658863f84719 100644
+index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..a052878d2c8b3bba41ac0cdc05a4504567823b1d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -620,8 +620,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+@@ -212,18 +212,26 @@ thread_local const char *currentOomReport = nullptr;
+ // The executing isolate's heap at its last collection. V8 collects before a
+ // fatal OOM, so this is the heap of the isolate whose allocation failed.
+ thread_local const std::atomic<uint64_t> *currentOomHeap = nullptr;
++kj::String oomReportText(kj::StringPtr identity, uint32_t memoryMiB) {
++  static const auto pid = getpid();
++  return kj::str("{\"event\":\"memory-culprit\",\"pid\":", pid, ",", identity,
++      "\"memoryLimitMiB\":", memoryMiB, "}\n");
++}
+ struct OomReportScope {
+   explicit OomReportScope(
+       kj::StringPtr identity, uint32_t memoryMiB, const std::atomic<uint64_t> *heap = nullptr)
+       : previous(currentOomReport),
+         previousHeap(currentOomHeap),
+-        report(kj::str("{\"event\":\"memory-culprit\",\"pid\":",
+-            getpid(),
+-            ",",
+-            identity,
+-            "\"memoryLimitMiB\":",
+-            memoryMiB,
+-            "}\n")) {
++        owned(oomReportText(identity, memoryMiB)) {
++    (void)limitEventFd();
++    currentOomReport = owned.cStr();
++    currentOomHeap = heap;
++  }
++  // A report formatted once for a whole call (RequestLimits), not at every
++  // JavaScript entry; it outlives this scope.
++  OomReportScope(const kj::String &report, const std::atomic<uint64_t> *heap)
++      : previous(currentOomReport),
++        previousHeap(currentOomHeap) {
+     (void)limitEventFd();
+     currentOomReport = report.cStr();
+     currentOomHeap = heap;
+@@ -234,7 +242,7 @@ struct OomReportScope {
+   }
+   const char *previous;
+   const std::atomic<uint64_t> *previousHeap;
+-  kj::String report;
++  kj::String owned;
+ };
+ 
+ kj::Exception limitException(LimitCause cause);
+@@ -263,6 +271,10 @@ struct ResourceBudget {
+   const uint32_t residentMaximum;
+   std::mutex mutex;
+   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
++  // Heap headroom near-heap-limit raises granted above what their isolates
++  // used, until each call's termination takes effect (MemoryBudget::raise()):
++  // two isolates raised at once never both count on the same remainder.
++  std::atomic<uint64_t> lent{0};
+   std::atomic<uint32_t> residents{0};
+   std::atomic<uint64_t> rejections{0}, evictions{0}, pressureTerminations{0};
+   std::condition_variable reclaimed;
+@@ -610,6 +622,7 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+         reservation(std::move(reservation)),
+         inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
+   ~MemoryBudget() noexcept override {
++    returnLent();
+     delete inner;
+   }
+   const uint64_t maximum;
+@@ -620,8 +633,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
    v8::ArrayBuffer::Allocator *inner;
    v8::Isolate *isolate = nullptr;
    std::atomic<bool> pendingPressure{false};
@@ -510,7 +1002,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..0809579d5fa853c7797f3c5865c06588
    std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
    void pressure() {
      if (currentCause) {
-@@ -728,19 +728,56 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+@@ -728,19 +741,81 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
      // large allocation can then meet the fixed ceiling with that object live
      // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
      // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
@@ -550,26 +1042,274 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..0809579d5fa853c7797f3c5865c06588
 +  // 256 MiB its other isolates keep); with nothing left the ceiling stays.
 +  // Reservations are read without their lock: the counters are atomic, and an
 +  // estimate made at a collection is all this needs.
++  // What other isolates' raises hold (ResourceBudget::lent) is not left. The
++  // headroom granted above this isolate's heap is lent (taken atomically from
++  // the shared count) until returnLent(), when its call's execution ends.
 +  size_t raise(size_t current) {
 +    v8::HeapStatistics stats;
 +    isolate->GetHeapStatistics(&stats);
 +    const uint64_t used = stats.total_heap_size();
-+    uint64_t ceiling = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
-+    if (ceilingRaised.load() > 0) {
-+      if (!reservation) return current;
-+      const auto &resources = *reservation->budget;
-+      uint64_t room = resources.memoryMaximum -
-+          kj::min(resources.memoryReserved.load(), resources.memoryMaximum);
-+      if (resources.addressMaximum != UINT64_MAX) {
-+        const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
-+        room = kj::min(room, cage - kj::min(resources.addressReserved.load(), cage));
-+      }
-+      ceiling = kj::min(ceiling, used + room);
++    const uint64_t wanted = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
++    const bool first = ceilingRaised.load() == 0;
++    if (!first && !reservation) return current;
++    if (!reservation) {
++      ceilingRaised.fetch_add(1);
++      return wanted;
 +    }
-+    if (ceiling <= current) return current;
++    auto &resources = *reservation->budget;
++    auto lentNow = resources.lent.load();
++    uint64_t ceiling;
++    for (;;) {
++      ceiling = wanted;
++      if (!first) {
++        const uint64_t others = lentNow - kj::min(lentHere, lentNow);
++        uint64_t room = resources.memoryMaximum -
++            kj::min(resources.memoryReserved.load() + others, resources.memoryMaximum);
++        if (resources.addressMaximum != UINT64_MAX) {
++          const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
++          room = kj::min(room, cage - kj::min(resources.addressReserved.load() + others, cage));
++        }
++        ceiling = kj::min(ceiling, used + room);
++      }
++      if (ceiling <= current) return current;
++      const uint64_t grant = ceiling - used;
++      if (resources.lent.compare_exchange_weak(lentNow, lentNow - kj::min(lentHere, lentNow) + grant)) {
++        lentHere = grant;
++        break;
++      }
++    }
 +    ceilingRaised.fetch_add(1);
 +    return ceiling;
 +  }
++  void returnLent() {
++    if (lentHere == 0 || !reservation) return;
++    reservation->budget->lent.fetch_sub(lentHere);
++    lentHere = 0;
++  }
++  uint64_t lentHere = 0;  // this isolate's share of ResourceBudget::lent (its lock's thread only)
  };
  
  // Only native state, a thread CPU clock and V8's thread-safe termination API
+@@ -754,7 +829,8 @@ class CpuWatchdog {
+     std::atomic<LimitCause> &cause;
+     LimitState memory;
+     uint64_t started, allowance, due, terminatedAt = 0, previousCpu = 0;
+-    kj::String identity;
++    // The execution's identity, owned by the call or startup that outlives the entry.
++    kj::StringPtr identity;
+     uint32_t cpuMs, memoryMiB;
+     bool culpritReported = false;
+   };
+@@ -838,11 +914,13 @@ struct CpuExecution {
+       uint64_t used,
+       uint32_t cpuMs,
+       uint32_t memoryMiB,
+-      kj::StringPtr identity)
++      kj::StringPtr identity,
++      const kj::String *oomReport = nullptr)
+       : cause(cause),
+         memory(std::move(memory)),
+         previousCause(this->memory ? this->memory->currentCause : nullptr),
+-        oom(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr),
++        oom(oomReport ? OomReportScope(*oomReport, this->memory ? &this->memory->heap : nullptr)
++                      : OomReportScope(identity, memoryMiB, this->memory ? &this->memory->heap : nullptr)),
+         entry{.isolate = isolate,
+           .cause = cause,
+           .memory = std::move(memoryState),
+@@ -850,7 +928,7 @@ struct CpuExecution {
+               : uint64_t(cpuMs) * 1000000 > used ? uint64_t(cpuMs) * 1000000 - used
+                                                  : 0,
+           .previousCpu = used,
+-          .identity = kj::str(identity),
++          .identity = identity,
+           .cpuMs = cpuMs,
+           .memoryMiB = memoryMiB},
+         registered(cpuMs != 0 || memoryMiB != 0) {
+@@ -883,6 +961,9 @@ struct CpuExecution {
+         entry.isolate->CancelTerminateExecution();
+         entry.isolate->LowMemoryNotification();
+       }
++      // The termination (or the call) has taken effect: what a raise lent is
++      // given back.
++      memory->returnLent();
+       memory->observe();
+       memory->currentCause = previousCause;
+     }
+@@ -1066,6 +1147,9 @@ struct Measurement {
+   std::atomic<LimitCause> limitCause{LimitCause::NONE};
+   std::shared_ptr<ResourcePreparation> preparation;
+   kj::Maybe<kj::String> unsupportedFeature;
++  // An HTTP call's response end: its body sent to the end, or the client gone
++  // (Invocation::request). Without it the drain limit runs from its call.
++  kj::Maybe<kj::ForkedPromise<void>> responseEnded;
+ };
+ 
+ struct RequestLimits final: LimitEnforcer {
+@@ -1074,6 +1158,7 @@ struct RequestLimits final: LimitEnforcer {
+         measurement(measurement),
+         timer(timer),
+         identity(kj::mv(identity)),
++        oomReport(oomReportText(this->identity, slot.limits->memoryMiB)),
+         failure(failurePair.promise.fork()) {}
+   ~RequestLimits() noexcept(false) {
+     writeLimitRow("completed", identity, measurement.totalCpu, slot.limits->cpuMs,
+@@ -1095,7 +1180,8 @@ struct RequestLimits final: LimitEnforcer {
+               measurement.totalCpu,
+               slot.limits->cpuMs,
+               slot.limits->memoryMiB,
+-              owner.identity) {
++              owner.identity,
++              &owner.oomReport) {
+       uint expected = 0;
+       KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
+       slot.maxActive.store(1);
+@@ -1142,13 +1228,23 @@ struct RequestLimits final: LimitEnforcer {
+     unsupported("analytics");
+   }
+   kj::Promise<void> limitDrain() override {
+-    // Called when the response has ended. A lease expires the authority to
++    // Called when the handler has returned. A lease expires the authority to
+     // make child calls, not this invocation's waitUntil work, which keeps its
+-    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT later. KJ's timer
+-    // does not advance while JavaScript runs, so the deadline is taken from the
+-    // monotonic clock now, not as a delay from the timer's cached time.
++    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT after the
++    // response ended: as on Cloudflare, once the response is sent -- a
++    // streamed body to its end -- or the client disconnected, not when the
++    // handler returned the response (v138 section 4). KJ's timer does not
++    // advance while JavaScript runs, so the deadline is taken from the
++    // monotonic clock (or the timer, if that is ahead), not as a delay from the
++    // timer's cached time.
+     if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
+-    return timer.timer.atTime(kj::systemPreciseMonotonicClock().now() + WAIT_UNTIL_LIMIT);
++    auto deadline = [this]() {
++      return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
++    };
++    KJ_IF_SOME(ended, measurement.responseEnded) {
++      return ended.addBranch().then(kj::mv(deadline));
++    }
++    return deadline();
+   }
+   kj::Promise<void> limitScheduled() override {
+     return kj::NEVER_DONE;
+@@ -1203,6 +1299,7 @@ struct RequestLimits final: LimitEnforcer {
+   Measurement &measurement;
+   Timer &timer;
+   kj::String identity;
++  kj::String oomReport;  // formatted once for the call's every JavaScript entry
+   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
+   kj::ForkedPromise<void> failure;
+   bool published = false;
+@@ -1659,11 +1756,41 @@ struct SubrequestBudget {
+   std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
+ };
+ 
++// One console line for the node's log post: at most LOG_MESSAGE_BYTES of the
++// message, and when it was longer its size, so that the node marks the line
++// truncated and counts it as it does for any line past its own limit (a cut
++// here without the size reached the node as an ordinary line, v138).
++constexpr size_t LOG_MESSAGE_BYTES = 4096;
++kj::String consoleLogRow(kj::StringPtr level, kj::StringPtr message) {
++  capnp::MallocMessageBuilder arena;
++  auto value = arena.initRoot<Json>();
++  const auto kept = kj::min(message.size(), LOG_MESSAGE_BYTES);
++  value.setString(kj::str(message.first(kept)));
++  if (kept == message.size())
++    return kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}");
++  return kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()),
++      ",\"messageBytes\":", message.size(), "}");
++}
++
+ bool canEvict(const std::shared_ptr<Slot> &slot, Slot *exclude) {
+   return slot.get() != exclude && slot->complete.load() && slot.use_count() == 1 &&
+       slot->contexts.load() == 0;
+ }
+ 
++// The maintenance pass's view of the residents, which it formats into the
++// lifecycle row outside the registry lock (tens of milliseconds with hundreds
++// of residents, every 100 ms). Weak references: a strong one made every idle
++// Worker look in use to canEvict() for that whole time, and a load past the
++// resident limit was refused instead of evicting one.
++template <typename Registry, typename Retired>
++std::vector<std::weak_ptr<Slot>> residentSnapshot(const Registry &registry, const Retired &retired) {
++  std::vector<std::weak_ptr<Slot>> snapshot;
++  snapshot.reserve(registry.size() + retired.size());
++  for (auto &[key, slot]: registry) snapshot.push_back(slot);
++  for (auto &slot: retired) snapshot.push_back(slot);
++  return snapshot;
++}
++
+ struct ThreadedServer {
+   kj::Own<v8::Platform> basePlatform = jsg::defaultPlatform(16);
+   server::WorkerdPlatform platform{*basePlatform};
+@@ -1763,11 +1890,10 @@ struct ThreadedServer {
+     // reservation whose owner is itself waiting for this maintenance pass.
+     reapRetired();
+     for (uint32_t i = 0; i < 8 && evictOne(nullptr, true); ++i) {}
+-    std::vector<std::shared_ptr<Slot>> snapshot;
++    std::vector<std::weak_ptr<Slot>> snapshot;
+     {
+       std::lock_guard lock(registryMutex);
+-      for (auto &[key, slot]: registry) snapshot.push_back(slot);
+-      for (auto &slot: retiredSlots) snapshot.push_back(slot);
++      snapshot = residentSnapshot(registry, retiredSlots);
+     }
+     auto quote = [](const std::string &value) {
+       capnp::MallocMessageBuilder arena;
+@@ -1778,7 +1904,10 @@ struct ThreadedServer {
+     std::string json = "{\"ordinaryServer\":\"threaded\",\"residentWorkers\":[";
+     uint64_t active = 0, background = 0, unknown = 0;
+     bool first = true;
+-    for (auto &slot: snapshot) {
++    for (auto &held: snapshot) {
++      // Evicted since the snapshot: gone from the row as well.
++      auto slot = held.lock();
++      if (!slot) continue;
+       auto complete = slot->complete.load();
+       if (!complete) ++unknown;
+       if (complete && slot->worker == kj::none) continue;
+@@ -2799,8 +2928,10 @@ struct SubrequestPermit {
+       bool tenantShare)
+       : budget(budget),
+         invocation(std::move(invocation)),
+-        tenant(std::move(tenant)),
+-        tenantShare(tenantShare) {}
++        // Without a per-tenant limit the share is the whole budget, which the
++        // global count already bounds: keep no tenant and no per-tenant count.
++        tenant(tenantShare && budget.tenantLimit != 0 ? std::move(tenant) : std::string()),
++        tenantShare(tenantShare && budget.tenantLimit != 0) {}
+   bool acquireLocked() {
+     auto perTenant = budget.tenantLimit == 0
+         ? budget.limit
+@@ -3159,11 +3290,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+   }
+   uint64_t logCharge = 0;
+   void log(kj::StringPtr level, kj::StringPtr message) {
+-    capnp::MallocMessageBuilder arena;
+-    auto value = arena.initRoot<Json>();
+-    auto bounded = kj::str(message.first(kj::min(message.size(), size_t(4096))));
+-    value.setString(bounded);
+-    auto row = kj::str("{\"level\":\"", level, "\",\"message\":", encode(value.asReader()), "}");
++    auto row = consoleLogRow(level, message);
+     if (!logBudget.accept(row.size())) {
+       dropLog(1, row.size());
+       return;
+@@ -3656,11 +3783,18 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+   auto &entry = prepared.entry;
+   kj::Maybe<kj::Exception> failure;
+   LimitedResponse checkedResponse(response, *invocation);
++  // workerd's request() returns once the response body is sent; a client that
++  // goes away cancels this coroutine. Either ends the response for the drain
++  // limit (RequestLimits::limitDrain).
++  auto responseEnd = kj::newPromiseAndFulfiller<void>();
++  invocation->measurement.responseEnded = responseEnd.promise.fork();
++  KJ_DEFER(if (responseEnd.fulfiller->isWaiting()) responseEnd.fulfiller->fulfill());
+   try {
+     co_await entry->request(method, url, headers, body, checkedResponse);
+   } catch (const kj::Exception &error) {
+     failure = error.clone();
+   }
++  responseEnd.fulfiller->fulfill();
+   KJ_IF_SOME(error, failure) {
+     // The library converts native refusals to JS errors. Preserve the refusal
+     // recorded by our own channels, without interpreting application messages.
