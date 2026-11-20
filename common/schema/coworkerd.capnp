@@ -471,7 +471,8 @@ struct ServerConfig {
     # The V8 sandbox's memory protection keys. Every isolate of an ordinary process has its own 8 GiB
     # V8 sandbox, fenced either by memory protection keys or by V8's guard regions (64 GiB on each
     # side, so one isolate reserves 136 GiB of address space and a process holds fewer than a
-    # thousand; the node then starts more ordinary processes).
+    # thousand; the node then lowers each ordinary process's resident limit, and keeps
+    # processPool.count).
     #   auto      keys when the CPU, the kernel and the container provide them, else guard regions.
     #   off       guard regions.
     #   required  the node refuses to start without keys and names what is missing (the CPU, the

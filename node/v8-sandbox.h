@@ -8,8 +8,8 @@
 // 8 GiB sandbox would be fenced by keys (S3b, not in this build); without them it is fenced by V8's
 // guard regions, and one isolate reserves 136 GiB of address space, so a process holds fewer than a
 // thousand. The node plans this once at startup (sandbox.protectionKeys: auto, off or required),
-// lowers the per-process resident limit to the plan's, starts more ordinary processes to keep the
-// configured capacity, and reports the plan in its startup log and state.
+// lowers the per-process resident limit to the plan's (the configured process count holds, r50
+// §6.4), and reports the plan, with the node's resident capacity, in its startup log and state.
 namespace coworkerd {
 
 // What the ordinary processes' binary reports about its V8 sandbox (coworkerd-threaded
@@ -69,7 +69,9 @@ struct SandboxPlan {
   uint64_t addressLimit = 0, measuredLimit = 0, mapLimit = 0;
   uint32_t perProcessLimit = 0;   // the node's per-process limit for this mode (0: none)
   uint32_t configuredResidentLimit = 0, residentLimit = 0;
-  uint32_t configuredProcesses = 0, processes = 0;
+  uint32_t configuredProcesses = 0, processes = 0;  // processes is always the configured count
+  uint64_t residentCapacity = 0;  // processes x residentLimit, once a per-process limit applies
+  std::string lowered;            // non-empty: the resident limit is below the configured one, and why
   std::string refusal;            // non-empty: the node refuses to start
   std::string warning;            // non-empty: the node starts, and says this loudly
   std::string json() const;
@@ -79,6 +81,10 @@ struct SandboxPlan {
 SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& build,
     const ProtectionKeyFacts& keys, const MachineFacts& machine, uint32_t configuredResidentLimit,
     uint32_t configuredProcesses, const SandboxPlanConstants& constants = {});
+
+// Applies a per-process limit to the plan: the resident limit, the node's resident capacity, and
+// the warning (the lowering, and below constants.warnBelow why so few fit). The process count stays.
+void limitPerProcess(SandboxPlan& plan, uint32_t perProcessLimit, const SandboxPlanConstants& constants = {});
 
 // What is missing for memory protection keys: "" when usable, else "cpu", "kernel" or
 // "container", and the sentence the node writes.

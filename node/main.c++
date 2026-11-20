@@ -8943,9 +8943,10 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 
 // The process pool's own environment overrides (process-pool.c++), applied here as well so that the
 // configuration a Server reports is the one it runs; the pool applies the same values again.
-// The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares
-// because it can start more ordinary processes: the threaded binary's sandbox, this machine's
-// memory protection keys, address space and vm.max_map_count. A plan that refuses ends the start.
+// The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares:
+// the threaded binary's sandbox, this machine's memory protection keys, address space and
+// vm.max_map_count lower each process's resident limit (never the process count, r50 §6.4).
+// A plan that refuses ends the start.
 void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
@@ -8958,14 +8959,12 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
   // so that a process fills until V8's own group creation refuses (the second line).
   if (const char* test = std::getenv("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST"); test != nullptr && plan.refusal.empty()) {
-    plan.perProcessLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST", 0, 1840));
-    plan.residentLimit = std::min(plan.configuredResidentLimit, plan.perProcessLimit);
-    plan.processes = plan.configuredProcesses;
+    coworkerd::limitPerProcess(plan, static_cast<uint32_t>(environmentUnsigned("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST", 0, 1840)));
   }
   pool.sandboxPlanJson = plan.json();
   pool.sandboxWarning = plan.warning;
   KJ_REQUIRE(plan.refusal.empty(), plan.refusal.c_str());
-  pool.count = plan.processes;
+  // The configured process count holds (r50 §6.4); only each process's resident limit is lowered.
   pool.threadedResidentLimit = plan.residentLimit;
   if (plan.perProcessLimit != 0) pool.sandboxResidentLimit = plan.perProcessLimit;
   // A Wasm memory reserves its maximum in the 4 GiB buffer half of the isolate's sandbox.

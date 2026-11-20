@@ -1,6 +1,6 @@
 // The node's V8 sandbox plan (node/v8-sandbox.h): the mode, the per-process limit from the address
-// space and vm.max_map_count, more ordinary processes for the configured capacity, and the refusals
-// of sandbox.protectionKeys = required.
+// space and vm.max_map_count, the configured process count kept with a lowered resident limit
+// (r50 §6.4), and the refusals of sandbox.protectionKeys = required.
 #include "v8-sandbox.h"
 
 #include <kj/debug.h>
@@ -52,14 +52,39 @@ void guardRegions() {
 }
 
 void scale() {
-  // The configured capacity (1 process x 1,840 residents) needs ceil(1840 / 648) = 3 processes.
-  const auto plan = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, 1);
-  KJ_REQUIRE(plan.processes == 3 && plan.configuredProcesses == 1, plan.processes);
-  const auto four = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, 4);
-  KJ_REQUIRE(four.processes == 12, four.processes);
-  // A configured limit already below the plan's needs no more processes.
+  // The node never starts more ordinary processes than configured (r50 §6.4), whatever the limit.
+  for (uint32_t count : {1u, 4u, 16u}) {
+    const auto plan = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, count);
+    KJ_REQUIRE(plan.processes == count && plan.configuredProcesses == count, count, plan.processes);
+  }
+  const auto arm39 = planV8Sandbox("auto", sandboxBuild(), noKeys(), {.addressSpaceBytes = 512 * GiB, .maxMapCount = 65530}, 1840, 2);
+  KJ_REQUIRE(arm39.perProcessLimit == 1 && arm39.processes == 2, arm39.processes);
   const auto small = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 500, 2);
   KJ_REQUIRE(small.residentLimit == 500 && small.processes == 2, small.residentLimit, small.processes);
+}
+
+void lowered() {
+  // The process count stays and each process's resident limit is lowered: 4 x 1,840 configured,
+  // 4 x 648 held, and the plan and its warning say so and what to change.
+  const auto plan = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, 4);
+  KJ_REQUIRE(plan.processes == 4 && plan.residentLimit == 648 && plan.residentCapacity == 4 * 648,
+      plan.processes, plan.residentLimit, plan.residentCapacity);
+  const std::string sentence = "the per-process resident limit is lowered from 1840 (processPool.threadedResidentLimit) to 648 "
+      "(one V8 sandbox per isolate): this node holds 4 x 648 = 2592 resident Workers in its ordinary processes; "
+      "for more, raise processPool.count";
+  KJ_REQUIRE(plan.lowered == sentence, plan.lowered.c_str());
+  KJ_REQUIRE(plan.warning == sentence, plan.warning.c_str());
+  KJ_REQUIRE(plan.json().find("\"residentCapacity\":2592,\"lowered\":\"the per-process resident limit is lowered from 1840") !=
+      std::string::npos, plan.json().c_str());
+  // A configured limit already below the plan's is not lowered and warns of nothing.
+  const auto small = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 500, 2);
+  KJ_REQUIRE(small.lowered.empty() && small.warning.empty() && small.residentCapacity == 1000, small.warning.c_str());
+  KJ_REQUIRE(small.json().find("lowered") == std::string::npos, small.json().c_str());
+  // The fill-until-failure override raises the limit back to the configured one: nothing is lowered.
+  auto raised = plan;
+  limitPerProcess(raised, 1840);
+  KJ_REQUIRE(raised.residentLimit == 1840 && raised.processes == 4 && raised.lowered.empty() && raised.warning.empty(),
+      raised.warning.c_str());
 }
 
 void offBuild() {
@@ -115,7 +140,11 @@ void machineGaps() {
   const auto arm39 = planV8Sandbox("auto", sandboxBuild(), noKeys(), {.addressSpaceBytes = 512 * GiB, .maxMapCount = 65530}, 1840, 1);
   KJ_REQUIRE(arm39.addressLimit == 2 && arm39.perProcessLimit == 1, arm39.addressLimit, arm39.perProcessLimit);
   KJ_REQUIRE(arm39.refusal.empty() && arm39.warning.find("48-bit virtual addresses") != std::string::npos, arm39.warning.c_str());
-  KJ_REQUIRE(planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, 1).warning.empty());
+  // Both said: first the lowering, then why so few fit.
+  KJ_REQUIRE(arm39.warning.rfind("the per-process resident limit is lowered from 1840 (processPool.threadedResidentLimit) to 1 ", 0) == 0,
+      arm39.warning.c_str());
+  // 48-bit addresses: the lowering is said, the few-fit reason is not.
+  KJ_REQUIRE(planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, 1).warning.find("48-bit") == std::string::npos);
   // An address space without room for one isolate refuses.
   const auto tiny = planV8Sandbox("auto", sandboxBuild(), noKeys(), {.addressSpaceBytes = 256 * GiB, .maxMapCount = 65530}, 1840, 1);
   KJ_REQUIRE(tiny.refusal.find("hold no Worker") != std::string::npos, tiny.refusal.c_str());
@@ -173,6 +202,7 @@ int main(int argc, char** argv) {
     const std::string_view label = argv[1];
     if (label == "guard-regions") guardRegions();
     else if (label == "scale") scale();
+    else if (label == "lowered") lowered();
     else if (label == "off-build") offBuild();
     else if (label == "insecure-build") insecureBuild();
     else if (label == "required") required();

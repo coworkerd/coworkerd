@@ -243,7 +243,7 @@ add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-
 add_executable(coworkerd-v8-sandbox-test EXCLUDE_FROM_ALL node/v8-sandbox-test.c++ node/v8-sandbox.c++)
 target_include_directories(coworkerd-v8-sandbox-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
 target_link_libraries(coworkerd-v8-sandbox-test PRIVATE common)
-foreach(case guard-regions scale off-build insecure-build required unknown machine-gaps map-count-first parse probe)
+foreach(case guard-regions scale lowered off-build insecure-build required unknown machine-gaps map-count-first parse probe)
   add_test(NAME node-v8-sandbox-${case} COMMAND coworkerd-v8-sandbox-test ${case})
 endforeach()
 set(COWORKERD_TEST_JUNIT "" CACHE FILEPATH "Optional JUnit result path for the check target")

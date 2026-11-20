@@ -252,8 +252,7 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
   plan.measuredLimit = build.groupCapacity;
   const uint64_t space = plan.measuredLimit ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
   const uint64_t bound = std::min(space, plan.mapLimit) * constants.marginPercent / 100;
-  plan.perProcessLimit = static_cast<uint32_t>(std::min<uint64_t>(bound, UINT32_MAX));
-  if (plan.perProcessLimit == 0) {
+  if (bound == 0) {
     if (plan.refusal.empty()) {
       plan.refusal = "this machine's address space (" + std::to_string(machine.addressSpaceBytes >> 30) +
           " GiB) and vm.max_map_count (" + std::to_string(machine.maxMapCount) +
@@ -261,22 +260,36 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
     }
     return plan;
   }
-  if (plan.perProcessLimit < constants.warnBelow) {
-    plan.warning = "only " + std::to_string(plan.perProcessLimit) + " Worker(s) per process fit: one isolate's V8 sandbox reserves " +
-        std::to_string(perIsolate >> 30) + " GiB of address space and this machine's user address space is " +
-        std::to_string(machine.addressSpaceBytes >> 30) + " GiB" +
-        (plan.mapLimit < space ? " and vm.max_map_count is " + std::to_string(machine.maxMapCount) : std::string()) +
+  limitPerProcess(plan, static_cast<uint32_t>(std::min<uint64_t>(bound, UINT32_MAX)), constants);
+  return plan;
+}
+
+void limitPerProcess(SandboxPlan& plan, uint32_t perProcessLimit, const SandboxPlanConstants& constants) {
+  plan.perProcessLimit = perProcessLimit;
+  // The configured process count holds (r50 §6.4): only each process's resident limit is lowered.
+  plan.processes = plan.configuredProcesses;
+  plan.residentLimit = std::min(plan.configuredResidentLimit, perProcessLimit);
+  plan.residentCapacity = uint64_t(plan.processes) * plan.residentLimit;
+  plan.lowered.clear();
+  if (plan.residentLimit < plan.configuredResidentLimit) {
+    plan.lowered = "the per-process resident limit is lowered from " + std::to_string(plan.configuredResidentLimit) +
+        " (processPool.threadedResidentLimit) to " + std::to_string(plan.residentLimit) +
+        " (one V8 sandbox per isolate): this node holds " + std::to_string(plan.processes) + " x " +
+        std::to_string(plan.residentLimit) + " = " + std::to_string(plan.residentCapacity) +
+        " resident Workers in its ordinary processes; for more, raise processPool.count";
+  }
+  plan.warning = plan.lowered;
+  if (perProcessLimit < constants.warnBelow) {
+    const uint64_t perIsolate = plan.build.reservationBytes + constants.outsideSandboxBytes;
+    const uint64_t space = plan.measuredLimit ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
+    plan.warning += std::string(plan.warning.empty() ? "" : "; ") + "only " + std::to_string(perProcessLimit) +
+        " Worker(s) per process fit: one isolate's V8 sandbox reserves " + std::to_string(perIsolate >> 30) +
+        " GiB of address space and this machine's user address space is " +
+        std::to_string(plan.machine.addressSpaceBytes >> 30) + " GiB" +
+        (plan.mapLimit < space ? " and vm.max_map_count is " + std::to_string(plan.machine.maxMapCount) : std::string()) +
         "; an arm64 host needs a kernel with 48-bit virtual addresses (CONFIG_ARM64_VA_BITS_48 or more), see "
         "docs/guide/install.md, \"The V8 sandbox and memory protection keys\"";
   }
-  plan.residentLimit = std::min(configuredResidentLimit, plan.perProcessLimit);
-  // Keep the configured capacity: as many more ordinary processes as the lower limit needs.
-  if (plan.residentLimit < configuredResidentLimit) {
-    const uint64_t wanted = uint64_t(configuredProcesses) * configuredResidentLimit;
-    plan.processes = static_cast<uint32_t>(std::clamp<uint64_t>(
-        (wanted + plan.residentLimit - 1) / plan.residentLimit, configuredProcesses, 256));
-  }
-  return plan;
 }
 
 std::string SandboxPlan::json() const {
@@ -294,7 +307,8 @@ std::string SandboxPlan::json() const {
       << ",\"addressLimit\":" << addressLimit << ",\"measuredLimit\":" << measuredLimit << ",\"mapLimit\":" << mapLimit
       << ",\"perProcessLimit\":" << perProcessLimit << ",\"configuredResidentLimit\":" << configuredResidentLimit
       << ",\"residentLimit\":" << residentLimit << ",\"configuredProcesses\":" << configuredProcesses
-      << ",\"processes\":" << processes;
+      << ",\"processes\":" << processes << ",\"residentCapacity\":" << residentCapacity;
+  if (!lowered.empty()) out << ",\"lowered\":\"" << jsonEscape(lowered) << "\"";
   if (!refusal.empty()) out << ",\"refusal\":\"" << jsonEscape(refusal) << "\"";
   if (!warning.empty()) out << ",\"warning\":\"" << jsonEscape(warning) << "\"";
   out << "}";
