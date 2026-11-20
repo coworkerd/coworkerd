@@ -969,6 +969,9 @@ struct ProcessGeneration {
   std::string eventSha256;            // its value once the pipe ended
   pid_t spawnPid = 0;
   std::string eventTail;
+  // The problem a process that refused to start for its V8 sandbox wrote to its event channel
+  // (kernel patch 0043: a sandbox-refused row before it exits with 78).
+  std::string sandboxRefusal;
   bool fatalMemoryEventPending = false;
   std::vector<LimitEvent> unappliedEvents;
   std::array<std::deque<std::pair<std::string, std::string>>, 3> terminatedCallOrder;
@@ -1175,6 +1178,19 @@ struct ProcessGeneration {
     for (size_t newline; (newline = eventTail.find('\n', start)) != std::string::npos; start = newline + 1) {
       const auto row = eventTail.substr(start, newline - start);
       ++eventRows;
+      if (row.find("\"event\":\"sandbox-refused\"") != std::string::npos) {
+        // The row's problem, a JSON string, as text (it has no field in the CPU report).
+        auto at = row.find("\"problem\":\"");
+        std::string problem;
+        if (at != std::string::npos) {
+          for (auto i = at + 11; i < row.size() && row[i] != '"'; ++i) {
+            if (row[i] == '\\' && i + 1 < row.size()) ++i;
+            problem += row[i];
+          }
+        }
+        sandboxRefusal = problem.empty() ? "the V8 sandbox is not usable" : problem;
+        continue;
+      }
       try {
         capnp::MallocMessageBuilder message;
         auto report = message.initRoot<v1::rpc::CpuReport>();
@@ -1624,6 +1640,8 @@ public:
         *setting.second = value;
       }
     }
+    // The node's V8 sandbox plan bounds residents per process whatever the environment asks.
+    this->config.threadedResidentLimit = std::min(this->config.threadedResidentLimit, this->config.sandboxResidentLimit);
     if (auto* mode = std::getenv("COWORKERD_SANDBOX_MODE")) this->config.sandboxMode = mode;
     if (auto* mode = std::getenv("COWORKERD_SANDBOX_SYSCALLS")) this->config.syscallsMode = mode;
     if (auto* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) this->config.allowlistPath = path;
@@ -1722,6 +1740,9 @@ public:
   uint32_t wasmMemoryCapMiB() const {
     uint32_t cap = config.memoryLimitMiB;
     if (workerLimits.maxMemoryMiB) cap = std::max(cap, workerLimits.maxMemoryMiB());
+    // With a V8 sandbox per isolate a Wasm memory reserves its maximum in the sandbox's 4 GiB
+    // buffer half, which also holds the isolate's 2 GiB ArrayBuffer pool: never uncapped there.
+    if (config.sandboxWasmCapMiB && (cap == 0 || cap > config.sandboxWasmCapMiB)) cap = config.sandboxWasmCapMiB;
     return cap;
   }
   // Where the durable processes keep their objects (workerd's localDisk storage): <stack>/do.
@@ -3003,10 +3024,14 @@ public:
         (sandbox.syscalls.steady.active && sandbox.syscalls.steady.mode == "enforce");
     const bool syscallDenied = p->launched && enforcing && !p->plannedExit && p->state != "killed" &&
         WIFSIGNALED(status) && WTERMSIG(status) == SYSCALL_DENIED_SIGNAL;
-    if (p->threaded && !p->plannedExit && WIFEXITED(status) && WEXITSTATUS(status) == 78) {
+    const bool sandboxRefused = !p->sandboxRefusal.empty();
+    if ((p->threaded || sandboxRefused) && !p->plannedExit && WIFEXITED(status) && WEXITSTATUS(status) == 78) {
+      // Not restarted: the same machine refuses the same way.
       s.configurationFailed = true;
-      s.lastExitCategory = "configuration";
-      p->lastReason = "native process configuration insufficient (exit 78); restart the node after correcting resource limits";
+      s.lastExitCategory = sandboxRefused ? "sandbox" : "configuration";
+      p->lastReason = sandboxRefused
+          ? "the V8 sandbox is not secure on this machine (exit 78): " + p->sandboxRefusal + "; restart the node after correcting it"
+          : "native process configuration insufficient (exit 78); restart the node after correcting resource limits";
     } else if (launchFailed) {
       recordLaunchFailure(s, *p);
     } else if (syscallDenied) {
@@ -3992,7 +4017,8 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"longPauseMs\":" << impl->config.gcLongPauseMs << ",\"idleCollectAfterMs\":" << impl->config.gcIdleCollectAfterMs
       << ",\"idleCollectMinGrowthMiB\":" << impl->config.gcIdleCollectMinGrowthMiB
       << ",\"initialOldSpaceMiB\":" << impl->config.gcInitialOldSpaceMiB << ",\"runtimeHeapMiB\":" << impl->config.gcRuntimeHeapMiB
-      << "}},\"entries\":[";
+      << "},\"v8Sandbox\":" << (impl->config.sandboxPlanJson.empty() ? std::string("null") : impl->config.sandboxPlanJson)
+      << "},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
     r47::Span span(r47::STATE_POOL);

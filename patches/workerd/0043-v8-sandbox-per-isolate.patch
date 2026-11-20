@@ -1,0 +1,2258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 20 Nov 2026 12:07:07 +0800
+Subject: [PATCH] Build the V8 sandbox with one 8 GiB sandbox per isolate group
+
+--config=coworkerd-sandbox (.bazelrc) builds V8 with its sandbox, one pointer-compression cage per
+isolate group, libc++ hardening, and V8 patch 0055's two parameters: an 8 GiB sandbox
+(V8_SANDBOX_SIZE_LOG2=33: the 4 GiB cage followed by 4 GiB for buffers) and no additional trailing
+guard region (V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS, as V8 does on Android: its TypedArray access
+masks keep every access within the regular 64 GiB guard regions). V8 patch 0057 adds
+IsolateGroup::TryCreate(), which returns no group instead of ending the process when the address
+space has no room for another sandbox. Without the config nothing changes.
+
+What the embedder needs with that build:
+- jsg: MemoryProtectionKeyScope is compiled only with WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY
+  (only Cloudflare's V8 has GetMemoryProtectionKey()); V8PlatformWrapper forwards
+  GetZeroSegmentSize(); SandboxedBytes (Blob payloads) finds the sandbox behind the front guard
+  region; the default ArrayBuffer allocator holds its group (newGroupArrayBufferAllocator()), so a
+  backing store outliving its isolate frees into a live sandbox.
+- WorkerdPlatform reserves the first 4 GiB and 1 MiB before V8 starts and reports it.
+- coworkerd-sandbox (factory): tryNewIsolateGroup() creates a Worker's group first, with a pool
+  allocator reserved in its sandbox before any isolate (V8's default reserves on the first
+  ArrayBuffer and ends the process when no 1 GiB is left), or none when no group fits; the
+  factory and the threaded server refuse that Worker (OVERLOADED). The memory limits allocate in
+  the isolate's group and bound MaxAllocationSize() by the limit. Startup refuses (exit 78, a
+  sandbox-refused row on the event channel) and every isolate is refused unless V8 reports its
+  sandbox as secure, laid out as configured, with the zero segment really held (probed) and a
+  group of its own; one [coworkerd-sandbox] row per check. coworkerd-threaded --sandbox-facts
+  prints the process row for the node's plan. A sandbox build without libc++ hardening does not
+  compile.
+- Tests: coworkerd-sandbox-test (layout, secure modes, groups, allocation placement, pool, zero
+  segment, refusals, exhaustion, a child refused for an occupied low 4 GiB) and the threaded
+  tests (four simultaneous near-GiB objects now preserve the process with a cage per isolate;
+  buffers in the Worker's own group).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/.bazelrc b/.bazelrc
+index 41dd1942d77a0e4323fe5c6e3c4170687fe684b0..41b61c4a35ce915668fd92a46dcfd503c21c8498 100644
+--- a/.bazelrc
++++ b/.bazelrc
+@@ -102,6 +102,21 @@ build --@v8//:v8_temporal_capi=//deps/rust:temporal_capi
+ # Room for every jsg::ContextDataSlot; V8 does not grow a context's embedder-data array.
+ build --@v8//:v8_embedder_data_array_size=10
+ 
++# Coworkerd: the V8 sandbox with one sandbox per isolate group (--config=coworkerd-sandbox). Every
++# isolate gets its own pointer-compression cage, and with it its own 8 GiB sandbox: the 4 GiB cage
++# followed by 4 GiB for ArrayBuffer backing stores and Wasm memories. Without memory protection
++# keys the sandbox keeps V8's guard regions: 64 GiB in front and 64 GiB behind
++# (kSandboxGuardRegionSize: a 32-bit index scaled by 8 plus a bounded-size offset), without V8's
++# additional 224 GiB trailing guard, whose job V8's TypedArray access masks take over, as V8
++# does on Android (patches/v8/0055). One isolate then reserves 136 GiB of address space.
++# Every target compilation unit needs the same defines: V8's Bazel build has no sandbox option,
++# and the layout of V8's inline API depends on them. V8 requires libc++ hardening with its sandbox.
++build:coworkerd-sandbox --copt=-DV8_ENABLE_SANDBOX
++build:coworkerd-sandbox --copt=-DV8_SANDBOX_SIZE_LOG2=33
++build:coworkerd-sandbox --copt=-DV8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS
++build:coworkerd-sandbox --@v8//:v8_enable_pointer_compression_shared_cage=False
++build:coworkerd-sandbox --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
++
+ # Increasing the optimization level of V8 significantly speeds up tests using V8 a lot, especially
+ # python tests. This is useful for both CI and local development and enabled by default, but still
+ # kept in a separate configuration to make it easy to disable.
+diff --git a/build/deps/v8.MODULE.bazel b/build/deps/v8.MODULE.bazel
+index 7fc2ad403d7c32e633de20992654994d65a60a55..8f77f8d335266be4d0155cafaef6842b51d96f8e 100644
+--- a/build/deps/v8.MODULE.bazel
++++ b/build/deps/v8.MODULE.bazel
+@@ -77,6 +77,8 @@ PATCHES = [
+     "0052-Keep-functions-created-by-v8-Function-New-in-the-context-snapshot.patch",
+     "0053-Leave-the-SharedFunctionInfo-id-out-of-the-read-only-heap-checksum.patch",
+     "0054-Add-SnapshotCreator-HasSuspendedGenerators.patch",
++    "0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch",
++    "0057-Add-IsolateGroup-TryCreate-which-can-fail-instead-of-aborting.patch",
+ ]
+ 
+ http_archive(
+diff --git a/patches/v8/0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch b/patches/v8/0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc17485f77f1c0c3e2c79be73acdceee62ca1da6
+--- /dev/null
++++ b/patches/v8/0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch
+@@ -0,0 +1,61 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Claude <noreply@anthropic.com>
++Date: Thu, 19 Nov 2026 23:34:34 +0000
++Subject: [PATCH] Make the sandbox size and the additional trailing guard build
++ parameters
++
++The sandbox size is a compile-time constant chosen per target OS (1 TB on
++Linux x64), which leaves room for only about a hundred sandboxes in a
++47-bit user address space. An embedder that gives every isolate group its
++own sandbox (V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES) needs a smaller one.
++
++V8_SANDBOX_SIZE_LOG2 sets kSandboxSizeLog2 (33 to 40). With 33 the sandbox
++is 8 GB: the 4 GB pointer compression cage followed by 4 GB for ArrayBuffer
++backing stores and Wasm memories. It equals kSandboxMinimumReservationSize,
++so such a sandbox is always fully reserved.
++
++V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS sets kAdditionalTrailingGuardRegionSize
++to 0, the configuration V8 already uses on Android, ARM64 ChromeOS and
++Loong64: kRequiresTypedArrayAccessMasks then masks the offsets of TypedArray
++accesses computed from an element count, so that the regular guard regions
++(32 GB for a 32-bit index scaled by 8 plus 32 GB for a bounded-size offset,
++kSandboxGuardRegionSize) still cover every access.
++
++Neither define changes anything when it is not set.
++
++diff --git a/include/v8-internal.h b/include/v8-internal.h
++index 4ff0b56f072a56a4f60dd9386c4cd6944fe592c5..729d0d4fad730fe40bb5298430660d88ed85b810 100644
++--- a/include/v8-internal.h
+++++ b/include/v8-internal.h
++@@ -218,7 +218,15 @@ using SandboxedPointer_t = Address;
++ #ifdef V8_ENABLE_SANDBOX
++ 
++ // Size of the sandbox, excluding the guard regions surrounding it.
++-#if defined(V8_TARGET_OS_ANDROID)
+++#if defined(V8_SANDBOX_SIZE_LOG2)
+++// Chosen by the embedder's build, for example 33 (8 GB: the 4 GB pointer
+++// compression cage followed by 4 GB for ArrayBuffer backing stores and Wasm
+++// memories) when every isolate group has its own sandbox
+++// (V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES).
+++constexpr size_t kSandboxSizeLog2 = V8_SANDBOX_SIZE_LOG2;
+++static_assert(kSandboxSizeLog2 >= 33 && kSandboxSizeLog2 <= 40,
+++              "V8_SANDBOX_SIZE_LOG2 must be between 33 (8 GB) and 40 (1 TB)");
+++#elif defined(V8_TARGET_OS_ANDROID)
++ // On Android, most 64-bit devices seem to be configured with only 39 bits of
++ // virtual address space for userspace. As such, limit the sandbox to 128GB (a
++ // quarter of the total available address space).
++@@ -308,7 +316,13 @@ static_assert(kMaxSafeBufferSizeForSandbox <= kSandboxGuardRegionSize,
++               "The maximum allowed buffer size must not be larger than the "
++               "sandbox's guard regions");
++ 
++-#if defined(V8_TARGET_OS_ANDROID)
+++#if defined(V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS)
+++// Chosen by the embedder's build where many sandboxes share one address space:
+++// no additional trailing guard region. TypedArray accesses whose offset is
+++// computed from an element count are then masked to at most
+++// kMaxSafeBufferSizeForSandbox (kRequiresTypedArrayAccessMasks), as on Android.
+++constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
+++#elif defined(V8_TARGET_OS_ANDROID)
++ // On Android, we often won't have sufficient virtual address space available.
++ constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
++ #elif defined(V8_TARGET_ARCH_ARM64) && defined(V8_TARGET_OS_CHROMEOS)
+diff --git a/patches/v8/0057-Add-IsolateGroup-TryCreate-which-can-fail-instead-of-aborting.patch b/patches/v8/0057-Add-IsolateGroup-TryCreate-which-can-fail-instead-of-aborting.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..107ef70d231dac61066fa0314146cd014e4d46b4
+--- /dev/null
++++ b/patches/v8/0057-Add-IsolateGroup-TryCreate-which-can-fail-instead-of-aborting.patch
+@@ -0,0 +1,254 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Claude <noreply@anthropic.com>
++Date: Fri, 20 Nov 2026 02:12:14 +0000
++Subject: [PATCH] Add IsolateGroup::TryCreate(), which can fail instead of
++ aborting
++
++With one sandbox per isolate group, every group reserves its sandbox with
++guard regions (136 GB for an 8 GB sandbox with
++V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS). When the address space has no room for
++another one, IsolateGroup::Create() aborts the process: an 8 GB sandbox is
++kSandboxMinimumReservationSize, so there is no partially reserved fallback,
++and Sandbox::Initialize() calls FatalProcessOutOfMemory. An embedder that
++creates a group per isolate wants to refuse that one isolate instead.
++
++TryCreate() returns no group in that case. Sandbox::TryNew() and
++TryInitialize() are Sandbox::New() and Initialize() without the final OOM
++crash. After the sandbox, IsolateGroup::TryNew() makes sure that a 4 GB
++aligned 4 GB region can still be reserved, room for what the group and its
++first isolate reserve outside the sandbox and would abort on (the 1 GB
++trusted range, the code range, the tables of the isolate); otherwise it
++releases the sandbox and returns nullptr. Create() is unchanged.
++
++diff --git a/include/v8-isolate.h b/include/v8-isolate.h
++index f7caba35ce648955337463ed8b4af47a15dfcf85..a383886b13f38f36adfea2669f808c43e64eb3d5 100644
++--- a/include/v8-isolate.h
+++++ b/include/v8-isolate.h
++@@ -10,6 +10,7 @@
++ 
++ #include <functional>
++ #include <memory>
+++#include <optional>
++ #include <string>
++ #include <utility>
++ 
++@@ -251,6 +252,16 @@ class V8_EXPORT IsolateGroup {
++    */
++   static IsolateGroup Create();
++ 
+++  /**
+++   * Like Create(), but returns no group instead of aborting the process when
+++   * the address space has no room left for the group's reservations: its
+++   * sandbox with the guard regions, and outside the sandbox its trusted range
+++   * and its first isolate's tables. An embedder that creates a group per
+++   * isolate can then refuse that isolate and keep the process. If this V8's
+++   * build configuration only supports a single group, abort.
+++   */
+++  static std::optional<IsolateGroup> TryCreate();
+++
++   IsolateGroup(IsolateGroup&& other);
++   IsolateGroup& operator=(IsolateGroup&& other);
++ 
++diff --git a/src/api/api.cc b/src/api/api.cc
++index b65302af06294fb1e45baea617f4f0df0c1c08a0..b132498c4f63dead0b577f9a172de61515653b45 100644
++--- a/src/api/api.cc
+++++ b/src/api/api.cc
++@@ -10062,6 +10062,13 @@ IsolateGroup IsolateGroup::Create() {
++   return IsolateGroup(i::IsolateGroup::New());
++ }
++ 
+++// static
+++std::optional<IsolateGroup> IsolateGroup::TryCreate() {
+++  i::IsolateGroup* group = i::IsolateGroup::TryNew();
+++  if (group == nullptr) return std::nullopt;
+++  return IsolateGroup(std::move(group));
+++}
+++
++ IsolateGroup::IsolateGroup(IsolateGroup&& other) {
++   isolate_group_ = other.isolate_group_;
++   other.isolate_group_ = nullptr;
++diff --git a/src/init/isolate-group.cc b/src/init/isolate-group.cc
++index 9ca26dbd6c082c63faeaeb3df93ff152659d510a..55dc58a850db58a1aa780cc45315439a9d46b968 100644
++--- a/src/init/isolate-group.cc
+++++ b/src/init/isolate-group.cc
++@@ -429,6 +429,52 @@ size_t IsolateGroup::GetIsolateCount() {
++   return isolates_.size();
++ }
++ 
+++namespace {
+++
+++// Whether the address space still has room for what a new group and its first
+++// isolate reserve outside the sandbox and abort on failure: the 1 GB trusted
+++// range (4 GB aligned), the code range and the isolate's tables, together well
+++// under 4 GB. Probed by reserving and releasing a 4 GB aligned region of 4 GB
+++// (plus `extra`).
+++bool HasReservationHeadroom(size_t extra) {
+++  v8::PageAllocator* allocator = GetPlatformPageAllocator();
+++  const size_t size = size_t{4} * GB + extra;
+++  void* probe = allocator->AllocatePages(nullptr, size, size_t{4} * GB,
+++                                         PageAllocator::kNoAccess);
+++  if (probe == nullptr) return false;
+++  CHECK(allocator->FreePages(probe, size));
+++  return true;
+++}
+++
+++}  // namespace
+++
+++// static
+++IsolateGroup* IsolateGroup::TryNew() {
+++  if (!CanCreateNewGroups()) {
+++    FATAL(
+++        "Creation of new isolate groups requires enabling "
+++        "multiple pointer compression cages at build-time");
+++  }
+++
+++#ifdef V8_ENABLE_SANDBOX
+++  Sandbox* sandbox = Sandbox::TryNew(V8::GetCurrentPlatform(),
+++                                     GetPlatformVirtualAddressSpace());
+++  if (sandbox == nullptr) return nullptr;
+++  if (!HasReservationHeadroom(0)) {
+++    sandbox->TearDown();
+++    delete sandbox;
+++    return nullptr;
+++  }
+++  IsolateGroup* group = new IsolateGroup;
+++  group->Initialize(false, sandbox);
+++#else
+++  if (!HasReservationHeadroom(kPtrComprCageReservationSize)) return nullptr;
+++  IsolateGroup* group = new IsolateGroup;
+++  group->Initialize(false);
+++#endif
+++  return FinishNew(group);
+++}
+++
++ // static
++ IsolateGroup* IsolateGroup::New() {
++   if (!CanCreateNewGroups()) {
++@@ -445,6 +491,11 @@ IsolateGroup* IsolateGroup::New() {
++ #else
++   group->Initialize(false);
++ #endif
+++  return FinishNew(group);
+++}
+++
+++// static
+++IsolateGroup* IsolateGroup::FinishNew(IsolateGroup* group) {
++   CHECK_NOT_NULL(group->page_allocator_);
++ 
++   // We need to set this early, because it is needed while initializing the
++diff --git a/src/init/isolate-group.h b/src/init/isolate-group.h
++index c92cebdaff42c7f72807794d8eb789315864b0a5..8b1416b2ad08077e26ffbe575752174a67c5f5f4 100644
++--- a/src/init/isolate-group.h
+++++ b/src/init/isolate-group.h
++@@ -124,6 +124,10 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
++   // group's refcount drops to zero.  The group's initial refcount is 1.
++   static IsolateGroup* New();
++ 
+++  // Like New(), but returns nullptr instead of aborting when the address space
+++  // has no room for the group's reservations.
+++  static IsolateGroup* TryNew();
+++
++   static void InitializeOncePerProcess();
++   static void TearDownOncePerProcess();
++ 
++@@ -287,6 +291,9 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
++   // Only used for testing.
++   static void ReleaseDefault();
++ 
+++  // The common end of New() and TryNew() for an initialized group.
+++  static IsolateGroup* FinishNew(IsolateGroup* group);
+++
++ #ifdef V8_ENABLE_SANDBOX
++   void Initialize(bool process_wide, Sandbox* sandbox);
++ #else   // V8_ENABLE_SANDBOX
++diff --git a/src/sandbox/sandbox.cc b/src/sandbox/sandbox.cc
++index 717b7213ffb0fc39b95dc04f8756b45ca8b46323..ab1d7aa1a652dc00c765b7d1826447e0a760982a 100644
++--- a/src/sandbox/sandbox.cc
+++++ b/src/sandbox/sandbox.cc
++@@ -346,6 +346,15 @@ static Address DetermineAddressSpaceLimit() {
++ }
++ 
++ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
+++  if (!TryInitialize(platform, vas)) {
+++    V8::FatalProcessOutOfMemory(
+++        nullptr,
+++        "Failed to reserve the virtual address space for the V8 sandbox");
+++  }
+++}
+++
+++bool Sandbox::TryInitialize(v8::Platform* platform,
+++                            v8::VirtualAddressSpace* vas) {
++   // Take the size of the virtual address space into account when determining
++   // the size of the address space reservation backing the sandbox. For
++   // example, if we only have a 40-bit address space, split evenly between
++@@ -409,11 +418,7 @@ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
++                                                    reservation_size);
++   }
++ 
++-  if (!success) {
++-    V8::FatalProcessOutOfMemory(
++-        nullptr,
++-        "Failed to reserve the virtual address space for the V8 sandbox");
++-  }
+++  if (!success) return false;
++ 
++   CHECK(IsTaggingMaskCompatible(kCodeEntrypointTagMask));
++ 
++@@ -443,6 +448,7 @@ void Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
++ #endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
++ 
++   DCHECK(initialized_);
+++  return true;
++ }
++ 
++ bool Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas,
++@@ -687,6 +693,21 @@ Sandbox* Sandbox::New(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
++   return sandbox;
++ }
++ 
+++Sandbox* Sandbox::TryNew(v8::Platform* platform, v8::VirtualAddressSpace* vas) {
+++  if (!COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) {
+++    FATAL(
+++        "Creation of new sandboxes requires enabling "
+++        "multiple pointer compression cages at build-time");
+++  }
+++  Sandbox* sandbox = new Sandbox;
+++  if (!sandbox->TryInitialize(platform, vas)) {
+++    delete sandbox;
+++    return nullptr;
+++  }
+++  CHECK(!v8_flags.sandbox_testing && !v8_flags.sandbox_fuzzing);
+++  return sandbox;
+++}
+++
++ void Sandbox::set_in_sandbox_allocator(std::shared_ptr<Allocator> allocator) {
++   in_sandbox_allocator_ = std::move(allocator);
++ }
++diff --git a/src/sandbox/sandbox.h b/src/sandbox/sandbox.h
++index 860dc2be54fd82469ea35565a2fc5280fa63ea9e..6913faaa3487ae84ff3fcfd24ca5f260950a5765 100644
++--- a/src/sandbox/sandbox.h
+++++ b/src/sandbox/sandbox.h
++@@ -99,6 +99,12 @@ class V8_EXPORT_PRIVATE Sandbox {
++    */
++   void Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
++ 
+++  /**
+++   * Like Initialize(), but returns false instead of crashing when not enough
+++   * virtual address space can be allocated.
+++   */
+++  bool TryInitialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+++
++   /**
++    * Tear down this sandbox.
++    *
++@@ -251,6 +257,10 @@ class V8_EXPORT_PRIVATE Sandbox {
++   //
++   static Sandbox* New(v8::Platform* platform, v8::VirtualAddressSpace* vas);
++ 
+++  // Like New(), but returns nullptr instead of crashing when not enough virtual
+++  // address space can be allocated for the sandbox.
+++  static Sandbox* TryNew(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+++
++ #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++ #ifdef USING_V8_SHARED_PRIVATE
++   static Sandbox* current() { return current_non_inlined(); }
+diff --git a/src/workerd/jsg/BUILD.bazel b/src/workerd/jsg/BUILD.bazel
+index bef99e50a1e94da1cb4079ef5b2afffbbe969fa6..98fa9dc5d416afe872d32d6defa1f2f2b71e3c5e 100644
+--- a/src/workerd/jsg/BUILD.bazel
++++ b/src/workerd/jsg/BUILD.bazel
+@@ -133,6 +133,7 @@ wd_cc_library(
+         "wrappable-tag.h",
+     ],
+     implementation_deps = [
++        ":sandbox",
+         "//src/workerd/util:entropy",
+         "@simdutf",
+         "@ssl",
+diff --git a/src/workerd/jsg/jsg.c++ b/src/workerd/jsg/jsg.c++
+index 02e2395c0b877f36d47adfc2c3c2f94696aeb56a..aaddc0431204ebf7a8944628b7ad4ef8ce302f9f 100644
+--- a/src/workerd/jsg/jsg.c++
++++ b/src/workerd/jsg/jsg.c++
+@@ -14,7 +14,7 @@
+ 
+ #include <v8-cppgc.h>
+ 
+-#ifdef V8_ENABLE_SANDBOX
++#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -719,7 +719,10 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
+   this->schemaLoader = schemaLoader;
+ }
+ 
+-#ifdef V8_ENABLE_SANDBOX
++// v8::Isolate::GetMemoryProtectionKey() is not part of upstream V8: with upstream V8 and the
++// sandbox, MemoryProtectionKeyScope stays the no-op it is without the sandbox. Define
++// WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY only with a V8 that has that API.
++#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
+ // These are disabled by default in workerd. We do not build workerd with
+ // the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
+ // additional setup to ensure that these are handled correctly on all platforms.
+diff --git a/src/workerd/jsg/jsg.h b/src/workerd/jsg/jsg.h
+index e752417eb045d7d89c8037ef2374b13c28324323..1b1a33bda30fe6a9fcd8c98965808f4bb0ab9913 100644
+--- a/src/workerd/jsg/jsg.h
++++ b/src/workerd/jsg/jsg.h
+@@ -2746,14 +2746,14 @@ class MemoryProtectionKeyScope final {
+   MemoryProtectionKeyScope& operator=(MemoryProtectionKeyScope&&) = default;
+ 
+   auto runWithKey(auto func) {
+-#ifdef V8_ENABLE_SANDBOX
++#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
+     PkeyScope scope(pkey);
+ #endif
+     return func();
+   }
+ 
+  private:
+-#ifdef V8_ENABLE_SANDBOX
++#if defined(V8_ENABLE_SANDBOX) && defined(WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY)
+   int pkey;
+   MemoryProtectionKeyScope(Lock&);
+ 
+diff --git a/src/workerd/jsg/sandbox.c++ b/src/workerd/jsg/sandbox.c++
+index 12fab3c9f30f093ab1b5753fe301cdab9e67132c..0bc9a577b703c1317dafc6f016566d1c1b640249 100644
+--- a/src/workerd/jsg/sandbox.c++
++++ b/src/workerd/jsg/sandbox.c++
+@@ -4,6 +4,7 @@
+ 
+ #include "sandbox.h"
+ 
++#include <v8-array-buffer.h>
+ #include <v8-internal.h>
+ #include <v8-isolate.h>
+ #include <v8-platform.h>
+@@ -21,14 +22,67 @@ constexpr uint64_t CAGE_SIZE = uint64_t{1} << 32;
+ static_assert(v8::internal::kPtrComprCageReservationSize == CAGE_SIZE);
+ static_assert(v8::internal::kSandboxSize == 2 * CAGE_SIZE);
+ 
++// The size of the address space V8 reserves for a sandbox with its guard regions: the front guard
++// region, the sandbox, the back guard region and any additional trailing guard region.
++constexpr uint64_t GUARDED_RESERVATION_SIZE = v8::internal::kSandboxSize +
++    2 * v8::internal::kSandboxGuardRegionSize + v8::internal::kAdditionalTrailingGuardRegionSize;
++
+ uintptr_t backingStoreCageBase(v8::Isolate* isolate) {
+-  // The sandbox reservation starts at the JS cage because sandbox guard regions are disabled.
+-  return isolate->GetGroup().GetSandboxAddressSpace()->base() + CAGE_SIZE;
++  // The sandbox starts with the JS cage. Its address space starts there too when sandbox guard
++  // regions are disabled; with them (upstream V8), it starts with the front guard region.
++  auto* space = isolate->GetGroup().GetSandboxAddressSpace();
++  uintptr_t sandboxBase = space->base();
++  if (space->size() != v8::internal::kSandboxSize) {
++    if (space->size() != GUARDED_RESERVATION_SIZE) {
++      KJ_LOG(FATAL, "unexpected V8 sandbox address space", space->size());
++      abort();
++    }
++    sandboxBase += v8::internal::kSandboxGuardRegionSize;
++  }
++  return sandboxBase + CAGE_SIZE;
+ }
+ 
+ }  // namespace
+ #endif
+ 
++namespace {
++
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++class GroupArrayBufferAllocator final: public v8::ArrayBuffer::Allocator {
++ public:
++  explicit GroupArrayBufferAllocator(const v8::IsolateGroup& group)
++      : group(group),
++        inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator(this->group)) {}
++  void* Allocate(size_t length) override {
++    return inner->Allocate(length);
++  }
++  void* AllocateUninitialized(size_t length) override {
++    return inner->AllocateUninitialized(length);
++  }
++  void Free(void* data, size_t length) override {
++    inner->Free(data, length);
++  }
++  size_t MaxAllocationSize() const override {
++    return inner->MaxAllocationSize();
++  }
++  v8::PageAllocator* GetPageAllocator() override {
++    return inner->GetPageAllocator();
++  }
++
++ private:
++  v8::IsolateGroup group;  // destroyed after `inner`
++  std::unique_ptr<v8::ArrayBuffer::Allocator> inner;
++};
++#endif
++
++}  // namespace
++
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++std::shared_ptr<v8::ArrayBuffer::Allocator> newGroupArrayBufferAllocator(const v8::IsolateGroup& group) {
++  return std::make_shared<GroupArrayBufferAllocator>(group);
++}
++#endif
++
+ SandboxedBytes::SandboxedBytes(v8::Isolate* isolate, kj::ArrayPtr<const kj::byte> bytes) {
+   if (bytes.size() == 0) return;
+ #ifdef V8_ENABLE_SANDBOX
+diff --git a/src/workerd/jsg/sandbox.h b/src/workerd/jsg/sandbox.h
+index 1f5c94472803a71940efcca5be61ecffe4f20136..40e46fbd8f191128a8dcb49f14ef3f26e29c97f4 100644
+--- a/src/workerd/jsg/sandbox.h
++++ b/src/workerd/jsg/sandbox.h
+@@ -10,18 +10,21 @@
+ 
+ #include <cstdint>
+ 
+-namespace v8 {
+-class Isolate;
+-}
++#include <v8-array-buffer.h>
++#include <v8-isolate.h>
++
++#include <memory>
+ 
+ namespace workerd::jsg {
+ 
+ // A non-owning view of ArrayBuffer bytes. With the V8 sandbox enabled, the address is a 32-bit
+ // offset into the 4 GiB immediately after the JS pointer cage. Backing-store allocators must
+-// place the bytes in this second cage, with sandbox guard regions disabled. Construction
++// place the bytes in this second cage, with or without sandbox guard regions (the cage follows
++// the front guard region when V8 reserves one). Construction
+ // aborts if a nonempty view cannot be encoded. Decoding uses the supplied isolate's cage base, so even
+ // a corrupted offset cannot select another isolate group's memory. The 32-bit length bounds
+-// overrun distance; it does not guarantee that the entire range remains inside the cage.
++// overrun distance; it does not guarantee that the entire range remains inside the cage. With
++// guard regions, an overrun past the cage ends in the sandbox's back guard region.
+ // Without the sandbox, the view stores an ordinary pointer.
+ class SandboxedBytes {
+  public:
+@@ -45,4 +48,10 @@ class SandboxedBytes {
+   uint32_t length = 0;
+ };
+ 
++// V8's default ArrayBuffer allocator for `group` (v8::ArrayBuffer::Allocator::NewDefaultAllocator),
++// holding a reference to the group: V8 keeps an allocator for as long as any of its backing stores
++// lives, which can be longer than the isolate and the group, and V8's own keeps only bare pointers
++// to the group's sandbox and pool. Builds with one pointer cage per group only.
++std::shared_ptr<v8::ArrayBuffer::Allocator> newGroupArrayBufferAllocator(const v8::IsolateGroup& group);
++
+ }  // namespace workerd::jsg
+diff --git a/src/workerd/jsg/setup.c++ b/src/workerd/jsg/setup.c++
+index c61d9ab5c16600406ea002c8a41709882666147d..5736b727aa7a2e284aed82183900ee7f707bdd11 100644
+--- a/src/workerd/jsg/setup.c++
++++ b/src/workerd/jsg/setup.c++
+@@ -9,6 +9,8 @@
+ 
+ #include "setup.h"
+ 
++#include "sandbox.h"
++
+ #include "libplatform/libplatform.h"
+ #include "modules-new.h"
+ 
+@@ -436,8 +438,10 @@ IsolateWithSnapshotCreator newIsolateWithSnapshotCreator(v8::Isolate::CreatePara
+     if (params.array_buffer_allocator == nullptr &&
+         params.array_buffer_allocator_shared == nullptr) {
+ #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+-      params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
+-          v8::ArrayBuffer::Allocator::NewDefaultAllocator(group));
++      // V8's allocator for the group keeps bare pointers to the group's sandbox and pool; V8 keeps
++      // the allocator for as long as any backing store lives, which can be longer than the isolate
++      // and the group. Keep the group (and with it the sandbox) alive as long.
++      params.array_buffer_allocator_shared = newGroupArrayBufferAllocator(group);
+ #else
+       params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
+           v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+diff --git a/src/workerd/jsg/v8-platform-wrapper.h b/src/workerd/jsg/v8-platform-wrapper.h
+index 26660d9b107e56a1dbd40b99f8b60eb38663a1da..1980468706ab51d1c424d9b89559e8c228ad1f01 100644
+--- a/src/workerd/jsg/v8-platform-wrapper.h
++++ b/src/workerd/jsg/v8-platform-wrapper.h
+@@ -80,6 +80,13 @@ class V8PlatformWrapper: public v8::Platform {
+     return inner.GetThreadIsolatedAllocator();
+   }
+ 
++  // Forward to the inner platform: with the V8 sandbox, a reserved zero segment (the first 4 GiB
++  // and the padding past them) is what lets V8 classify the sandbox as secure
++  // (v8::V8::GetSandboxMode()).
++  size_t GetZeroSegmentSize() override {
++    return inner.GetZeroSegmentSize();
++  }
++
+  private:
+   v8::Platform& inner;
+ 
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index a6ae671461633de4f44a27e2133ddf95e7a1e49d..d7dc20b8d3c92b8ccd280d755d957574ef2df64c 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -1,3 +1,4 @@
++load("//:build/kj_test.bzl", "kj_test")
+ load("//:build/linking.bzl", "CC_LIBRARY_LINKSTATIC")
+ load("//:build/wd_cc_library.bzl", "wd_cc_library")
+ 
+@@ -47,6 +48,7 @@ wd_cc_library(
+     hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
+     linkstatic = CC_LIBRARY_LINKSTATIC,
+     deps = [
++        ":coworkerd-sandbox",
+         ":worker-factory-hdrs",
+         "@sqlite3",
+         "//src/rust/worker:bridge",
+@@ -98,6 +100,7 @@ wd_cc_library(
+     linkstatic = CC_LIBRARY_LINKSTATIC,
+     deps = [
+         ":bootstrap-hdrs",
++        ":coworkerd-sandbox",
+         ":worker-factory",
+         "//src/pyodide:pyodide_extra_capnp",
+         "//src/rust/cxx/kj-rs",
+@@ -134,3 +137,33 @@ wd_cc_library(
+     deps = ["@capnp-cpp//src/kj"],
+     visibility = ["//src/workerd/threaded:__pkg__"],
+ )
++
++# The V8 sandbox of --config=coworkerd-sandbox: the startup and per-isolate checks, and isolate
++# groups that can fail. Used by the factory and the threaded server.
++wd_cc_library(
++    name = "coworkerd-sandbox",
++    srcs = ["coworkerd-sandbox.c++"],
++    hdrs = ["coworkerd-sandbox.h"],
++    visibility = [
++        "//src/workerd/server:__subpackages__",
++        "//src/workerd/threaded:__pkg__",
++    ],
++    deps = [
++        "//src/workerd/jsg",
++        "@capnp-cpp//src/kj",
++    ],
++)
++
++# The V8 sandbox of --config=coworkerd-sandbox: its layout, V8's secure mode for the process and for
++# every isolate group, and the embedder's placement of bytes in each group's sandbox.
++kj_test(
++    src = "coworkerd-sandbox-test.c++",
++    deps = [
++        ":coworkerd-sandbox",
++        ":worker-factory",
++        "//src/workerd/jsg",
++        "//src/workerd/server:v8-platform-impl",
++        # The factory's bridge reaches the Rust server, which links the bootstrap.
++        "//src/workerd/server/server:workerd-server",
++    ],
++)
+diff --git a/src/workerd/server/factory/bootstrap.c++ b/src/workerd/server/factory/bootstrap.c++
+index 9e1aa1f6ac4fe039908c6314aa19710eabbfeaa5..fb89a42906f85f898ea2e1785b22349f175d2d4e 100644
+--- a/src/workerd/server/factory/bootstrap.c++
++++ b/src/workerd/server/factory/bootstrap.c++
+@@ -6,6 +6,7 @@
+ #include "coworkerd-wal-shipper.h"
+ #include "coworkerd-parent-death.h"
+ #include "coworkerd-channels.h"
++#include "coworkerd-sandbox.h"
+ 
+ #include "worker-factory.h"
+ 
+@@ -187,6 +188,8 @@ class Bootstrap {
+     v8Platform = kj::heap<WorkerdPlatform>(*platform);
+     v8System = kj::heap<jsg::V8System>(*v8Platform,
+         KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
++    // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker.
++    requireSecureSandbox();
+   }
+ 
+   // Ends the --async-trace file. The factory is destroyed first, ending every context, so the exit
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 00c12e4f371aaf239fcbe0e3279e03ac68e41225..6684c1ce0df5ae7ded16cebd3b2533f3ae71d4d4 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -5,6 +5,7 @@
+ #include "coworkerd-idle-eviction.h"
+ #include "coworkerd-channels.h"
+ #include "coworkerd-memory-limit.h"
++#include "coworkerd-sandbox.h"
+ 
+ #include <workerd/io/actor-cache.h>
+ #include <workerd/io/io-channels.h>
+@@ -148,15 +149,17 @@ class RootLimitFailures final: public kj::Refcounted {
+ 
+ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
+-  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, kj::StringPtr name,
+-      const kj::Maybe<CoworkerdWorkerIdentity>& identity, kj::StringPtr startupIdentity = "",
+-      IdleWorkerRef idleWorker = {}, kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
++  // `group` is the isolate group the isolate will be created in (its memory limit allocates there).
++  CpuIsolateLimitEnforcer(kj::Own<IsolateLimitEnforcer> fallback, const v8::IsolateGroup& group,
++      kj::StringPtr name, const kj::Maybe<CoworkerdWorkerIdentity>& identity,
++      kj::StringPtr startupIdentity = "", IdleWorkerRef idleWorker = {},
++      kj::Timer* rootTimer = nullptr, kj::TaskSet* rootTasks = nullptr)
+       : fallback(kj::mv(fallback)), name(kj::str(name)),
+         cpuNs(0), tenantWorker(identity != kj::none), startupIdentity(kj::str(startupIdentity)), idleWorker(kj::mv(idleWorker)) {
+     KJ_IF_SOME(record, identity) {
+       cpuNs = uint64_t(record.cpuLimitMs ? record.cpuLimitMs : cpuLimitFromEnvironment()) * 1000000;
+       auto limit = record.memoryLimitMiB ? record.memoryLimitMiB : memoryLimitFromEnvironment();
+-      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded);
++      if (limit) memory = std::make_shared<IsolateMemoryLimit>(limit, exceeded, group);
+     }
+     // The isolate's GC callbacks account for excluded CPU and long pauses.
+     if (gcSettings().observes()) {
+@@ -218,6 +221,8 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   const TrackedWasmInstanceList& getTrackedWasmInstances() const override { return fallback->getTrackedWasmInstances(); }
+   void markPerfEvent(kj::LiteralStringConst name) const override { fallback->markPerfEvent(name); }
+   void customizeIsolate(v8::Isolate* value) override {
++    // With the V8 sandbox, the isolate's own sandbox must be secure before it runs any code.
++    requireSecureIsolateSandbox(value, name);
+     isolate = value;
+     if (memory) memory->customize(value);
+     if (gc) gc->install(value);
+diff --git a/src/workerd/server/factory/coworkerd-memory-limit.c++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
+index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..33dee2215af9af62c0ec2ac9ce0d98507b0bdeef 100644
+--- a/src/workerd/server/factory/coworkerd-memory-limit.c++
++++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
+@@ -29,6 +29,17 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
+   while (old < value && !peak.compare_exchange_weak(old, value)) {}
+ }
+ 
++// V8's allocator for `group`, as jsg gives an isolate without an allocator of its own: with the
++// sandbox and one pointer-compression cage per group, the default allocator would place every
++// backing store in the default group's sandbox, and V8 aborts the process on the first one.
++v8::ArrayBuffer::Allocator* newGroupAllocator(const v8::IsolateGroup& group) {
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++  return v8::ArrayBuffer::Allocator::NewDefaultAllocator(group);
++#else
++  return v8::ArrayBuffer::Allocator::NewDefaultAllocator();
++#endif
++}
++
+ }  // namespace
+ 
+ uint32_t memoryLimitFromEnvironment() {
+@@ -45,8 +56,8 @@ uint32_t memoryLimitFromEnvironment() {
+ }
+ void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
+ 
+-IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state)
+-    : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {
++IsolateMemoryLimit::IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, const v8::IsolateGroup& group)
++    : limitBytes(uint64_t(limitMiB) << 20), state(kj::mv(state)), group(group), inner(newGroupAllocator(this->group)) {
+   // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
+   if (cpuEventsDescriptor() < 0) return;
+   if (!oomReportReady.load(std::memory_order_acquire)) {
+@@ -82,6 +93,8 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
+ }
+ void* IsolateMemoryLimit::Allocate(size_t length) { return allocate(length, Initialization::ZERO); }
+ void* IsolateMemoryLimit::AllocateUninitialized(size_t length) { return allocate(length, Initialization::UNINITIALIZED); }
++size_t IsolateMemoryLimit::MaxAllocationSize() const { return std::min<size_t>(limitBytes, inner->MaxAllocationSize()); }
++v8::PageAllocator* IsolateMemoryLimit::GetPageAllocator() { return inner->GetPageAllocator(); }
+ void IsolateMemoryLimit::Free(void* address, size_t length) { inner->Free(address, length); bufferBytes.fetch_sub(length); release(length); }
+ 
+ void IsolateMemoryLimit::customize(v8::Isolate* value) {
+diff --git a/src/workerd/server/factory/coworkerd-memory-limit.h b/src/workerd/server/factory/coworkerd-memory-limit.h
+index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..5034d6368c4f97228e36b27f47ad4dfb1657a563 100644
+--- a/src/workerd/server/factory/coworkerd-memory-limit.h
++++ b/src/workerd/server/factory/coworkerd-memory-limit.h
+@@ -23,14 +23,22 @@ struct MemoryExecution {
+ };
+ 
+ // V8 retains shared allocator ownership until the last backing store is freed.
++// `group` is the isolate's group: with the V8 sandbox and one sandbox per group, backing stores
++// must lie in that group's sandbox (V8 checks it), so the allocator allocates there and keeps the
++// group, and with it the sandbox, alive.
+ class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::enable_shared_from_this<IsolateMemoryLimit> {
+  public:
+   static constexpr size_t HEADROOM = 8ull << 20;
+-  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state);
++  IsolateMemoryLimit(uint32_t limitMiB, IsolateLimitState state, const v8::IsolateGroup& group);
+   ~IsolateMemoryLimit() noexcept override;
+   void* Allocate(size_t length) override;
+   void* AllocateUninitialized(size_t length) override;
+   void Free(void* address, size_t length) override;
++  // No single buffer, and no resizable buffer's reservation, beyond the limit: V8 refuses those
++  // before reserving anything (otherwise its default is 32 GiB, and a resizable ArrayBuffer could
++  // reserve the whole buffer half of an 8 GiB sandbox).
++  size_t MaxAllocationSize() const override;
++  v8::PageAllocator* GetPageAllocator() override;
+   void customize(v8::Isolate* isolate);
+   MemoryExecution enter(kj::StringPtr report);
+   void leave(MemoryExecution previous);
+@@ -52,6 +60,7 @@ class IsolateMemoryLimit final: public v8::ArrayBuffer::Allocator, public std::e
+   static void gc(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* data);
+   static void oom(const char*, const v8::OOMDetails&);
+   IsolateLimitState state;
++  v8::IsolateGroup group;
+   v8::ArrayBuffer::Allocator* inner;
+   v8::Isolate* isolate = nullptr;
+ };
+diff --git a/src/workerd/server/factory/coworkerd-sandbox-test.c++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bb63d32a73b4856b8ec1ff4ea54b72cd8d4feec
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
+@@ -0,0 +1,369 @@
++// The V8 sandbox in Coworkerd's build (--config=coworkerd-sandbox): its layout, V8's secure mode
++// for the process and for every isolate group, and the two places where the embedder must place
++// bytes in the right group's sandbox.
++#include "coworkerd-memory-limit.h"
++#include "coworkerd-sandbox.h"
++
++#include <workerd/jsg/sandbox.h>
++#include <workerd/jsg/setup.h>
++#include <workerd/server/v8-platform-impl.h>
++
++#include <kj/test.h>
++#include <kj/vector.h>
++#include <v8-array-buffer.h>
++#include <v8-initialization.h>
++#include <v8-internal.h>
++#include <v8-isolate.h>
++#include <v8-context.h>
++#include <v8-local-handle.h>
++#include <v8-locker.h>
++#include <v8-primitive.h>
++#include <v8-script.h>
++
++#include <cstdio>
++#include <cstring>
++#include <fcntl.h>
++#include <spawn.h>
++#include <string>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++extern char** environ;
++
++// Selected by a parent test: before any static initializer runs (the platform reserves the zero
++// segment in one), take a page at 1 GiB, as a preloaded library or an early mapping might.
++__attribute__((constructor(101))) static void occupyLowForChild() {
++  if (getenv("COWORKERD_SANDBOX_CHILD_OCCUPY_LOW") == nullptr) return;
++  (void)mmap(reinterpret_cast<void*>(uintptr_t(1) << 30), 4096, PROT_NONE,
++      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++}
++
++namespace workerd::server {
++namespace {
++
++// As the workerd binary does: the platform reserves the zero segment before V8 starts.
++kj::Own<v8::Platform> innerPlatform = jsg::defaultPlatform(0);
++WorkerdPlatform platform(*innerPlatform);
++jsg::V8System v8System(platform, nullptr, innerPlatform.get());
++
++#ifdef V8_ENABLE_SANDBOX
++constexpr size_t GiB = size_t(1) << 30;
++
++bool mentions(const kj::Maybe<kj::String>& problem, const char* words) {
++  KJ_IF_SOME(text, problem) {
++    return strstr(text.cStr(), words) != nullptr;
++  }
++  return false;
++}
++
++// An isolate in `group`, with `allocator` or else V8's allocator for that group.
++struct GroupIsolate {
++  explicit GroupIsolate(
++      v8::IsolateGroup groupParam, std::shared_ptr<v8::ArrayBuffer::Allocator> allocator = nullptr)
++      : group(kj::mv(groupParam)) {
++    v8::Isolate::CreateParams params;
++    params.array_buffer_allocator_shared = allocator != nullptr
++        ? kj::mv(allocator)
++        : std::shared_ptr<v8::ArrayBuffer::Allocator>(
++              v8::ArrayBuffer::Allocator::NewDefaultAllocator(group));
++    isolate = v8::Isolate::New(group, params);
++  }
++  ~GroupIsolate() {
++    isolate->Dispose();
++  }
++  KJ_DISALLOW_COPY_AND_MOVE(GroupIsolate);
++
++  v8::IsolateGroup group;
++  v8::Isolate* isolate;
++};
++
++// First: V8 answers for the calling thread's sandbox, which is the process-wide one only until
++// this thread has entered and left an isolate.
++KJ_TEST("the process-wide sandbox is secure and laid out as configured") {
++  KJ_EXPECT(v8::internal::kSandboxSize == 8 * GiB);
++  KJ_EXPECT(v8::internal::kSandboxGuardRegionSize == 64 * GiB);
++  KJ_EXPECT(v8::internal::kAdditionalTrailingGuardRegionSize == 0);
++  KJ_EXPECT(v8::internal::kRequiresTypedArrayAccessMasks);
++  KJ_EXPECT(v8::IsolateGroup::CanCreateNewGroups());
++
++  KJ_EXPECT(v8::V8::GetSandboxMode() == v8::V8::SandboxMode::kSecure,
++      sandboxModeName(static_cast<int>(v8::V8::GetSandboxMode())));
++  KJ_EXPECT(v8::V8::GetSandboxSizeInBytes() == 8 * GiB);
++  KJ_EXPECT(v8::V8::GetSandboxAddressSpace()->size() == 136 * GiB);
++  SandboxFacts facts{
++    .mode = static_cast<int>(v8::V8::GetSandboxMode()),
++    .sandboxBytes = v8::V8::GetSandboxSizeInBytes(),
++    .addressSpaceBytes = v8::V8::GetSandboxAddressSpace()->size(),
++    .groupPerIsolate = v8::IsolateGroup::CanCreateNewGroups(),
++  };
++  KJ_EXPECT(sandboxProblem(facts) == kj::none);
++}
++
++KJ_TEST("every isolate group has its own secure sandbox") {
++  constexpr size_t COUNT = 3;
++  kj::Vector<kj::Own<GroupIsolate>> isolates;
++  kj::Vector<uintptr_t> bases;
++  bases.add(v8::IsolateGroup::GetDefault().GetSandboxAddressSpace()->base());
++  for (size_t i = 0; i < COUNT; i++) {
++    auto& entry = *isolates.add(kj::heap<GroupIsolate>(jsg::newIsolateGroup()));
++    v8::Locker locker(entry.isolate);
++    v8::Isolate::Scope scope(entry.isolate);
++    auto* space = entry.group.GetSandboxAddressSpace();
++    KJ_EXPECT(v8::V8::GetSandboxAddressSpace() == space);
++    KJ_EXPECT(v8::V8::GetSandboxMode() == v8::V8::SandboxMode::kSecure,
++        sandboxModeName(static_cast<int>(v8::V8::GetSandboxMode())));
++    KJ_EXPECT(space->size() == 136 * GiB);
++    requireSecureIsolateSandbox(entry.isolate, "every-group-test"_kj);
++    bases.add(space->base());
++  }
++  // The default group's and the three new ones: four reservations that do not overlap.
++  for (size_t i = 0; i < bases.size(); i++) {
++    for (size_t j = i + 1; j < bases.size(); j++) {
++      KJ_EXPECT(bases[i] + 136 * GiB <= bases[j] || bases[j] + 136 * GiB <= bases[i], i, j);
++    }
++  }
++}
++
++KJ_TEST("a memory-limited isolate allocates its ArrayBuffers in its own sandbox") {
++  auto group = jsg::newIsolateGroup();
++  auto other = jsg::newIsolateGroup();
++  auto state = std::make_shared<std::atomic<IsolateLimitCause>>(IsolateLimitCause::NONE);
++  auto limit = std::make_shared<IsolateMemoryLimit>(64, state, group);
++  GroupIsolate entry(group, limit);
++  v8::Locker locker(entry.isolate);
++  v8::Isolate::Scope scope(entry.isolate);
++  // A backing store through the isolate's allocator; V8 checks that it lies in the isolate's sandbox.
++  auto store = v8::ArrayBuffer::NewBackingStore(entry.isolate, 1 << 20);
++  KJ_EXPECT(group.SandboxContains(store->Data()));
++  KJ_EXPECT(!other.SandboxContains(store->Data()));
++  KJ_EXPECT(limit->bufferBytes.load() >= size_t(1) << 20);
++}
++
++KJ_TEST("a byte view of an ArrayBuffer decodes to the same bytes in its isolate's sandbox") {
++  GroupIsolate entry(jsg::newIsolateGroup());
++  v8::Locker locker(entry.isolate);
++  v8::Isolate::Scope scope(entry.isolate);
++  auto store = v8::ArrayBuffer::NewBackingStore(entry.isolate, 4096);
++  auto bytes = kj::arrayPtr(static_cast<const kj::byte*>(store->Data()), 4096);
++  jsg::SandboxedBytes view(entry.isolate, bytes);
++  auto decoded = view.get(entry.isolate);
++  KJ_EXPECT(decoded.begin() == bytes.begin());
++  KJ_EXPECT(decoded.size() == bytes.size());
++}
++
++KJ_TEST("sandboxProblem names what is wrong with a sandbox") {
++  SandboxFacts good{
++    .mode = static_cast<int>(v8::V8::SandboxMode::kSecure),
++    .sandboxBytes = 8 * GiB,
++    .addressSpaceBytes = 136 * GiB,
++    .groupPerIsolate = true,
++  };
++  KJ_EXPECT(sandboxProblem(good) == kj::none);
++
++  auto smiAccessible = good;
++  smiAccessible.mode = static_cast<int>(v8::V8::SandboxMode::kInsecureFullReservationSmiAccessible);
++  KJ_EXPECT(mentions(sandboxProblem(smiAccessible), "first 4 GiB"));
++
++  auto partial = good;
++  partial.mode = static_cast<int>(v8::V8::SandboxMode::kInsecurePartialReservationSmiInaccessible);
++  KJ_EXPECT(mentions(sandboxProblem(partial), "guard regions"));
++
++  auto sharedCage = good;
++  sharedCage.groupPerIsolate = false;
++  KJ_EXPECT(mentions(sandboxProblem(sharedCage), "one pointer-compression cage"));
++
++  auto defaultSize = good;
++  defaultSize.sandboxBytes = 1024 * GiB;
++  KJ_EXPECT(mentions(sandboxProblem(defaultSize), "sandbox defines"));
++
++  auto defaultTrailingGuard = good;
++  defaultTrailingGuard.addressSpaceBytes = 360 * GiB;
++  KJ_EXPECT(mentions(sandboxProblem(defaultTrailingGuard), "reserves"));
++}
++KJ_TEST("the zero segment is really held, not only reported") {
++  // Probed with MAP_FIXED_NOREPLACE at 1 GiB and 4 GiB + 512 KiB, independently of the number the
++  // platform reports to V8.
++  KJ_EXPECT(zeroSegmentHeld());
++  SandboxFacts reportedOnly{
++    .mode = static_cast<int>(v8::V8::SandboxMode::kSecure),
++    .sandboxBytes = 8 * GiB,
++    .addressSpaceBytes = 136 * GiB,
++    .groupPerIsolate = true,
++    .zeroSegmentHeld = false,
++  };
++  KJ_EXPECT(mentions(sandboxProblem(reportedOnly), "can still be mapped"));
++}
++
++KJ_TEST("an isolate of the default group, or one not entered, is refused") {
++  GroupIsolate entry(v8::IsolateGroup::GetDefault());
++  // Without the isolate entered V8's current sandbox is null: a refusal, not a crash.
++  KJ_EXPECT_THROW_MESSAGE("not entered", requireSecureIsolateSandbox(entry.isolate, "default"_kj));
++  v8::Locker locker(entry.isolate);
++  v8::Isolate::Scope scope(entry.isolate);
++  KJ_EXPECT_THROW_MESSAGE("default isolate group", requireSecureIsolateSandbox(entry.isolate, "default"_kj));
++}
++
++KJ_TEST("a resizable ArrayBuffer reserved first leaves plain ArrayBuffers their pool") {
++  // The buffer half of the 8 GiB sandbox is 4 GiB. With V8's default in-sandbox allocator, whose
++  // pool is reserved on the first plain allocation, a 3.5 GiB resizable buffer reserved first
++  // leaves no 1 GiB for it and V8 ends the process. The group's own pool exists before any isolate.
++  auto group = KJ_ASSERT_NONNULL(tryNewIsolateGroup());
++  GroupIsolate entry(group);
++  v8::Locker locker(entry.isolate);
++  v8::Isolate::Scope scope(entry.isolate);
++  v8::HandleScope handles(entry.isolate);
++  auto context = v8::Context::New(entry.isolate);
++  v8::Context::Scope inContext(context);
++  auto code = "let reserved; try { new ArrayBuffer(0, {maxByteLength: 3.5 * 2 ** 30}); reserved = 'reserved'; }"
++              " catch (e) { reserved = e.name; }"
++              " const plain = new ArrayBuffer(1 << 20); new Uint8Array(plain)[0] = 1;"
++              " reserved + ':' + plain.byteLength"_kj;
++  auto source = v8::String::NewFromUtf8(entry.isolate, code.begin(), v8::NewStringType::kNormal, code.size())
++                    .ToLocalChecked();
++  auto result = v8::Script::Compile(context, source).ToLocalChecked()->Run(context).ToLocalChecked();
++  v8::String::Utf8Value text(entry.isolate, result);
++  KJ_EXPECT(kj::StringPtr(*text) == "RangeError:1048576"_kj, *text);
++}
++
++KJ_TEST("the sandbox pool refuses when full, zeroes, and reuses what was freed") {
++  auto group = KJ_ASSERT_NONNULL(tryNewIsolateGroup());
++  // A second pool in the same group's buffer half (its own pool holds 2 GiB of it).
++  auto pool = newSandboxPoolAllocator(*group.GetSandboxAddressSpace());
++  KJ_ASSERT(pool != nullptr);
++  constexpr size_t BLOCK = size_t(64) << 20;
++  kj::Vector<void*> blocks;
++  while (blocks.size() < 64) {
++    auto* block = pool->AllocateUninitialized(BLOCK);
++    if (block == nullptr) break;
++    KJ_EXPECT(group.SandboxContains(block));
++    blocks.add(block);
++  }
++  KJ_EXPECT(blocks.size() >= 4 && blocks.size() < 64, blocks.size());
++  KJ_EXPECT(pool->Allocate(BLOCK) == nullptr);
++  // A small block reused after it was dirtied comes back zeroed.
++  auto* small = static_cast<char*>(pool->Allocate(1000));
++  KJ_ASSERT(small == nullptr);  // full
++  pool->Free(blocks.back());
++  blocks.removeLast();
++  small = static_cast<char*>(pool->Allocate(1000));
++  KJ_ASSERT(small != nullptr);
++  memset(small, 0xab, 1000);
++  pool->Free(small);
++  small = static_cast<char*>(pool->Allocate(1000));
++  KJ_ASSERT(small != nullptr);
++  KJ_EXPECT(small[0] == 0 && small[999] == 0);
++  pool->Free(small);
++  // Freed neighbors merge: the whole pool is one block again.
++  const size_t total = (blocks.size() + 1) * BLOCK;
++  for (auto* block: blocks) pool->Free(block);
++  auto* whole = static_cast<char*>(pool->AllocateUninitialized(total));
++  KJ_EXPECT(whole != nullptr);
++  pool->Free(whole);
++}
++
++KJ_TEST("a backing store that outlives its isolate and group keeps their sandbox") {
++  std::shared_ptr<v8::BackingStore> store;
++  {
++    auto group = KJ_ASSERT_NONNULL(tryNewIsolateGroup());
++    GroupIsolate entry(group, jsg::newGroupArrayBufferAllocator(group));
++    v8::Locker locker(entry.isolate);
++    v8::Isolate::Scope scope(entry.isolate);
++    store = v8::ArrayBuffer::NewBackingStore(entry.isolate, 1 << 20);
++    memset(store->Data(), 7, 1 << 20);
++  }
++  // The isolate is gone and so are this test's references to the group: only the allocator V8
++  // keeps for the store holds it, and with it the sandbox the bytes are in.
++  KJ_EXPECT(static_cast<unsigned char*>(store->Data())[12345] == 7);
++  store.reset();
++}
++
++struct ChildResult {
++  int status;
++  std::string output, events;
++};
++constexpr uint SANDBOX_CHILD_LINE = __LINE__ + 1;
++KJ_TEST("child body: the process-wide check, selected by a parent test") {
++  if (getenv("COWORKERD_SANDBOX_CHILD") == nullptr) return;
++  requireSecureSandbox();
++  _exit(0);
++}
++ChildResult runSandboxChild(bool occupyLow) {
++  int output[2], events[2];
++  KJ_REQUIRE(pipe2(output, O_CLOEXEC) == 0 && pipe2(events, O_CLOEXEC) == 0);
++  int childEvents = fcntl(events[1], F_DUPFD, 100);
++  KJ_REQUIRE(childEvents >= 0);
++  auto filter = kj::str("--filter=coworkerd-sandbox-test.c++:", SANDBOX_CHILD_LINE);
++  auto eventFd = kj::str("COWORKERD_EVENT_FD=", childEvents);
++  kj::Vector<char*> env;
++  for (char** at = environ; *at != nullptr; ++at)
++    if (!kj::StringPtr(*at).startsWith("COWORKERD_")) env.add(*at);
++  env.add(const_cast<char*>("COWORKERD_SANDBOX_CHILD=1"));
++  if (occupyLow) env.add(const_cast<char*>("COWORKERD_SANDBOX_CHILD_OCCUPY_LOW=1"));
++  env.add(eventFd.begin());
++  env.add(nullptr);
++  posix_spawn_file_actions_t actions;
++  posix_spawn_file_actions_init(&actions);
++  posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
++  char program[] = "/proc/self/exe";
++  char* argv[] = {program, filter.begin(), nullptr};
++  pid_t pid;
++  KJ_REQUIRE(posix_spawn(&pid, program, &actions, nullptr, argv, env.begin()) == 0);
++  posix_spawn_file_actions_destroy(&actions);
++  close(output[1]);
++  close(events[1]);
++  close(childEvents);
++  auto drain = [](int fd) {
++    std::string text;
++    char buffer[4096];
++    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) != 0;) {
++      if (n < 0 && errno == EINTR) continue;
++      if (n < 0) break;
++      text.append(buffer, n);
++    }
++    close(fd);
++    return text;
++  };
++  ChildResult result;
++  result.output = drain(output[0]);
++  result.events = drain(events[0]);
++  while (waitpid(pid, &result.status, 0) < 0 && errno == EINTR) {}
++  return result;
++}
++
++KJ_TEST("a process whose first 4 GiB are taken refuses to start with 78 and says why") {
++  auto refused = runSandboxChild(true);
++  KJ_EXPECT(WIFEXITED(refused.status) && WEXITSTATUS(refused.status) == SANDBOX_REFUSED_EXIT,
++      refused.status, refused.output.c_str());
++  KJ_EXPECT(refused.output.find("\"mode\":\"smi-accessible\"") != std::string::npos, refused.output.c_str());
++  KJ_EXPECT(refused.output.find("workerd: refusing to start: the first 4 GiB") != std::string::npos,
++      refused.output.c_str());
++  KJ_EXPECT(refused.events.find("\"event\":\"sandbox-refused\"") != std::string::npos, refused.events.c_str());
++  // The same process without the page starts.
++  auto started = runSandboxChild(false);
++  KJ_EXPECT(WIFEXITED(started.status) && WEXITSTATUS(started.status) == 0, started.status, started.output.c_str());
++  KJ_EXPECT(started.output.find("\"mode\":\"secure\"") != std::string::npos, started.output.c_str());
++}
++
++// Last: it uses up the address space for a moment.
++KJ_TEST("isolate groups run out as a refusal, not as the end of the process") {
++  // Every group reserves its sandbox with the guard regions (136 GiB) and, outside it, its
++  // trusted range: a 47-bit user address space (128 TiB) holds fewer than a thousand. Past that,
++  // tryNewIsolateGroup() returns none (V8's IsolateGroup::TryCreate()) and the process goes on.
++  auto created = measureGroupCapacity(4096);
++  fprintf(stdout, "SANDBOX_GROUPS created=%zu\n", created);
++  fflush(stdout);
++  KJ_EXPECT(created > 100 && created < 4096, created);
++  // Released groups give their address space back.
++  KJ_EXPECT(tryNewIsolateGroup() != kj::none);
++  KJ_EXPECT(measureGroupCapacity(4096) + 50 > created);
++}
++#else
++KJ_TEST("without the sandbox nothing is checked") {
++  KJ_EXPECT(sandboxModeName(0) == "off"_kj);
++  KJ_EXPECT(sandboxProblem(SandboxFacts{}) == kj::none);
++}
++#endif
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-sandbox.c++ b/src/workerd/server/factory/coworkerd-sandbox.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..f67a2d7f0170f792ed72d99dd0d0d9898cee22a7
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-sandbox.c++
+@@ -0,0 +1,392 @@
++#include "coworkerd-sandbox.h"
++
++#include <kj/debug.h>
++#include <v8-initialization.h>
++#include <v8-internal.h>
++#include <v8-isolate.h>
++#include <v8-platform.h>
++
++#include <kj/vector.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <unordered_map>
++#include <version>
++
++#ifdef V8_ENABLE_SANDBOX
++// V8 requires libc++ hardening with its sandbox (its GN build asserts it); --config=coworkerd-sandbox
++// sets the fast mode for every target compilation unit.
++#ifndef _LIBCPP_HARDENING_MODE
++#error "the V8 sandbox build needs libc++ hardening (--config=coworkerd-sandbox)"
++#else
++static_assert(_LIBCPP_HARDENING_MODE == _LIBCPP_HARDENING_MODE_FAST,
++    "the V8 sandbox build needs libc++ hardening in its fast mode (--config=coworkerd-sandbox)");
++#endif
++#endif
++
++namespace workerd::server {
++
++namespace {
++
++void writeStderr(kj::StringPtr line) {
++  size_t done = 0;
++  while (done < line.size()) {
++    ssize_t written = write(STDERR_FILENO, line.begin() + done, line.size() - done);
++    if (written < 0 && errno == EINTR) continue;
++    if (written <= 0) return;
++    done += written;
++  }
++}
++
++// A JSON string: the text quoted, with quotes, backslashes and control characters escaped.
++[[maybe_unused]] kj::String jsonString(kj::StringPtr text) {
++  static const char HEX[] = "0123456789abcdef";
++  kj::Vector<char> out(text.size() + 3);
++  out.add('"');
++  for (char c: text) {
++    if (c == '"' || c == '\\') {
++      out.add('\\');
++      out.add(c);
++    } else if (static_cast<unsigned char>(c) < 0x20) {
++      out.addAll(kj::StringPtr("\\u00"));
++      out.add(HEX[(c >> 4) & 0xf]);
++      out.add(HEX[c & 0xf]);
++    } else {
++      out.add(c);
++    }
++  }
++  out.add('"');
++  out.add('\0');
++  return kj::String(out.releaseAsArray());
++}
++
++#ifdef V8_ENABLE_SANDBOX
++using v8::internal::kAdditionalTrailingGuardRegionSize;
++using v8::internal::kRequiresTypedArrayAccessMasks;
++using v8::internal::kSandboxGuardRegionSize;
++using v8::internal::kSandboxSize;
++
++// The address space V8 reserves for one sandbox in this build: the front guard region, the
++// sandbox, the back guard region and any additional trailing guard region (sandbox.cc).
++constexpr size_t CONFIGURED_ADDRESS_SPACE =
++    kSandboxSize + 2 * kSandboxGuardRegionSize + kAdditionalTrailingGuardRegionSize;
++
++// The sandbox of the calling thread: the process-wide one on the thread that initialized V8, an
++// isolate's own while that isolate is entered.
++SandboxFacts currentFacts() {
++  return {
++    .mode = static_cast<int>(v8::V8::GetSandboxMode()),
++    .sandboxBytes = v8::V8::GetSandboxSizeInBytes(),
++    .addressSpaceBytes = v8::V8::GetSandboxAddressSpace()->size(),
++    .groupPerIsolate = v8::IsolateGroup::CanCreateNewGroups(),
++    .zeroSegmentHeld = zeroSegmentHeld(),
++  };
++}
++
++// The refusal, also on the process's event channel when it has one (COWORKERD_EVENT_FD), so that
++// the node reports why a process exited with 78 instead of restarting it.
++void writeRefusalEvent(kj::StringPtr problem) {
++  auto* text = getenv("COWORKERD_EVENT_FD");
++  if (text == nullptr) return;
++  int fd = atoi(text);
++  if (fd < 0) return;
++  auto row = kj::str("{\"event\":\"sandbox-refused\",\"problem\":", jsonString(problem),
++      ",\"pid\":", getpid(), "}\n");
++  if (row.size() > 4096) return;
++  ssize_t written;
++  do {
++    written = write(fd, row.begin(), row.size());
++  } while (written < 0 && errno == EINTR);
++}
++
++// One [coworkerd-sandbox] row: `subject` names what was checked (a JSON member), then V8's facts,
++// this build's layout and the problem, if any.
++void writeRow(kj::StringPtr subject, const SandboxFacts& facts, kj::Maybe<kj::StringPtr> problem) {
++  auto problemMember = problem.map([](kj::StringPtr text) {
++    return kj::str(",\"problem\":", jsonString(text));
++  }).orDefault(kj::String());
++  writeStderr(kj::str("[coworkerd-sandbox] {", subject, ",\"mode\":\"", sandboxModeName(facts.mode),
++      "\",\"sandboxBytes\":", facts.sandboxBytes, ",\"reservationBytes\":", facts.addressSpaceBytes,
++      ",\"guardBytes\":", kSandboxGuardRegionSize,
++      ",\"trailingGuardBytes\":", kSandboxGuardRegionSize + kAdditionalTrailingGuardRegionSize,
++      ",\"typedArrayAccessMasks\":", kRequiresTypedArrayAccessMasks ? "true" : "false",
++      ",\"groupPerIsolate\":", facts.groupPerIsolate ? "true" : "false",
++      ",\"zeroSegmentHeld\":", facts.zeroSegmentHeld ? "true" : "false", problemMember, "}\n"));
++}
++#endif
++
++}  // namespace
++
++kj::StringPtr sandboxModeName(int mode) {
++#ifdef V8_ENABLE_SANDBOX
++  switch (static_cast<v8::V8::SandboxMode>(mode)) {
++    case v8::V8::SandboxMode::kSecure:
++      return "secure"_kj;
++    case v8::V8::SandboxMode::kInsecureFullReservationSmiAccessible:
++      return "smi-accessible"_kj;
++    case v8::V8::SandboxMode::kInsecurePartialReservationSmiInaccessible:
++      return "partially-reserved"_kj;
++    case v8::V8::SandboxMode::kInsecurePartialReservationSmiAccessible:
++      return "partially-reserved-smi-accessible"_kj;
++    default:
++      return "insecure"_kj;
++  }
++#else
++  (void)mode;
++  return "off"_kj;
++#endif
++}
++
++kj::Maybe<kj::String> sandboxProblem(const SandboxFacts& facts) {
++#ifdef V8_ENABLE_SANDBOX
++  if (!facts.groupPerIsolate) {
++    return kj::str("this build has one pointer-compression cage, and with it one sandbox, for every "
++                   "isolate; build with --config=coworkerd-sandbox");
++  }
++  if (facts.sandboxBytes != kSandboxSize) {
++    return kj::str("V8's sandbox is ", facts.sandboxBytes, " bytes, not the ", kSandboxSize,
++        " this build was configured with: part of the build lacks the sandbox defines");
++  }
++  switch (static_cast<v8::V8::SandboxMode>(facts.mode)) {
++    case v8::V8::SandboxMode::kSecure:
++      break;
++    case v8::V8::SandboxMode::kInsecureFullReservationSmiAccessible:
++      return kj::str("the first 4 GiB of the address space are not reserved (something is mapped "
++                     "there, or vm.mmap_min_addr is above 64 KiB), so V8's sandbox is not secure "
++                     "(smi-accessible)");
++    case v8::V8::SandboxMode::kInsecurePartialReservationSmiInaccessible:
++    case v8::V8::SandboxMode::kInsecurePartialReservationSmiAccessible:
++      return kj::str("V8 could not reserve its sandbox with guard regions, so the sandbox is not "
++                     "secure (",
++          sandboxModeName(facts.mode), ")");
++    default:
++      return kj::str("V8 reports its sandbox as insecure (mode ", facts.mode, ")");
++  }
++  if (!facts.zeroSegmentHeld) {
++    return kj::str("the platform reports the first 4 GiB and 1 MiB of the address space as reserved, "
++                   "but addresses there can still be mapped, so V8's secure mode does not hold");
++  }
++  if (facts.addressSpaceBytes != CONFIGURED_ADDRESS_SPACE) {
++    return kj::str("V8's sandbox reserves ", facts.addressSpaceBytes,
++        " bytes with its guard regions, not the ", CONFIGURED_ADDRESS_SPACE,
++        " this build was configured with: part of the build lacks the sandbox defines");
++  }
++  if (!facts.ownGroup) {
++    return kj::str("the isolate is in the default isolate group, whose sandbox the process itself "
++                   "uses; every isolate needs a group of its own");
++  }
++#else
++  (void)facts;
++#endif
++  return kj::none;
++}
++
++void requireSecureSandbox() {
++#ifdef V8_ENABLE_SANDBOX
++  auto facts = currentFacts();
++  auto problem = sandboxProblem(facts);
++  writeRow("\"process\":true"_kj, facts, problem.map([](kj::String& text) -> kj::StringPtr {
++    return text;
++  }));
++  KJ_IF_SOME(text, problem) {
++    writeStderr(kj::str("workerd: refusing to start: ", text, "\n"));
++    writeRefusalEvent(text);
++    _exit(SANDBOX_REFUSED_EXIT);
++  }
++#else
++  writeStderr(kj::str("[coworkerd-sandbox] {\"process\":true,\"mode\":\"off\",\"groupPerIsolate\":",
++      v8::IsolateGroup::CanCreateNewGroups() ? "true" : "false", "}\n"));
++#endif
++}
++
++namespace {
++
++// A first-fit-by-size allocator over one pool, reserved inside the group's sandbox when the group
++// is created. Blocks are multiples of 128 bytes (as V8's default allocator rounds them); freed
++// blocks merge with free neighbors, and whole pages that become free go back to the system.
++class SandboxPoolAllocator final: public v8::Allocator {
++ public:
++  SandboxPoolAllocator(v8::VirtualAddressSpace& space, uintptr_t base, size_t size)
++      : space(space),
++        base(base),
++        size(size),
++        page(space.page_size()) {
++    insertFree(base, size);
++  }
++  ~SandboxPoolAllocator() override {
++    // Destroyed by the sandbox's teardown while its address space is still intact.
++    space.FreePages(base, size);
++  }
++
++  void* Allocate(size_t length) override {
++    auto* data = AllocateUninitialized(length);
++    if (data != nullptr) memset(data, 0, length);
++    return data;
++  }
++  void* AllocateUninitialized(size_t length) override {
++    const size_t rounded = (std::max<size_t>(length, 1) + GRANULE - 1) / GRANULE * GRANULE;
++    if (rounded < length) return nullptr;  // overflow
++    std::lock_guard lock(mutex);
++    auto fit = bySize.lower_bound(rounded);
++    if (fit == bySize.end()) return nullptr;
++    auto [blockSize, address] = *fit;
++    bySize.erase(fit);
++    byAddress.erase(address);
++    if (blockSize > rounded) insertFree(address + rounded, blockSize - rounded);
++    used.emplace(address, rounded);
++    return reinterpret_cast<void*>(address);
++  }
++  void* AllocateUninitializedOrCrash(size_t length) override {
++    auto* data = AllocateUninitialized(length);
++    if (data == nullptr) {
++      writeStderr(kj::str("[coworkerd-sandbox] {\"event\":\"pool-exhausted\",\"bytes\":", length, "}\n"));
++      abort();
++    }
++    return data;
++  }
++  void Free(void* data) override {
++    if (data == nullptr) return;
++    auto address = reinterpret_cast<uintptr_t>(data);
++    std::lock_guard lock(mutex);
++    auto block = used.find(address);
++    if (block == used.end()) {
++      writeStderr("[coworkerd-sandbox] {\"event\":\"pool-free-unknown\"}\n"_kj);
++      abort();
++    }
++    size_t length = block->second;
++    used.erase(block);
++    uintptr_t start = address, end = address + length;
++    auto next = byAddress.find(end);
++    if (next != byAddress.end()) {
++      end += next->second;
++      eraseFree(next);
++    }
++    auto previous = byAddress.lower_bound(start);
++    if (previous != byAddress.begin()) {
++      --previous;
++      if (previous->first + previous->second == start) {
++        start = previous->first;
++        eraseFree(previous);
++      }
++    }
++    insertFree(start, end - start);
++    // The pages that this free made entirely free; the rest of the merged block was released when
++    // it became free.
++    uintptr_t from = std::max(roundUp(start), roundDown(address));
++    uintptr_t to = std::min(roundDown(end), roundUp(address + length));
++    if (from < to) (void)space.DiscardSystemPages(from, to - from);
++  }
++
++ private:
++  static constexpr size_t GRANULE = 128;
++  v8::VirtualAddressSpace& space;
++  const uintptr_t base;
++  const size_t size, page;
++  std::mutex mutex;
++  std::map<uintptr_t, size_t> byAddress;  // free blocks
++  std::multimap<size_t, uintptr_t> bySize;
++  std::unordered_map<uintptr_t, size_t> used;
++
++  uintptr_t roundUp(uintptr_t value) const { return (value + page - 1) / page * page; }
++  uintptr_t roundDown(uintptr_t value) const { return value / page * page; }
++  void insertFree(uintptr_t address, size_t length) {
++    byAddress.emplace(address, length);
++    bySize.emplace(length, address);
++  }
++  void eraseFree(std::map<uintptr_t, size_t>::iterator at) {
++    auto range = bySize.equal_range(at->second);
++    for (auto i = range.first; i != range.second; ++i) {
++      if (i->second == at->first) {
++        bySize.erase(i);
++        break;
++      }
++    }
++    byAddress.erase(at);
++  }
++};
++
++#ifdef __linux__
++bool addressTaken(uintptr_t address) {
++  void* got = mmap(reinterpret_cast<void*>(address), 4096, PROT_NONE,
++      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
++  if (got == MAP_FAILED) return errno == EEXIST;
++  // Mapped (or, before Linux 4.17, mapped elsewhere): nothing held the address.
++  munmap(got, 4096);
++  return false;
++}
++#endif
++
++}  // namespace
++
++std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space) {
++  for (size_t size = SANDBOX_POOL_BYTES; size >= (size_t(256) << 20); size /= 2) {
++    auto base = space.AllocatePages(v8::VirtualAddressSpace::kNoHint, size, size_t(1) << 20,
++        v8::PagePermissions::kReadWrite);
++    if (base != 0) return std::make_shared<SandboxPoolAllocator>(space, base, size);
++  }
++  return nullptr;
++}
++
++bool zeroSegmentHeld() {
++#ifdef __linux__
++  return addressTaken(uintptr_t(1) << 30) && addressTaken((uintptr_t(4) << 30) + (512 << 10));
++#else
++  return true;
++#endif
++}
++
++size_t measureGroupCapacity(size_t limit) {
++  if (!v8::IsolateGroup::CanCreateNewGroups()) return 0;
++  kj::Vector<v8::IsolateGroup> groups;
++  while (groups.size() < limit) {
++    KJ_IF_SOME(group, tryNewIsolateGroup()) {
++      groups.add(kj::mv(group));
++    } else {
++      break;
++    }
++  }
++  return groups.size();
++}
++
++kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup() {
++  if (!v8::IsolateGroup::CanCreateNewGroups()) return v8::IsolateGroup::GetDefault();
++  auto group = v8::IsolateGroup::TryCreate();
++  if (!group.has_value()) return kj::none;
++#ifdef V8_ENABLE_SANDBOX
++  // Before any isolate exists in the group, so the pool is the first thing in the buffer half.
++  auto allocator = newSandboxPoolAllocator(*group->GetSandboxAddressSpace());
++  if (allocator == nullptr) return kj::none;
++  group->SetInSandboxAllocator(kj::mv(allocator));
++#endif
++  return kj::mv(*group);
++}
++
++void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name) {
++#ifdef V8_ENABLE_SANDBOX
++  // V8 answers for the calling thread's sandbox, so the isolate must be the one entered here
++  // (without any, V8's current sandbox is null).
++  KJ_REQUIRE(v8::Isolate::GetCurrent() == isolate, "the isolate is not entered on this thread", name);
++  KJ_REQUIRE(isolate->GetGroup().GetSandboxAddressSpace() == v8::V8::GetSandboxAddressSpace(),
++      "the isolate's sandbox is not the current one", name);
++  auto facts = currentFacts();
++  facts.ownGroup = !v8::IsolateGroup::CanCreateNewGroups() ||
++      isolate->GetGroup() != v8::IsolateGroup::GetDefault();
++  auto problem = sandboxProblem(facts);
++  writeRow(kj::str("\"isolate\":", jsonString(name)), facts,
++      problem.map([](kj::String& text) -> kj::StringPtr { return text; }));
++  KJ_IF_SOME(text, problem) {
++    KJ_FAIL_REQUIRE("the V8 sandbox of this isolate is not usable", name, text);
++  }
++#else
++  (void)isolate;
++  (void)name;
++#endif
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-sandbox.h b/src/workerd/server/factory/coworkerd-sandbox.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..122dbbf7ad2cc1556d0592cbea750258e2a91270
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-sandbox.h
+@@ -0,0 +1,78 @@
++#pragma once
++
++#include <kj/common.h>
++#include <kj/string.h>
++#include <v8-isolate.h>
++#include <v8-platform.h>
++#include <cstddef>
++#include <memory>
++
++namespace workerd::server {
++
++// The V8 sandbox as Coworkerd builds it (--config=coworkerd-sandbox in .bazelrc): one 8 GiB
++// sandbox per isolate group, with V8's guard regions. V8 classifies a sandbox as secure when its
++// address space is fully reserved and the first 4 GiB of the process's address space and a page
++// can never be mapped (WorkerdPlatform reserves them before V8 starts). Without V8_ENABLE_SANDBOX
++// nothing here checks or writes anything.
++
++// What V8 reports for one sandbox.
++struct SandboxFacts {
++  int mode = 0;                  // v8::V8::SandboxMode
++  size_t sandboxBytes = 0;       // v8::V8::GetSandboxSizeInBytes()
++  size_t addressSpaceBytes = 0;  // the sandbox's address space, its guard regions included
++  bool groupPerIsolate = false;  // v8::IsolateGroup::CanCreateNewGroups()
++  // Addresses inside the zero segment (1 GiB and 4 GiB + 512 KiB) cannot be mapped: probed, not
++  // taken from what the platform reports to V8.
++  bool zeroSegmentHeld = true;
++  // An isolate's check: the isolate is not in the default group (which the process itself uses).
++  bool ownGroup = true;
++};
++
++// Why `facts` do not describe a secure sandbox laid out as this build configured it, or none.
++kj::Maybe<kj::String> sandboxProblem(const SandboxFacts& facts);
++
++// V8's name-like spelling of a v8::V8::SandboxMode: "secure", "smi-accessible",
++// "partially-reserved", "partially-reserved-smi-accessible", or "insecure"; "off" without the
++// sandbox.
++kj::StringPtr sandboxModeName(int mode);
++
++// Checks the process-wide sandbox once V8 is initialized, on the thread that initialized it, and
++// writes one [coworkerd-sandbox] row to stderr (`"mode":"off"` in a build without the sandbox).
++// Unless the sandbox is secure and laid out as this build configured it, the row carries the
++// problem and the process exits with status SANDBOX_REFUSED_EXIT before it loads any Worker.
++void requireSecureSandbox();
++constexpr int SANDBOX_REFUSED_EXIT = 78;
++
++// The same for the sandbox of `isolate`, which the caller holds locked and entered, before the
++// isolate runs any code; the row names the isolate. Throws instead of exiting, so that only this
++// Worker is not created.
++void requireSecureIsolateSandbox(v8::Isolate* isolate, kj::StringPtr name);
++
++// A new isolate group for one isolate, or none when the address space has no room left for its
++// sandbox and the reservations around it (V8's IsolateGroup::TryCreate(), fork patch
++// patches/v8/0057): the caller refuses that isolate instead of losing the process. The group gets
++// newSandboxPoolAllocator() as its in-sandbox allocator before any isolate exists. The default
++// group in a build with one shared pointer-compression cage.
++kj::Maybe<v8::IsolateGroup> tryNewIsolateGroup();
++
++// The in-sandbox allocator of a group's ArrayBuffer backing stores. V8's default reserves its pool
++// on the first allocation, trying 8, 4, 2 and 1 GiB, and ends the process when none fits: in an
++// 8 GiB sandbox only the second half's 4 GiB hold buffers, and a resizable ArrayBuffer or a Wasm
++// memory reserved there before that first allocation can leave less than 1 GiB. This one reserves
++// its pool at once (the largest of 2 GiB, 1 GiB, ... 256 MiB that fits in `space`) and returns
++// null from Allocate() instead of ending the process when the pool is full. None when no pool fits.
++std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space);
++constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
++
++// How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
++// refuses, then releases them. V8 places each sandbox at a random address, so the address space
++// holds about three quarters of what its size divided by one reservation suggests (random
++// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations, cwkd-p40).
++// 0 in a build with one shared pointer-compression cage.
++size_t measureGroupCapacity(size_t limit = 65536);
++
++// Whether the zero segment is really held: MAP_FIXED_NOREPLACE at 1 GiB and at 4 GiB + 512 KiB
++// fails with EEXIST. True where it cannot be probed (not Linux).
++bool zeroSegmentHeld();
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 232f1b4e00d6a270cffe135c1d5c15d9c3e80359..ac0280962beb544fd6682b80f3b45481fa7da405 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -1783,8 +1783,17 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+   // The isolate of the Worker, or of the zygote that snapshots its startup.
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
++    // The isolate's group first: with the V8 sandbox, each group has its own sandbox, in which the
++    // isolate's memory limit allocates its backing stores. When the address space has no room
++    // for another sandbox, this Worker is refused and the process keeps its other Workers.
++    auto group = KJ_UNWRAP_OR(tryNewIsolateGroup(), {
++      kj::throwFatalException(jsg::tagCoworkerdRpcError(
++          KJ_EXCEPTION(OVERLOADED,
++              "jsg.Error: OVERLOADED: no address space for another isolate's V8 sandbox in process"),
++          "OVERLOADED"));
++    });
+     impl->cpuLimits = kj::refcounted<CpuIsolateLimitEnforcer>(
+-        kj::refcounted<NullIsolateLimitEnforcer>(), isolateName, impl->coworkerdIdentity,
++        kj::refcounted<NullIsolateLimitEnforcer>(), group, isolateName, impl->coworkerdIdentity,
+         kj::str(spec.load_identity.startup_identity), impl->idleWorker,
+         spec.runtime_config.size() != 0 ? &factory.timer : nullptr,
+         spec.runtime_config.size() != 0 ? &factory.tasks : nullptr);
+@@ -1797,7 +1806,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+       };
+     };
+     auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
+-        limitEnforcer->getCreateParams(), jsg::newIsolateGroup(),
++        limitEnforcer->getCreateParams(), kj::mv(group),
+         kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
+         options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
+     Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;
+diff --git a/src/workerd/server/v8-platform-impl.c++ b/src/workerd/server/v8-platform-impl.c++
+index 302ec7070e018b23971c2cea446804b5ef1e38e5..f6133d71d7e89e369984f4ad99cdf967f2f95404 100644
+--- a/src/workerd/server/v8-platform-impl.c++
++++ b/src/workerd/server/v8-platform-impl.c++
+@@ -6,8 +6,90 @@
+ 
+ #include <workerd/io/io-util.h>
+ 
++#if defined(V8_ENABLE_SANDBOX) && defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstdint>
++#elif defined(V8_ENABLE_SANDBOX) && defined(__APPLE__)
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++
++#include <cstdint>
++#include <cstring>
++#endif
++
+ namespace workerd::server {
+ 
++namespace {
++
++#if defined(V8_ENABLE_SANDBOX) && (defined(__linux__) || defined(__APPLE__))
++// The range V8 needs unmappable: the 4 GiB a Smi can address, plus padding for the fields of an
++// object at such an address. V8 15.8 asks for 4 GiB plus the largest JS or Wasm object field offset
++// (kMinZeroSegmentSize, src/sandbox/sandbox-zero-segment.h; a Wasm struct of 10,000 fields makes it
++// about 160 KB) and asserts that this stays within 4097 MiB, so 4 GiB + 1 MiB always suffices.
++constexpr uintptr_t kZeroSegmentEnd = (uintptr_t(4) << 30) + (uintptr_t(1) << 20);
++#endif
++
++size_t reserveZeroSegment() {
++#if defined(V8_ENABLE_SANDBOX) && defined(__linux__)
++  // Nothing can be mapped below vm.mmap_min_addr (mmap fails with EPERM, or EACCES under an LSM).
++  // Reserve the rest of [0, kZeroSegmentEnd), inaccessible and without commit, for the life of the
++  // process. Its start is found by trying page by page up to 64 KiB, the largest usual
++  // vm.mmap_min_addr, so that this needs no /proc (a confined process may have none). If anything
++  // already occupies part of the range, nothing is reserved and V8 reports the sandbox as insecure
++  // (smi-accessible).
++  uintptr_t page = sysconf(_SC_PAGESIZE);
++  for (uintptr_t start = page; start <= 65536 && start < kZeroSegmentEnd; start += page) {
++    void* reserved = mmap(reinterpret_cast<void*>(start), kZeroSegmentEnd - start, PROT_NONE,
++        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
++    if (reserved == reinterpret_cast<void*>(start)) return kZeroSegmentEnd;
++    // Kernels before 4.17 take MAP_FIXED_NOREPLACE as a hint and may map elsewhere.
++    if (reserved != MAP_FAILED) {
++      munmap(reserved, kZeroSegmentEnd - start);
++      return 0;
++    }
++    if (errno != EPERM && errno != EACCES) return 0;
++  }
++  return 0;
++#elif defined(V8_ENABLE_SANDBOX) && defined(__APPLE__)
++  // For a PIE executable the kernel extends __PAGEZERO by the ASLR slide and puts the whole range
++  // below the VM map's minimum address, where nothing can ever be mapped; there is nothing to
++  // reserve. Confirm it for the page below the end before reporting it.
++  auto header = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
++  if (header == nullptr || header->magic != MH_MAGIC_64) return 0;
++  auto command = reinterpret_cast<const load_command*>(header + 1);
++  for (uint32_t i = 0; i < header->ncmds; i++) {
++    if (command->cmd == LC_SEGMENT_64) {
++      auto segment = reinterpret_cast<const segment_command_64*>(command);
++      if (strncmp(segment->segname, SEG_PAGEZERO, sizeof(segment->segname)) == 0) {
++        if (segment->vmaddr != 0 || segment->maxprot != VM_PROT_NONE) return 0;
++        uintptr_t end = segment->vmsize + _dyld_get_image_vmaddr_slide(0);
++        if (end < kZeroSegmentEnd) return 0;
++        mach_vm_address_t probe = (end - 1) & ~uintptr_t(vm_page_size - 1);
++        kern_return_t result = mach_vm_allocate(mach_task_self(), &probe, vm_page_size, VM_FLAGS_FIXED);
++        if (result == KERN_SUCCESS) mach_vm_deallocate(mach_task_self(), probe, vm_page_size);
++        return result == KERN_INVALID_ADDRESS ? end : 0;
++      }
++    }
++    command = reinterpret_cast<const load_command*>(
++        reinterpret_cast<const char*>(command) + command->cmdsize);
++  }
++  return 0;
++#else
++  return 0;
++#endif
++}
++
++}  // namespace
++
++WorkerdPlatform::WorkerdPlatform(v8::Platform& inner)
++    : inner(inner),
++      zeroSegmentSize(reserveZeroSegment()) {}
++
+ double WorkerdPlatform::CurrentClockTimeMillis() noexcept {
+   return dateNow();
+ }
+diff --git a/src/workerd/server/v8-platform-impl.h b/src/workerd/server/v8-platform-impl.h
+index 09ee81ac34bb1845ee1087b82075f1f984da081b..3267a65fd3ea297c261d61c3c965c81860c2e3d5 100644
+--- a/src/workerd/server/v8-platform-impl.h
++++ b/src/workerd/server/v8-platform-impl.h
+@@ -21,7 +21,7 @@ class WorkerdPlatform final: public v8::Platform {
+  public:
+   // This takes a reference to its wrapped platform because otherwise we would have to destroy a
+   // kj::Own in our noexcept destructor (feasible but ugly).
+-  explicit WorkerdPlatform(v8::Platform& inner): inner(inner) {}
++  explicit WorkerdPlatform(v8::Platform& inner);
+ 
+   ~WorkerdPlatform() noexcept {}
+ 
+@@ -77,6 +77,14 @@ class WorkerdPlatform final: public v8::Platform {
+     return inner.GetTracingController();
+   }
+ 
++  // With the V8 sandbox, V8 counts the sandbox as configured securely only when the first 4 GiB of
++  // the address space and 1 MiB past them can never be mapped, so that a Smi taken for a pointer
++  // faults. The constructor makes sure of that before V8 is initialized; this reports the size of
++  // that range, or 0.
++  size_t GetZeroSegmentSize() noexcept override {
++    return zeroSegmentSize;
++  }
++
+   v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() noexcept override {
+     // Forward to the inner platform so that V8's ThreadIsolation can use PKU
+     // (Memory Protection Keys) to enforce W^X on JIT code pages and
+@@ -88,6 +96,7 @@ class WorkerdPlatform final: public v8::Platform {
+ 
+  private:
+   v8::Platform& inner;
++  size_t zeroSegmentSize = 0;
+ };
+ 
+ }  // namespace workerd::server
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 2cac73c8b6ef474222a22f760dac058fdd3d932a..7437c7af7413021406babc98d30fef317e59c9da 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -12,6 +12,7 @@ THREADED_DEPS = [
+     "//src/workerd/jsg",
+     "//src/workerd/server:v8-platform-impl",
+     "//src/workerd/server:workerd-api",
++    "//src/workerd/server/factory:coworkerd-sandbox",
+     "//src/workerd/server/factory:coworkerd-steady",
+     "//src/workerd/util:autogate",
+     "//src/workerd/util:entropy",
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c98b22e637 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -27,6 +27,17 @@ void initializeV8() {
+   static auto* platform = new TestPlatform;
+   (void)platform;
+ }
++// A group of its own for a test isolate, as the server creates one per Worker.
++v8::IsolateGroup newGroup() {
++  initializeV8();
++  return KJ_ASSERT_NONNULL(server::tryNewIsolateGroup());
++}
++// customizeIsolate() runs with the isolate entered, as Worker::Isolate and sourceJsonFailure do.
++void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
++  v8::Locker locker(isolate);
++  v8::Isolate::Scope entered(isolate);
++  limits.customizeIsolate(isolate);
++}
+ 
+ KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
+   DescriptorQueue queue(2);
+@@ -224,10 +235,10 @@ KJ_TEST("log quotas and a failed flush reset pending and in-flight buffers") {
+ 
+ KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
+   initializeV8();
+-  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
+-  auto* isolate = v8::Isolate::New(limits.getCreateParams());
++  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr, newGroup());
++  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+   KJ_DEFER(isolate->Dispose());
+-  limits.customizeIsolate(isolate);
++  customizeEntered(limits, isolate);
+   v8::Locker locker(isolate);
+   v8::Isolate::Scope entered(isolate);
+   v8::HandleScope handles(isolate);
+@@ -291,10 +302,10 @@ KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termina
+ 
+ void allocationComponent(kj::StringPtr code) {
+   initializeV8();
+-  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr);
+-  auto* neighbor = v8::Isolate::New(neighborLimits.getCreateParams());
++  IsolateLimits neighborLimits(1000, 32, kj::str("\"workerId\":\"a/neighbor\","), nullptr, newGroup());
++  auto* neighbor = v8::Isolate::New(neighborLimits.group, neighborLimits.getCreateParams());
+   KJ_DEFER(neighbor->Dispose());
+-  neighborLimits.customizeIsolate(neighbor);
++  customizeEntered(neighborLimits, neighbor);
+   auto checkNeighbor = [&] {
+     v8::Locker lock(neighbor);
+     v8::Isolate::Scope scope(neighbor);
+@@ -309,12 +320,12 @@ void allocationComponent(kj::StringPtr code) {
+   auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
+   auto reservation = std::make_shared<ResourceReservation>(budget, 32);
+   KJ_ASSERT(reservation->registerPreparation());
+-  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation);
++  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/heap\","), reservation, newGroup());
+   auto params = limits.getCreateParams();
+   KJ_EXPECT(params.constraints.max_old_generation_size_in_bytes() > (1ull << 30));
+-  auto* isolate = v8::Isolate::New(params);
++  auto* isolate = v8::Isolate::New(limits.group, params);
+   KJ_DEFER(isolate->Dispose());
+-  limits.customizeIsolate(isolate);
++  customizeEntered(limits, isolate);
+   v8::Locker locker(isolate);
+   v8::Isolate::Scope entered(isolate);
+   v8::HandleScope handles(isolate);
+@@ -340,6 +351,27 @@ void allocationComponent(kj::StringPtr code) {
+   checkNeighbor();
+ }
+ 
++KJ_TEST("a Worker's ArrayBuffers lie in its own isolate group's sandbox") {
++  // MemoryBudget allocates in the group it was given: with a V8 sandbox per group, V8 ends the
++  // process on the first backing store outside the isolate's own sandbox.
++  initializeV8();
++  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 4, 1);
++  auto reservation = std::make_shared<ResourceReservation>(budget, 32);
++  KJ_ASSERT(reservation->registerPreparation());
++  auto other = newGroup();
++  IsolateLimits limits(1000, 32, kj::str("\"workerId\":\"a/buffers\","), reservation, newGroup());
++  auto* isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
++  KJ_DEFER(isolate->Dispose());
++  customizeEntered(limits, isolate);
++  v8::Locker locker(isolate);
++  v8::Isolate::Scope entered(isolate);
++  auto store = v8::ArrayBuffer::NewBackingStore(isolate, 1 << 20);
++  KJ_EXPECT(limits.group.SandboxContains(store->Data()));
++  KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
++  // A buffer above the Worker's limit is refused before anything is reserved.
++  KJ_EXPECT(limits.memory->MaxAllocationSize() == (32ull << 20));
++}
++
+ KJ_TEST("single large heap allocation preserves the process") {
+   allocationComponent("globalThis.retained = new Array(12*1024*1024).fill(7)");
+ }
+@@ -398,9 +430,9 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+     auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+     KJ_ASSERT(reservation->registerPreparation());
+     limits.push_back(kj::refcounted<IsolateLimits>(
+-        10000, 128, kj::str("\"workerId\":\"a/large-", i, "\","), reservation));
+-    isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
+-    limits[i]->customizeIsolate(isolates[i]);
++        10000, 128, kj::str("\"workerId\":\"a/large-", i, "\","), reservation, newGroup()));
++    isolates.push_back(v8::Isolate::New(limits[i]->group, limits[i]->getCreateParams()));
++    customizeEntered(*limits[i], isolates[i]);
+   }
+   KJ_DEFER(for (auto* isolate : isolates) isolate->Dispose());
+   // No resident is idle during this test. Wake growers just as a maintenance
+@@ -418,10 +450,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+   auto neighborReservation = std::make_shared<ResourceReservation>(budget, 128);
+   KJ_ASSERT(neighborReservation->registerPreparation());
+   IsolateLimits neighborLimits(
+-      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation);
+-  auto* neighbor = v8::Isolate::New(jsg::newIsolateGroup(), neighborLimits.getCreateParams());
++      10000, 128, kj::str("\"workerId\":\"a/neighbor\","), neighborReservation, newGroup());
++  auto* neighbor = v8::Isolate::New(neighborLimits.group, neighborLimits.getCreateParams());
+   KJ_DEFER(neighbor->Dispose());
+-  neighborLimits.customizeIsolate(neighbor);
++  customizeEntered(neighborLimits, neighbor);
+   auto runNeighbor = [&](kj::StringPtr code, int32_t expected) {
+     v8::Locker lock(neighbor);
+     v8::Isolate::Scope scope(neighbor);
+@@ -607,17 +639,22 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
+   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+ }
+ 
+-// KNOWN FAILURE until each isolate has its own pointer cage (S3): every heap
+-// of this V8 build shares one 4 GiB cage, and the hard reserve that lets one
+-// isolate finish a maximum-sized object cannot be granted to four at once.
+-// V8's fatal OOM then ends the process (exit 74). This test passes while the
+-// failure reproduces and fails when it stops, so the status is updated.
+-KJ_TEST("four simultaneous near-GiB heap objects end the process (known failure until S3)") {
++// Four isolates each finish an object of about 1 GiB at the same moment while a neighbor keeps
++// answering. With a pointer cage (and a V8 sandbox) per isolate (--config=coworkerd-sandbox), each
++// heap has its own 4 GiB, so the process survives. With one shared 4 GiB cage this ended the
++// process with V8's fatal OOM (exit 74; the known failure until S3, v137 §6.24), which a build
++// without per-isolate cages still reproduces: that branch keeps the old expectation.
++KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neighboring Worker") {
+   auto child = runAllocationChild("4:string");
++  if (v8::IsolateGroup::CanCreateNewGroups()) {
++    KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
++    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
++    return;
++  }
+   bool reproduced = WIFEXITED(child.status) && WEXITSTATUS(child.status) == 74;
+   fprintf(stdout, "KNOWN_FAILURE four-simultaneous-near-GiB reproduced=%d\n", reproduced);
+   fflush(stdout);
+-  KJ_EXPECT(reproduced, "the known failure changed; update its status", child.status);
++  KJ_EXPECT(reproduced, "the shared-cage failure changed; update its status", child.status);
+   // The OOM row names the execution whose allocation failed and carries its
+   // isolate's heap: far below that Worker's 128 MiB limit, because the other
+   // isolates filled the shared cage. The node must not blame it.
+@@ -740,14 +777,14 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
+ 
+ KJ_TEST("source JSON failures preserve the actual Worker decoder exception") {
+   initializeV8();
+-  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
++  IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr, newGroup());
+   bool failed = false;
+   KJ_IF_SOME(error, sourceJsonFailure("not JSON", limits)) {
+     failed = true;
+     KJ_EXPECT(error == "SyntaxError: Unexpected token 'o', \"not JSON\" is not valid JSON");
+   }
+   KJ_EXPECT(failed);
+-  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr);
++  IsolateLimits valid(100, 32, kj::str("\"workerId\":\"a/source\","), nullptr, newGroup());
+   KJ_EXPECT(sourceJsonFailure("{}", valid) == kj::none);
+ }
+ 
+@@ -778,7 +815,7 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
+   auto lagging = kj::systemPreciseMonotonicClock().now() - 5 * kj::SECONDS;
+   kj::TimerImpl clock(lagging);
+   Timer timer(clock);
+-  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr);
++  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/background\","), nullptr, newGroup());
+   Slot slot;
+   slot.limits = &isolateLimits;
+   Measurement measurement;
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546ed510560 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -19,6 +19,7 @@
+ #include <workerd/io/worker-interface.h>
+ #include <workerd/jsg/coworkerd-rpc-code.h>
+ #include <workerd/jsg/setup.h>
++#include <workerd/server/factory/coworkerd-sandbox.h>
+ #include <workerd/server/factory/coworkerd-steady.h>
+ #include <workerd/server/v8-platform-impl.h>
+ #include <workerd/server/workerd-api.h>
+@@ -256,8 +257,11 @@ struct ResourceBudget {
+         memoryReserved(baselineMemory) {
+     KJ_REQUIRE(admissionMaximum > baselineMemory + 2 * MiB,
+         "native thread budget leaves no memory for an active Worker");
+-    KJ_REQUIRE(
+-        residents > 0 && residents <= 1840, "invalid resident budget for this shared-group build");
++    // One shared pointer cage holds at most 1,840 residents; with a cage and a V8 sandbox per
++    // isolate the address space bounds them instead: the node passes its per-process limit for the
++    // mode (sandbox.protectionKeys) and isolate group creation refuses beyond it.
++    KJ_REQUIRE(residents > 0 && residents <= (v8::IsolateGroup::CanCreateNewGroups() ? 65536 : 1840),
++        "invalid resident budget for this build");
+   }
+   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
+   const uint32_t residentMaximum;
+@@ -456,6 +460,15 @@ struct ResourcePreparation {
+   std::shared_ptr<ResourceReservation> reservation;
+ };
+ 
++// Workers refused because the address space had no room for another isolate's V8 sandbox
++// (tryNewIsolateGroup()); one [coworkerd-sandbox] row each.
++std::atomic<uint64_t> sandboxRefusals{0};
++void noSandboxRoom() {
++  auto refusals = sandboxRefusals.fetch_add(1) + 1;
++  fprintf(stderr, "[coworkerd-sandbox] {\"event\":\"group-refused\",\"refusals\":%llu}\n",
++      static_cast<unsigned long long>(refusals));
++}
++
+ constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
+ enum class CapacityScope { PROCESS, TENANT };
+ kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
+@@ -603,20 +616,44 @@ bool writeLimitRow(kj::StringPtr event,
+   _exit(74);
+ }
+ 
++// V8's allocator for `group`: with the sandbox and one pointer cage per group, backing stores
++// must lie in the isolate's own sandbox (V8 aborts the process on the first one otherwise).
++v8::ArrayBuffer::Allocator *newGroupAllocator(const v8::IsolateGroup &group) {
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++  return v8::ArrayBuffer::Allocator::NewDefaultAllocator(group);
++#else
++  return v8::ArrayBuffer::Allocator::NewDefaultAllocator();
++#endif
++}
++
+ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+-  MemoryBudget(uint32_t mib, LimitState cause, std::shared_ptr<ResourceReservation> reservation)
++  // `group` is the isolate's group; the budget allocates in its sandbox and keeps it.
++  MemoryBudget(uint32_t mib,
++      LimitState cause,
++      std::shared_ptr<ResourceReservation> reservation,
++      const v8::IsolateGroup &group)
+       : maximum(uint64_t(mib == 0 ? 128 : mib) << 20),
+         cause(std::move(cause)),
+         reservation(std::move(reservation)),
+-        inner(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
++        group(group),
++        inner(newGroupAllocator(this->group)) {}
+   ~MemoryBudget() noexcept override {
+     delete inner;
+   }
++  // No single buffer, and no resizable buffer's reservation, beyond the Worker's limit (V8's
++  // default is 32 GiB, more than the buffer half of an 8 GiB sandbox).
++  size_t MaxAllocationSize() const override {
++    return std::min<size_t>(maximum, inner->MaxAllocationSize());
++  }
++  v8::PageAllocator *GetPageAllocator() override {
++    return inner->GetPageAllocator();
++  }
+   const uint64_t maximum;
+   LimitState cause;
+   std::shared_ptr<ResourceReservation> reservation;
+   std::atomic<uint64_t> external{0}, heap{0};
+   std::atomic<uint64_t> peakUsedBytes{0};
++  v8::IsolateGroup group;
+   v8::ArrayBuffer::Allocator *inner;
+   v8::Isolate *isolate = nullptr;
+   std::atomic<bool> pendingPressure{false};
+@@ -896,17 +933,23 @@ struct CpuExecution {
+ };
+ 
+ struct IsolateLimits final: IsolateLimitEnforcer {
++  // `group` is the group the isolate is created in (tryNewIsolateGroup()).
+   IsolateLimits(uint32_t cpuMs,
+       uint32_t memoryMiB,
+       kj::String identity,
+-      std::shared_ptr<ResourceReservation> reservation)
++      std::shared_ptr<ResourceReservation> reservation,
++      v8::IsolateGroup groupParam)
+       : cpuMs(cpuMs),
+         memoryMiB(memoryMiB),
+-        identity(kj::mv(identity)) {
+-    memory = std::make_shared<MemoryBudget>(memoryMiB, memoryState, std::move(reservation));
++        identity(kj::mv(identity)),
++        group(kj::mv(groupParam)) {
++    memory = std::make_shared<MemoryBudget>(memoryMiB, memoryState, std::move(reservation), group);
+   }
+   uint32_t cpuMs, memoryMiB;
+   kj::String identity;
++  v8::IsolateGroup group;
++  // The name in this isolate's [coworkerd-sandbox] row.
++  std::string sandboxName = "threaded";
+   LimitState memoryState = std::make_shared<std::atomic<LimitCause>>(LimitCause::NONE);
+   std::shared_ptr<MemoryBudget> memory;
+   mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
+@@ -921,7 +964,10 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+     }
+     return params;
+   }
++  // Called with the isolate entered (Worker::Isolate, sourceJsonFailure): with the V8 sandbox,
++  // its own sandbox must be secure before it runs any code.
+   void customizeIsolate(v8::Isolate *value) override {
++    server::requireSecureIsolateSandbox(value, sandboxName.c_str());
+     if (memory) memory->install(value);
+   }
+   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
+@@ -1333,11 +1379,11 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
+   // rejected the source response. Its temporary validation isolate belongs
+   // to this load and uses its CPU, heap and process reservation.
+   OomReportScope oom(limits.identity, limits.memoryMiB, limits.memory ? &limits.memory->heap : nullptr);
+-  auto *isolate = v8::Isolate::New(limits.getCreateParams());
++  auto *isolate = v8::Isolate::New(limits.group, limits.getCreateParams());
+   KJ_DEFER(isolate->Dispose());
+-  limits.customizeIsolate(isolate);
+   v8::Locker locker(isolate);
+   v8::Isolate::Scope entered(isolate);
++  limits.customizeIsolate(isolate);
+   v8::HandleScope handles(isolate);
+   auto context = v8::Context::New(isolate);
+   v8::Context::Scope inContext(context);
+@@ -1732,6 +1778,8 @@ struct ThreadedServer {
+             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
+         subrequestBudget(limit, tenantBudget->limit) {
+     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
++    // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
++    server::requireSecureSandbox();
+     resources->reclaimWake = managerWake;
+     server::coworkerdServing();
+     fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
+@@ -1809,6 +1857,7 @@ struct ThreadedServer {
+         ",\"addressMaximum\":" + std::to_string(resources->addressMaximum) +
+         ",\"residents\":" + std::to_string(resources->residents.load()) +
+         ",\"rejected\":" + std::to_string(resources->rejections.load()) +
++        ",\"sandboxRefused\":" + std::to_string(sandboxRefusals.load()) +
+         ",\"evicted\":" + std::to_string(resources->evictions.load()) +
+         ",\"tenantRejected\":" + std::to_string(tenantBudget->rejected.load()) +
+         ",\"limitRowsDropped\":" + std::to_string(limitRowsDropped.load()) + "}}";
+@@ -2168,9 +2217,14 @@ struct ThreadedServer {
+     try {
+       source = std::make_unique<JsonDoc>(content);
+     } catch (kj::Exception &error) {
++      auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
++        noSandboxRoom();
++        kj::throwFatalException(capacityError());
++      });
+       IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
+           workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
+-          invocationIdentity(slot, descriptor), slot.reservation);
++          invocationIdentity(slot, descriptor), slot.reservation, kj::mv(group));
++      limits.sandboxName = slot.isolateLabel + "/source-json";
+       isolateCreationAttempts.fetch_add(1);
+       KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
+         kj::throwRecoverableException(
+@@ -2248,16 +2302,22 @@ struct ThreadedServer {
+         ",\"versionId\":", encode(field(descriptor, "versionId")),
+         ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",\"isolate\":\"",
+         slot.isolateLabel.c_str(), "\",");
++    // With a V8 sandbox per isolate, an address space without room for another one refuses this
++    // Worker (the node's per-process limit normally refuses first), never ends the process.
++    auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
++      noSandboxRoom();
++      kj::throwFatalException(capacityError());
++    });
+     auto limits = kj::refcounted<IsolateLimits>(
+         workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
+         workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity),
+-        slot.reservation);
++        slot.reservation, group);
++    limits->sandboxName = slot.isolateLabel;
+     slot.limits = limits.get();
+     slot.limitsOwner = kj::addRef(*limits);
+     OomReportScope oom(
+         limits->identity, limits->memoryMiB, limits->memory ? &limits->memory->heap : nullptr);
+     isolateCreationAttempts.fetch_add(1);
+-    auto group = jsg::newIsolateGroup();
+     const api::pyodide::PythonConfig python{
+       .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
+     auto api = kj::heap<server::WorkerdApi>(v8, flags.asReader(),
+@@ -3840,6 +3900,19 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+ 
+ int main(int argc, char **argv) {
+   using namespace workerd;
++  if (argc == 2 && strcmp(argv[1], "--sandbox-facts") == 0) {
++    // The node's startup probe of this build: one [coworkerd-sandbox] row on stderr, with V8's mode
++    // and this build's sandbox layout ("mode":"off" without the sandbox); exit 78 with the problem
++    // when the sandbox would not be secure on this machine.
++    auto basePlatform = jsg::defaultPlatform(0);
++    server::WorkerdPlatform platform{*basePlatform};
++    jsg::V8System v8{platform, {}, basePlatform.get()};
++    server::requireSecureSandbox();
++    // How many isolates' sandboxes fit in this machine's address space (the node's plan).
++    if (v8::IsolateGroup::CanCreateNewGroups())
++      fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
++    return 0;
++  }
+   if (argc != 5) {
+     fprintf(stderr,
+         "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS "

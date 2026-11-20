@@ -92,6 +92,8 @@ void ProcessPoolConfig::validate() const {
   KJ_REQUIRE(gcInitialOldSpaceMiB <= 65536 && gcIdleCollectMinGrowthMiB <= 65536, "gc sizes are at most 65536 MiB");
   KJ_REQUIRE(sandboxMode == "off" || sandboxMode == "launcher" || sandboxMode == "auto",
       "sandbox.mode must be off, launcher or auto", sandboxMode.c_str());
+  KJ_REQUIRE(protectionKeys == "auto" || protectionKeys == "off" || protectionKeys == "required",
+      "sandbox.protectionKeys must be auto, off or required", protectionKeys.c_str());
   KJ_REQUIRE(syscallsMode == "off" || syscallsMode == "observe" || syscallsMode == "enforce",
       "sandbox.syscalls.mode must be off, observe or enforce", syscallsMode.c_str());
   KJ_REQUIRE(steadySyscallsMode == "off" || steadySyscallsMode == "observe" || steadySyscallsMode == "enforce",
@@ -296,6 +298,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   auto sandbox = root.getSandbox();
   result.processPool.sandboxMode = sandbox.getMode().cStr();
   result.processPool.launcherPath = sandbox.getLauncherPath().cStr();
+  result.processPool.protectionKeys = sandbox.getProtectionKeys().cStr();
   result.processPool.syscallsMode = sandbox.getSyscalls().getMode().cStr();
   result.processPool.allowlistPath = sandbox.getSyscalls().getAllowlistPath().cStr();
   result.processPool.steadySyscallsMode = sandbox.getSyscalls().getSteady().getMode().cStr();
