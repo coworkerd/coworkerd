@@ -185,6 +185,7 @@ add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test
 add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
 add_test(NAME durable-segment-cache COMMAND coworkerd-durable-channel-test segment-cache)
 add_test(NAME durable-earlier-segment COMMAND coworkerd-durable-channel-test earlier-segment)
+add_test(NAME durable-earlier-publish-gate COMMAND coworkerd-durable-channel-test publish-gate)
 add_test(NAME durable-restored-tail COMMAND coworkerd-durable-channel-test restored-tail)
 add_test(NAME durable-restored-tail-negative-controls COMMAND coworkerd-durable-channel-test restored-tail-negative)
 # Freed memory is overwritten, so that a load touching its destroyed cache fails this test instead of passing by luck.

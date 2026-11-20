@@ -7326,7 +7326,9 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
 // epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS. A request
-// for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before (r49
+// for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before, except
+// that a restored epoch answers a request naming an object for that object without fencing (b58; the shard is
+// fenced when a proof is given for all of it) (r49
 // section 6.3; the check needs a wire signal or a new rule, in the backlog).
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;

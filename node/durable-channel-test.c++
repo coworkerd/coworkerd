@@ -1225,6 +1225,7 @@ struct DurableLogChannelTest {
       if (i == 2 || i == 3) object.state = UNTOUCHED;
       if (i == 4) object.state = PUBLISHING;
       if (i == 5) { object.state = PUBLISHED; object.excluded = true; }
+      if (i == 6) object.state = PUBLISHED;  // its data epoch 1 only: data epoch 2 below stays
       objects.push_back(object);
     }
     std::map<uint64_t, std::pair<size_t, LogRecord>> excludedRecords;
@@ -1240,6 +1241,16 @@ struct DurableLogChannelTest {
         log.noteEarlierUnpublished(info, r);
         objects[i].sequences.push_back(sequence++);
       }
+    }
+    {
+      // Object 6 has records of a second data epoch too (the same object name, another host name).
+      LogRecord r;
+      r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[6].shard;
+      r.shardEpoch = 1; r.objectName = objects[6].name; r.dataEpoch = 2; r.txn = sequence;
+      log.earlier[EPOCH][sequence] = r;
+      log.indexEarlierRecord({EPOCH, sequence}, r);
+      log.noteEarlierUnpublished(info, r);
+      objects[6].sequences.push_back(sequence++);
     }
     for (size_t i = 0; i < objects.size(); ++i) {
       if (objects[i].sequences.empty()) {  // every object has a record
@@ -1278,7 +1289,7 @@ struct DurableLogChannelTest {
         }
       }
       if (object.state == PUBLISHING) log.earlierPublishing.insert(object.name);
-      truth[i] = object.state != PUBLISHED || excludedLeft[i];
+      truth[i] = object.state != PUBLISHED || excludedLeft[i] || i == 6;
     }
     auto ask = [&](uint32_t shard, const std::string& id) {
       DurableTailAsk out;
@@ -1306,6 +1317,164 @@ struct DurableLogChannelTest {
     for (size_t i = 0; i < objects.size(); ++i)
       if (objects[i].shard == 0 && !pending(ask(0, objects[i].id))) matched = false;
     return matched;
+  }
+
+
+  // b58: an object's records leave its earlier epoch only after the manifest that names them is written. A stand-in
+  // for S3 (listing, reads, create-if-absent) holds or fails the manifest create of one object: while it is held a
+  // request naming that object is still told there is more, and after a failed create the records stay.
+  class HeldStore final: public kj::HttpService {
+  public:
+    HeldStore(const kj::HttpHeaderTable& table, kj::HttpHeaderId ifNoneMatch): table(table), ifNoneMatch(ifNoneMatch) {}
+    kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+        kj::AsyncInputStream& body, Response& response) override {
+      const std::string target(url.cStr());
+      const auto question = target.find('?');
+      const auto path = decode(target.substr(0, question));
+      const auto query = question == std::string::npos ? std::string() : target.substr(question + 1);
+      const auto key = path.size() > 3 ? path.substr(3) : std::string();  // "/b/<key>"
+      if (method == kj::HttpMethod::GET && query.find("list-type=2") != std::string::npos) {
+        const auto prefix = decode(parameter(query, "prefix"));
+        std::string xml = "<ListBucketResult><IsTruncated>false</IsTruncated>";
+        for (const auto& [name, bytes] : objects) {
+          if (!name.starts_with(prefix)) continue;
+          xml += "<Contents><Key>" + name + "</Key><LastModified>2026-11-20T00:00:00.000Z</LastModified><Size>" +
+              std::to_string(bytes.size()) + "</Size></Contents>";
+        }
+        co_await send(response, 200, xml + "</ListBucketResult>");
+        co_return;
+      }
+      if (method == kj::HttpMethod::GET) {
+        auto found = objects.find(key);
+        co_await send(response, found == objects.end() ? 404 : 200, found == objects.end() ? std::string() : found->second);
+        co_return;
+      }
+      auto bytes = co_await body.readAllBytes();
+      std::string text(bytes.asChars().begin(), bytes.size());
+      if (!hold.empty() && key.find(hold) != std::string::npos) {
+        ++held;
+        if (parked) parked->fulfill();
+        co_await release.addBranch();
+      }
+      if (!fail.empty() && key.find(fail) != std::string::npos) {
+        ++failed;
+        co_await send(response, 503, "");
+        co_return;
+      }
+      if (headers.get(ifNoneMatch) != kj::none && objects.contains(key)) {
+        co_await send(response, 412, "");
+        co_return;
+      }
+      objects[key] = std::move(text);
+      ++written;
+      co_await send(response, 200, "");
+    }
+    std::map<std::string, std::string> objects;
+    std::string hold, fail;
+    uint32_t held = 0, failed = 0, written = 0;
+    kj::Own<kj::PromiseFulfiller<void>> parked;
+    kj::PromiseFulfillerPair<void> gate = kj::newPromiseAndFulfiller<void>();
+    kj::ForkedPromise<void> release = gate.promise.fork();
+  private:
+    static std::string decode(const std::string& text) {
+      std::string out;
+      for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '%' && i + 2 < text.size()) { out.push_back(char(std::stoi(text.substr(i + 1, 2), nullptr, 16))); i += 2; }
+        else out.push_back(text[i]);
+      }
+      return out;
+    }
+    static std::string parameter(const std::string& query, const std::string& name) {
+      for (size_t at = 0; at <= query.size();) {
+        const auto end = std::min(query.find('&', at), query.size());
+        const auto pair = query.substr(at, end - at);
+        if (pair.starts_with(name + "=")) return pair.substr(name.size() + 1);
+        at = end + 1;
+      }
+      return {};
+    }
+    kj::Promise<void> send(Response& response, uint32_t status, std::string text) {
+      kj::HttpHeaders out(table);
+      auto stream = response.send(status, status == 200 ? "OK" : "Error", out, uint64_t(text.size()));
+      if (!text.empty()) co_await stream->write(kj::arrayPtr(text.data(), text.size()).asBytes());
+    }
+    const kj::HttpHeaderTable& table;
+    kj::HttpHeaderId ifNoneMatch;
+  };
+
+  static void publishGate() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-publish-gate-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    kj::HttpHeaderTable::Builder builder;
+    const auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(io.provider->getTimer(), *table, store);
+    auto http = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.bucket = "b";
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    DurableLog log({"peer", "instance", temp, {}}, config, io.provider->getNetwork(), clock, *io.lowLevelProvider,
+        membership, {});
+    log.nodeEpoch = 9;
+    log.diskTrusted = true;
+    log.sameBootCache = true;
+    constexpr uint64_t EPOCH = 3;
+    auto& info = log.predecessorLogs[EPOCH];
+    info.complete = true;
+    const std::string ns(64, 'c');
+    auto id = [](int n) {
+      char out[65];
+      std::snprintf(out, sizeof(out), "%016llx%048x", (unsigned long long) n * 1024, n);
+      return std::string(out);
+    };
+    for (uint64_t sequence = 1; sequence <= 6; ++sequence) {
+      LogRecord r;
+      r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = 0; r.shardEpoch = 1;
+      r.objectName = ns + "/" + id(sequence % 2 ? 1 : 2); r.dataEpoch = 1; r.txn = sequence;
+      log.earlier[EPOCH][sequence] = r;
+      log.indexEarlierRecord({EPOCH, sequence}, r);
+      log.noteEarlierUnpublished(info, r);
+    }
+    SegmentHeader header;
+    header.nodeId = "peer"; header.nodeEpoch = EPOCH; header.segment = 1; header.firstSeq = 1; header.lastSeq = 6;
+    header.reason = "earlier-epoch";
+    auto pending = [&](const std::string& objectId) {
+      DurableTailAsk ask;
+      ask.namespaceId = ns; ask.shard = 0; ask.shardEpoch = 2; ask.ownerNodeId = "peer"; ask.ownerNodeEpoch = EPOCH;
+      ask.objectId = objectId;
+      const auto answer = log.tailFor(ask, false);
+      if (answer.refusal == "the restored owner shard still has unpublished records") return true;
+      KJ_REQUIRE(answer.refusal.empty() && answer.ownerConfirmed, "an answer is pending or an owner's empty tail",
+          answer.refusal.c_str());
+      return false;
+    };
+    // The first object's manifest create is held.
+    store.hold = id(1);
+    auto parked = kj::newPromiseAndFulfiller<void>();
+    store.parked = kj::mv(parked.fulfiller);
+    auto publishing = log.publishEarlierObject(EPOCH, header, ns + "/" + id(1) + "/1", 1).eagerlyEvaluate(nullptr);
+    parked.promise.wait(io.waitScope);
+    KJ_REQUIRE(pending(id(1)), "while its manifest write is held, a request naming the object is told there is more");
+    KJ_REQUIRE(log.earlierPublishing.contains(ns + "/" + id(1)) && log.earlier.at(EPOCH).size() == 6,
+        "a manifest being written retires nothing");
+    store.gate.fulfiller->fulfill();
+    publishing.wait(io.waitScope);
+    KJ_REQUIRE(store.written == 1 && log.earlierManifests == 1 && log.earlierPublishing.empty(), store.written);
+    KJ_REQUIRE(!pending(id(1)) && log.earlier.at(EPOCH).size() == 3, "once the manifest is written the object's tail is empty");
+    // The second object's manifest create fails.
+    store.fail = id(2);
+    log.publishEarlierObject(EPOCH, header, ns + "/" + id(2) + "/1", 1).wait(io.waitScope);
+    KJ_REQUIRE(store.failed == 1 && log.earlierManifests == 1, store.failed);
+    KJ_REQUIRE(pending(id(2)) && log.earlier.at(EPOCH).size() == 3, "a failed manifest write retires nothing");
   }
 
   static void restoredTail(bool negativeControls) {
@@ -1340,6 +1509,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
+  else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "restored-tail" || mode == "restored-tail-negative")
     coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
