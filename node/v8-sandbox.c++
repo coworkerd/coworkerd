@@ -72,6 +72,7 @@ SandboxBuildFacts parseSandboxFacts(const std::string& output, int exitStatus) {
     auto row = line.substr(at + std::strlen(ROW));
     if (field(row, "capacity") != "true") continue;
     auto groups = field(row, "groups");
+    facts.capacityMeasured = !groups.empty();
     facts.groupCapacity = groups.empty() ? 0 : std::stoull(groups);
   }
   if (!facts.probed)
@@ -226,7 +227,12 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
         : "sandbox.protectionKeys is required, but " + protectionKeysReason(keys);
   }
   if (!build.probed) {
+    // Nothing is planned: each process keeps its configured limit and V8's fallible group
+    // creation is the only line. Said loudly (r50 §6.5).
     plan.mode = "unknown";
+    plan.warning = "the V8 sandbox of the ordinary processes is unknown: the probe (coworkerd-threaded "
+        "--sandbox-facts) failed (" + build.probeError + "); each process keeps its resident limit of " +
+        std::to_string(configuredResidentLimit) + " and only V8's own refusal bounds what fits in its address space";
     return plan;
   }
   if (!build.problem.empty()) {
@@ -250,7 +256,9 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
       : machine.maxMapCount > constants.processMaps
       ? (machine.maxMapCount - constants.processMaps) / constants.mapsPerIsolate : 0;
   plan.measuredLimit = build.groupCapacity;
-  const uint64_t space = plan.measuredLimit ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
+  // A measured 0 bounds (and refuses below); only an unmeasured capacity falls back to the size.
+  const bool measured = build.capacityMeasured || build.groupCapacity > 0;
+  const uint64_t space = measured ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
   const uint64_t bound = std::min(space, plan.mapLimit) * constants.marginPercent / 100;
   if (bound == 0) {
     if (plan.refusal.empty()) {
@@ -281,7 +289,8 @@ void limitPerProcess(SandboxPlan& plan, uint32_t perProcessLimit, const SandboxP
   plan.warning = plan.lowered;
   if (perProcessLimit < constants.warnBelow) {
     const uint64_t perIsolate = plan.build.reservationBytes + constants.outsideSandboxBytes;
-    const uint64_t space = plan.measuredLimit ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
+    const bool measured = plan.build.capacityMeasured || plan.measuredLimit > 0;
+    const uint64_t space = measured ? std::min(plan.addressLimit, plan.measuredLimit) : plan.addressLimit;
     plan.warning += std::string(plan.warning.empty() ? "" : "; ") + "only " + std::to_string(perProcessLimit) +
         " Worker(s) per process fit: one isolate's V8 sandbox reserves " + std::to_string(perIsolate >> 30) +
         " GiB of address space and this machine's user address space is " +
@@ -300,7 +309,8 @@ std::string SandboxPlan::json() const {
       << ",\"errno\":" << keyFacts.error << ",\"reason\":\"" << jsonEscape(protectionKeysReason(keyFacts))
       << "\"},\"build\":{\"probed\":" << (build.probed ? "true" : "false") << ",\"v8Mode\":\"" << jsonEscape(build.mode)
       << "\",\"groupPerIsolate\":" << (build.groupPerIsolate ? "true" : "false")
-      << ",\"reservationBytes\":" << build.reservationBytes << ",\"groupCapacity\":" << build.groupCapacity;
+      << ",\"reservationBytes\":" << build.reservationBytes << ",\"capacityMeasured\":"
+      << (build.capacityMeasured ? "true" : "false") << ",\"groupCapacity\":" << build.groupCapacity;
   if (!build.probeError.empty()) out << ",\"probeError\":\"" << jsonEscape(build.probeError) << "\"";
   if (!build.problem.empty()) out << ",\"problem\":\"" << jsonEscape(build.problem) << "\"";
   out << "},\"addressSpaceBytes\":" << machine.addressSpaceBytes << ",\"maxMapCount\":" << machine.maxMapCount

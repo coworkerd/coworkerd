@@ -21,6 +21,7 @@ SandboxBuildFacts sandboxBuild() {
   build.mode = "secure";
   build.groupPerIsolate = true;
   build.reservationBytes = 136 * GiB;
+  build.capacityMeasured = true;
   build.groupCapacity = 720;  // what --sandbox-facts measured on cwkd-p40
   return build;
 }
@@ -37,8 +38,9 @@ void guardRegions() {
   KJ_REQUIRE(plan.addressLimit == 934 && plan.measuredLimit == 720 && plan.mapLimit == 10465,
       plan.addressLimit, plan.measuredLimit, plan.mapLimit);
   KJ_REQUIRE(plan.perProcessLimit == 648 && plan.residentLimit == 648, plan.perProcessLimit);
-  // Without a measurement the address space's size bounds it: 90% of 934.
+  // Without a measurement (no capacity row) the address space's size bounds it: 90% of 934.
   auto unmeasured = sandboxBuild();
+  unmeasured.capacityMeasured = false;
   unmeasured.groupCapacity = 0;
   KJ_REQUIRE(planV8Sandbox("auto", unmeasured, noKeys(), machine48(), 1840, 1).perProcessLimit == 840);
   // "off" plans the same: guard regions are this build's only mode.
@@ -126,14 +128,23 @@ void unknown() {
   const auto plan = planV8Sandbox("auto", build, noKeys(), machine48(), 1840, 1);
   KJ_REQUIRE(plan.refusal.empty() && plan.mode == "unknown" && plan.residentLimit == 1840 && plan.processes == 1);
   KJ_REQUIRE(plan.json().find("cannot run coworkerd-threaded") != std::string::npos, plan.json().c_str());
+  // Said loudly (r50 §6.5): the node prints its warning line.
+  KJ_REQUIRE(plan.warning.find("the probe (coworkerd-threaded --sandbox-facts) failed (cannot run coworkerd-threaded)") !=
+      std::string::npos, plan.warning.c_str());
 }
 
 void machineGaps() {
   // No /proc: only the probe's measurement bounds it (90% of 720).
   const auto none = planV8Sandbox("auto", sandboxBuild(), noKeys(), MachineFacts{}, 1840, 1);
   KJ_REQUIRE(none.refusal.empty() && none.residentLimit == 648, none.refusal.c_str(), none.residentLimit);
+  // A probe that measured 0 groups holds no Worker (r50 §6.5): not the theoretical 934 x 90% = 840.
+  auto none0 = sandboxBuild();
+  none0.groupCapacity = 0;
+  const auto zero = planV8Sandbox("auto", none0, noKeys(), machine48(), 1840, 1);
+  KJ_REQUIRE(zero.refusal.find("hold no Worker") != std::string::npos, zero.refusal.c_str(), zero.perProcessLimit);
   // Nothing known at all: nothing is lowered, V8's fallible groups remain.
   auto unmeasured = sandboxBuild();
+  unmeasured.capacityMeasured = false;
   unmeasured.groupCapacity = 0;
   KJ_REQUIRE(planV8Sandbox("auto", unmeasured, noKeys(), MachineFacts{}, 1840, 1).residentLimit == 1840);
   // A 39-bit arm64 kernel (512 GiB): (512 - 200) / 140 = 2 isolates, 90% of it is 1.
@@ -163,7 +174,10 @@ void parse() {
       "\"typedArrayAccessMasks\":true,\"groupPerIsolate\":true}\n[coworkerd-sandbox] {\"capacity\":true,\"groups\":721}\n";
   const auto facts = parseSandboxFacts(row, 0);
   KJ_REQUIRE(facts.probed && facts.mode == "secure" && facts.groupPerIsolate && facts.reservationBytes == 146028888064ull);
-  KJ_REQUIRE(facts.groupCapacity == 721, facts.groupCapacity);
+  KJ_REQUIRE(facts.capacityMeasured && facts.groupCapacity == 721, facts.groupCapacity);
+  KJ_REQUIRE(parseSandboxFacts(row.substr(0, row.find("[coworkerd-sandbox] {\"capacity\"")), 0).capacityMeasured == false);
+  KJ_REQUIRE(parseSandboxFacts("[coworkerd-sandbox] {\"process\":true,\"mode\":\"secure\",\"groupPerIsolate\":true}\n"
+      "[coworkerd-sandbox] {\"capacity\":true,\"groups\":0}\n", 0).capacityMeasured);
   const auto refused = parseSandboxFacts(
       "[coworkerd-sandbox] {\"process\":true,\"mode\":\"smi-accessible\",\"reservationBytes\":1,\"groupPerIsolate\":true,"
       "\"problem\":\"the first 4 GiB \\\"x\\\"\"}\nworkerd: refusing to start\n", 78);

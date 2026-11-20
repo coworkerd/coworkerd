@@ -430,7 +430,10 @@ sandbox. In the server package and the threaded server (0042): the platform rese
 gets its group first (`tryNewIsolateGroup()`: a refusal, `OVERLOADED`, when none fits), with an
 in-sandbox pool allocator reserved before any isolate (V8's default reserves on the first
 ArrayBuffer and ends the process when an earlier resizable buffer or Wasm memory left no 1 GiB);
-the memory limits allocate in that group and bound `MaxAllocationSize()` by the limit; and
+the memory limits allocate in that group and bound `MaxAllocationSize()` by the group's 2 GiB
+pool (only in this configuration: the limit itself stays with the allocators' accounting); a
+refused group is a retryable refusal that lowers the process's resident limit to the residents it
+holds; and
 `coworkerd-sandbox` refuses to start a process (exit 78, with a `sandbox-refused` row on its event
 channel) or to create a Worker whose sandbox V8 does not report as secure, whose zero segment is
 not really held, or which shares the default group, writing one `[coworkerd-sandbox]` row per

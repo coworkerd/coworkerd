@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 21 Nov 2026 02:17:53 +0800
+Date: Sat, 21 Nov 2026 02:50:56 +0800
 Subject: [PATCH] Build the V8 sandbox with one 8 GiB sandbox per isolate group
 
 --config=coworkerd-sandbox (.bazelrc) builds V8 with its sandbox, one pointer-compression cage per
@@ -21,8 +21,11 @@ What the embedder needs with that build:
 - coworkerd-sandbox (factory): tryNewIsolateGroup() creates a Worker's group first, with a pool
   allocator reserved in its sandbox before any isolate (V8's default reserves on the first
   ArrayBuffer and ends the process when no 1 GiB is left), or none when no group fits; the
-  factory and the threaded server refuse that Worker (OVERLOADED). The memory limits allocate in
-  the isolate's group and bound MaxAllocationSize() by the limit. Startup refuses (exit 78, a
+  factory and the threaded server refuse that Worker (OVERLOADED); in the threaded server the
+  refusal is retryable (not kept as the Worker's failure) and lowers the process's resident limit
+  to the residents it holds. The memory limits allocate in the isolate's group; MaxAllocationSize()
+  is the group's 2 GiB pool only with a sandbox per group (V8's own value otherwise), the limit
+  itself stays with the allocators' accounting. Startup refuses (exit 78, a
   sandbox-refused row on the event channel) and every isolate is refused unless V8 reports its
   sandbox as secure, laid out as configured, with the zero segment really held (probed) and a
   group of its own; one [coworkerd-sandbox] row per check. coworkerd-threaded --sandbox-facts
@@ -31,7 +34,8 @@ What the embedder needs with that build:
 - Tests: coworkerd-sandbox-test (layout, secure modes, groups, allocation placement, pool, zero
   segment, refusals, exhaustion, a child refused for an occupied low 4 GiB) and the threaded
   tests (four simultaneous near-GiB objects now preserve the process with a cage per isolate;
-  buffers in the Worker's own group).
+  buffers in the Worker's own group; a refused group retried and lowering the resident limit; one
+  ArrayBuffer above the memory limit ending the execution as MEMORY, with and without the sandbox).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
@@ -751,10 +755,16 @@ index 00c12e4f371aaf239fcbe0e3279e03ac68e41225..6684c1ce0df5ae7ded16cebd3b2533f3
      if (memory) memory->customize(value);
      if (gc) gc->install(value);
 diff --git a/src/workerd/server/factory/coworkerd-memory-limit.c++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
-index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..33dee2215af9af62c0ec2ac9ce0d98507b0bdeef 100644
+index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..539656f9d4b92f8a1a29ac30000658560de78831 100644
 --- a/src/workerd/server/factory/coworkerd-memory-limit.c++
 +++ b/src/workerd/server/factory/coworkerd-memory-limit.c++
-@@ -29,6 +29,17 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
+@@ -1,4 +1,5 @@
+ #include "coworkerd-memory-limit.h"
++#include "coworkerd-sandbox.h"
+ 
+ #include <kj/debug.h>
+ #include <v8-statistics.h>
+@@ -29,6 +30,17 @@ void raisePeak(std::atomic<size_t>& peak, size_t value) {
    while (old < value && !peak.compare_exchange_weak(old, value)) {}
  }
  
@@ -772,7 +782,7 @@ index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..33dee2215af9af62c0ec2ac9ce0d9850
  }  // namespace
  
  uint32_t memoryLimitFromEnvironment() {
-@@ -45,8 +56,8 @@ uint32_t memoryLimitFromEnvironment() {
+@@ -45,8 +57,8 @@ uint32_t memoryLimitFromEnvironment() {
  }
  void setLimitStateObserver(void (*observer)()) { limitStateObserver.store(observer); }
  
@@ -783,17 +793,17 @@ index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..33dee2215af9af62c0ec2ac9ce0d9850
    // Everything the fatal path needs is prepared here: the descriptor and the bare OOM row.
    if (cpuEventsDescriptor() < 0) return;
    if (!oomReportReady.load(std::memory_order_acquire)) {
-@@ -82,6 +93,8 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
+@@ -82,6 +94,8 @@ void* IsolateMemoryLimit::allocate(size_t length, Initialization initialization)
  }
  void* IsolateMemoryLimit::Allocate(size_t length) { return allocate(length, Initialization::ZERO); }
  void* IsolateMemoryLimit::AllocateUninitialized(size_t length) { return allocate(length, Initialization::UNINITIALIZED); }
-+size_t IsolateMemoryLimit::MaxAllocationSize() const { return std::min<size_t>(limitBytes, inner->MaxAllocationSize()); }
++size_t IsolateMemoryLimit::MaxAllocationSize() const { return sandboxMaxAllocationSize(inner->MaxAllocationSize()); }
 +v8::PageAllocator* IsolateMemoryLimit::GetPageAllocator() { return inner->GetPageAllocator(); }
  void IsolateMemoryLimit::Free(void* address, size_t length) { inner->Free(address, length); bufferBytes.fetch_sub(length); release(length); }
  
  void IsolateMemoryLimit::customize(v8::Isolate* value) {
 diff --git a/src/workerd/server/factory/coworkerd-memory-limit.h b/src/workerd/server/factory/coworkerd-memory-limit.h
-index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..5034d6368c4f97228e36b27f47ad4dfb1657a563 100644
+index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..95a535be3d6d098e2d0b31738c25b2915c92e07c 100644
 --- a/src/workerd/server/factory/coworkerd-memory-limit.h
 +++ b/src/workerd/server/factory/coworkerd-memory-limit.h
 @@ -23,14 +23,22 @@ struct MemoryExecution {
@@ -812,9 +822,9 @@ index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..5034d6368c4f97228e36b27f47ad4dfb
    void* Allocate(size_t length) override;
    void* AllocateUninitialized(size_t length) override;
    void Free(void* address, size_t length) override;
-+  // No single buffer, and no resizable buffer's reservation, beyond the limit: V8 refuses those
-+  // before reserving anything (otherwise its default is 32 GiB, and a resizable ArrayBuffer could
-+  // reserve the whole buffer half of an 8 GiB sandbox).
++  // sandboxMaxAllocationSize(): with a V8 sandbox per isolate group, no single buffer and no
++  // resizable buffer's reservation beyond the group's pool (V8's default is 32 GiB, more than the
++  // buffer half of an 8 GiB sandbox); the limit itself stays with allocate() (r50 §6.5 B2).
 +  size_t MaxAllocationSize() const override;
 +  v8::PageAllocator* GetPageAllocator() override;
    void customize(v8::Isolate* isolate);
@@ -830,10 +840,10 @@ index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..5034d6368c4f97228e36b27f47ad4dfb
  };
 diff --git a/src/workerd/server/factory/coworkerd-sandbox-test.c++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bb63d32a73b4856b8ec1ff4ea54b72cd8d4feec
+index 0000000000000000000000000000000000000000..a1e8b500578ac87ba1095b34c588b8f407f7fb42
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,372 @@
 +// The V8 sandbox in Coworkerd's build (--config=coworkerd-sandbox): its layout, V8's secure mode
 +// for the process and for every isolate group, and the two places where the embedder must place
 +// bytes in the right group's sandbox.
@@ -974,6 +984,9 @@ index 0000000000000000000000000000000000000000..4bb63d32a73b4856b8ec1ff4ea54b72c
 +  KJ_EXPECT(group.SandboxContains(store->Data()));
 +  KJ_EXPECT(!other.SandboxContains(store->Data()));
 +  KJ_EXPECT(limit->bufferBytes.load() >= size_t(1) << 20);
++  // V8's maximum is the group's pool, not the 64 MiB limit, which allocate() enforces itself
++  // (r50 §6.5 B2).
++  KJ_EXPECT(limit->MaxAllocationSize() == SANDBOX_POOL_BYTES);
 +}
 +
 +KJ_TEST("a byte view of an ArrayBuffer decodes to the same bytes in its isolate's sandbox") {
@@ -1205,10 +1218,10 @@ index 0000000000000000000000000000000000000000..4bb63d32a73b4856b8ec1ff4ea54b72c
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-sandbox.c++ b/src/workerd/server/factory/coworkerd-sandbox.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..f67a2d7f0170f792ed72d99dd0d0d9898cee22a7
+index 0000000000000000000000000000000000000000..586fcef2b332b6ddd923d5c1c1779759cddeb1e9
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-sandbox.c++
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,399 @@
 +#include "coworkerd-sandbox.h"
 +
 +#include <kj/debug.h>
@@ -1552,6 +1565,13 @@ index 0000000000000000000000000000000000000000..f67a2d7f0170f792ed72d99dd0d0d989
 +#endif
 +}
 +
++size_t sandboxMaxAllocationSize(size_t inner) {
++#ifdef V8_ENABLE_SANDBOX
++  if (v8::IsolateGroup::CanCreateNewGroups()) return std::min(inner, SANDBOX_POOL_BYTES);
++#endif
++  return inner;
++}
++
 +size_t measureGroupCapacity(size_t limit) {
 +  if (!v8::IsolateGroup::CanCreateNewGroups()) return 0;
 +  kj::Vector<v8::IsolateGroup> groups;
@@ -1603,10 +1623,10 @@ index 0000000000000000000000000000000000000000..f67a2d7f0170f792ed72d99dd0d0d989
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-sandbox.h b/src/workerd/server/factory/coworkerd-sandbox.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..122dbbf7ad2cc1556d0592cbea750258e2a91270
+index 0000000000000000000000000000000000000000..2b5bee3f673d3787475297412fa7a37d7532616e
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-sandbox.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,85 @@
 +#pragma once
 +
 +#include <kj/common.h>
@@ -1672,6 +1692,13 @@ index 0000000000000000000000000000000000000000..122dbbf7ad2cc1556d0592cbea750258
 +// null from Allocate() instead of ending the process when the pool is full. None when no pool fits.
 +std::shared_ptr<v8::Allocator> newSandboxPoolAllocator(v8::VirtualAddressSpace& space);
 +constexpr size_t SANDBOX_POOL_BYTES = size_t(2) << 30;
++
++// MaxAllocationSize() for the ArrayBuffer allocator of an isolate (`inner`: V8's own allocator's).
++// With a V8 sandbox per isolate group no buffer can be larger than the group's pool, so V8 refuses
++// one above SANDBOX_POOL_BYTES before reserving anything; otherwise, and in a build without the
++// sandbox, V8's own value. Never the Worker's memory limit: a buffer above it still reaches the
++// allocator, which ends the execution with the limit's own cause (r50 §6.5 B2).
++size_t sandboxMaxAllocationSize(size_t inner);
 +
 +// How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
 +// refuses, then releases them. V8 places each sandbox at a random address, so the address space
@@ -1871,7 +1898,7 @@ index 2cac73c8b6ef474222a22f760dac058fdd3d932a..a9ea7a312afd18d6ffb1307c2c8372e3
      malloc = "//src/workerd/server:malloc",
      target_compatible_with = ["@platforms//os:linux"],
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c98b22e637 100644
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce7fef0322 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -27,6 +27,17 @@ void initializeV8() {
@@ -1936,7 +1963,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    v8::Locker locker(isolate);
    v8::Isolate::Scope entered(isolate);
    v8::HandleScope handles(isolate);
-@@ -340,6 +351,27 @@ void allocationComponent(kj::StringPtr code) {
+@@ -340,6 +351,86 @@ void allocationComponent(kj::StringPtr code) {
    checkNeighbor();
  }
  
@@ -1957,14 +1984,73 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
 +  auto store = v8::ArrayBuffer::NewBackingStore(isolate, 1 << 20);
 +  KJ_EXPECT(limits.group.SandboxContains(store->Data()));
 +  KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
-+  // A buffer above the Worker's limit is refused before anything is reserved.
-+  KJ_EXPECT(limits.memory->MaxAllocationSize() == (32ull << 20));
++  // V8 refuses a buffer above the group's pool before reserving anything; the Worker's own limit
++  // (32 MiB here) is not V8's maximum (r50 §6.5 B2: the next test).
++  if (v8::IsolateGroup::CanCreateNewGroups()) {
++    KJ_EXPECT(limits.memory->MaxAllocationSize() == server::SANDBOX_POOL_BYTES);
++  } else {
++    KJ_EXPECT(limits.memory->MaxAllocationSize() > (32ull << 20));
++  }
++}
++
++KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIMIT_EXCEEDED") {
++  // With or without the V8 sandbox: the buffer reaches the budget, which marks MEMORY and ends
++  // the execution, never a RangeError the Worker could catch (r50 §6.5 B2).
++  allocationComponent(
++      "try { globalThis.retained = new ArrayBuffer(64 * 1024 * 1024); } catch (e) { globalThis.caught = e; }");
++}
++
++KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") {
++  // compile() throws capacityError() when tryNewIsolateGroup() refuses (no room in the address
++  // space for another V8 sandbox). Kept in the slot, every request for that Worker answered 503
++  // in this process until the slot idled out (r50 §6.5 B1).
++  kj::Maybe<kj::Exception> refused = capacityError();
++  KJ_EXPECT(loadFailureRetryable(refused, true, false));
++  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(refused)));
++  // A tenant's own failure stays the Worker's failure, unless the source was never fetched.
++  kj::Maybe<kj::Exception> script = KJ_EXCEPTION(FAILED, "jsg.Error: the Worker's script threw");
++  KJ_EXPECT(!loadFailureRetryable(script, true, false));
++  KJ_EXPECT(loadFailureRetryable(script, false, false));
++  kj::Maybe<kj::Exception> canceled = KJ_EXCEPTION(DISCONNECTED, "canceled before publication");
++  KJ_EXPECT(loadFailureRetryable(canceled, true, false));
++  // Memory pressure at startup becomes a capacity refusal, even of a load that succeeded.
++  kj::Maybe<kj::Exception> loaded;
++  KJ_EXPECT(!loadFailureRetryable(loaded, true, false) && loaded == kj::none);
++  KJ_EXPECT(loadFailureRetryable(loaded, true, true));
++  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(loaded)));
++}
++
++KJ_TEST("a refused isolate group lowers the process's resident limit to its residents") {
++  // r50 §6.5 B3: the next Worker then evicts an idle one instead of being refused again.
++  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 1840, 1);
++  std::vector<std::shared_ptr<ResourceReservation>> residents;
++  for (int i = 0; i < 4; i++) {
++    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
++    KJ_ASSERT(residents.back()->registerPreparation());
++  }
++  // The fourth one's group was refused: three residents besides it.
++  noSandboxRoom(*budget);
++  KJ_EXPECT(budget->residentMaximum.load() == 3 && budget->configuredResidentMaximum == 1840,
++      budget->residentMaximum.load());
++  residents.pop_back();
++  auto next = std::make_shared<ResourceReservation>(budget, 32);
++  KJ_EXPECT(!next->registerPreparation());
++  // Lowered again to fewer residents, never raised back.
++  residents.pop_back();
++  noSandboxRoom(*budget);
++  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
++  for (int i = 0; i < 2; i++) {
++    residents.push_back(std::make_shared<ResourceReservation>(budget, 32));
++    (void)residents.back()->registerPreparation();
++  }
++  noSandboxRoom(*budget);
++  KJ_EXPECT(budget->residentMaximum.load() == 1, budget->residentMaximum.load());
 +}
 +
  KJ_TEST("single large heap allocation preserves the process") {
    allocationComponent("globalThis.retained = new Array(12*1024*1024).fill(7)");
  }
-@@ -398,9 +430,9 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -398,9 +489,9 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
      auto reservation = std::make_shared<ResourceReservation>(budget, 128);
      KJ_ASSERT(reservation->registerPreparation());
      limits.push_back(kj::refcounted<IsolateLimits>(
@@ -1977,7 +2063,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    }
    KJ_DEFER(for (auto* isolate : isolates) isolate->Dispose());
    // No resident is idle during this test. Wake growers just as a maintenance
-@@ -418,10 +450,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -418,10 +509,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
    auto neighborReservation = std::make_shared<ResourceReservation>(budget, 128);
    KJ_ASSERT(neighborReservation->registerPreparation());
    IsolateLimits neighborLimits(
@@ -1991,7 +2077,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    auto runNeighbor = [&](kj::StringPtr code, int32_t expected) {
      v8::Locker lock(neighbor);
      v8::Isolate::Scope scope(neighbor);
-@@ -607,17 +639,22 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
+@@ -607,17 +698,22 @@ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker
    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
  }
  
@@ -2021,7 +2107,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    // The OOM row names the execution whose allocation failed and carries its
    // isolate's heap: far below that Worker's 128 MiB limit, because the other
    // isolates filled the shared cage. The node must not blame it.
-@@ -740,14 +777,14 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
+@@ -740,14 +836,14 @@ KJ_TEST("validation reports retain the original JavaScript exception") {
  
  KJ_TEST("source JSON failures preserve the actual Worker decoder exception") {
    initializeV8();
@@ -2038,7 +2124,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    KJ_EXPECT(sourceJsonFailure("{}", valid) == kj::none);
  }
  
-@@ -778,7 +815,7 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
+@@ -778,7 +874,7 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
    auto lagging = kj::systemPreciseMonotonicClock().now() - 5 * kj::SECONDS;
    kj::TimerImpl clock(lagging);
    Timer timer(clock);
@@ -2048,7 +2134,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..faf55b2da1b5e5ee5d9839564a6092c9
    slot.limits = &isolateLimits;
    Measurement measurement;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546ed510560 100644
+index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..612036c54c1437e0981dc5da39318f7f9347f1f4 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -19,6 +19,7 @@
@@ -2059,7 +2145,12 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
  #include <workerd/server/factory/coworkerd-steady.h>
  #include <workerd/server/v8-platform-impl.h>
  #include <workerd/server/workerd-api.h>
-@@ -256,8 +257,11 @@ struct ResourceBudget {
+@@ -252,15 +253,24 @@ struct ResourceBudget {
+                 ? UINT64_MAX
+                 : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
+         baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
++        configuredResidentMaximum(residents),
+         residentMaximum(residents),
          memoryReserved(baselineMemory) {
      KJ_REQUIRE(admissionMaximum > baselineMemory + 2 * MiB,
          "native thread budget leaves no memory for an active Worker");
@@ -2072,24 +2163,81 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
 +        "invalid resident budget for this build");
    }
    const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
-   const uint32_t residentMaximum;
-@@ -456,6 +460,15 @@ struct ResourcePreparation {
+-  const uint32_t residentMaximum;
++  // The node's per-process limit, and the one in force: the first time the address space has no
++  // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
++  // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
++  // being refused again.
++  const uint32_t configuredResidentMaximum;
++  std::atomic<uint32_t> residentMaximum;
+   std::mutex mutex;
+   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
+   std::atomic<uint32_t> residents{0};
+@@ -380,7 +390,7 @@ struct ResourceReservation {
+   }
+   bool registerPreparation() {
+     std::lock_guard lock(mutex);
+-    if (budget->residents.fetch_add(1) >= budget->residentMaximum) {
++    if (budget->residents.fetch_add(1) >= budget->residentMaximum.load()) {
+       budget->residents.fetch_sub(1);
+       return false;
+     }
+@@ -456,8 +466,31 @@ struct ResourcePreparation {
    std::shared_ptr<ResourceReservation> reservation;
  };
  
 +// Workers refused because the address space had no room for another isolate's V8 sandbox
-+// (tryNewIsolateGroup()); one [coworkerd-sandbox] row each.
++// (tryNewIsolateGroup()); one [coworkerd-sandbox] row each. The refused Worker is not resident:
++// the process's resident limit is lowered to the residents besides it (never raised again), and
++// the row says so.
 +std::atomic<uint64_t> sandboxRefusals{0};
-+void noSandboxRoom() {
++void noSandboxRoom(ResourceBudget &budget) {
 +  auto refusals = sandboxRefusals.fetch_add(1) + 1;
-+  fprintf(stderr, "[coworkerd-sandbox] {\"event\":\"group-refused\",\"refusals\":%llu}\n",
-+      static_cast<unsigned long long>(refusals));
++  // The refused Worker was counted when its load registered.
++  const uint32_t residents = budget.residents.load();
++  const uint32_t others = residents > 1 ? residents - 1 : 1;
++  auto previous = budget.residentMaximum.load();
++  while (others < previous && !budget.residentMaximum.compare_exchange_weak(previous, others)) {
++  }
++  fprintf(stderr,
++      "[coworkerd-sandbox] {\"event\":\"group-refused\",\"refusals\":%llu,\"residents\":%u,"
++      "\"residentMaximum\":%u,\"configuredResidentMaximum\":%u}\n",
++      static_cast<unsigned long long>(refusals), residents > 0 ? residents - 1 : 0,
++      budget.residentMaximum.load(), budget.configuredResidentMaximum);
 +}
 +
  constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
  enum class CapacityScope { PROCESS, TENANT };
++bool isCapacityError(const kj::Exception &error) {
++  return error.getDetail(CAPACITY_DETAIL) != kj::none;
++}
  kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
-@@ -603,20 +616,44 @@ bool writeLimitRow(kj::StringPtr event,
+   const auto tenant = scope == CapacityScope::TENANT;
+   auto error = jsg::tagCoworkerdRpcError(tenant
+@@ -471,6 +504,22 @@ kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
+   return error;
+ }
+ 
++// Whether a finished load's failure stays out of the registry, so that the next request loads
++// the Worker again instead of receiving this failure: one before the source was fetched, a caller
++// failure (DISCONNECTED), memory pressure at startup (which becomes capacityError()), and any
++// capacity refusal -- in particular no room for another isolate's V8 sandbox. Kept, a refused
++// group answered 503 for this Worker in this process until its slot idled out (r50 §6.5 B1).
++// A tenant's own failure (its script throws, a binding is invalid) stays the Worker's failure.
++bool loadFailureRetryable(kj::Maybe<kj::Exception> &error, bool fetched, bool memoryPressure) {
++  if (memoryPressure) error = capacityError();
++  bool retryable = !fetched || memoryPressure;
++  KJ_IF_SOME(failure, error) {
++    retryable = retryable || failure.getType() == kj::Exception::Type::DISCONNECTED ||
++        isCapacityError(failure);
++  }
++  return retryable;
++}
++
+ struct TenantBudget {
+   explicit TenantBudget(uint32_t limit): limit(limit) {
+     KJ_REQUIRE(limit <= 16384, "invalid per-tenant in-flight limit");
+@@ -603,20 +652,46 @@ bool writeLimitRow(kj::StringPtr event,
    _exit(74);
  }
  
@@ -2119,10 +2267,12 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
    ~MemoryBudget() noexcept override {
      delete inner;
    }
-+  // No single buffer, and no resizable buffer's reservation, beyond the Worker's limit (V8's
-+  // default is 32 GiB, more than the buffer half of an 8 GiB sandbox).
++  // With a V8 sandbox per isolate group, no single buffer and no resizable buffer's reservation
++  // beyond the group's pool (V8's default is 32 GiB, more than the buffer half of an 8 GiB
++  // sandbox). Not the Worker's limit: a buffer above it reaches reserve(), which marks MEMORY and
++  // ends the execution (r50 §6.5 B2).
 +  size_t MaxAllocationSize() const override {
-+    return std::min<size_t>(maximum, inner->MaxAllocationSize());
++    return server::sandboxMaxAllocationSize(inner->MaxAllocationSize());
 +  }
 +  v8::PageAllocator *GetPageAllocator() override {
 +    return inner->GetPageAllocator();
@@ -2136,7 +2286,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
    v8::ArrayBuffer::Allocator *inner;
    v8::Isolate *isolate = nullptr;
    std::atomic<bool> pendingPressure{false};
-@@ -896,17 +933,23 @@ struct CpuExecution {
+@@ -896,17 +971,23 @@ struct CpuExecution {
  };
  
  struct IsolateLimits final: IsolateLimitEnforcer {
@@ -2163,7 +2313,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
    LimitState memoryState = std::make_shared<std::atomic<LimitCause>>(LimitCause::NONE);
    std::shared_ptr<MemoryBudget> memory;
    mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
-@@ -921,7 +964,10 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -921,7 +1002,10 @@ struct IsolateLimits final: IsolateLimitEnforcer {
      }
      return params;
    }
@@ -2174,7 +2324,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
      if (memory) memory->install(value);
    }
    ActorCacheSharedLruOptions getActorCacheLruOptions() override {
-@@ -1333,11 +1379,11 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
+@@ -1333,11 +1417,11 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
    // rejected the source response. Its temporary validation isolate belongs
    // to this load and uses its CPU, heap and process reservation.
    OomReportScope oom(limits.identity, limits.memoryMiB, limits.memory ? &limits.memory->heap : nullptr);
@@ -2188,7 +2338,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
    v8::HandleScope handles(isolate);
    auto context = v8::Context::New(isolate);
    v8::Context::Scope inContext(context);
-@@ -1732,6 +1778,8 @@ struct ThreadedServer {
+@@ -1732,6 +1816,8 @@ struct ThreadedServer {
              configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
          subrequestBudget(limit, tenantBudget->limit) {
      KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
@@ -2197,20 +2347,23 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
      resources->reclaimWake = managerWake;
      server::coworkerdServing();
      fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
-@@ -1809,6 +1857,7 @@ struct ThreadedServer {
+@@ -1808,7 +1894,10 @@ struct ThreadedServer {
+         ",\"addressBytes\":" + std::to_string(resources->addressReserved.load()) +
          ",\"addressMaximum\":" + std::to_string(resources->addressMaximum) +
          ",\"residents\":" + std::to_string(resources->residents.load()) +
++        ",\"residentMaximum\":" + std::to_string(resources->residentMaximum.load()) +
++        ",\"configuredResidentMaximum\":" + std::to_string(resources->configuredResidentMaximum) +
          ",\"rejected\":" + std::to_string(resources->rejections.load()) +
 +        ",\"sandboxRefused\":" + std::to_string(sandboxRefusals.load()) +
          ",\"evicted\":" + std::to_string(resources->evictions.load()) +
          ",\"tenantRejected\":" + std::to_string(tenantBudget->rejected.load()) +
          ",\"limitRowsDropped\":" + std::to_string(limitRowsDropped.load()) + "}}";
-@@ -2168,9 +2217,14 @@ struct ThreadedServer {
+@@ -2168,9 +2257,14 @@ struct ThreadedServer {
      try {
        source = std::make_unique<JsonDoc>(content);
      } catch (kj::Exception &error) {
 +      auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
-+        noSandboxRoom();
++        noSandboxRoom(*resources);
 +        kj::throwFatalException(capacityError());
 +      });
        IsolateLimits limits(workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
@@ -2221,14 +2374,14 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
        isolateCreationAttempts.fetch_add(1);
        KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
          kj::throwRecoverableException(
-@@ -2248,16 +2302,22 @@ struct ThreadedServer {
+@@ -2248,16 +2342,22 @@ struct ThreadedServer {
          ",\"versionId\":", encode(field(descriptor, "versionId")),
          ",\"invocationId\":", encode(field(descriptor, "invocationId")), ",\"isolate\":\"",
          slot.isolateLabel.c_str(), "\",");
 +    // With a V8 sandbox per isolate, an address space without room for another one refuses this
 +    // Worker (the node's per-process limit normally refuses first), never ends the process.
 +    auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
-+      noSandboxRoom();
++      noSandboxRoom(*resources);
 +      kj::throwFatalException(capacityError());
 +    });
      auto limits = kj::refcounted<IsolateLimits>(
@@ -2246,7 +2399,28 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..7c913ffb8afa66444a4833a88d699546
      const api::pyodide::PythonConfig python{
        .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
      auto api = kj::heap<server::WorkerdApi>(v8, flags.asReader(),
-@@ -3840,6 +3900,19 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -2525,17 +2625,10 @@ struct ThreadedServer {
+           error.setDetail(LOAD_STAGE_DETAIL, kj::mv(stage));
+           slot->error = kj::mv(error);
+         }
+-        bool callerFailure = false;
+-        KJ_IF_SOME(error, slot->error) {
+-          callerFailure = error.getType() == kj::Exception::Type::DISCONNECTED;
+-        }
+-        if (slot->limits &&
++        const bool pressure = slot->limits &&
+             (slot->limits->startupCause.load() == LimitCause::PROCESS_MEMORY ||
+-                slot->limits->memory->pendingPressure.load())) {
+-          slot->error = capacityError();
+-          callerFailure = true;
+-        }
+-        if (!fetched || callerFailure) {
++                slot->limits->memory->pendingPressure.load());
++        if (loadFailureRetryable(slot->error, fetched, pressure)) {
+           slot->retryableLoad.store(true);
+           remove();
+         }
+@@ -3840,6 +3933,19 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
  
  int main(int argc, char **argv) {
    using namespace workerd;

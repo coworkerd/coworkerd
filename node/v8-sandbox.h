@@ -20,9 +20,10 @@ struct SandboxBuildFacts {
   std::string mode;             // V8's mode on this machine ("secure", ...); "off" without the sandbox
   bool groupPerIsolate = false;
   uint64_t reservationBytes = 0;  // one isolate's sandbox with its guard regions
-  // How many isolate groups the probe process could create before V8 refused (0: not measured).
-  // V8 places sandboxes at random addresses, so about three quarters of the address space's
-  // share fit (random sequential packing).
+  // How many isolate groups the probe process could create before V8 refused, when it measured
+  // (its capacity row); a measured 0 holds no Worker. V8 places sandboxes at random addresses, so
+  // about three quarters of the address space's share fit (random sequential packing).
+  bool capacityMeasured = false;
   uint64_t groupCapacity = 0;
   std::string problem;          // the binary refuses to start here (exit 78) and says why
 };
