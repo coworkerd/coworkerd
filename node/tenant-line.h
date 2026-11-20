@@ -88,12 +88,14 @@ inline size_t jsonTextCut(std::string_view text, size_t limit) {
   return at;
 }
 // What the drainer keeps of a line's message: at most maxLineBytes of its JSON text, cut between two characters; the
-// line is marked truncated when that cut something or its server had already (then with its full size).
+// line is marked truncated when that cut something or its server had already (then with its full size). A server
+// sends messageBytes only for a message it cut, so its presence is the mark: its value counts raw bytes, which can be
+// fewer than the escaped text kept (v138 §8.5).
 struct TenantLineKeep { size_t bytes; bool truncated; uint64_t messageBytes; };
 inline TenantLineKeep tenantLineKeep(const TenantLine& line, size_t maxLineBytes) {
   const auto size = line.message.size();
   const auto bytes = size > maxLineBytes ? jsonTextCut(line.message, maxLineBytes) : size;
-  const bool earlier = line.messageBytes > size;
+  const bool earlier = line.messageBytes > 0;
   return {bytes, bytes < size || earlier, earlier ? line.messageBytes : uint64_t(size)};
 }
 

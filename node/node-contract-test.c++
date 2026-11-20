@@ -217,6 +217,14 @@ void tenantLineTruncation() {
   KJ_REQUIRE(line.has_value() && line->messageBytes == 0);
   keep = tenantLineKeep(*line, 4096);
   KJ_REQUIRE(keep.truncated && keep.bytes == 4096 && keep.messageBytes == 5000);
+  // A message of 4,096 quotes its server cut from 5,000 raw bytes: escaped, the text kept is 8,192 bytes, more than the
+  // raw size; under a drainer limit above it the line is still marked, with the raw size its server sent.
+  std::string quotes;
+  for (int at = 0; at < 4096; ++at) quotes += "\\\"";
+  line = parse(tenantLineText("acme/noisy", "v1", "log", quotes, 5000));
+  KJ_REQUIRE(line.has_value() && line->message.size() == 8192 && line->messageBytes == 5000);
+  keep = tenantLineKeep(*line, 1 << 20);
+  KJ_REQUIRE(keep.truncated && keep.bytes == 8192 && keep.messageBytes == 5000, keep.messageBytes);
   line = parse(tenantLineText("acme/quiet", "v1", "info", "hello"));
   KJ_REQUIRE(line.has_value() && !tenantLineKeep(*line, 4096).truncated && tenantLineKeep(*line, 4096).bytes == 5);
   KJ_REQUIRE(!parseTenantLine("{\"workerId\":\"acme/quiet\",\"versionId\":\"v1\",\"level\":\"info\",\"message\":\"x\",\"messageBytes\":}").has_value());
