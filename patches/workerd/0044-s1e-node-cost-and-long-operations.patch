@@ -397,7 +397,7 @@ index 0000000000000000000000000000000000000000..ea862c0d6fe68abfcef1b1f08a4df9ca
 + 
 +       if (element == TheHole) {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38bf9f82211 100644
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..d2077a8516d966b02dcb3c30fa692b4c39d01205 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -153,6 +153,34 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
@@ -483,7 +483,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
  KJ_TEST("CPU remaining budget, previous CPU, nested attribution and late termination") {
    initializeV8();
    IsolateLimits limits(100, 32, kj::str("\"workerId\":\"a/cpu\","), nullptr);
-@@ -379,6 +441,117 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -379,6 +441,118 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
      "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
      "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
  
@@ -536,7 +536,8 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
 +    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**26) + '1]', (k, v) => v); retained.length"_kj;
 +constexpr kj::StringPtr JSON_PROPERTIES =
 +    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}'); 1"_kj;
-+// The same object with a reviver takes the iterative parser and its own check.
++// The same object with a reviver takes the iterative parser and its own check. Both must throw the RangeError:
++// without the limit the repeated key collapses into one property and the parse completes.
 +constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
 +    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
 +// The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
@@ -601,7 +602,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
  // `count` isolates allocate at the same moment while a neighbor isolate keeps
  // answering. Every heap of this build shares one pointer cage.
  // `raised`: whether each isolate's ceiling must have been raised by the
-@@ -387,18 +560,21 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+@@ -387,18 +561,21 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
  // shapes never need the callback; only an object V8 placed without a
  // collection (the 500 MB young one) does. Without this check the callback
  // would hide a missing reserve.
@@ -629,7 +630,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
      isolates.push_back(v8::Isolate::New(jsg::newIsolateGroup(), limits[i]->getCreateParams()));
      limits[i]->customizeIsolate(isolates[i]);
    }
-@@ -457,16 +633,32 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -457,16 +634,32 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
        v8::HandleScope handles(isolate);
        auto context = v8::Context::New(isolate);
        v8::Context::Scope entered(context);
@@ -664,7 +665,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
        completed.arrive_and_wait();
        release.arrive_and_wait();
        caught.Reset();
-@@ -485,7 +677,13 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+@@ -485,7 +678,13 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
    release.arrive_and_wait();
    for (auto& worker: workers) worker.join();
    for (size_t i = 0; i < count; ++i) {
@@ -679,7 +680,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
      const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
      if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
      fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
-@@ -501,20 +699,73 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
+@@ -501,20 +700,73 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
    auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
    if (selected == nullptr) return;
    kj::StringPtr spec(selected);
@@ -726,8 +727,8 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
 +    {"replace-all"_kj, REPLACE_ALL, -1, Outcome::MEMORY},
 +    {"json-mixed"_kj, JSON_MIXED, -1, Outcome::MEMORY_OR_RANGE},
 +    {"json-reviver"_kj, JSON_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
-+    {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::MEMORY_OR_RANGE},
-+    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::MEMORY_OR_RANGE},
++    {"json-properties"_kj, JSON_PROPERTIES, -1, Outcome::RANGE},
++    {"json-properties-reviver"_kj, JSON_PROPERTIES_REVIVER, -1, Outcome::RANGE},
 +    {"cpu-json-numbers"_kj, CPU_JSON_NUMBERS, -1, Outcome::CPU, cpu},
 +    {"cpu-json-slow"_kj, CPU_JSON_SLOW, -1, Outcome::CPU, cpu},
 +    {"cpu-json-reviver"_kj, CPU_JSON_REVIVER, -1, Outcome::CPU, cpu},
@@ -765,7 +766,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
    fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
    fflush(stdout);
  }
-@@ -601,6 +852,123 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
+@@ -601,6 +853,123 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
    KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
  }
  
@@ -889,7 +890,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..997dc04d1550eee93972ed99ce35c38b
  KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
    auto child = runAllocationChild("1:string");
    KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
-@@ -802,6 +1170,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
+@@ -802,6 +1171,37 @@ KJ_TEST("waitUntil drain outlives child-call authority and ends 30 seconds after
    if (ended) drain.wait(waitScope);
  }
  
