@@ -233,7 +233,7 @@ void memoryEvents() {
   const int fd = mkstemp(path);
   KJ_REQUIRE(fd >= 0);
   const std::string first = "low 0\noom_kill 3\n";
-  KJ_REQUIRE(write(fd, first.data(), first.size()) == ssize_t(first.size()));
+  KJ_REQUIRE(::write(fd, first.data(), first.size()) == ssize_t(first.size()));
   MemoryEventsReader reader(path);
   KJ_REQUIRE(reader.oomKills() == 3);
   KJ_REQUIRE(unlink(path) == 0);
