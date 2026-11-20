@@ -44,23 +44,61 @@ constexpr double SECRET_RELEASE_GRACE_MS = 60000;
 constexpr uint32_t LOG_LINE_STALE_MS = 50000;
 static_assert(LOG_LINE_STALE_MS + 10000 <= SECRET_RELEASE_GRACE_MS);
 
+// The longest needle the shared dictionary takes: a secret value is at most 5 KiB, its JSON-escaped form at most
+// six times that.
+constexpr size_t PLATFORM_LOG_NEEDLE_MAX_BYTES = 65535;
+#define COWORKERD_CLEANER_AUTOMATON 1
+
+// Every needle at once (Aho-Corasick): one step per byte of output whatever the number of needles, where one
+// search per needle (KMP) took a step per byte per needle (v137 section 6.25, v138 section 4). Nodes are laid out
+// so that a needle's own continuation is the next node; only branch points keep a list of further children.
+class NeedleAutomaton {
+public:
+  void build(const std::vector<std::string_view>& needles);
+  // The state after one more byte, from a state (0 is the start).
+  uint32_t step(uint32_t state, uint8_t byte) const;
+  // How many bytes of input the state stands for (the longest held prefix of a needle), and the longest needle
+  // that ends where the state stands (0: none).
+  uint16_t depth(uint32_t state) const { return nodeDepth[state]; }
+  uint16_t match(uint32_t state) const { return nodeMatch[state]; }
+  size_t patterns() const { return count; }
+  size_t bytes() const;  // memory held
+private:
+  uint32_t child(uint32_t node, uint8_t byte) const;
+  std::vector<uint8_t> label;          // the byte on the edge into the node
+  std::vector<uint32_t> fail, extra;   // extra: bit 31 = the next node is a child; the rest = 1 + a branch index
+  std::vector<uint16_t> nodeDepth, nodeMatch;
+  std::vector<std::pair<uint32_t, uint32_t>> branches;  // (first, count) into edges, sorted by byte
+  std::vector<std::pair<uint8_t, uint32_t>> edges;
+  uint32_t root[256] = {};
+  size_t count = 0;
+};
+
 // Used only by the log writers, never by the pipe reader or request threads.
-// Keep possible secret prefixes across records, pipe chunks and newlines.
+// Keep possible secret prefixes across records, pipe chunks and newlines. The needles are two automata: those of
+// the last full load, and those appended since (rebuilt with every addition, merged into the first once they
+// reach a quarter of it), so an addition never rebuilds the whole dictionary.
 class PlatformLogCleaner {
 public:
   std::string append(std::string_view input, bool final = false);
   bool suppressed() const { return blocked; }
+  // Readings: the needles held and the memory of their automata.
+  size_t patterns() const { return main.patterns() + recent.patterns(); }
+  size_t automatonBytes() const { return main.bytes() + recent.bytes(); }
 private:
   bool refresh();
-  void addNeedle(std::string needle);
-  void scan(size_t pattern, size_t begin);
+  void rebuildRecent();
+  void rebuildMain();
+  void scan(const NeedleAutomaton& automaton, uint32_t& state, size_t begin);
   uint64_t generation = UINT64_MAX;
   size_t consumed = 0;
-  std::vector<std::string> needles;
+  std::vector<std::string> needles;   // all of them: the first `mainCount` built into `main`, the rest into `recent`
+  size_t mainCount = 0, mainBytes = 0, recentBytes = 0;
+  NeedleAutomaton main, recent;
+  uint32_t mainState = 0, recentState = 0;
   std::string pending;
-  std::vector<std::vector<uint32_t>> failures;
-  std::vector<size_t> states;
   std::vector<uint8_t> marks;
+  size_t markedFrom = 0, markedTo = 0;  // the marked run the last match extended, [from, to)
   bool emittingRedaction = false;
   bool blocked = false;
   bool rescanAll = false;

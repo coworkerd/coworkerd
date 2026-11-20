@@ -186,6 +186,7 @@ set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/wo
   CACHE FILEPATH "Built workerd for the real Worker diagnostic redaction test")
 add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
 add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
+add_test(NAME node-log-many-values-equivalence COMMAND coworkerd-log-cleaning-test many-values-equivalence)
 add_test(NAME node-log-generations COMMAND coworkerd-log-cleaning-test generations)
 add_test(NAME node-secret-rotations COMMAND coworkerd-log-cleaning-test secret-rotations)
 add_test(NAME node-secret-limits COMMAND coworkerd-log-cleaning-test secret-limits)

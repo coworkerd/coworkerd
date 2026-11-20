@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
+#include <tuple>
+#include <kj/debug.h>
 #include <unordered_set>
 #include <unistd.h>
 
@@ -87,7 +89,7 @@ bool appendPlatformLogRedactions(const std::vector<std::string>& needles) {
   size_t bytes = 0;
   for (const auto& needle : needles) {
     if (needle.empty() || owner.active.contains(needle) || !batch.insert(needle).second) continue;
-    if (needle.size() > UINT32_MAX) return false;
+    if (needle.size() > PLATFORM_LOG_NEEDLE_MAX_BYTES) return false;
     bytes += platformLogNeedleBytes(needle.size());
     added.push_back(&needle);
   }
@@ -107,7 +109,8 @@ bool replacePlatformLogRedactions(const std::vector<std::string>& needles) {
   std::unordered_set<std::string> kept;
   size_t bytes = 0;
   for (const auto& needle : needles) {
-    if (needle.empty() || needle.size() > UINT32_MAX || kept.contains(needle)) continue;
+    if (needle.size() > PLATFORM_LOG_NEEDLE_MAX_BYTES) return false;
+    if (needle.empty() || kept.contains(needle)) continue;
     bytes += platformLogNeedleBytes(needle.size());
     if (bytes > LOG_REDACTION_REGION_BYTES) return false;
     kept.insert(needle);
@@ -133,16 +136,121 @@ PlatformLogRedactionUsage platformLogRedactionUsage() {
       LOG_REDACTION_REGION_BYTES, generation};
 }
 
-void PlatformLogCleaner::addNeedle(std::string needle) {
-  needles.push_back(std::move(needle));
-  const auto& added = needles.back();
-  auto& failure = failures.emplace_back(added.size(), 0);
-  for (size_t at = 1, state = 0; at < added.size(); ++at) {
-    while (state && added[state] != added[at]) state = failure[state - 1];
-    if (added[state] == added[at]) ++state;
-    failure[at] = state;
+namespace {
+constexpr uint32_t NEXT_IS_CHILD = 1u << 31;
+}
+
+void NeedleAutomaton::build(const std::vector<std::string_view>& input) {
+  std::vector<std::string_view> sorted;
+  for (auto needle : input) if (!needle.empty()) sorted.push_back(needle);
+  std::sort(sorted.begin(), sorted.end());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+  label.assign(1, 0); fail.assign(1, 0); extra.assign(1, 0); nodeDepth.assign(1, 0); nodeMatch.assign(1, 0);
+  branches.clear(); edges.clear();
+  std::fill(std::begin(root), std::end(root), 0u);
+  count = sorted.size();
+  size_t total = 1;
+  for (auto needle : sorted) total += needle.size();
+  label.reserve(total); fail.reserve(total); extra.reserve(total); nodeDepth.reserve(total); nodeMatch.reserve(total);
+  // Sorted, a needle shares its longest common prefix among the earlier ones with the one before it, so it starts
+  // from that one's path; its own nodes follow one another.
+  std::vector<std::tuple<uint32_t, uint8_t, uint32_t>> more;  // (parent, byte, child) beside a consecutive child
+  std::vector<uint32_t> path{0};
+  std::string_view previous;
+  for (auto needle : sorted) {
+    KJ_REQUIRE(needle.size() <= PLATFORM_LOG_NEEDLE_MAX_BYTES);
+    size_t common = 0;
+    while (common < previous.size() && common < needle.size() && previous[common] == needle[common]) ++common;
+    path.resize(common + 1);
+    uint32_t node = path.back();
+    for (size_t at = common; at < needle.size(); ++at) {
+      const auto created = static_cast<uint32_t>(label.size());
+      const auto byte = static_cast<uint8_t>(needle[at]);
+      label.push_back(byte); fail.push_back(0); extra.push_back(0);
+      nodeDepth.push_back(static_cast<uint16_t>(at + 1)); nodeMatch.push_back(0);
+      if (node == 0) root[byte] = created;
+      else if (created == node + 1) extra[node] |= NEXT_IS_CHILD;
+      else more.emplace_back(node, byte, created);
+      node = created;
+      path.push_back(node);
+    }
+    nodeMatch[node] = static_cast<uint16_t>(needle.size());
+    previous = needle;
   }
-  states.push_back(0);
+  std::sort(more.begin(), more.end());
+  for (size_t at = 0; at < more.size();) {
+    const auto parent = std::get<0>(more[at]);
+    const auto first = static_cast<uint32_t>(edges.size());
+    for (; at < more.size() && std::get<0>(more[at]) == parent; ++at) edges.emplace_back(std::get<1>(more[at]), std::get<2>(more[at]));
+    branches.emplace_back(first, static_cast<uint32_t>(edges.size()) - first);
+    extra[parent] |= static_cast<uint32_t>(branches.size());
+  }
+  // Failure links breadth first: a node's falls back from its parent's.
+  std::vector<uint32_t> queue;
+  queue.reserve(label.size());
+  for (auto node : root) if (node) queue.push_back(node);
+  for (size_t at = 0; at < queue.size(); ++at) {
+    const auto node = queue[at];
+    auto visit = [&](uint32_t next) {
+      const auto byte = label[next];
+      uint32_t back = fail[node];
+      while (true) {
+        const auto found = child(back, byte);
+        if (found && found != next) { fail[next] = found; break; }
+        if (back == 0) { fail[next] = 0; break; }
+        back = fail[back];
+      }
+      if (nodeMatch[next] == 0) nodeMatch[next] = nodeMatch[fail[next]];
+      queue.push_back(next);
+    };
+    if (extra[node] & NEXT_IS_CHILD) visit(node + 1);
+    if (const auto index = extra[node] & ~NEXT_IS_CHILD) {
+      const auto [first, size] = branches[index - 1];
+      for (uint32_t edge = first; edge < first + size; ++edge) visit(edges[edge].second);
+    }
+  }
+}
+
+uint32_t NeedleAutomaton::child(uint32_t node, uint8_t byte) const {
+  if (node == 0) return root[byte];
+  if ((extra[node] & NEXT_IS_CHILD) && label[node + 1] == byte) return node + 1;
+  if (const auto index = extra[node] & ~NEXT_IS_CHILD) {
+    const auto [first, size] = branches[index - 1];
+    for (uint32_t edge = first; edge < first + size; ++edge)
+      if (edges[edge].first == byte) return edges[edge].second;
+  }
+  return 0;
+}
+
+uint32_t NeedleAutomaton::step(uint32_t state, uint8_t byte) const {
+  while (true) {
+    if (const auto next = child(state, byte)) return next;
+    if (state == 0) return 0;
+    state = fail[state];
+  }
+}
+
+size_t NeedleAutomaton::bytes() const {
+  return label.capacity() + (fail.capacity() + extra.capacity()) * sizeof(uint32_t) +
+      (nodeDepth.capacity() + nodeMatch.capacity()) * sizeof(uint16_t) +
+      branches.capacity() * sizeof(branches[0]) + edges.capacity() * sizeof(edges[0]) + sizeof(root);
+}
+
+void PlatformLogCleaner::rebuildMain() {
+  std::vector<std::string_view> all(needles.begin(), needles.end());
+  main.build(all);
+  recent.build({});
+  mainCount = needles.size();
+  mainBytes = 0;
+  for (const auto& needle : needles) mainBytes += needle.size();
+  recentBytes = 0;
+  mainState = recentState = 0;
+}
+
+void PlatformLogCleaner::rebuildRecent() {
+  std::vector<std::string_view> added(needles.begin() + mainCount, needles.end());
+  recent.build(added);
+  recentState = 0;
 }
 
 // The active region's needles, read under its sequence number. A rebuilt
@@ -164,24 +272,33 @@ bool PlatformLogCleaner::refresh() {
       uint32_t size;
       if (published - at < sizeof(size)) { torn = true; break; }
       std::memcpy(&size, region.bytes + at, sizeof(size));
-      if (size == 0 || size > published - at - sizeof(size)) { torn = true; break; }
+      if (size == 0 || size > published - at - sizeof(size) || size > PLATFORM_LOG_NEEDLE_MAX_BYTES) { torn = true; break; }
       loaded.emplace_back(region.bytes + at + sizeof(size), size);
       at += platformLogNeedleBytes(size);
     }
     std::atomic_thread_fence(std::memory_order_acquire);
     if (torn || region.sequence.load(std::memory_order_relaxed) != sequence ||
         shared->generation.load(std::memory_order_acquire) != current) continue;
-    if (reload) {
-      needles.clear();
-      failures.clear();
-      states.clear();
-      generation = current;
-    }
     consumed = at;
-    // A new needle is looked for in the bytes held back as well.
+    if (reload) {
+      needles = std::move(loaded);
+      generation = current;
+      rebuildMain();
+      scan(main, mainState, 0);
+      return true;
+    }
+    if (loaded.empty()) return true;
     for (auto& needle : loaded) {
-      addNeedle(std::move(needle));
-      scan(needles.size() - 1, 0);
+      recentBytes += needle.size();
+      needles.push_back(std::move(needle));
+    }
+    // A new needle is looked for in the bytes held back as well.
+    if (recentBytes > std::max<size_t>(64 * 1024, mainBytes / 4)) {
+      rebuildMain();
+      scan(main, mainState, 0);
+    } else {
+      rebuildRecent();
+      scan(recent, recentState, 0);
     }
     return true;
   }
@@ -189,18 +306,26 @@ bool PlatformLogCleaner::refresh() {
 }
 
 // Match against the original stream, including bytes suppressed by a block
-// quota. KMP suffix states retain only prefixes that can still form a value.
-void PlatformLogCleaner::scan(size_t pattern, size_t begin) {
-  const auto& needle = needles[pattern];
-  const auto& failure = failures[pattern];
-  auto& state = states[pattern];
+// quota. An automaton's state retains only prefixes that can still form a
+// value. A match marks its bytes; the run the last match marked is kept so that
+// overlapping matches (a long periodic value) mark each byte once.
+void PlatformLogCleaner::scan(const NeedleAutomaton& automaton, uint32_t& state, size_t begin) {
+  if (automaton.patterns() == 0) return;
+  size_t runFrom = 0, runTo = 0;
   for (size_t at = begin; at < pending.size(); ++at) {
-    while (state && needle[state] != pending[at]) state = failure[state - 1];
-    if (needle[state] == pending[at]) ++state;
-    if (state == needle.size()) {
-      for (size_t pos = at + 1 - state; pos <= at; ++pos) marks[pos] |= 1;
-      state = failure[state - 1];
+    state = automaton.step(state, static_cast<uint8_t>(pending[at]));
+    const auto length = automaton.match(state);
+    if (!length) continue;
+    const size_t from = at + 1 - length, to = at + 1;
+    if (runTo <= from || runTo == 0) {
+      for (size_t pos = from; pos < to; ++pos) marks[pos] |= 1;
+      runFrom = from;
+    } else {
+      for (size_t pos = from; pos < runFrom; ++pos) marks[pos] |= 1;
+      for (size_t pos = runTo; pos < to; ++pos) marks[pos] |= 1;
+      runFrom = std::min(runFrom, from);
     }
+    runTo = to;
   }
 }
 
@@ -218,10 +343,9 @@ std::string PlatformLogCleaner::append(std::string_view input, bool final) {
   }
   if (rescanAll) {
     rescanAll = false;
-    for (size_t pattern = 0; pattern < needles.size(); ++pattern) {
-      states[pattern] = 0;
-      scan(pattern, 0);
-    }
+    mainState = recentState = 0;
+    scan(main, mainState, 0);
+    scan(recent, recentState, 0);
   }
   if (needles.empty() && pending.empty()) {
     if (!input.empty()) emittingRedaction = false;
@@ -238,11 +362,9 @@ std::string PlatformLogCleaner::append(std::string_view input, bool final) {
     pending.append(input.substr(0, take));
     marks.resize(pending.size(), blocked ? 2 : 0);
     input.remove_prefix(take);
-    size_t hold = 0;
-    for (size_t pattern = 0; pattern < needles.size(); ++pattern) {
-      scan(pattern, begin);
-      hold = std::max(hold, states[pattern]);
-    }
+    scan(main, mainState, begin);
+    scan(recent, recentState, begin);
+    const size_t hold = std::max(main.patterns() ? main.depth(mainState) : 0, recent.patterns() ? recent.depth(recentState) : 0);
     const auto cut = final && input.empty() ? pending.size() : pending.size() - hold;
     for (size_t at = 0; at < cut; ++at) {
       if (marks[at] & 2) continue;
@@ -258,7 +380,7 @@ std::string PlatformLogCleaner::append(std::string_view input, bool final) {
     marks.erase(marks.begin(), marks.begin() + cut);
   } while (!input.empty());
   if (final) {
-    std::fill(states.begin(), states.end(), 0);
+    mainState = recentState = 0;
     emittingRedaction = false;
   }
   return output;
