@@ -88,6 +88,7 @@ add_library(common STATIC
   common/deployment.c++
   common/tenancy.c++
   common/config.c++
+  common/cpu-capacity.c++
   common/support.c++
   common/log-cleaning.c++
   common/log-sink.c++
@@ -101,6 +102,7 @@ target_link_libraries(common PUBLIC capnp-http-over OpenSSL::Crypto)
 add_executable(coworkerd
   node/main.c++
   node/process-pool.c++
+  node/secret-dictionary.c++
   node/async-log.c++
   node/memory-watermark.c++
   node/host-check.c++
@@ -173,6 +175,28 @@ target_link_libraries(coworkerd-durable-channel-test PRIVATE common kj-tls-local
 
 # This gate runs the already built unit/component tests without starting a cluster.
 enable_testing()
+add_executable(coworkerd-process-culprit-test EXCLUDE_FROM_ALL node/process-culprit-test.c++)
+target_link_libraries(coworkerd-process-culprit-test PRIVATE common)
+add_test(NAME node-threaded-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
+add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-test memory)
+add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-test.c++ node/async-log.c++
+  node/secret-dictionary.c++)
+target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
+set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd"
+  CACHE FILEPATH "Built workerd for the real Worker diagnostic redaction test")
+add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
+add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
+add_test(NAME node-log-generations COMMAND coworkerd-log-cleaning-test generations)
+add_test(NAME node-secret-rotations COMMAND coworkerd-log-cleaning-test secret-rotations)
+add_test(NAME node-secret-limits COMMAND coworkerd-log-cleaning-test secret-limits)
+add_test(NAME node-secret-share COMMAND coworkerd-log-cleaning-test secret-share)
+add_test(NAME node-secret-pinned-rotation COMMAND coworkerd-log-cleaning-test secret-pinned-rotation)
+add_test(NAME node-secret-rotation-cooldown COMMAND coworkerd-log-cleaning-test secret-rotation-cooldown)
+add_test(NAME node-log-stale COMMAND coworkerd-log-cleaning-test stale-lines)
+add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
+set_tests_properties(node-log-stream node-log-many-values node-log-redaction PROPERTIES TIMEOUT 30)
+set_tests_properties(node-log-generations node-secret-rotations node-secret-limits node-secret-share
+  node-secret-pinned-rotation node-secret-rotation-cooldown node-log-stale PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
   node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
@@ -205,9 +229,8 @@ foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect
     reacquired)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
-foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
-    cache-unavailable cache-deadline cache-capacity cache-single-flight
-    cpu-culprit-current-behavior memory-culprit rejected-manifest)
+foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission placement package module-types cache
+    cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
 # The object store client's kept-alive connections, against a loopback store of the test's own.
@@ -224,9 +247,15 @@ add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
 add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
 add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
+set(COWORKERD_TEST_JUNIT "" CACHE FILEPATH "Optional JUnit result path for the check target")
+set(COWORKERD_TEST_REPORT_ARGS)
+if(COWORKERD_TEST_JUNIT)
+  list(APPEND COWORKERD_TEST_REPORT_ARGS --output-junit "${COWORKERD_TEST_JUNIT}")
+endif()
 add_custom_target(check
-  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
-  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-config-test coworkerd-object-store-test
+  COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test coworkerd-config-test
+    coworkerd-object-store-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.
@@ -236,7 +265,6 @@ if(NOT COWORKERD_TEST_NODE)
 endif()
 # A configured patched Workerd is external to the CMake targets. This component
 # starts a single process on a loopback port, with no node, control plane, or storage.
-set(COWORKERD_TEST_WORKERD "" CACHE FILEPATH "Patched Workerd executable for the configuration component test")
 if(COWORKERD_TEST_WORKERD)
   if(NOT EXISTS "${COWORKERD_TEST_WORKERD}")
     message(FATAL_ERROR "COWORKERD_TEST_WORKERD does not exist: ${COWORKERD_TEST_WORKERD}")
@@ -252,7 +280,18 @@ if(COWORKERD_TEST_WORKERD)
     add_dependencies(check coworkerd)
   endif()
 endif()
-add_test(NAME node-error-contract COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/node/error-contract.test.mjs")
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
 endforeach()
+add_test(NAME node-error-contract COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/node/error-contract.test.mjs")
+
+set(COWORKERD_NATIVE_TEST_LOG "" CACHE FILEPATH "Output of the native KJ contract test")
+set(COWORKERD_NATIVE_TEST_RECEIPT "" CACHE FILEPATH "Native test source and result receipt")
+set(COWORKERD_NATIVE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/workerd" CACHE PATH "Native source tested by the receipt")
+if(COWORKERD_NATIVE_TEST_LOG AND COWORKERD_NATIVE_TEST_RECEIPT)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME native-error-contract COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-native-error-contract.py"
+    --native-source "${COWORKERD_NATIVE_SOURCE_DIR}" --receipt "${COWORKERD_NATIVE_TEST_RECEIPT}"
+    --log "${COWORKERD_NATIVE_TEST_LOG}" --errors "${CMAKE_CURRENT_SOURCE_DIR}/docs/guide/errors.md")
+endif()

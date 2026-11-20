@@ -1,4 +1,7 @@
 #include "invocation-contract.h"
+#include "tenant-execution.h"
+#include "event-loop.h"
+#include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
 #include "r47-trace.h"
@@ -64,6 +67,7 @@
 #include <optional>
 #include <random>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sstream>
 #include <cerrno>
 #include <cstring>
@@ -259,7 +263,10 @@ struct PlacementDefinition {
 };
 
 using coworkerd::OpenEvent;
-struct ProcessUnavailable { bool quarantine = false; };
+// `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
+struct ProcessUnavailable { bool quarantine = false; std::string reason; };
+// A trial probe that was never sent (TrialService::probe()).
+constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
 
 // Capture request stages without writing a log line at each measurement point.
@@ -344,6 +351,14 @@ struct InvocationLeaseState {
   }
 };
 
+using NativeProps = std::shared_ptr<capnp::MallocMessageBuilder>;
+NativeProps copyNativeProps(capnp::AnyPointer::Reader value) {
+  if (value.isNull()) return {};
+  auto message = std::make_shared<capnp::MallocMessageBuilder>();
+  message->initRoot<capnp::AnyPointer>().set(value);
+  return message;
+}
+
 struct ChildAllocation {
   std::string treeId;
   std::string parentInvocationId;
@@ -359,6 +374,7 @@ struct ChildAllocation {
   std::string ingressServerId;
   SharedPathTiming timing;
   std::string entrypoint;
+  NativeProps nativeProps;
 };
 
 // A request to a Durable Object (docs/compatibility.md, section 7): the object's namespace, id and class, and how many
@@ -405,6 +421,7 @@ struct InvocationRejection {
   uint32_t limit = 0;
   uint32_t avoidMs = 0;
   std::string category;  // LOAD_FAILED: package-unavailable, evaluation, limit, secret-missing
+  bool notExecuted = false, retryable = false;
 
   std::string json() const {
     std::ostringstream out;
@@ -414,12 +431,18 @@ struct InvocationRejection {
     if (!category.empty()) out << ",\"category\":\"" << jsonEscape(category) << "\"";
     if (code == "LOAD_FAILED" && status == 409 && category == "limit")
       out << ",\"dispatched\":false,\"retryable\":false";
+    else if (notExecuted) out << ",\"dispatched\":false,\"retryable\":" << (retryable ? "true" : "false");
     out << "}";
     return out.str();
   }
 };
 
 constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
+constexpr std::string_view PROCESS_TENANT_LIMIT = "process-tenant-concurrency";
+constexpr const char* PROCESS_TENANT_REASON = "tenant execution concurrency limit reached in process";
+bool processTenantRefusal(const InvocationRejection& refusal) {
+  return refusal.code == "OVERLOADED" && refusal.category == PROCESS_TENANT_LIMIT;
+}
 bool tenantLimitRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == TENANT_ADMISSION_LIMIT;
 }
@@ -435,7 +458,7 @@ bool pausedRefusal(const InvocationRejection& refusal) {
 // this Server could not get or verify, which another Server (another cache) may have.
 using coworkerd::PACKAGE_UNAVAILABLE;
 bool rerouteAfter(const InvocationRejection& refusal) {
-  return coworkerd::placementRetryable(refusal.code, refusal.category);
+  return refusal.code != "PROCESS_MEMORY_PRESSURE" && coworkerd::placementRetryable(refusal.code, refusal.category);
 }
 
 uint64_t preparationLargeBudget(uint32_t heapMiB) {
@@ -456,6 +479,7 @@ struct AdmissionSlot {
   bool root = false;
   // Every pre-dispatch recheck shares this slot and the call's one paused-wait budget.
   double pausedWaitMs = 0;
+  double processTenantWaitMs = 0;
   std::string ingressNodeId;
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
@@ -465,9 +489,9 @@ struct AdmissionSlot {
   std::function<void(uint status, const std::string& code)> outcome;
   // Only the platform runtime receives this receipt. A tenant response cannot
   // turn an uncertain execution into a refusal that placement may retry.
-  std::string dispatchReceipt, preparationReason;
+  std::string dispatchReceipt, rejectionReason, rejectionCode, rejectionCategory;
   double deadline = 0;
-  bool decided = false, notExecuted = false, preparationLimit = false;
+  bool decided = false, notExecuted = false, capacityRejected = false;
   std::function<void(bool)> executionDecision;
   void decide(bool executed) {
     if (decided) return;
@@ -478,8 +502,9 @@ struct AdmissionSlot {
   }
   void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
-  ~AdmissionSlot() { decide(true); finish(); report(0, ""); }
-  void finish() { decide(true); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
+  ~AdmissionSlot() { decide(!process || process->dispatched); finish(); report(0, ""); }
+  void finish() { decide(!process || process->dispatched); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
+  NativeProps nativeProps;
 };
 
 std::string refusalBody(const InvocationRejection& refusal, double deadline);
@@ -494,15 +519,20 @@ struct LoadCheck {
   bool coldLoaded = false;  // the check loaded the version for that call
 };
 
-// The trial load's verdict (defined with it below) and the cleaning of its message (trialClean,
-// log-cleaning.h); the load check before a dispatch classifies and cleans with them.
-struct TrialVerdict {
-  std::string category;  // empty: the version loads
-  std::string limit;     // "cpu" or "memory" for LIMIT_EXCEEDED
-  std::string message;
+struct PendingThreadedLoad {
+  PendingThreadedLoad(kj::Promise<void> signal, kj::Own<kj::PromiseFulfiller<void>> fulfiller)
+      : done(kj::mv(signal).fork()), fulfiller(kj::mv(fulfiller)) {}
+  kj::ForkedPromise<void> done;
+  kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+  std::optional<LoadCheck> result;
 };
-TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& name, const std::string& raw,
-    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB);
+
+// The shared trial verdict and the cleaning of its message (trialClean,
+// log-cleaning.h); the load check before a dispatch classifies and cleans with them.
+using coworkerd::TrialVerdict;
+using coworkerd::classifyTrialFailure;
+using coworkerd::classifyLoadRejection;
+using coworkerd::callPathPlatformFailure;
 
 void phaseTiming(const char* stage, double started, const std::shared_ptr<coworkerd::ProcessCall>& call = {});
 
@@ -760,8 +790,8 @@ private:
 // tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
 class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
-      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
+      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
@@ -776,9 +806,12 @@ private:
     auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
     auto request = runtimeTarget.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
-    auto path = builder.initMethodPath(2);
-    path.set(0, JS_RPC_RUNTIME_PROPERTY);
-    path.set(1, descriptor);
+    if (threaded) builder.setMethodName(JS_RPC_BIND_METHOD);
+    else {
+      auto path = builder.initMethodPath(2);
+      path.set(0, JS_RPC_RUNTIME_PROPERTY);
+      path.set(1, descriptor);
+    }
     copyCallParams(params, builder);
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
@@ -792,6 +825,7 @@ private:
   capnp::Capability::Client runtimeTarget;
   kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
+  bool threaded;
 };
 
 // A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
@@ -799,8 +833,8 @@ private:
 // descriptor into the runtime.
 class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot)
-      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)) {}
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
+      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
@@ -810,7 +844,7 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot, threaded));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
@@ -819,6 +853,7 @@ private:
   rpc::EventDispatcher::Client inner;
   kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
+  bool threaded;
 };
 
 class ServerCore final {
@@ -853,6 +888,8 @@ public:
         for (const auto& [name, secret] : names) if (!secret.value.empty()) values.push_back(secret.value);
       return values;
     };
+    redactions.earlierRevision = [this]() { syncSecretDictionary(); return secretDictionary.earlierRevision(); };
+    redactions.earlierValues = [this]() { return secretDictionary.earlierValues(); };
     if (leaseConfig.naive()) {
       std::cout << "[server] {\"event\":\"experimental-naive-lease\",\"warning\":\"the naive lease is a test-only counterexample: "
                    "it does not conserve the subrequest budget across Servers\"}" << std::endl;
@@ -872,6 +909,8 @@ public:
     auto& redactions = secretRedactions();
     redactions.stamp = nullptr;
     redactions.values = nullptr;
+    redactions.earlierRevision = nullptr;
+    redactions.earlierValues = nullptr;
   }
 
   // ---- Tenants: their records (being deleted, or gone: not served) and their usage here ----
@@ -884,8 +923,8 @@ public:
   // tenant's default, else this node's).
   // What one Worker's executions are limited to, as the control plane stored it: the Worker's own
   // value, else its tenant's default, and 0 for each limit neither names -- this node's own value applies
-  // there. The processes apply exactly this: it goes in the invocation descriptor, the runtime bridge
-  // puts it in the loader key, and the isolate is created under it.
+  // there. The invocation descriptor applies the ordinary CPU ceiling; durable
+  // processes retain the declared limits and their own node default.
   coworkerd::WorkerLimits namedLimits(const std::string& workerId) const {
     coworkerd::WorkerLimits named;
     const auto* record = tenants ? tenants->tenant(coworkerd::tenantOf(workerId)) : nullptr;
@@ -1012,7 +1051,8 @@ public:
     return found != pins->end() && found->second == value;
   }
 
-  kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline) {
+  kj::Promise<std::string> ensureCode(const VersionDefinition& version, double deadline, bool durable = false) {
+    if (!durable) return desiredState.ensureCode(version, deadline - monotonicTimeMs());
     if (auto known = preparationBytes.find(version.contentHash); known != preparationBytes.end()) {
       known->second.used = ++preparationByteSequence;
       preparationByteFlights.erase(version.contentHash);
@@ -1097,15 +1137,53 @@ public:
   // The executing Server gives a version its secrets from its own deployment
   // view, whatever the caller saw: without a usable value for every declared
   // name nothing executes (explicit, retryable elsewhere). Names only.
-  std::optional<InvocationRejection> secretRefusal(const VersionDefinition& version, bool root) {
+  // `durable`: a call to a Durable Object (its process names no isolates).
+  std::optional<InvocationRejection> secretRefusal(const VersionDefinition& version, bool root, bool durable = false) {
     auto missing = desiredState.state().missingSecrets(version);
-    if (missing.empty()) return std::nullopt;
+    if (missing.empty()) {
+      // Its values must fit in this node's secret dictionary before any descriptor carries them.
+      auto refused = admitSecrets(version, durable);
+      if (!refused) return std::nullopt;
+      auto reason = *refused + " (Worker " + version.workerId + ")";
+      ++secretUnavailableRejections;
+      lastRejection = reason;
+      return refusal("SECRET_UNAVAILABLE", std::move(reason), 503, root);
+    }
     std::string reason = missing.size() == 1 ? "missing secret on this Server: " : "missing secrets on this Server: ";
     for (size_t i = 0; i < missing.size(); ++i) reason += (i ? ", " : "") + missing[i];
     reason += " (Worker " + version.workerId + ")";
     ++secretUnavailableRejections;
     lastRejection = reason;
     return refusal("SECRET_UNAVAILABLE", std::move(reason), 503, root);
+  }
+  // The current values of the version's secrets (each one has a value: missingSecrets() is empty).
+  std::set<std::string> secretValues(const VersionDefinition& version) const {
+    std::set<std::string> values;
+    const auto& state = desiredState.state();
+    for (const auto& name : version.secrets)
+      if (const auto* secret = state.secret(version.workerId, name); secret && !secret->value.empty()) values.insert(secret->value);
+    return values;
+  }
+  void syncSecretDictionary() const {
+    const auto& state = desiredState.state();
+    const std::pair<uint64_t, uint64_t> view{state.revision(), state.generation()};
+    if (view == secretDictionaryView) return;
+    std::map<std::string, std::set<std::string>> current;
+    for (const auto& [worker, names] : state.secrets())
+      for (const auto& [name, secret] : names) if (!secret.value.empty()) current[coworkerd::tenantOf(worker)].insert(secret.value);
+    secretDictionary.setCurrent(std::move(current));
+    secretDictionaryView = view;
+  }
+  // A call (or a trial) that carries the version's secrets may start here: nullopt, or why not on this node.
+  // Its values are held until the lease's time to live has passed; the descriptor holds them from then on.
+  std::optional<std::string> admitSecrets(const VersionDefinition& version, bool durable = false) {
+    if (version.secrets.empty()) return std::nullopt;
+    syncSecretDictionary();
+    const auto now = monotonicTimeMs();
+    auto refused = secretDictionary.admit(coworkerd::tenantOf(version.workerId), secretValues(version), now,
+        now + std::max<double>(leaseConfig.ttlMs, 30000), durable);
+    if (refused) ++secretDictionaryRefusals;
+    return refused;
   }
 
   // Static assets: answered by the asset layer without workerd, a lease or
@@ -1518,8 +1596,10 @@ public:
   }
 
   InvocationRejection processRefusal(const ProcessUnavailable& error, bool root = false) {
-    return refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE",
+    auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE", !error.reason.empty() ? error.reason :
         error.quarantine ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch", 503, root);
+    value.notExecuted = value.retryable = true;
+    return value;
   }
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
@@ -1566,6 +1646,14 @@ public:
         [&] { return durable ? runtime.durableHot(hash) : hot(hash); }))
       return rejected("LOAD_BAND_REJECTED", reason);
     if (!checkProcess || (durable ? runtime.durableAvailable(durable->key()) : runtime.available(worker))) return std::nullopt;
+    if (!durable) if (const auto limited = runtime.tenantExecutionLimit(worker)) {
+      auto value = refusal("OVERLOADED", PROCESS_TENANT_REASON, 503, root);
+      value.category = PROCESS_TENANT_LIMIT;
+      value.inFlight = limited->inFlight; value.limit = limited->limit;
+      value.notExecuted = value.retryable = true;
+      if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return value;
+    }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
     if (serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
@@ -1591,6 +1679,7 @@ public:
     if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root, worker, durable)};
     auto reject = [&](InvocationRejection value) {
       if (tenantLimitRefusal(value)) recordTenantLimitRefusal(worker, root, value, durable);
+      else if (processTenantRefusal(value)) value.avoidMs = 0;
       else {
         value.category.clear();
         value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
@@ -1598,6 +1687,40 @@ public:
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return Admission{std::move(value), {}};
     };
+    if (wait && processTenantRefusal(*failure)) {
+      const auto began = monotonicTimeMs();
+      const auto used = slot ? slot->processTenantWaitMs : 0;
+      const auto duration = std::max(0.0, std::min(deadline - began,
+          serverConfig.processPool.tenantAdmissionWaitMs - used));
+      const auto id = beginAdmissionWait("tenant-execution");
+      std::string outcome = "canceled";
+      auto done = kj::defer([&] { endAdmissionWait("tenant-execution", id, began, outcome); });
+      const auto until = began + duration;
+      while (true) {
+        auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+        if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
+        if (!current) break;
+        if (!processTenantRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
+        const auto limited = runtime.tenantExecutionLimit(worker);
+        if (!limited) {
+          auto refreshed = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+          if (!refreshed) break;
+          outcome = "unavailable"; co_return reject(std::move(*refreshed));
+        }
+        const auto remaining = std::max(0.0, until - monotonicTimeMs());
+        const auto waited = co_await tenantExecutionQueue.wait(timer, static_cast<int64_t>(remaining * 1000) * kj::MICROSECONDS,
+            static_cast<uint32_t>(std::min<uint64_t>(uint64_t(serverConfig.rootLimit) + serverConfig.nestedLimit, 16384)),
+            coworkerd::tenantOf(worker), limited->states);
+        if (waited != coworkerd::TenantExecutionQueue::READY) {
+          outcome = waited == coworkerd::TenantExecutionQueue::FULL ? "full" : "expired";
+          co_return reject(std::move(*failure));
+        }
+      }
+      outcome = "resumed";
+      if (!slot) slot = reserve(root, worker, durable);
+      slot->processTenantWaitMs += monotonicTimeMs() - began;
+      co_return Admission{std::nullopt, std::move(slot)};
+    }
     if (!wait || !pausedRefusal(*failure)) {
       if (!wait && pausedRefusal(*failure)) co_return Admission{std::move(failure), {}};
       co_return reject(std::move(*failure));
@@ -1654,7 +1777,7 @@ public:
   std::string pausedAdmissionJson() const {
     std::ostringstream out; out << std::setprecision(17) << '{';
     bool first = true;
-    for (const auto* kind : {"ordinary", "quarantine", "durable"}) {
+    for (const auto* kind : {"ordinary", "quarantine", "durable", "tenant-execution"}) {
       auto found = pausedAdmissionCounts.find(kind);
       const auto count = found == pausedAdmissionCounts.end() ? PausedAdmissionCounts{} : found->second;
       out << (first ? "" : ",") << '"' << kind << "\":{\"count\":" << count.count << ",\"active\":" << count.active
@@ -1663,6 +1786,10 @@ public:
       for (const auto* outcome : {"resumed", "expired", "killed", "lease", "unavailable", "canceled"}) {
         auto value = count.outcomes.find(outcome);
         out << ",\"" << outcome << "\":" << (value == count.outcomes.end() ? 0 : value->second);
+      }
+      if (std::string_view(kind) == "tenant-execution") {
+        const auto full = count.outcomes.find("full");
+        out << ",\"full\":" << (full == count.outcomes.end() ? 0 : full->second);
       }
       out << '}';
     }
@@ -1866,15 +1993,47 @@ public:
   std::string loadRevision(const VersionDefinition& version) const {
     return version.definitionHash + ":" + coworkerd::plainEnvironmentRevision(desiredState.state(), version);
   }
+  static std::string loadKey(const std::string& processId, uint64_t generation, const std::string& hash, const std::string& entrypoint) {
+    return processId + ":" + std::to_string(generation) + ":" + hash + "#" + (entrypoint.empty() ? "default" : entrypoint);
+  }
   static std::string loadKey(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
-    return process.processId + ":" + std::to_string(process.generation) + ":" + hash + "#" + (entrypoint.empty() ? "default" : entrypoint);
+    return loadKey(process.processId, process.generation, hash, entrypoint);
   }
   void confirmLoaded(const coworkerd::ProcessCall& process, const std::string& hash, const std::string& entrypoint) {
     loadConfirmed[loadKey(process, hash, entrypoint)] = monotonicTimeMs();
   }
+  std::string beginThreadedColdRoute(const VersionDefinition& version) {
+    if (!version.hasCode() || !serverConfig.loadCheck ||
+        runtime.quarantined(version.workerId)) return {};
+    auto process = runtime.threadedGenerationHint(version.workerId);
+    if (!process) return {};
+    // A scheduling hint only. Actual confirmation and admission select and
+    // validate again; the hint itself consumes no process ticket.
+    const auto& catalog = desiredState.state();
+    auto revision = std::pair{catalog.generation(), catalog.revision()};
+    if (threadedHintRevision != revision) {
+      threadedHintRevision = revision;
+      threadedHintLoads.clear();
+    }
+    auto [hint, inserted] = threadedHintLoads.try_emplace(version.definitionHash);
+    if (inserted) hint->second = loadRevision(version);
+    auto key = process->first + ":" + std::to_string(process->second) + ":" + hint->second + "#default";
+    auto found = loadConfirmed.find(key);
+    if (!threadedColdRoutes.contains(key) && found != loadConfirmed.end() &&
+        monotonicTimeMs() - found->second <= loadCheckFreshMs()) return {};
+    ++threadedColdRoutes[key];
+    return key;
+  }
+  void endThreadedColdRoute(const std::string& key) {
+    if (key.empty()) return;
+    auto found = threadedColdRoutes.find(key);
+    KJ_ASSERT(found != threadedColdRoutes.end() && found->second > 0);
+    if (--found->second == 0) threadedColdRoutes.erase(found);
+  }
   // One load probe on a selected process: what the runtime reported, or how the probe failed.
   struct LoadProbe {
     std::string checkId, processId, report, failure, culprit, workerId;
+    std::string notSent;  // why the probe was not sent (nothing reached the process)
     uint64_t generation = 0;
     bool timedOut = false, exited = false, cpuExceeded = false, memoryExceeded = false;
     double elapsedMs = 0;
@@ -1888,8 +2047,16 @@ public:
     process->invocationId = probe.checkId; process->treeId = probe.checkId;
     probe.processId = process->processId;
     probe.generation = process->generation;
-    auto descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
-        *process, serverConfig.serverId, entrypoint, true, true, forInvocation);
+    kj::String descriptor;
+    try {
+      descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
+          *process, serverConfig.serverId, entrypoint, true, true, forInvocation);
+    } catch (const ProcessUnavailable& error) {
+      // The secret dictionary could not take the values: nothing is sent, the call may go elsewhere.
+      probe.notSent = error.reason;
+      process->finish();
+      co_return probe;
+    }
     const auto started = monotonicTimeMs();
     auto opened = runtime.open(process, descriptor, version.definitionHash);
     // Kept until the probe ends: dropping it would cancel the dispatch.
@@ -1927,6 +2094,13 @@ public:
   }
   kj::Promise<LoadCheck> loadCheck(std::shared_ptr<const VersionDefinition> version, std::string entrypoint, double deadline, bool root) {
     if (!serverConfig.loadCheck || !version->hasCode()) co_return LoadCheck{};
+    if (const auto hint = runtime.threadedGenerationHint(version->workerId)) {
+      const auto key = loadKey(hint->first, hint->second, loadRevision(*version), entrypoint);
+      // A cached check sends nothing to the process. It must not acquire and
+      // immediately release a call ticket, which would wake its tenant queue.
+      if (const auto found = loadConfirmed.find(key); found != loadConfirmed.end() &&
+          monotonicTimeMs() - found->second <= loadCheckFreshMs()) co_return LoadCheck{};
+    }
     // The process the dispatch will select (the same selection, made again there); none: the
     // dispatch refuses.
     auto process = runtime.select(version->workerId);
@@ -1934,18 +2108,67 @@ public:
     auto key = loadKey(*process, loadRevision(*version), entrypoint);
     if (auto found = loadConfirmed.find(key); found != loadConfirmed.end() && monotonicTimeMs() - found->second <= loadCheckFreshMs())
       co_return LoadCheck{};
+    std::shared_ptr<PendingThreadedLoad> shared;
+    const auto pendingKey = key;
+    auto complete = kj::defer([this, &shared, &pendingKey] {
+      if (shared) {
+        threadedLoads.erase(pendingKey);
+        shared->fulfiller->fulfill();
+      }
+    });
+    if (process->threadedServer()) {
+      if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
+        auto pending = found->second;
+        // The shared check owns its own process admission. A waiter keeps no
+        // extra process ticket, invocation number, or another caller's deadline.
+        process.reset();
+        bool expired = false;
+        try {
+          auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
+          co_await timer.timeoutAfter(remaining, pending->done.addBranch());
+          // A completed load can release hundreds of waiters. Let ready I/O
+          // and existing RPC continuations run before opening their calls.
+          co_await kj::yieldUntilWouldSleep();
+        } catch (const kj::Exception&) { expired = true; }
+        if (expired || monotonicTimeMs() >= deadline) {
+          LoadCheck result;
+          result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+          co_return result;
+        }
+        if (pending->result) {
+          const auto& result = *pending->result;
+          if (!result.refusal) co_return LoadCheck{};
+          if (result.refusal->code != "LEASE_EXPIRED") {
+            LoadCheck failed;
+            failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
+            failed.refusal->category = result.refusal->category;
+            failed.refusal->notExecuted = result.refusal->notExecuted;
+            failed.refusal->retryable = result.refusal->retryable;
+            co_return failed;
+          }
+        }
+        // Cancellation or the initiating caller's deadline cannot poison a
+        // later caller's check. Select the current generation again.
+        co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
+      }
+      auto signal = kj::newPromiseAndFulfiller<void>();
+      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
+      threadedLoads.emplace(key, shared);
+    }
     LoadCheck result;
     result.sequence = nextSequence++;
     const auto forInvocation = invocationId(result.sequence);
     const std::string entrypointName = entrypoint.empty() ? "default" : entrypoint;
     std::string category, detail, message;
-    bool coldLoad = false, preparationLimit = false;
+    bool coldLoad = false;
     LoadProbe probe;
     for (int attempt = 0;; ++attempt) {
       probe = co_await loadProbe(*version, std::move(process), entrypoint, deadline, forInvocation);
-      category.clear(); detail.clear(); message.clear(); coldLoad = false; preparationLimit = false; result.refusal.reset();
+      category.clear(); detail.clear(); message.clear(); coldLoad = false; result.refusal.reset();
       bool limitWithoutEvidence = false;
-      if (probe.timedOut) {
+      if (!probe.notSent.empty()) {
+        result.refusal = processRefusal(ProcessUnavailable{false, probe.notSent}, root);
+      } else if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
       } else if (!probe.culprit.empty()) {
         category = "limit"; detail = "LIMIT_EXCEEDED";
@@ -1970,8 +2193,9 @@ public:
             message = entrypointName == "default" ? (flag("hasDefault") ? "the default export has no fetch handler" : "there is no default export")
                 : "the entrypoint " + entrypointName + " is missing or has no fetch handler";
           }
-        } else if (flag("preparationLimit")) {
-          category = "limit"; detail = "PREPARATION_LIMIT"; message = string("message"); preparationLimit = true;
+        } else if (flag("capacityRejected")) {
+          result.refusal = refusal("OVERLOADED", "process admission budget is full", 503, root);
+          result.refusal->notExecuted = result.refusal->retryable = true;
         } else if (string("stage") == "code") {
           const auto codeStage = string("codeStage"), text = string("message");
           if (codeStage == "secrets") { category = "secret-missing"; detail = "SECRET_MISSING"; message = text; }
@@ -1980,9 +2204,15 @@ public:
         } else if (string("message").starts_with("Trusted ")) {
           // Our own loader failed in a load another call started (they share the isolate): the package.
           category = PACKAGE_UNAVAILABLE; detail = "PACKAGE_UNAVAILABLE"; message = "the code package could not be fetched or verified: " + string("message");
+        } else if (auto platform = callPathPlatformFailure(string("stage"), string("message"))) {
+          // The process could not get the call's plan from this node: nothing ran, another node may take it, and
+          // it is no load failure of the version (no category, so not counted in loadFailures).
+          result.refusal = refusal(platform->code, platform->reason, 503, root);
+          result.refusal->category = platform->category;
+          result.refusal->notExecuted = result.refusal->retryable = true;
         } else {
           const auto applied = runtime.effectiveLimits(probe.workerId);
-          auto verdict = classifyTrialFailure("load", string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
+          auto verdict = classifyLoadRejection(string("stage"), string("name"), string("message"), probe.cpuExceeded, probe.memoryExceeded,
               applied.cpuMs, applied.memoryMiB);
           category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
           detail = verdict.category.empty() ? "LOAD_FAILED" : verdict.category;
@@ -1999,7 +2229,7 @@ public:
     }
     if (!category.empty()) {
       auto [secrets, variables] = trialRedactions(*version);
-      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), preparationLimit ? 409 : 503, root);
+      auto value = refusal("LOAD_FAILED", trialClean(message, secrets, variables), 503, root);
       value.category = category;
       result.refusal = std::move(value);
       ++loadFailures[category];
@@ -2022,6 +2252,7 @@ public:
               << ",\"category\":" << quoted(category) << ",\"detail\":" << quoted(detail)
               << ",\"reasonBytes\":" << (result.refusal ? result.refusal->reason.size() : 0) << ",\"coldLoad\":" << (coldLoad ? "true" : "false")
               << ",\"elapsedMs\":" << probe.elapsedMs << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+    if (shared) shared->result = result;
     co_return result;
   }
   // One line per load failure, on the Server that decided what follows: where it failed, its category
@@ -2162,7 +2393,7 @@ public:
     if (!process) throw ProcessUnavailable{false};
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
-      if (auto missing = secretRefusal(*version, false))
+      if (auto missing = secretRefusal(*version, false, true))
         throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
     }
     const auto limits = namedLimits(version->workerId);
@@ -2296,7 +2527,8 @@ public:
       std::shared_ptr<const VersionDefinition> version,
       std::string kind,
       ChildAllocation allocation, std::shared_ptr<AdmissionSlot> slot = {}, const LoadCheck& check = {}) {
-    if (slot) { slot->timing = allocation.timing; slot->entrypoint = allocation.entrypoint; }
+    if (slot) { slot->timing = allocation.timing; slot->entrypoint = allocation.entrypoint; slot->nativeProps = allocation.nativeProps; }
+    KJ_REQUIRE(!allocation.nativeProps || slot, "loopback props require an invocation admission slot");
     auto process = selectProcess(version->workerId);
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
@@ -2506,7 +2738,7 @@ private:
                      ingress, peerIngress, deferredCpu](bool executed) {
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
-      pendingPreparations.erase(invocationId);
+      pendingDispatchDecisions.erase(invocationId);
       if (!executed) {
         for (auto& item : executions) if (item->invocationId == invocationId) {
           if (item.use_count() != 1) item = std::make_shared<ExecutionRecord>(*item);
@@ -2515,8 +2747,8 @@ private:
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
-        const bool limited = current && current->preparationLimit;
-        const auto refusal = this->refusal(limited ? "LOAD_FAILED" : "CODE_UNAVAILABLE", "Worker preparation unavailable before execution", limited ? 409 : 503, ingress);
+        const auto refusal = this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
+            current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
         observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
@@ -2528,7 +2760,7 @@ private:
     };
     if (slot && durable == nullptr) {
       slot->executionDecision = std::move(decision);
-      pendingPreparations[invocationId] = slot;
+      pendingDispatchDecisions[invocationId] = slot;
     } else {
       decision(true);
     }
@@ -2549,11 +2781,15 @@ private:
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
-    auto opened = runtime.open(process, descriptor, version->definitionHash);
+    if (slot) process->onCapacityRejected = [this, lifetime = std::weak_ptr<int>(executionLifetime),
+        invocation = invocationId, receipt = slot->dispatchReceipt] {
+      if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
+    };
+    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
-        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot));
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot, process->threadedServer()));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -2565,22 +2801,39 @@ private:
 
 public:
 
-  std::optional<std::string> confirmPreparation(const std::string& invocation, const std::string& receipt,
-      const std::string& state, const std::string& reason) {
-    auto found = pendingPreparations.find(invocation);
-    if (found == pendingPreparations.end()) return std::nullopt;
+  std::optional<std::string> confirmCapacityRejection(const std::string& invocation, const std::string& receipt,
+      const std::string& state, const std::string& reason, const std::string& stage = "", const std::string& codeStage = "") {
+    auto found = pendingDispatchDecisions.find(invocation);
+    if (found == pendingDispatchDecisions.end()) return std::nullopt;
     auto slot = found->second.lock();
-    if (!slot || slot->decided || receipt != slot->dispatchReceipt || (state != "rejected" && state != "load-failed")) return std::nullopt;
-    slot->preparationReason = cleanReason(reason).substr(0, 300);
-    slot->preparationLimit = state == "load-failed";
-    slot->decide(false);
-    auto refused = refusal(slot->preparationLimit ? "LOAD_FAILED" : "CODE_UNAVAILABLE", slot->preparationReason, slot->preparationLimit ? 409 : 503, slot->root);
-    if (slot->preparationLimit) refused.category = "limit";
-    auto body = refusalBody(refused, slot->deadline);
-    if (!slot->preparationLimit) {
-      body.pop_back(); body += ",\"dispatched\":false,\"retryable\":true}";
+    if (!slot || slot->decided || receipt != slot->dispatchReceipt ||
+        (state != "capacity-rejected" && state != "load-rejected")) return std::nullopt;
+    auto refused = refusal("OVERLOADED", "process admission budget is full", 503, slot->root);
+    if (state == "capacity-rejected" && reason == PROCESS_TENANT_REASON) {
+      refused.reason = PROCESS_TENANT_REASON;
+      refused.category = PROCESS_TENANT_LIMIT;
     }
-    return body;
+    if (state == "load-rejected") {
+      refused.code = "LOAD_FAILED";
+      if (stage == "code") {
+        refused.category = codeStage == "secrets" ? "secret-missing" : codeStage == "decode" ? "evaluation" : PACKAGE_UNAVAILABLE;
+        refused.reason = codeStage == "decode" ? "a module or variable cannot be decoded: Error: " + reason : reason;
+      } else if (auto platform = callPathPlatformFailure(stage, reason)) {
+        refused.code = platform->code; refused.category = platform->category; refused.reason = platform->reason;
+      } else {
+        auto limits = runtime.effectiveLimits(slot->process->workerId);
+        auto verdict = classifyLoadRejection(stage, "Error", reason, false, false, limits.cpuMs, limits.memoryMiB);
+        refused.category = verdict.category == "LIMIT_EXCEEDED" ? "limit" : "evaluation";
+        refused.reason = verdict.message;
+      }
+      refused.retryable = refused.category == PACKAGE_UNAVAILABLE || refused.code == "PROCESS_UNAVAILABLE";
+    } else refused.retryable = true;
+    refused.reason = cleanReason(refused.reason).substr(0, 1000);
+    refused.notExecuted = true;
+    slot->rejectionReason = refused.reason; slot->rejectionCode = refused.code; slot->rejectionCategory = refused.category;
+    slot->capacityRejected = state == "capacity-rejected";
+    slot->decide(false);
+    return refusalBody(refused, slot->deadline);
   }
 
   void reload() {
@@ -2646,6 +2899,11 @@ public:
 
   void reapExpiredLeases() {
     expireLeases(monotonicTimeMs());
+    if (const auto now = monotonicTimeMs(); now - secretDictionaryCollectedMs >= 1000) {
+      secretDictionaryCollectedMs = now;
+      syncSecretDictionary();
+      secretDictionary.collect(now, runtime.residentPlans());
+    }
     pruneLogEvents();
     pruneCounterEvents(monotonicTimeMs());
     std::erase_if(lastExecution, [&](const auto& entry) { return monotonicTimeMs() - entry.second > serverConfig.idleMs; });
@@ -2781,6 +3039,8 @@ public:
            << ",\"codeUnavailable\":" << versionCodeRejections << "}"
            << ",\"versionPinMismatchRejections\":" << versionPinMismatchRejections
            << ",\"secretUnavailableRejections\":" << secretUnavailableRejections
+           << ",\"secretDictionaryRefusals\":" << secretDictionaryRefusals
+           << ",\"secretDictionary\":" << secretDictionary.json(monotonicTimeMs())
            << ",\"placementHopRejections\":" << placementHopRejections
            << ",\"receivedPeerInvocations\":" << receivedPeerInvocations
            << ",\"lastRejection\":\"" << jsonEscape(cleanReason(lastRejection)) << "\""
@@ -2986,15 +3246,22 @@ public:
   coworkerd::WorkerLimits effectiveLimits(const std::string& workerId) const { return runtime.effectiveLimits(workerId); }
   // A trial's process: the tenant's quarantine shard, never an ordinary process.
   std::shared_ptr<coworkerd::ProcessCall> trialProcess(const std::string& worker) { return runtime.selectTrial(worker); }
+  std::shared_ptr<coworkerd::ProcessCall> rootTrialProcess(const std::string& worker) {
+    return runtime.selectDurable("root-trial/" + worker);
+  }
   bool quarantined(const std::string& worker) const { return runtime.quarantined(worker); }
   bool trialsQuarantined() const { return serverConfig.processPool.quarantineProcesses > 0; }
   std::string nextTrialInvocationId() {
     return serverConfig.serverId + "." + epoch() + "-trial-" + std::to_string(nextTrialSequence++);
   }
   OpenEvent openTrial(const VersionDefinition& version, const std::shared_ptr<coworkerd::ProcessCall>& process,
-      const std::string& invocationId, double deadline) {
+      const std::string& invocationId, double deadline, bool rootTrial = false) {
     auto descriptor = encodeDescriptor(version, invocationId, invocationId, 0, 0, 0, 0, deadline,
         std::make_shared<const VersionPins>(), *process, serverConfig.serverId, "", true);
+    if (rootTrial) {
+      std::string encoded(descriptor.cStr()); encoded.pop_back(); encoded += ",\"rootTrial\":true}";
+      descriptor = kj::str(encoded.c_str());
+    }
     process->workerId = version.workerId; process->versionId = version.versionId;
     process->invocationId = invocationId; process->treeId = invocationId;
     return runtime.open(process, descriptor, version.definitionHash);
@@ -3042,6 +3309,20 @@ private:
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
       const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
       const std::string& dispatchReceipt = {}) const {
+    auto encodeNative = [&](kj::String encoded) {
+      if (!process.threadedServer()) return encoded;
+      std::string value(encoded.cStr()); value.pop_back();
+      value += ",\"nativeNamespaces\":[";
+      bool first = true;
+      for (const auto& className: version.declaredClasses) {
+        const auto* space = desiredState.state().durableNamespace(version.workerId, className);
+        value += (first ? "" : ",") + std::string("{\"className\":\"") + jsonEscape(className) +
+            "\",\"namespaceId\":\"" + jsonEscape(space && space->status == "active" ? space->id : "") + "\"}";
+        first = false;
+      }
+      value += "]}";
+      return kj::str(value.c_str());
+    };
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
     descriptor.setServerId(serverConfig.serverId.c_str());
@@ -3067,6 +3348,25 @@ private:
     // env when it loads the Worker: the values of this Server's deployment view
     // (a RemoteInvocation never carries them). Every dispatch checks them first
     // (secretRefusal), synchronously before this point.
+    // The shared dictionary holds every value a descriptor carries before the descriptor is returned (and so before
+    // it can reach a runtime), for as long as the process it goes to may hold them (node/secret-dictionary.h).
+    auto holdSecrets = [&](const std::string& plan) {
+      if (version.secrets.empty()) return;
+      syncSecretDictionary();
+      std::string revision;
+      if (process.threadedServer()) {
+        constexpr std::string_view field = "\"versionFingerprint\":\"";
+        if (const auto at = plan.find(field); at != std::string::npos) {
+          const auto begin = at + field.size();
+          revision = plan.substr(begin, plan.find('"', begin) - begin);
+        }
+        if (revision.empty()) revision = version.definitionHash;
+      }
+      // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
+      if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
+              process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
+        throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now"};
+    };
     if (!version.secrets.empty()) {
       const auto& state = desiredState.state();
       auto secrets = descriptor.initSecrets(version.secrets.size());
@@ -3090,7 +3390,8 @@ private:
     // The limits this Worker names: the runtime bridge puts them in the loader key, so the version's
     // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
     // (and the loader key of a Worker that names none has no limits segment).
-    const auto limits = namedLimits(version.workerId);
+    auto limits = namedLimits(version.workerId);
+    if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
@@ -3107,11 +3408,10 @@ private:
       capnp::JsonCodec json;
       const coworkerd::VersionPins emptyPins;
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-      auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
-      const auto known = preparationBytes.find(version.contentHash);
-      encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
+      auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
       encoded += '}';
+      holdSecrets(plain.plan);
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
     }
     // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
@@ -3161,11 +3461,12 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
+      holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
-        const auto encoded = root->descriptor(json.encode(descriptor.asReader()).cStr());
+        const auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
         return kj::str(encoded.c_str());
       }
-      return json.encode(descriptor.asReader());
+      return encodeNative(json.encode(descriptor.asReader()));
     }
     auto bindingPins = pins;
     if (perCallForTest()) {
@@ -3195,11 +3496,10 @@ private:
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-    auto encoded = std::string(json.encode(descriptor.asReader()).cStr()); encoded.pop_back();
-    const auto known = preparationBytes.find(version.contentHash);
-    encoded += ",\"preparationMemoryBytes\":" + std::to_string(known == preparationBytes.end() ? 80 * 1024 * 1024 : known->second.bytes);
+    auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
     encoded += '}';
+    holdSecrets(plain.plan);
     return kj::str(plain.descriptor(std::move(encoded)).c_str());
   }
 
@@ -3228,7 +3528,7 @@ private:
   coworkerd::ProcessPool& runtime;
   coworkerd::MemoryWatermark& memory;
   std::deque<std::shared_ptr<ExecutionRecord>> executions;
-  std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingPreparations;
+  std::map<std::string, std::weak_ptr<AdmissionSlot>> pendingDispatchDecisions;
   struct PreparationBytes { uint64_t bytes, used; };
   std::map<std::string, PreparationBytes> preparationBytes;
   mutable coworkerd::PlainPlanCache plainPlanCache;
@@ -3247,6 +3547,22 @@ private:
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
   WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerTenant};
+  // What the forked log writers hide on this node, and which calls with secrets it starts
+  // (node/secret-dictionary.h). Mutable: encodeDescriptor() records what each descriptor carries.
+  mutable coworkerd::SecretDictionary secretDictionary{[this] {
+    coworkerd::SecretDictionary::Limits limits;
+    limits.idleEvictMs = serverConfig.processPool.idleEvictMs;
+    return limits;
+  }(), {coworkerd::appendPlatformLogRedactions, coworkerd::replacePlatformLogRedactions,
+      [this](const std::string& processId, uint64_t generation, const std::string& reason) {
+        // The ordinary rotation of that slot: a new generation takes its calls, the old one drains and exits.
+        auto failed = kj::runCatchingExceptions([&] { runtime.requestAutomaticRotation(processId, reason); });
+        std::cout << "[secret-dictionary] {\"event\":\"rotation-requested\",\"processId\":\"" << jsonEscape(processId)
+                  << "\",\"generation\":" << generation << ",\"queued\":" << (failed == kj::none ? "true" : "false")
+                  << ",\"reason\":\"" << jsonEscape(reason) << "\",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+      }}};
+  mutable std::pair<uint64_t, uint64_t> secretDictionaryView{UINT64_MAX, UINT64_MAX};
+  double secretDictionaryCollectedMs = 0;
   coworkerd::Membership& membership;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headers;
@@ -3256,6 +3572,10 @@ private:
   kj::Timer& timer;
   // The load check: when a version last loaded on a process (process:generation:hash#entrypoint).
   std::map<std::string, double> loadConfirmed;
+  std::map<std::string, std::shared_ptr<PendingThreadedLoad>> threadedLoads;
+  std::map<std::string, uint> threadedColdRoutes;
+  std::pair<uint64_t, uint64_t> threadedHintRevision{0, 0};
+  std::map<std::string, std::string> threadedHintLoads;
   // Durable Objects: each object's requests in flight here and how many calls led to them (objectHops), by its key.
   std::map<std::string, ObjectActivity> objects;
   std::set<std::string> rootNamespaces;
@@ -3276,6 +3596,7 @@ private:
     std::map<std::string, uint64_t> outcomes;
   };
   std::map<std::string, PausedAdmissionCounts> pausedAdmissionCounts;
+  coworkerd::TenantExecutionQueue tenantExecutionQueue;
   uint64_t nextAdmissionWaitId = 1;
   uint64_t nextPlacementSequence = 1;
   uint64_t nextTreeSequence = 1;
@@ -3338,6 +3659,7 @@ private:
   uint64_t peerUnavailableRejections = 0;
   uint64_t versionUnavailableRejections = 0;
   uint64_t secretUnavailableRejections = 0;
+  uint64_t secretDictionaryRefusals = 0;  // of them, refused by the secret dictionary's limits
   mutable std::map<coworkerd::DeploymentState::Selection::Kind, uint64_t> routeRejections;
   // The synthetic definition of each tenant's databases (databaseVersion), made once.
   mutable std::map<std::string, std::shared_ptr<const VersionDefinition>> databaseVersions;
@@ -3499,7 +3821,8 @@ std::string rejectionJson(
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
-           code == "RESULT_UNCERTAIN" ? "execution result uncertain" :
+           code == "NOT_SUPPORTED" ? "operation is not supported" :
+           (code == "RESULT_UNCERTAIN" || code == "PROCESS_MEMORY_PRESSURE") ? "execution result uncertain" :
            "execution rejected before start") << "\","
        << "\"reason\":\"" << jsonEscape(cleanReason(reason)) << "\",\"code\":\""
        << jsonEscape(code) << "\",\"observedAtUnixMs\":"
@@ -3553,7 +3876,7 @@ std::string hostWithoutPort(const std::string& host) {
 std::string refusalBody(const InvocationRejection& refusal, double deadline) {
   auto body = refusal.json();
   body.pop_back();
-  body += std::string(",\"error\":\"") + (refusal.code == "RESULT_UNCERTAIN" ? "execution result uncertain" : "execution rejected before start") + "\",\"observedAtUnixMs\":" +
+  body += std::string(",\"error\":\"") + ((refusal.code == "RESULT_UNCERTAIN" || refusal.code == "PROCESS_MEMORY_PRESSURE") ? "execution result uncertain" : "execution rejected before start") + "\",\"observedAtUnixMs\":" +
       std::to_string(wallTimeMsForTest()) + ",\"expiresAtMonotonicMs\":" + std::to_string(deadline) + "}";
   return body;
 }
@@ -3569,12 +3892,13 @@ void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRej
   refusal.setCode(value.code.c_str()); refusal.setReason(cleanReason(value.reason).c_str());
   refusal.setLoadBand(value.loadBand.c_str()); refusal.setInFlight(value.inFlight);
   refusal.setLimit(value.limit); refusal.setAvoidMs(value.avoidMs); refusal.setStatus(value.status);
+  refusal.setNotExecuted(value.notExecuted); refusal.setRetryable(value.retryable);
   if (!value.category.empty()) refusal.setCategory(value.category.c_str());
 }
 
 InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
   return {value.getStatus(), value.getCode().cStr(), value.getReason().cStr(), value.getLoadBand().cStr(),
-      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr()};
+      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr(), value.getNotExecuted(), value.getRetryable()};
 }
 
 // One relay of an inbound WebSocket connection (WebSocketRegistry): `outer` toward the client -- the client itself at the
@@ -3961,6 +4285,7 @@ public:
       server.nextLogEvent(invocation);
     };
     hooks.limitCode = [process]() -> std::string {
+      if (process->processMemoryPressure()) return "PROCESS_MEMORY_PRESSURE";
       if (process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
       if (process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
       return {};
@@ -4010,6 +4335,7 @@ public:
     auto tracked = kj::heap<TrackingHttpResponse>(response, slot->timing, slot);
     auto started = monotonicTimeMs();
     std::string failure;
+    std::string platformCode;
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
@@ -4028,8 +4354,9 @@ public:
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
+      if (slot->process && slot->process->threadedServer()) platformCode = rpcFailureCode(error);
     }
-    co_await refuse(*tracked, failure);
+    co_await refuse(*tracked, failure, platformCode);
   }
 private:
   // An ingress root that asks for a WebSocket. Once the Worker answered 101 the connection is the response: when the request
@@ -4056,19 +4383,24 @@ private:
     }
     KJ_IF_SOME(error, failed) {
       if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
-      co_await refuse(*tracked, failure);
+      co_await refuse(*tracked, failure, slot->process && slot->process->threadedServer() ? rpcFailureCode(error) : "");
     }
   }
   // A failure before the response started: the code the call's limits or its process say.
-  kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure) {
-    const auto code = limitCode();
-    slot->report(503, code.empty() ? "RESULT_UNCERTAIN" : code);
-    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, 503, "Service Unavailable",
+  kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
+      const std::string& platformCode = "") {
+    auto code = limitCode();
+    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE") code = platformCode;
+    const bool unsupported = code == "NOT_SUPPORTED";
+    slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
+    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
+        unsupported ? "Not Implemented" : "Service Unavailable",
         rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
     co_await rejection->respond(tracked);
   }
   // The limit that ended the call, if one did ("" otherwise).
   std::string limitCode() const {
+    if (slot->process && slot->process->processMemoryPressure()) return "PROCESS_MEMORY_PRESSURE";
     if (slot->process && slot->process->memoryLimitExceeded()) return "MEMORY_LIMIT_EXCEEDED";
     if (slot->process && slot->process->cpuLimitExceeded()) return "CPU_LIMIT_EXCEEDED";
     return {};
@@ -4137,6 +4469,7 @@ struct RemoteInvocationData {
   bool ingressRoot = false;
   std::string ingressServerId;
   std::string entrypoint;
+  NativeProps nativeProps;
 };
 
 // A request to a Durable Object sent to the owner of its shard (PeerServer.openObjectInvocation).
@@ -4563,6 +4896,7 @@ public:
     remote.setAlreadyPlaced(invocation.alreadyPlaced); remote.setOriginServerId(invocation.originServerId.c_str());
     remote.setIngressRoot(invocation.ingressRoot); remote.setIngressServerId(invocation.ingressServerId.c_str());
     remote.setEntrypoint(invocation.entrypoint.c_str());
+    if (invocation.nativeProps) remote.getCoworkerdProps().set(invocation.nativeProps->getRoot<capnp::AnyPointer>());
     remote.setCallSequence(invocation.callSequence); remote.setOrderSequence(invocation.orderSequence);
     remote.setDestinationEpoch(epoch.c_str());
     auto pins = remote.initVersionPins(invocation.pins->size()); size_t index = 0;
@@ -4822,9 +5156,10 @@ public:
       return RemoteInvocationData{version->workerId, pin.versionId, pin.contentHash,
           allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
           allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
-          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint};
+          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint, allocation.nativeProps};
     };
     bool allPaused = true, allTenantLimited = true;
+    bool allNotExecuted = true;
     std::optional<InvocationRejection> tenantRefusal;
     std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
@@ -4833,6 +5168,7 @@ public:
       const auto startedAt = wallTimeMsForTest();
       if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1);
       else result = co_await tryOpen(id, invocationFor(hops));
+      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
       allPaused = allPaused && result.failure && pausedRefusal(*result.failure);
       if (result.failure && pausedRefusal(*result.failure) && !firstPaused) firstPaused = result.failure;
       server.observeAttempt(id, allocation.ingressRoot, result.failure);
@@ -4899,6 +5235,7 @@ public:
         std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
       const auto target = config.serverId;
       auto result = co_await attemptHere(true);
+      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
       server.observeAttempt(target, allocation.ingressRoot, result.failure);
       if (!result.failure) {
         avoidance.erase(target);
@@ -4916,6 +5253,9 @@ public:
       co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
     failures += ']';
     auto refusal = server.refusal("PLACEMENT_EXHAUSTED", coworkerd::placementExhaustionReason(hops), 503, allocation.ingressRoot);
+    // Preserve explicit pre-execution proof through placement aggregation. A failed
+    // connection alone is insufficient evidence that another node did not execute.
+    if (attempted > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
     if (attempted > 0 && packagesUnavailable) {
       // No candidate could load the code package: the load failure is the answer.
       refusal = server.refusal("LOAD_FAILED", "the code package could not be fetched or verified on any candidate (" +
@@ -5240,6 +5580,7 @@ public:
       remote.getIngressRoot(),
       remote.getIngressServerId().cStr(),
       remote.getEntrypoint().cStr(),
+      copyNativeProps(remote.getCoworkerdProps()),
     };
     KJ_REQUIRE(coworkerd::workerFullName(invocation.workerId), "invalid remote workerId");
     KJ_REQUIRE(safeName(invocation.versionId), "invalid remote versionId");
@@ -5345,6 +5686,7 @@ public:
     current = co_await server.admit(version->workerId, version->definitionHash, invocation.ingressRoot,
         invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
     if (current.refused) { reject(*current.refused); co_return; }
+    slot->nativeProps = invocation.nativeProps;
     try {
       auto opened = server.openGranted(std::move(version), invocation.treeId, invocation.parentInvocationId,
           invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
@@ -5916,6 +6258,7 @@ public:
           false,
           allocation.ingressServerId,
           allocation.entrypoint,
+          allocation.nativeProps,
         };
         co_return Dispatched{peerForwarder.open(targetServerId, std::move(invocation))};
       }
@@ -6314,12 +6657,12 @@ private:
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
     if (!target.isDatabase()) {
-      auto unavailable = co_await server.ensureCode(*version, deadline);
+      auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
         server.rejectVersionUnavailable(unavailable);
         co_return refused(server.refusal("VERSION_UNAVAILABLE", unavailable, 409));
       }
-      if (auto missing = server.secretRefusal(*version, false)) co_return refused(*missing);
+      if (auto missing = server.secretRefusal(*version, false, true)) co_return refused(*missing);
     }
     // A call another node sent carries no lock table: its lease names the object's version here.
     if (request.allocation && !request.allocation->pins)
@@ -6347,8 +6690,9 @@ private:
       co_return Ran{std::nullopt, BindingDispatch::Dispatched{std::move(opened.dispatcher), std::move(opened.ready)}};
     } catch (const DurableDispatchRefused& failure) {
       co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
-    } catch (const ProcessUnavailable&) {
-      co_return refused(server.refusal("DO_UNAVAILABLE", "the durable process of this object (" +
+    } catch (const ProcessUnavailable& error) {
+      // Nothing was sent: the durable process is not ready, or the secret dictionary could not take the values.
+      co_return refused(server.refusal("DO_UNAVAILABLE", !error.reason.empty() ? error.reason : "the durable process of this object (" +
           server.durableProcessFor(target.key()) + ") is not ready", 503));
     }
   }
@@ -6638,7 +6982,7 @@ class BindingBootstrap;
 // rpcTarget). It carries no HTTP request; its one method call is the envelope.
 class RpcSessionDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  explicit RpcSessionDispatcher(BindingBootstrap& bootstrap): bootstrap(bootstrap) {}
+  RpcSessionDispatcher(BindingBootstrap& bootstrap, NativeProps props): bootstrap(bootstrap), nativeProps(std::move(props)) {}
   kj::Promise<void> getHttpService(GetHttpServiceContext) override {
     KJ_FAIL_REQUIRE("a JS RPC session carries no HTTP request");
   }
@@ -6646,6 +6990,7 @@ public:
 
 private:
   BindingBootstrap& bootstrap;
+  NativeProps nativeProps;
 };
 
 // The top-level target of such a session: the one call made on it names the envelope and is answered with the
@@ -6654,8 +6999,8 @@ private:
 // go of the entrypoint and everything reached through it.
 class RpcBindTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcBindTarget(BindingBootstrap& bootstrap, kj::Own<kj::PromiseFulfiller<void>> done)
-      : bootstrap(bootstrap), done(kj::mv(done)) {}
+  RpcBindTarget(BindingBootstrap& bootstrap, kj::Own<kj::PromiseFulfiller<void>> done, NativeProps props)
+      : bootstrap(bootstrap), done(kj::mv(done)), nativeProps(std::move(props)) {}
   // Nothing was handed out: the session is over with this object. Once the bind answered, the capability's own
   // membrane holds the fulfiller instead, so the session lasts as long as the caller's capabilities.
   ~RpcBindTarget() noexcept(false) { if (done.get() != nullptr) done->fulfill(); }
@@ -6670,11 +7015,12 @@ private:
   kj::Promise<void> bind(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context);
   BindingBootstrap& bootstrap;
+  NativeProps nativeProps;
   kj::Own<kj::PromiseFulfiller<void>> done;
   bool used = false;
 };
 
-class BindingBootstrap final: public rpc::WorkerdBootstrap::Server {
+class BindingBootstrap final: public rpc::ThreadedBootstrap::Server {
 public:
   BindingBootstrap(
       ServerCore& server,
@@ -6696,7 +7042,7 @@ public:
   // the opened event, as `startEvent` always did; a session does not, because its answer is the target's own
   // capability and the open travels with it.
   kj::Promise<void> openBinding(rpc::BindingDescriptor::Reader descriptor, SharedPathTiming timing,
-      BindingDispatch::Dispatched& out, bool awaitReady) {
+      BindingDispatch::Dispatched& out, bool awaitReady, NativeProps nativeProps = {}) {
     // `context` below is this one, not the RPC call's: the body is what `startEvent` has always been, and it names
     // the dispatcher it chose in the one way it always has, so that the `fetch` path's behaviour is unchanged while a
     // method call opens its event through the very same code.
@@ -6847,6 +7193,7 @@ public:
       expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
       allocation.timing = timing;
       allocation.entrypoint = entrypoint;
+      allocation.nativeProps = std::move(nativeProps);
       pathMark(timing, "allocate-child");
       if (!server.perCallForTest() && !server.pinMatches(allocation.pins,
           {workerId, versionId, contentHash, definitionHash})) {
@@ -6911,10 +7258,26 @@ public:
     // A JS RPC session carries no cf: workerd sends none for one, in either direction (see JS_RPC_TARGET_TYPE_ID
     // above), so the envelope arrives as the name of the one method the session takes.
     if (metadata.size() == 0) {
-      context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::heap<RpcSessionDispatcher>(*this));
+      context.initResults(capnp::MessageSize{4, 1}).setDispatcher(kj::heap<RpcSessionDispatcher>(*this, NativeProps()));
       return kj::READY_NOW;
     }
     return startFetchEvent(context);
+  }
+
+  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
+    auto params = context.getParams();
+    auto props = copyNativeProps(params.getCoworkerdProps());
+    auto metadata = params.getCfBlobJson();
+    if (metadata.size() == 0) {
+      context.getResults().setDispatcher(kj::heap<RpcSessionDispatcher>(*this, std::move(props)));
+      co_return;
+    }
+    capnp::MallocMessageBuilder message;
+    auto descriptor = message.initRoot<rpc::BindingDescriptor>();
+    capnp::JsonCodec json; json.setRejectUnknownFields(true); json.decode(metadata, descriptor);
+    BindingDispatch::Dispatched out;
+    co_await openBinding(descriptor.asReader(), pathTiming("binding"), out, true, std::move(props));
+    context.getResults().setDispatcher(kj::mv(out.dispatcher));
   }
 
   kj::Promise<void> startFetchEvent(StartEventContext context) {
@@ -6937,7 +7300,7 @@ public:
   void observeRpcFailure(const std::string& code) { server.observeRpcFailure(code); }
 
   kj::Promise<capnp::Capability::Client> openRpcTarget(kj::StringPtr envelope,
-      kj::Own<kj::PromiseFulfiller<void>> done) {
+      kj::Own<kj::PromiseFulfiller<void>> done, NativeProps nativeProps = {}) {
     auto timing = pathTiming("rpc");
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::BindingDescriptor>();
@@ -6951,7 +7314,7 @@ public:
     const bool durableCall = descriptor.hasDurableObject();
     const auto startedAt = monotonicTimeMs();
     BindingDispatch::Dispatched out;
-    co_await openBinding(descriptor.asReader(), std::move(timing), out, false);
+    co_await openBinding(descriptor.asReader(), std::move(timing), out, false, std::move(nativeProps));
     auto started = out.dispatcher.jsRpcSessionRequest(capnp::MessageSize{4, 0}).send();
     server.observeRpcSession(durableCall);
     server.observeRpcProxied();
@@ -6995,7 +7358,7 @@ private:
 kj::Promise<void> RpcSessionDispatcher::jsRpcSession(JsRpcSessionContext context) {
   auto paf = kj::newPromiseAndFulfiller<void>();
   auto results = context.initResults(capnp::MessageSize{4, 2});
-  results.setTopLevel(kj::heap<RpcBindTarget>(bootstrap, kj::mv(paf.fulfiller)));
+  results.setTopLevel(kj::heap<RpcBindTarget>(bootstrap, kj::mv(paf.fulfiller), std::move(nativeProps)));
   // Resolves to a null capability once the caller has dropped the target: workerd's own signal that the session is
   // over (src/workerd/api/worker-rpc.c++, JsRpcSessionCustomEvent).
   results.setSession(paf.promise.then([]() { return rpc::JsRpcSession::Client(nullptr); },
@@ -7013,7 +7376,7 @@ kj::Promise<void> RpcBindTarget::bind(uint64_t interfaceId, uint16_t methodId,
   KJ_REQUIRE(params.which() == rpc::JsRpcTarget::CallParams::METHOD_NAME,
       "a Binding's JS RPC session names its envelope");
   try {
-    auto target = co_await bootstrap.openRpcTarget(params.getMethodName(), kj::mv(done));
+    auto target = co_await bootstrap.openRpcTarget(params.getMethodName(), kj::mv(done), std::move(nativeProps));
     auto request = target.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
     builder.setMethodName(JS_RPC_BIND_METHOD);
@@ -7166,8 +7529,10 @@ private:
         capnp::MallocMessageBuilder message;
         auto json = message.initRoot<capnp::JsonValue>();
         capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.cStr(), text.size()), json);
-        refused = server.confirmPreparation(coworkerd::json::text(json, "invocationId"),
-            coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"));
+        refused = server.confirmCapacityRejection(coworkerd::json::text(json, "invocationId"),
+            coworkerd::json::text(json, "receipt"), coworkerd::json::text(json, "state"), coworkerd::json::text(json, "reason"),
+            coworkerd::json::field(json, "stage").isString() ? coworkerd::json::text(json, "stage") : "",
+            coworkerd::json::field(json, "codeStage").isString() ? coworkerd::json::text(json, "codeStage") : "");
       } catch (const kj::Exception&) {}
       const std::string text = refused ? "{\"accepted\":true,\"refusal\":" + *refused + "}" : "{\"accepted\":false}";
       kj::HttpHeaders headers(headerTable); headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
@@ -7435,68 +7800,6 @@ struct TrialRequest {
   bool routed = false;
 };
 
-// A failed load, as the runtime reported it ("Failed to start Worker:\n
-// Uncaught Error: No such module ...\n  at worker.js:1:7"), and what the
-// process's limit events say about this probe.
-TrialVerdict classifyTrialFailure(const std::string& stage, const std::string& name, const std::string& raw,
-    bool cpuExceeded, bool memoryExceeded, uint32_t cpuLimitMs, uint32_t memoryLimitMiB) {
-  std::string text = raw;
-  for (const char* prefix : {"Failed to start Worker:", "\n", " ", "Uncaught "}) {
-    if (text.starts_with(prefix)) text = text.substr(std::string_view(prefix).size());
-  }
-  std::vector<std::string> lines;
-  for (size_t start = 0; start <= text.size();) {
-    auto end = text.find('\n', start);
-    if (end == std::string::npos) end = text.size();
-    auto line = text.substr(start, end - start);
-    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
-    if (!line.empty()) lines.push_back(line);
-    start = end + 1;
-  }
-  const std::string head = lines.empty() ? std::string() : lines.front();
-  // Where it happened: an import or the first frame in the version's own modules.
-  std::string where;
-  for (size_t i = 1; i < lines.size() && where.empty(); ++i) {
-    const auto& line = lines[i];
-    if (line.starts_with("imported from ")) where = line;
-    else if (line.starts_with("at ") && line.find("node-internal:") == std::string::npos &&
-        line.find("__coworkerd_entrypoint__.js") == std::string::npos) where = line;
-  }
-  auto colon = head.find(": ");
-  std::string error = colon == std::string::npos ? std::string() : head.substr(0, colon);
-  if (!std::all_of(error.begin(), error.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; })) error.clear();
-  const std::string detail = where.empty() ? head : head + " (" + where + ")";
-  if (memoryExceeded || head.find("MEMORY_LIMIT_EXCEEDED") != std::string::npos)
-    return {"LIMIT_EXCEEDED", "memory", "memory limit exceeded while loading (" + std::to_string(memoryLimitMiB) + " MiB per isolate)"};
-  if (cpuExceeded || head.find("CPU_LIMIT_EXCEEDED") != std::string::npos)
-    return {"LIMIT_EXCEEDED", "cpu", "CPU limit exceeded while loading (" + std::to_string(cpuLimitMs) + " ms)"};
-  if (stage == "code") {
-    // The runtime builds the modules from verified bytes: a JSON module that
-    // does not parse or a text module that is not UTF-8 is the version's
-    // fault; anything else is this Server failing to hand over the code.
-    if (name == "SyntaxError" || name == "TypeError") return {"INVALID_MODULE", "", "a module cannot be decoded: " + name + ": " + text};
-    return {"UNAVAILABLE", "", "the runtime could not read the code: " + text};
-  }
-  if (head.find("does not provide an export named 'default'") != std::string::npos &&
-      head.find("__coworkerd_tenant__.js") != std::string::npos)
-    return {"ENTRYPOINT_MISSING", "", "the script has no default export"};
-  const std::string missing = "Error: No such module \"";
-  if (head.starts_with(missing)) {
-    const auto module = head.substr(missing.size(), head.find('"', missing.size()) - missing.size());
-    if (module.starts_with("node:"))
-      return {"COMPATIBILITY_FLAG", "", detail + "; node:* modules need the nodejs_compat compatibility flag"};
-    return {"MISSING_MODULE", "", detail};
-  }
-  if (error == "SyntaxError") return {"SYNTAX_ERROR", "", detail};
-  if (error == "CompileError" || error == "LinkError" || head.find("WebAssembly") != std::string::npos ||
-      head.find("WasmModuleObject") != std::string::npos)
-    return {"INVALID_MODULE", "", detail};
-  if (head == "Error: Top-level await in module is unsettled.")
-    return {"TOP_LEVEL_AWAIT", "", "a top-level await never settles (workerd refuses the module while loading)"};
-  if (head.empty()) return {"LOAD_FAILED", "", text};
-  return {"TOP_LEVEL_THROW", "", detail};
-}
-
 class TrialService final {
 public:
   static constexpr const char* PATH = "/__coworkerd/trial-load";
@@ -7571,6 +7874,35 @@ private:
   static int64_t micros(double ms) { return static_cast<int64_t>(std::max(0.0, ms) * 1000); }
   static constexpr double VIEW_WAIT_MS = 1000;
 
+  kj::Promise<std::string> probe(const VersionDefinition& version,
+      const std::shared_ptr<coworkerd::ProcessCall>& process, const std::string& invocationId,
+      double deadline, bool rootTrial = false) {
+    auto opened = [&] {
+      try {
+        return server.openTrial(version, process, invocationId, deadline, rootTrial);
+      } catch (const ProcessUnavailable& error) {
+        // Nothing was sent (the secret dictionary could not take the values): this node's condition, not the code's.
+        auto failure = KJ_EXCEPTION(DISCONNECTED, "not sent", error.reason.c_str());
+        failure.setDetail(TRIAL_NOT_SENT_DETAIL, kj::heapArray<kj::byte>(0));
+        kj::throwFatalException(kj::mv(failure));
+      }
+    }();
+    auto ready = kj::mv(opened.ready);
+    auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
+    auto service = factory.capnpToKj(getHttp.getHttp());
+    auto client = kj::newHttpClient(*service);
+    kj::HttpHeaders requestHeaders(headers);
+    auto call = client->request(kj::HttpMethod::GET, "http://coworkerd-trial/", requestHeaders, uint64_t(0));
+    auto exit = process->onExit().then([]() -> kj::HttpClient::Response { KJ_UNREACHABLE; });
+    auto response = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
+        kj::mv(call.response).exclusiveJoin(kj::mv(exit)));
+    auto body = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
+        response.body->readAllText(65536));
+    KJ_REQUIRE(response.statusCode == 200, "the runtime answered the trial with an HTTP error", response.statusCode);
+    co_return std::string(body.cStr());
+  }
+
+
   kj::Promise<std::string> run(TrialRequest request) {
     const auto started = monotonicTimeMs();
     const auto startedAtUnixMs = wallTimeMsForTest();
@@ -7637,9 +7969,13 @@ private:
       const auto codeStarted = monotonicTimeMs();
       auto unavailable = co_await server.ensureCode(*version, deadline);
       codeMs = monotonicTimeMs() - codeStarted;
-      auto process = unavailable.empty() ? server.trialProcess(version->workerId) : nullptr;
+      // A trial carries the version's secrets as a call does: they must fit in this node's secret dictionary.
+      const auto secretsRefused = unavailable.empty() ? server.admitSecrets(*version) : std::nullopt;
+      auto process = unavailable.empty() && !secretsRefused ? server.trialProcess(version->workerId) : nullptr;
       if (!unavailable.empty()) {
         verdict = {"UNAVAILABLE", "", monotonicTimeMs() >= deadline ? "timed out before loading: fetching the code" : unavailable};
+      } else if (secretsRefused) {
+        verdict = {"UNAVAILABLE", "", *secretsRefused};
       } else if (!process) {
         verdict = {"UNAVAILABLE", "", server.trialsQuarantined() ? "no ready quarantine process" : "no ready workerd process"};
       } else {
@@ -7648,26 +7984,46 @@ private:
         generation = process->generation;
         dispatched = true;
         const auto probeStarted = monotonicTimeMs();
-        auto opened = server.openTrial(*version, process, invocationId, deadline);
-        // Kept until the probe ends: dropping it would cancel the dispatch.
-        auto ready = kj::mv(opened.ready);
-        std::string report, failure;
-        bool timedOut = false;
+        std::string report, failure, notSent;
+        bool timedOut = false, rootCpuExceeded = false, rootMemoryExceeded = false;
+        auto probeProcess = process;
+        auto probeInvocation = invocationId;
         try {
-          auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
-          auto service = factory.capnpToKj(getHttp.getHttp());
-          auto client = kj::newHttpClient(*service);
-          kj::HttpHeaders requestHeaders(headers);
-          auto call = client->request(kj::HttpMethod::GET, "http://coworkerd-trial/", requestHeaders, uint64_t(0));
-          auto exit = process->onExit().then([]() -> kj::HttpClient::Response { KJ_UNREACHABLE; });
-          auto response = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
-              kj::mv(call.response).exclusiveJoin(kj::mv(exit)));
-          auto body = co_await timer.timeoutAfter(micros(deadline - monotonicTimeMs()) * kj::MICROSECONDS,
-              response.body->readAllText(65536));
-          KJ_REQUIRE(response.statusCode == 200, "the runtime answered the trial with an HTTP error", response.statusCode);
-          report = body.cStr();
+          report = co_await probe(*version, process, invocationId, deadline);
+          if (process->threadedServer() && version->format == "v2" && !version->declaredClasses.empty()) {
+            capnp::MallocMessageBuilder message;
+            auto json = message.initRoot<capnp::JsonValue>();
+            capnp::JsonCodec().decodeRaw(kj::arrayPtr(report.data(), report.size()), json);
+            auto ok = coworkerd::json::field(json, "ok");
+            auto classes = coworkerd::json::field(json, "durableObjectClasses");
+            bool usable = classes.isArray() && classes.getArray().size() == version->declaredClasses.size();
+            if (usable) for (auto entry: classes.getArray()) {
+              auto value = coworkerd::json::field(entry, "usable");
+              if (!value.isBoolean() || !value.getBoolean()) usable = false;
+            }
+            if (ok.isBoolean() && ok.getBoolean() && usable) {
+              auto root = server.rootTrialProcess(version->workerId);
+              if (!root) {
+                verdict = {"UNAVAILABLE", "", "no ready durable process for the root trial"};
+              } else {
+                probeProcess = root; probeInvocation = invocationId + "-root";
+                KJ_DEFER({
+                  rootCpuExceeded = root->cpuLimitExceeded();
+                  rootMemoryExceeded = root->memoryLimitExceeded();
+                  root->finish();
+                });
+                auto rootReport = co_await probe(*version, root, probeInvocation, deadline, true);
+                capnp::MallocMessageBuilder rootMessage;
+                auto rootJson = rootMessage.initRoot<capnp::JsonValue>();
+                capnp::JsonCodec().decodeRaw(kj::arrayPtr(rootReport.data(), rootReport.size()), rootJson);
+                auto rootOk = coworkerd::json::field(rootJson, "ok");
+                if (!rootOk.isBoolean() || !rootOk.getBoolean()) report = std::move(rootReport);
+              }
+            }
+          }
         } catch (const kj::Exception& error) {
-          failure = error.getDescription().cStr();
+          if (error.getDetail(TRIAL_NOT_SENT_DETAIL) != kj::none) notSent = "this node's secret dictionary cannot take the version's secret values now";
+          else failure = error.getDescription().cStr();
           timedOut = monotonicTimeMs() >= deadline;
         }
         bool exited = false;
@@ -7675,17 +8031,21 @@ private:
           // The connection to workerd failed: let the pool observe the exit
           // (it reads the culprit then), bounded.
           std::string ended;
-          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, process->onExit()); }
+          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, probeProcess->onExit()); }
           catch (const kj::Exception& error) { ended = error.getDescription().cStr(); }
           exited = ended.find("exited") != std::string::npos;
-          if (exited) culprit = server.culpritOf(invocationId);
+          if (exited) culprit = server.culpritOf(probeInvocation);
         }
         // The probe ends here, whatever happened: its process call is released,
         // and on a timeout the request into workerd is cancelled.
-        const bool cpuExceeded = process->cpuLimitExceeded(), memoryExceeded = process->memoryLimitExceeded();
+        const bool cpuExceeded = rootCpuExceeded || process->cpuLimitExceeded(),
+            memoryExceeded = rootMemoryExceeded || process->memoryLimitExceeded();
         process->finish();
         probeMs = monotonicTimeMs() - probeStarted;
-        if (timedOut) {
+        if (!notSent.empty()) {
+          dispatched = false;
+          verdict = {"UNAVAILABLE", "", notSent};
+        } else if (timedOut) {
           verdict = {"TIMEOUT", "", "timed out while loading (" + std::to_string(request.timeoutMs) + " ms); the probe was cancelled"};
         } else if (!culprit.empty()) {
           quarantined = server.quarantined(version->workerId);
@@ -7704,7 +8064,9 @@ private:
           auto string = [&](const char* name) { auto value = field(json, name); return value.isString() ? std::string(value.getString().cStr()) : std::string(); };
           coldLoad = flag("coldLoad");
           if (auto value = field(json, "loadMs"); value.isNumber()) loadMs = value.getNumber();
-          if (flag("ok")) {
+          if (!verdict.category.empty()) {
+            // The durable half could not be admitted; retain the retryable verdict.
+          } else if (flag("ok")) {
             const auto kind = string("defaultKind");
             std::vector<std::string> named;
             if (auto list = field(json, "namedEntrypoints"); list.isArray())
@@ -7717,7 +8079,9 @@ private:
             entrypoint = out.str();
             std::string names;
             for (const auto& name : named) names += (names.empty() ? "" : ", ") + name;
-            if (kind == "class" || kind == "object") {
+            if (kind == "class" || kind == "object" ||
+                (process->threadedServer() && flag("nativeHttpValidated") &&
+                    flag("hasDefault") && flag("entrypointUsable"))) {
               verdict.message = "the default export serves fetch (" + kind + ")";
               // The isolate stays for the next call; the load check before it need not load again.
               server.confirmLoaded(*process, server.loadRevision(*version), "");
@@ -7736,10 +8100,12 @@ private:
                 break;
               }
             }
+          } else if (flag("capacityRejected")) {
+            dispatched = false;
+            verdict = {"UNAVAILABLE", "", "native process admission budget is full; nothing executed"};
           } else {
             const auto applied = server.effectiveLimits(request.workerId);
-            verdict = flag("preparationLimit") ? TrialVerdict{"LOAD_FAILED", "", string("message")}
-                : classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
+            verdict = classifyTrialFailure(string("stage"), string("name"), string("message"), cpuExceeded, memoryExceeded,
                     applied.cpuMs, applied.memoryMiB);
           }
         }
@@ -8009,6 +8375,15 @@ private:
       server.observeLocalRefusal(failure, "localIngress");
       co_return co_await sendText(response, 503, "Service Unavailable",
           rejectionJson(failure.code, failure.reason, deadline), "application/json");
+    }
+    // A burst of cold headers must not run every preparation chain before an
+    // established Worker's ready I/O. Admission remains per request.
+    auto coldRoute = server.beginThreadedColdRoute(*selected.version);
+    KJ_DEFER(server.endThreadedColdRoute(coldRoute));
+    if (!coldRoute.empty()) {
+      pathMark(timing, "cold-yield-start");
+      co_await kj::yieldUntilWouldSleep();
+      pathMark(timing, "cold-yield-end");
     }
     if (selected.version->assets && co_await assets.serve(*selected.version, AssetLayer::Source::INGRESS, method, path, headers,
         response, deadline)) co_return;
@@ -8569,8 +8944,84 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 // configuration a Server reports is the one it runs; the pool applies the same values again.
 void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
+  if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
+  pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
+  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || pool.cpuLimitMs <= 300000,
+      "ordinary cpuLimitMs is at most 300000 milliseconds");
+  pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
+  pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
+  pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
+  pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
+  const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
+  const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
+  const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
+  if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
+  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
+      "native process memory budget exceeds its node share", memorySource.c_str());
+  if (pool.count + pool.quarantineProcesses > 0) {
+    // Include a replacement generation, private channels and prepared sockets;
+    // reject an insufficient host hard limit before starting any child process.
+    const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
+    const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
+    const auto required = std::max(childRequired, nodeRequired);
+    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
+        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+    uint64_t uidThreads = 0;
+#ifdef __linux__
+    // RLIMIT_NPROC counts every existing thread of the real UID, including
+    // this node and unrelated processes, rather than just our child pool.
+    for (const auto& entry: fs::directory_iterator("/proc")) {
+      auto name = entry.path().filename().string();
+      if (name.empty() || !std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c); })) continue;
+      std::ifstream status(entry.path() / "status");
+      uint64_t uid = UINT64_MAX, threads = 0; std::string line;
+      while (std::getline(status, line)) {
+        if (line.starts_with("Uid:")) std::istringstream(line.substr(4)) >> uid;
+        else if (line.starts_with("Threads:")) std::istringstream(line.substr(8)) >> threads;
+      }
+      if (uid == getuid()) uidThreads += threads;
+    }
+#endif
+    const auto uidRequired = uidThreads + threadsRequired;
+    rlimit processLimit;
+    KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
+    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= uidRequired,
+        "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
+    if (processLimit.rlim_cur < uidRequired) {
+      processLimit.rlim_cur = uidRequired;
+      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
+    }
+#ifdef __linux__
+    auto cgroup = fs::path("/sys/fs/cgroup");
+    std::ifstream membership("/proc/self/cgroup"); std::string member;
+    while (std::getline(membership, member)) if (member.starts_with("0::") && member.substr(3) != "/") {
+      auto candidate = cgroup / member.substr(4);
+      if (fs::exists(candidate / "pids.max")) cgroup = candidate;
+    }
+    for (auto directory = cgroup; !directory.empty() && directory.string().starts_with("/sys/fs/cgroup"); directory = directory.parent_path()) {
+      std::ifstream maximumFile(directory / "pids.max"), currentFile(directory / "pids.current");
+      std::string maximum; uint64_t current = 0;
+      if (maximumFile >> maximum && maximum != "max" && currentFile >> current) {
+        uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
+        KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
+            "insufficient cgroup thread headroom", threadsRequired, current, bound);
+      }
+    }
+#endif
+    const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
+    KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
+        "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
+    rlimit inherited;
+    KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");
+    KJ_REQUIRE(inherited.rlim_max >= required, "insufficient host descriptor hard limit",
+        required, inherited.rlim_max, "missing", required > inherited.rlim_max ? required - inherited.rlim_max : 0);
+    if (inherited.rlim_cur < required) {
+      inherited.rlim_cur = required;
+      KJ_REQUIRE(setrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot set node descriptor soft limit", required);
+    }
+  }
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
                              std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
                              std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &pool.rotationDrainTimeoutMs},
@@ -8621,13 +9072,15 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   // The steady-state table of the same build, beside it as well.
   if (pool.steadyAllowlistPath.empty()) pool.steadyAllowlistPath = (executableDirectory() / "coworkerd-syscalls-steady.txt").string();
   pool.validate();
-  const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
-  std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
-            << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-            << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
-  if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
-    std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
-  std::cout << '}' << std::endl;
+  if (pool.durableProcesses > 0) {
+    const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
+    std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
+              << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
+              << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
+    if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
+      std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
+    std::cout << '}' << std::endl;
+  }
 }
 
 // The shortest text that reads back as the same double (0.05, not 0.050000000000000003).
@@ -8725,6 +9178,27 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
   return out.str();
 }
 
+class FairConnectionReceiver final: public kj::ConnectionReceiver {
+public:
+  explicit FairConnectionReceiver(kj::Own<kj::ConnectionReceiver> inner): inner(kj::mv(inner)) {}
+  kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override {
+    auto connection = co_await inner->accept();
+    co_await kj::yieldUntilWouldSleep();
+    co_return kj::mv(connection);
+  }
+  kj::Promise<kj::AuthenticatedStream> acceptAuthenticated() override {
+    auto connection = co_await inner->acceptAuthenticated();
+    co_await kj::yieldUntilWouldSleep();
+    co_return kj::mv(connection);
+  }
+  uint getPort() override { return inner->getPort(); }
+  void getsockopt(int level, int option, void* value, uint* length) override { inner->getsockopt(level, option, value, length); }
+  void setsockopt(int level, int option, const void* value, uint length) override { inner->setsockopt(level, option, value, length); }
+  void getsockname(struct sockaddr* address, uint* length) override { inner->getsockname(address, length); }
+private:
+  kj::Own<kj::ConnectionReceiver> inner;
+};
+
 int run(Launch launch) {
   auto io = kj::setupAsyncIo();
   const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
@@ -8742,6 +9216,8 @@ int run(Launch launch) {
 
   const auto& manifestPath = launch.manifestPath;
   auto serverConfig = std::move(launch.config);
+  // Poll sockets during bursts of RPC continuations, before their queue drains.
+  coworkerd::configureNodeEventLoop(waitScope);
   serverConfig.drainTimeoutMs = static_cast<uint32_t>(
       environmentUnsigned("COWORKERD_DRAIN_TIMEOUT_MS", serverConfig.drainTimeoutMs, 86'400'000));
   serverConfig.drainAnnounceDelayMsForTest = static_cast<uint32_t>(
@@ -9090,6 +9566,7 @@ int run(Launch launch) {
   auto peerAddress = io.provider->getNetwork()
       .parseAddress(peerAddressText.c_str()).wait(waitScope);
   auto httpListener = httpAddress->listen();
+  httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener));
   auto bindingListener = bindingAddress->listen();
   auto peerListener = peerAddress->listen();
   auto sourceListener = sourceAddress->listen();

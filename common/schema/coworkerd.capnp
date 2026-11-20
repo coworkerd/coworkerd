@@ -67,6 +67,13 @@ interface WorkerdBootstrap @0x878048cda334ade3 {
       -> (dispatcher :EventDispatcher);
 }
 
+# Native ordinary-process loopback props. The wire type and method are private
+# to this transport; upstream workerd keeps using WorkerdBootstrap unchanged.
+interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
+  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer)
+      -> (dispatcher :EventDispatcher);
+}
+
 interface PeerServer @0xab4d6df924ec776f {
   openInvocation @0 (invocation :RemoteInvocation)
       -> (result :InvocationOpenResult);
@@ -153,6 +160,8 @@ struct InvocationRejection {
   status @6 :UInt16;
   # LOAD_FAILED: package-unavailable, evaluation, limit or secret-missing.
   category @7 :Text;
+  notExecuted @8 :Bool;
+  retryable @9 :Bool;
 }
 
 struct RemoteInvocation {
@@ -175,6 +184,8 @@ struct RemoteInvocation {
   ingressRoot @16 :Bool = false;
   ingressServerId @17 :Text;
   entrypoint @18 :Text;
+  # Opaque native loopback props, including its capability table. Nodes only copy it.
+  coworkerdProps @19 :AnyPointer;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
@@ -231,7 +242,7 @@ struct ServerConfig {
   placement @10 :PlacementConfig;
   processPool @11 :ProcessPoolConfig;
   ingressPlacement @12 :Bool = true;
-  cpuLimitMs @13 :UInt32 = 200;
+  cpuLimitMs @13 :UInt32 = 30000;
   # Quarantine processes; suspects are tenants, sharded over these processes by the tenant's
   # rendezvous hash, and trial loads run here too.
   quarantineProcesses @14 :UInt32 = 2;
@@ -590,6 +601,19 @@ struct ProcessPoolConfig {
   # Process-wide cumulative SQL CPU and active-SQL wall limits per event. Independent of tenant CPU limits.
   sqlCpuLimitMs @10 :UInt32 = 200;
   sqlWallLimitMs @11 :UInt32 = 800;
+  # Backend for ordinary and quarantine processes. Durable processes stay upstream.
+  ordinaryServer @12 :Text = "threaded";
+  # Empty: coworkerd-threaded beside workerdPath.
+  threadedExecutable @13 :Text;
+  # Per-tenant calls while another tenant is in flight. Omitted or 0 disables it.
+  tenantInFlightLimit @14 :UInt32 = 0;
+  # 0 derives a safe share from the node's cgroup/configured memory budget.
+  threadedMemoryBytes @15 :UInt64 = 0;
+  # Shared-pointer-space budget, below the measured fatal boundary.
+  threadedResidentLimit @16 :UInt32 = 1840;
+  threadedThreadIdleMs @17 :UInt32 = 60000;
+  # Node-side wait for this tenant's process share, bounded by the call's lease.
+  tenantAdmissionWaitMs @18 :UInt32 = 1000;
 }
 
 struct RotationConfig {
@@ -663,6 +687,11 @@ struct CpuReport {
   majorOrdinal @22 :UInt64;
   # When the collection ended (gc-pause rows).
   observedAtUnixMs @23 :UInt64;
+  # memory-culprit rows of the native server: the heap of the isolate whose allocation failed, at its last
+  # collection before V8's fatal OOM, and whether the row reports it (the stock workerd rows do not; a value
+  # of 0 is a reported heap, for example an isolate that died in its first collection).
+  oomIsolateHeapBytes @24 :UInt64;
+  oomIsolateHeapReported @25 :Bool;
 }
 
 struct PlacementConfig {

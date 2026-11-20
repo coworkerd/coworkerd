@@ -38,6 +38,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -83,7 +84,7 @@ struct bind {
 };
 
 static struct {
-  int status_fd, program_fd, check;
+  int status_fd, program_fd, check, threaded, nofile;
   pid_t parent_pid;
   const char *root, *hostname;
   int user_ns, mount_ns, net, ipc, uts, drop_caps, no_new_privs, non_dumpable;
@@ -200,6 +201,7 @@ static void parse(int argc, char **argv) {
     else if (TAKE("--status-fd")) options.status_fd = number(value, "--status-fd");
     else if (TAKE("--program-fd")) options.program_fd = number(value, "--program-fd");
     else if (TAKE("--parent-pid")) options.parent_pid = (pid_t)number(value, "--parent-pid");
+    else if (TAKE("--nofile")) options.nofile = number(value, "--nofile");
     else if (TAKE("--root")) { options.root = value; options.mount_ns = 1; }
     else if (TAKE("--bind")) add_bind(value, BIND_RO);
     else if (TAKE("--bind-rw")) add_bind(value, BIND_RW);
@@ -217,6 +219,7 @@ static void parse(int argc, char **argv) {
     else if (!strcmp(word, "--drop-caps")) options.drop_caps = 1;
     else if (!strcmp(word, "--no-new-privs")) options.no_new_privs = 1;
     else if (!strcmp(word, "--non-dumpable")) options.non_dumpable = 1;
+    else if (!strcmp(word, "--threaded")) options.threaded = 1;
     else if (!strcmp(word, "--check")) options.check = 1;
     else { errno = EINVAL; fail("unknown option %s", word); }
 #undef TAKE
@@ -315,6 +318,22 @@ static int build_filter(struct sock_filter *program, __u32 action) {
   program[at++] = (struct sock_filter)BPF_STMT(BPF_JMP | BPF_JA | BPF_K, 1);
   program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 #endif
+  if (options.threaded) {
+    const __u32 thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+        CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]));
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, thread_flags, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+        action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4);
+    program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+        action == SECCOMP_RET_USER_NOTIF ? action : SECCOMP_RET_KILL_PROCESS);
+    program[at++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+  }
   const int allow_slot = at + allowed_count + 1;
   for (int i = 0; i < allowed_count; ++i)
     program[at++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (__u32)allowed[i], (__u8)(allowed_count - i), 0);
@@ -330,7 +349,7 @@ static void install_filter(void) {
   if (!strcmp(options.seccomp_mode, "off")) return;
   step = "seccomp";
   const int observe = !strcmp(options.seccomp_mode, "observe");
-  struct sock_filter program[MAX_ALLOWED + 8];
+  struct sock_filter program[MAX_ALLOWED + 24];
   const int length = build_filter(program, observe ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_KILL_PROCESS);
   struct sock_fprog filter = {.len = (unsigned short)length, .filter = program};
   // no_new_privs is a precondition of seccomp(2) for an unprivileged process; set it either way.
@@ -536,6 +555,17 @@ int main(int argc, char **argv) {
     return 0;
   }
   parse(argc, argv);
+  if (options.nofile) {
+    step = "descriptor-limit";
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) fail("cannot read descriptor limit");
+    if (limit.rlim_max < (rlim_t)options.nofile) {
+      errno = EINVAL;
+      fail("descriptor hard limit %llu is below required %d", (unsigned long long)limit.rlim_max, options.nofile);
+    }
+    limit.rlim_cur = (rlim_t)options.nofile;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0) fail("cannot set descriptor soft limit %d", options.nofile);
+  }
   // The Server's two descriptors for the launcher itself must not reach workerd.
   if (options.status_fd >= 0 && fcntl(options.status_fd, F_SETFD, FD_CLOEXEC) != 0) { int fd = options.status_fd; options.status_fd = -1; fail("--status-fd %d is not open", fd); }
   if (options.program_fd >= 0 && fcntl(options.program_fd, F_SETFD, FD_CLOEXEC) != 0) fail("--program-fd %d is not open", options.program_fd);

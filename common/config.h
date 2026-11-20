@@ -1,6 +1,7 @@
 #pragma once
 
 #include "object-store.h"
+#include "cpu-capacity.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -25,7 +26,8 @@ struct ProcessPoolConfig {
   uint32_t restartMaxMs = 2000;
   bool watchdog = true;
   uint32_t pausedAdmissionWaitMs = 1000;
-  uint32_t cpuLimitMs = 200;
+  uint32_t cpuLimitMs = 30000;
+  uint32_t durableCpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
   // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
@@ -85,6 +87,16 @@ struct ProcessPoolConfig {
   // COWORKERD_SANDBOX_STEADY_ALLOWLIST override them.
   std::string steadySyscallsMode = "off";
   std::string steadyAllowlistPath;
+  // Selects the ordinary and quarantine backend; durable processes use upstream.
+  std::string ordinaryServer = "threaded";
+  std::string threadedExecutable;
+  // Experimental per-tenant calls per native process; disabled unless explicitly configured.
+  uint32_t tenantInFlightLimit = 0;
+  uint32_t tenantAdmissionWaitMs = 1000;
+  // 0 derives a process share from the node's actual memory budget, including a spare generation.
+  uint64_t threadedMemoryBytes = 0;
+  uint32_t threadedResidentLimit = 1840;
+  uint32_t threadedThreadIdleMs = 60000;
   void validate() const;
 };
 
@@ -124,6 +136,9 @@ struct WorkerLogSettings {
   // all. 0 bytes: no rotation. A sink that is not a regular file (a FIFO) never rotates.
   uint64_t sinkMaxBytes = 256ull << 20;
   uint32_t sinkFiles = 4;
+  // Not configurable (no field in the schema): a queued line older than this is dropped, not cleaned late
+  // (LOG_LINE_STALE_MS, common/log-cleaning.h). Tests set it shorter.
+  uint32_t staleLineMs = 50000;
 };
 
 // Per-tenant usage (ServerConfig.usage): counted on the node, the hours that changed written to its own objects on the

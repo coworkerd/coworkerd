@@ -12,7 +12,8 @@ coworkerd-launcher --version
 ```
 
 Everything after `--` is workerd's command line exactly as the Server would start it without the launcher
-(`<workerd> serve --experimental --socket-fd rpc=4 <stack>/processes/<slot>.capnp`). The options are read from
+(`<workerd> serve --experimental --socket-fd rpc=4 <stack>/processes/<slot>.capnp` for a durable process,
+or `<coworkerd-threaded> 4 <source-address> <slot>:<generation> <in-flight-limit>` for an ordinary process). The options are read from
 the command line only; the launcher reads no environment variable and changes none except `PWD` (set to `/`,
 the new working directory).
 
@@ -28,6 +29,8 @@ the new working directory).
 | `--drop-caps` | every capability dropped: bounding, permitted, effective, inheritable and ambient sets |
 | `--no-new-privs` | `PR_SET_NO_NEW_PRIVS` |
 | `--non-dumpable` | `PR_SET_DUMPABLE 0` (see "Layers" for what survives the `execv`) |
+| `--nofile N` | Set the child's soft `RLIMIT_NOFILE` to `N` before namespaces and filters. The inherited hard limit must already cover `N`; otherwise launch fails at `descriptor-limit` |
+| `--threaded` | Apply the native backend's thread-only `clone` rule; `clone3` returns `ENOSYS`. Invalid clone flags notify the Server in observe mode and end the process in enforce mode |
 | `--seccomp MODE` | the system call allowlist's mode: `off` (no filter), `observe` (a call outside the list is reported to the Server and then proceeds) or `enforce` (it ends the process). The filter is the last step before the `execv`, so it is in force for workerd itself |
 | `--allow-file FILE` | the allowlist the build generated (`scripts/syscall-allowlist.py`): this architecture's call numbers, one per line, everything else a comment -- among them a `# workerd-sha256 <hex>` line for **every** workerd the list belongs to (at most 8) and `# name <number> <name>`, the table the Server reports an observed call by. Read before the mount namespace is built, since the file is a path of the Server's root, and read again at every launch, so a list put in place while the Server runs takes effect for the launches that follow |
 | `--program-sha256 HEX` | the digest the Server has for the workerd file of this launch. It must be **among** the digests the allowlist names: a list that does not cover these bytes would end processes in the enforce mode and report calls that are not this binary's in the observe one. The Server passes the digest of the very file it opened as `--program-fd`, and that file is what gets bound, so the comparison is between the allowlist and what actually runs. No match fails the launch at step `allowlist`; the `exec` record says which digest matched and how many the list names, which is what makes an upgrade possible: a list covering the binary in place and the one about to replace it is installed first, then the binary is replaced (docs/guide/install.md) |
@@ -42,6 +45,12 @@ module), `<stack>/run` (read-write: its listening socket and the two callback so
 `/sys/devices/system/cpu` and `/etc/localtime`; the stack's paths and the libraries come from the Server rather
 than being fixed. Every path keeps its absolute name inside, so workerd's command
 line, its configuration (`embed`, the `unix:` callback addresses) and its descriptors are unchanged.
+
+Native processes receive `--nofile 8*inFlightLimit+256` and `--threaded`. Before spawning,
+the Server checks its own inherited hard descriptor limit against both this child requirement and
+`256 + (ordinary + quarantine + durable + 1) * (4*inFlightLimit + 128)` for its connections,
+including a replacement generation. It raises only its soft limit and refuses startup with the
+required, available and missing counts if the hard limit is insufficient.
 
 ## Descriptors
 
@@ -118,6 +127,7 @@ the process's own uid rather than root) says what is in effect.
 | Status | Meaning |
 | --- | --- |
 | 125 | the launch failed before workerd was executed (`failed` record) |
+| 78 | the native backend could not initialize its configured resources. The Server reports exit category `configuration` and leaves the slot stopped instead of repeatedly restarting it |
 | none: signal 31 | the enforce mode's filter ended the process on a call outside the allowlist, so it has no exit status at all: it was signalled (`SIGSYS`). The Server's exit category for such an exit is `syscall-denied` |
 | 0 | `--check` or `--version` passed |
 | anything else | workerd's own: after the `execv` the process is workerd |

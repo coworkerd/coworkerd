@@ -1,6 +1,12 @@
 #include "bundle-cache.h"
+#include "config.h"
 #include "code-package.h"
 #include "invocation-contract.h"
+#include "event-loop.h"
+#include "trial-verdict.h"
+#include "tenant-execution.h"
+#include "process-heat.h"
+#include "cpu-capacity.h"
 #include "placement-contract-test.h"
 #include "json.h"
 #include "process-culprit.h"
@@ -15,6 +21,10 @@
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
+#include <sys/wait.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace coworkerd {
 namespace {
@@ -28,6 +38,194 @@ struct TempDir {
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
+}
+
+void nativeConfig() {
+  TempDir directory;
+  write(directory / "default.json", "{}");
+  const auto direct = ServerConfig::load({});
+  const auto decoded = ServerConfig::load(directory / "default.json");
+  for (const auto* config : {&direct, &decoded}) {
+    KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
+    KJ_REQUIRE(config->processPool.tenantInFlightLimit == 0);
+    KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
+    KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
+  }
+  write(directory / "limits.json", "{\"cpuLimitMs\":200,\"memoryLimitMiB\":64}");
+  const auto overridden = ServerConfig::load(directory / "limits.json");
+  KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
+      overridden.processPool.memoryLimitMiB == 64);
+  write(directory / "disabled.json", "{\"processPool\":{\"tenantInFlightLimit\":0,\"tenantAdmissionWaitMs\":25}}");
+  const auto disabled = ServerConfig::load(directory / "disabled.json");
+  KJ_REQUIRE(disabled.processPool.tenantInFlightLimit == 0 && disabled.processPool.tenantAdmissionWaitMs == 25);
+  disabled.processPool.validate();
+}
+
+void tenantExecution() {
+  KJ_REQUIRE(makeTenantExecutionState(0) == nullptr);
+  KJ_REQUIRE(makeTenantExecutionState(2) != nullptr);
+  for (const auto [cpus, expected] : {std::pair{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 2u}, {4u, 2u},
+      {5u, 3u}, {16u, 13u}, {64u, 61u}}) KJ_REQUIRE(tenantExecutionShare(cpus) == expected);
+  KJ_REQUIRE(quotaCpuCount(150000, 100000) == 2 && quotaCpuCount(200000, 100000) == 2);
+  KJ_REQUIRE(quotaCpuCount(UINT64_MAX, 1) == UINT32_MAX && quotaCpuCount(1, 0) == 0);
+  TempDir directory;
+  const auto leaf = std::filesystem::path(directory.path) / "parent/leaf";
+  std::filesystem::create_directories(leaf);
+  write(leaf / "cpu.max", "max 100000\n");
+  write(leaf.parent_path() / "cpu.max", "150000 100000\n");
+  write(std::filesystem::path(directory.path) / "cpu.max", "400000 100000\n");
+  KJ_REQUIRE(cpusWithinQuota(16, leaf, directory.path) == 2);
+  KJ_REQUIRE(cpusWithinQuota(1, leaf, directory.path) == 1);
+  write(leaf / "cpu.max", "100000 100000\n");
+  KJ_REQUIRE(cpusWithinQuota(16, leaf, directory.path) == 1);
+  KJ_REQUIRE(!tenantExecutionLimited(100, 1, 13));
+  KJ_REQUIRE(tenantExecutionLimited(100, 2, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(12, 2, 13));
+  KJ_REQUIRE(!tenantExecutionLimited(100, 2, 0));
+#ifdef __linux__
+  const auto child = fork(); KJ_REQUIRE(child >= 0);
+  if (!child) {
+    cpu_set_t available, two;
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) _exit(1);
+    CPU_ZERO(&two); unsigned count = 0;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE && count < 2; ++cpu) if (CPU_ISSET(cpu, &available)) {
+      CPU_SET(cpu, &two); ++count;
+    }
+    if (sched_setaffinity(0, sizeof(two), &two) != 0) _exit(1);
+    const auto actual = availableProcessCpus();
+    _exit(actual >= 1 && actual <= count ? 0 : 1);
+  }
+  int status = 0; KJ_REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
+  kj::EventLoop loop; kj::WaitScope scope(loop);
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  TenantExecutionQueue queue;
+  auto state = std::make_shared<TenantExecutionState>(2);
+  state->enter("x"); state->enter("x"); state->enter("y");
+  KJ_REQUIRE(state->active() == 2 && state->count("x") == 2 && state->limited("x"));
+  auto first = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
+  auto second = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope) && queue.active() == 2 && state->queued() == 2);
+  auto full = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(full.wait(scope) == TenantExecutionQueue::FULL && queue.active() == 2);
+  timer.advanceTo(timer.now() + 5 * kj::MILLISECONDS);
+  KJ_REQUIRE(!first.poll(scope) && !second.poll(scope));
+  state->leave("x");
+  KJ_REQUIRE(first.poll(scope) && !second.poll(scope));
+  KJ_REQUIRE(first.wait(scope) == TenantExecutionQueue::READY && queue.active() == 1);
+  state->enter("x");
+  second = nullptr;
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && state->count("x") == 2);
+
+  auto borrowed = std::make_shared<TenantExecutionState>(2);
+  for (unsigned i = 0; i < 4; ++i) borrowed->enter("x");
+  KJ_REQUIRE(borrowed->active() == 1 && !borrowed->limited("x"));
+  borrowed->enter("y");
+  auto allFirst = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {borrowed});
+  auto allSecond = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {borrowed});
+  KJ_REQUIRE(!allFirst.poll(scope) && !allSecond.poll(scope));
+  borrowed->leave("y");
+  KJ_REQUIRE(borrowed->active() == 1 && borrowed->count("x") == 4);
+  KJ_REQUIRE(allFirst.poll(scope) && allSecond.poll(scope));
+  KJ_REQUIRE(allFirst.wait(scope) == TenantExecutionQueue::READY && allSecond.wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && borrowed->queued() == 0);
+
+  auto other = std::make_shared<TenantExecutionState>(2);
+  other->enter("x"); other->enter("x"); other->enter("y");
+  auto either = queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {state, other});
+  KJ_REQUIRE(!either.poll(scope) && state->queued() == 1 && other->queued() == 1);
+  other->leave("x");
+  KJ_REQUIRE(either.poll(scope) && either.wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && other->queued() == 0);
+
+  auto expired = queue.wait(timer, 10 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!expired.poll(scope) && state->count("x") == 2);
+  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS);
+  KJ_REQUIRE(expired.poll(scope) && expired.wait(scope) == TenantExecutionQueue::EXPIRED);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0 && state->count("x") == 2);
+  auto late = queue.wait(timer, 10 * kj::MILLISECONDS, 2, "x", {state});
+  KJ_REQUIRE(!late.poll(scope));
+  timer.advanceTo(timer.now() + 11 * kj::MILLISECONDS); state->leave("x");
+  KJ_REQUIRE(late.poll(scope) && late.wait(scope) == TenantExecutionQueue::EXPIRED);
+  KJ_REQUIRE(queue.active() == 0 && state->queued() == 0);
+
+  auto disabled = std::make_shared<TenantExecutionState>(0);
+  for (unsigned i = 0; i < 100; ++i) disabled->enter("x");
+  disabled->enter("y");
+  KJ_REQUIRE(disabled->active() == 2 && !disabled->limited("x"));
+  KJ_REQUIRE(queue.wait(timer, 1000 * kj::MILLISECONDS, 2, "x", {disabled}).wait(scope) == TenantExecutionQueue::READY);
+  KJ_REQUIRE(queue.active() == 0 && disabled->queued() == 0);
+
+  ProcessHeat heat;
+  heat.touch("a", 0); heat.touch("b", 1); heat.touch("c", 2); heat.touch("a", 3);
+  heat.expire(4, 2);
+  KJ_REQUIRE(heat.size() == 2 && heat.find("b") == heat.end() && heat.find("a")->second == 3);
+  heat.touch("c", 4); heat.expire(6, 2);
+  KJ_REQUIRE(heat.size() == 1 && heat.find("c") != heat.end());
+  heat.expire(6.001, 2); KJ_REQUIRE(heat.size() == 0);
+  for (unsigned i = 0; i < 1000; ++i) heat.touch("same", i);
+  KJ_REQUIRE(heat.size() == 1); heat.expire(1000, 0); KJ_REQUIRE(heat.size() == 0);
+}
+
+void eventLoopProgress() {
+  class Port final: public kj::EventPort {
+  public:
+    bool wait() override { KJ_FAIL_REQUIRE("runnable continuation chain must not sleep"); }
+    bool poll() override {
+      ++polls;
+      largestBatch = kj::max(largestBatch, callbacks - atLastPoll);
+      atLastPoll = callbacks;
+      return false;
+    }
+    kj::Promise<void> burst(unsigned remaining) {
+      return kj::evalLater([this, remaining]() -> kj::Promise<void> {
+        ++callbacks;
+        if (remaining == 1) return kj::READY_NOW;
+        return burst(remaining - 1);
+      });
+    }
+    unsigned callbacks = 0, polls = 0, atLastPoll = 0, largestBatch = 0;
+  } port;
+  kj::EventLoop loop(port);
+  kj::WaitScope scope(loop);
+  configureNodeEventLoop(scope);
+  port.burst(1000).wait(scope);
+  KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= 4,
+      "ready I/O must be checked during a continuation burst", port.polls, port.largestBatch);
+}
+
+void trialVerdicts() {
+  auto bridge = classifyTrialFailure("bridge", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128);
+  KJ_REQUIRE(bridge.category == "LOAD_FAILED" && bridge.limit.empty() &&
+      bridge.message == "the trial could not reach the runtime: remote exception: remote.jsg.Error: Missing trusted ordinary worker plan");
+  auto decode = classifyTrialFailure("code", "SyntaxError", "invalid JSON", false, false, 30000, 128);
+  KJ_REQUIRE(decode.category == "INVALID_MODULE");
+  KJ_REQUIRE(classifyTrialFailure("code", "SyntaxError", "Uncaught SyntaxError: invalid JSON", false, false, 30000, 128).message == "a module cannot be decoded: SyntaxError: invalid JSON");
+  auto unavailable = classifyTrialFailure("code", "Error", "Trusted source fetch failed: 503", false, false, 30000, 128);
+  KJ_REQUIRE(unavailable.category == "UNAVAILABLE");
+  auto cpu = classifyTrialFailure("evaluation", "Error", "CPU_LIMIT_EXCEEDED", true, false, 30000, 128);
+  auto memory = classifyTrialFailure("evaluation", "Error", "MEMORY_LIMIT_EXCEEDED", false, true, 30000, 128);
+  KJ_REQUIRE(cpu.category == "LIMIT_EXCEEDED" && cpu.limit == "cpu" && memory.limit == "memory");
+  KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: tenant top-level throw", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  auto native = classifyTrialFailure("evaluation", "Error", "Uncaught Error: top-level failure\nat index.js:1:7", false, false, 30000, 128);
+  KJ_REQUIRE(native.message == "Error: top-level failure (at index.js:1:7)");
+  KJ_REQUIRE(classifyTrialFailure("evaluation", "Error", "Error: failure\nat index.js:1:" + std::string(80, '9'), false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  // The call path classifies other failures at the stage the native server
+  // reported; a report without a stage keeps the general load classification.
+  KJ_REQUIRE(classifyLoadRejection("", "Error", "Missing trusted ordinary worker plan", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  KJ_REQUIRE(classifyLoadRejection("evaluation", "Error", "Error: tenant top-level throw", false, false, 30000, 128).category == "TOP_LEVEL_THROW");
+  KJ_REQUIRE(classifyLoadRejection("code", "SyntaxError", "invalid JSON", false, false, 30000, 128).category == "INVALID_MODULE");
+  // Both call-path sites answer a bridge failure as the platform's: PROCESS_UNAVAILABLE, which placement
+  // retries on the next node, never a LOAD_FAILED of the version, and no word about a trial.
+  const auto platform = callPathPlatformFailure("bridge", "Missing trusted ordinary worker plan");
+  const bool mapped = platform.has_value() && platform->code == "PROCESS_UNAVAILABLE" && platform->category == "bridge" &&
+      platform->reason == "the native process could not get this call's plan from the node: Missing trusted ordinary worker plan" &&
+      platform->reason.find("trial") == std::string::npos;
+  KJ_REQUIRE(mapped);
+  KJ_REQUIRE(placementRetryable(platform->code, platform->category) && !placementRetryable("LOAD_FAILED", "evaluation"));
+  const bool tenantStages = !callPathPlatformFailure("evaluation", "Error: tenant top-level throw").has_value() &&
+      !callPathPlatformFailure("code", "x").has_value() && !callPathPlatformFailure("", "Missing trusted ordinary worker plan").has_value();
+  KJ_REQUIRE(tenantStages);
 }
 
 auto number(const std::string& bytes, const char* field) {
@@ -147,6 +345,29 @@ void memoryCulprit() {
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/other", "v1"));
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "not-dispatched", "tenant/worker", "v1"));
   KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
+  // The native OOM row's isolate heap: an isolate far below its own limit did not
+  // cause the exit (other isolates filled the shared pointer cage). Rows without
+  // the field (stock workerd) keep their attribution.
+  KJ_REQUIRE(memoryCulpritOwnsOom(false, 0, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 110 * 1024, 128));
+  // A reported 0 (an isolate that died in its first collection) is not an old row.
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 0, 128));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(true, (uint64_t(128) << 20) - 1, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(128) << 20, 128));
+  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(1100) << 20, 128));
+  // The production decoder reads the field the native server writes.
+  capnp::MallocMessageBuilder message;
+  auto report = message.initRoot<v1::rpc::CpuReport>();
+  capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"workerId\":\"tenant/worker\","
+      "\"versionId\":\"v1\",\"invocationId\":\"in-flight\",\"isolate\":\"i\",\"memoryLimitMiB\":128,"
+      "\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":110592}"), report);
+  KJ_REQUIRE(report.getOomIsolateHeapReported() && report.getOomIsolateHeapBytes() == 110592 &&
+      !memoryCulpritOwnsOom(report.getOomIsolateHeapReported(), report.getOomIsolateHeapBytes(), report.getMemoryLimitMiB()));
+  capnp::MallocMessageBuilder stock;
+  auto old = stock.initRoot<v1::rpc::CpuReport>();
+  capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"memoryLimitMiB\":128}"), old);
+  KJ_REQUIRE(!old.getOomIsolateHeapReported() &&
+      memoryCulpritOwnsOom(old.getOomIsolateHeapReported(), old.getOomIsolateHeapBytes(), old.getMemoryLimitMiB()));
 }
 void package() {
   TempDir path;
@@ -440,7 +661,11 @@ int main(int argc, char* argv[]) {
   using namespace coworkerd;
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
-  if (name == "deadlines") deadlines();
+  if (name == "native-config") nativeConfig();
+  else if (name == "tenant-execution") tenantExecution();
+  else if (name == "deadlines") deadlines();
+  else if (name == "event-loop") eventLoopProgress();
+  else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();
   else if (name == "tree-lease") treeLease();
   else if (name == "budget") budget();

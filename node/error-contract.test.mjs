@@ -49,7 +49,7 @@ function workerResponses() {
   };
   const [, defaultStatus] = evidence(node, /InvocationRejection refusal\(std::string code, std::string reason, uint status = (\d{3})/);
   const generic = [
-    section(node, 'class ServerCore final', 'std::optional<std::string> confirmPreparation'),
+    section(node, 'class ServerCore final', node.includes('std::optional<std::string> confirmPreparation') ? 'std::optional<std::string> confirmPreparation' : 'std::optional<std::string> confirmCapacityRejection'),
     section(node, 'class PeerForwarder final', 'class PeerBootstrap final'),
     section(node, 'class PeerBootstrap final', 'class PeerRpcService final'),
     section(node, 'class GatewayService final', '\n};'),
@@ -62,7 +62,7 @@ function workerResponses() {
     add(status, code, code === 'RESULT_UNCERTAIN' ? 'Result uncertain' : 'Not executed');
   }
   const [, quarantine, unavailable, processStatus] = evidence(generic,
-    /return refusal\(error\.quarantine \? "([A-Z_]+)" : "([A-Z_]+)",[\s\S]*?, (\d{3}), root\);/);
+    /\brefusal\(error\.quarantine \? "([A-Z_]+)" : "([A-Z_]+)",[\s\S]*?, (\d{3}), root\);/);
   for (const code of [quarantine, unavailable]) add(processStatus, code);
 
   const [, missing, brokenRoute, brokenWorker] = evidence(generic,
@@ -72,12 +72,26 @@ function workerResponses() {
   for (const code of [brokenRoute, brokenWorker]) add(invalidStatus, code);
 
   const dispatch = section(node, 'class AdmissionHttpService final', 'struct InvocationAttempt');
-  const [, responseStatus, uncertain] = evidence(dispatch, /slot->report\((\d{3}), code\.empty\(\) \? "([A-Z_]+)" : code\);/);
-  add(responseStatus, uncertain, 'Result uncertain');
-  const limits = [...section(dispatch, 'std::string limitCode() const', 'kj::Own<kj::HttpService> inner')
-    .matchAll(/LimitExceeded\(\)\) return "([A-Z_]+)";/g)];
-  assert.equal(limits.length, 2, 'CPU and memory limit responses');
-  for (const [, code] of limits) add(responseStatus, code, 'Partly executed');
+  let uncertain;
+  const limitSection = section(dispatch, 'std::string limitCode() const', 'kj::Own<kj::HttpService> inner');
+  const limits = [...limitSection.matchAll(/process->([a-zA-Z]+)\(\)\) return "([A-Z_]+)";/g)];
+  assert.ok(limits.length >= 2, 'CPU and memory limit producers');
+  if (dispatch.includes('const bool unsupported =')) {
+    const [, unsupported, specialStatus, normalStatus, reportedUncertain] = evidence(dispatch,
+      /const bool unsupported = code == "([A-Z_]+)";\s*slot->report\(unsupported \? (\d{3}) : (\d{3}), code.empty\(\) \? "([A-Z_]+)" : code\);/);
+    uncertain = reportedUncertain;
+    add(specialStatus, unsupported, 'Partly executed');
+    add(normalStatus, uncertain, 'Result uncertain');
+    for (const [, method, code] of limits) {
+      add(normalStatus, code, method === 'processMemoryPressure' ? 'Result uncertain' : 'Partly executed');
+    }
+  } else {
+    const [, responseStatus, reportedUncertain] = evidence(dispatch, /slot->report\((\d{3}), code\.empty\(\) \? "([A-Z_]+)" : code\);/);
+    uncertain = reportedUncertain;
+    add(responseStatus, uncertain, 'Result uncertain');
+    assert.equal(limits.length, 2, 'CPU and memory limit responses');
+    for (const [, , code] of limits) add(responseStatus, code, 'Partly executed');
+  }
 
   const [, budget, expired, outOfOrder] = evidence(node,
     /server\.refusal\(budget \? "([A-Z_]+)" :\s*expired \? "([A-Z_]+)" : "([A-Z_]+)", detail, status\)/);
@@ -94,6 +108,7 @@ function workerResponses() {
     add(status, code, code === uncertain ? 'Result uncertain' : 'Not executed');
   }
 
+  if (node.includes('std::optional<std::string> confirmPreparation')) {
   const [, loadCode, prepareStatus, loadStatus] = evidence(generic,
     /refusal\("([A-Z_]+)", trialClean\(message, secrets, variables\), preparationLimit \? (\d{3}) : (\d{3}), root\)/);
   evidence(generic, /flag\("preparationLimit"\)\) \{\s*category = "limit"; detail = "PREPARATION_LIMIT";[^\n]*preparationLimit = true;/);
@@ -117,6 +132,14 @@ function workerResponses() {
   add(prepareStatus, loadCode, 'Not executed', { dispatched, retryable, category: serialCategory });
   add(loadStatus, loadCode);
   add(unavailableStatus, runtimeUnavailable, 'Not executed', { dispatched: unavailableDispatched, retryable: unavailableRetryable });
+  } else {
+    // S1 removes ordinary preparation and its 409/CODE_UNAVAILABLE HTTP
+    // producers. Do not import dead producers just to match the main table.
+    const [, loadCode, loadStatus] = evidence(generic,
+      /refusal\("([A-Z_]+)", trialClean\(message, secrets, variables\), (\d{3}), root\)/);
+    add(loadStatus, loadCode);
+    evidence(node, /confirmCapacityRejection/);
+  }
   return expected;
 }
 

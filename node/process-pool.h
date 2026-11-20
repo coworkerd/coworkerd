@@ -1,9 +1,13 @@
 #pragma once
 
+#include <capnp/message.h>
+
 #include "coworkerd.capnp.h"
 #include "config.h"
 #include "suspects.h"
 #include "tenancy.h"
+#include "tenant-execution.h"
+#include "secret-dictionary.h"
 #include <kj/async-io.h>
 #include <kj/async-unix.h>
 #include <kj/compat/http.h>
@@ -32,18 +36,23 @@ public:
   // Exceptional completion only: capture a dying generation before its calls are released.
   void snapshotAfterFailure() noexcept;
   kj::Promise<void> onExit();
+  bool threadedServer() const;
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;
+  bool processMemoryPressure() const;
   const std::string processId;
   const uint64_t generation;
   std::string invocationId, treeId, workerId, versionId;
   double startedAtMonotonicMs = 0;
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
+  bool capacityRejected = false;
+  std::function<void()> onCapacityRejected;
 private:
   friend class ProcessPool;
-  explicit ProcessCall(std::shared_ptr<ProcessGeneration> process);
+  explicit ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string tenant = {});
   std::shared_ptr<ProcessGeneration> process;
+  std::string tenant;
   bool finished = false;
 };
 
@@ -68,6 +77,11 @@ public:
   ~ProcessPool() noexcept(false);
   kj::Promise<void> run();
   bool available(const std::string& worker);
+  struct TenantExecutionLimit {
+    uint32_t inFlight = 0, limit = 0;
+    std::vector<std::shared_ptr<TenantExecutionState>> states;
+  };
+  std::optional<TenantExecutionLimit> tenantExecutionLimit(const std::string& worker);
   // The original paused generations, only when none of this target's processes is admitted.
   // Retaining the snapshot never waits for a replacement generation after death or rotation.
   struct PausedAdmission {
@@ -102,9 +116,11 @@ public:
   // increment foreign, rather than evidence against a workerd SIGKILL exit.
   void setHostCheckOomGuard(std::function<bool()> guard);
   // The limits in force for one Worker here: what it names, else this node's own.
-  WorkerLimits effectiveLimits(const std::string& workerId) const;
+  WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
+  // Scheduling hint only: no refresh, process admission, or dispatch commitment.
+  std::optional<std::pair<std::string, uint64_t>> threadedGenerationHint(const std::string& worker) const;
   // A trial load's process: a quarantine process, the tenant's shard.
   std::shared_ptr<ProcessCall> selectTrial(const std::string& worker);
   // Durable Objects: the durable process of an object (by its key, <namespace id>/<object id>: the same one while the
@@ -134,10 +150,15 @@ public:
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();
   std::map<std::string, uint64_t> residentIsolatesByTenant() const;
+  // Each live generation, for the secret dictionary: a native generation's lifecycle snapshot names the plan
+  // revision of every isolate it holds (loading and retired ones included); any other generation, or a snapshot
+  // that cannot be read, is not known.
+  std::vector<SecretDictionary::Residents> residentPlans() const;
   // The quarantine process a tenant's trials and (when it is a suspect) calls go to first; "" without one.
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
-      const std::string& definitionHash);
+      const std::string& definitionHash,
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {});
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);

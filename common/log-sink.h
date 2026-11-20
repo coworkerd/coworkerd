@@ -1,5 +1,7 @@
 #pragma once
 
+#include "log-cleaning.h"
+
 #include <kj/async-io.h>
 
 #include <cstdint>
@@ -14,7 +16,8 @@ namespace coworkerd {
 // this sink; deployment-tool stdout remains its synchronous command result.
 class AsyncLog {
 public:
-  AsyncLog();
+  // `staleLineMs`: a record queued longer than this is dropped, not cleaned late (common/log-cleaning.h).
+  explicit AsyncLog(uint32_t staleLineMs = LOG_LINE_STALE_MS);
   ~AsyncLog();
   AsyncLog(const AsyncLog&) = delete;
   AsyncLog& operator=(const AsyncLog&) = delete;

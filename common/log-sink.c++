@@ -1,4 +1,5 @@
 #include "log-sink.h"
+#include "log-cleaning.h"
 
 #include <kj/debug.h>
 
@@ -56,13 +57,23 @@ struct alignas(64) Shared {
   alignas(64) std::atomic<uint64_t> head{0};
   std::atomic<uint64_t> accepted{0}, written{0}, highWaterBytes{0};
   std::atomic<uint64_t> clockUnixMs{0};
+  // The monotonic clock, kept current by the event loop and by the writer, so
+  // that the producer stamps a record without reading a clock itself.
+  std::atomic<uint64_t> clockMonotonicMs{0};
+  std::atomic<uint64_t> staleLines{0};
   std::atomic<uint32_t> closed{0}, writerError{0}, ready{0};
+  std::atomic<uint64_t> redactionSuppressedLines{0};
   std::array<Drop, SOURCES.size()> drops;
 };
-struct Header { uint32_t size, descriptor; };
+// `queuedMs`: the cached monotonic clock when the record was queued.
+struct Header { uint32_t size, descriptor; uint64_t queuedMs; };
 uint64_t wallClock() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
+}
+uint64_t steadyClock() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 size_t capacity() {
   const char* value = std::getenv("COWORKERD_LOG_BUFFER_BYTES");
@@ -117,6 +128,8 @@ public:
       for (std::streamsize i = 0; i < size; ++i) {
         if (used < MAX_LINE) buffer[used++] = data[i]; else oversized = true;
         if (data[i] == '\n') {
+          // The writer reads the shared dictionary, including what the node
+          // adds after its fork (node/secret-dictionary.h).
           owner.enqueue(buffer, used, descriptor, oversized);
           used = 0; oversized = false;
         }
@@ -138,7 +151,8 @@ public:
     bool oversized = false;
   };
 
-  Impl(): cap(capacity()), mappingBytes(sizeof(Shared) + cap + 2 * MAX_LINE) {
+  explicit Impl(uint32_t staleLineMs): staleLineMs(staleLineMs), cap(capacity()), mappingBytes(sizeof(Shared) + cap + 2 * MAX_LINE) {
+    preparePlatformLogCleaning();
     mapping = mmap(nullptr, mappingBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (mapping == MAP_FAILED) throw std::runtime_error("async log mmap failed");
     std::memset(mapping, 0, mappingBytes);
@@ -148,6 +162,7 @@ public:
                           << std::strerror(errno) << std::endl;
     shared = new (mapping) Shared;
     shared->clockUnixMs.store(wallClock(), std::memory_order_relaxed);
+    shared->clockMonotonicMs.store(steadyClock(), std::memory_order_relaxed);
     ring = static_cast<char*>(mapping) + sizeof(Shared);
     int pipeFd[2];
     if (pipe(pipeFd) != 0) { release(); throw std::runtime_error("async log liveness pipe failed"); }
@@ -205,7 +220,8 @@ public:
       drop.count.fetch_add(1, std::memory_order_release);
       return;
     }
-    Header header{static_cast<uint32_t>(size), static_cast<uint32_t>(descriptor)};
+    Header header{static_cast<uint32_t>(size), static_cast<uint32_t>(descriptor),
+        shared->clockMonotonicMs.load(std::memory_order_relaxed)};
     copyInto(ring, cap, tail, &header, sizeof(header));
     copyInto(ring, cap, tail + sizeof(header), data, size);
     shared->accepted.fetch_add(1, std::memory_order_relaxed);
@@ -238,7 +254,9 @@ public:
       if (i) output << ',';
       output << '"' << SOURCES[i] << "\":" << count;
     }
-    output << "},\"droppedLines\":" << dropped << "}";
+    output << "},\"droppedLines\":" << dropped
+      << ",\"redactionSuppressedLines\":" << shared->redactionSuppressedLines.load()
+      << ",\"staleLines\":" << shared->staleLines.load() << "}";
     return output.str();
   }
   Shared* shared;
@@ -247,6 +265,13 @@ private:
   void consume(int liveness) {
     shared->ready.store(1, std::memory_order_release);
     std::array<uint64_t, SOURCES.size()> reported{};
+    std::array<PlatformLogCleaner, 2> cleaners;
+    auto writeClean = [&](int fd, std::string_view bytes, bool final = false) {
+      auto& cleaner = cleaners[fd == STDOUT_FILENO ? 0 : 1];
+      const auto text = cleaner.append(bytes, final);
+      if (cleaner.suppressed()) shared->redactionSuppressedLines.fetch_add(1, std::memory_order_relaxed);
+      return writeAll(fd, text.data(), text.size());
+    };
     bool parentGone = false;
     for (;;) {
       pollfd descriptor{liveness, POLLIN | POLLHUP, 0};
@@ -254,14 +279,22 @@ private:
       // Observe completion before the queue snapshot: the final published line
       // and drop counters must be visible before deciding that draining is done.
       if (shared->closed.load(std::memory_order_acquire)) parentGone = true;
+      const auto now = steadyClock();
+      shared->clockMonotonicMs.store(now, std::memory_order_relaxed);
       auto head = shared->head.load(std::memory_order_relaxed);
       auto tail = shared->tail.load(std::memory_order_acquire);
       if (head != tail) {
         Header header; copyOut(ring, cap, head, &header, sizeof(header));
         auto at = (head + sizeof(header)) % cap;
         auto first = std::min<size_t>(header.size, cap - at);
-        if (!writeAll(header.descriptor, ring + at, first) ||
-            !writeAll(header.descriptor, ring, header.size - first)) {
+        std::string record(ring + at, first);
+        record.append(ring, header.size - first);
+        // A record that waited longer than LOG_LINE_STALE_MS (a stuck stream) is dropped: a secret value it holds
+        // may have left the dictionary since. It still passes its cleaner, which keeps its state across records.
+        if (now > header.queuedMs && now - header.queuedMs > staleLineMs) {
+          (void)cleaners[header.descriptor == STDOUT_FILENO ? 0 : 1].append(record);
+          shared->staleLines.fetch_add(1, std::memory_order_relaxed);
+        } else if (!writeClean(header.descriptor, record)) {
           shared->writerError.store(1, std::memory_order_release); return;
         }
         shared->written.fetch_add(1, std::memory_order_relaxed);
@@ -279,19 +312,24 @@ private:
           << ",\"total\":" << count << ",\"firstDroppedAtUnixMs\":" << drop.firstUnixMs.load()
           << ",\"lastDroppedAtUnixMs\":" << drop.lastUnixMs.load() << "}\n";
         auto text = line.str();
-        if (!writeAll(STDOUT_FILENO, text.data(), text.size())) {
+        if (!writeClean(STDOUT_FILENO, text)) {
           shared->writerError.store(1, std::memory_order_release); return;
         }
         reported[i] = count;
       }
       if (head == tail) {
-        if (parentGone) return;
+        if (parentGone) {
+          if (!writeClean(STDOUT_FILENO, {}, true) || !writeClean(STDERR_FILENO, {}, true))
+            shared->writerError.store(1, std::memory_order_release);
+          return;
+        }
         // Idle writer polling is entirely outside the server event loop.
         poll(&descriptor, 1, 1);
       }
     }
   }
   bool locked = false;
+  const uint32_t staleLineMs;
   size_t cap, mappingBytes;
   void* mapping;
   char* ring;
@@ -303,11 +341,13 @@ private:
 };
 
 AsyncLog::Impl* AsyncLog::active = nullptr;
-AsyncLog::AsyncLog(): impl(std::make_unique<Impl>()) { active = impl.get(); }
+AsyncLog::AsyncLog(uint32_t staleLineMs): impl(std::make_unique<Impl>(staleLineMs)) { active = impl.get(); }
 AsyncLog::~AsyncLog() { active = nullptr; }
 std::string AsyncLog::stateJson() { return active ? active->json() : "{}"; }
 void AsyncLog::updateClock() {
-  if (active) active->shared->clockUnixMs.store(wallClock(), std::memory_order_relaxed);
+  if (!active) return;
+  active->shared->clockUnixMs.store(wallClock(), std::memory_order_relaxed);
+  active->shared->clockMonotonicMs.store(steadyClock(), std::memory_order_relaxed);
 }
 
 kj::Promise<void> runLogClock(kj::Timer& timer) {

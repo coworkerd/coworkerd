@@ -75,6 +75,31 @@ operations validate the series before mutating a checkout or exporting files.
 
 ## Rust server port (v1.20261114.1)
 
+### 0042: Native threaded execution and lifecycle
+
+`src/workerd/threaded/{BUILD.bazel,threaded-server.c++,protocol.h,protocol.capnp}` adds the
+`coworkerd-threaded` executable over the C++ worker and I/O libraries. Its accept
+loop hands raw descriptors to a native thread pool; each invocation owns its KJ
+loop and RPC connection on one thread. Worker versions share an isolate and enter
+it under the library's lock. `WorkerdPlatform` supplies the frozen request clock.
+The target links no Rust server crate. The node selects the ordinary and quarantine
+backend with `processPool.ordinaryServer`; durable processes use upstream.
+
+The path exception is limited to those four new files. Existing server files expose
+the V8 platform library to that package and build the serving filter separately.
+In the threaded executable the filter permits only the exact pthread `clone`
+flags and answers `clone3` with `ENOSYS`; other syscall rules retain their tables.
+The node selects this target with `processPool.ordinaryServer = "threaded"`.
+
+The backend dispatches HTTP and JS RPC through the library's native entrypoints.
+Private node channels supply bindings, egress and bounded tenant logs. Thread CPU
+watchdogs and per-isolate heap/external-memory limits enforce invocation limits.
+Process memory, shared address space, resident versions and per-tenant concurrency
+are reserved before execution; inactive versions can be evicted. The lifecycle
+shared-memory channel reports active contexts and resource counters for draining
+and replacement generations. Only descriptors, cross-thread fulfillers and native
+metadata cross invocation threads.
+
 ### 0041: Exact ordinary call deadlines
 
 The private ordinary selection carries the lease deadline's original decimal text.

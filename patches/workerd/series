@@ -35,3 +35,4 @@
 0039-lifecycle-publication-pause.patch
 0040-lifecycle-identity-cache.patch
 0041-ordinary-lease-deadline.patch
+0042-threaded-server-s1a.patch
