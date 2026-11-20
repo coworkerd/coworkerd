@@ -2,6 +2,7 @@
 #include "durable-shards.h"
 
 #include "support.h"
+#include "json.h"
 
 #include <kj/async-io.h>
 #include <kj/timer.h>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <random>
 
 namespace coworkerd {
 
@@ -531,6 +533,24 @@ struct DurableLogChannelTest {
       const auto later = send(three);
       KJ_REQUIRE(later.refusal.empty() && later.accepted == 3 && log.incoming.at(stream).fencedSeqs.empty(),
           "a full buffer does not hold the answers back", later.accepted);
+    } else if (name == "resend-held") {
+      // r49: a record this node holds, sent again after a reconnect once its shard's floor has gone up, is taken as a
+      // duplicate (it was taken before the floor and is in the newer owner's tail); a new record below the floor is
+      // still refused, and the answers are not held back by the duplicate.
+      KJ_REQUIRE(send(two).accepted == 2);
+      log.fenceOwner(ns, 1, 3, "test", false);
+      uint64_t again = 0;
+      KJ_REQUIRE(log.openIncoming("owner", 2, "old", "9", 1, again).empty() && again == stream);
+      KJ_REQUIRE(send(one).accepted == 2, "a held record of another shard");
+      const auto resent = send(two);
+      KJ_REQUIRE(resent.refusal.empty() && resent.accepted == 2 && log.incoming.at(stream).fencedSeqs.empty(),
+          "a held record below the floor is a duplicate, not refused", resent.refusal.c_str());
+      auto five = testRecord(ns, 2, 5, 1, 3);
+      KJ_REQUIRE(send(five).refusal.starts_with("fenced"), "a new record below the floor is refused");
+      // Other bytes under the held sequence 2 are not that record: checked like a new one, and refused.
+      auto changed = two;
+      changed.txn = 99;
+      KJ_REQUIRE(send(changed).refusal.starts_with("fenced"), "a different record under a held sequence is refused");
     } else if (name == "full-resend") {
       // At its limit, the peer still takes a record it already holds, sent again after a reconnect: that record needs
       // no room, and refusing it would fail a write the peer can confirm.
@@ -622,7 +642,12 @@ struct DurableLogChannelTest {
     peer.settings.config.peerBufferBytes = 32768;
     std::deque<FakeSink::Call> calls;
     uint32_t opened = 0;
+    std::map<uint32_t, uint64_t> knownFor;  // the shards' view of this node (r49 "fenced-known", "reacquired")
     DurableLog::Hooks hooks;
+    hooks.knownShardEpoch = [&](const std::string&, uint32_t shard) {
+      const auto found = knownFor.find(shard);
+      return found == knownFor.end() ? uint64_t(0) : found->second;
+    };
     hooks.openStream = [&](std::string, uint64_t ownerEpoch, uint64_t firstSeq)
         -> kj::Promise<kj::Own<DurableLog::PeerSink>> {
       ++opened;
@@ -653,6 +678,16 @@ struct DurableLogChannelTest {
       hosts.push_back(host);
     }
     if (name == "pair-fenced") peer.fenceOwner(ns, log.objects.at(hosts[1]).shard, 1, "test", false);
+    const bool drop = name == "fenced-drop" || name == "fenced-unshown" || name == "full-keeps" ||
+        name == "fenced-known" || name == "reacquired";
+    const bool resend = name == "fenced-drop-resend";
+    if (name == "fenced-drop" || name == "full-keeps" || resend) {
+      // r49: the store shows the next epoch of record 2's shard (4): another node has taken it.
+      ShardEpoch next;
+      next.namespaceId = ns; next.shard = 4; next.epoch = 2; next.nodeId = "node-3"; next.nodeEpoch = 7;
+      next.dataEpoch = 1; next.reason = "timeout"; next.instance = "i"; next.nonce = "n"; next.acquiredAtUnixMs = 1;
+      log.store->put(shardEpochKey(ns, 4, 2), shardEpochJson(next)).wait(io.waitScope);
+    }
     for (size_t i = 0; i < hosts.size(); ++i) {
       LogRecord record;
       record.kind = LogRecordKind::RESET;
@@ -687,7 +722,114 @@ struct DurableLogChannelTest {
       clock.advanceTo(clock.now() + ms * kj::MILLISECONDS);
       answers();
     };
-    if (name == "pair-full") {
+    auto write = [&](size_t i, uint64_t request) {
+      LogRecord record;
+      record.kind = LogRecordKind::RESET;
+      record.objectName = hosts[i];
+      record.storageId = log.objects.at(hosts[i]).storageId;
+      record.dataEpoch = 1;
+      log.takeRecord(channel, std::move(record), request);
+    };
+    if (resend) {
+      // r49: records 1, 2, 3 (shards 3, 4, 5) are taken and confirmed; then a write to shard 4 is refused as fenced and
+      // the store shows epoch 2 of it -- the shard is given up. When the session reopens, the given-up shard's
+      // confirmed record (2) is not sent again; the others are, and a new write to shard 5 is confirmed as usual.
+      for (uint64_t i = 0; i < 3; ++i) calls[i].fulfiller->fulfill({i + 1, ""});
+      answers();
+      KJ_REQUIRE(log.confirmations == 3);
+      write(1, 104);
+      answers();
+      KJ_REQUIRE(calls.size() == 4 && calls[3].sequence == 4);
+      calls[3].fulfiller->fulfill({3, "fenced: this node knows a newer epoch of the shard"});
+      answers();
+      answers();
+      KJ_REQUIRE(log.ownerFenced(ns, 4, 1) && log.fencedShardsLost == 1 && acks.at(104) != 0);
+      calls.clear();
+      log.peers.at("peer").attemptedAtMs = 0;
+      log.drivePeers();
+      io.waitScope.poll();
+      std::vector<uint64_t> again;
+      for (const auto& call : calls) again.push_back(call.sequence);
+      KJ_REQUIRE(opened == 2 && again == std::vector<uint64_t>({1, 3}), "a given-up shard's records are not sent again",
+          again.size());
+      for (auto& call : calls) call.fulfiller->fulfill({3, ""});
+      calls.clear();
+      write(2, 105);
+      answers();
+      KJ_REQUIRE(calls.size() == 1 && calls[0].sequence == 5);
+      calls[0].fulfiller->fulfill({5, ""});
+      answers();
+      KJ_REQUIRE(acks.at(105) == 0 && log.confirmations == 4, "another shard's write is confirmed after the reopen");
+    } else if (drop) {
+      // r49: "fenced-drop": a peer refuses record 2 as fenced and the store shows epoch 2 of its shard -- this node
+      // gives the shard up at once: record 2 fails now (not at confirmTimeoutMs), a later write to that object is
+      // refused at once, the other shards are untouched. "fenced-unshown": the store does not show it -- nothing is
+      // given up, until a background read finds it. "full-keeps": a full buffer gives nothing up and reads nothing,
+      // the next epoch shown or not. "fenced-known": this node's shards' view already has epoch 2 -- given up with no
+      // read, epoch 1 only. "reacquired": this node holds the shard again at epoch 2 when the peer's refusal of
+      // record 2 (epoch 1) comes back -- epoch 1 is fenced (record 2 fails), epoch 2 is not: the object, now at
+      // epoch 2, takes writes.
+      if (name == "fenced-known") knownFor[4] = 2;
+      if (name == "reacquired") {
+        log.objects.at(hosts[1]).shardEpoch = 2;
+        knownFor[4] = 2;
+      }
+      calls[0].fulfiller->fulfill({1, ""});
+      calls[1].fulfiller->fulfill({1, name == "full-keeps" ?
+          "full: this node buffers durableObjects.peerBufferBytes for the owners it is a peer of" :
+          "fenced: this node knows a newer epoch of the shard"});
+      calls[2].fulfiller->fulfill({3, ""});
+      answers();
+      answers();
+      KJ_REQUIRE(acks.at(101) == 0 && acks.at(103) == 0, "the other shards' records are confirmed");
+      const bool lost = log.ownerFenced(ns, 4, 1);
+      if (name == "fenced-drop") {
+        KJ_REQUIRE(lost && !log.ownerFenced(ns, 4, 2) && log.fencedShardsLost == 1 && acks.contains(102) &&
+            acks.at(102) != 0 && !log.inFlight.contains(2) &&
+            log.objects.at(hosts[1]).state == DurableLog::ObjectState::GONE,
+            "a shard the store shows lost is given up at once, epoch 1 only", log.fencedShardsLost);
+        KJ_REQUIRE(!log.ownerFenced(ns, 3, 1) && !log.ownerFenced(ns, 5, 1), "only that shard is given up");
+        for (size_t i : {1u, 2u}) {
+          LogRecord record;
+          record.kind = LogRecordKind::RESET;
+          record.objectName = hosts[i];
+          record.storageId = log.objects.at(hosts[i]).storageId;
+          record.dataEpoch = 1;
+          log.takeRecord(channel, std::move(record), 104 + i);
+        }
+        answers();
+        KJ_REQUIRE(acks.contains(105) && acks.at(105) != 0 && !acks.contains(106) && log.inFlight.size() == 1,
+            "a later write to the lost shard is refused at once; another shard's waits for its peer");
+      } else if (name == "fenced-unshown") {
+        KJ_REQUIRE(!lost && log.fencedShardChecks == 1 && log.fencedShardsLost == 0 && !acks.contains(102) &&
+            log.inFlight.contains(2) && log.peerFenceUnverified == 1, "nothing is given up on an unshown epoch");
+        // The store shows it later: the background read gives the shard up, counted and logged the same way.
+        ShardEpoch next;
+        next.namespaceId = ns; next.shard = 4; next.epoch = 2; next.nodeId = "node-3"; next.nodeEpoch = 7;
+        next.dataEpoch = 1; next.reason = "timeout"; next.instance = "i"; next.nonce = "n"; next.acquiredAtUnixMs = 1;
+        log.store->put(shardEpochKey(ns, 4, 2), shardEpochJson(next)).wait(io.waitScope);
+        later(int64_t(DurableLog::OWNER_REREAD_MS) + 1);
+        answers();
+        KJ_REQUIRE(log.ownerFenced(ns, 4, 1) && log.fencedShardsLost == 1 && acks.at(102) != 0,
+            "a background read that finds the epoch gives the shard up", log.fencedShardsLost);
+      } else if (name == "fenced-known") {
+        KJ_REQUIRE(lost && !log.ownerFenced(ns, 4, 2) && log.fencedShardsLost == 1 && log.peerFenceChecks == 0 &&
+            acks.at(102) != 0, "a newer epoch this node already knows gives the shard up with no read, epoch 1 only",
+            log.fencedShardsLost);
+      } else if (name == "reacquired") {
+        log.checkConfirmations();  // the epoch-1 record pending is excluded (what the next confirmation pass does)
+        answers();
+        KJ_REQUIRE(lost && !log.ownerFenced(ns, 4, 2) && log.fencedShardsLost == 1 && log.peerFenceChecks == 0 &&
+            acks.at(102) != 0 && log.objects.at(hosts[1]).state == DurableLog::ObjectState::LOCAL,
+            "only the refused epoch is fenced");
+        write(1, 107);
+        answers();
+        KJ_REQUIRE(!acks.contains(107), "a write at the shard's new epoch is not refused");
+      } else {
+        KJ_REQUIRE(!lost && log.fencedShardChecks == 0 && log.peerFenceChecks == 0 && !acks.contains(102) &&
+            log.inFlight.contains(2), "a full buffer gives nothing up");
+      }
+    } else if (name == "pair-full") {
       answers();
       KJ_REQUIRE(log.confirmations == 2 && acks.at(101) == 0 && acks.at(103) == 0 && !acks.contains(102) &&
           log.inFlight.contains(2), "record 2 refused (full) is not counted; 3 is not held up", log.confirmations);
@@ -882,6 +1024,472 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(wake > clock.now() + 1 * kj::MICROSECONDS, "close must cancel the suspended reader");
     }
   }
+
+  // b58: the restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The
+  // reference is the 42af4392 selection, which encoded every record on the loop; it runs on a copy of what is left
+  // before each segment, then selectEarlier (sizes computed, records copied in slices) and buildEarlierSegment run on
+  // the log itself, and the segment's objects are retired the way a published manifest retires them.
+  struct EarlierReference {
+    SegmentHeader header;
+    std::string body;
+    std::set<std::string> touched;
+    std::map<std::string, uint64_t> sourceEpochs;
+  };
+  static EarlierReference earlierReference(const std::map<uint64_t, LogRecord>& held, SegmentHeader header,
+      uint64_t segmentBytes, const std::string& nodeId) {
+    // 42af4392's constants and budgets (durable-log.c++): the store's read limit, the envelope and an index entry.
+    constexpr uint64_t STORE_SEGMENT_BYTES = 64u << 20;
+    const auto host = [](const LogRecord& record) { return record.objectName + "/" + std::to_string(record.dataEpoch); };
+    EarlierReference out;
+    std::vector<std::string> encoded;
+    std::map<std::pair<std::string, uint32_t>, SegmentIndexEntry> index;
+    uint64_t wireBytes = 1024 + json::quote(nodeId).size() + json::quote("earlier-epoch").size();
+    for (const auto& [sequence, record] : held) {
+      auto bytes = encodeLogRecord(record);
+      const auto extra = bytes.size() + 4 +
+          (index.contains({record.objectName, record.facetId}) ? 0 : 256 + json::quote(record.objectName).size());
+      if (!encoded.empty() && (header.bytes + bytes.size() > segmentBytes || wireBytes + extra > STORE_SEGMENT_BYTES)) break;
+      KJ_REQUIRE(wireBytes + extra <= STORE_SEGMENT_BYTES);
+      wireBytes += extra;
+      header.bytes += bytes.size();
+      encoded.push_back(std::move(bytes));
+      ++header.records;
+      if (!header.firstSeq) header.firstSeq = sequence;
+      header.lastSeq = sequence;
+      auto& entry = index[{record.objectName, record.facetId}];
+      entry.objectName = record.objectName;
+      entry.facetId = record.facetId;
+      if (!entry.records) entry.firstTxn = record.txn;
+      entry.lastTxn = record.txn;
+      ++entry.records;
+      out.touched.insert(host(record));
+      out.sourceEpochs[host(record)] = std::max(out.sourceEpochs[host(record)], record.shardEpoch);
+    }
+    for (auto& [key, entry] : index) header.objects.push_back(entry);
+    out.body = encodeSegment(header, encoded);
+    out.header = header;
+    return out;
+  }
+
+  static void earlierSegment() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-earlier-segment-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    const std::string ns(64, 'a');
+    constexpr uint64_t EPOCH = 3;
+    std::mt19937 random(58);
+    auto text = [&](size_t size) {
+      std::string out(size, '\0');
+      for (auto& c : out) c = char('a' + random() % 26);
+      return out;
+    };
+    uint32_t segmentsSeen = 0, yieldsSeen = 0;
+    for (int round = 0; round < 8; ++round) {
+      DurableLog log({"peer", "instance", temp + "/" + std::to_string(round), {}}, store, io.provider->getNetwork(), clock,
+          *io.lowLevelProvider, membership, {});
+      log.nodeEpoch = 9;
+      const uint64_t sizes[] = {12u << 10, 96u << 10, 16u << 20};
+      log.settings.config.segmentBytes = sizes[round % 3];
+      log.earlierSliceBytes = round % 2 ? 1 : 32u << 10;
+      std::map<uint64_t, LogRecord> model;
+      const int count = 150 + int(random() % 250);
+      uint64_t sequence = 1 + random() % 5;
+      for (int i = 0; i < count; ++i) {
+        LogRecord r;
+        r.kind = random() % 5 == 0 ? LogRecordKind::RESET : LogRecordKind::FRAMES;
+        r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shardEpoch = 1 + random() % 2; r.shard = 0;
+        char id[65];
+        std::snprintf(id, sizeof(id), "%016llx%048x", (unsigned long long) (1 + random() % 24) * 1024, 0);
+        r.objectName = ns + "/" + id;
+        r.dataEpoch = 1 + random() % 2;
+        r.storageId = text(random() % 20);
+        r.facetId = random() % 3; r.parentFacetId = 0; r.facetName = text(random() % 12);
+        r.txn = uint64_t(i + 1); r.generation = random() % 4; r.salt1 = random(); r.salt2 = random();
+        r.pageSize = 4096; r.firstFrame = random() % 100; r.frames = 1 + random() % 3; r.commits = 1;
+        if (random() % 3 == 0) r.header = text(32);
+        if (r.kind == LogRecordKind::FRAMES) r.frameBytes = text(random() % 3 == 0 ? random() % 40000 : random() % 3000);
+        KJ_REQUIRE(encodedLogRecordSize(r) == encodeLogRecord(r).size(), "the computed size is the encoded size",
+            encodedLogRecordSize(r), encodeLogRecord(r).size());
+        model[sequence] = r;
+        sequence += 1 + random() % 3;
+      }
+      if (round % 4 == 3) {
+        // A segment that ends exactly at segmentBytes: the record that fills it is kept.
+        uint64_t sum = 0;
+        const int fill = 2 + int(random() % 5);
+        int taken = 0;
+        for (const auto& [seq, record] : model) {
+          if (taken++ == fill) break;
+          sum += encodedLogRecordSize(record);
+        }
+        log.settings.config.segmentBytes = sum;
+      }
+      auto& held = log.earlier[EPOCH];
+      held = model;
+      auto& info = log.predecessorLogs[EPOCH];
+      for (const auto& [seq, record] : held) {
+        log.indexEarlierRecord({EPOCH, seq}, record);
+        log.noteEarlierUnpublished(info, record);
+      }
+      SegmentHeader base;
+      base.nodeId = "peer"; base.nodeEpoch = EPOCH; base.sealedAtUnixMs = 1234; base.reason = "earlier-epoch";
+      for (uint32_t segment = 1;; ++segment) {
+        auto found = log.earlier.find(EPOCH);
+        if (found == log.earlier.end()) break;
+        KJ_REQUIRE(segment < 10000, "the reseal makes progress");
+        auto expectedHeader = base;
+        expectedHeader.segment = segment;
+        const auto expected = earlierReference(found->second, expectedHeader, log.settings.config.segmentBytes, "peer");
+        auto promise = log.selectEarlier(EPOCH, std::nullopt);
+        while (!promise.poll(io.waitScope)) { clock.advanceTo(clock.now() + 1 * kj::MICROSECONDS); ++yieldsSeen; }
+        auto selection = promise.wait(io.waitScope);
+        KJ_REQUIRE(!selection.aborted && !selection.input.records.empty(), "a segment is chosen", round, segment);
+        auto header = base;
+        header.segment = segment;
+        auto built = buildEarlierSegment(header, std::move(selection.input));
+        KJ_REQUIRE(built.body == expected.body, "the segment's bytes are the event loop's", round, segment,
+            built.body.size(), expected.body.size());
+        KJ_REQUIRE(built.sha256 == objectSha256(expected.body), "the digest is the event loop's", round, segment);
+        KJ_REQUIRE(built.header.records == expected.header.records && built.header.bytes == expected.header.bytes &&
+            built.header.firstSeq == expected.header.firstSeq && built.header.lastSeq == expected.header.lastSeq,
+            "the segment's header is the event loop's", round, segment);
+        KJ_REQUIRE(built.touched == expected.touched && built.sourceEpochs == expected.sourceEpochs,
+            "the segment names the same objects", round, segment);
+        ++segmentsSeen;
+        // The manifests are written: every object of the segment gives up its records in the segment's range.
+        for (const auto& host : built.touched)
+          log.retireEarlierObject(EPOCH, host, built.header.firstSeq, built.header.lastSeq);
+        std::erase_if(model, [&](const auto& entry) {
+          return entry.first >= built.header.firstSeq && entry.first <= built.header.lastSeq;
+        });
+        const auto left = log.earlier.find(EPOCH);
+        KJ_REQUIRE((left == log.earlier.end() ? model.empty() : left->second.size() == model.size()),
+            "retiring takes exactly the segment's records", round, segment);
+        uint64_t counted = 0;
+        for (const auto& [name, records] : info.unpublishedObjects) counted += records;
+        KJ_REQUIRE(counted == model.size(), "the per-object counts follow the retired records", counted, model.size());
+        for (const auto& [name, positions] : log.earlierByObject)
+          for (const auto& position : positions)
+            KJ_REQUIRE(position.first != EPOCH || model.contains(position.second), "no index entry outlives its record");
+      }
+      KJ_REQUIRE(model.empty());
+    }
+    KJ_REQUIRE(segmentsSeen > 16 && yieldsSeen > 100, "several segments per round and slices that yield",
+        segmentsSeen, yieldsSeen);
+  }
+
+  // b58: a restored holder answers a tail request naming its object for that object. Random objects in two shards of
+  // one earlier epoch, each published, partly published, being published (a manifest write in flight) or untouched,
+  // some with an excluded record; every per-object and per-shard answer against the truth computed from what was
+  // generated. With a deliberately wrong decision (shard-wide only, or a write in flight taken for done) some answer
+  // must differ, or the test would not see that bug.
+  static bool restoredTailCase(unsigned seed, DurableLog::RestoredTailControl control) {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-restored-tail-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    DurableLog log({"peer", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
+        membership, {});
+    log.nodeEpoch = 9;
+    log.diskTrusted = true;
+    log.sameBootCache = true;
+    log.restoredTailControlForTest = control;
+    constexpr uint64_t EPOCH = 3;
+    auto& info = log.predecessorLogs[EPOCH];
+    info.complete = true;
+    const std::string ns(64, 'b');
+    std::mt19937 random(seed);
+    enum State { UNTOUCHED, PUBLISHED, PARTIAL, PUBLISHING };
+    struct Object { std::string id, name; uint32_t shard; State state; std::vector<uint64_t> sequences; bool excluded; };
+    std::vector<Object> objects;
+    uint64_t sequence = 1;
+    const int count = 12 + int(random() % 20);
+    for (int i = 0; i < count; ++i) {
+      char id[65];
+      std::snprintf(id, sizeof(id), "%016llx%048x", (unsigned long long) (i + 1) * 1024, i);
+      Object object{id, ns + "/" + id, uint32_t(i % 2), State(random() % 4), {}, random() % 6 == 0};
+      // At least one published object in each shard beside unpublished ones, one write in flight, and one object
+      // whose records are all named but for an excluded one.
+      if (i < 2) object.state = PUBLISHED;
+      if (i == 2 || i == 3) object.state = UNTOUCHED;
+      if (i == 4) object.state = PUBLISHING;
+      if (i == 5) { object.state = PUBLISHED; object.excluded = true; }
+      if (i == 6) object.state = PUBLISHED;  // its data epoch 1 only: data epoch 2 below stays
+      objects.push_back(object);
+    }
+    std::map<uint64_t, std::pair<size_t, LogRecord>> excludedRecords;
+    // Interleaved records, as the fixture's writes are.
+    for (int round = 0; round < 6; ++round) {
+      for (size_t i = 0; i < objects.size(); ++i) {
+        if (random() % 3 == 0) continue;
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlier[EPOCH][sequence] = r;
+        log.indexEarlierRecord({EPOCH, sequence}, r);
+        log.noteEarlierUnpublished(info, r);
+        objects[i].sequences.push_back(sequence++);
+      }
+    }
+    {
+      // Object 6 has records of a second data epoch too (the same object name, another host name).
+      LogRecord r;
+      r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[6].shard;
+      r.shardEpoch = 1; r.objectName = objects[6].name; r.dataEpoch = 2; r.txn = sequence;
+      log.earlier[EPOCH][sequence] = r;
+      log.indexEarlierRecord({EPOCH, sequence}, r);
+      log.noteEarlierUnpublished(info, r);
+      objects[6].sequences.push_back(sequence++);
+    }
+    for (size_t i = 0; i < objects.size(); ++i) {
+      if (objects[i].sequences.empty()) {  // every object has a record
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlier[EPOCH][sequence] = r;
+        log.indexEarlierRecord({EPOCH, sequence}, r);
+        log.noteEarlierUnpublished(info, r);
+        objects[i].sequences.push_back(sequence++);
+      }
+      if (objects[i].excluded) {
+        LogRecord r;
+        r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = objects[i].shard;
+        r.shardEpoch = 1; r.objectName = objects[i].name; r.dataEpoch = 1; r.txn = sequence;
+        log.earlierExcluded[EPOCH][sequence] = r;
+        log.noteEarlierUnpublished(info, r);
+        excludedRecords[sequence++] = {i, r};
+      }
+    }
+    std::vector<bool> truth(objects.size()), excludedLeft(objects.size());
+    for (size_t i = 0; i < objects.size(); ++i) {
+      auto& object = objects[i];
+      const auto host = object.name + "/1";
+      if (object.state == PUBLISHED || object.state == PARTIAL) {
+        const auto upTo = object.state == PUBLISHED ? object.sequences.back()
+            : object.sequences[object.sequences.size() / 2] - 1;
+        log.retireEarlierObject(EPOCH, host, 0, upTo);
+        if (object.state == PARTIAL && upTo < object.sequences.front()) object.state = UNTOUCHED;
+      }
+      if (object.state == PUBLISHED && object.excluded && (i == 5 || random() % 2 == 0)) excludedLeft[i] = true;
+      else if (object.state == PUBLISHED && object.excluded) {
+        for (auto it = log.earlierExcluded[EPOCH].begin(); it != log.earlierExcluded[EPOCH].end();) {
+          if (it->second.objectName == object.name) { log.noteEarlierRetired(EPOCH, it->second); it = log.earlierExcluded[EPOCH].erase(it); }
+          else ++it;
+        }
+      }
+      if (object.state == PUBLISHING) log.earlierPublishing.insert(object.name);
+      truth[i] = object.state != PUBLISHED || excludedLeft[i] || i == 6;
+    }
+    auto ask = [&](uint32_t shard, const std::string& id) {
+      DurableTailAsk out;
+      out.namespaceId = ns; out.shard = shard; out.shardEpoch = 2; out.ownerNodeId = "peer"; out.ownerNodeEpoch = EPOCH;
+      out.objectId = id;
+      return log.tailFor(out, false);
+    };
+    auto pending = [](const DurableTailAnswer& answer) {
+      if (answer.refusal == "the restored owner shard still has unpublished records") return true;
+      KJ_REQUIRE(answer.refusal.empty() && answer.ownerConfirmed && answer.records.empty(),
+          "an answer is either pending or an owner's empty tail", answer.refusal.c_str());
+      return false;
+    };
+    bool matched = true;
+    for (size_t i = 0; i < objects.size(); ++i)
+      if (pending(ask(objects[i].shard, objects[i].id)) != truth[i]) matched = false;
+    for (uint32_t shard = 0; shard < 2; ++shard) {
+      bool any = false;
+      for (size_t i = 0; i < objects.size(); ++i) any = any || (objects[i].shard == shard && truth[i]);
+      if (pending(ask(shard, "")) != any) matched = false;
+    }
+    // A shard count the per-object counts do not account for (b54's durable-tail-equivalence makes one): requests
+    // naming an object are answered for the shard again.
+    ++info.unpublishedShards[{ns, 0}];
+    for (size_t i = 0; i < objects.size(); ++i)
+      if (objects[i].shard == 0 && !pending(ask(0, objects[i].id))) matched = false;
+    return matched;
+  }
+
+
+  // b58: an object's records leave its earlier epoch only after the manifest that names them is written. A stand-in
+  // for S3 (listing, reads, create-if-absent) holds or fails the manifest create of one object: while it is held a
+  // request naming that object is still told there is more, and after a failed create the records stay.
+  class HeldStore final: public kj::HttpService {
+  public:
+    HeldStore(const kj::HttpHeaderTable& table, kj::HttpHeaderId ifNoneMatch): table(table), ifNoneMatch(ifNoneMatch) {}
+    kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+        kj::AsyncInputStream& body, Response& response) override {
+      const std::string target(url.cStr());
+      const auto question = target.find('?');
+      const auto path = decode(target.substr(0, question));
+      const auto query = question == std::string::npos ? std::string() : target.substr(question + 1);
+      const auto key = path.size() > 3 ? path.substr(3) : std::string();  // "/b/<key>"
+      if (method == kj::HttpMethod::GET && query.find("list-type=2") != std::string::npos) {
+        const auto prefix = decode(parameter(query, "prefix"));
+        std::string xml = "<ListBucketResult><IsTruncated>false</IsTruncated>";
+        for (const auto& [name, bytes] : objects) {
+          if (!name.starts_with(prefix)) continue;
+          xml += "<Contents><Key>" + name + "</Key><LastModified>2026-11-20T00:00:00.000Z</LastModified><Size>" +
+              std::to_string(bytes.size()) + "</Size></Contents>";
+        }
+        co_await send(response, 200, xml + "</ListBucketResult>");
+        co_return;
+      }
+      if (method == kj::HttpMethod::GET) {
+        auto found = objects.find(key);
+        co_await send(response, found == objects.end() ? 404 : 200, found == objects.end() ? std::string() : found->second);
+        co_return;
+      }
+      auto bytes = co_await body.readAllBytes();
+      std::string text(bytes.asChars().begin(), bytes.size());
+      if (!hold.empty() && key.find(hold) != std::string::npos) {
+        ++held;
+        if (parked) parked->fulfill();
+        co_await release.addBranch();
+      }
+      if (!fail.empty() && key.find(fail) != std::string::npos) {
+        ++failed;
+        co_await send(response, 503, "");
+        co_return;
+      }
+      if (headers.get(ifNoneMatch) != kj::none && objects.contains(key)) {
+        co_await send(response, 412, "");
+        co_return;
+      }
+      objects[key] = std::move(text);
+      ++written;
+      co_await send(response, 200, "");
+    }
+    std::map<std::string, std::string> objects;
+    std::string hold, fail;
+    uint32_t held = 0, failed = 0, written = 0;
+    kj::Own<kj::PromiseFulfiller<void>> parked;
+    kj::PromiseFulfillerPair<void> gate = kj::newPromiseAndFulfiller<void>();
+    kj::ForkedPromise<void> release = gate.promise.fork();
+  private:
+    static std::string decode(const std::string& text) {
+      std::string out;
+      for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '%' && i + 2 < text.size()) { out.push_back(char(std::stoi(text.substr(i + 1, 2), nullptr, 16))); i += 2; }
+        else out.push_back(text[i]);
+      }
+      return out;
+    }
+    static std::string parameter(const std::string& query, const std::string& name) {
+      for (size_t at = 0; at <= query.size();) {
+        const auto end = std::min(query.find('&', at), query.size());
+        const auto pair = query.substr(at, end - at);
+        if (pair.starts_with(name + "=")) return pair.substr(name.size() + 1);
+        at = end + 1;
+      }
+      return {};
+    }
+    kj::Promise<void> send(Response& response, uint32_t status, std::string text) {
+      kj::HttpHeaders out(table);
+      auto stream = response.send(status, status == 200 ? "OK" : "Error", out, uint64_t(text.size()));
+      if (!text.empty()) co_await stream->write(kj::arrayPtr(text.data(), text.size()).asBytes());
+    }
+    const kj::HttpHeaderTable& table;
+    kj::HttpHeaderId ifNoneMatch;
+  };
+
+  static void publishGate() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-publish-gate-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    kj::HttpHeaderTable::Builder builder;
+    const auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(io.provider->getTimer(), *table, store);
+    auto http = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.bucket = "b";
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    DurableLog log({"peer", "instance", temp, {}}, config, io.provider->getNetwork(), clock, *io.lowLevelProvider,
+        membership, {});
+    log.nodeEpoch = 9;
+    log.diskTrusted = true;
+    log.sameBootCache = true;
+    constexpr uint64_t EPOCH = 3;
+    auto& info = log.predecessorLogs[EPOCH];
+    info.complete = true;
+    const std::string ns(64, 'c');
+    auto id = [](int n) {
+      char out[65];
+      std::snprintf(out, sizeof(out), "%016llx%048x", (unsigned long long) n * 1024, n);
+      return std::string(out);
+    };
+    for (uint64_t sequence = 1; sequence <= 6; ++sequence) {
+      LogRecord r;
+      r.kind = LogRecordKind::RESET; r.nodeEpoch = EPOCH; r.nodeSeq = sequence; r.shard = 0; r.shardEpoch = 1;
+      r.objectName = ns + "/" + id(sequence % 2 ? 1 : 2); r.dataEpoch = 1; r.txn = sequence;
+      log.earlier[EPOCH][sequence] = r;
+      log.indexEarlierRecord({EPOCH, sequence}, r);
+      log.noteEarlierUnpublished(info, r);
+    }
+    SegmentHeader header;
+    header.nodeId = "peer"; header.nodeEpoch = EPOCH; header.segment = 1; header.firstSeq = 1; header.lastSeq = 6;
+    header.reason = "earlier-epoch";
+    auto pending = [&](const std::string& objectId) {
+      DurableTailAsk ask;
+      ask.namespaceId = ns; ask.shard = 0; ask.shardEpoch = 2; ask.ownerNodeId = "peer"; ask.ownerNodeEpoch = EPOCH;
+      ask.objectId = objectId;
+      const auto answer = log.tailFor(ask, false);
+      if (answer.refusal == "the restored owner shard still has unpublished records") return true;
+      KJ_REQUIRE(answer.refusal.empty() && answer.ownerConfirmed, "an answer is pending or an owner's empty tail",
+          answer.refusal.c_str());
+      return false;
+    };
+    // The first object's manifest create is held.
+    store.hold = id(1);
+    auto parked = kj::newPromiseAndFulfiller<void>();
+    store.parked = kj::mv(parked.fulfiller);
+    auto publishing = log.publishEarlierObject(EPOCH, header, ns + "/" + id(1) + "/1", 1).eagerlyEvaluate(nullptr);
+    parked.promise.wait(io.waitScope);
+    KJ_REQUIRE(pending(id(1)), "while its manifest write is held, a request naming the object is told there is more");
+    KJ_REQUIRE(log.earlierPublishing.contains(ns + "/" + id(1)) && log.earlier.at(EPOCH).size() == 6,
+        "a manifest being written retires nothing");
+    store.gate.fulfiller->fulfill();
+    publishing.wait(io.waitScope);
+    KJ_REQUIRE(store.written == 1 && log.earlierManifests == 1 && log.earlierPublishing.empty(), store.written);
+    KJ_REQUIRE(!pending(id(1)) && log.earlier.at(EPOCH).size() == 3, "once the manifest is written the object's tail is empty");
+    // The second object's manifest create fails.
+    store.fail = id(2);
+    log.publishEarlierObject(EPOCH, header, ns + "/" + id(2) + "/1", 1).wait(io.waitScope);
+    KJ_REQUIRE(store.failed == 1 && log.earlierManifests == 1, store.failed);
+    KJ_REQUIRE(pending(id(2)) && log.earlier.at(EPOCH).size() == 3, "a failed manifest write retires nothing");
+  }
+
+  static void restoredTail(bool negativeControls) {
+    using Control = DurableLog::RestoredTailControl;
+    if (!negativeControls) {
+      for (unsigned seed = 1; seed <= 40; ++seed)
+        KJ_REQUIRE(restoredTailCase(seed, Control::NONE), "per-object answers match the generated truth", seed);
+      return;
+    }
+    for (const auto control : {Control::SHARD_ONLY, Control::IGNORE_PUBLISHING}) {
+      bool caught = false;
+      for (unsigned seed = 1; seed <= 40 && !caught; ++seed) caught = !restoredTailCase(seed, control);
+      KJ_REQUIRE(caught, "a wrong per-object decision is detected", int(control));
+    }
+  }
 };
 
 }  // namespace coworkerd
@@ -900,5 +1508,9 @@ int main(int argc, char* argv[]) {
   else if (mode == "peer-fence") coworkerd::DurableLogChannelTest::peerFence(argc == 3 ? argv[2] : "");
   else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
+  else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
+  else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
+  else if (mode == "restored-tail" || mode == "restored-tail-negative")
+    coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
 }

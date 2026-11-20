@@ -133,6 +133,23 @@ struct SegmentHeader {
   std::vector<SegmentIndexEntry> objects;
 };
 std::string encodeSegment(const SegmentHeader& header, const std::vector<std::string>& records);
+// encodeLogRecord(record).size(), without encoding the record.
+uint64_t encodedLogRecordSize(const LogRecord& record);
+// What a restored holder's reseal hands its background thread: copies of the records of one earlier-epoch segment, in
+// sequence order, with their sequence numbers and encoded sizes.
+struct EarlierSegmentInput {
+  std::vector<LogRecord> records;
+  std::vector<uint64_t> sequences, sizes;
+};
+struct EarlierSegmentBuild {
+  SegmentHeader header;
+  std::string body, sha256;
+  std::set<std::string> touched;                // the records' objects, as host names
+  std::map<std::string, uint64_t> sourceEpochs;  // host name -> the highest shard epoch of its records here
+};
+// Encodes the records, indexes them per object and facet, encodes the segment and hashes it: what the reseal did on
+// the event loop before b58, byte for byte. `header` carries everything but the records' counts and index.
+EarlierSegmentBuild buildEarlierSegment(SegmentHeader header, EarlierSegmentInput input);
 // The records of a segment, with its header; none when the magic, the length or the digest do not hold.
 struct SegmentContents {
   SegmentHeader header;
@@ -433,6 +450,9 @@ public:
   // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
   // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
   kj::Promise<void> raisePeerFence(DurableTailAsk ask);
+  // r49: the floor of one shard raised to `epoch` once the object store shows that epoch (shared with raisePeerFence:
+  // one read at a time per epoch, failures kept and read again in the background). `reason` names what asked.
+  kj::Promise<void> raiseFloor(std::string namespaceId, uint32_t shard, uint64_t epoch, std::string reason);
   static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
   // r48: a check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
   // most this many times, while the epoch is still not known.
@@ -738,7 +758,12 @@ private:
   // The epochs with background rereads under way: one chain each, however many requests failed meanwhile.
   std::set<std::tuple<std::string, uint32_t, uint64_t>> fenceRereading;
   // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
-  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread);
+  kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread,
+      std::string reason);
+  // r49: a peer refused one of this node's records as fenced -- check whether the record's shard is lost.
+  void checkFencedShard(uint64_t sequence);
+  // r49: the shards such a refusal is being checked for, (namespace, shard) -> the refused record's epoch.
+  std::map<std::pair<std::string, uint32_t>, uint64_t> lostShardChecks;
 
   // ---- segments, manifests, snapshots ----
   struct SnapshotImage {
@@ -750,8 +775,10 @@ private:
   kj::Promise<void> sealLoop();
   kj::Promise<void> sealNow(std::string reason);
   bool sealDrainExpired() const;
+  // With `offLoop` (holding `body`), the store requests run on a worker thread with a client of their own.
   kj::Promise<bool> uploadSegment(const SegmentHeader& header, const std::string& body,
-      std::string payloadSha256 = {}, bool observeDrainDeadline = false);
+      std::string payloadSha256 = {}, bool observeDrainDeadline = false,
+      std::shared_ptr<const std::string> offLoop = nullptr);
   kj::Promise<bool> writeManifest(Object& object, bool withSnapshot,
       std::optional<uint64_t> expectedRevision = std::nullopt, const SnapshotImage* image = nullptr);
   kj::Promise<void> snapshotIfDue(std::string objectName);
@@ -761,9 +788,29 @@ private:
   void scheduleIdleCheckpoint(Object& object);
   kj::Promise<void> checkpointIdleObjects(double now);
   kj::Promise<void> resealEarlier();
+  // b58: the next segment of an earlier epoch, chosen on the event loop in slices without encoding a record (or, for
+  // an uploaded segment being published again, the objects it still names).
+  struct EarlierSelection {
+    EarlierSegmentInput input;
+    uint64_t records = 0, firstSeq = 0, lastSeq = 0;
+    bool aborted = false;  // the epoch went away or the recovery log failed while selecting
+    std::set<std::string> touched;
+    std::map<std::string, uint64_t> sourceEpochs;
+  };
+  kj::Promise<EarlierSelection> selectEarlier(uint64_t epoch, std::optional<ManifestSegment> cached);
+  // b58: the manifests naming one uploaded earlier segment, EARLIER_PUBLISH_CONCURRENCY objects at a time.
+  kj::Promise<void> publishEarlierObjects(uint64_t epoch, const SegmentHeader& header, std::vector<std::string> names,
+      const std::map<std::string, uint64_t>& sourceEpochs);
+  kj::Promise<void> publishEarlierObject(uint64_t epoch, const SegmentHeader& header, std::string hostName,
+      uint64_t sourceEpoch);
+  // Drops the records of one object (its host name) in [firstSeq, lastSeq] of an earlier epoch once a manifest names
+  // them, through the per-object index.
+  void retireEarlierObject(uint64_t epoch, const std::string& hostName, uint64_t firstSeq, uint64_t lastSeq);
   void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
   void persistEarlierSeals();
-  void cleanupClosedEpoch();
+  // b58: the same, with the writes and their synchronization on a worker thread (the reseal's calls).
+  kj::Promise<void> persistEarlierSealsAsync();
+  kj::Promise<void> cleanupClosedEpoch();
   kj::Promise<void> dropColdFiles(uint64_t reservedBytes = 0);
   void accountCacheSize(Object& object);
   std::set<std::pair<double, std::string>> idleCheckpoints;
@@ -861,6 +908,9 @@ private:
 
   Settings settings;
   std::optional<ObjectStore> store;
+  // b58: the store's configuration, for the clients of worker threads.
+  ObjectStoreConfig workerStoreConfig;
+  bool persistingSeals = false, cleaningEpoch = false;
   kj::Network& network;
   kj::Timer& timer;
   kj::LowLevelAsyncIoProvider& lowLevel;
@@ -915,14 +965,31 @@ private:
     std::set<std::pair<std::string, uint64_t>> startupUnsealed;
     // Publication is tracked per shard, independently of the current batch.
     std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedShards;
+    // b58: the same count per object (a record's objectName: namespace/object id), for tail requests naming it,
+    // and per shard the part of unpublishedShards that these per-object counts account for (always all of it in a
+    // running node; a request naming an object is answered for the shard when it is not).
+    std::map<std::string, uint64_t> unpublishedObjects;
+    std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedTracked;
   };
   std::map<uint64_t, PredecessorLog> predecessorLogs;
+  void noteEarlierUnpublished(PredecessorLog& info, const LogRecord& record);
+  // Whether a restored epoch still holds a record of one object that no manifest names: its count, its indexed
+  // records and its excluded ones (any of them is enough).
+  bool restoredObjectPending(const PredecessorLog& info, uint64_t epoch, const std::string& objectName) const;
   std::map<std::string, std::pair<uint64_t, uint32_t>> fencedTailReadAttempts;
   std::map<uint64_t, ManifestSegment> earlierUploads;
   std::map<uint64_t, std::map<std::string, uint32_t>> earlierPublishAttempts;
   std::map<uint64_t, double> earlierRetryAfter;
   uint64_t earlierCursor = 0;
   std::deque<uint64_t> earlierPriority;
+  // b58: the objects (namespace/object id) whose earlier-epoch manifest a reseal is writing right now, one entry per
+  // write (two data epochs of one object may be written at once).
+  std::multiset<std::string> earlierPublishing;
+  // The reseal's selection yields after this many bytes of records (tests make it small).
+  uint64_t earlierSliceBytes = 256 * 1024;
+  // Tests only: deliberately wrong per-object tail decisions, for the negative controls.
+  enum class RestoredTailControl : uint8_t { NONE, SHARD_ONLY, IGNORE_PUBLISHING };
+  RestoredTailControl restoredTailControlForTest = RestoredTailControl::NONE;
   std::set<std::string> carriedRecoveryObjects;
 
   std::map<std::string, Object> objects;         // objectName -> object
@@ -1042,10 +1109,12 @@ private:
   uint64_t transferredTailRecords = 0, unaccountedTailRecords = 0, unaccountedTailBytes = 0;
   uint64_t restoredUnaccountedRecords = 0, restoredUnaccountedBytes = 0;
   uint64_t restoredEmptyAnswers = 0, restoredLogUnavailableAnswers = 0, localLogEmptyClosures = 0;
+  uint64_t restoredObjectAnswers = 0, earlierSegmentBuilds = 0, earlierManifests = 0;
   uint64_t ownerLogUnavailableRecoveries = 0;
   uint64_t objectFailures = 0;
   uint64_t tailAnswers = 0, tailRefusals = 0, fencedRecords = 0, bufferRefusals = 0, recordLimitRefusals = 0;
   uint64_t peerFenceChecks = 0, peerFenceRaises = 0, peerFenceUnverified = 0, fullRetriesSent = 0;
+  uint64_t fencedShardChecks = 0, fencedShardsLost = 0;
   uint64_t walCutBacks = 0, walCutBackFailures = 0, positionMismatches = 0, manifestFences = 0, replayStops = 0, diskUsedBytes = 0;
   uint64_t alarmsSet = 0, alarmsCleared = 0, alarmsFired = 0, alarmFailures = 0, alarmRetries = 0;
   uint64_t alarmsNotDue = 0, alarmsAdopted = 0, alarmHintWrites = 0, alarmHintFailures = 0, alarmsDropped = 0;

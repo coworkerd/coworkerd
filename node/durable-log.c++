@@ -871,6 +871,50 @@ double percentile(std::vector<double> values, double fraction) {
 }
 }  // namespace
 
+// Field by field what encodeLogRecord writes: 116 bytes of fixed fields, length prefixes and checksum, then the texts,
+// the WAL header when there is one and the frames.
+uint64_t encodedLogRecordSize(const LogRecord& record) {
+  return 116 + record.objectName.size() + record.storageId.size() + record.facetName.size() +
+      (record.header.empty() ? 0 : 32) + record.frameBytes.size();
+}
+
+EarlierSegmentBuild buildEarlierSegment(SegmentHeader header, EarlierSegmentInput input) {
+  EarlierSegmentBuild out;
+  std::vector<std::string> encoded;
+  encoded.reserve(input.records.size());
+  std::map<std::pair<std::string, uint32_t>, SegmentIndexEntry> index;
+  header.records = 0;
+  header.bytes = 0;
+  header.firstSeq = 0;
+  header.lastSeq = 0;
+  for (size_t i = 0; i < input.records.size(); ++i) {
+    const auto& record = input.records[i];
+    const auto sequence = input.sequences[i];
+    auto bytes = encodeLogRecord(record);
+    KJ_REQUIRE(bytes.size() == input.sizes[i], "a record's encoded size changed between selection and encoding");
+    header.bytes += bytes.size();
+    encoded.push_back(std::move(bytes));
+    ++header.records;
+    if (!header.firstSeq) header.firstSeq = sequence;
+    header.lastSeq = sequence;
+    auto& entry = index[{record.objectName, record.facetId}];
+    entry.objectName = record.objectName;
+    entry.facetId = record.facetId;
+    if (!entry.records) entry.firstTxn = record.txn;
+    entry.lastTxn = record.txn;
+    ++entry.records;
+    const auto host = hostNameOf(record);
+    out.touched.insert(host);
+    auto& source = out.sourceEpochs[host];
+    source = std::max(source, record.shardEpoch);
+  }
+  for (auto& [key, entry] : index) header.objects.push_back(entry);
+  out.body = encodeSegment(header, encoded);
+  out.sha256 = objectSha256(out.body);
+  out.header = std::move(header);
+  return out;
+}
+
 DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeConfig, kj::Network& networkParam,
     kj::Timer& timerParam, kj::LowLevelAsyncIoProvider& lowLevelParam, const MembershipView& membershipParam,
     Hooks hooksParam)
@@ -885,6 +929,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
   if (const auto* v = std::getenv("COWORKERD_SLOW_FLUSH_FOR_TEST"); v != nullptr && *v != '\0') slowFlushForTest = v;
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
+    workerStoreConfig = storeConfig;
     segmentCache = std::make_unique<SegmentDecodeCache>([this](std::string key) { return store->get(std::move(key)); },
         SEGMENT_CACHE_BYTES, SEGMENT_CACHE_IDLE_MS, [this](const std::string& key, const DecodedSegment& segment) {
           log("segment-decoded", "\"key\":" + quote(key) + ",\"records\":" + std::to_string(segment.records) +
@@ -1024,10 +1069,12 @@ void DurableLog::setNodeEpoch(uint64_t epoch) {
     info.sealedTo = sealedSeq;
     info.maxSeq = nextSeq;
     info.unpublishedShards.clear();
+    info.unpublishedObjects.clear();
+    info.unpublishedTracked.clear();
     for (const auto* held : {&earlier[nodeEpoch], &earlierExcluded[nodeEpoch]}) {
       for (const auto& [sequence, record] : *held) {
         const auto shard = std::make_pair(record.objectName.substr(0, record.objectName.find('/')), record.shard);
-        ++info.unpublishedShards[shard];info.shards.insert(shard);info.objects.insert(hostNameOf(record));
+        noteEarlierUnpublished(info, record);info.shards.insert(shard);info.objects.insert(hostNameOf(record));
         info.objectEpochs[hostNameOf(record)] = std::max(info.objectEpochs[hostNameOf(record)], record.shardEpoch);
         info.startupUnsealed.emplace(record.objectName, record.shardEpoch);
       }
@@ -1532,7 +1579,7 @@ kj::Promise<void> DurableLog::readOwnLog(bool slice) {
     for (const auto& [sequence, record] : unsealed) {
       if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
       info.startupUnsealed.emplace(record.objectName, record.shardEpoch);
-      ++info.unpublishedShards[{record.objectName.substr(0, record.objectName.find('/')), record.shard}];
+      noteEarlierUnpublished(info, record);
     }
     for (auto entry = unsealed.begin(); entry != unsealed.end();) {
       if (budget.elapsed()) { co_await timer.afterDelay(0 * kj::MILLISECONDS); budget.reset(); }
@@ -2585,6 +2632,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         ++current->refusals;
         current->lastRefusal = accepted.refusal;
         if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
+        if (accepted.refusal.starts_with("fenced:")) checkFencedShard(sequence);
         // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
         // peer takes it; a full buffer is tried again on this session after a growing wait.
         current->refusedSeqs.insert(sequence);
@@ -2626,6 +2674,36 @@ void DurableLog::pumpPeer(PeerStream& peer) {
               "\",\"error\":" + quote(std::string(error.getDescription().cStr())));
     }).attach(sink.addRef()));
   }
+}
+
+// r49: a peer refused a record as fenced: it knows a newer epoch of the record's shard. That is believed once the object
+// store shows the next epoch after the record's (an epoch object is created only by the node that takes the shard),
+// and then this node has lost the shard: raising its own floor to that epoch (fenceOwner) refuses the shard's
+// pending and later writes at once, closes its objects here and drops it from the shards this node holds, so that
+// requests go to the newer owner -- instead of each write waiting for confirmTimeoutMs. Only the fence does this; a
+// full buffer or any other refusal does not. The read is shared with the peer floor's (raiseFloor).
+void DurableLog::checkFencedShard(uint64_t sequence) {
+  const auto record = parsed.find(sequence);
+  if (record == parsed.end() || !record->second.shardEpoch) return;
+  const auto& name = record->second.objectName;
+  const auto namespaceId = name.substr(0, name.find('/'));
+  const auto shard = record->second.shard;
+  const auto epoch = record->second.shardEpoch;
+  if (ownerFenced(namespaceId, shard, epoch)) return;
+  ++fencedShardChecks;
+  // Counted and logged when the fence comes, whichever read raises it (fenceOwner).
+  auto& watched = lostShardChecks[{namespaceId, shard}];
+  watched = std::max(watched, epoch);
+  // This node already knows a newer epoch (its shards' view, read from the store, can learn it first): no read. The
+  // fence is raised on the next turn, not inside the answer's own callback (it replaces the peer sessions).
+  if (knownEpoch(namespaceId, shard) > epoch) {
+    tasks.add(kj::evalLater([this, namespaceId, shard, epoch]() {
+      if (!ownerFenced(namespaceId, shard, epoch))
+        fenceOwner(namespaceId, shard, epoch, "a peer refused this node's append as fenced", true);
+    }));
+    return;
+  }
+  tasks.add(raiseFloor(namespaceId, shard, epoch + 1, "a peer refused this node's append as fenced"));
 }
 
 // r48: a record the peer refused because its buffer was full, sent again on the same session while it still waits.
@@ -2683,6 +2761,12 @@ kj::Promise<void> DurableLog::openPeer(std::string nodeId) {
             "\",\"receiver\":" + quote(entry->identity) + ",\"firstSeq\":\"" + std::to_string(firstSeq) + "\"");
     for (const auto& [sequence, encoded] : records) {
       if (sequence < firstSeq || isolated.contains(sequence)) continue;
+      // r49: nor the records of a shard this node has given up (fenced): its newer owner has their tail already.
+      if (!ownerFenceThrough.empty()) {
+        if (const auto record = parsed.find(sequence); record != parsed.end() &&
+            ownerFenced(record->second.objectName.substr(0, record->second.objectName.find('/')), record->second.shard,
+                record->second.shardEpoch)) continue;
+      }
       sendOne(*entry, sequence, encoded);
     }
   } catch (const kj::Exception& error) {
@@ -3187,7 +3271,7 @@ bool DurableLog::sealDrainExpired() const {
 }
 
 kj::Promise<bool> DurableLog::uploadSegment(const SegmentHeader& header, const std::string& body,
-    std::string payloadSha256, bool observeDrainDeadline) {
+    std::string payloadSha256, bool observeDrainDeadline, std::shared_ptr<const std::string> offLoop) {
   KJ_REQUIRE(body.size() <= STORE_SEGMENT_BYTES, "a segment exceeds the store client's read limit");
   const auto key = nodeSegmentKey(settings.nodeId, header.nodeEpoch, header.segment);
   auto defer = [&]() {
@@ -3201,20 +3285,49 @@ kj::Promise<bool> DurableLog::uploadSegment(const SegmentHeader& header, const s
       log("segment-deferred", "\"key\":" + quote(key) + ",\"reason\":\"recovery or a new log epoch has priority\"");
       co_return false;
     }
-    auto outcome = co_await store->create(key, body, payloadSha256)
-                       .then([](CreateResult result) { return std::make_pair(result.created, std::string()); })
-                       .catch_([](kj::Exception&& error) {
-      return std::make_pair(false, std::string(error.getDescription().cStr()));
-    });
+    std::pair<bool, std::string> outcome;
+    if (offLoop) {
+      outcome = co_await backgroundValue([config = workerStoreConfig, key, offLoop, payloadSha256]() {
+        try {
+          auto io = kj::setupAsyncIo();
+          ObjectStore threadStore(config, io.provider->getNetwork(), io.provider->getTimer());
+          return std::make_pair(threadStore.create(key, *offLoop, payloadSha256).wait(io.waitScope).created, std::string());
+        } catch (const kj::Exception& error) {
+          return std::make_pair(false, std::string(error.getDescription().cStr()));
+        }
+      });
+    } else {
+      outcome = co_await store->create(key, body, payloadSha256)
+                    .then([](CreateResult result) { return std::make_pair(result.created, std::string()); })
+                    .catch_([](kj::Exception&& error) {
+        return std::make_pair(false, std::string(error.getDescription().cStr()));
+      });
+    }
     if (outcome.second.empty() && !outcome.first) {
       // Existence alone does not prove this upload succeeded: another attempt may have used the same number.
       // Read errors retry the same immutable bytes; a different body must never be named by this manifest.
-      auto held = co_await store->get(key).then([&body](ObjectResponse response) {
+      auto check = [&body](ObjectResponse response) {
         return std::make_pair(response.status == 200 && response.bytes == body,
             response.status == 200 ? std::string() : std::string("the existing segment could not be read"));
-      }).catch_([](kj::Exception&& error) {
-        return std::make_pair(false, std::string(error.getDescription().cStr()));
-      });
+      };
+      std::pair<bool, std::string> held;
+      if (offLoop) {
+        held = co_await backgroundValue([config = workerStoreConfig, key, offLoop]() {
+          try {
+            auto io = kj::setupAsyncIo();
+            ObjectStore threadStore(config, io.provider->getNetwork(), io.provider->getTimer());
+            auto response = threadStore.get(key).wait(io.waitScope);
+            return std::make_pair(response.status == 200 && response.bytes == *offLoop,
+                response.status == 200 ? std::string() : std::string("the existing segment could not be read"));
+          } catch (const kj::Exception& error) {
+            return std::make_pair(false, std::string(error.getDescription().cStr()));
+          }
+        });
+      } else {
+        held = co_await store->get(key).then(check).catch_([](kj::Exception&& error) {
+          return std::make_pair(false, std::string(error.getDescription().cStr()));
+        });
+      }
       outcome.second = std::move(held.second);
       if (outcome.second.empty() && !held.first) {
         ++uploadFailures;
@@ -3673,10 +3786,7 @@ kj::Promise<void> DurableLog::housekeeping() {
     co_await checkpointIdleObjects(monotonicTimeMs());
     try {
       co_await resealEarlier();
-      {
-        r47::Span cleanup(r47::CLOSED_EPOCH_CLEANUP);
-        cleanupClosedEpoch();
-      }
+      co_await cleanupClosedEpoch();
       co_await dropColdFiles();
     } catch (const kj::Exception& error) {
       log("housekeeping-failed", "\"error\":" + quote(std::string(error.getDescription().cStr())));
@@ -3694,10 +3804,62 @@ void DurableLog::noteEarlierRetired(uint64_t epoch, const LogRecord& record) {
   auto held = info.unpublishedShards.find(key);
   if (held != info.unpublishedShards.end() && held->second && --held->second == 0)
     info.unpublishedShards.erase(held);
+  auto object = info.unpublishedObjects.find(record.objectName);
+  if (object != info.unpublishedObjects.end() && object->second && --object->second == 0)
+    info.unpublishedObjects.erase(object);
+  auto tracked = info.unpublishedTracked.find(key);
+  if (tracked != info.unpublishedTracked.end() && tracked->second && --tracked->second == 0)
+    info.unpublishedTracked.erase(tracked);
 }
 
-void DurableLog::cleanupClosedEpoch() {
-  if (recoveryWriteFailed || recoveryReadIncomplete || !nodeEpoch || (startupAttempted && !startupReady)) return;
+void DurableLog::noteEarlierUnpublished(PredecessorLog& info, const LogRecord& record) {
+  const auto shard = std::make_pair(record.objectName.substr(0, record.objectName.find('/')), record.shard);
+  ++info.unpublishedShards[shard];
+  ++info.unpublishedObjects[record.objectName];
+  ++info.unpublishedTracked[shard];
+}
+
+bool DurableLog::restoredObjectPending(const PredecessorLog& info, uint64_t epoch, const std::string& objectName) const {
+  if (restoredTailControlForTest == RestoredTailControl::IGNORE_PUBLISHING && earlierPublishing.contains(objectName))
+    return false;  // deliberately wrong: a manifest being written does not name the records yet
+  if (auto held = info.unpublishedObjects.find(objectName); held != info.unpublishedObjects.end() && held->second)
+    return true;
+  if (auto indexed = earlierByObject.find(objectName); indexed != earlierByObject.end()) {
+    const auto position = indexed->second.lower_bound({epoch, 0});
+    if (position != indexed->second.end() && position->first == epoch) return true;
+  }
+  if (auto excluded = earlierExcluded.find(epoch); excluded != earlierExcluded.end())
+    for (const auto& [sequence, record] : excluded->second)
+      if (record.objectName == objectName) return true;
+  return false;
+}
+
+void DurableLog::retireEarlierObject(uint64_t epoch, const std::string& hostName, uint64_t firstSeq, uint64_t lastSeq) {
+  auto held = earlier.find(epoch);
+  if (held == earlier.end()) return;
+  const auto slash = hostName.rfind('/');
+  auto indexed = earlierByObject.find(std::string_view(hostName).substr(0, slash == std::string::npos ? 0 : slash));
+  if (indexed == earlierByObject.end()) return;
+  std::vector<uint64_t> sequences;
+  for (auto position = indexed->second.lower_bound({epoch, firstSeq});
+       position != indexed->second.end() && position->first == epoch && position->second <= lastSeq; ++position) {
+    auto record = held->second.find(position->second);
+    if (record != held->second.end() && hostNameOf(record->second) == hostName) sequences.push_back(position->second);
+  }
+  for (const auto sequence : sequences) {
+    auto record = held->second.find(sequence);
+    noteEarlierRetired(epoch, record->second);
+    unindexEarlierRecord({epoch, sequence}, record->second);
+    held->second.erase(record);
+  }
+  if (held->second.empty()) earlier.erase(held);
+}
+
+kj::Promise<void> DurableLog::cleanupClosedEpoch() {
+  if (recoveryWriteFailed || recoveryReadIncomplete || !nodeEpoch || (startupAttempted && !startupReady) ||
+      persistingSeals || cleaningEpoch) co_return;
+  cleaningEpoch = true;
+  const auto cleaning = kj::defer([this]() { cleaningEpoch = false; });
   for (auto& [epoch, info] : predecessorLogs) {
     if (epoch == nodeEpoch || info.closed || !info.complete || info.sealedTo < info.maxSeq ||
         earlier.contains(epoch) || earlierExcluded.contains(epoch)) continue;
@@ -3705,6 +3867,7 @@ void DurableLog::cleanupClosedEpoch() {
     const auto original = logDirectory() / (wide(epoch) + ".log");
     std::error_code code;
     if (!std::filesystem::is_regular_file(original, code) || code) continue;
+    std::optional<r47::Span> cleanup(std::in_place, r47::CLOSED_EPOCH_CLEANUP);  // the loop's part only
     std::vector<RecoveryEvent> carry;
     std::vector<std::string> carried;
     // Snapshot aggregate object state once per destination epoch. Later live
@@ -3713,7 +3876,7 @@ void DurableLog::cleanupClosedEpoch() {
     for (const auto& [name, state] : recoveryStates) {
       if (carriedRecoveryObjects.contains(name)) continue;
       auto found = objects.find(name);
-      if (found == objects.end()) return;
+      if (found == objects.end()) co_return;
       const auto& object = found->second;
       auto add = [&](RecoveryKind kind, RecoveryGeneration generation) {
         carry.push_back(recoveryEvent(kind, object, generation));
@@ -3734,8 +3897,14 @@ void DurableLog::cleanupClosedEpoch() {
       if (state.healing) add(RecoveryKind::HEAL_BEGIN, state.rebuild);
       carried.push_back(name);
     }
-    if (!appendRecovery(carry, true)) return;
+    // b58: appended here, synchronized on a worker thread before anything below relies on it.
+    if (!appendRecovery(carry, false)) co_return;
     for (const auto& name : carried) carriedRecoveryObjects.insert(name);
+    cleanup.reset();
+    if (!carry.empty() && !co_await synchronizeRecoveryFile(recoveryFd) && !syncFile(recoveryFd)) {
+      failRecovery("a recovery event could not be appended and synchronized");
+      co_return;
+    }
     std::ostringstream summary;
     summary << "{\"nodeId\":" << quote(settings.nodeId) << ",\"epoch\":\"" << epoch
         << "\",\"completeEOF\":true,\"crossedBoot\":false,\"bootId\":" << quote(bootId())
@@ -3754,23 +3923,29 @@ void DurableLog::cleanupClosedEpoch() {
     }
     summary << "]}\n";
     const auto replacement = logDirectory() / (wide(epoch) + ".closed");
-    if (!atomicLocalFile(replacement, summary.str(), true)) {
-      failRecovery("the released-epoch summary could not be made durable");return;
-    }
-    if (::unlink(original.c_str()) != 0 ||
-        (::unlink((logDirectory() / (wide(epoch) + ".recovery")).c_str()) != 0 && errno != ENOENT) ||
-        !syncDirectory(logDirectory())) {
-      failRecovery("the released log epoch could not be replaced by its durable summary");return;
-    }
-    info.closed = true;
-    log("log-epoch-closed", "\"epoch\":\"" + std::to_string(epoch) + "\",\"through\":\"" + std::to_string(info.maxSeq) +
-        "\",\"summaryBytes\":" + std::to_string(summary.str().size()));
-    return;  // At most one synchronous cleanup per housekeeping pass.
+    const auto closedEpoch = epoch;
+    const auto through = info.maxSeq;
+    const auto summaryBytes = summary.str().size();
+    // The summary, the removal of the old log and of its sidecar, and the directory's synchronization: on a worker
+    // thread (the old log can be hundreds of MiB).
+    const auto outcome = co_await backgroundValue([replacement, text = summary.str(), original,
+        sidecar = logDirectory() / (wide(epoch) + ".recovery"), directory = logDirectory()]() {
+      if (!atomicLocalFile(replacement, text, true)) return 1;
+      if (::unlink(original.c_str()) != 0 || (::unlink(sidecar.c_str()) != 0 && errno != ENOENT) ||
+          !syncDirectory(directory)) return 2;
+      return 0;
+    });
+    if (outcome == 1) { failRecovery("the released-epoch summary could not be made durable"); co_return; }
+    if (outcome == 2) { failRecovery("the released log epoch could not be replaced by its durable summary"); co_return; }
+    if (auto closed = predecessorLogs.find(closedEpoch); closed != predecessorLogs.end()) closed->second.closed = true;
+    log("log-epoch-closed", "\"epoch\":\"" + std::to_string(closedEpoch) + "\",\"through\":\"" + std::to_string(through) +
+        "\",\"summaryBytes\":" + std::to_string(summaryBytes));
+    co_return;  // At most one cleanup per housekeeping pass.
   }
 }
 
 void DurableLog::persistEarlierSeals() {
-  if (recoveryWriteFailed) return;
+  if (recoveryWriteFailed || persistingSeals) return;  // the asynchronous one is writing; it is redone later
   for (auto& [epoch, info] : predecessorLogs) {
     if (epoch == nodeEpoch || !info.complete || info.sealFailures >= 5) continue;
     auto through = info.retiredTo;
@@ -3816,8 +3991,75 @@ void DurableLog::persistEarlierSeals() {
   }
 }
 
+// b58: what persistEarlierSeals does, with the appends and their fdatasync on a worker thread.
+kj::Promise<void> DurableLog::persistEarlierSealsAsync() {
+  if (recoveryWriteFailed || persistingSeals) co_return;
+  struct Seal { uint64_t epoch, through; std::string path, framed; };
+  std::vector<Seal> seals;
+  for (auto& [epoch, info] : predecessorLogs) {
+    if (epoch == nodeEpoch || !info.complete || info.sealFailures >= 5) continue;
+    auto through = info.retiredTo;
+    if (auto pending = earlier.find(epoch); pending != earlier.end() && !pending->second.empty())
+      through = std::min(through, pending->second.begin()->first - 1);
+    if (auto pending = earlierExcluded.find(epoch); pending != earlierExcluded.end() && !pending->second.empty())
+      through = std::min(through, pending->second.begin()->first - 1);
+    if (through <= info.sealedTo) continue;
+    LogRecord marker;marker.kind = LogRecordKind::SEAL;marker.nodeEpoch = epoch;marker.nodeSeq = through;
+    seals.push_back({epoch, through, (logDirectory() / (wide(epoch) + ".log")).string(), frameRecords({encodeLogRecord(marker)})});
+  }
+  if (seals.empty()) co_return;
+  persistingSeals = true;
+  const auto done = kj::defer([this]() { persistingSeals = false; });
+  struct Outcome { int openErrno = 0; size_t written = 0; bool synced = false; };
+  auto outcomes = co_await backgroundValue([seals]() {
+    std::vector<Outcome> out;
+    for (const auto& seal : seals) {
+      Outcome outcome;
+      const int fd = ::open(seal.path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+      if (fd < 0) { outcome.openErrno = errno; out.push_back(outcome); continue; }
+      while (outcome.written < seal.framed.size()) {
+        const auto n = ::write(fd, seal.framed.data() + outcome.written, seal.framed.size() - outcome.written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        outcome.written += size_t(n);
+      }
+#ifdef __APPLE__
+      outcome.synced = outcome.written == seal.framed.size() && ::fsync(fd) == 0;
+#else
+      outcome.synced = outcome.written == seal.framed.size() && ::fdatasync(fd) == 0;
+#endif
+      ::close(fd);
+      out.push_back(outcome);
+    }
+    return out;
+  });
+  for (size_t i = 0; i < seals.size(); ++i) {
+    auto found = predecessorLogs.find(seals[i].epoch);
+    if (found == predecessorLogs.end()) continue;
+    auto& info = found->second;
+    const auto& outcome = outcomes[i];
+    if (outcome.openErrno) {
+      ++info.sealFailures;
+      log("earlier-log-seal-failed", "\"epoch\":\"" + std::to_string(seals[i].epoch) +
+          "\",\"errno\":" + std::to_string(outcome.openErrno));
+      continue;
+    }
+    if (!outcome.synced) {
+      ++info.sealFailures;
+      info.complete = false;
+      log("earlier-log-seal-failed", "\"epoch\":\"" + std::to_string(seals[i].epoch) +
+          "\",\"partialBytes\":\"" + std::to_string(outcome.written) + "\"");
+      continue;
+    }
+    info.sealedTo = std::max(info.sealedTo, seals[i].through);
+    info.sealFailures = 0;
+    log("earlier-log-sealed", "\"epoch\":\"" + std::to_string(seals[i].epoch) +
+        "\",\"through\":\"" + std::to_string(seals[i].through) + "\"");
+  }
+}
+
 kj::Promise<void> DurableLog::resealEarlier() {
-  persistEarlierSeals();
+  co_await persistEarlierSealsAsync();
   if ((earlier.empty() && earlierExcluded.empty()) || !enabled() || !nodeEpoch || sealing || recoveryPublishWaiters || recoveryWriteFailed ||
       (startupAttempted && !startupReady)) co_return;
   // Normal seals and earlier-epoch seals share one writer, including numbering and manifest publication.
@@ -3850,7 +4092,7 @@ kj::Promise<void> DurableLog::resealEarlier() {
         log("restored-exclusions-published", "\"object\":" + quote(name) + ",\"epoch\":\"" + std::to_string(epoch) +
             "\",\"fenced\":" + (fenced ? "true" : "false"));
       }
-      persistEarlierSeals();
+      co_await persistEarlierSealsAsync();
     }
   }
   if (earlier.empty() || recoveryWriteFailed) co_return;
@@ -3877,119 +4119,70 @@ kj::Promise<void> DurableLog::resealEarlier() {
   const auto saved = earlierUploads.find(epoch);
   const auto cached = saved == earlierUploads.end() ? std::optional<ManifestSegment>() : saved->second;
   const bool reuse = cached.has_value();
-  std::vector<std::string> encoded;
-  SegmentHeader header;
-  std::map<std::pair<std::string, uint32_t>, SegmentIndexEntry> index;
-  std::set<std::string> touched;
-  std::map<std::string, uint64_t> sourceEpochs;
-  uint64_t wireBytes = segmentEnvelopeBudget(settings.nodeId, "earlier-epoch");
-  for (const auto& [sequence, record] : chosen->second) {
-    if (reuse && (sequence < cached->firstSeq || sequence > cached->lastSeq)) continue;
-    if (!reuse) {
-      auto bytes = encodeLogRecord(record);
-      const auto extra = bytes.size() + 4 +
-          (index.contains({record.objectName, record.facetId}) ? 0 : segmentEntryBudget(record));
-      if (!encoded.empty() && (header.bytes + bytes.size() > settings.config.segmentBytes ||
-          wireBytes + extra > STORE_SEGMENT_BYTES)) break;
-      KJ_REQUIRE(wireBytes + extra <= STORE_SEGMENT_BYTES, "an earlier record cannot fit a readable store segment");
-      wireBytes += extra;
-      header.bytes += bytes.size();
-      encoded.push_back(std::move(bytes));
-    }
-    ++header.records;
-    if (!header.firstSeq) header.firstSeq = sequence;
-    header.lastSeq = sequence;
-    auto& entry = index[{record.objectName, record.facetId}];
-    entry.objectName = record.objectName;
-    entry.facetId = record.facetId;
-    if (!entry.records) entry.firstTxn = record.txn;
-    entry.lastTxn = record.txn;
-    ++entry.records;
-    touched.insert(hostNameOf(record));
-    sourceEpochs[hostNameOf(record)] = std::max(sourceEpochs[hostNameOf(record)], record.shardEpoch);
-  }
-  if (!header.records) {
+  // b58: before, this selection encoded every record (some 15,000 per segment here) and the segment was encoded and
+  // hashed on the event loop, up to 0.86 s at a time. Now the loop only picks the records, in slices, with the same
+  // boundaries (each record's encoded size is computed, not encoded); the background thread encodes, indexes,
+  // assembles and hashes (buildEarlierSegment), and the loop uploads with that digest and publishes.
+  const auto selectStarted = monotonicTimeMs();
+  auto selection = co_await selectEarlier(epoch, cached);
+  const auto selectMs = monotonicTimeMs() - selectStarted;
+  if (selection.aborted) co_return;
+  if (reuse ? !selection.records : selection.input.records.empty()) {
     earlierUploads.erase(epoch);
     if (auto held = earlier.find(epoch); held != earlier.end() && held->second.empty()) earlier.erase(held);
     co_return;
   }
+  SegmentHeader header;
   header.nodeId = settings.nodeId;
   header.nodeEpoch = epoch;
   header.segment = 1;
   header.sealedAtUnixMs = realClockUnixMs();
   header.reason = "earlier-epoch";
-  for (auto& [key, entry] : index) header.objects.push_back(entry);
+  std::set<std::string> touched;
+  std::map<std::string, uint64_t> sourceEpochs;
   // The segment number of an earlier epoch may be taken already: the next free one is used.
   if (!reuse) {
     auto listing = co_await store->list(nodeLogEpochPrefix(settings.nodeId, epoch));
     header.segment = latestRevision(listing, nodeLogPrefix(settings.nodeId) + wide(epoch)) + 1;
-    const auto body = encodeSegment(header, encoded);
-    if (!co_await uploadSegment(header, body)) co_return;
+    const auto buildStarted = monotonicTimeMs();
+    auto built = co_await backgroundValue([header, input = std::move(selection.input)]() mutable {
+      return buildEarlierSegment(std::move(header), std::move(input));
+    });
+    const auto buildMs = monotonicTimeMs() - buildStarted;
+    ++earlierSegmentBuilds;
+    header = std::move(built.header);
+    touched = std::move(built.touched);
+    sourceEpochs = std::move(built.sourceEpochs);
+    const auto uploadStarted = monotonicTimeMs();
+    {
+      // The store client copies the body it is given and the request writes all of it: on a worker thread, as is
+      // the last reference to the body (freeing 64 MiB is not free either).
+      auto body = std::make_shared<const std::string>(std::move(built.body));
+      const bool uploaded = co_await uploadSegment(header, *body, std::move(built.sha256), false, body);
+      tasks.add(backgroundValue([body = std::move(body)]() mutable { body.reset(); return true; }).ignoreResult());
+      if (!uploaded) co_return;
+    }
     earlierUploads[epoch] = {settings.nodeId, epoch, header.segment, header.firstSeq, header.lastSeq, 0};
     ++segments;
     log("segment-earlier", "\"epoch\":\"" + std::to_string(epoch) + "\",\"segment\":\"" +
             std::to_string(header.segment) + "\",\"records\":" + std::to_string(header.records) + ",\"objects\":" +
-            std::to_string(touched.size()));
+            std::to_string(touched.size()) + ",\"selectMs\":" + std::to_string(selectMs) + ",\"buildMs\":" +
+            std::to_string(buildMs) + ",\"uploadMs\":" + std::to_string(monotonicTimeMs() - uploadStarted));
   } else {
     header.segment = cached->segment;
     header.firstSeq = cached->firstSeq;
     header.lastSeq = cached->lastSeq;
+    header.records = selection.records;
+    touched = std::move(selection.touched);
+    sourceEpochs = std::move(selection.sourceEpochs);
   }
   if (recoveryPublishWaiters) co_return;
-  unsigned visited = 0;
-  for (const auto& objectName : touched) {
-    if (visited++ == 8) {
-      co_await timer.afterDelay(1 * kj::MICROSECONDS);
-      visited = 1;
-    }
-    auto* object = objectOf(objectName);
-    if (object == nullptr) {
-      const auto identity = parseDurableHostName(objectName);
-      KJ_REQUIRE(identity.has_value(), "an earlier record has no object identity");
-      auto& held = objects[objectName];
-      held.objectName = objectName;held.namespaceId = identity->namespaceId;held.objectId = identity->objectId;
-      locate(held, identity->namespaceId, identity->objectId, identity->dataEpoch);
-      held.shardEpoch = sourceEpochs[objectName];
-      if (auto pending = earlier.find(epoch); pending != earlier.end())
-        for (const auto& [sequence, record] : pending->second)
-          if (hostNameOf(record) == objectName) { held.shard = record.shard; break; }
-      object = &held;
-    }
-    if (healingManifest(*object)) continue;
-    auto& attempts = earlierPublishAttempts[epoch][objectName];
-    if (attempts >= 5) continue;
-    ++attempts;
-    const auto already = std::any_of(object->segments.begin(), object->segments.end(), [&](const ManifestSegment& segment) {
-      return segment.nodeId == settings.nodeId && segment.nodeEpoch == epoch && segment.segment == header.segment;
-    });
-    if (!already) object->segments.push_back(ManifestSegment{settings.nodeId, epoch, header.segment, header.firstSeq,
-        header.lastSeq, sourceEpochs[objectName]});
-    bool published = false;
-    bool fenced = false;
-    if (object->state == ObjectState::GONE) {
-      auto current = co_await readManifest(object->namespaceId, object->objectId);
-      // Lease expiry also marks an object GONE. Its acknowledged old tail still
-      // needs publishing when no newer manifest fences it; this metadata write
-      // does not reopen the object or grant ownership of its files.
-      if (current && current->shardEpoch > object->shardEpoch) {
-        fenced = true;
-        co_await retireFencedTails(*object, *current);
-      }
-    }
-    if (!fenced) published = co_await writeManifest(*object, false).catch_([](kj::Exception&&) { return false; });
-    if (published) {
-      if (auto held = earlier.find(epoch); held != earlier.end()) {
-        std::erase_if(held->second, [&](const auto& entry) {
-          const auto& record = entry.second;
-          if (entry.first < header.firstSeq || entry.first > header.lastSeq || hostNameOf(record) != objectName) return false;
-          noteEarlierRetired(epoch, record);
-          unindexEarlierRecord({epoch, entry.first}, record);
-          return true;
-        });
-        if (held->second.empty()) earlier.erase(held);
-      }
-    }
-  }
+  const auto publishStarted = monotonicTimeMs();
+  const auto written = earlierManifests;
+  co_await publishEarlierObjects(epoch, header, std::vector<std::string>(touched.begin(), touched.end()), sourceEpochs);
+  log("segment-earlier-published", "\"epoch\":\"" + std::to_string(epoch) + "\",\"segment\":\"" +
+          std::to_string(header.segment) + "\",\"objects\":" + std::to_string(touched.size()) + ",\"manifests\":" +
+          std::to_string(earlierManifests - written) + ",\"publishMs\":" + std::to_string(monotonicTimeMs() - publishStarted));
   // A failed or fenced object does not republish the other objects every second.
   auto held = earlier.find(epoch);
   if (held == earlier.end() || held->second.empty() || held->second.begin()->first > header.lastSeq) {
@@ -4002,10 +4195,142 @@ kj::Promise<void> DurableLog::resealEarlier() {
     earlierRetryAfter[epoch] = monotonicTimeMs() + 30000;
     earlierPublishAttempts.erase(epoch);
   }
-  persistEarlierSeals();
+  co_await persistEarlierSealsAsync();
   if (prioritized && earlier.contains(epoch)) {
     earlierPriority.push_back(epoch);
     tasks.add(timer.afterDelay(0 * kj::MILLISECONDS).then([this]() { return resealEarlier(); }));
+  }
+}
+
+kj::Promise<DurableLog::EarlierSelection> DurableLog::selectEarlier(uint64_t epoch, std::optional<ManifestSegment> cached) {
+  // The boundaries are the ones the reseal always had: a segment ends before the record that would pass
+  // settings.config.segmentBytes of records or the store's read limit, and always holds at least one record. The
+  // records are copied for the background thread; every slice of about earlierSliceBytes yields, and the next slice
+  // goes on from the next sequence (records published or retired meanwhile are no longer there to take).
+  EarlierSelection out;
+  const bool reuse = cached.has_value();
+  uint64_t wireBytes = segmentEnvelopeBudget(settings.nodeId, "earlier-epoch"), bytes = 0;
+  std::map<std::string, std::set<uint32_t>, std::less<>> keys;  // the (object, facet) pairs indexed so far
+  uint64_t next = reuse ? cached->firstSeq : 0;
+  uint32_t counted = 0;
+  for (;;) {
+    auto held = earlier.find(epoch);
+    if (held == earlier.end()) {
+      out.aborted = !out.input.records.empty() || out.records;
+      co_return out;
+    }
+    uint64_t sliced = 0;
+    const auto sliceStarted = monotonicTimeMs();
+    bool more = false;
+    for (auto it = held->second.lower_bound(next); it != held->second.end(); ++it) {
+      const auto sequence = it->first;
+      const auto& record = it->second;
+      if (reuse) {
+        if (sequence > cached->lastSeq) co_return out;
+        ++out.records;
+        if (!out.firstSeq) out.firstSeq = sequence;
+        out.lastSeq = sequence;
+        const auto host = hostNameOf(record);
+        out.touched.insert(host);
+        auto& source = out.sourceEpochs[host];
+        source = std::max(source, record.shardEpoch);
+        sliced += 64;
+      } else {
+        const auto size = encodedLogRecordSize(record);
+        auto known = keys.find(std::string_view(record.objectName));
+        const bool indexed = known != keys.end() && known->second.contains(record.facetId);
+        const auto extra = size + 4 + (indexed ? 0 : segmentEntryBudget(record));
+        if (!out.input.records.empty() && (bytes + size > settings.config.segmentBytes ||
+            wireBytes + extra > STORE_SEGMENT_BYTES)) co_return out;
+        KJ_REQUIRE(wireBytes + extra <= STORE_SEGMENT_BYTES, "an earlier record cannot fit a readable store segment");
+        wireBytes += extra;
+        bytes += size;
+        if (!indexed) keys[record.objectName].insert(record.facetId);
+        out.input.records.push_back(record);
+        out.input.sequences.push_back(sequence);
+        out.input.sizes.push_back(size);
+        sliced += size;
+      }
+      next = sequence + 1;
+      // A clock read costs about 1.4 us on cwkd-p40 (hpet): look at it every 16 records only.
+      if (sliced >= earlierSliceBytes || ((++counted & 15) == 0 && monotonicTimeMs() - sliceStarted >= 0.5)) {
+        more = true;
+        break;
+      }
+    }
+    if (!more) co_return out;
+    co_await timer.afterDelay(1 * kj::MICROSECONDS);
+    if (recoveryWriteFailed) {
+      out.aborted = true;
+      co_return out;
+    }
+  }
+}
+
+// b58: before, the manifests were written one object after another (with a yield every 8): each write a listing, a
+// read and a create on the store (13 ms on cwkd-p40), then a scan of the whole epoch's records to retire the object's
+// (5 ms on the event loop); 4,638 writes over 5 segments took 94 s. Now up to EARLIER_PUBLISH_CONCURRENCY objects of
+// the segment are written at once, and retiring uses the per-object index. Each object still gets one manifest write
+// per segment, in segment order, and its records are retired only once that write succeeded.
+constexpr uint32_t EARLIER_PUBLISH_CONCURRENCY = 16;
+kj::Promise<void> DurableLog::publishEarlierObjects(uint64_t epoch, const SegmentHeader& header,
+    std::vector<std::string> names, const std::map<std::string, uint64_t>& sourceEpochs) {
+  size_t next = 0;
+  auto worker = [this, epoch, &header, &names, &sourceEpochs, &next]() -> kj::Promise<void> {
+    while (next < names.size()) {
+      auto name = names[next++];
+      const auto source = sourceEpochs.find(name);
+      co_await publishEarlierObject(epoch, header, std::move(name), source == sourceEpochs.end() ? 0 : source->second);
+    }
+  };
+  kj::Vector<kj::Promise<void>> workers;
+  for (uint32_t i = 0; i < EARLIER_PUBLISH_CONCURRENCY && i < names.size(); ++i) workers.add(worker());
+  co_await kj::joinPromises(workers.releaseAsArray());
+}
+
+kj::Promise<void> DurableLog::publishEarlierObject(uint64_t epoch, const SegmentHeader& header, std::string objectName,
+    uint64_t sourceEpoch) {
+  auto* object = objectOf(objectName);
+  if (object == nullptr) {
+    const auto identity = parseDurableHostName(objectName);
+    KJ_REQUIRE(identity.has_value(), "an earlier record has no object identity");
+    auto& held = objects[objectName];
+    held.objectName = objectName;held.namespaceId = identity->namespaceId;held.objectId = identity->objectId;
+    locate(held, identity->namespaceId, identity->objectId, identity->dataEpoch);
+    held.shardEpoch = sourceEpoch;
+    if (auto pending = earlier.find(epoch); pending != earlier.end())
+      for (const auto& [sequence, record] : pending->second)
+        if (hostNameOf(record) == objectName) { held.shard = record.shard; break; }
+    object = &held;
+  }
+  if (healingManifest(*object)) co_return;
+  auto& attempts = earlierPublishAttempts[epoch][objectName];
+  if (attempts >= 5) co_return;
+  ++attempts;
+  const auto already = std::any_of(object->segments.begin(), object->segments.end(), [&](const ManifestSegment& segment) {
+    return segment.nodeId == settings.nodeId && segment.nodeEpoch == epoch && segment.segment == header.segment;
+  });
+  if (!already) object->segments.push_back(ManifestSegment{settings.nodeId, epoch, header.segment, header.firstSeq,
+      header.lastSeq, sourceEpoch});
+  const auto key = object->namespaceId + "/" + object->objectId;
+  earlierPublishing.insert(key);
+  const auto publishing = kj::defer([this, key]() { earlierPublishing.erase(earlierPublishing.find(key)); });
+  bool published = false;
+  bool fenced = false;
+  if (object->state == ObjectState::GONE) {
+    auto current = co_await readManifest(object->namespaceId, object->objectId);
+    // Lease expiry also marks an object GONE. Its acknowledged old tail still
+    // needs publishing when no newer manifest fences it; this metadata write
+    // does not reopen the object or grant ownership of its files.
+    if (current && current->shardEpoch > object->shardEpoch) {
+      fenced = true;
+      co_await retireFencedTails(*object, *current);
+    }
+  }
+  if (!fenced) published = co_await writeManifest(*object, false).catch_([](kj::Exception&&) { return false; });
+  if (published) {
+    ++earlierManifests;
+    retireEarlierObject(epoch, objectName, header.firstSeq, header.lastSeq);
   }
 }
 
@@ -6700,6 +7025,16 @@ void DurableLog::fenceOwner(const std::string& namespaceId, uint32_t shard, uint
     log("owner-fenced", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
         ",\"throughShardEpoch\":\"" + std::to_string(through) + "\",\"reason\":" + quote(reason));
   }
+  // r49: a shard a peer's fenced refusal made this node check is lost once the fence covers the refused record.
+  if (!lostShardChecks.empty()) {
+    if (const auto watched = lostShardChecks.find({namespaceId, shard});
+        watched != lostShardChecks.end() && watched->second <= boundary) {
+      ++fencedShardsLost;
+      log("shard-lost-fenced", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
+          ",\"shardEpoch\":\"" + std::to_string(watched->second) + "\"");
+      lostShardChecks.erase(watched);
+    }
+  }
   for (auto& [name, object] : objects) {
     if (object.namespaceId != namespaceId || object.shard != shard || object.shardEpoch > boundary) continue;
     isolateObjectPending(object, reason);
@@ -6855,7 +7190,14 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
       result.refusal = "a record of another epoch of the owner";
       return result;
     }
-    if (record->kind != LogRecordKind::SEAL) {
+    // r49: a record this node already holds, sent again after the owner reconnected, was taken before any floor that
+    // would refuse it now and is in a newer owner's tail: it is taken again as a duplicate, not refused -- refusing it
+    // would hold back the owner's answers for its other shards until a trim. Only the same bytes are that record; a
+    // different record under a held sequence is checked like any new one.
+    if (record->nodeSeq <= buffer.droppedTo || buffer.isolated.contains(record->nodeSeq)) continue;
+    const auto heldAt = buffer.held.find(record->nodeSeq);
+    const bool duplicate = heldAt != buffer.held.end() && heldAt->second == encoded;
+    if (record->kind != LogRecordKind::SEAL && !duplicate) {
       const auto known = knownEpoch(record->objectName.substr(0, record->objectName.find('/')), record->shard);
       if (known != 0 && record->shardEpoch < known) {
         ++fencedRecords;
@@ -6869,7 +7211,6 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
         return result;
       }
     }
-    if (record->nodeSeq <= buffer.droppedTo || buffer.isolated.contains(record->nodeSeq)) continue;
     auto [entry, added] = buffer.held.insert({record->nodeSeq, encoded});
     if (added) {
       buffer.bytes += encoded.size();
@@ -6984,21 +7325,29 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // at least this one, is never fenced by it. The answer is computed after the raise: an append taken before it is in
 // the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
-// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
+// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS. A request
+// for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before, except
+// that a restored epoch answers a request naming an object for that object without fencing (b58; the shard is
+// fenced when a proof is given for all of it) (r49
+// section 6.3; the check needs a wire signal or a new rule, in the backlog).
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
-  if (ask.shardEpoch <= knownEpoch(ask.namespaceId, ask.shard)) co_return;
+  co_await raiseFloor(ask.namespaceId, ask.shard, ask.shardEpoch, "a newer epoch of the shard asked for a tail");
+}
+
+kj::Promise<void> DurableLog::raiseFloor(std::string namespaceId, uint32_t shard, uint64_t epoch, std::string reason) {
+  if (!enabled() || epoch < 2 || epoch <= knownEpoch(namespaceId, shard)) co_return;
   const auto now = timer.now();
   for (auto it = fenceChecks.begin(); it != fenceChecks.end();)
     it = it->second.settled && now - it->second.at >= int64_t(OWNER_REREAD_MS) * kj::MILLISECONDS ? fenceChecks.erase(it)
                                                                                                     : std::next(it);
-  const auto key = std::make_tuple(ask.namespaceId, ask.shard, ask.shardEpoch);
+  const auto key = std::make_tuple(namespaceId, shard, epoch);
   auto found = fenceChecks.find(key);
   // A check of this epoch that failed within OWNER_REREAD_MS: answered at once, as before (a background read follows).
   if (found != fenceChecks.end() && found->second.settled) co_return;
   if (found == fenceChecks.end()) {
     ++peerFenceChecks;
-    auto check = checkPeerFence(ask.namespaceId, ask.shard, ask.shardEpoch, 0).fork();
+    auto check = checkPeerFence(namespaceId, shard, epoch, 0, std::move(reason)).fork();
     found = fenceChecks.emplace(key, FenceCheck{kj::mv(check), now, false}).first;
   }
   co_await found->second.done.addBranch();
@@ -7013,7 +7362,8 @@ kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
 // the floor here, before any of them is answered; a failure is kept for OWNER_REREAD_MS, and the epoch is read again
 // in the background -- after OWNER_REREAD_MS, doubled each time, at most FENCE_REREADS times, while it is still not
 // known -- so that the floor goes up soon after the store answers again.
-kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread) {
+kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread,
+    std::string reason) {
   std::string failure;
   try {
     const auto waitMs = std::max<uint32_t>(1, settings.peerTimeoutMs / 2);
@@ -7024,7 +7374,7 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
       if (record && record->epoch == epoch && record->namespaceId == namespaceId && record->shard == shard) {
         if (epoch > knownEpoch(namespaceId, shard)) {
           ++peerFenceRaises;
-          fenceOwner(namespaceId, shard, epoch - 1, "a newer epoch of the shard asked for a tail", true);
+          fenceOwner(namespaceId, shard, epoch - 1, reason, true);
         }
         if (reread) fenceRereading.erase({namespaceId, shard, epoch});
         co_return;
@@ -7047,8 +7397,8 @@ kj::Promise<void> DurableLog::checkPeerFence(std::string namespaceId, uint32_t s
     co_return;
   }
   const auto waitMs = int64_t(OWNER_REREAD_MS) << reread;
-  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread]() {
-    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1);
+  tasks.add(timer.afterDelay(waitMs * kj::MILLISECONDS).then([this, namespaceId, shard, epoch, reread, reason]() {
+    if (epoch > knownEpoch(namespaceId, shard)) return checkPeerFence(namespaceId, shard, epoch, reread + 1, reason);
     fenceRereading.erase({namespaceId, shard, epoch});
     return kj::Promise<void>(kj::READY_NOW);
   }));
@@ -7073,22 +7423,38 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
     }
     const auto& info = predecessorLogs.at(ask.ownerNodeEpoch);
     const auto pending = info.unpublishedShards.find({ask.namespaceId, ask.shard});
-    if (pending != info.unpublishedShards.end() && pending->second) {
+    const bool shardPending = pending != info.unpublishedShards.end() && pending->second;
+    // b58: a request naming its object (b54) is answered for that object: once no record of it in this epoch is left
+    // unnamed by a manifest, the rest of the shard does not make the new owner wait. Never "nothing left" while any
+    // record of the object is unpublished (restoredObjectPending). A request without an object is answered for the
+    // shard, as before.
+    const auto named = ask.objectId.empty() ? std::string() : ask.namespaceId + "/" + ask.objectId;
+    const auto tracked = info.unpublishedTracked.find({ask.namespaceId, ask.shard});
+    const bool accounted = !shardPending ||
+        (tracked != info.unpublishedTracked.end() && tracked->second == pending->second);
+    const bool stillPending = (named.empty() || !accounted ||
+        restoredTailControlForTest == RestoredTailControl::SHARD_ONLY)
+        ? shardPending : restoredObjectPending(info, ask.ownerNodeEpoch, named);
+    if (stillPending) {
       if (std::find(earlierPriority.begin(), earlierPriority.end(), ask.ownerNodeEpoch) == earlierPriority.end())
         earlierPriority.push_back(ask.ownerNodeEpoch);
       tasks.add(timer.afterDelay(0 * kj::MILLISECONDS).then([this]() { return resealEarlier(); }));
       answer.refusal = "the restored owner shard still has unpublished records";
       log("restored-owner-tail-pending", "\"namespaceId\":" + quote(ask.namespaceId) +
           ",\"shard\":" + std::to_string(ask.shard) + ",\"sourceNodeEpoch\":\"" +
-          sourceEpoch + "\",\"records\":" + std::to_string(pending->second));
+          sourceEpoch + "\",\"records\":" + std::to_string(shardPending ? pending->second : 0) +
+          (named.empty() ? std::string() : ",\"objectId\":" + quote(ask.objectId.substr(0, 12))));
       return answer;
     }
-    if (remote && ask.shardEpoch > 1)
+    // The shard's owner proof (and its fence) stays what it was: only once the whole shard is published.
+    if (remote && ask.shardEpoch > 1 && !shardPending)
       fenceOwner(ask.namespaceId, ask.shard, ask.shardEpoch - 1, "a remote complete owner proof", true);
     ++tailAnswers;++restoredEmptyAnswers;
+    if (shardPending) ++restoredObjectAnswers;
     answer.ownerConfirmed = true;
-    log("restored-owner-tail-empty", "\"namespaceId\":" + quote(ask.namespaceId) +
-        ",\"shard\":" + std::to_string(ask.shard) + ",\"sourceNodeEpoch\":\"" + sourceEpoch + "\"");
+    log(shardPending ? "restored-owner-object-empty" : "restored-owner-tail-empty", "\"namespaceId\":" +
+        quote(ask.namespaceId) + ",\"shard\":" + std::to_string(ask.shard) + ",\"sourceNodeEpoch\":\"" + sourceEpoch +
+        "\"" + (named.empty() ? std::string() : ",\"objectId\":" + quote(ask.objectId.substr(0, 12))));
     return answer;
   }
   if (remote && ask.ownerNodeId == settings.nodeId && ask.shardEpoch > 1)
@@ -7345,7 +7711,7 @@ std::string DurableLog::json() const {
       << "\",\"streams\":" << incoming.size() << ",\"refusals\":" << bufferRefusals << ",\"fencedRecords\":"
       << fencedRecords << ",\"peerFenceChecks\":" << peerFenceChecks << ",\"peerFenceRaises\":" << peerFenceRaises
       << ",\"peerFenceUnverified\":" << peerFenceUnverified << ",\"ownerFences\":" << ownerFenceThrough.size()
-      << ",\"fullRetriesSent\":" << fullRetriesSent
+      << ",\"fullRetriesSent\":" << fullRetriesSent << ",\"fencedShardChecks\":" << fencedShardChecks << ",\"fencedShardsLost\":" << fencedShardsLost
       << ",\"tailAnswers\":" << tailAnswers << ",\"tailFetches\":" << tailFetches << ",\"owners\":[";
   first = true;
   for (const auto& [streamId, buffer] : incoming) {
@@ -7385,6 +7751,8 @@ std::string DurableLog::json() const {
       << unaccountedTailBytes << "\",\"restoredUnaccountedRecords\":" << restoredUnaccountedRecords
       << ",\"restoredUnaccountedBytes\":\"" << restoredUnaccountedBytes
       << "\",\"restoredEmptyAnswers\":" << restoredEmptyAnswers
+      << ",\"restoredObjectAnswers\":" << restoredObjectAnswers << ",\"earlierSegmentBuilds\":" << earlierSegmentBuilds
+      << ",\"earlierManifests\":" << earlierManifests << ",\"earlierPublishing\":" << earlierPublishing.size()
       << ",\"restoredLogUnavailableAnswers\":" << restoredLogUnavailableAnswers
       << ",\"localLogEmptyClosures\":" << localLogEmptyClosures
       << ",\"ownerLogUnavailable\":" << ownerLogUnavailableRecoveries

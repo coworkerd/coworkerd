@@ -208,6 +208,10 @@ add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-t
 add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)
 add_test(NAME durable-segment-negative-controls COMMAND coworkerd-durable-channel-test segment-negative)
 add_test(NAME durable-segment-cache COMMAND coworkerd-durable-channel-test segment-cache)
+add_test(NAME durable-earlier-segment COMMAND coworkerd-durable-channel-test earlier-segment)
+add_test(NAME durable-earlier-publish-gate COMMAND coworkerd-durable-channel-test publish-gate)
+add_test(NAME durable-restored-tail COMMAND coworkerd-durable-channel-test restored-tail)
+add_test(NAME durable-restored-tail-negative-controls COMMAND coworkerd-durable-channel-test restored-tail-negative)
 # Freed memory is overwritten, so that a load touching its destroyed cache fails this test instead of passing by luck.
 set_tests_properties(durable-segment-cache PROPERTIES ENVIRONMENT "MALLOC_PERTURB_=165")
 add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
@@ -217,11 +221,12 @@ endforeach()
 foreach(case raise unverified old-ask coalesce outage)
   add_test(NAME durable-peer-fence-${case} COMMAND coworkerd-durable-channel-test peer-fence ${case})
 endforeach()
-foreach(case fenced full full-resend)
+foreach(case fenced full full-resend resend-held)
   add_test(NAME durable-refused-peer-${case} COMMAND coworkerd-durable-channel-test refused-peer ${case})
 endforeach()
 foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect cut-short-reconnect limit-reconnect
-    corrupt-reconnect chunk pair-full pair-fenced)
+    corrupt-reconnect chunk pair-full pair-fenced fenced-drop fenced-unshown full-keeps fenced-drop-resend fenced-known
+    reacquired)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
 foreach(case native-config tenant-execution deadlines event-loop trial-verdicts leases tree-lease budget identity admission placement package module-types cache
