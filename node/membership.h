@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <array>
 #include <map>
 #include <set>
 #include <string>
@@ -156,6 +157,12 @@ struct MembershipView {
   // the current epoch was fenced, and the heartbeat successes that came too late to renew it.
   std::string leaseClock, leaseFenceReason;
   uint64_t leaseFences = 0, lateHeartbeats = 0;
+  // Every heartbeat PUT, answered or not, from its start to its end by the monotonic clock (on its own connections:
+  // ObjectStoreLane::HEARTBEAT): the last, the longest, the sum (a mean) and how many took longer than 10, 50, 100, 250,
+  // 500 and 1,000 ms.
+  uint64_t heartbeatPuts = 0;
+  double heartbeatPutLastMs = 0, heartbeatPutMaxMs = 0, heartbeatPutTotalMs = 0;
+  std::array<uint64_t, 6> heartbeatPutsOver{};
   // The recovery anchor: once this node could not list the store for longer than the TTL, the members it had whose
   // heartbeat objects are still listed stay in its table until recoveredUntilUnixMs (the store's clock: the recovery
   // + TTL + grace) unless a newer epoch of theirs appears. recoveries counts the anchors, keptMembers the members the

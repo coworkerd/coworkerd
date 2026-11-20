@@ -7639,6 +7639,8 @@ std::string DurableLog::json() const {
   }
   out << "{\"enabled\":" << (enabled() ? "true" : "false") << ",\"nodeEpoch\":\"" << nodeEpoch
       << "\",\"earlierRecords\":" << earlierRecords << ",\"ownerFences\":" << ownerFenceEvents
+      << ",\"storeClient\":" << (store ? store->stats().json() : std::string("null"))
+      << ",\"storeProcess\":" << objectStoreProcessConnections().json()
       << ",\"localRecovery\":{\"writeFailed\":" << (recoveryWriteFailed ? "true" : "false")
       << ",\"writeFailures\":" << recoveryWriteFailures << ",\"startupReady\":" << ((!startupAttempted || startupReady) ? "true" : "false")
       << ",\"startupMarkerFailures\":" << startupMarkerFailures << ",\"startupCleanupFailures\":" << startupCleanupFailures << "}"

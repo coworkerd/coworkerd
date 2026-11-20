@@ -210,6 +210,14 @@ foreach(case deadlines leases tree-lease budget identity admission placement pac
     cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
+# The object store client's kept-alive connections, against a loopback store of the test's own.
+add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
+target_link_libraries(coworkerd-object-store-test PRIVATE common)
+foreach(case reuse broken retry-rules timeout limits heartbeat)
+  add_test(NAME object-store-${case} COMMAND coworkerd-object-store-test ${case})
+endforeach()
+set_tests_properties(object-store-reuse object-store-broken object-store-retry-rules object-store-timeout
+  object-store-limits object-store-heartbeat PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-config-test EXCLUDE_FROM_ALL common/config-test.c++)
 target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
@@ -218,7 +226,7 @@ add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-bor
 add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG>
-  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-config-test
+  DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-config-test coworkerd-object-store-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.
