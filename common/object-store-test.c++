@@ -44,6 +44,7 @@ public:
     LATE,          // answered after lateMs
     EXTRA,         // 200, then at once a whole second answer nobody asked for; the connection stays open
     EXTRA_LATE,    // the same, the second answer 20 ms later
+    EXTRA_SPLIT,   // the same, the second answer in two pieces 20 ms apart ("HTTP/1.1 200 OK\r\nCont", then the rest)
   };
 
   FakeStore(kj::AsyncIoContext& io): io(io), timer(io.provider->getTimer()) {
@@ -182,6 +183,12 @@ private:
           if (act == Act::EXTRA_LATE) co_await timer.afterDelay(20 * kj::MILLISECONDS);
           co_await write(*stream, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nextra");
           break;
+        case Act::EXTRA_SPLIT:
+          co_await answer(*stream, request, 200, false);
+          co_await write(*stream, "HTTP/1.1 200 OK\r\nCont");
+          co_await timer.afterDelay(20 * kj::MILLISECONDS);
+          co_await write(*stream, "ent-Length: 5\r\n\r\nextra");
+          break;
       }
     }
   }
@@ -295,15 +302,15 @@ void broken() {
       c.json().c_str());
 }
 
-// The store sends a whole answer nobody asked for and keeps the connection open, right after an answer or a moment
-// later: the next overwrite and the read after it each read their own answer (no client reads an idle connection; the
-// peek finds bytes still in the socket, and bytes a client read ahead go with it).
+// The store sends a whole answer nobody asked for and keeps the connection open, right after an answer, a moment later,
+// or in two pieces a moment apart: the next overwrite and the read after it each read their own answer (no client
+// reads an idle connection; the peek finds bytes still in the socket, and bytes a client read ahead go with it).
 void extraAnswer() {
   auto io = kj::setupAsyncIo();
   FakeStore fake(io);
   ObjectStore store(fake.config(), io.provider->getNetwork(), io.provider->getTimer());
   const auto& c = store.stats().connections;
-  for (const auto act : {FakeStore::Act::EXTRA, FakeStore::Act::EXTRA_LATE}) {
+  for (const auto act : {FakeStore::Act::EXTRA, FakeStore::Act::EXTRA_LATE, FakeStore::Act::EXTRA_SPLIT}) {
     bool once = true;
     fake.decide = [&](const Seen& s) {
       if (s.key() == "do/extra" && once) { once = false; return act; }
