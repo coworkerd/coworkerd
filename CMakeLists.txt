@@ -231,7 +231,7 @@ foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect
     reacquired)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
-foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent trial-verdicts leases tree-lease budget identity admission placement package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent node-cpu trial-verdicts leases tree-lease budget identity admission placement package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()

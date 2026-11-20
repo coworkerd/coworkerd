@@ -6,8 +6,36 @@
 #include <map>
 
 namespace coworkerd {
+// v138 section 2: the two saturation refusals, the (node, Worker) marks and the "nowhere to go" decision.
+inline void saturationPlacement() {
+  KJ_REQUIRE(saturationRefusal(WORKER_SATURATED, ""));
+  KJ_REQUIRE(saturationRefusal("OVERLOADED", NODE_CPU_FULL));
+  KJ_REQUIRE(!saturationRefusal("OVERLOADED", ""), "a full node's concurrency is not saturation");
+  KJ_REQUIRE(placementRetryable(WORKER_SATURATED, ""), "a saturated Worker's refusal sends the call on");
+  SaturationMarks marks;
+  marks.mark("n1", "acme/hot", 2000);
+  KJ_REQUIRE(marks.marked("n1", "acme/hot", 1999) && !marks.marked("n1", "acme/hot", 2000));
+  KJ_REQUIRE(!marks.marked("n1", "acme/cold", 1000), "another Worker on the same node is not marked");
+  KJ_REQUIRE(!marks.marked("n2", "acme/hot", 1000));
+  std::vector<std::string> ordered{"n0", "n1", "n2", "n3"};
+  marks.mark("n0", "acme/hot", 2000);
+  orderBySaturation(ordered, false, [&](const std::string& id) { return marks.marked(id, "acme/hot", 1000); });
+  KJ_REQUIRE((ordered == std::vector<std::string>{"n2", "n3", "n0", "n1"}), "marked candidates go last, in order");
+  ordered = {"n0", "n1", "n2"};
+  orderBySaturation(ordered, true, [&](const std::string& id) { return marks.marked(id, "acme/hot", 1000); });
+  KJ_REQUIRE((ordered == std::vector<std::string>{"n0", "n2", "n1"}), "a hot local first stays first");
+  marks.prune(3000);
+  KJ_REQUIRE(marks.size() == 0);
+  KJ_REQUIRE(placeDespiteSaturation(3, 3, true, true), "every candidate saturated: the own node takes it");
+  KJ_REQUIRE(!placeDespiteSaturation(2, 3, true, true), "a candidate left to try");
+  KJ_REQUIRE(!placeDespiteSaturation(3, 3, false, true), "one refused for something else");
+  KJ_REQUIRE(!placeDespiteSaturation(3, 3, true, false), "the own node is not a candidate");
+  KJ_REQUIRE(!placeDespiteSaturation(0, 0, true, true));
+}
+
 inline void placementContracts() {
   placementTransitions();
+  saturationPlacement();
   struct BandCase {
     const char* old;
     bool root, forwarded, hot;

@@ -4,6 +4,7 @@
 #include "invocation-contract.h"
 #include "event-loop.h"
 #include "memory-events.h"
+#include "node-cpu.h"
 #include "trial-verdict.h"
 #include "tenant-execution.h"
 #include "process-heat.h"
@@ -196,6 +197,22 @@ void eventLoopProgress() {
   KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= NODE_BUSY_POLL_INTERVAL + 1 &&
       port.largestBatch >= NODE_BUSY_POLL_INTERVAL / 4,
       "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
+}
+
+// The node's CPU use: its cgroup's usage over the window, against its CPUs; nothing until two samples span half the
+// window; old samples leave.
+void nodeCpu() {
+  NodeCpuUse use(3000, 4);
+  use.sample(0, 1000000);
+  KJ_REQUIRE(use.utilization() == 0);
+  use.sample(1000, 1000000 + 3800000);  // 3.8 of 4 CPUs for a second
+  KJ_REQUIRE(use.utilization() > 0.94 && use.utilization() < 0.96, use.utilization());
+  use.sample(2000, 4800000 + 2000000);
+  use.sample(3000, 6800000 + 2000000);
+  use.sample(4000, 8800000 + 2000000);  // the first samples left: half the CPUs since
+  KJ_REQUIRE(use.utilization() > 0.49 && use.utilization() < 0.51, use.utilization());
+  KJ_REQUIRE(NodeCpuUse::usageIn("usage_usec 1234\nuser_usec 1000\nsystem_usec 234\n") == 1234u);
+  KJ_REQUIRE(!NodeCpuUse::usageIn("user_usec 1000\n"));
 }
 
 // A Durable Object call its node's secret dictionary could not take is SECRET_UNAVAILABLE, as at its admission,
@@ -732,6 +749,7 @@ int main(int argc, char* argv[]) {
   else if (name == "shutdown-signals") shutdownSignals();
   else if (name == "once-per-turn") oncePerTurn();
   else if (name == "durable-not-sent") durableNotSent();
+  else if (name == "node-cpu") nodeCpu();
   else if (name == "memory-events") memoryEvents();
   else if (name == "trial-verdicts") trialVerdicts();
   else if (name == "leases") leases();

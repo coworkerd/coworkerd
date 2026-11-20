@@ -3,6 +3,7 @@
 #include "support.h"
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -93,6 +94,52 @@ void orderByPlacementAvoidance(std::vector<std::string>& ordered, bool localFirs
   auto first = ordered.begin();
   if (localFirst && first != ordered.end()) ++first;
   std::stable_partition(first, ordered.end(), isAvailable);
+}
+
+// v138 section 2: a Worker saturated on a node (WORKER_SATURATED: its isolate there busy most of the last window)
+// or a node whose CPU is full (OVERLOADED, category node-cpu-full) refuses a new call before anything runs; the
+// call is placed on another node. Neither sets the node's avoidance (a saturated Worker says nothing about the
+// node's other Workers); the caller remembers a saturated (node, Worker) for one window instead, and when every
+// candidate refused for one of the two reasons, its own node takes the call anyway.
+inline constexpr const char* WORKER_SATURATED = "WORKER_SATURATED";
+inline constexpr const char* NODE_CPU_FULL = "node-cpu-full";
+inline bool saturationRefusal(std::string_view code, std::string_view category) {
+  return code == WORKER_SATURATED || (code == "OVERLOADED" && category == NODE_CPU_FULL);
+}
+
+// The caller's record of (node, Worker) pairs that answered WORKER_SATURATED, each until its window ends.
+class SaturationMarks {
+public:
+  void mark(const std::string& node, const std::string& worker, double untilMs) {
+    marks[{node, worker}] = untilMs;
+    if (marks.size() > 4096) prune(untilMs - 1e9);
+  }
+  bool marked(const std::string& node, const std::string& worker, double nowMs) const {
+    const auto found = marks.find({node, worker});
+    return found != marks.end() && found->second > nowMs;
+  }
+  void prune(double nowMs) {
+    for (auto at = marks.begin(); at != marks.end();) at = at->second <= nowMs ? marks.erase(at) : std::next(at);
+  }
+  size_t size() const { return marks.size(); }
+
+private:
+  std::map<std::pair<std::string, std::string>, double> marks;
+};
+
+// Candidates the Worker is known saturated on go last, the rest keep their order (a hot local version that stays
+// first keeps its place).
+template <typename IsMarked>
+void orderBySaturation(std::vector<std::string>& ordered, bool localFirst, IsMarked isMarked) {
+  auto first = ordered.begin();
+  if (localFirst && first != ordered.end()) ++first;
+  std::stable_partition(first, ordered.end(), [&](const std::string& id) { return !isMarked(id); });
+}
+
+// Whether the caller's own node takes the call despite saturation: every candidate was tried and every one refused
+// for a saturated Worker or a full CPU, and this node is one of them ("nowhere to go": the call is slowed, not refused).
+inline bool placeDespiteSaturation(size_t attempted, size_t candidates, bool allSaturation, bool selfCandidate) {
+  return attempted > 0 && attempted == candidates && allSaturation && selfCandidate;
 }
 
 } // namespace coworkerd

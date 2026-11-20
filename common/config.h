@@ -97,6 +97,10 @@ struct ProcessPoolConfig {
   uint64_t threadedMemoryBytes = 0;
   uint32_t threadedResidentLimit = 1840;
   uint32_t threadedThreadIdleMs = 60000;
+  // A Worker is saturated in a native process (its new calls refused there, placed elsewhere, v138 section 2) from
+  // this share of the last window a thread ran in its isolate on, and no longer below the second share
+  // (COWORKERD_SATURATION_ENTER_PERMILLE, COWORKERD_SATURATION_EXIT_PERMILLE, COWORKERD_SATURATION_WINDOW_MS).
+  uint32_t saturationEnterPermille = 900, saturationExitPermille = 800, saturationWindowMs = 2000;
   void validate() const;
 };
 

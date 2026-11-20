@@ -121,6 +121,8 @@ public:
   std::shared_ptr<ProcessCall> select(const std::string& worker);
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.
   std::optional<std::pair<std::string, uint64_t>> threadedGenerationHint(const std::string& worker) const;
+  // Whether the process a new call of `worker` would go to reported the Worker saturated (v138 section 2).
+  bool saturated(const std::string& worker) const;
   // A trial load's process: a quarantine process, the tenant's shard.
   std::shared_ptr<ProcessCall> selectTrial(const std::string& worker);
   // Durable Objects: the durable process of an object (by its key, <namespace id>/<object id>: the same one while the

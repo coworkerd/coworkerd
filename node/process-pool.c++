@@ -978,6 +978,7 @@ struct ProcessGeneration {
   // The evidence rows: the latest CPU culprit (withdrawn by a later terminated row of the same
   // invocation: the termination took effect after all), the OOM row, the OOM identity row.
   std::string culpritRow, culpritInvocation, oomCulpritRow;
+  std::set<std::string> saturatedWorkers;  // from its worker-saturated / worker-unsaturated rows
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
@@ -1233,6 +1234,10 @@ struct ProcessGeneration {
             culpritInvocation == report.getInvocationId().cStr()) {
           culpritRow.clear(); culpritInvocation.clear();
         }
+        // A Worker saturated in this process (v138 section 2): its new calls are refused here until it is not.
+        if (event == "worker-saturated") saturatedWorkers.insert(report.getWorkerId().cStr());
+        if (event == "worker-unsaturated") saturatedWorkers.erase(report.getWorkerId().cStr());
+        if (event == "worker-saturated" || event == "worker-unsaturated") continue;
         if (event == "memory-oom-undetermined") oomSignalled = true;
         if (event == "memory-culprit") oomCulpritRow = row;
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
@@ -2459,6 +2464,9 @@ public:
       childEnvironment.push_back("COWORKERD_THREADED_MEMORY_BYTES=" + std::to_string(config.threadedMemoryBytes));
       childEnvironment.push_back("COWORKERD_THREADED_RESIDENT_LIMIT=" + std::to_string(config.threadedResidentLimit));
       childEnvironment.push_back("COWORKERD_THREADED_THREAD_IDLE_MS=" + std::to_string(config.threadedThreadIdleMs));
+      childEnvironment.push_back("COWORKERD_THREADED_SATURATION_ENTER_PERMILLE=" + std::to_string(config.saturationEnterPermille));
+      childEnvironment.push_back("COWORKERD_THREADED_SATURATION_EXIT_PERMILLE=" + std::to_string(config.saturationExitPermille));
+      childEnvironment.push_back("COWORKERD_THREADED_SATURATION_WINDOW_MS=" + std::to_string(config.saturationWindowMs));
       childEnvironment.push_back("COWORKERD_THREADED_WASM_MAX_MIB=" + std::to_string(p->wasmMemoryCapMiB));
       childEnvironment.push_back("COWORKERD_THREADED_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
       childEnvironment.push_back("COWORKERD_THREADED_BINDING_ADDRESS=" + bindingAddress);
@@ -3778,6 +3786,17 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
     }
   }
   return {};
+}
+// Whether the process a new call of `worker` would go to (select()'s choice) reported it saturated; as of the last
+// read of its event pipe (at most a second old: syncDueEvents).
+bool ProcessPool::saturated(const std::string& worker) const {
+  const auto quarantine = quarantined(worker);
+  std::vector<std::string> ids;
+  for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
+  for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
+    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) return s.current->saturatedWorkers.contains(worker);
+  }
+  return false;
 }
 std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
   const auto quarantine = quarantined(worker);

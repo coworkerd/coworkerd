@@ -2,6 +2,8 @@
 #include "tenant-execution.h"
 #include "event-loop.h"
 #include "rpc-clock.h"
+#include "node-cpu.h"
+#include "cpu-capacity.h"
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
@@ -1605,7 +1607,8 @@ public:
 
   std::optional<InvocationRejection> admission(const std::string& worker, const std::string& hash, bool root, double deadline,
       bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr,
-      bool reserved = false, bool checkProcess = true, bool checkMemoryBand = true, bool checkTenant = true) {
+      bool reserved = false, bool checkProcess = true, bool checkMemoryBand = true, bool checkTenant = true,
+      bool acceptSaturated = false) {
     auto started = monotonicTimeMs();
     auto timing = kj::defer([&] { phaseTiming("admission", started); });
     auto rejected = [&](std::string code, std::string reason, uint status = 503) {
@@ -1646,6 +1649,29 @@ public:
     if (const auto* reason = coworkerd::placementBandRefusal(checkMemoryBand, root, forwardedRoot, band,
         [&] { return durable ? runtime.durableHot(hash) : hot(hash); }))
       return rejected("LOAD_BAND_REJECTED", reason);
+    // v138 section 2: a stateless Worker saturated here, or this node's CPU full, refuses the new call before anything
+    // runs so that placement sends it to another node -- unless the caller's placement found nowhere else
+    // (acceptSaturated: its own node's second round), when the call is taken and slowed, not refused.
+    if (!durable && !acceptSaturated) {
+      if (runtime.saturated(worker)) {
+        auto value = refusal(coworkerd::WORKER_SATURATED, "this Worker's isolate on this node has been busy for most of the last " +
+            std::to_string(serverConfig.processPool.saturationWindowMs) + " ms; the call goes to another node", 503, root);
+        value.avoidMs = 0;
+        value.notExecuted = value.retryable = true;
+        ++workerSaturatedRefusals;
+        if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+        return value;
+      }
+      if (nodeCpuFull()) {
+        auto value = refusal("OVERLOADED", "this node's CPU is full (" + std::to_string(int(nodeCpu.utilization() * 100)) +
+            " per cent over its last seconds); the call goes to another node", 503, root);
+        value.category = coworkerd::NODE_CPU_FULL;
+        value.notExecuted = value.retryable = true;
+        ++nodeCpuFullRefusals;
+        if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+        return value;
+      }
+    }
     if (!checkProcess || (durable ? runtime.durableAvailable(durable->key()) : runtime.available(worker))) return std::nullopt;
     if (!durable) if (const auto limited = runtime.tenantExecutionLimit(worker)) {
       auto value = refusal("OVERLOADED", PROCESS_TENANT_REASON, 503, root);
@@ -1675,13 +1701,16 @@ public:
   };
   kj::Promise<Admission> admit(const std::string& worker, const std::string& hash, bool root, double deadline,
       bool record = true, bool forwardedRoot = false, const DurableTarget* durable = nullptr, bool wait = true,
-      std::shared_ptr<AdmissionSlot> slot = {}) {
-    auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+      std::shared_ptr<AdmissionSlot> slot = {}, bool acceptSaturated = false) {
+    auto failure = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot), true, true, true, acceptSaturated);
     if (!failure) co_return Admission{std::nullopt, slot ? std::move(slot) : reserve(root, worker, durable)};
     auto reject = [&](InvocationRejection value) {
       if (tenantLimitRefusal(value)) recordTenantLimitRefusal(worker, root, value, durable);
       else if (processTenantRefusal(value)) value.avoidMs = 0;
-      else {
+      else if (coworkerd::saturationRefusal(value.code, value.category)) {
+        // Its category stays (the caller's placement tells the two apart); a saturated Worker avoids no node.
+        if (value.code == coworkerd::WORKER_SATURATED) value.avoidMs = 0;
+      } else {
         value.category.clear();
         value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
       }
@@ -1698,7 +1727,7 @@ public:
       auto done = kj::defer([&] { endAdmissionWait("tenant-execution", id, began, outcome); });
       const auto until = began + duration;
       while (true) {
-        auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot));
+        auto current = admission(worker, hash, root, deadline, false, forwardedRoot, durable, bool(slot), true, true, true, acceptSaturated);
         if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
         if (!current) break;
         if (!processTenantRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
@@ -1929,6 +1958,11 @@ public:
         << ",\"nested\":" << inFlightNested << ",\"total\":" << inFlightRoots + inFlightNested
         << "},\"rootLimit\":" << serverConfig.rootLimit << ",\"nestedLimit\":" << serverConfig.nestedLimit
         << ",\"tenantAdmission\":" << tenantAdmissionJson()
+        << ",\"saturation\":{\"enterPermille\":" << serverConfig.processPool.saturationEnterPermille
+        << ",\"exitPermille\":" << serverConfig.processPool.saturationExitPermille << ",\"windowMs\":" << serverConfig.processPool.saturationWindowMs
+        << ",\"workerSaturatedRefusals\":" << workerSaturatedRefusals << ",\"nodeCpuFullRefusals\":" << nodeCpuFullRefusals
+        << ",\"acceptedDespiteSaturation\":" << saturatedAccepted << ",\"nodeCpuUse\":" << nodeCpu.utilization()
+        << ",\"nodeCpuFullPercent\":" << int(nodeCpuFullShare * 100) << "}"
         << ",\"loadBand\":\"" << memory.effectiveBand() << "\",\"loadBandForTest\":\"" << serverConfig.loadBandForTest << "\",\"p\":" << serverConfig.homeProbability
         << ",\"idleMs\":" << serverConfig.idleMs << ",\"hotVersions\":[";
     size_t n = 0;
@@ -3661,6 +3695,23 @@ private:
   uint64_t versionUnavailableRejections = 0;
   uint64_t secretUnavailableRejections = 0;
   uint64_t secretDictionaryRefusals = 0;  // of them, refused by the secret dictionary's limits
+  // v138 section 2: the node's CPU over its last 3 s (sampleNodeCpu(), once a second), and its saturation refusals.
+  coworkerd::NodeCpuUse nodeCpu{3000, coworkerd::availableProcessCpus()};
+  double nodeCpuFullShare = double(environmentUnsigned("COWORKERD_NODE_CPU_FULL_PERCENT", 95, 101)) / 100;
+  int nodeCpuStat = ::open(coworkerd::NodeCpuUse::statPath().c_str(), O_RDONLY | O_CLOEXEC);
+  uint64_t workerSaturatedRefusals = 0, nodeCpuFullRefusals = 0, saturatedAccepted = 0;
+public:
+  bool nodeCpuFull() const { return nodeCpuFullShare <= 1 && nodeCpu.utilization() >= nodeCpuFullShare; }
+  void sampleNodeCpu() {
+    if (nodeCpuStat < 0) return;
+    char text[1024];
+    const auto n = pread(nodeCpuStat, text, sizeof(text) - 1, 0);
+    if (n <= 0) return;
+    if (const auto usage = coworkerd::NodeCpuUse::usageIn(std::string(text, size_t(n)))) nodeCpu.sample(monotonicTimeMs(), *usage);
+  }
+  void acceptedSaturated() { ++saturatedAccepted; }
+  uint32_t saturationWindowMs() const { return serverConfig.processPool.saturationWindowMs; }
+private:
   mutable std::map<coworkerd::DeploymentState::Selection::Kind, uint64_t> routeRejections;
   // The synthetic definition of each tenant's databases (databaseVersion), made once.
   mutable std::map<std::string, std::shared_ptr<const VersionDefinition>> databaseVersions;
@@ -5088,6 +5139,13 @@ public:
     coworkerd::orderByPlacementAvoidance(ordered, localFirst, [this](const auto& id) {
       auto found = avoidance.find(id); return found == avoidance.end() || found->second.until <= monotonicTimeMs();
     });
+    // A node that answered WORKER_SATURATED for this Worker within the last window is tried after the others.
+    if (saturationMarks.size()) {
+      const auto now = monotonicTimeMs();
+      coworkerd::orderBySaturation(ordered, localFirst, [&](const std::string& id) {
+        return saturationMarks.marked(id, version->workerId, now);
+      });
+    }
     server.decisionTiming(decisionStart);
     pathMark(allocation.timing, "placement-decision");
     server.recordForward(*version, allocation, ordered.empty() ? "" : ordered.front());
@@ -5109,11 +5167,11 @@ public:
     pathMark(allocation.timing, "placement-logs");
     std::string failures = "["; size_t attempted = 0;
     bool packagesUnavailable = true;  // every candidate tried failed to load the package
-    auto attemptHere = [&](bool wait) -> kj::Promise<InvocationAttempt> {
+    auto attemptHere = [&](bool wait, bool acceptSaturated = false) -> kj::Promise<InvocationAttempt> {
       InvocationAttempt result;
       pathMark(allocation.timing, "admission-start");
       auto admitted = co_await server.admit(version->workerId, version->definitionHash, allocation.ingressRoot,
-          allocation.expiresAtMonotonicMs, false, false, nullptr, wait);
+          allocation.expiresAtMonotonicMs, false, false, nullptr, wait, {}, acceptSaturated);
       pathMark(allocation.timing, "admission-end");
       if (admitted.refused) result = {nullptr, std::move(admitted.refused), true};
       else {
@@ -5129,7 +5187,7 @@ public:
         } else if (auto missing = server.secretRefusal(*version, allocation.ingressRoot)) {
           result = {nullptr, std::move(missing), true};
         } else if (auto current = co_await server.admit(version->workerId, version->definitionHash,
-                       allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot);
+                       allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot, acceptSaturated);
                    current.refused) {
           result = {nullptr, std::move(current.refused), true};
         } else if (auto check = co_await server.loadCheck(version, allocation.entrypoint, allocation.expiresAtMonotonicMs,
@@ -5139,7 +5197,7 @@ public:
           result = {nullptr, std::move(check.refusal), retry};
         } else {
           auto finalAdmission = co_await server.admit(version->workerId, version->definitionHash,
-              allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot);
+              allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot, acceptSaturated);
           if (finalAdmission.refused) co_return InvocationAttempt{nullptr, std::move(finalAdmission.refused), true};
           try {
             auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
@@ -5163,6 +5221,7 @@ public:
     };
     bool allPaused = true, allTenantLimited = true;
     bool allNotExecuted = true;
+    bool allSaturated = true;  // every refusal so far for a saturated Worker or a full CPU (v138 section 2)
     std::optional<InvocationRejection> tenantRefusal;
     std::optional<InvocationRejection> firstPaused;
     for (const auto& id : ordered) {
@@ -5172,6 +5231,7 @@ public:
       if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1);
       else result = co_await tryOpen(id, invocationFor(hops));
       allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
+      allSaturated = allSaturated && result.failure && coworkerd::saturationRefusal(result.failure->code, result.failure->category);
       allPaused = allPaused && result.failure && pausedRefusal(*result.failure);
       if (result.failure && pausedRefusal(*result.failure) && !firstPaused) firstPaused = result.failure;
       server.observeAttempt(id, allocation.ingressRoot, result.failure);
@@ -5223,6 +5283,10 @@ public:
       if (tenantLimitRefusal(*result.failure)) {
         // This candidate can still accept other tenants. Do not touch shared node avoidance.
         tenantRefusal = *result.failure;
+      } else if (result.failure->code == coworkerd::WORKER_SATURATED) {
+        // This candidate can still take other Workers: no node avoidance; this Worker tries it last for a window.
+        allTenantLimited = false;
+        saturationMarks.mark(id, version->workerId, monotonicTimeMs() + server.saturationWindowMs());
       } else {
         allTenantLimited = false;
         auto& avoid = avoidance[id];
@@ -5231,6 +5295,24 @@ public:
         avoid.until = monotonicTimeMs() + delay;
       }
       if (attempted < ordered.size() && hops > 0) server.reroute(result.failure->code);
+    }
+    // Nowhere to go (v138 section 2): every candidate refused for a saturated Worker or a full CPU. This node takes the
+    // call anyway, slowed rather than refused, as long as it is a candidate itself.
+    if (coworkerd::placeDespiteSaturation(attempted, ordered.size(), allSaturated,
+            std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end())) {
+      auto result = co_await attemptHere(false, true);
+      server.observeAttempt(config.serverId, allocation.ingressRoot, result.failure);
+      if (!result.failure) {
+        avoidance.erase(config.serverId);
+        if (forwarded) *forwarded = false;
+        if (placedOn) *placedOn = config.serverId;
+        server.decision("localDespiteSaturation", allocation.ingressRoot);
+        server.acceptedSaturated();
+        co_return std::move(result.dispatcher);
+      }
+      if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)
+        co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
+      failures += ",{\"nodeId\":\"" + config.serverId + "\",\"failure\":" + result.failure->json() + "}";
     }
     // Every candidate explicitly refused before execution because its eligible processes were paused.
     // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
@@ -5282,6 +5364,7 @@ private:
   }
   struct Avoidance { double until = 0; uint32_t failures = 0; };
   std::map<std::string, Avoidance> avoidance;
+  coworkerd::SaturationMarks saturationMarks;
 
   struct PeerState {
     std::string memberIdentity;
@@ -8814,6 +8897,14 @@ kj::Promise<void> watchDurableEpoch(coworkerd::DurableLog& durableLog, coworkerd
   }
 }
 
+// The node's CPU use, sampled once a second (v138 section 2; ServerCore::nodeCpuFull()).
+kj::Promise<void> runNodeCpuSampler(ServerCore& server, kj::Timer& timer) {
+  for (;;) {
+    server.sampleNodeCpu();
+    co_await timer.afterDelay(1 * kj::SECONDS);
+  }
+}
+
 kj::Promise<void> runLeaseReaper(ServerCore& server, kj::Timer& timer) {
   while (true) {
     co_await timer.afterDelay(
@@ -8955,6 +9046,11 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
+  pool.saturationEnterPermille = static_cast<uint32_t>(environmentUnsigned("COWORKERD_SATURATION_ENTER_PERMILLE", pool.saturationEnterPermille, 1001));
+  pool.saturationExitPermille = static_cast<uint32_t>(environmentUnsigned("COWORKERD_SATURATION_EXIT_PERMILLE", pool.saturationExitPermille, 1000));
+  pool.saturationWindowMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_SATURATION_WINDOW_MS", pool.saturationWindowMs, 600000));
+  KJ_REQUIRE(pool.saturationExitPermille <= pool.saturationEnterPermille && pool.saturationWindowMs >= 2,
+      "saturation: the exit share is at most the entry share, the window at least 2 ms");
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
   const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
@@ -9620,6 +9716,7 @@ int run(Launch launch) {
       .exclusiveJoin(tenantUsage.run())
       .exclusiveJoin(runLeaseReaper(server, timer))
       .exclusiveJoin(runLogClock(timer))
+      .exclusiveJoin(runNodeCpuSampler(server, timer))
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer, leaseDroppedShards))
       .exclusiveJoin(durableLog.run())
