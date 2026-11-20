@@ -35,6 +35,7 @@
 #include "tenant-manifest.h"
 #include "tenants.h"
 #include "usage.h"
+#include "v8-sandbox.h"
 
 #include <capnp/compat/byte-stream.h>
 #include <capnp/compat/http-over-capnp.h>
@@ -8947,7 +8948,36 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 
 // The process pool's own environment overrides (process-pool.c++), applied here as well so that the
 // configuration a Server reports is the one it runs; the pool applies the same values again.
-void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes) {
+// The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares:
+// the threaded binary's sandbox, this machine's memory protection keys, address space and
+// vm.max_map_count lower each process's resident limit (never the process count, r50 §6.4).
+// A plan that refuses ends the start.
+void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
+  if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
+  KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
+      "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
+  if (pool.count + pool.quarantineProcesses == 0) return;
+  const auto threaded = pool.threadedExecutable.empty()
+      ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
+  auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
+      coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit, pool.count);
+  // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
+  // so that a process fills until V8's own group creation refuses (the second line).
+  if (const char* test = std::getenv("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST"); test != nullptr && plan.refusal.empty()) {
+    coworkerd::limitPerProcess(plan, static_cast<uint32_t>(environmentUnsigned("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST", 0, 1840)));
+  }
+  pool.sandboxPlanJson = plan.json();
+  pool.sandboxWarning = plan.warning;
+  KJ_REQUIRE(plan.refusal.empty(), plan.refusal.c_str());
+  // The configured process count holds (r50 §6.4); only each process's resident limit is lowered.
+  pool.threadedResidentLimit = plan.residentLimit;
+  if (plan.perProcessLimit != 0) pool.sandboxResidentLimit = plan.perProcessLimit;
+  // A Wasm memory reserves its maximum in the 4 GiB buffer half of the isolate's sandbox.
+  if (plan.mode == "guard-regions") pool.sandboxWasmCapMiB = 1024;
+}
+
+void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes,
+    const std::string& workerdPath) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
@@ -8959,6 +8989,7 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
+  planOrdinarySandbox(pool, workerdPath);
   const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
@@ -9145,6 +9176,8 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
       << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << b(preparationLargeBudget(p.gcRuntimeHeapMiB) >= MAX_PACKAGE_PREPARATION_BYTES)
       << "},\"sandbox\":{\"mode\":" << q(p.sandboxMode) << ",\"launcherPath\":" << q(p.launcherPath)
+      << ",\"protectionKeys\":" << q(p.protectionKeys)
+      << ",\"v8Sandbox\":" << (p.sandboxPlanJson.empty() ? std::string("null") : p.sandboxPlanJson)
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
@@ -9251,7 +9284,7 @@ int run(Launch launch) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes);
+  applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes, launch.workerd);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) serverConfig.egress.defaultPolicy = policy;
@@ -9265,6 +9298,13 @@ int run(Launch launch) {
   std::cout << "[server] {\"event\":\"configuration\",\"version\":\"" << jsonEscape(COWORKERD_VERSION) << "\",\"form\":\""
             << launch.form << "\",\"configFile\":\"" << jsonEscape(launch.configFile.string()) << "\",\"tokenSource\":\""
             << tokenSource << "\",\"configuration\":" << configuration << "}" << std::endl;
+  // The V8 sandbox's mode and per-process limit on this machine (node/v8-sandbox.h), on a line of its own.
+  if (!serverConfig.processPool.sandboxPlanJson.empty()) {
+    std::cout << "[server] {\"event\":\"v8-sandbox\",\"plan\":" << serverConfig.processPool.sandboxPlanJson << "}" << std::endl;
+    if (!serverConfig.processPool.sandboxWarning.empty())
+      std::cout << "[server] {\"event\":\"warning\",\"subject\":\"v8-sandbox\",\"reason\":\"" << jsonEscape(serverConfig.processPool.sandboxWarning)
+                << "\"}" << std::endl;
+  }
   if (serverConfig.managementToken.empty()) {
     // The management endpoints (state, drain, rotation, trial loads, every tenant's log lines) take the token; a node
     // without one starts only where its configuration says so, for development.
@@ -9663,7 +9703,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
     launch = serveLaunch(options, false);
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
-    applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes);
+    applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes, launch->workerd);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\"");
   } catch (const kj::Exception& error) {

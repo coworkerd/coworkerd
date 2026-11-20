@@ -4,6 +4,7 @@
 #include <kj/compat/http.h>
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -29,14 +30,52 @@ struct ObjectStoreConfig {
   uint32_t connectTimeoutMs = 2000;
   uint32_t readTimeoutMs = 5000;
   uint32_t createTimeoutMs = 30000;
+  // Kept-alive connections (not read from a configuration file). After a whole answer a connection is kept for the next
+  // request, at most idleConnections of them per lane (the heartbeat's lane keeps two); a read (GET, HEAD, a listing) or
+  // a DELETE goes on one kept for at most idleConnectionMs, an overwrite or a create only on one used within
+  // writeIdleConnectionMs, else on a new connection. Both well below the stores' own idle timeouts (reported 3-5 s for
+  // S3, MinIO's default 30 s, SeaweedFS 4.48's 120 s for `weed s3`): a store that closes a connection as a request goes
+  // out on it fails that request, and an overwrite is never sent again.
+  uint32_t idleConnections = 64;
+  uint32_t idleConnectionMs = 2000;
+  uint32_t writeIdleConnectionMs = 1000;
 };
 
-// What the client met: the requests it made (each on a connection of its own), the idempotent ones sent once more on a
-// new connection after the first failed (a timeout or a connection that broke before the whole answer came), the
-// timeouts by phase, and the creates whose answer was lost, decided by reading the key back.
+// Which connections a request goes on: the shared ones, or the membership heartbeat's own (writeHeartbeat), which no
+// other request uses -- however many requests the shared connections carry, a heartbeat neither waits for one of them
+// nor goes on one a burst of other requests left behind.
+enum class ObjectStoreLane : uint8_t { SHARED = 0, HEARTBEAT = 1 };
+
+// The connections of one lane: open on a request (inUse) or kept for the next (idle); established (created), and the
+// requests that went on a kept one (reused). How the others ended: an error, a timeout or a cancellation in the middle
+// of a request (discardedOnError: its state unknown, never used again); found closed by the store, or holding bytes no
+// request asked for, when taken -- before anything was sent on it (closedByPeer); an answer that said
+// `Connection: close` (closedByAnswer); kept longer than the lane allows (closedIdle); more than idleConnections kept
+// (closedOverCap). closedByAnswer also counts a request with a body that was answered other than 2xx (the store may not
+// have read the whole body). reusedReadFailures and reusedWriteFailures: requests that failed on a kept connection other
+// than by a timeout (a read is then sent once more on a new connection; an overwrite or a create follows its own rule
+// and is never sent twice).
+struct ObjectStoreConnections {
+  uint64_t inUse = 0, idle = 0, created = 0, reused = 0, discardedOnError = 0, closedByPeer = 0, closedByAnswer = 0,
+      closedIdle = 0, closedOverCap = 0, reusedReadFailures = 0, reusedWriteFailures = 0;
+  std::string json() const;
+};
+
+// Every ObjectStore of this process, on every thread (the segment decoder's and the off-loop uploads' worker threads
+// make one per job): connections established, requests on a kept one, connections discarded on an error.
+struct ObjectStoreProcessConnections {
+  uint64_t created = 0, reused = 0, discardedOnError = 0;
+  std::string json() const;
+};
+ObjectStoreProcessConnections objectStoreProcessConnections();
+
+// What the client met: the requests it made, the idempotent ones sent once more on a new connection after the first
+// failed (a timeout or a connection that broke before the whole answer came), the timeouts by phase, the creates whose
+// answer was lost, decided by reading the key back, and the connections of each lane.
 struct ObjectStoreStats {
   uint64_t requests = 0, retries = 0, connectTimeouts = 0, readTimeouts = 0, failures = 0;
   uint64_t createsReadBack = 0, createsConfirmed = 0, createsFoundOther = 0, createsUnknown = 0;
+  ObjectStoreConnections connections, heartbeatConnections;
   std::string json() const;
 };
 
@@ -111,11 +150,16 @@ struct CreateResult {
 class ObjectStore {
 public:
   ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Timer& timer);
+  // Its kept connections and their sweeps hold `this`; one instance serves the thread that made it. Every promise it
+  // returns (a request's coroutine frame) must be done or destroyed before the ObjectStore is: the frame uses its
+  // connections, header table and statistics.
+  KJ_DISALLOW_COPY_AND_MOVE(ObjectStore);
+  ~ObjectStore() noexcept(false);
   kj::Promise<bool> exists(std::string key);
   // S3 object length from one HEAD; nullopt for 404. No body or listing is read.
   kj::Promise<std::optional<uint64_t>> headSize(std::string key);
-  // An overwrite.
-  kj::Promise<ObjectResponse> put(std::string key, std::string bytes);
+  // An overwrite, on the lane's connections (the membership heartbeat's: ObjectStoreLane::HEARTBEAT).
+  kj::Promise<ObjectResponse> put(std::string key, std::string bytes, ObjectStoreLane lane = ObjectStoreLane::SHARED);
   kj::Promise<ObjectResponse> get(std::string key);
   // PUT with `If-None-Match: *`: written only where the key does not exist. 412 (Precondition Failed) and 409 (a
   // conditional write to the same key in flight) both mean that it exists; any other status is an error. A create can
@@ -155,6 +199,22 @@ private:
     std::optional<uint64_t>* headLength = nullptr;
     // SHA-256 of the exact bytes when the producer already computed it off the event loop.
     std::string payloadSha256;
+    ObjectStoreLane lane = ObjectStoreLane::SHARED;
+  };
+  // A kept-alive connection: only its stream. Each request makes an HTTP client on it and destroys it after the whole
+  // answer, so that no client reads the connection while it is idle (bytes the store sends unasked stay in the socket,
+  // where the peek before the next request finds them).
+  struct Connection {
+    kj::Own<kj::AsyncIoStream> stream;
+    kj::TimePoint idleSince = kj::origin<kj::TimePoint>();
+  };
+  struct Lane {
+    ObjectStoreConnections* counts = nullptr;
+    uint32_t keep = 0;
+    // Oldest first; a request takes the one kept last.
+    std::deque<kj::Own<Connection>> idle;
+    bool sweeping = false;
+    kj::Promise<void> sweep = kj::READY_NOW;
   };
   ObjectStoreConfig settings;
   ObjectStoreStats statistics;
@@ -166,12 +226,22 @@ private:
   kj::HttpHeaderId authorizationHeader;
   kj::HttpHeaderId ifNoneMatchHeader;
   kj::HttpHeaderId lastModifiedHeader;
+  // After `table`: the kept clients read their answers' headers with it.
+  Lane lanes[2];
   // One request, sent once more on a new connection when it is idempotent (GET, HEAD, a listing, DELETE) and the first
   // attempt failed; an overwrite is sent once. Errors never carry the request's URL (a presigned one holds the access
   // key's identifier).
   kj::Promise<ObjectResponse> send(Call call);
-  // One attempt on a connection of its own, every phase bounded (connect, write, answer, each read).
-  kj::Promise<ObjectResponse> exchange(const Call& call);
+  // One attempt, every phase bounded (connect, write, answer, each read): on a kept connection of the call's lane
+  // unless `fresh` (a second attempt) or none is young enough for it, else on a new one, with an HTTP client of its
+  // own. Kept again only after its whole answer was read and its client destroyed; any failure on it closes it.
+  kj::Promise<ObjectResponse> exchange(const Call& call, bool fresh = false);
+  // The newest kept connection of the lane that is younger than `maxIdleMs` and still open, after closing the ones
+  // past the lane's limit.
+  kj::Maybe<kj::Own<Connection>> takeKept(Lane& lane, uint32_t maxIdleMs);
+  void keep(Lane& lane, kj::Own<Connection> connection);
+  void closeExpired(Lane& lane);
+  kj::Promise<void> sweepKept(Lane& lane);
   kj::Exception sanitized(const kj::Exception& error);
 };
 

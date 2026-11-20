@@ -468,6 +468,20 @@ struct ServerConfig {
     launcherPath @1 :Text;
     # The system call allowlist, installed by the launcher before it executes workerd.
     syscalls @2 :SyscallsConfig;
+    # The V8 sandbox's memory protection keys. Every isolate of an ordinary process has its own 8 GiB
+    # V8 sandbox, fenced either by memory protection keys or by V8's guard regions (64 GiB on each
+    # side, so one isolate reserves 136 GiB of address space and a process holds fewer than a
+    # thousand; the node then lowers each ordinary process's resident limit, and keeps
+    # processPool.count).
+    #   auto      keys when the CPU, the kernel and the container provide them, else guard regions.
+    #   off       guard regions.
+    #   required  the node refuses to start without keys and names what is missing (the CPU, the
+    #             kernel, or the container).
+    # This build has the guard-region mode only: auto and off run with guard regions, and required
+    # refuses to start. The state endpoint (processes.configuration.v8Sandbox) and the startup log
+    # (v8-sandbox) show the mode and the per-process limit. COWORKERD_SANDBOX_PROTECTION_KEYS
+    # overrides it. See docs/guide/install.md.
+    protectionKeys @3 :Text = "auto";
 
     struct SyscallsConfig {
       # The allowlist is the build's: scripts/syscall-allowlist.py generates it from a profile of the

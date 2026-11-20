@@ -3,9 +3,12 @@
 #include <kj/debug.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +18,23 @@
 
 namespace coworkerd {
 namespace {
+// Every instance's connections, on every thread (objectStoreProcessConnections).
+std::atomic<uint64_t> processCreated{0}, processReused{0}, processDiscarded{0};
+// A kept connection is still open and holds no bytes that no request asked for: a peek that does not block finds
+// nothing to read (the store's FIN reads as 0, a reset as an error, unasked bytes as more than 0). No HTTP client reads
+// a kept connection (exchange() destroys its client before keeping it), so whatever the store sent is still there.
+bool stillOpen(const kj::AsyncIoStream& stream) {
+  KJ_IF_SOME(fd, stream.getFd()) {
+    char byte;
+    while (true) {
+      const auto read = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+      if (read < 0 && errno == EINTR) continue;
+      return read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+  }
+  return true;
+}
+kj::TimePoint clockNow() { return kj::systemPreciseMonotonicClock().now(); }
 std::string hex(const unsigned char* bytes, size_t size) {
   constexpr char alphabet[] = "0123456789abcdef";
   std::string result(size * 2, '0');
@@ -218,8 +238,30 @@ uint64_t isoTimeUnixMs(std::string_view text) {
   return seconds <= 0 ? 0 : static_cast<uint64_t>(seconds) * 1000 + millis;
 }
 
+ObjectStoreProcessConnections objectStoreProcessConnections() {
+  return {processCreated.load(std::memory_order_relaxed), processReused.load(std::memory_order_relaxed),
+      processDiscarded.load(std::memory_order_relaxed)};
+}
+std::string ObjectStoreProcessConnections::json() const {
+  return "{\"created\":" + std::to_string(created) + ",\"reused\":" + std::to_string(reused) + ",\"discardedOnError\":" +
+      std::to_string(discardedOnError) + "}";
+}
+std::string ObjectStoreConnections::json() const {
+  return "{\"inUse\":" + std::to_string(inUse) + ",\"idle\":" + std::to_string(idle) + ",\"created\":" +
+      std::to_string(created) + ",\"reused\":" + std::to_string(reused) + ",\"discardedOnError\":" +
+      std::to_string(discardedOnError) + ",\"closedByPeer\":" + std::to_string(closedByPeer) + ",\"closedByAnswer\":" +
+      std::to_string(closedByAnswer) + ",\"closedIdle\":" + std::to_string(closedIdle) + ",\"closedOverCap\":" +
+      std::to_string(closedOverCap) + ",\"reusedReadFailures\":" + std::to_string(reusedReadFailures) +
+      ",\"reusedWriteFailures\":" + std::to_string(reusedWriteFailures) + "}";
+}
+
 ObjectStore::ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Timer& timer)
     : settings(std::move(config)), network(network), timer(timer) {
+  lanes[0].counts = &statistics.connections;
+  lanes[0].keep = settings.idleConnections;
+  // Two heartbeats may be in flight (membership: heartbeats()).
+  lanes[1].counts = &statistics.heartbeatConnections;
+  lanes[1].keep = 2;
   kj::HttpHeaderTable::Builder builder;
   dateHeader = builder.add("x-amz-date");
   hashHeader = builder.add("x-amz-content-sha256");
@@ -229,6 +271,7 @@ ObjectStore::ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Tim
   table = builder.build();
   KJ_REQUIRE(settings.timeoutMs > 0 && settings.connectTimeoutMs > 0 && settings.readTimeoutMs > 0 && settings.createTimeoutMs > 0,
       "object store timeouts must be positive");
+  KJ_REQUIRE(settings.writeIdleConnectionMs <= settings.idleConnectionMs, "an overwrite's connections are a read's");
   if (settings.backend == "directory") {
     KJ_REQUIRE(!settings.directory.empty(), "object directory is required");
     return;
@@ -245,6 +288,8 @@ ObjectStore::ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Tim
   KJ_REQUIRE(!settings.accessKey.empty() && !settings.secretKey.empty(), "S3 credentials are required");
 }
 
+ObjectStore::~ObjectStore() noexcept(false) {}
+
 kj::Promise<ObjectResponse> ObjectStore::request(kj::HttpMethod method, std::string key,
     std::string bytes, bool sign) {
   return send({method, std::move(key), std::move(bytes), sign});
@@ -255,7 +300,8 @@ std::string ObjectStoreStats::json() const {
       std::to_string(connectTimeouts) + ",\"readTimeouts\":" + std::to_string(readTimeouts) + ",\"failures\":" +
       std::to_string(failures) + ",\"createsReadBack\":" + std::to_string(createsReadBack) + ",\"createsConfirmed\":" +
       std::to_string(createsConfirmed) + ",\"createsFoundOther\":" + std::to_string(createsFoundOther) +
-      ",\"createsUnknown\":" + std::to_string(createsUnknown) + "}";
+      ",\"createsUnknown\":" + std::to_string(createsUnknown) + ",\"connections\":" + connections.json() +
+      ",\"heartbeatConnections\":" + heartbeatConnections.json() + "}";
 }
 
 kj::Exception ObjectStore::sanitized(const kj::Exception& error) {
@@ -278,7 +324,8 @@ kj::Promise<ObjectResponse> ObjectStore::send(Call call) {
     ++statistics.requests;
     kj::Maybe<kj::Exception> failure;
     try {
-      co_return co_await exchange(call);
+      // A second attempt on a new connection, as before connections were kept.
+      co_return co_await exchange(call, attempt > 1);
     } catch (...) {
       failure = kj::getCaughtExceptionAsKj();
     }
@@ -290,7 +337,63 @@ kj::Promise<ObjectResponse> ObjectStore::send(Call call) {
   }
 }
 
-kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
+kj::Maybe<kj::Own<ObjectStore::Connection>> ObjectStore::takeKept(Lane& lane, uint32_t maxIdleMs) {
+  closeExpired(lane);
+  auto& counts = *lane.counts;
+  const auto now = clockNow();
+  while (!lane.idle.empty()) {
+    // The newest is too old for this request: a new connection (the older ones are older still).
+    if (now - lane.idle.back()->idleSince > maxIdleMs * kj::MILLISECONDS) return kj::none;
+    auto connection = kj::mv(lane.idle.back());
+    lane.idle.pop_back();
+    --counts.idle;
+    if (stillOpen(*connection->stream)) return kj::mv(connection);
+    ++counts.closedByPeer;
+  }
+  return kj::none;
+}
+
+void ObjectStore::closeExpired(Lane& lane) {
+  const auto now = clockNow();
+  while (!lane.idle.empty() && now - lane.idle.front()->idleSince >= settings.idleConnectionMs * kj::MILLISECONDS) {
+    lane.idle.pop_front();
+    --lane.counts->idle;
+    ++lane.counts->closedIdle;
+  }
+}
+
+void ObjectStore::keep(Lane& lane, kj::Own<Connection> connection) {
+  closeExpired(lane);
+  if (lane.idle.size() >= lane.keep) {
+    lane.idle.pop_front();
+    --lane.counts->idle;
+    ++lane.counts->closedOverCap;
+  }
+  if (lane.keep == 0) {
+    ++lane.counts->closedOverCap;
+    return;
+  }
+  connection->idleSince = clockNow();
+  lane.idle.push_back(kj::mv(connection));
+  ++lane.counts->idle;
+  if (!lane.sweeping) {
+    lane.sweeping = true;
+    lane.sweep = sweepKept(lane).eagerlyEvaluate(nullptr);
+  }
+}
+
+// Closes the kept connections as they pass idleConnectionMs, while the lane keeps any.
+kj::Promise<void> ObjectStore::sweepKept(Lane& lane) {
+  const auto limit = settings.idleConnectionMs * kj::MILLISECONDS;
+  while (!lane.idle.empty()) {
+    const auto age = clockNow() - lane.idle.front()->idleSince;
+    if (age < limit) co_await timer.afterDelay(limit - age);
+    closeExpired(lane);
+  }
+  lane.sweeping = false;
+}
+
+kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call, bool fresh) {
   const auto method = call.method;
   const auto& key = call.key;
   const auto& bytes = call.bytes;
@@ -322,7 +425,6 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
   const std::string payloadHash = call.payloadSha256.empty() ? objectSha256(bytes) : call.payloadSha256;
   kj::HttpHeaders headers(*table);
   headers.setPtr(kj::HttpHeaderId::HOST, host.c_str());
-  headers.setPtr(kj::HttpHeaderId::CONNECTION, "close");
   if (call.ifNoneMatch) headers.setPtr(ifNoneMatchHeader, "*");
   std::string timestamp, authorization;
   // The query in canonical order (names and values encoded, sorted by name): the signature covers it.
@@ -380,51 +482,127 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call) {
   } else {
     query = joined();
   }
-  // A connection of its own (the request says Connection: close), established within connectTimeoutMs; then every write
-  // of the request's body and every read of the answer's within readTimeoutMs of the one before, and the answer itself
-  // within readTimeoutMs -- a create's within createTimeoutMs.
-  auto connection = co_await within(timer, settings.connectTimeoutMs, [](kj::Network& network, std::string host)
-      -> kj::Promise<kj::Own<kj::AsyncIoStream>> {
-    auto address = co_await network.parseAddress(host.c_str(), 80);
-    co_return co_await address->connect();
-  }(network, host), statistics.connectTimeouts, "connect");
-  auto client = kj::newHttpClient(*table, *connection);
+  // A kept connection of the call's lane (an overwrite or a create: only one used within writeIdleConnectionMs), else
+  // a new one established within connectTimeoutMs; then every write of the request's body and every read of the
+  // answer's within readTimeoutMs of the one before, and the answer itself within readTimeoutMs -- a create's within
+  // createTimeoutMs.
   const auto target = path + (query.empty() ? "" : '?' + query);
-  auto request = client->request(method, target.c_str(), headers, bytes.size());
-  constexpr size_t CHUNK = 64 * 1024;
-  for (size_t at = 0; at < bytes.size(); at += CHUNK) {
-    co_await within(timer, settings.readTimeoutMs,
-        request.body->write(kj::arrayPtr(bytes.data() + at, std::min(CHUNK, bytes.size() - at)).asBytes()),
-        statistics.readTimeouts, "write");
-  }
-  request.body = nullptr;
-  auto response = co_await within(timer, call.ifNoneMatch ? settings.createTimeoutMs : settings.readTimeoutMs,
-      kj::mv(request.response), statistics.readTimeouts, "answer");
-  uint64_t date = 0, lastModified = 0;
-  KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::DATE)) {
-    date = httpDateUnixMs(std::string_view(value.begin(), value.size()));
-  }
-  KJ_IF_SOME(value, response.headers->get(lastModifiedHeader)) {
-    lastModified = httpDateUnixMs(std::string_view(value.begin(), value.size()));
-  }
-  if (call.headLength != nullptr) {
-    *call.headLength = std::nullopt;
-    KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::CONTENT_LENGTH)) {
-      uint64_t length = 0;
-      const auto parsed = std::from_chars(value.begin(), value.end(), length);
-      if (parsed.ec == std::errc{} && parsed.ptr == value.end()) *call.headLength = length;
+  auto& lane = lanes[static_cast<size_t>(call.lane)];
+  auto& counts = *lane.counts;
+  const bool write = method == kj::HttpMethod::PUT || method == kj::HttpMethod::POST;
+  kj::Own<Connection> connection;
+  // From the request on, the connection is the request's until its whole answer is read: a failure, a timeout or a
+  // cancellation closes it.
+  struct Hold {
+    ObjectStoreConnections& counts;
+    kj::Own<Connection>& connection;
+    bool held = false;
+    ~Hold() {
+      if (!held) return;
+      --counts.inUse;
+      if (connection.get() != nullptr) {
+        ++counts.discardedOnError;
+        processDiscarded.fetch_add(1, std::memory_order_relaxed);
+        connection = nullptr;
+      }
+    }
+  } hold{counts, connection};
+  // Declared after `hold`, in this order: the body writer and the answer go before the client they use, the client
+  // before the stream (`connection`) it uses.
+  kj::Own<kj::HttpClient> client;
+  kj::Maybe<kj::HttpClient::Request> sent;
+  bool reused = false;
+  if (!fresh) {
+    KJ_IF_SOME(kept, takeKept(lane, write ? settings.writeIdleConnectionMs : settings.idleConnectionMs)) {
+      connection = kj::mv(kept);
+      reused = true;
     }
   }
-  std::string body;
-  std::string buffer(CHUNK, '\0');
-  while (true) {
-    const size_t read = co_await within(timer, settings.readTimeoutMs, response.body->tryRead(buffer.data(), 1, buffer.size()),
-        statistics.readTimeouts, "read");
-    if (read == 0) break;
-    body.append(buffer.data(), read);
-    KJ_REQUIRE(body.size() <= 64 * 1024 * 1024, "object store answer larger than 64 MiB");
+  if (!reused) {
+    auto stream = co_await within(timer, settings.connectTimeoutMs, [](kj::Network& network, std::string host)
+        -> kj::Promise<kj::Own<kj::AsyncIoStream>> {
+      auto address = co_await network.parseAddress(host.c_str(), 80);
+      co_return co_await address->connect();
+    }(network, host), statistics.connectTimeouts, "connect");
+    connection = kj::heap<Connection>();
+    connection->stream = kj::mv(stream);
+    ++counts.created;
+    processCreated.fetch_add(1, std::memory_order_relaxed);
   }
-  co_return ObjectResponse{response.statusCode, std::move(body), date, lastModified};
+  client = kj::newHttpClient(*table, *connection->stream);
+  sent = client->request(method, target.c_str(), headers, bytes.size());
+  if (reused) {
+    ++counts.reused;
+    processReused.fetch_add(1, std::memory_order_relaxed);
+  }
+  ++counts.inUse;
+  hold.held = true;
+  auto& request = KJ_ASSERT_NONNULL(sent);
+  ObjectResponse result{};
+  bool closeAnswer = false;
+  kj::Maybe<kj::Exception> failure;
+  try {
+    constexpr size_t CHUNK = 64 * 1024;
+    for (size_t at = 0; at < bytes.size(); at += CHUNK) {
+      co_await within(timer, settings.readTimeoutMs,
+          request.body->write(kj::arrayPtr(bytes.data() + at, std::min(CHUNK, bytes.size() - at)).asBytes()),
+          statistics.readTimeouts, "write");
+    }
+    request.body = nullptr;
+    auto response = co_await within(timer, call.ifNoneMatch ? settings.createTimeoutMs : settings.readTimeoutMs,
+        kj::mv(request.response), statistics.readTimeouts, "answer");
+    uint64_t date = 0, lastModified = 0;
+    KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::DATE)) {
+      date = httpDateUnixMs(std::string_view(value.begin(), value.size()));
+    }
+    KJ_IF_SOME(value, response.headers->get(lastModifiedHeader)) {
+      lastModified = httpDateUnixMs(std::string_view(value.begin(), value.size()));
+    }
+    KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::CONNECTION)) {
+      std::string tokens(value.begin(), value.size());
+      std::transform(tokens.begin(), tokens.end(), tokens.begin(), [](unsigned char c) { return std::tolower(c); });
+      closeAnswer = tokens.find("close") != std::string::npos;
+    }
+    if (call.headLength != nullptr) {
+      *call.headLength = std::nullopt;
+      KJ_IF_SOME(value, response.headers->get(kj::HttpHeaderId::CONTENT_LENGTH)) {
+        uint64_t length = 0;
+        const auto parsed = std::from_chars(value.begin(), value.end(), length);
+        if (parsed.ec == std::errc{} && parsed.ptr == value.end()) *call.headLength = length;
+      }
+    }
+    std::string body;
+    std::string buffer(CHUNK, '\0');
+    while (true) {
+      const size_t read = co_await within(timer, settings.readTimeoutMs, response.body->tryRead(buffer.data(), 1, buffer.size()),
+          statistics.readTimeouts, "read");
+      if (read == 0) break;
+      body.append(buffer.data(), read);
+      KJ_REQUIRE(body.size() <= 64 * 1024 * 1024, "object store answer larger than 64 MiB");
+    }
+    response.body = nullptr;
+    result = ObjectResponse{response.statusCode, std::move(body), date, lastModified};
+  } catch (...) {
+    failure = kj::getCaughtExceptionAsKj();
+  }
+  KJ_IF_SOME(error, failure) {
+    if (reused && error.getType() != kj::Exception::Type::OVERLOADED) ++(write ? counts.reusedWriteFailures : counts.reusedReadFailures);
+    sent = kj::none;
+    client = nullptr;
+    kj::throwFatalException(kj::mv(error));
+  }
+  // The client goes before the stream is kept: nothing reads the connection while it waits.
+  sent = kj::none;
+  client = nullptr;
+  // A request with a body the store refused may have left part of the body unread on the connection.
+  if (!bytes.empty() && (result.status < 200 || result.status >= 300)) closeAnswer = true;
+  if (closeAnswer) {
+    ++counts.closedByAnswer;
+    connection = nullptr;
+  } else {
+    keep(lane, kj::mv(connection));
+  }
+  co_return result;
 }
 
 kj::Promise<bool> ObjectStore::exists(std::string key) {
@@ -444,8 +622,10 @@ kj::Promise<std::optional<uint64_t>> ObjectStore::headSize(std::string key) {
   requireStorage(length.has_value(), "object HEAD did not provide a valid Content-Length");
   co_return length;
 }
-kj::Promise<ObjectResponse> ObjectStore::put(std::string key, std::string bytes) {
-  auto response = co_await request(kj::HttpMethod::PUT, std::move(key), std::move(bytes));
+kj::Promise<ObjectResponse> ObjectStore::put(std::string key, std::string bytes, ObjectStoreLane lane) {
+  Call call{kj::HttpMethod::PUT, std::move(key), std::move(bytes), true};
+  call.lane = lane;
+  auto response = co_await send(std::move(call));
   requireStorage(response.status == 200, "object PUT failed: HTTP " + std::to_string(response.status) +
       (errorCode(response.bytes).empty() ? std::string() : " " + errorCode(response.bytes)));
   co_return response;
@@ -464,7 +644,8 @@ kj::Promise<CreateResult> ObjectStore::create(std::string key, std::string bytes
     kj::Maybe<kj::Exception> failure;
     ObjectResponse response{};
     try {
-      response = co_await exchange(call);
+      // The second create on a new connection.
+      response = co_await exchange(call, attempt > 1);
     } catch (...) {
       failure = kj::getCaughtExceptionAsKj();
     }

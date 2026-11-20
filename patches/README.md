@@ -27,6 +27,10 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   The hook sets a platform error's `.code` from exception detail ID `0xc6f4a09d8b3e2175`, shared with the
   node's `common/rpc-error.h`; it never infers a code from an application message. That patch also watches
   the inherited parent pipe through the existing channel startup I/O provider in our server helpers.
+  A third explicit exception, `0043-v8-sandbox-per-isolate.patch`, changes V8 through the fork's
+  `patches/v8/0055` and `0057`, the build configuration (`.bazelrc`, `build/deps/v8.MODULE.bazel`),
+  four jsg hooks (`jsg.h`, `jsg.c++`, `v8-platform-wrapper.h`, `sandbox.h`, `sandbox.c++`,
+  `setup.c++`, `BUILD.bazel`) and the threaded server of 0042; see its section below.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
@@ -401,3 +405,37 @@ The factory lifecycle snapshot observes the existing wait-until task set and rep
 0031 publishes actor request activity on the next loop turn, after its background drain is queued, and timestamps snapshots so the node can reject a pre-completion observation.
 
 0032 gives ordinary cold preparations bounded Native reservations and validates selection before supersession. The lifecycle publication includes a bounded drain aggregate and an atomic completion trailer, so durable generation checks do not copy the resident array or depend on historical invocation count.
+
+### 0043: the V8 sandbox, one 8 GiB sandbox per isolate group
+
+Off unless the kernel is built with `--config=coworkerd-sandbox` (the fork's `.bazelrc`): the V8
+sandbox, one pointer-compression cage per isolate group (so every isolate has its own sandbox),
+libc++ hardening, and two parameters from the fork's V8 patch `patches/v8/0055`:
+`V8_SANDBOX_SIZE_LOG2=33` (an 8 GiB sandbox: the 4 GiB cage followed by 4 GiB for buffers) and
+`V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS` (no additional trailing guard region; V8's TypedArray access
+masks take its place, as V8 does on Android). V8 ships the guard regions and the masks; it does not
+ship a fully reserved 8 GiB sandbox (its sizes are 1 TiB, 128 GiB on Android, a partially reserved
+16 GiB on iOS). Without memory protection keys an isolate reserves 136 GiB: V8's 64 GiB guard
+regions in front of and behind its sandbox (a 32-bit index scaled by 8 plus a bounded-size offset).
+The fork's V8 patch `patches/v8/0057` adds `IsolateGroup::TryCreate()`, which returns no group
+instead of ending the process when the address space has no room for another sandbox.
+
+The patch is the one exception that changes V8 and the build configuration. Its jsg hooks: the
+memory protection key scope (compiled only with `WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY`, which
+only Cloudflare's V8 supports), the platform wrapper's zero segment, the Blob byte view's sandbox
+base (upstream takes it from a sandbox without guard regions), and jsg's default ArrayBuffer
+allocator, which holds its group so that a backing store outliving the isolate frees into a live
+sandbox. In the server package and the threaded server (0042): the platform reserves the first
+4 GiB and 1 MiB (V8 15.8 needs 4 GiB plus the largest object field offset); every Worker's isolate
+gets its group first (`tryNewIsolateGroup()`: a refusal, `OVERLOADED`, when none fits), with an
+in-sandbox pool allocator reserved before any isolate (V8's default reserves on the first
+ArrayBuffer and ends the process when an earlier resizable buffer or Wasm memory left no 1 GiB);
+the memory limits allocate in that group and bound `MaxAllocationSize()` by the group's 2 GiB
+pool (only in this configuration: the limit itself stays with the allocators' accounting); a
+refused group is a retryable refusal that lowers the process's resident limit to the residents it
+holds; and
+`coworkerd-sandbox` refuses to start a process (exit 78, with a `sandbox-refused` row on its event
+channel) or to create a Worker whose sandbox V8 does not report as secure, whose zero segment is
+not really held, or which shares the default group, writing one `[coworkerd-sandbox]` row per
+check. `coworkerd-threaded --sandbox-facts` prints the process row for the node's startup plan
+(`node/v8-sandbox.h`).

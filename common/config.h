@@ -97,6 +97,17 @@ struct ProcessPoolConfig {
   uint64_t threadedMemoryBytes = 0;
   uint32_t threadedResidentLimit = 1840;
   uint32_t threadedThreadIdleMs = 60000;
+  // The V8 sandbox's memory protection keys (ServerConfig.sandbox.protectionKeys): auto (keys when
+  // this machine has them, else guard regions), off (guard regions) or required (no start without
+  // keys). This build has the guard-region mode only. COWORKERD_SANDBOX_PROTECTION_KEYS overrides it.
+  std::string protectionKeys = "auto";
+  // Set by the node from its plan (node/v8-sandbox.h) before the pool starts: the per-process limit
+  // of this machine and build, below which the pool keeps threadedResidentLimit, and the plan itself
+  // for the state endpoint.
+  uint32_t sandboxResidentLimit = UINT32_MAX;
+  // The largest Wasm memory the plan allows a process's isolates (0: no cap of the sandbox's).
+  uint32_t sandboxWasmCapMiB = 0;
+  std::string sandboxPlanJson, sandboxWarning;
   void validate() const;
 };
 
