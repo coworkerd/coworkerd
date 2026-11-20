@@ -452,6 +452,14 @@ void manyValuesEquivalence() {
   for (int at = 0; at < 30; ++at) values.push_back(values[next() % 1000] + values[next() % 1000]);  // concatenations
   values.push_back(std::string(300, 'q'));  // periodic
   values.push_back("quote\"and\nnewline");
+  // A value inside a longer one, and the text leaving the longer one right after it ('#' is in no value): only the
+  // failure links' matches find it (each node reports the longest value its failure chain ends with).
+  std::vector<std::string> embedded;
+  for (int at = 0; at < 50; ++at) {
+    const auto inner = values[next() % 1000], before = word(4 + next() % 8, "abcdefghijklmnop");
+    values.push_back(before + inner + word(4, "abcdefghijklmnop"));
+    embedded.push_back(before + inner + "#");
+  }
   std::vector<std::string> needles;
   for (const auto& value : values) addRedaction(needles, value);
   sortRedactions(needles);
@@ -461,6 +469,7 @@ void manyValuesEquivalence() {
     text += word(1 + next() % 80, "abcdefghijklmnopqrstuvwxyz0123456789 \"\\\n");
     if (next() % 3 == 0) text += values[next() % values.size()];
     if (next() % 50 == 0) text += std::string(100 + next() % 900, 'q');
+    if (next() % 20 == 0) text += embedded[next() % embedded.size()];
   }
   const auto expected = referenceClean(text, needles);
   for (int round = 0; round < 3; ++round) {
