@@ -51,9 +51,10 @@ enum class ObjectStoreLane : uint8_t { SHARED = 0, HEARTBEAT = 1 };
 // of a request (discardedOnError: its state unknown, never used again); found closed by the store, or holding bytes no
 // request asked for, when taken -- before anything was sent on it (closedByPeer); an answer that said
 // `Connection: close` (closedByAnswer); kept longer than the lane allows (closedIdle); more than idleConnections kept
-// (closedOverCap). reusedReadFailures and reusedWriteFailures: requests that failed on a kept connection other than by a
-// timeout (a read is then sent once more on a new connection; an overwrite or a create follows its own rule and is
-// never sent twice).
+// (closedOverCap). closedByAnswer also counts a request with a body that was answered other than 2xx (the store may not
+// have read the whole body). reusedReadFailures and reusedWriteFailures: requests that failed on a kept connection other
+// than by a timeout (a read is then sent once more on a new connection; an overwrite or a create follows its own rule
+// and is never sent twice).
 struct ObjectStoreConnections {
   uint64_t inUse = 0, idle = 0, created = 0, reused = 0, discardedOnError = 0, closedByPeer = 0, closedByAnswer = 0,
       closedIdle = 0, closedOverCap = 0, reusedReadFailures = 0, reusedWriteFailures = 0;
@@ -149,7 +150,9 @@ struct CreateResult {
 class ObjectStore {
 public:
   ObjectStore(ObjectStoreConfig config, kj::Network& network, kj::Timer& timer);
-  // Its kept connections and their sweeps hold `this`; one instance serves the thread that made it.
+  // Its kept connections and their sweeps hold `this`; one instance serves the thread that made it. Every promise it
+  // returns (a request's coroutine frame) must be done or destroyed before the ObjectStore is: the frame uses its
+  // connections, header table and statistics.
   KJ_DISALLOW_COPY_AND_MOVE(ObjectStore);
   ~ObjectStore() noexcept(false);
   kj::Promise<bool> exists(std::string key);
@@ -198,10 +201,11 @@ private:
     std::string payloadSha256;
     ObjectStoreLane lane = ObjectStoreLane::SHARED;
   };
-  // A kept-alive connection: the client is destroyed before its stream.
+  // A kept-alive connection: only its stream. Each request makes an HTTP client on it and destroys it after the whole
+  // answer, so that no client reads the connection while it is idle (bytes the store sends unasked stay in the socket,
+  // where the peek before the next request finds them).
   struct Connection {
     kj::Own<kj::AsyncIoStream> stream;
-    kj::Own<kj::HttpClient> client;
     kj::TimePoint idleSince = kj::origin<kj::TimePoint>();
   };
   struct Lane {
@@ -229,8 +233,8 @@ private:
   // key's identifier).
   kj::Promise<ObjectResponse> send(Call call);
   // One attempt, every phase bounded (connect, write, answer, each read): on a kept connection of the call's lane
-  // unless `fresh` (a second attempt) or none is young enough for it, else on a new one. Kept again only after its
-  // whole answer was read; any failure on it closes it.
+  // unless `fresh` (a second attempt) or none is young enough for it, else on a new one, with an HTTP client of its
+  // own. Kept again only after its whole answer was read and its client destroyed; any failure on it closes it.
   kj::Promise<ObjectResponse> exchange(const Call& call, bool fresh = false);
   // The newest kept connection of the lane that is younger than `maxIdleMs` and still open, after closing the ones
   // past the lane's limit.

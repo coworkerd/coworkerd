@@ -21,8 +21,8 @@ namespace {
 // Every instance's connections, on every thread (objectStoreProcessConnections).
 std::atomic<uint64_t> processCreated{0}, processReused{0}, processDiscarded{0};
 // A kept connection is still open and holds no bytes that no request asked for: a peek that does not block finds
-// nothing to read (the store's FIN reads as 0, a reset as an error). KJ watches a kept connection for the store's
-// close as well (request() then refuses it), but only when the event loop gets to it.
+// nothing to read (the store's FIN reads as 0, a reset as an error, unasked bytes as more than 0). No HTTP client reads
+// a kept connection (exchange() destroys its client before keeping it), so whatever the store sent is still there.
 bool stillOpen(const kj::AsyncIoStream& stream) {
   KJ_IF_SOME(fd, stream.getFd()) {
     char byte;
@@ -507,39 +507,30 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call, bool fresh) 
       }
     }
   } hold{counts, connection};
-  // Declared after `hold`: its body writer and answer go before the client they use.
+  // Declared after `hold`, in this order: the body writer and the answer go before the client they use, the client
+  // before the stream (`connection`) it uses.
+  kj::Own<kj::HttpClient> client;
   kj::Maybe<kj::HttpClient::Request> sent;
   bool reused = false;
-  while (true) {
-    reused = false;
-    if (!fresh) {
-      KJ_IF_SOME(kept, takeKept(lane, write ? settings.writeIdleConnectionMs : settings.idleConnectionMs)) {
-        connection = kj::mv(kept);
-        reused = true;
-      }
-    }
-    if (!reused) {
-      auto stream = co_await within(timer, settings.connectTimeoutMs, [](kj::Network& network, std::string host)
-          -> kj::Promise<kj::Own<kj::AsyncIoStream>> {
-        auto address = co_await network.parseAddress(host.c_str(), 80);
-        co_return co_await address->connect();
-      }(network, host), statistics.connectTimeouts, "connect");
-      connection = kj::heap<Connection>();
-      connection->client = kj::newHttpClient(*table, *stream);
-      connection->stream = kj::mv(stream);
-      ++counts.created;
-      processCreated.fetch_add(1, std::memory_order_relaxed);
-    }
-    try {
-      sent = connection->client->request(method, target.c_str(), headers, bytes.size());
-      break;
-    } catch (...) {
-      // KJ refuses a request on a kept connection it saw the store close; nothing was written on it.
-      if (!reused) throw;
-      ++counts.closedByPeer;
-      connection = nullptr;
+  if (!fresh) {
+    KJ_IF_SOME(kept, takeKept(lane, write ? settings.writeIdleConnectionMs : settings.idleConnectionMs)) {
+      connection = kj::mv(kept);
+      reused = true;
     }
   }
+  if (!reused) {
+    auto stream = co_await within(timer, settings.connectTimeoutMs, [](kj::Network& network, std::string host)
+        -> kj::Promise<kj::Own<kj::AsyncIoStream>> {
+      auto address = co_await network.parseAddress(host.c_str(), 80);
+      co_return co_await address->connect();
+    }(network, host), statistics.connectTimeouts, "connect");
+    connection = kj::heap<Connection>();
+    connection->stream = kj::mv(stream);
+    ++counts.created;
+    processCreated.fetch_add(1, std::memory_order_relaxed);
+  }
+  client = kj::newHttpClient(*table, *connection->stream);
+  sent = client->request(method, target.c_str(), headers, bytes.size());
   if (reused) {
     ++counts.reused;
     processReused.fetch_add(1, std::memory_order_relaxed);
@@ -597,8 +588,14 @@ kj::Promise<ObjectResponse> ObjectStore::exchange(const Call& call, bool fresh) 
   KJ_IF_SOME(error, failure) {
     if (reused && error.getType() != kj::Exception::Type::OVERLOADED) ++(write ? counts.reusedWriteFailures : counts.reusedReadFailures);
     sent = kj::none;
+    client = nullptr;
     kj::throwFatalException(kj::mv(error));
   }
+  // The client goes before the stream is kept: nothing reads the connection while it waits.
+  sent = kj::none;
+  client = nullptr;
+  // A request with a body the store refused may have left part of the body unread on the connection.
+  if (!bytes.empty() && (result.status < 200 || result.status >= 300)) closeAnswer = true;
   if (closeAnswer) {
     ++counts.closedByAnswer;
     connection = nullptr;

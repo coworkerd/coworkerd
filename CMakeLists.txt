@@ -236,11 +236,11 @@ endforeach()
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)
-foreach(case reuse broken retry-rules timeout limits heartbeat)
+foreach(case reuse broken retry-rules timeout limits heartbeat extra-answer)
   add_test(NAME object-store-${case} COMMAND coworkerd-object-store-test ${case})
 endforeach()
 set_tests_properties(object-store-reuse object-store-broken object-store-retry-rules object-store-timeout
-  object-store-limits object-store-heartbeat PROPERTIES TIMEOUT 60)
+  object-store-limits object-store-heartbeat object-store-extra-answer PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-config-test EXCLUDE_FROM_ALL common/config-test.c++)
 target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)

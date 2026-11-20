@@ -42,6 +42,8 @@ public:
     DROP,          // the whole request read, the connection closed without an answer
     HOLD,          // answered once release() is called
     LATE,          // answered after lateMs
+    EXTRA,         // 200, then at once a whole second answer nobody asked for; the connection stays open
+    EXTRA_LATE,    // the same, the second answer 20 ms later
   };
 
   FakeStore(kj::AsyncIoContext& io): io(io), timer(io.provider->getTimer()) {
@@ -174,6 +176,12 @@ private:
           co_await timer.afterDelay(lateMs * kj::MILLISECONDS);
           co_await answer(*stream, request, 200, false);
           break;
+        case Act::EXTRA:
+        case Act::EXTRA_LATE:
+          co_await answer(*stream, request, 200, false);
+          if (act == Act::EXTRA_LATE) co_await timer.afterDelay(20 * kj::MILLISECONDS);
+          co_await write(*stream, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nextra");
+          break;
       }
     }
   }
@@ -277,6 +285,38 @@ void broken() {
   within(io, store.put("do/after-silent", "w"));
   KJ_REQUIRE(c.closedByPeer == 3 && c.reusedWriteFailures == 0, c.json().c_str());
   KJ_REQUIRE(store.stats().failures == 0 && store.stats().retries == 0, store.stats().json().c_str());
+
+  // An overwrite the store refused (404): the store may not have read its whole body, so its connection is not kept.
+  fake.decide = [](const Seen& s) { return s.key() == "do/refused" ? FakeStore::Act::NOT_FOUND : FakeStore::Act::ANSWER; };
+  KJ_REQUIRE(fails(io, store.put("do/refused", "body")));
+  const auto refused = fake.seen.back().connection;
+  within(io, store.get("do/after-refused"));
+  KJ_REQUIRE(fake.seen.back().connection != refused && c.closedByAnswer == 2, "a refused body's connection is not kept",
+      c.json().c_str());
+}
+
+// The store sends a whole answer nobody asked for and keeps the connection open, right after an answer or a moment
+// later: the next overwrite and the read after it each read their own answer (no client reads an idle connection; the
+// peek finds bytes still in the socket, and bytes a client read ahead go with it).
+void extraAnswer() {
+  auto io = kj::setupAsyncIo();
+  FakeStore fake(io);
+  ObjectStore store(fake.config(), io.provider->getNetwork(), io.provider->getTimer());
+  const auto& c = store.stats().connections;
+  for (const auto act : {FakeStore::Act::EXTRA, FakeStore::Act::EXTRA_LATE}) {
+    bool once = true;
+    fake.decide = [&](const Seen& s) {
+      if (s.key() == "do/extra" && once) { once = false; return act; }
+      return FakeStore::Act::ANSWER;
+    };
+    KJ_REQUIRE(within(io, store.get("do/extra")).bytes == "do/extra");
+    pause(io, 50);
+    const auto put = within(io, store.put("do/after-extra", "x"));
+    KJ_REQUIRE(put.bytes.empty(), "the overwrite read its own answer", put.bytes.c_str());
+    const auto next = within(io, store.get("do/next")).bytes;
+    KJ_REQUIRE(next == "do/next", "the read after it read its own answer", next.c_str());
+  }
+  KJ_REQUIRE(c.reusedWriteFailures == 0 && c.reusedReadFailures == 0 && store.stats().failures == 0, c.json().c_str());
 }
 
 // The retry rules on kept connections, unchanged: a read that fails is sent once more, on a new connection (not on
@@ -481,6 +521,7 @@ int main(int argc, char** argv) {
     else if (label == "timeout") timeoutDiscard();
     else if (label == "limits") limits();
     else if (label == "heartbeat") heartbeat();
+    else if (label == "extra-answer") extraAnswer();
     else KJ_FAIL_REQUIRE("unknown object store test case", argv[1]);
   } catch (const kj::Exception& error) {
     std::cerr << error.getDescription().cStr() << '\n';
