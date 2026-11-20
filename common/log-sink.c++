@@ -265,10 +265,11 @@ private:
   void consume(int liveness) {
     shared->ready.store(1, std::memory_order_release);
     std::array<uint64_t, SOURCES.size()> reported{};
-    std::array<PlatformLogCleaner, 2> cleaners;
+    // One cleaner (one copy of the needles' automata), one state per stream.
+    PlatformLogCleaner cleaner;
+    std::array<PlatformLogCleaner::Stream, 2> streams;
     auto writeClean = [&](int fd, std::string_view bytes, bool final = false) {
-      auto& cleaner = cleaners[fd == STDOUT_FILENO ? 0 : 1];
-      const auto text = cleaner.append(bytes, final);
+      const auto text = cleaner.append(streams[fd == STDOUT_FILENO ? 0 : 1], bytes, final);
       if (cleaner.suppressed()) shared->redactionSuppressedLines.fetch_add(1, std::memory_order_relaxed);
       return writeAll(fd, text.data(), text.size());
     };
@@ -292,7 +293,7 @@ private:
         // A record that waited longer than LOG_LINE_STALE_MS (a stuck stream) is dropped: a secret value it holds
         // may have left the dictionary since. It still passes its cleaner, which keeps its state across records.
         if (now > header.queuedMs && now - header.queuedMs > staleLineMs) {
-          (void)cleaners[header.descriptor == STDOUT_FILENO ? 0 : 1].append(record);
+          (void)cleaner.append(streams[header.descriptor == STDOUT_FILENO ? 0 : 1], record);
           shared->staleLines.fetch_add(1, std::memory_order_relaxed);
         } else if (!writeClean(header.descriptor, record)) {
           shared->writerError.store(1, std::memory_order_release); return;

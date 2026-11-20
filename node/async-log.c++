@@ -1,4 +1,5 @@
 #include "async-log.h"
+#include "tenant-line.h"
 
 #include "log-cleaning.h"
 #include "memory-observation.h"
@@ -157,71 +158,9 @@ void closeOtherDescriptors(int keep) {
 }
 
 // ---- The Workers' logs (by tenant) ----
-// Tenant lines as the node appends them: {"workerId":"..","versionId":"..","level":"..","message":"<JSON string>"}
-// (fields in this order). The workerId is a Worker's full name, <tenant>/<worker>, the versionId a deployment's safe
-// name; the message stays as its JSON text. Output of a process that starts with TENANT_PREFIX is only counted.
+// Tenant lines as the node appends them: see tenant-line.h. Output of a process that starts with TENANT_PREFIX is
+// only counted.
 constexpr std::string_view TENANT_PREFIX = "[tenant-log] ";
-bool nameCharacter(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-}
-struct TenantLine { std::string_view workerId, versionId, level, message; };
-std::optional<TenantLine> parseTenantLine(std::string_view json) {
-  TenantLine line;
-  auto literal = [&](std::string_view expected) {
-    if (!json.starts_with(expected)) return false;
-    json.remove_prefix(expected.size());
-    return true;
-  };
-  auto name = [&](std::string_view& out, size_t limit) {
-    size_t n = 0;
-    while (n < json.size() && n <= limit && nameCharacter(json[n])) ++n;
-    if (n == 0 || n > limit) return false;
-    out = json.substr(0, n);
-    json.remove_prefix(n);
-    return true;
-  };
-  // A full name: the tenant, one '/', the Worker's name.
-  auto fullName = [&](std::string_view& out) {
-    std::string_view tenant, worker;
-    if (!name(tenant, 63) || !literal("/") || !name(worker, 255)) return false;
-    out = std::string_view(tenant.data(), tenant.size() + 1 + worker.size());
-    return true;
-  };
-  if (!literal("{\"workerId\":\"") || !fullName(line.workerId) || !literal("\",\"versionId\":\"") ||
-      !name(line.versionId, 255) || !literal("\",\"level\":\"") || !name(line.level, 16) || !literal("\",\"message\":\"")) {
-    return std::nullopt;
-  }
-  bool escaped = false;
-  size_t end = 0;
-  for (; end < json.size(); ++end) {
-    const char c = json[end];
-    if (escaped) { escaped = false; continue; }
-    if (c == '\\') { escaped = true; continue; }
-    if (c == '"') break;
-    if (static_cast<unsigned char>(c) < 0x20) return std::nullopt;
-  }
-  if (end >= json.size()) return std::nullopt;
-  line.message = json.substr(0, end);
-  json.remove_prefix(end + 1);
-  if (json != "}") return std::nullopt;
-  return line;
-}
-// The longest prefix of a JSON string's text within `limit` bytes that ends between two characters:
-// never inside an escape sequence or a UTF-8 sequence.
-size_t jsonTextCut(std::string_view text, size_t limit) {
-  size_t at = 0;
-  while (at < text.size()) {
-    const auto c = static_cast<unsigned char>(text[at]);
-    size_t unit = 1;
-    if (c == '\\') unit = at + 1 < text.size() && text[at + 1] == 'u' ? 6 : 2;
-    else if (c >= 0xf0) unit = 4;
-    else if (c >= 0xe0) unit = 3;
-    else if (c >= 0xc0) unit = 2;
-    if (at + unit > limit) break;
-    at += unit;
-  }
-  return at;
-}
 std::string jsonQuoted(std::string_view value) { return "\"" + jsonText(value) + "\""; }
 
 // What the drainer keeps (reader thread writes, query thread reads; one mutex, held briefly). The quota
@@ -253,7 +192,8 @@ public:
       return;
     }
     ++log.windowLines;
-    const auto cut = line.message.size() > settings.maxLineBytes ? jsonTextCut(line.message, settings.maxLineBytes) : line.message.size();
+    const auto keep = tenantLineKeep(line, settings.maxLineBytes);
+    const auto cut = keep.bytes;
     std::string json;
     json.reserve(160 + cut);
     json += "{\"seq\":" + std::to_string(++sequence) + ",\"atUnixMs\":" + std::to_string(now) + ",\"processId\":" +
@@ -266,8 +206,8 @@ public:
     json += "\",\"message\":\"";
     json.append(line.message.data(), cut);
     json += '"';
-    if (cut < line.message.size()) {
-      json += ",\"truncated\":true,\"messageBytes\":" + std::to_string(line.message.size());
+    if (keep.truncated) {
+      json += ",\"truncated\":true,\"messageBytes\":" + std::to_string(keep.messageBytes);
       ++log.truncatedLines;
       shared.tenantTruncatedLines.fetch_add(1, std::memory_order_relaxed);
     }
@@ -487,7 +427,9 @@ private:
   struct Source { uint32_t slot; uint64_t generation; int64_t pid; std::array<Stream, 2> streams; std::string processId; };
   // `queuedMs`: when the reader took the lines from the pipe (the monotonic clock); for a line begun in an
   // earlier read, when its first byte was taken.
-  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; };
+  // A process's stream's whole lines; `final` (no lines) when that stream ended, so that its cleaner state writes
+  // what it held back.
+  struct Batch { uint32_t slot; uint64_t lines; std::string bytes; uint64_t queuedMs = 0; uint8_t stream = 0; bool final = false; };
 
   // Reader thread: keeps every pipe empty whatever the sink does.
   void readLoop() {
@@ -622,7 +564,8 @@ private:
   void consume(Source& source, Stream& stream, const char* data, size_t size) {
     auto& slot = shared.slots[source.slot];
     const uint64_t readMs = monotonicMs();
-    Batch batch{source.slot, 0, {}, readMs};
+    const auto streamIndex = static_cast<uint8_t>(&stream == &source.streams[0] ? 0 : 1);
+    Batch batch{source.slot, 0, {}, readMs, streamIndex};
     batch.bytes.reserve(size);
     bool dropped = false;
     for (size_t at = 0; at < size;) {
@@ -663,7 +606,7 @@ private:
         } else if (!stream.partial.empty()) {
           // A line that began in an earlier read is as old as its first byte. It is this read's first line and
           // goes alone, so the lines after it keep this read's time.
-          Batch line{source.slot, 1, {}, std::min(readMs, stream.partialSinceMs)};
+          Batch line{source.slot, 1, {}, std::min(readMs, stream.partialSinceMs), streamIndex};
           line.bytes.reserve(length);
           line.bytes.append(stream.partial);
           line.bytes.append(data + at, piece);
@@ -704,6 +647,8 @@ private:
     std::string().swap(stream.partial);
     stream.discarding = false;
     stream.discarded = 0;
+    // The writer writes what this stream's cleaner state held back (a prefix of a value that did not come).
+    enqueue(Batch{source.slot, 0, {}, monotonicMs(), static_cast<uint8_t>(&stream == &source.streams[0] ? 0 : 1), true});
     closeDescriptor(stream.fd);
     shared.slots[source.slot].openStreams.fetch_sub(1, std::memory_order_relaxed);
   }
@@ -870,7 +815,8 @@ private:
       writeMarkers(reported);
       if (done) break;
     }
-    const auto tail = cleaner.append({}, true);
+    std::string tail;
+    for (auto& pair : streams) for (auto& stream : pair) if (!stream.pending.empty()) tail += cleaner.append(stream, {}, true);
     if (!tail.empty() && ensureSink(true)) {
       const auto written = writeSome(sink, tail.data(), tail.size());
       if (written != tail.size()) sinkFailed(errno);
@@ -935,7 +881,7 @@ private:
     // dropped: a secret value it holds may have left the dictionary since. It
     // still passes the cleaner, which keeps its state across blocks.
     const bool stale = monotonicMs() - batch.queuedMs > settings.staleLineMs;
-    const auto text = cleaner.append(batch.bytes);
+    const auto text = cleaner.append(streams[batch.slot][batch.stream], batch.bytes, batch.final);
     const auto* data = text.data();
     const size_t size = text.size(), originalSize = batch.bytes.size();
     if (stale || cleaner.suppressed()) {
@@ -990,7 +936,7 @@ private:
         line << (r ? "," : "") << '"' << DROP_NAMES[r] << "\":" << slot.droppedBy[r].load();
       line << "},\"firstDroppedAtUnixMs\":" << slot.firstDropUnixMs.load()
            << ",\"lastDroppedAtUnixMs\":" << slot.lastDropUnixMs.load() << "}\n";
-      const auto text = cleaner.append(line.str());
+      const auto text = cleaner.append(markers, line.str(), true);
       if (writeSome(sink, text.data(), text.size()) != text.size()) {
         sinkFailed(errno);
         return;
@@ -1020,8 +966,10 @@ private:
   bool readerDone = false;
   std::array<std::string, OUTPUT_SLOTS> names;
   std::array<uint32_t, OUTPUT_SLOTS> classes{};
-  // Writer thread only.
+  // Writer thread only: one cleaner, one state for each process's stream and one for the markers.
   PlatformLogCleaner cleaner;
+  std::vector<std::array<PlatformLogCleaner::Stream, 2>> streams = std::vector<std::array<PlatformLogCleaner::Stream, 2>>(OUTPUT_SLOTS);
+  PlatformLogCleaner::Stream markers;
   int sink = -1;
   uint64_t failingSinceMs = 0;
   bool sinkRegular = false;
