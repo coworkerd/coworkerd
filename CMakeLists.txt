@@ -196,11 +196,12 @@ endforeach()
 foreach(case raise unverified old-ask coalesce outage)
   add_test(NAME durable-peer-fence-${case} COMMAND coworkerd-durable-channel-test peer-fence ${case})
 endforeach()
-foreach(case fenced full full-resend)
+foreach(case fenced full full-resend resend-held)
   add_test(NAME durable-refused-peer-${case} COMMAND coworkerd-durable-channel-test refused-peer ${case})
 endforeach()
 foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect cut-short-reconnect limit-reconnect
-    corrupt-reconnect chunk pair-full pair-fenced)
+    corrupt-reconnect chunk pair-full pair-fenced fenced-drop fenced-unshown full-keeps fenced-drop-resend fenced-known
+    reacquired)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
 foreach(case deadlines leases tree-lease budget identity admission placement package module-types cache
