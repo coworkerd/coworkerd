@@ -1,0 +1,575 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 20 Nov 2026 12:00:00 +0800
+Subject: [PATCH] S1e: long operations take interrupts, the heap ceiling rises within the process budget
+
+
+diff --git a/build/deps/v8.MODULE.bazel b/build/deps/v8.MODULE.bazel
+index 7fc2ad403d7c32e633de20992654994d65a60a55..ddca78b2991b0eb0213b8709359de0c72c7efc1b 100644
+--- a/build/deps/v8.MODULE.bazel
++++ b/build/deps/v8.MODULE.bazel
+@@ -77,6 +77,7 @@ PATCHES = [
+     "0052-Keep-functions-created-by-v8-Function-New-in-the-context-snapshot.patch",
+     "0053-Leave-the-SharedFunctionInfo-id-out-of-the-read-only-heap-checksum.patch",
+     "0054-Add-SnapshotCreator-HasSuspendedGenerators.patch",
++    "0056-Let-JSON-parse-and-split-take-interrupts.patch",
+ ]
+ 
+ http_archive(
+diff --git a/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch b/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..061d664d278863aea0dd6b75f10e09862f2c8323
+--- /dev/null
++++ b/patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch
+@@ -0,0 +1,216 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: maslow <wangfugen@126.com>
++Date: Fri, 20 Nov 2026 12:00:00 +0800
++Subject: Let JSON.parse and String.prototype.split take interrupts, and
++ throw instead of ending the process past the largest array
++
++JSON.parse only checked for stack overflow: a termination requested while
++it parses (a CPU or memory limit of the embedder) took effect only after
++the whole text, however much it allocated meanwhile. Handle interrupts
++once per value, as JSON.stringify does. String.prototype.split creates
++every part in one runtime call; handle interrupts every 1,024 parts.
++
++A JSON array or a split with more elements than FixedArray::kMaxLength,
++and a JSON object with more properties than its dictionary can hold,
++ended the process ("Fatal JavaScript invalid size error", "invalid array
++length", "invalid table size"), reachable from a script with one text of
++a few hundred megabytes. Throw a RangeError instead (Invalid array length,
++Too many properties to enumerate). The split stops collecting indices one
++past the maximum.
++
++diff --git a/src/builtins/builtins-string-gen.cc b/src/builtins/builtins-string-gen.cc
++index d282fa8..570d937 100644
++--- a/src/builtins/builtins-string-gen.cc
+++++ b/src/builtins/builtins-string-gen.cc
++@@ -1577,6 +1577,10 @@ TNode<JSArray> StringBuiltinsAssembler::StringToArray(
++         [=, this] { return SmiMin(CAST(limit_number), subject_length); },
++         [=] { return subject_length; });
++     TNode<IntPtrT> length = SmiToIntPtr(length_smi);
+++    // More characters than the largest array: the runtime throws a RangeError
+++    // (AllocateFixedArray would end the process).
+++    GotoIf(IntPtrGreaterThan(length, IntPtrConstant(FixedArray::kMaxLength)),
+++           &call_runtime);
++ 
++     ToDirectStringAssembler to_direct(state(), subject_string);
++     to_direct.TryToDirect(&call_runtime);
++diff --git a/src/json/json-parser.cc b/src/json/json-parser.cc
++index cc719ef..87d3f02 100644
++--- a/src/json/json-parser.cc
+++++ b/src/json/json-parser.cc
++@@ -146,6 +146,26 @@ static const constexpr uint8_t character_json_scan_flags[256] = {
++     return ret;                                      \
++   }
++ 
+++// Parsing a large text allocates for as long as the text lasts. Like
+++// JSON.stringify, the parser handles interrupts once per value, so that a
+++// termination requested meanwhile (for example by a CPU or memory limit)
+++// takes effect during the parse instead of after it. Returns true when an
+++// interrupt left an exception (the termination) to propagate.
+++V8_INLINE bool JsonParseInterrupted(Isolate* isolate) {
+++  StackLimitCheck interrupt_check(isolate);
+++  return V8_UNLIKELY(interrupt_check.InterruptRequested()) &&
+++         IsExceptionHole(isolate->stack_guard()->HandleInterrupts());
+++}
+++
+++// The largest array and object the parser builds. Beyond them the backing
+++// stores cannot be allocated and V8 would end the process
+++// ("Fatal JavaScript invalid size error", "invalid table size"), so the
+++// parse throws a RangeError instead. An object's properties go into a
+++// dictionary whose capacity rounds 1.5 times the count up to a power of two.
+++constexpr size_t kMaxJsonArrayLength = FixedArray::kMaxLength;
+++constexpr size_t kMaxJsonObjectProperties = NameDictionary::kMaxCapacity / 2;
+++static_assert(kMaxJsonObjectProperties <= NumberDictionary::kMaxCapacity / 2);
+++
++ }  // namespace
++ 
++ MaybeHandle<Object> JsonParseInternalizer::Internalize(
++@@ -1047,6 +1067,7 @@ bool JsonParser<Char>::ParseRawJson() {
++ template <typename Char>
++ V8_INLINE MaybeHandle<Object> JsonParser<Char>::ParseJsonValueRecursive(
++     Handle<Map> feedback) {
+++  if (JsonParseInterrupted(isolate_)) return MaybeHandle<Object>();
++   GetNextNonWhitespaceToken();
++   switch (peek()) {
++     case JsonToken::NUMBER:
++@@ -1109,6 +1130,11 @@ bool JsonParser<Char>::ParseJsonPropertyValue(const JsonString& key) {
++   Handle<Object> value;
++   if (V8_UNLIKELY(!ParseJsonValueRecursive().ToHandle(&value))) return false;
++   property_stack_.emplace_back(key, value);
+++  if (V8_UNLIKELY(property_stack_.size() > kMaxJsonObjectProperties)) {
+++    isolate_->Throw(
+++        *factory()->NewRangeError(MessageTemplate::kTooManyProperties));
+++    return false;
+++  }
++   return true;
++ }
++ 
++@@ -1384,6 +1410,19 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
++         smi_elements_.push_back(current_smi);
++       }
++     }
+++    if (V8_UNLIKELY(smi_elements_.size() + double_elements_.size() >
+++                    kMaxJsonArrayLength)) {
+++      smi_elements_.resize(0);
+++      double_elements_.resize(0);
+++      isolate_->Throw(
+++          *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
+++      return {};
+++    }
+++    if (V8_UNLIKELY(JsonParseInterrupted(isolate_))) {
+++      smi_elements_.resize(0);
+++      double_elements_.resize(0);
+++      return {};
+++    }
++     if (Check<JsonToken::COMMA>()) {
++       GetNextNonWhitespaceToken();
++       continue;
++@@ -1456,6 +1495,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonArray() {
++       return {};
++     }
++     element_stack_.emplace_back(value);
+++    if (V8_UNLIKELY(element_stack_.size() - start > kMaxJsonArrayLength)) {
+++      isolate_->Throw(
+++          *factory()->NewRangeError(MessageTemplate::kInvalidArrayLength));
+++      return {};
+++    }
++   }
++ 
++   EXPECT_RETURN_ON_ERROR(JsonToken::RBRACK,
++@@ -1519,6 +1563,7 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++     // objects and arrays will cause the loop to continue until a first member
++     // is completed.
++     while (true) {
+++      if (JsonParseInterrupted(isolate_)) return MaybeHandle<Object>();
++       GetNextNonWhitespaceToken();
++       // The switch is immediately followed by 'break' so we can use 'break' to
++       // break out of the loop, and 'continue' to continue the loop.
++@@ -1668,6 +1713,11 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++                 {});
++ 
++             property_stack_.emplace_back(ScanJsonPropertyKey(&cont.current()));
+++            if (V8_UNLIKELY(property_stack_.size() > kMaxJsonObjectProperties)) {
+++              isolate_->Throw(*factory()->NewRangeError(
+++                  MessageTemplate::kTooManyProperties));
+++              return MaybeHandle<Object>();
+++            }
++             if constexpr (should_track_json_source) {
++               property_val_node_stack.emplace_back(Handle<Object>());
++             }
++@@ -1730,6 +1780,12 @@ MaybeHandle<Object> JsonParser<Char>::ParseJsonValue() {
++         case JsonContinuation::kArrayElement: {
++           // Store the previous element on the stack.
++           element_stack_.emplace_back(value);
+++          if (V8_UNLIKELY(element_stack_.size() - cont.current().index() >
+++                          kMaxJsonArrayLength)) {
+++            isolate_->Throw(*factory()->NewRangeError(
+++                MessageTemplate::kInvalidArrayLength));
+++            return MaybeHandle<Object>();
+++          }
++           if constexpr (should_track_json_source) {
++             element_val_node_stack.emplace_back(val_node);
++           }
++diff --git a/src/runtime/runtime-regexp.cc b/src/runtime/runtime-regexp.cc
++index ec17453..edf9c70 100644
++--- a/src/runtime/runtime-regexp.cc
+++++ b/src/runtime/runtime-regexp.cc
++@@ -884,13 +884,23 @@ RUNTIME_FUNCTION(Runtime_StringSplit) {
++ 
++   std::vector<int>* indices = GetRewoundRegexpIndicesList(isolate);
++ 
++-  FindStringIndicesDispatch(isolate, *subject, *pattern, indices, limit,
++-                            first_index);
+++  // More parts than the largest array cannot be stored (V8 would end the
+++  // process), so the split throws a RangeError instead; finding one index
+++  // past that maximum is enough to know.
+++  constexpr uint32_t kMaxParts = FixedArray::kMaxLength;
+++  FindStringIndicesDispatch(isolate, *subject, *pattern, indices,
+++                            std::min(limit, kMaxParts + 1), first_index);
++ 
++   if (static_cast<uint32_t>(indices->size()) < limit) {
++     indices->push_back(subject_length);
++   }
++ 
+++  if (V8_UNLIKELY(indices->size() > kMaxParts)) {
+++    TruncateRegexpIndicesList(isolate);
+++    THROW_NEW_ERROR_RETURN_FAILURE(
+++        isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
+++  }
+++
++   // The list indices now contains the end of each part to create.
++ 
++   // Create JSArray of substrings separated by separator.
++@@ -910,6 +920,16 @@ RUNTIME_FUNCTION(Runtime_StringSplit) {
++   } else {
++     int part_start = 0;
++     FOR_WITH_HANDLE_SCOPE(isolate, int i = 0, i, i < part_count, i++) {
+++      // Every part may allocate: handle interrupts now and then, so that a
+++      // termination requested meanwhile (a CPU or memory limit) takes effect.
+++      if (V8_UNLIKELY((i & 0x3FF) == 0x3FF)) {
+++        StackLimitCheck interrupt_check(isolate);
+++        if (V8_UNLIKELY(interrupt_check.InterruptRequested()) &&
+++            IsExceptionHole(isolate->stack_guard()->HandleInterrupts())) {
+++          TruncateRegexpIndicesList(isolate);
+++          return ReadOnlyRoots(isolate).exception();
+++        }
+++      }
++       int part_end = indices->at(i);
++       DirectHandle<String> substring =
++           isolate->factory()->NewProperSubString(subject, part_start, part_end);
++diff --git a/src/runtime/runtime-strings.cc b/src/runtime/runtime-strings.cc
++index 9d2ef19..bc17198 100644
++--- a/src/runtime/runtime-strings.cc
+++++ b/src/runtime/runtime-strings.cc
++@@ -404,6 +404,13 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
++   DirectHandle<String> s = args.at<String>(0);
++   uint32_t limit = NumberToUint32(args[1]);
++ 
+++  // More characters than the largest array cannot be stored (V8 would end
+++  // the process), so this throws a RangeError instead.
+++  if (V8_UNLIKELY(std::min(static_cast<uint32_t>(s->length()), limit) >
+++                  FixedArray::kMaxLength)) {
+++    THROW_NEW_ERROR_RETURN_FAILURE(
+++        isolate, NewRangeError(MessageTemplate::kInvalidArrayLength));
+++  }
++   s = String::Flatten(isolate, s);
++   const int length =
++       static_cast<int>(std::min(static_cast<uint32_t>(s->length()), limit));
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..e38378d8aa1af7c25656381de418663a459fbe5a 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -379,6 +379,63 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+     "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
+     "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
+ 
++// Long operations that check no interrupt while they allocate: after the
++// near-heap-limit callback has raised the ceiling and requested the
++// termination, they keep allocating until they meet the raised ceiling (v137
++// §6.28-§6.29, v138 §4).
++// JSON.parse of 120 million empty objects (about 3.4 GB) from a 360 MB text.
++constexpr kj::StringPtr JSON_OBJECTS =
++    "globalThis.retained = JSON.parse('[' + '{},'.repeat(1.2e8) + '{}]'); retained.length"_kj;
++// JSON.parse of one number more than the largest array: no V8 allocation
++// while parsing, then a backing store V8 cannot allocate.
++constexpr kj::StringPtr JSON_NUMBERS =
++    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**27) + '1]'); retained.length"_kj;
++// Straight-line code: no loop and no JavaScript call, so no interrupt check,
++// six flattened 500 MB strings one after another (the shape of the §6.29
++// verifier).
++constexpr kj::StringPtr STRAIGHT_LINE =
++    "const a = ' '.repeat(5e8); a.indexOf('z'); const b = a + '1'; b.indexOf('z');"
++    "const c = b + '2'; c.indexOf('z'); const d = c + '3'; d.indexOf('z');"
++    "const e = d + '4'; e.indexOf('z'); const f = e + '5'; f.indexOf('z');"
++    "globalThis.kept = [a, b, c, d, e, f]; kept.length"_kj;
++// A structured clone (ValueSerializer and ValueDeserializer, as
++// jsg::structuredClone) of three maximum two-byte strings.
++constexpr kj::StringPtr CLONE_STRINGS =
++    "globalThis.retained = clone([0, 1, 2].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
++    "retained.length"_kj;
++// String.prototype.split into 120 million three-character strings (about
++// 1.9 GB) and their array.
++constexpr kj::StringPtr SPLIT_PARTS =
++    "globalThis.retained = 'abc,'.repeat(1.2e8).split(','); retained.length"_kj;
++// Splits into one part more than the largest array, by a separator and into
++// characters.
++constexpr kj::StringPtr SPLIT_TOO_MANY =
++    "globalThis.retained = 'a,'.repeat(2**27).split(','); retained.length"_kj;
++constexpr kj::StringPtr SPLIT_CHARACTERS =
++    "const s = ' '.repeat(2**27 + 8); s.indexOf('z'); globalThis.retained = s.split(''); retained.length"_kj;
++
++// structuredClone for the plain test contexts: V8's serializer and
++// deserializer with the default delegate, as jsg::structuredClone uses them.
++void cloneForTest(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  auto* isolate = info.GetIsolate();
++  auto context = isolate->GetCurrentContext();
++  v8::ValueSerializer serializer(isolate);
++  serializer.WriteHeader();
++  if (serializer.WriteValue(context, info[0]).IsNothing()) return;
++  auto released = serializer.Release();
++  KJ_DEFER(free(released.first));
++  v8::ValueDeserializer deserializer(isolate, released.first, released.second);
++  v8::Local<v8::Value> result;
++  if (deserializer.ReadHeader(context).FromMaybe(false) &&
++      deserializer.ReadValue(context).ToLocal(&result))
++    info.GetReturnValue().Set(result);
++}
++
++// What a child's allocating call must end with: the memory limit, or the
++// memory limit or a RangeError (an array V8 cannot allocate), or anything
++// (an exploration run).
++enum class Outcome { MEMORY, MEMORY_OR_RANGE, ANY };
++
+ // `count` isolates allocate at the same moment while a neighbor isolate keeps
+ // answering. Every heap of this build shares one pointer cage.
+ // `raised`: whether each isolate's ceiling must have been raised by the
+@@ -387,13 +444,14 @@ constexpr kj::StringPtr LIVE126_128K_THEN_STRING =
+ // shapes never need the callback; only an object V8 placed without a
+ // collection (the 500 MB young one) does. Without this check the callback
+ // would hide a missing reserve.
+-void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1) {
++void simultaneousAllocations(
++    size_t count, kj::StringPtr code, int raised = -1, Outcome outcome = Outcome::MEMORY) {
+   initializeV8();
+   auto budget = std::make_shared<ResourceBudget>(16ull << 30, 8, count + 1);
+   std::vector<kj::Own<IsolateLimits>> limits;
+   std::vector<v8::Isolate*> isolates;
+   std::vector<uint64_t> peaks(count);
+-  std::vector<char> refused(count);
++  std::vector<char> refused(count), rangeError(count);
+   for (size_t i = 0; i < count; ++i) {
+     auto reservation = std::make_shared<ResourceReservation>(budget, 128);
+     KJ_ASSERT(reservation->registerPreparation());
+@@ -457,6 +515,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+       v8::HandleScope handles(isolate);
+       auto context = v8::Context::New(isolate);
+       v8::Context::Scope entered(context);
++      KJ_ASSERT(context->Global()
++              ->Set(context, v8::String::NewFromUtf8Literal(isolate, "clone"),
++                  v8::Function::New(context, cloneForTest).ToLocalChecked())
++              .FromJust());
+       auto source =
+           v8::String::NewFromUtf8(isolate, code.begin(), v8::NewStringType::kNormal, code.size())
+               .ToLocalChecked();
+@@ -467,6 +529,15 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+           128, limits[i]->identity);
+       v8::TryCatch caught(isolate);
+       auto result = script->Run(context);
++      std::string thrown;
++      if (result.IsEmpty() && caught.HasCaught() && !caught.HasTerminated()) {
++        v8::String::Utf8Value text(isolate, caught.Exception());
++        if (*text != nullptr) thrown = *text;
++      }
++      rangeError[i] = thrown.starts_with("RangeError");
++      fprintf(stdout, "ALLOCATION_RESULT worker=%zu completed=%d terminated=%d thrown=\"%s\"\n", i,
++          !result.IsEmpty(), caught.HasTerminated(), thrown.c_str());
++      fflush(stdout);
+       completed.arrive_and_wait();
+       release.arrive_and_wait();
+       caught.Reset();
+@@ -485,7 +556,10 @@ void simultaneousAllocations(size_t count, kj::StringPtr code, int raised = -1)
+   release.arrive_and_wait();
+   for (auto& worker: workers) worker.join();
+   for (size_t i = 0; i < count; ++i) {
+-    KJ_EXPECT(refused[i] && peaks[i] >= (128ull << 20), i, peaks[i]);
++    const bool limited = refused[i] && peaks[i] >= (128ull << 20);
++    if (outcome == Outcome::MEMORY) KJ_EXPECT(limited, i, peaks[i]);
++    if (outcome == Outcome::MEMORY_OR_RANGE)
++      KJ_EXPECT(limited || rangeError[i], i, peaks[i], int(refused[i]));
+     const int ceilingRaised = limits[i]->memory->ceilingRaised.load();
+     if (raised >= 0) KJ_EXPECT(ceilingRaised == raised, i, ceilingRaised, raised);
+     fprintf(stdout, "CONCURRENT_HEAP worker=%zu peak=%llu separateCages=%d ceilingRaised=%d\n", i,
+@@ -501,20 +575,44 @@ KJ_TEST("child body: simultaneous near-GiB heap allocations, selected by a paren
+   auto selected = getenv("COWORKERD_THREADED_ALLOCATION_CHILD");
+   if (selected == nullptr) return;
+   kj::StringPtr spec(selected);
+-  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<string|array|live126|live86k|live128k|young500>");
++  auto colon = KJ_REQUIRE_NONNULL(spec.findFirst(':'), "expected <count>:<kind>");
+   auto count = kj::str(spec.first(colon)).parseAs<uint>();
+   auto kind = spec.slice(colon + 1);
+-  KJ_REQUIRE(count > 0 && count <= 8 &&
+-      (kind == "string" || kind == "array" || kind == "live126" || kind == "live86k" || kind == "live128k" ||
+-          kind == "young500"));
+-  simultaneousAllocations(count,
+-      kind == "array"          ? NEAR_GIB_ARRAY
+-          : kind == "live126"  ? LIVE126_THEN_STRING
+-          : kind == "live86k"  ? LIVE126_86K_THEN_STRING
+-          : kind == "live128k" ? LIVE126_128K_THEN_STRING
+-          : kind == "young500" ? YOUNG500_THEN_STRING
+-                               : NEAR_GIB_STRING,
+-      count == 1 ? int(kind == "young500") : -1);
++  struct Shape {
++    kj::StringPtr name, code;
++    int raised;
++    Outcome outcome;
++  };
++  // `raised` only for one isolate: -1 is not checked.
++  const Shape shapes[] = {
++    {"string"_kj, NEAR_GIB_STRING, 0, Outcome::MEMORY},
++    {"array"_kj, NEAR_GIB_ARRAY, 0, Outcome::MEMORY},
++    {"live126"_kj, LIVE126_THEN_STRING, 0, Outcome::MEMORY},
++    {"live86k"_kj, LIVE126_86K_THEN_STRING, 0, Outcome::MEMORY},
++    {"live128k"_kj, LIVE126_128K_THEN_STRING, 0, Outcome::MEMORY},
++    {"young500"_kj, YOUNG500_THEN_STRING, 1, Outcome::MEMORY},
++    {"json"_kj, JSON_OBJECTS, -1, Outcome::MEMORY},
++    {"json-numbers"_kj, JSON_NUMBERS, -1, Outcome::MEMORY_OR_RANGE},
++    {"straight"_kj, STRAIGHT_LINE, -1, Outcome::MEMORY},
++    {"clone"_kj, CLONE_STRINGS, -1, Outcome::MEMORY},
++    {"split"_kj, SPLIT_PARTS, -1, Outcome::MEMORY},
++    {"split-many"_kj, SPLIT_TOO_MANY, -1, Outcome::MEMORY_OR_RANGE},
++    {"split-chars"_kj, SPLIT_CHARACTERS, -1, Outcome::MEMORY_OR_RANGE},
++  };
++  KJ_REQUIRE(count > 0 && count <= 8);
++  if (kind == "code") {
++    // Exploration of other shapes (not a test): the code comes from the
++    // environment, the outcome is only printed.
++    const char* code = getenv("COWORKERD_THREADED_ALLOCATION_CODE");
++    KJ_REQUIRE(code != nullptr, "COWORKERD_THREADED_ALLOCATION_CODE is not set");
++    simultaneousAllocations(count, kj::StringPtr(code), -1, Outcome::ANY);
++  } else {
++    const Shape* found = nullptr;
++    for (auto& shape: shapes)
++      if (shape.name == kind) found = &shape;
++    KJ_REQUIRE(found != nullptr, "unknown allocation shape", kind);
++    simultaneousAllocations(count, found->code, count == 1 ? found->raised : -1, found->outcome);
++  }
+   fprintf(stdout, "ALLOCATION_CHILD survived count=%u kind=%s\n", count, kind.cStr());
+   fflush(stdout);
+ }
+@@ -601,6 +699,75 @@ KJ_TEST("a 500 MB young object then one near-GiB object preserves the process")
+   KJ_EXPECT(child.events.find("memory-oom") == std::string::npos);
+ }
+ 
++// The near-heap-limit callback's ceilings (MemoryBudget::raise), against a
++// real isolate with 64 MiB live in a 2 GiB process budget: the first is one
++// maximum object above the heap in use even when the heap is already past the
++// old ceiling (young large objects are promoted without a check); a later one,
++// while the termination is pending, reaches at most what the process budget has
++// left; with nothing left the ceiling stays and V8's OOM path follows.
++KJ_TEST("the raised heap ceiling counts from the heap in use and later stays within the process budget") {
++  initializeV8();
++  auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 2);
++  auto reservation = std::make_shared<ResourceReservation>(budget, 128);
++  KJ_ASSERT(reservation->registerPreparation());
++  IsolateLimits limits(10000, 128, kj::str("\"workerId\":\"a/raise\","), reservation);
++  auto* isolate = v8::Isolate::New(limits.getCreateParams());
++  KJ_DEFER(isolate->Dispose());
++  limits.customizeIsolate(isolate);
++  v8::Locker locker(isolate);
++  v8::Isolate::Scope entered(isolate);
++  v8::HandleScope handles(isolate);
++  auto context = v8::Context::New(isolate);
++  v8::Context::Scope inContext(context);
++  auto source = v8::String::NewFromUtf8Literal(isolate, "globalThis.kept = new Array(8 * 1024 * 1024).fill(1.5); 1");
++  KJ_ASSERT(!v8::Script::Compile(context, source).ToLocalChecked()->Run(context).IsEmpty());
++  isolate->LowMemoryNotification();  // the reservation now holds this heap (observe() after the collection)
++  v8::HeapStatistics stats;
++  isolate->GetHeapStatistics(&stats);
++  const uint64_t used = stats.total_heap_size();
++  KJ_ASSERT(used >= (64ull << 20) && used < (256ull << 20), used);
++  auto& memory = *limits.memory;
++  const auto first = memory.raise(used / 2);
++  KJ_EXPECT(first == used + MAX_SINGLE_HEAP_OBJECT, first, used);
++  const auto left = budget->memoryMaximum - budget->memoryReserved.load();
++  KJ_ASSERT(left > MAX_SINGLE_HEAP_OBJECT && left < 2 * MAX_SINGLE_HEAP_OBJECT, left);
++  const auto second = memory.raise(first);
++  KJ_EXPECT(second == used + left, second, used, left);
++  const auto third = memory.raise(second);
++  KJ_EXPECT(third == second, third, second);
++  KJ_EXPECT(memory.ceilingRaised.load() == 2);
++  isolate->CancelTerminateExecution();
++}
++
++// Each long operation below ended the process before v138 (exit 74 at the
++// raised ceiling, or V8's fatal invalid size): the child must survive, its
++// call end with the memory limit (or, where noted, a RangeError), and the
++// neighbor keep answering and allocating.
++void expectChildSurvives(kj::StringPtr spec) {
++  auto child = runAllocationChild(spec);
++  KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, spec, child.status);
++  KJ_EXPECT(child.events.find("memory-oom") == std::string::npos, spec);
++}
++KJ_TEST("JSON.parse of 120 million objects ends at the memory limit and preserves the process") {
++  expectChildSurvives("1:json");
++}
++KJ_TEST("JSON.parse of an array past the largest one ends with a RangeError or the limit") {
++  expectChildSurvives("1:json-numbers");
++}
++KJ_TEST("straight-line code making 500 MB strings one after another preserves the process") {
++  expectChildSurvives("1:straight");
++}
++KJ_TEST("a structured clone of three maximum strings preserves the process") {
++  expectChildSurvives("1:clone");
++}
++KJ_TEST("splitting into 120 million strings ends at the memory limit and preserves the process") {
++  expectChildSurvives("1:split");
++}
++KJ_TEST("splits past the largest array end with a RangeError or the limit") {
++  expectChildSurvives("1:split-many");
++  expectChildSurvives("1:split-chars");
++}
++
+ KJ_TEST("one near-GiB heap object preserves the process and a neighboring Worker") {
+   auto child = runAllocationChild("1:string");
+   KJ_EXPECT(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, child.status);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..0809579d5fa853c7797f3c5865c0658863f84719 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -620,8 +620,8 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+   v8::ArrayBuffer::Allocator *inner;
+   v8::Isolate *isolate = nullptr;
+   std::atomic<bool> pendingPressure{false};
+-  // Whether this isolate's ceiling was raised once already (install()).
+-  std::atomic<bool> ceilingRaised{false};
++  // How many times this isolate's ceiling was raised (install()).
++  std::atomic<uint32_t> ceilingRaised{0};
+   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
+   void pressure() {
+     if (currentCause) {
+@@ -728,19 +728,56 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+     // large allocation can then meet the fixed ceiling with that object live
+     // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
+     // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
+-    // terminated as such, and its ceiling is raised once by one maximum
+-    // object so that the allocation in progress finishes; its call ends with
++    // terminated as such, and its ceiling is raised by one maximum object so
++    // that the allocation in progress finishes; its call ends with
+     // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
+-    // its limit. A second time in the same isolate the ceiling stays and V8's
+-    // OOM ends the process, as before.
++    // its limit.
++    //
++    // The termination takes effect at V8's next interrupt check. Code that
++    // reaches none keeps allocating meanwhile: straight-line code making one
++    // large string after another, or one long builtin (V8's JSON.parse and
++    // String.prototype.split check interrupts with patch 0056). So while it is
++    // pending the ceiling may rise again (raise()), within what the process
++    // can still give; only past that does V8's OOM end the process.
+     value->AddNearHeapLimitCallback([](void *opaque, size_t current, size_t) -> size_t {
+       auto &budget = *static_cast<MemoryBudget *>(opaque);
+       budget.cause->store(LimitCause::MEMORY);
+       budget.isolate->TerminateExecution();
+-      if (budget.ceilingRaised.exchange(true)) return current;
+-      return current + MAX_SINGLE_HEAP_OBJECT;
++      return budget.raise(current);
+     }, this);
+   }
++  // The new ceiling. The heap can already be past the old one: young large
++  // objects are promoted without a limit check (cwkd-p40, v138: a structured
++  // clone of three maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
++  // raising the ceiling itself by one maximum object left no room for the
++  // third and V8's OOM ended the process). So the room is counted from what is
++  // in use. The first raise is one maximum object, whatever else is in use. A
++  // later one (the termination requested at the first is still pending) grants
++  // at most what is left under the process memory maximum and, with one
++  // pointer cage for every isolate of the process, in that cage (less the
++  // 256 MiB its other isolates keep); with nothing left the ceiling stays.
++  // Reservations are read without their lock: the counters are atomic, and an
++  // estimate made at a collection is all this needs.
++  size_t raise(size_t current) {
++    v8::HeapStatistics stats;
++    isolate->GetHeapStatistics(&stats);
++    const uint64_t used = stats.total_heap_size();
++    uint64_t ceiling = kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT;
++    if (ceilingRaised.load() > 0) {
++      if (!reservation) return current;
++      const auto &resources = *reservation->budget;
++      uint64_t room = resources.memoryMaximum -
++          kj::min(resources.memoryReserved.load(), resources.memoryMaximum);
++      if (resources.addressMaximum != UINT64_MAX) {
++        const auto cage = resources.addressMaximum + MAX_SINGLE_HEAP_OBJECT;
++        room = kj::min(room, cage - kj::min(resources.addressReserved.load(), cage));
++      }
++      ceiling = kj::min(ceiling, used + room);
++    }
++    if (ceiling <= current) return current;
++    ceilingRaised.fetch_add(1);
++    return ceiling;
++  }
+ };
+ 
+ // Only native state, a thread CPU clock and V8's thread-safe termination API
