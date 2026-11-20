@@ -633,7 +633,9 @@ void secretRotationCooldown() {
   int lastAdmitted = -1, firstRefused = -1;
   for (int minute = 1; minute <= 150; ++minute) {
     now += 60000;
-    const auto token = longValue(64 * 1024);
+    // 60 KiB: the writers' cleaner takes needles of at most 65,535 bytes (a secret is at most 5 KiB, its escaped
+    // form six times that).
+    const auto token = longValue(60 * 1024);
     dictionary.setCurrent({{"fast", {token}}, {"calm", {calm}}});
     if (auto refused = dictionary.admit("fast", {token}, now, now + 30000, true)) {
       ++fastRefused;

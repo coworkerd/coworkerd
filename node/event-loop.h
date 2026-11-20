@@ -71,20 +71,20 @@ public:
 #endif
   }
   ~ShutdownSignals() noexcept(false) {
-    observer = nullptr;
     if (descriptor >= 0) close(descriptor);
   }
   KJ_DISALLOW_COPY_AND_MOVE(ShutdownSignals);
-  // The next signal's number. One wait at a time.
+  // The next signal's number. One wait at a time; the wait (its observer in the event port) lasts no longer than
+  // the promise, so the port can go before this object does.
   kj::Promise<int> next(kj::UnixEventPort& port) {
 #ifdef __linux__
-    if (!observer) observer = kj::heap<kj::UnixEventPort::FdObserver>(port, descriptor, kj::UnixEventPort::FdObserver::OBSERVE_READ);
+    kj::UnixEventPort::FdObserver observer(port, descriptor, kj::UnixEventPort::FdObserver::OBSERVE_READ);
     for (;;) {
       signalfd_siginfo info;
       const auto n = read(descriptor, &info, sizeof(info));
       if (n == sizeof(info)) co_return int(info.ssi_signo);
       KJ_REQUIRE(n < 0 && (errno == EAGAIN || errno == EINTR), "cannot read the shutdown signals", n, errno);
-      if (errno == EAGAIN) co_await observer->whenBecomesReadable();
+      if (errno == EAGAIN) co_await observer.whenBecomesReadable();
     }
 #else
     auto info = co_await port.onSignal(SIGTERM).exclusiveJoin(port.onSignal(SIGINT));
@@ -94,7 +94,6 @@ public:
 
 private:
   int descriptor = -1;
-  kj::Own<kj::UnixEventPort::FdObserver> observer;
 };
 
 }  // namespace coworkerd
