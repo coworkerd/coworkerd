@@ -25,6 +25,16 @@ STARTUP_IDENTITY_PATCH = "0005-memory-limit.patch"
 STARTUP_IDENTITY_PATHS = frozenset({
     "src/workerd/api/worker-loader.c++", "src/workerd/io/io-channels.h",
 })
+# The V8 sandbox needs V8 itself (a V8 patch and the build parameters) and three jsg hooks: the
+# memory protection key scope only Cloudflare's V8 supports, the platform wrapper's zero segment,
+# and the Blob byte view's sandbox base with V8's guard regions.
+SANDBOX_PATCH = "0043-v8-sandbox-per-isolate.patch"
+SANDBOX_PATHS = frozenset({
+    ".bazelrc", "build/deps/v8.MODULE.bazel",
+    "patches/v8/0055-Make-the-sandbox-size-and-the-additional-trailing-guard-build-parameters.patch",
+    "src/workerd/jsg/jsg.h", "src/workerd/jsg/jsg.c++", "src/workerd/jsg/v8-platform-wrapper.h",
+    "src/workerd/jsg/sandbox.h", "src/workerd/jsg/sandbox.c++",
+})
 CREATION_IDENTITY_PATCH = "0017-creation-identity.patch"
 CREATION_IDENTITY_PATHS = frozenset({
     "src/workerd/api/worker-loader.h", "src/workerd/api/worker-loader.c++",
@@ -131,6 +141,7 @@ def allowed_path(name, path):
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
                           name == RPC_CODE_PATCH and path in RPC_CODE_PATHS or
+                          name == SANDBOX_PATCH and path in SANDBOX_PATHS or
                           name == '0021-sql-execution-limit.patch' and path in {
                               'src/workerd/util/sqlite.h', 'src/workerd/util/sqlite.c++',
                               'src/workerd/api/sql.h', 'src/workerd/api/sql.c++',

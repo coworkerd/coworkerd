@@ -27,6 +27,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   The hook sets a platform error's `.code` from exception detail ID `0xc6f4a09d8b3e2175`, shared with the
   node's `common/rpc-error.h`; it never infers a code from an application message. That patch also watches
   the inherited parent pipe through the existing channel startup I/O provider in our server helpers.
+  A third explicit exception, `0043-v8-sandbox-per-isolate.patch`, changes V8 through the fork's
+  `patches/v8/0055`, the build configuration (`.bazelrc`, `build/deps/v8.MODULE.bazel`) and three
+  jsg hooks (`jsg.h`, `jsg.c++`, `v8-platform-wrapper.h`, `sandbox.h`, `sandbox.c++`); see its section below.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
@@ -376,3 +379,23 @@ The factory lifecycle snapshot observes the existing wait-until task set and rep
 0031 publishes actor request activity on the next loop turn, after its background drain is queued, and timestamps snapshots so the node can reject a pre-completion observation.
 
 0032 gives ordinary cold preparations bounded Native reservations and validates selection before supersession. The lifecycle publication includes a bounded drain aggregate and an atomic completion trailer, so durable generation checks do not copy the resident array or depend on historical invocation count.
+
+### 0043: the V8 sandbox, one 8 GiB sandbox per isolate group
+
+Off unless the kernel is built with `--config=coworkerd-sandbox` (the fork's `.bazelrc`): the V8
+sandbox, one pointer-compression cage per isolate group (so every isolate has its own sandbox),
+libc++ hardening, and two parameters from the fork's V8 patch `patches/v8/0055`:
+`V8_SANDBOX_SIZE_LOG2=33` (an 8 GiB sandbox: the 4 GiB cage followed by 4 GiB for buffers) and
+`V8_SANDBOX_TYPED_ARRAY_ACCESS_MASKS` (no additional trailing guard region; V8's TypedArray access
+masks take its place, as V8 does on Android). Without memory protection keys an isolate reserves
+136 GiB: V8's 64 GiB guard regions in front of and behind its sandbox (a 32-bit index scaled by 8
+plus a bounded-size offset). The patch is the one exception that changes V8 and the build
+configuration; its jsg hooks are the memory protection key scope (compiled only with
+`WORKERD_V8_ISOLATE_MEMORY_PROTECTION_KEY`, which only Cloudflare's V8 supports), the platform
+wrapper's zero segment, and the Blob byte view's sandbox base, which upstream takes from a sandbox
+without guard regions. In the server package: the platform reserves the first 4 GiB and 1 MiB (V8 15.8 needs 4 GiB plus
+the largest object field offset),
+the factory creates an isolate's group before its limits so the memory limit allocates in that
+group's sandbox, and `coworkerd-sandbox` refuses to start a process (exit 78) or to create a
+Worker whose sandbox V8 does not report as secure and laid out as configured, writing one
+`[coworkerd-sandbox]` row per check.
