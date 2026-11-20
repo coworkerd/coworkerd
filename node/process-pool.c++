@@ -1,5 +1,8 @@
 #include "process-culprit.h"
 #include "process-pool.h"
+#include "rpc-clock.h"
+#include "event-loop.h"
+#include "memory-events.h"
 #include "process-heat.h"
 #include "root-objects.h"
 #include "memory-observation.h"
@@ -92,12 +95,6 @@ std::string memoryEventsPath() {
     if (std::filesystem::exists(candidate)) return candidate;
   }
   return "/sys/fs/cgroup/memory.events";
-}
-uint64_t kernelOomKills(const std::string& path) {
-  std::ifstream input(path);
-  std::string key; uint64_t value;
-  while (input >> key >> value) if (key == "oom_kill") return value;
-  return 0;
 }
 // An OOM kill the cgroup counted is this pool's when one of its processes exits by SIGKILL within this long after it was
 // seen (the kernel counts the kill before the process is gone and is reaped); one that no such exit takes was another
@@ -302,7 +299,7 @@ public:
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
-  kj::Own<capnp::TwoPartyClient> rpc;
+  kj::Own<coworkerd::CoarseTwoPartyClient> rpc;
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
@@ -367,7 +364,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   }
   onDispatched();
   ready->fulfill();
-  connection->rpc = kj::heap<capnp::TwoPartyClient>(*connection->stream);
+  connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
   connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
   v1::rpc::EventDispatcher::Client dispatcher = nullptr;
   if (nativeProps) {
@@ -1419,15 +1416,15 @@ public:
   std::deque<std::string> channelExits;
   // The cgroup's OOM kills (memoryEventsPath): the counter as last read, and the increments no exit has taken yet, each
   // with when it was seen (observeOomKills, at the supervisor cadence and at every exit).
-  const std::string memoryEvents = memoryEventsPath();
-  uint64_t lastOomKills = kernelOomKills(memoryEvents), foreignOomKills = 0, poolOomKills = 0;
+  const coworkerd::MemoryEventsReader memoryEvents{memoryEventsPath()};
+  uint64_t lastOomKills = memoryEvents.oomKills(), foreignOomKills = 0, poolOomKills = 0;
   uint64_t hostCheckOomUnattributed = 0;
   std::function<bool()> hostCheckOomGuard;
   std::deque<double> unattributedOomKills;
   void observeOomKills() {
     const auto now = mono();
     const bool exposed = hostCheckOomGuard && hostCheckOomGuard();
-    for (const auto count = kernelOomKills(memoryEvents); lastOomKills < count; ++lastOomKills) {
+    for (const auto count = memoryEvents.oomKills(); lastOomKills < count; ++lastOomKills) {
       if (exposed) { ++foreignOomKills; ++hostCheckOomUnattributed; }
       else unattributedOomKills.push_back(now);
     }
@@ -2648,7 +2645,7 @@ public:
         auto tunnel = r->connector->connect("coworkerd-runtime", kj::HttpHeaders(headers), {});
         auto status = co_await provider.getTimer().timeoutAfter(500 * kj::MILLISECONDS, kj::mv(tunnel.status));
         KJ_REQUIRE(status.statusCode == 200, "workerd rejected CONNECT");
-        r->stream = kj::mv(tunnel.connection); r->rpc = kj::heap<capnp::TwoPartyClient>(*r->stream);
+        r->stream = kj::mv(tunnel.connection); r->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*r->stream);
         r->bootstrap = r->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
         }
         if (p->pid == 0) co_return;
@@ -3035,8 +3032,12 @@ public:
     auto delay = std::min<uint64_t>(uint64_t(config.restartBackoffMs) << std::min(s.failures++, 16u), config.restartMaxMs);
     s.restartAt = mono() + delay;
   }
-  // Process state for dispatch decisions; no file is opened or read here except at an exit.
+  // Process state for dispatch decisions; no file is opened or read here except at an exit. One request asks
+  // several times in one turn of the event loop (available, select, pausedAdmission, ...); nothing this reads
+  // changes for the dispatch within that turn, so the first call of a turn refreshes and the others reuse it.
+  coworkerd::OncePerTurn refreshTurn{tasks};
   void refresh() {
+    if (!refreshTurn.first()) return;
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
 #ifdef __linux__
       drainSyscallObservations(*p);
@@ -4081,7 +4082,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
         << ",\"culpritCount\":" << stats.culprit << ",\"peakUsedBytes\":" << stats.peakUsedBytes << "}";
   }
   // The cgroup's OOM kills as this pool attributed them: its own processes', and the others' (not this pool's exits).
-  out << "],\"kernelOomKills\":{\"memoryEvents\":\"" << escape(impl->memoryEvents) << "\",\"counted\":" << impl->lastOomKills
+  out << "],\"kernelOomKills\":{\"memoryEvents\":\"" << escape(impl->memoryEvents.path) << "\",\"counted\":" << impl->lastOomKills
       << ",\"pool\":" << impl->poolOomKills << ",\"other\":" << impl->foreignOomKills
       << ",\"hostCheckUnattributed\":" << impl->hostCheckOomUnattributed
       << ",\"unattributed\":" << impl->unattributedOomKills.size() << "}";
