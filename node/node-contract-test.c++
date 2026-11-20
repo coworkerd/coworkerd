@@ -209,17 +209,17 @@ void tenantLineTruncation() {
   auto parse = [](const std::string& text) { return parseTenantLine(std::string_view(text).substr(0, text.size() - 1)); };
   const auto earlier = tenantLineText("acme/noisy", "v1", "log", std::string(4096, 'x'), 5000);
   auto line = parse(earlier);
-  KJ_REQUIRE(line && line->messageBytes == 5000 && line->message.size() == 4096);
+  KJ_REQUIRE(line.has_value() && line->messageBytes == 5000 && line->message.size() == 4096);
   auto keep = tenantLineKeep(*line, 4096);
   KJ_REQUIRE(keep.truncated && keep.bytes == 4096 && keep.messageBytes == 5000);
   const auto own = tenantLineText("acme/noisy", "v1", "log", std::string(5000, 'y'));
   line = parse(own);
-  KJ_REQUIRE(line && line->messageBytes == 0);
+  KJ_REQUIRE(line.has_value() && line->messageBytes == 0);
   keep = tenantLineKeep(*line, 4096);
   KJ_REQUIRE(keep.truncated && keep.bytes == 4096 && keep.messageBytes == 5000);
   line = parse(tenantLineText("acme/quiet", "v1", "info", "hello"));
-  KJ_REQUIRE(line && !tenantLineKeep(*line, 4096).truncated && tenantLineKeep(*line, 4096).bytes == 5);
-  KJ_REQUIRE(!parseTenantLine("{\"workerId\":\"acme/quiet\",\"versionId\":\"v1\",\"level\":\"info\",\"message\":\"x\",\"messageBytes\":}"));
+  KJ_REQUIRE(line.has_value() && !tenantLineKeep(*line, 4096).truncated && tenantLineKeep(*line, 4096).bytes == 5);
+  KJ_REQUIRE(!parseTenantLine("{\"workerId\":\"acme/quiet\",\"versionId\":\"v1\",\"level\":\"info\",\"message\":\"x\",\"messageBytes\":}").has_value());
 }
 
 // A Durable Object call its node's secret dictionary could not take is SECRET_UNAVAILABLE, as at its admission,
