@@ -957,8 +957,11 @@ private:
     std::set<std::pair<std::string, uint64_t>> startupUnsealed;
     // Publication is tracked per shard, independently of the current batch.
     std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedShards;
-    // b58: the same count per object (a record's objectName: namespace/object id), for tail requests naming it.
+    // b58: the same count per object (a record's objectName: namespace/object id), for tail requests naming it,
+    // and per shard the part of unpublishedShards that these per-object counts account for (always all of it in a
+    // running node; a request naming an object is answered for the shard when it is not).
     std::map<std::string, uint64_t> unpublishedObjects;
+    std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedTracked;
   };
   std::map<uint64_t, PredecessorLog> predecessorLogs;
   void noteEarlierUnpublished(PredecessorLog& info, const LogRecord& record);

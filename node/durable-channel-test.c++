@@ -1160,6 +1160,11 @@ struct DurableLogChannelTest {
       for (size_t i = 0; i < objects.size(); ++i) any = any || (objects[i].shard == shard && truth[i]);
       if (pending(ask(shard, "")) != any) matched = false;
     }
+    // A shard count the per-object counts do not account for (b54's durable-tail-equivalence makes one): requests
+    // naming an object are answered for the shard again.
+    ++info.unpublishedShards[{ns, 0}];
+    for (size_t i = 0; i < objects.size(); ++i)
+      if (objects[i].shard == 0 && !pending(ask(0, objects[i].id))) matched = false;
     return matched;
   }
 

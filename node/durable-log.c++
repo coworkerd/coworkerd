@@ -1070,6 +1070,7 @@ void DurableLog::setNodeEpoch(uint64_t epoch) {
     info.maxSeq = nextSeq;
     info.unpublishedShards.clear();
     info.unpublishedObjects.clear();
+    info.unpublishedTracked.clear();
     for (const auto* held : {&earlier[nodeEpoch], &earlierExcluded[nodeEpoch]}) {
       for (const auto& [sequence, record] : *held) {
         const auto shard = std::make_pair(record.objectName.substr(0, record.objectName.find('/')), record.shard);
@@ -3769,11 +3770,16 @@ void DurableLog::noteEarlierRetired(uint64_t epoch, const LogRecord& record) {
   auto object = info.unpublishedObjects.find(record.objectName);
   if (object != info.unpublishedObjects.end() && object->second && --object->second == 0)
     info.unpublishedObjects.erase(object);
+  auto tracked = info.unpublishedTracked.find(key);
+  if (tracked != info.unpublishedTracked.end() && tracked->second && --tracked->second == 0)
+    info.unpublishedTracked.erase(tracked);
 }
 
 void DurableLog::noteEarlierUnpublished(PredecessorLog& info, const LogRecord& record) {
-  ++info.unpublishedShards[{record.objectName.substr(0, record.objectName.find('/')), record.shard}];
+  const auto shard = std::make_pair(record.objectName.substr(0, record.objectName.find('/')), record.shard);
+  ++info.unpublishedShards[shard];
   ++info.unpublishedObjects[record.objectName];
+  ++info.unpublishedTracked[shard];
 }
 
 bool DurableLog::restoredObjectPending(const PredecessorLog& info, uint64_t epoch, const std::string& objectName) const {
@@ -7361,7 +7367,11 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
     // record of the object is unpublished (restoredObjectPending). A request without an object is answered for the
     // shard, as before.
     const auto named = ask.objectId.empty() ? std::string() : ask.namespaceId + "/" + ask.objectId;
-    const bool stillPending = (named.empty() || restoredTailControlForTest == RestoredTailControl::SHARD_ONLY)
+    const auto tracked = info.unpublishedTracked.find({ask.namespaceId, ask.shard});
+    const bool accounted = !shardPending ||
+        (tracked != info.unpublishedTracked.end() && tracked->second == pending->second);
+    const bool stillPending = (named.empty() || !accounted ||
+        restoredTailControlForTest == RestoredTailControl::SHARD_ONLY)
         ? shardPending : restoredObjectPending(info, ask.ownerNodeEpoch, named);
     if (stillPending) {
       if (std::find(earlierPriority.begin(), earlierPriority.end(), ask.ownerNodeEpoch) == earlierPriority.end())
