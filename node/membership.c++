@@ -332,6 +332,15 @@ private:
   template <typename T> kj::Promise<T> bounded(kj::Promise<T> promise) {
     return timer.timeoutAfter(boundMs() * kj::MILLISECONDS, kj::mv(promise));
   }
+  void heartbeatPutTook(kj::TimePoint started) {
+    const double ms = double((kj::systemPreciseMonotonicClock().now() - started) / kj::MICROSECONDS) / 1000;
+    ++state.heartbeatPuts;
+    state.heartbeatPutLastMs = ms;
+    state.heartbeatPutMaxMs = std::max(state.heartbeatPutMaxMs, ms);
+    state.heartbeatPutTotalMs += ms;
+    constexpr double OVER[] = {10, 50, 100, 250, 500, 1000};
+    for (size_t i = 0; i < state.heartbeatPutsOver.size(); ++i) if (ms > OVER[i]) ++state.heartbeatPutsOver[i];
+  }
 
   void failed(const char* operation, const kj::Exception& error) {
     state.lastError = error.getDescription().cStr();
@@ -578,9 +587,12 @@ private:
     KJ_DEFER(--writing);
     bool settled = false;
     KJ_DEFER(if (!settled) lease.forget(beatId));
+    const auto putStarted = kj::systemPreciseMonotonicClock().now();
     try {
-      co_await bounded(store.put(memberHeartbeatKey(serverId, epoch), memberRecordJson(record)));
+      co_await bounded(store.put(memberHeartbeatKey(serverId, epoch), memberRecordJson(record), ObjectStoreLane::HEARTBEAT));
     } catch (const kj::Exception&) {
+      heartbeatPutTook(putStarted);
+      state.storeClient = store.stats().json();
       settled = true;
       lease.settled(beatId, false, leaseClockMs());
       ++state.heartbeatFailures;
@@ -591,6 +603,7 @@ private:
       if (leaseCallback && epoch) leaseCallback(epoch, false);
       throw;
     }
+    heartbeatPutTook(putStarted);
     settled = true;
     // Handled after its end, or for an epoch that changed or was fenced meanwhile, a success renews nothing.
     if (lease.settled(beatId, true, leaseClockMs())) {
@@ -1058,7 +1071,13 @@ std::string MembershipView::json() const {
            << ",\"selfExpired\":" << (selfExpired ? "true" : "false") << ",\"selfExpiries\":" << selfExpiries
            << ",\"selfExpiredAtUnixMs\":" << selfExpiredAtUnixMs << ",\"leaseClock\":" << quote(leaseClock)
            << ",\"leaseFenceReason\":" << quote(leaseFenceReason) << ",\"leaseFences\":" << leaseFences
-           << ",\"lateHeartbeats\":" << lateHeartbeats << ",\"recoveries\":" << recoveries
+           << ",\"lateHeartbeats\":" << lateHeartbeats
+           << ",\"heartbeatPut\":{\"puts\":" << heartbeatPuts << ",\"lastMs\":" << heartbeatPutLastMs
+           << ",\"maxMs\":" << heartbeatPutMaxMs << ",\"meanMs\":" << (heartbeatPuts ? heartbeatPutTotalMs / heartbeatPuts : 0.)
+           << ",\"over10Ms\":" << heartbeatPutsOver[0] << ",\"over50Ms\":" << heartbeatPutsOver[1]
+           << ",\"over100Ms\":" << heartbeatPutsOver[2] << ",\"over250Ms\":" << heartbeatPutsOver[3]
+           << ",\"over500Ms\":" << heartbeatPutsOver[4] << ",\"over1000Ms\":" << heartbeatPutsOver[5] << "}"
+           << ",\"recoveries\":" << recoveries
            << ",\"recoveredUntilUnixMs\":" << recoveredUntilUnixMs << ",\"keptMembers\":" << keptMembers
            << ",\"clockSkewMs\":" << clockSkewMs << ",\"clockSkewMinMs\":" << clockSkewMinMs << ",\"clockSkewMaxMs\":" << clockSkewMaxMs
            << ",\"clockSkewToleranceMs\":" << clockSkewToleranceMs << ",\"clockCheckedAtUnixMs\":" << clockCheckedAtUnixMs
