@@ -63,7 +63,7 @@ responses and one `STORAGE_UNAVAILABLE`. Reopening its oldest object returned HT
 `DO_UNAVAILABLE` with SQLite's `SQLITE_CANTOPEN`. This run hit the descriptor limit before
 the process had enough resident actors to trigger the LRU target. With the fixture's normal
 container limits, the node raises the child's inherited soft limit to a minimum calculated for
-dispatch and process generations. [Limit calculation](../node/main.c++#L8999).
+dispatch and process generations. [Limit calculation](https://github.com/coworkerd/coworkerd/blob/dfc8803731a33feaaf8796313a0053d403f5ba8a/node/main.c++#L8999).
 
 Raising only the container's descriptor limit to 65,536 let the same workload reach a sampled peak
 of 4,099 with the target still at 4,096. During the next group the old child exited with

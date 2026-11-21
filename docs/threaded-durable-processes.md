@@ -37,15 +37,17 @@ first opens. Events and completion messages go to the selected home. Use namespa
 epochs, and the admitted open identity to reject stale home references. Actor, isolate-bound values, SQLite
 connection, cursors and callbacks never travel across threads.
 
-The main thread of the child accepts and demultiplexes work. Home threads run their own event loops and may
-host several object trees. Global thread, memory and descriptor reservations bound the pool. Budget the database, WAL and
+The main thread of the child accepts and demultiplexes work. Home threads run their own event loops. An object home
+holds exactly one isolate copy and the object trees placed in it. Copies of different Worker definitions never
+share a home, so a synchronous event can delay only objects of its own Worker that live in the same copy.
+Global thread, memory and descriptor reservations bound the pool. Budget the database, WAL and
 shared-memory descriptors per open and leave headroom for checkpoint and recovery work, the log channel
 and control traffic. Refuse new work before it consumes that headroom. A native
 database leases its own thread as long as its connection is resident. Other databases and actors use
 different threads. Close an idle connection before returning its thread to the pool. Object workers sharing a home
 have fair mailboxes and bounded synchronous execution. Each Worker definition may have multiple independent
-isolate copies in the child. Each copy belongs to one home thread, and a woken tree is placed with a copy
-that has safe capacity, or a bounded new copy on an eligible thread. A tree and its facets stay together.
+isolate copies in the child. Each copy has a home thread of its own, and a woken tree is placed with a copy
+that has safe capacity, or with a bounded new copy on a new home. A tree and its facets stay together.
 Choose placement before constructing the actor, and reserve thread, address space, heap and native charges
 before publishing it. Count initializing and closing trees against the backstop until their reservations
 are released. Include native databases in the process backstop, as database objects count today. Preserve the
@@ -174,8 +176,10 @@ Use idle time since the last delivered event finished, or since its last hiberna
 An active event, response/RPC stream, timer, outbound connection, pending IO or `waitUntil` work prevents
 hibernation, as does a standard `ws.accept()` socket. Re-evaluate blockers at the home before retirement, with
 a monotonic clock. A hibernatable tree with no pending work closes approximately 10 s after becoming eligible.
-Each retirement releases the object's home reservation. When the home has no resident work, retire its
-idle isolate copies and return the thread to the pool. If a tree has hibernatable sockets, atomically
+Each retirement releases the object's home reservation. A home whose copy has no resident tree left keeps
+the copy warm for the idle time of ordinary Workers (`idleEvictMs`), so that a wake soon after a release does
+not pay for a cold isolate. After that time, or earlier under memory pressure, retire the copy and return the
+thread to the pool. If a tree has hibernatable sockets, atomically
 transfer its transport state before closing the actor. An otherwise idle ineligible tree gets a jittered deadline within 70–140 s. A pending operation can protect it for at most
 15 min from its start. Cancel expired work before final retirement and close non-hibernatable sockets when
 evicting. Active request wall limits and their invocation leases are separate. An event racing the retirement
@@ -198,7 +202,7 @@ Preserve one scheduled alarm stored per object as its source of truth. Compare t
 firing token before entry and before clearing, and commit the clear through the same storage gate when the
 schedule was neither changed nor deleted by the handler. Stale hints and platform/rebuild refusals never
 authorize handler execution. Target six retries after an initial failed handler with nominal delays 2, 4, 8,
-16, 32 and 64 s. Preserve jitter around those delays unless review chooses exact delays. Key the retry
+16, 32 and 64 s. Preserve jitter around those delays. Key the retry
 series to the schedule. Stop retrying that schedule after the sixth failed retry and conditionally clear it
 through confirmed storage, keeping an alarm set by newer work. Treat loss of reply as uncertain and retain
 at-least-once behavior on owner change.
@@ -223,7 +227,10 @@ Preserve local filesystem bounds and declare
 any native operation without a proven interruption path a release blocker for that execution path.
 [Existing database API and error contract](guide/databases.md).
 
-### Maintainer decisions before production changes
+### Decisions taken in review
+
+The four points below were open when the design was written. Each ends with what the review of the design
+decided.
 
 - **Retry exhaustion.** The issue says six retries are already enforced. In `DurableLog::fireAlarm`'s
   `FAILED` branch, `countedRetries` saturates at six and `backoff` continues to grow. The JS wrapper's
@@ -234,6 +241,11 @@ any native operation without a proven interruption path a release blocker for th
   cluster-wide cap after a crash. A durable count, if required, needs an explicitly reviewed SQLite metadata
   representation, schedule identity, rollback compatibility and a definition for ambiguous in-flight failures.
   [Node scheduler](../node/durable-log.c++) · [Alarm wrapper](../runtime/runtime.js).
+
+  **Decided.** The cap counts on the owner that fires the alarm, in memory. After the sixth failed retry of a
+  schedule that owner clears it through confirmed storage, as "Lifecycle and alarms" describes. A takeover
+  starts the count again, and alarms stay at-least-once. There is no durable counter and no new metadata.
+  Deferrals and refusals by the platform do not count as retries.
 - **CPU time and leases.** The node defaults its invocation-tree lease to 30 seconds. The ordinary threaded
   path already clamps its descriptor CPU to five minutes, but inheriting a 30 s call-tree lease can prevent
   the caller from observing even a 30 s D1 timeout or using a 5 min DO budget. The control plane SQL
@@ -244,6 +256,11 @@ any native operation without a proven interruption path a release blocker for th
   higher configurable CPU. Preserve authenticated tree grants, monotonic deadline enforcement and the shorter bound on unanswered peer-open
   attempts. CPU refills apply to delivered events and do not renew an expired caller's authority.
   [Lease and dispatch](../node/main.c++) · [Control plane](../apiserver/main.c++).
+
+  **Decided.** This design sets no lease rules of its own: how long a call tree's lease lasts is settled in
+  [#18](https://github.com/coworkerd/coworkerd/issues/18). Step 4 raises the control plane's SQL forwarding
+  timeout to the query deadline plus the confirmation deadline, and there is no separate ceiling on the
+  public response. A per-Worker CPU limit above 30 s for object events is accepted once #18 is in.
 - **Pressure and host sizing.** Set pool size, per-object queue depth and bytes, placement thresholds,
   reservation headroom and the compatible treatment of `residentObjects: 0`. Current zero disables the
   residency pass. The new process needs a real backstop even in that case. Review the extent of isolation
@@ -255,6 +272,15 @@ any native operation without a proven interruption path a release blocker for th
   runtime failures must still trigger the generation containment path.
   [Residency coordinator](../patches/workerd/0020-root-loader.patch) ·
   [Threaded allocations](../patches/workerd/0044-s1e-node-cost-and-long-operations.patch).
+
+  **Decided.** An object home holds one isolate copy, as "Current execution and the proposed boundary" says,
+  so an event can delay only objects of its own Worker in the same copy. The final gates check this across
+  Workers. Pool size, queue depth and bytes per object, placement thresholds and headroom are configuration,
+  with defaults that step 1's pull request proposes from measurement. Nothing is limited by a count per
+  tenant. `residentObjects: 0` means no count target; the reservations still refuse before threads,
+  descriptors or memory run out. Hard memory pressure may reset an isolate copy together with the objects
+  left in it, after the two earlier stages. A V8 fatal error stays a containment event for the process, and
+  the durable role writes the culprit record of [#17](https://github.com/coworkerd/coworkerd/issues/17).
 - **Recovery close and socket scope.** Today the node can reset durable processes to recover one object
   with a live open, in-flight call or socket. The new targeted revocation needs an acknowledged close and
   a positive proof that no SQLite handle can still access the old files. Keep generation death as the
@@ -262,6 +288,10 @@ any native operation without a proven interruption path a release blocker for th
   as the initial implementation. A stale socket may be closed at a fence, since the transport belongs to
   the old owner. Existing recovery may discard cached files and rebuild from history even if the caller
   reuses a node ID. [Dispatch and recovery rules](cluster-state.md#12-durable-object-durability).
+
+  **Decided.** Step 2 implements the acknowledged close: the home sends it after its SQLite connection is
+  closed, and a targeted reconstruction waits for that acknowledgement. The death of the generation stays as
+  the fallback when the acknowledgement does not arrive in time. A parked socket is closed at a fence.
 
 ## Migration and follow-up issues
 
@@ -322,7 +352,7 @@ rollover cases.
 
 ### 3. Move hibernation, alarms and class migration onto the durable host
 
-**Depends on step 2.** The final alarm cap requires the maintainer decision on retry exhaustion.
+**Depends on step 2.** The alarm cap is the one decided under "Decisions taken in review".
 
 **Scope and deletion.** Implement the timed lifecycle for sockets and other blockers, hand sockets to the
 node for parking, and route wakes and alarms through validated opens. Retire child-owned parked socket
@@ -410,5 +440,7 @@ cluster fixture, and keep placement evidence for every same-process assertion.
 | Hibernatable WebSocket | Observe the actor become nonresident after idle and verify a real protocol ping/pong and the configured application auto-response on the same connection. An external constructor counter and home-residency state remain unchanged through both messages. Only then send a message requiring tenant code and assert one reconstruction, correct attachment/state, and the expected reply. Record wake p50/p99. |
 | Capacity exhaustion | Load a durable process to its first refusal using separate cases for mailbox, active trees, database threads, memory and descriptor reservation. Require explicit overload/refusal and a stable PID and generation. An already admitted object on another home must still answer. After release, capacity and a previously refused object's ability to run return. Repeat with CPU reset and memory-pressure paths. |
 | Existing replication and ownership faults | All existing `durable-*` CTest cases, ownership/placement component cases and the public takeover case pass with the new backend exercised where applicable. Keep negative controls for lease/fence, denied and full peers, partial/torn and corrupt tails, recovery equivalence, segment/manifest failures and uncertain writes. Run #29 with an early-answer negative control and then on the correct host. Include mixed-backend ownership, restart/EOF and recovery/file replacement under live work, plus no-peer local flush, and verify the same values and response codes. |
+| A CPU-bound object (added in review) | In one durable PID/generation, an object runs a synchronous loop until its CPU limit. Requests to objects of another Worker of the same tenant and of another tenant are sampled meanwhile, at a fixed offered rate, with at least 1,000 successful samples per class and overlap confirmed by the server. Each class's busy p99 is at most 5 ms above its quiet p99. The event ends with `CPU_LIMIT_EXCEEDED`, that object is reset, and another object in the same isolate copy still holds its in-memory state. |
+| Wake latency (added in review) | Measured on one machine in one run, before the old backend is removed, with the Worker's isolate copy warm: reopening a released object and waking a hibernated object with an application message have a p50 and a p99 at most 5 ms above the old backend's. The [baseline](threaded-durable-baseline.md) recorded 14.877/19.088 ms and 6.148/7.967 ms. |
 
 See [the current-main baseline and replay instructions](threaded-durable-baseline.md) for the comparison workload.
