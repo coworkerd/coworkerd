@@ -17,7 +17,7 @@ For a clean Ubuntu 24.04 system with Node.js and Docker already installed:
 ```sh
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl python3
+  clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
 export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
 npm ci --prefix cli --registry=https://registry.npmjs.org
 kernel=$(python3 scripts/fetch-kernel.py)

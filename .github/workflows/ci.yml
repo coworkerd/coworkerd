@@ -48,7 +48,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git curl python3
+          sudo apt-get install -y --no-install-recommends \
+            clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
       - name: Select OpenSSL on macOS
         if: runner.os == 'macOS'
         run: |
