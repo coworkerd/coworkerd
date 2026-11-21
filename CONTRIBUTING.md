@@ -115,5 +115,3 @@ how you checked the change on a local cluster.
   discussion first.
 - Never commit credentials, keys or tokens, including test values that look real.
 - Security issues are not reported in public issues: see [SECURITY.md](SECURITY.md).
-
-A coding agent follows the same process; [AGENTS.md](AGENTS.md) puts the steps in the order an agent takes them.
