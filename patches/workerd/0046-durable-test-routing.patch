@@ -1,0 +1,988 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 04:34:39 +0800
+Subject: [PATCH] Bound test routing prefaces and hand connections to durable
+ home loops
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index fcfa9508eb99ac8d4ce692d568ae3034c40f30d5..4cae4622991c020090ba7847287132ad7c631392 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -17,6 +17,35 @@ kj_test(
+     deps = [":coworkerd-durable-admission"],
+ )
+ 
++wd_cc_library(
++    name = "coworkerd-durable-placement",
++    srcs = ["coworkerd-durable-placement.c++"],
++    hdrs = ["coworkerd-durable-placement.h"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++    deps = ["@capnp-cpp//src/kj"],
++)
++
++kj_test(
++    src = "coworkerd-durable-placement-test.c++",
++    deps = [":coworkerd-durable-placement"],
++)
++
++wd_cc_library(
++    name = "coworkerd-durable-test-storage",
++    srcs = ["coworkerd-durable-test-storage.c++"],
++    hdrs = ["coworkerd-durable-test-storage.h"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++    deps = [
++        "//src/workerd/util:sqlite",
++        "@capnp-cpp//src/kj",
++    ],
++)
++
++kj_test(
++    src = "coworkerd-durable-test-storage-test.c++",
++    deps = [":coworkerd-durable-test-storage"],
++)
++
+ # The declarations the server crate's bridge header needs. Header-only: the bridge library depends
+ # on it, and :worker-factory depends on the bridge library, so the two cannot be one target.
+ wd_cc_library(
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+index 81083964ea58231f514a48e66f5a10778056398e..d612c02c3db2dc18a5d96e1ce6f153718c58866a 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -50,8 +50,8 @@ KJ_TEST("durable admission fences the generation, identity, home and queued even
+   KJ_EXPECT((table.homeFor(event.tree) == 9));
+   KJ_EXPECT((table.next(event.tree) == event));
+ 
+-  for (auto changed: {&Admission::Open::dataEpoch, &Admission::Open::shardEpoch,
+-         &Admission::Open::openId}) {
++  for (auto changed:
++      {&Admission::Open::dataEpoch, &Admission::Open::shardEpoch, &Admission::Open::openId}) {
+     stale = open;
+     ++(stale.*changed);
+     KJ_EXPECT(table.queue(first, stale, 10, deadline, now).status == Status::STALE);
+@@ -143,6 +143,19 @@ KJ_TEST("durable admission retains a closing tree until its home acknowledges re
+   KJ_EXPECT(table.begin(replacement, 1, first, nextOpen, now) == Delivery::ACCEPTED);
+ }
+ 
++KJ_TEST("durable admission returns an unassigned tree only when its final waiting call leaves") {
++  Admission table(limits, 1);
++  const auto leaving = queued(table.queue(first, open, 30, deadline, now), true);
++  const auto waiting = queued(table.queue(first, open, 40, deadline, now), false);
++  KJ_EXPECT(table.cancel(leaving) == Cancellation::RELEASED);
++  KJ_EXPECT(!table.releaseUnassigned(leaving.tree));
++  KJ_EXPECT(table.state().trees == 1);
++  KJ_EXPECT(table.cancel(waiting) == Cancellation::RELEASED);
++  KJ_EXPECT(table.releaseUnassigned(waiting.tree));
++  KJ_EXPECT(!table.releaseUnassigned(waiting.tree));
++  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++}
++
+ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree") {
+   auto below = limits;
+   // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index b6da16bdaa2349213eb48338a68c28a2bec6319b..b6cfe15f7962d0dbff1de93c57d4b9181c92a64f 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -40,7 +40,8 @@ void release(Resources& used, Resources amount) {
+ }  // namespace
+ 
+ DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
+-    : limits(limits), generation(generation) {
++    : limits(limits),
++      generation(generation) {
+   KJ_REQUIRE(limits.mailboxDepth > 0 && limits.mailboxBytes > 0 && generation > 0,
+       "invalid durable admission limits or generation");
+   KJ_REQUIRE(limits.tree.memory > 0 && limits.event.memory > 0,
+@@ -63,8 +64,9 @@ DurableAdmission::Result DurableAdmission::queue(
+     return {Status::OVERLOADED};
+   };
+   if (bytes > limits.mailboxBytes ||
+-      (tree != nullptr && (tree->waiting >= limits.mailboxDepth ||
+-          bytes > limits.mailboxBytes - tree->waitingBytes))) {
++      (tree != nullptr &&
++          (tree->waiting >= limits.mailboxDepth ||
++              bytes > limits.mailboxBytes - tree->waitingBytes))) {
+     return refuse();
+   }
+   auto reserved = counters.reserved;
+@@ -73,8 +75,9 @@ DurableAdmission::Result DurableAdmission::queue(
+     return refuse();
+   }
+   const bool newTree = tree == nullptr;
+-  if (newTree && ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
+-      !reserve(reserved, limits.capacity, limits.tree))) {
++  if (newTree &&
++      ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
++          !reserve(reserved, limits.capacity, limits.tree))) {
+     return refuse();
+   }
+ 
+@@ -131,8 +134,8 @@ std::optional<DurableAdmission::Ticket> DurableAdmission::next(uint64_t tree) co
+ DurableAdmission::Delivery DurableAdmission::begin(
+     Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now) {
+   auto entry = trees.find(ticket.tree);
+-  if (entry == trees.end() || home == 0 || entry->second.home != home ||
+-      entry->second.key != key || entry->second.open != open || next(ticket.tree) != ticket) {
++  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.key != key ||
++      entry->second.open != open || next(ticket.tree) != ticket) {
+     return Delivery::STALE;
+   }
+   auto& tree = entry->second;
+@@ -190,8 +193,8 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
+ 
+ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
+   auto entry = trees.find(tree);
+-  if (entry == trees.end() || home == 0 || entry->second.home != home ||
+-      entry->second.closing || !entry->second.events.empty()) {
++  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.closing ||
++      !entry->second.events.empty()) {
+     return false;
+   }
+   entry->second.closing = true;
+@@ -222,6 +225,13 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::failOpen(uint64_t tree)
+   return refused;
+ }
+ 
++bool DurableAdmission::releaseUnassigned(uint64_t tree) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || entry->second.home != 0 || !entry->second.events.empty()) return false;
++  eraseTree(entry);
++  return true;
++}
++
+ void DurableAdmission::releaseWaiting(Tree& tree, const Event& event) {
+   --tree.waiting;
+   tree.waitingBytes -= event.bytes;
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index e2a95ec94c1e656d0eec3d914e6d6baea3ff31e1..71d5c22a8a5ed16d7f4cb4c19e0e2d54827ebaef 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -100,8 +100,11 @@ class DurableAdmission {
+   bool releaseTree(uint64_t tree, uint64_t home);
+   // The home failed to open. Releases all waiting credits without a close acknowledgement.
+   std::vector<Ticket> failOpen(uint64_t tree);
++  bool releaseUnassigned(uint64_t tree);
+ 
+-  State state() const { return counters; }
++  State state() const {
++    return counters;
++  }
+ 
+  private:
+   enum class Phase { WAITING, ACTIVE, CANCELING };
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement-test.c++ b/src/workerd/server/factory/coworkerd-durable-placement-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3af53c23b3dbd9219a5d47f95a114472284bc36
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-placement-test.c++
+@@ -0,0 +1,64 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-placement.h"
++
++#include <kj/test.h>
++
++namespace workerd::server {
++namespace {
++
++using namespace std::chrono_literals;
++constexpr DurableHomeLoad::Time origin{};
++
++KJ_TEST("durable placement excludes a busy copy before it fills") {
++  DurableHomeLoad hot(4s);
++  hot.begin(origin);
++  DurableCopyCandidate candidates[] = {
++    {1, "version-a", 2, 500, hot.busyFor(origin + 500ms), true},
++    {2, "version-a", 1, 500, 0ms, true},
++    {3, "version-b", 3, 500, 0ms, true},
++  };
++  const DurablePlacementLimits limits{4, 1000, 2s};
++  KJ_EXPECT((chooseDurableCopy(candidates, "version-a", limits) == 1));
++  candidates[0].busyFor = hot.busyFor(origin + 2s);
++  KJ_EXPECT((chooseDurableCopy(candidates, "version-a", limits) == 2));
++  candidates[1].memoryBytes = 1000;
++  KJ_EXPECT(!chooseDurableCopy(candidates, "version-a", limits).has_value());
++  hot.end(origin + 3s);
++  candidates[0].busyFor = hot.busyFor(origin + 8s);
++  KJ_EXPECT((chooseDurableCopy(candidates, "version-a", limits) == 1));
++  candidates[0].residentTrees = 4;
++  KJ_EXPECT(!chooseDurableCopy(candidates, "version-a", limits).has_value());
++  candidates[0].residentTrees = 1;
++  candidates[0].placing = false;
++  KJ_EXPECT(!chooseDurableCopy(candidates, "version-a", limits).has_value());
++}
++
++KJ_TEST("durable home time counts execution across turns and ages out across idle time") {
++  DurableHomeLoad home(4s);
++  home.begin(origin + 1s);
++  home.end(origin + 2s);
++  home.begin(origin + 3s);
++  KJ_EXPECT((home.busyFor(origin + 3500ms) == 1500ms));
++  home.end(origin + 4s);
++  KJ_EXPECT((home.busyFor(origin + 5500ms) == 1500ms));
++  KJ_EXPECT((home.busyFor(origin + 10s) == 0ms));
++  home.begin(origin + 11s);
++  home.end(origin + 100s);
++  KJ_EXPECT((home.busyFor(origin + 100s) == 4s));
++  KJ_EXPECT((home.busyFor(origin + 105s) == 0ms));
++}
++
++KJ_TEST("durable home retains the partial bucket at the start of its rolling window") {
++  DurableHomeLoad home(4s);
++  home.begin(origin + 63ms);
++  home.end(origin + 100ms);
++  home.begin(origin + 4050ms);
++  home.end(origin + 4070ms);
++  KJ_EXPECT((home.busyFor(origin + 4070ms) == 57ms));
++}
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement.c++ b/src/workerd/server/factory/coworkerd-durable-placement.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cdf2ce86b1edcd52bf1611a7b2bf05c8d2ca96d
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-placement.c++
+@@ -0,0 +1,77 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-placement.h"
++
++#include <kj/debug.h>
++
++#include <algorithm>
++
++namespace workerd::server {
++
++DurableHomeLoad::DurableHomeLoad(Duration window): width(window / BUCKETS) {
++  KJ_REQUIRE(width > Duration::zero(), "durable placement busy window is too short");
++}
++
++void DurableHomeLoad::begin(Time now) {
++  KJ_ASSERT(!running && now >= Time{});
++  running = now;
++}
++
++void DurableHomeLoad::end(Time now) {
++  KJ_ASSERT(running.has_value() && now >= *running);
++  auto start = std::max(*running, now - window());
++  while (start < now) {
++    const auto index = start.time_since_epoch() / width;
++    const auto end = std::min(now, Time{} + width * (index + 1));
++    auto& bucket = buckets[index % buckets.size()];
++    if (bucket.index != index) bucket = {index};
++    bucket.busy += end - start;
++    start = end;
++  }
++  running.reset();
++}
++
++DurableHomeLoad::Duration DurableHomeLoad::busyFor(Time now) const {
++  const auto oldest = now - window();
++  Duration busy{};
++  for (const auto& bucket: buckets) {
++    if (bucket.index < 0) continue;
++    const auto start = Time{} + width * bucket.index;
++    const auto end = std::min(now, start + width);
++    if (end <= oldest || end <= start) continue;
++    // At most one historical bucket straddles the cutoff. Its contribution
++    // conservatively assumes that busy time was at the end of the bucket.
++    busy += std::min(bucket.busy, end - std::max(start, oldest));
++  }
++  if (running && *running <= now) busy += now - std::max(*running, oldest);
++  return std::min(busy, window());
++}
++
++DurableHomeLoad::Duration DurableHomeLoad::window() const {
++  return width * BUCKETS;
++}
++
++std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate> candidates,
++    std::string_view definition,
++    DurablePlacementLimits limits) {
++  const DurableCopyCandidate* selected = nullptr;
++  for (const auto& candidate: candidates) {
++    if (!candidate.placing || candidate.definition != definition ||
++        candidate.residentTrees >= limits.treesPerCopy ||
++        candidate.memoryBytes >= limits.placementBytes ||
++        candidate.busyFor >= limits.busyThreshold) {
++      continue;
++    }
++    // Pack quiet, warm copies first to bound isolate and thread growth.
++    if (selected == nullptr || candidate.residentTrees > selected->residentTrees ||
++        (candidate.residentTrees == selected->residentTrees &&
++            candidate.busyFor < selected->busyFor)) {
++      selected = &candidate;
++    }
++  }
++  return selected == nullptr ? std::nullopt : std::optional(selected->home);
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement.h b/src/workerd/server/factory/coworkerd-durable-placement.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfa62b2738023c269f0322e7b1e036ef6fbf0b21
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-placement.h
+@@ -0,0 +1,64 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <string_view>
++
++namespace workerd::server {
++
++// A bounded record of synchronous work on one home. A suspended event does not count as busy.
++// The router reads completed turns together with the current turn, if one is still executing.
++class DurableHomeLoad {
++ public:
++  using Clock = std::chrono::steady_clock;
++  using Time = Clock::time_point;
++  using Duration = Clock::duration;
++
++  explicit DurableHomeLoad(Duration window);
++
++  void begin(Time now);
++  void end(Time now);
++  Duration busyFor(Time now) const;
++  Duration window() const;
++
++ private:
++  static constexpr int64_t BUCKETS = 16;
++  struct Bucket {
++    int64_t index = -1;
++    Duration busy{};
++  };
++
++  const Duration width;
++  std::array<Bucket, BUCKETS + 1> buckets;
++  std::optional<Time> running;
++};
++
++struct DurableCopyCandidate {
++  uint64_t home;
++  std::string_view definition;
++  uint32_t residentTrees;
++  uint64_t memoryBytes;
++  DurableHomeLoad::Duration busyFor;
++  bool placing;
++};
++
++struct DurablePlacementLimits {
++  uint32_t treesPerCopy;
++  uint64_t placementBytes;
++  DurableHomeLoad::Duration busyThreshold;
++};
++
++// An existing tree keeps its placement. Call this only for a fresh or newly woken tree.
++// An empty result requires a separately reserved new home, or an overload refusal.
++std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate> candidates,
++    std::string_view definition,
++    DurablePlacementLimits limits);
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage-test.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a4af681d830bd9d726e96551c38519cf13f6932
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage-test.c++
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-test-storage.h"
++
++#include <kj/test.h>
++
++namespace workerd::server {
++namespace {
++
++constexpr auto key =
++    "coworkerd-do-root-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_kj;
++constexpr auto id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"_kj;
++constexpr auto other = "f000000000000000000000000000000000000000000000000000000000000000"_kj;
++
++KJ_TEST("disposable durable SQLite files reopen inside a generation") {
++  DurableTestStorage storage;
++  {
++    auto database = storage.open(key, id);
++    database->run("CREATE TABLE example (value INTEGER)");
++    database->run("INSERT INTO example VALUES (42)");
++    database->run("BEGIN");
++    database->run("INSERT INTO example VALUES (43)");
++  }
++  auto reopened = storage.open(key, id);
++  auto rows = reopened->run("SELECT value FROM example");
++  KJ_EXPECT(rows.getInt(0) == 42);
++  rows.nextRow();
++  KJ_EXPECT(rows.isDone());
++  auto unrelated = storage.open(key, other);
++  KJ_EXPECT(unrelated->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
++  DurableTestStorage replacementGeneration;
++  auto afterRestart = replacementGeneration.open(key, id);
++  KJ_EXPECT(afterRestart->run("SELECT count(*) FROM sqlite_schema").getInt(0) == 0);
++}
++
++KJ_TEST("disposable durable SQLite refuses paths and malformed identities") {
++  DurableTestStorage storage;
++  KJ_EXPECT_THROW_MESSAGE(
++      "invalid durable test storage identity", storage.open("/var/lib/data", id));
++  KJ_EXPECT_THROW_MESSAGE("invalid durable test storage identity", storage.open(key, "../other"));
++  KJ_EXPECT_THROW_MESSAGE("invalid durable test storage identity", storage.open(key, "other"));
++}
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f4c6e01c87db796989bac327e17ac32dd8df9e1
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+@@ -0,0 +1,40 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-test-storage.h"
++
++#include <kj/debug.h>
++
++#include <algorithm>
++
++namespace workerd::server {
++namespace {
++
++constexpr kj::StringPtr ROOT_PREFIX = "coworkerd-do-root-v1-"_kj;
++
++bool isDigest(kj::StringPtr value) {
++  return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
++    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++  });
++}
++
++}  // namespace
++
++DurableTestStorage::DurableTestStorage()
++    : directory(kj::newInMemoryDirectory(kj::systemPreciseCalendarClock())),
++      vfs(*directory) {}
++
++kj::Own<SqliteDatabase> DurableTestStorage::open(
++    kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteObserver& observer) const {
++  KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
++          isDigest(storageId),
++      "invalid durable test storage identity");
++  const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
++  directory->openSubdir(kj::Path({kj::str(uniqueKey)}), mode);
++  return kj::heap<SqliteDatabase>(vfs,
++      kj::Path({kj::str(uniqueKey), kj::str(storageId, ".sqlite")}), mode, kj::maxValue,
++      kj::maxValue, observer);
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c5ba1ca18fb5e73dd43aa588dae9a19cf97cd24
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+@@ -0,0 +1,27 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <workerd/util/sqlite.h>
++
++namespace workerd::server {
++
++// A child-generation-local SQLite volume. It never receives a host path, file descriptor,
++// VFS name, or replication service. Keep the volume alive across actor retirement and retain
++// only the SQLite connection on the actor's home.
++class DurableTestStorage {
++ public:
++  DurableTestStorage();
++
++  kj::Own<SqliteDatabase> open(kj::StringPtr uniqueKey,
++      kj::StringPtr storageId,
++      SqliteObserver& observer = SqliteObserver::DEFAULT) const;
++
++ private:
++  kj::Own<const kj::Directory> directory;
++  SqliteDatabase::Vfs vfs;
++};
++
++}  // namespace workerd::server
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index a9ea7a312afd18d6ffb1307c2c8372e3c8e478b2..e05b8897dddcd81efa71ba4ab12de73a46168b7d 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -12,6 +12,9 @@ THREADED_DEPS = [
+     "//src/workerd/jsg",
+     "//src/workerd/server:v8-platform-impl",
+     "//src/workerd/server:workerd-api",
++    "//src/workerd/server/factory:coworkerd-durable-admission",
++    "//src/workerd/server/factory:coworkerd-durable-placement",
++    "//src/workerd/server/factory:coworkerd-durable-test-storage",
+     "//src/workerd/server/factory:coworkerd-sandbox",
+     "//src/workerd/server/factory:coworkerd-steady",
+     "//src/workerd/util:autogate",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 67de7fde2e8eeaf3e10d87812c43af64b1625fa8..4920d4b64b069bcf924a9ea8f1da5e0448354ea8 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -19,6 +19,9 @@
+ #include <workerd/io/worker-interface.h>
+ #include <workerd/jsg/coworkerd-rpc-code.h>
+ #include <workerd/jsg/setup.h>
++#include <workerd/server/factory/coworkerd-durable-admission.h>
++#include <workerd/server/factory/coworkerd-durable-placement.h>
++#include <workerd/server/factory/coworkerd-durable-test-storage.h>
+ #include <workerd/server/factory/coworkerd-sandbox.h>
+ #include <workerd/server/factory/coworkerd-steady.h>
+ #include <workerd/server/v8-platform-impl.h>
+@@ -29,6 +32,7 @@
+ #include <workerd/util/stream-utils.h>
+ 
+ #include <arpa/inet.h>
++#include <charconv>
+ #include <fcntl.h>
+ #include <netinet/tcp.h>
+ #include <openssl/evp.h>
+@@ -66,6 +70,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -1487,6 +1492,54 @@ struct JsonDoc {
+   }
+ };
+ 
++struct DurableRoute {
++  server::DurableAdmission::Key key;
++  server::DurableAdmission::Open open;
++  std::string invocation;
++
++  bool operator==(const DurableRoute&) const = default;
++};
++
++struct DurableIncoming {
++  kj::AutoCloseFd socket;
++  DurableRoute route;
++  server::DurableAdmission::Ticket ticket;
++  server::DurableAdmission::Time deadline;
++};
++
++uint64_t durableNumber(std::string_view encoded) {
++  uint64_t number;
++  auto [end, error] = std::from_chars(encoded.data(), encoded.data() + encoded.size(), number);
++  KJ_REQUIRE(error == std::errc() && end == encoded.data() + encoded.size(),
++      "invalid durable routing number");
++  return number;
++}
++
++uint64_t durableNumber(Json::Reader value, kj::StringPtr name) {
++  auto encoded = text(value, name);
++  return durableNumber(std::string_view(encoded.begin(), encoded.size()));
++}
++
++DurableRoute readDurableRoute(Json::Reader value) {
++  auto checkedText = [&](kj::StringPtr name, size_t maximum) {
++    auto result = text(value, name);
++    KJ_REQUIRE(result.size() > 0 && result.size() <= maximum, "invalid durable routing field", name);
++    return std::string(result.begin(), result.size());
++  };
++  auto identifier = [&](kj::StringPtr name) {
++    auto result = checkedText(name, 64);
++    KJ_REQUIRE(result.size() == 64 && std::all_of(result.begin(), result.end(),
++        [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }),
++        "invalid durable routing identifier", name);
++    return result;
++  };
++  return {{identifier("namespaceId"), identifier("objectId")},
++    {durableNumber(value, "generation"), durableNumber(value, "dataEpoch"),
++        durableNumber(value, "shardEpoch"), durableNumber(value, "openId"),
++        checkedText("definition", 256), checkedText("className", 255)},
++    checkedText("invocationId", 255)};
++}
++
+ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+   return kj::str("\"workerId\":", encode(field(descriptor, "workerId")),
+       ",\"versionId\":", encode(field(descriptor, "versionId")),
+@@ -1839,6 +1892,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+   bool used = false;
+ };
+ 
++class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
++ public:
++  explicit DurableBootstrap(DurableRoute route): route(std::move(route)) {}
++
++  kj::Promise<void> startEvent(StartEventContext context) override {
++    return checkDescriptor(context.getParams().getCfBlobJson());
++  }
++  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
++    return checkDescriptor(context.getParams().getCfBlobJson());
++  }
++
++ private:
++  DurableRoute route;
++
++  kj::Promise<void> checkDescriptor(kj::StringPtr descriptor) {
++    JsonDoc full(descriptor);
++    KJ_REQUIRE(readDurableRoute(field(full.get(), "durableTestRoute")) == route,
++        "durable routing descriptor mismatch");
++    return unsupportedError("threaded durable event dispatch");
++  }
++};
++
+ struct SubrequestBudget {
+   SubrequestBudget(uint32_t limit, uint32_t tenantLimit): limit(limit), tenantLimit(tenantLimit) {}
+   const uint32_t limit, tenantLimit;
+@@ -1890,7 +1965,10 @@ struct ThreadedServer {
+   server::WorkerdPlatform platform{*basePlatform};
+   jsg::V8System v8{platform, {}, basePlatform.get()};
+   const std::string sourceAddress, identity;
+-  const bool durableTestStorage;
++  const std::unique_ptr<server::DurableTestStorage> durableTestStorage;
++  std::optional<server::DurableAdmission> durableAdmission;
++  std::mutex durableRoutingMutex;
++  std::atomic<uint64_t> durableHomeSessions{0};
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
+@@ -1919,6 +1997,14 @@ struct ThreadedServer {
+     std::atomic<bool> invocation{false};
+     std::atomic<uint64_t> idleSince{nowNs()};
+     std::thread thread;
++    struct DurableHome {
++      std::string definition;
++      uint32_t reservedTrees = 0;
++      uint64_t memory = 0;
++      server::DurableHomeLoad load{std::chrono::seconds(4)};
++      std::vector<DurableIncoming> incoming;
++    };
++    std::optional<DurableHome> home;
+     Thread(bool control, bool maintenanceOnly)
+         : control(control),
+           maintenanceOnly(maintenanceOnly),
+@@ -1945,7 +2031,7 @@ struct ThreadedServer {
+       bool durableTestStorage = false)
+       : sourceAddress(std::move(sourceAddress)),
+         identity(std::move(identity)),
+-        durableTestStorage(durableTestStorage),
++        durableTestStorage(durableTestStorage ? std::make_unique<server::DurableTestStorage>() : nullptr),
+         pending(limit * 2),
+         limit(limit),
+         resources(std::make_shared<ResourceBudget>(
+@@ -1956,6 +2042,20 @@ struct ThreadedServer {
+             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
+         subrequestBudget(limit, tenantBudget->limit) {
+     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
++    if (this->durableTestStorage) {
++      const auto colon = this->identity.rfind(':');
++      KJ_REQUIRE(colon != std::string::npos, "invalid durable child identity");
++      // Bound pre-execution admission independently of the existing ordinary queue.
++      durableAdmission.emplace(server::DurableAdmission::Limits{
++        .capacity = {.threads = limit, .descriptors = uint64_t(limit) * 8,
++          .memory = resources->admissionMaximum - resources->baselineMemory},
++        .tree = {.descriptors = 3, .memory = 16 * 1024},
++        .event = {.descriptors = 1, .memory = 4096},
++        .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
++        .mailboxDepth = 4,
++        .mailboxBytes = 64 * 1024,
++      }, durableNumber(std::string_view(this->identity).substr(colon + 1)));
++    }
+     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
+     server::requireSecureSandbox();
+     resources->reclaimWake = managerWake;
+@@ -2168,6 +2268,73 @@ struct ThreadedServer {
+     wake(managerWake);
+     return true;
+   }
++
++  // The accept loop has consumed the bounded preface. Transfer the socket
++  // once it has a home assignment. Only the home reads any RPC bytes.
++  bool handoffDurable(int fd, DurableRoute& route, server::DurableAdmission::Ticket ticket,
++      server::DurableAdmission::Time deadline) {
++    if (!ready.load(std::memory_order_acquire)) return false;
++    std::lock_guard lock(durableRoutingMutex);
++    if (deadline <= server::DurableAdmission::Clock::now()) return false;
++    auto assigned = durableAdmission->homeFor(ticket.tree);
++    if (!assigned) {
++      std::vector<server::DurableCopyCandidate> candidates;
++      size_t spare = 0;
++      const auto now = server::DurableAdmission::Clock::now();
++      for (size_t i = 0; i < threads.size(); ++i) {
++        if (!threads[i]->home) continue;
++        auto& home = *threads[i]->home;
++        if (home.definition.empty()) {
++          if (spare == 0) spare = i + 1;
++          continue;
++        }
++        candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
++          home.load.busyFor(now), true});
++      }
++      auto choice = server::chooseDurableCopy(candidates, route.open.definition,
++          {.treesPerCopy = 64, .placementBytes = 64ull << 20, .busyThreshold = std::chrono::seconds(3)});
++      if (!choice && spare == 0) return false;
++      assigned = choice.value_or(spare);
++      auto& home = *threads[*assigned - 1]->home;
++      if (!choice) home.definition = route.open.definition;
++      KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
++      ++home.reservedTrees;
++    }
++    auto& thread = *threads[*assigned - 1];
++    thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
++    wake(thread.wake);
++    return true;
++  }
++
++  void finishDurable(server::DurableAdmission::Ticket ticket) {
++    std::lock_guard lock(durableRoutingMutex);
++    durableAdmission->cancel(ticket);
++    auto assigned = durableAdmission->homeFor(ticket.tree);
++    if (!assigned) {
++      durableAdmission->releaseUnassigned(ticket.tree);
++      return;
++    }
++    durableAdmission->complete(ticket, *assigned);
++    if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
++    KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
++    auto& home = *threads[*assigned - 1]->home;
++    if (--home.reservedTrees == 0) home.definition.clear();
++  }
++
++  kj::Promise<void> startDurableSession(ThreadState& state, DurableIncoming call) {
++    KJ_DEFER(finishDurable(call.ticket));
++    const auto remaining =
++        std::chrono::duration_cast<std::chrono::nanoseconds>(
++            call.deadline - server::DurableAdmission::Clock::now());
++    if (remaining.count() <= 0) co_return;
++    durableHomeSessions.fetch_add(1);
++    KJ_DEFER(durableHomeSessions.fetch_sub(1));
++    auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
++    capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(std::move(call.route)));
++    co_await state.io.provider->getTimer().timeoutAfter(remaining.count() * kj::NANOSECONDS,
++        session.accept(*stream)).catch_([](kj::Exception&&) {});
++  }
++
+   void manage() {
+     pthread_setname_np(pthread_self(), "cwkd-pool");
+     // The initial high watermark is the in-flight limit. Readiness waits for
+@@ -2175,8 +2342,10 @@ struct ThreadedServer {
+     // initialize one.
+     try {
+       threads.reserve(limit + CONTROL_THREADS);
+-      for (uint i = 0; i < limit + CONTROL_THREADS; ++i) {
++      const auto count = limit + (durableAdmission ? 0 : CONTROL_THREADS);
++      for (uint i = 0; i < count; ++i) {
+         auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
++        if (durableAdmission) item->home.emplace();
+         auto *pointer = item.get();
+         liveThreads.fetch_add(1);
+         item->thread = std::thread([this, pointer]() { runThread(*pointer); });
+@@ -2192,6 +2361,7 @@ struct ThreadedServer {
+     for (auto &item: threads)
+       while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
+     ready.store(true, std::memory_order_release);
++    if (durableAdmission) return;
+     int held = -1;
+     auto nextMaintenance = nowNs();
+     auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
+@@ -2309,6 +2479,23 @@ struct ThreadedServer {
+     thread.idleSince.store(nowNs());
+     thread.descriptor.store(-1, std::memory_order_release);
+     wake(managerWake);
++    if (thread.home) {
++      // Blocking on this promise pumps the home's KJ loop while it waits
++      // for the accept thread to hand over the next private RPC connection.
++      auto signal = state.io.lowLevelProvider->wrapInputFd(thread.wake);
++      for (;;) {
++        kj::byte notifications[sizeof(uint64_t)];
++        signal->read(kj::arrayPtr(notifications)).wait(state.io.waitScope);
++        std::vector<DurableIncoming> incoming;
++        {
++          std::lock_guard lock(durableRoutingMutex);
++          incoming.swap(thread.home->incoming);
++        }
++        for (auto& call: incoming) {
++          state.tasks.add(startDurableSession(state, std::move(call)));
++        }
++      }
++    }
+     for (;;) {
+       uint64_t count;
+       ssize_t n;
+@@ -3913,6 +4100,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+ }
+ 
+ void acceptLoop(ThreadedServer &server, int listener, int parent) {
++  using Admission = workerd::server::DurableAdmission;
+   int epoll = epoll_create1(EPOLL_CLOEXEC);
+   KJ_REQUIRE(epoll >= 0);
+   auto add = [&](int fd) {
+@@ -3940,15 +4128,29 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+   struct Connection {
+     std::string input, output;
+     size_t sent = 0;
++    std::optional<Admission::Ticket> durableCredit;
++    std::optional<DurableRoute> durableRoute;
++    Admission::Time durableDeadline{};
+   };
+   std::map<int, Connection> connections;
++  std::map<uint64_t, int> durableWaiting;
++  auto closeConnection = [&](auto found) {
++    const int fd = found->first;
++    if (auto credit = found->second.durableCredit) {
++      durableWaiting.erase(credit->event);
++      server.finishDurable(*credit);
++    }
++    epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
++    ::close(fd);
++    connections.erase(found);
++  };
+   for (;;) {
+     if (!listening && nowNs() >= retryAt) {
+       listening = add(listener);
+       if (!listening) pauseListener();
+     }
+     epoll_event events[256];
+-    int count = epoll_wait(epoll, events, 256, listening ? -1 : 25);
++    int count = epoll_wait(epoll, events, 256, listening && !server.durableAdmission ? -1 : 25);
+     if (count < 0) {
+       if (errno != EINTR) {
+         server.acceptFailures.fetch_add(1);
+@@ -3987,6 +4189,23 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+       if (found == connections.end()) continue;
+       auto &connection = found->second;
+       bool close = false;
++      if (connection.durableCredit) {
++        // Before the application dispatch handshake, a disconnect releases its
++        // waiting credit. No request body belongs to the routing preface.
++        char discarded;
++        const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
++        if (size > 0 && server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
++              connection.durableDeadline)) {
++          epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
++          durableWaiting.erase(connection.durableCredit->event);
++          connections.erase(found);
++          continue;
++        }
++        if (size >= 0 || (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
++          closeConnection(found);
++        }
++        continue;
++      }
+       if (connection.input.empty() && connection.output.empty()) {
+         char prefix;
+         auto size = recv(fd, &prefix, 1, MSG_PEEK | MSG_DONTWAIT);
+@@ -4012,6 +4231,41 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+         else if (size == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+           close = true;
+         if (connection.input.size() > 4096) close = true;
++        if (!close && server.durableAdmission && connection.input.starts_with('D') &&
++            connection.input.ends_with('\n')) {
++          char receipt = 'S';
++          auto error = kj::runCatchingExceptions([&] {
++            JsonDoc frame(kj::StringPtr(connection.input.c_str() + 1, connection.input.size() - 1));
++            auto input = frame.get();
++            auto route = readDurableRoute(input);
++            const auto deadlineNs = durableNumber(input, "expiresMonotonicNs");
++            KJ_REQUIRE(deadlineNs <= uint64_t(std::numeric_limits<int64_t>::max()),
++                "invalid durable routing deadline");
++            auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
++                std::chrono::nanoseconds(deadlineNs)));
++            auto result = [&] {
++              std::lock_guard lock(server.durableRoutingMutex);
++              return server.durableAdmission->queue(route.key, route.open,
++                  durableNumber(input, "queuedBytes"), deadline, Admission::Clock::now());
++            }();
++            if (result.ticket) {
++              receipt = 'A';
++              connection.durableCredit = *result.ticket;
++              connection.durableRoute = std::move(route);
++              connection.durableDeadline = deadline;
++              durableWaiting.emplace(result.ticket->event, fd);
++            } else if (result.status == Admission::Status::OVERLOADED) {
++              receipt = 'R';
++            } else if (result.status == Admission::Status::EXPIRED) {
++              receipt = 'E';
++            }
++          });
++          if (error != kj::none || send(fd, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 ||
++              receipt != 'A') {
++            closeConnection(found);
++          }
++          continue;
++        }
+         if (connection.input.find("\r\n\r\n") != std::string::npos) {
+           auto body = server.identity;
+           if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
+@@ -4027,7 +4281,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+                 std::to_string(server.isolateCreationAttempts.load()) +
+                 ",\"canceledLoads\":" + std::to_string(server.canceledLoads.load()) +
+                 ",\"liveThreads\":" + std::to_string(server.liveThreads.load()) +
+-                ",\"controlThreads\":" + std::to_string(server.CONTROL_THREADS) +
++                ",\"controlThreads\":" + std::to_string(server.durableAdmission ? 0 : server.CONTROL_THREADS) +
+                 ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
+                 ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
+                 ",\"subrequestsActive\":" + std::to_string(server.subrequestBudget.active.load()) +
+@@ -4038,6 +4292,21 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+                 ",\"logDroppedBytes\":" + std::to_string(server.logDroppedBytes.load()) +
+                 ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
+                 ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
++            if (server.durableAdmission) {
++              const auto state = [&] {
++                std::lock_guard lock(server.durableRoutingMutex);
++                return server.durableAdmission->state();
++              }();
++              body.pop_back();
++              body += ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
++                  ",\"waiting\":" + std::to_string(state.waiting) +
++                  ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
++                  ",\"homeSessions\":" + std::to_string(server.durableHomeSessions.load()) +
++                  ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
++                  ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
++                  ",\"overloaded\":" + std::to_string(state.overloads) +
++                  ",\"expired\":" + std::to_string(state.expired) + "}}";
++            }
+           }
+           auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
+           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
+@@ -4070,9 +4339,17 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+         }
+       }
+       if (close || (events[i].events & EPOLLRDHUP)) {
+-        epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+-        ::close(fd);
+-        connections.erase(fd);
++        closeConnection(found);
++      }
++    }
++    if (server.durableAdmission) {
++      const auto expired = [&] {
++        std::lock_guard lock(server.durableRoutingMutex);
++        return server.durableAdmission->expire(Admission::Clock::now());
++      }();
++      for (const auto& ticket: expired) {
++        auto socket = durableWaiting.find(ticket.event);
++        if (socket != durableWaiting.end()) closeConnection(connections.find(socket->second));
+       }
+     }
+   }

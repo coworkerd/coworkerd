@@ -2459,6 +2459,9 @@ public:
       childEnvironment.push_back("COWORKERD_DO_CHECKPOINT_BYTES=" + std::to_string(durableLog.checkpointBytes));
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
+    if (p->durableTestStorage) {
+      childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
+    }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.
     childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));

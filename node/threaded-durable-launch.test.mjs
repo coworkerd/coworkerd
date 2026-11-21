@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { get } from 'node:http';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -55,17 +56,51 @@ function reservePort() {
   });
 }
 
-function ordinaryPreface(path) {
+function sendPreface(path, preface) {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path, () => socket.write('T'));
+    const socket = createConnection(path, () => socket.write(preface));
     socket.setTimeout(1000, () => socket.destroy(new Error('admission response timed out')));
     socket.once('error', reject);
     socket.once('data', bytes => {
-      socket.destroy();
-      resolve(bytes.toString());
+      socket.setTimeout(0);
+      resolve({ socket, receipt: bytes.toString() });
     });
     socket.once('end', () => reject(new Error('admission closed without a response')));
   });
+}
+
+function readAdmission(socketPath) {
+  return new Promise((resolve, reject) => {
+    get({ socketPath, path: '/__coworkerd/threaded' }, async response => {
+      try {
+        assert.equal(response.statusCode, 200);
+        const chunks = [];
+        for await (const chunk of response) chunks.push(chunk);
+        resolve(JSON.parse(Buffer.concat(chunks).toString()).durableAdmission);
+      } catch (error) {
+        reject(error);
+      }
+    }).once('error', reject);
+  });
+}
+
+function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n) {
+  return 'D' + JSON.stringify({
+    namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition: 'fixture',
+    generation: '1', dataEpoch: '1', shardEpoch: '1', openId: '1',
+    queuedBytes: String(queuedBytes), expiresMonotonicNs: String(expiry),
+  }) + '\n';
+}
+
+async function waitForAdmission(path, waiting, homeSessions = 0) {
+  let state;
+  const until = performance.now() + 2000;
+  do {
+    state = await readAdmission(path);
+    if (state.waiting === waiting && state.homeSessions === homeSessions) return state;
+    await delay(20);
+  } while (performance.now() < until);
+  assert.fail(`Admission counters did not reach ${waiting} waiting and ${homeSessions} home sessions: ${JSON.stringify(state)}`);
 }
 
 let child, exited;
@@ -146,7 +181,65 @@ try {
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
   const paths = (await readdir(scratch)).filter(name => name.startsWith('coworkerd-durable-test-'));
   assert.equal(paths.length, 1);
-  assert.equal(await ordinaryPreface(join(scratch, paths[0], 'run', processInfo.socket)), 'R');
+  const socketPath = join(scratch, paths[0], 'run', processInfo.socket);
+  const ordinary = await sendPreface(socketPath, 'T');
+  ordinary.socket.destroy();
+  assert.equal(ordinary.receipt, 'R');
+  const objectId = 'b'.repeat(64);
+  const held = [];
+  try {
+    for (const [id, sequence, bytes, expected] of [
+      [objectId, 'first', 32768, 'A'],
+      [objectId, 'second', 32768, 'A'],
+      [objectId, 'overflow', 1, 'R'],
+      ['c'.repeat(64), 'unrelated', 1024, 'A'],
+    ]) {
+      const { socket, receipt } = await sendPreface(socketPath, durablePreface(id, sequence, bytes));
+      held.push(socket);
+      assert.equal(receipt, expected);
+    }
+    const loaded = await readAdmission(socketPath);
+    assert.equal(loaded.trees, 2);
+    assert.equal(loaded.waiting, 3);
+    assert.equal(loaded.waitingBytes, 66560);
+    assert.equal(loaded.overloaded, 1);
+    assert.ok(loaded.reservedDescriptors > 0);
+    assert.ok(loaded.reservedBytes > loaded.waitingBytes);
+  } finally {
+    for (const socket of held) socket.destroy();
+  }
+  let released = await waitForAdmission(socketPath, 0);
+  assert.equal(released.trees, 0);
+  assert.equal(released.reservedDescriptors, 0);
+  assert.equal(released.reservedBytes, 0);
+  const routed = await sendPreface(socketPath, durablePreface(objectId, 'home-cancellation', 32));
+  try {
+    assert.equal(routed.receipt, 'A');
+    // Begin RPC framing, then cancel it while the home holds the connection.
+    routed.socket.write(Buffer.alloc(1));
+    await waitForAdmission(socketPath, 1, 1);
+  } finally {
+    routed.socket.destroy();
+  }
+  released = await waitForAdmission(socketPath, 0);
+  assert.equal(released.reservedBytes, 0);
+  const expiring = await sendPreface(socketPath,
+    durablePreface(objectId, 'expiry', 8, process.hrtime.bigint() + 500_000_000n));
+  try {
+    assert.equal(expiring.receipt, 'A');
+    released = await waitForAdmission(socketPath, 0);
+    assert.equal(released.expired, 1);
+    assert.equal(released.reservedBytes, 0);
+  } finally {
+    expiring.socket.destroy();
+  }
+  const live = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+    headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(500),
+  });
+  const output = await live.json();
+  assert.equal(output.processes.entries[0].pid, processInfo.pid);
+  assert.equal(output.processes.entries[0].generation, processInfo.generation);
+  assert.equal(output.processes.entries[0].state, 'ready');
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
   child.kill('SIGTERM');
   await exited;

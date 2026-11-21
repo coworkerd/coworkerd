@@ -156,6 +156,9 @@ def allowed_path(name, path):
                               'patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch'} or
                           name == '0045-threaded-durable-admission.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0046-durable-test-routing.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
