@@ -1,0 +1,90 @@
+name: Verify issue 26 in a clean Ubuntu 24.04 container
+
+on:
+  push:
+    branches: [codex/issue-26-ubuntu-deps]
+    paths: ['.github/workflows/verify-issue-26.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  clean-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the documented Node.js prerequisite
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Run the documented build and check in ubuntu:24.04
+        run: |
+          validation_dir=$(mktemp -d)
+          chmod 0755 "$validation_dir"
+          node_dir=$(dirname "$(dirname "$(command -v node)")")
+          git archive --format=tar HEAD > "$validation_dir/coworkerd.tar"
+          awk '
+            /^To run the same checks locally on Ubuntu 24[.]04 / { ubuntu = 1 }
+            ubuntu && /^```bash$/ { commands = 1; next }
+            commands && /^```$/ { exit }
+            commands { print }
+          ' CONTRIBUTING.md > "$validation_dir/ubuntu.sh"
+          test -s "$validation_dir/ubuntu.sh"
+          cat "$validation_dir/ubuntu.sh"
+          git rev-parse HEAD
+
+          docker pull --platform linux/amd64 ubuntu:24.04
+          docker image inspect --format '{{.Os}}/{{.Architecture}} {{join .RepoDigests " "}}' ubuntu:24.04
+          docker run --rm --platform linux/amd64 -i \
+            --mount "type=bind,source=$node_dir,target=/opt/node,readonly" \
+            --mount "type=bind,source=$validation_dir,target=/inputs,readonly" \
+            ubuntu:24.04 bash -euo pipefail <<'CONTAINER'
+          cat /etc/os-release
+          uname -sm
+          test "$(uname -m)" = x86_64
+          test "$(dpkg --print-architecture)" = amd64
+          dpkg-query -W clang-19 libstdc++-13-dev libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3 sudo || true
+          for package in clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl; do
+            if dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null | grep -qx installed; then
+              printf 'Preinstalled build dependency: %s\n' "$package" >&2
+              exit 1
+            fi
+          done
+
+          # The bare image has no sudo. Use an ordinary user for the guide.
+          apt-get update
+          apt-get install -y --no-install-recommends sudo
+          useradd --create-home verifier
+          printf 'verifier ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/verifier
+          chmod 0440 /etc/sudoers.d/verifier
+          mkdir /home/verifier/coworkerd
+          tar -xf /inputs/coworkerd.tar -C /home/verifier/coworkerd
+          chown -R verifier:verifier /home/verifier/coworkerd
+          cd /home/verifier/coworkerd
+          export PATH="/opt/node/bin:$PATH"
+          node --version
+          npm --version
+
+          runuser -u verifier -- bash -euxo pipefail /inputs/ubuntu.sh
+
+          dpkg-query -W clang-19 libstdc++-14-dev ca-certificates
+          test -x build/coworkerd
+          test -x build/coworkerd-apiserver
+          test -x build/coworkerd-launcher
+          python3 - <<'PY'
+          from xml.etree import ElementTree as ET
+
+          cases = ET.parse('build/test-results.xml').findall('.//testcase')
+          failed = sum(c.find('failure') is not None or c.find('error') is not None for c in cases)
+          skipped = sum(c.find('skipped') is not None for c in cases)
+          required = {'node-log-redaction', 'workerd-configuration', 'node-child-memory'}
+          missing = required - {c.get('name') for c in cases}
+          print(f'CTest: {len(cases)} tests, {failed} failed, {skipped} skipped.')
+          assert cases and not failed and not skipped and not missing, missing
+          PY
+          CONTAINER
