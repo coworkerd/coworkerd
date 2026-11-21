@@ -128,7 +128,6 @@ the kernel-independent suite. Use `-DCOWORKERD_TEST_WORKERD=auto` to restore aut
 the test log and a passing receipt with source hashes from that run. Configure `COWORKERD_NATIVE_SOURCE_DIR`,
 `COWORKERD_NATIVE_TEST_LOG` and `COWORKERD_NATIVE_TEST_RECEIPT` to register it locally. The release archive
 contains the two executables and their allowlist, so the hosted job does not run this verifier.
-Cluster smoke tests are tracked separately in [#1](https://github.com/coworkerd/coworkerd/issues/1).
 
 `main` requires **`Build and unit tests (linux-x86_64)`** from GitHub Actions before a pull request can be merged.
 
@@ -163,9 +162,8 @@ container and requires a published archive for its Linux architecture. [docs/gui
 covers the configuration, the sandbox (sections 3 and 4: the default compose file runs workerd without it, a host
 prepared as section 4 describes runs it with `docker-compose.sandbox.yml`) and operations.
 
-The integration tests -- cluster-level regression cases and the tool that runs them -- are not in this repository
-yet; [#1](https://github.com/coworkerd/coworkerd/issues/1) tracks adding them. Until then, say in the pull request
-how you checked the change on a local cluster.
+The [cluster integration suite](tests/cluster/README.md) starts its own three-node cluster and object store. Use its
+runner to check a change on Linux, with all six cases or a single case. Linux pull-request CI runs the same command.
 
 ## Sending a change
 
