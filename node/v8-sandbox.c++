@@ -228,7 +228,7 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
   }
   if (!build.probed) {
     // Nothing is planned: each process keeps its configured limit and V8's fallible group
-    // creation is the only line. Said loudly (r50 §6.5).
+    // creation is the only line. A startup warning reports the failed probe.
     plan.mode = "unknown";
     plan.warning = "the V8 sandbox of the ordinary processes is unknown: the probe (coworkerd-threaded "
         "--sandbox-facts) failed (" + build.probeError + "); each process keeps its resident limit of " +
@@ -279,7 +279,7 @@ SandboxPlan planV8Sandbox(const std::string& setting, const SandboxBuildFacts& b
 
 void limitPerProcess(SandboxPlan& plan, uint32_t perProcessLimit, const SandboxPlanConstants& constants) {
   plan.perProcessLimit = perProcessLimit;
-  // The configured process count holds (r50 §6.4): only each process's resident limit is lowered.
+  // The configured process count holds: only each process's resident limit is lowered.
   plan.processes = plan.configuredProcesses;
   plan.residentLimit = std::min(plan.configuredResidentLimit, perProcessLimit);
   plan.residentCapacity = uint64_t(plan.processes) * plan.residentLimit;

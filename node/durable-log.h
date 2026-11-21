@@ -147,8 +147,8 @@ struct EarlierSegmentBuild {
   std::set<std::string> touched;                // the records' objects, as host names
   std::map<std::string, uint64_t> sourceEpochs;  // host name -> the highest shard epoch of its records here
 };
-// Encodes the records, indexes them per object and facet, encodes the segment and hashes it: what the reseal did on
-// the event loop before b58, byte for byte. `header` carries everything but the records' counts and index.
+// Encodes the records, indexes them per object and facet, encodes the segment and hashes it, byte for byte as
+// the earlier event-loop implementation did. `header` carries everything but the records' counts and index.
 EarlierSegmentBuild buildEarlierSegment(SegmentHeader header, EarlierSegmentInput input);
 // The records of a segment, with its header; none when the magic, the length or the digest do not hold.
 struct SegmentContents {
@@ -185,7 +185,7 @@ struct ObjectManifest {
   // peer still holds them.
   std::vector<std::pair<uint64_t, uint64_t>> isolated;  // (shardEpoch, nodeSeq)
   // Who wrote this revision: the node, its membership epoch, the process and a random value of the write, so that a
-  // create whose answer was lost is decided by reading the bytes back (R5).
+  // create whose answer was lost is decided by reading the bytes back.
   std::string writerNodeId, instance, nonce;
   uint64_t writerNodeEpoch = 0, writtenAtUnixMs = 0, databaseBytes = 0;
 };
@@ -359,7 +359,7 @@ public:
   void setOwnerFenceHook(std::function<void(const std::string&, uint32_t, uint64_t)> hook) {
     ownerFenceHook = std::move(hook);
   }
-  // The membership lease of this log's epoch (r46, results/r45/DESIGN.md section 10). `check` judges it at a reading of
+  // The membership lease of this log's epoch. `check` judges it at a reading of
   // the lease clock: every record is judged as it is taken and again just before its confirmation is answered, after
   // any local flush, with nothing that waits in between. `lost` is called, synchronously and after the refused records
   // were answered and excluded, when the lease is lost: the node stops holding its shards at once. Without the hooks
@@ -445,16 +445,16 @@ public:
   void closeIncoming(uint64_t streamId);
   // What this node holds of another node's log for one shard.
   DurableTailAnswer tailFor(const DurableTailAsk& ask, bool remote = true);
-  // r48: before a tail is answered, a newer epoch of the shard than this node knows raises the node's floor for the
+  // Before a tail is answered, a newer epoch of the shard than this node knows raises the node's floor for the
   // shard -- only once the object store shows that epoch (an epoch object is created by its owner alone, and only if
   // absent). Nothing this node holds is dropped; appends of older epochs are refused from then on. A number the store
   // does not show raises nothing; an older one lowers nothing. In memory only: a restart forgets it.
   kj::Promise<void> raisePeerFence(DurableTailAsk ask);
-  // r49: the floor of one shard raised to `epoch` once the object store shows that epoch (shared with raisePeerFence:
+  // The floor of one shard raised to `epoch` once the object store shows that epoch (shared with raisePeerFence:
   // one read at a time per epoch, failures kept and read again in the background). `reason` names what asked.
   kj::Promise<void> raiseFloor(std::string namespaceId, uint32_t shard, uint64_t epoch, std::string reason);
   static constexpr uint32_t FULL_RETRY_FIRST_MS = 100, FULL_RETRIES = 5;
-  // r48: a check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
+  // A check of a shard epoch that failed is read again in the background, OWNER_REREAD_MS doubled each time, at
   // most this many times, while the epoch is still not known.
   static constexpr uint32_t FENCE_REREADS = 5;
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
@@ -613,11 +613,11 @@ private:
     double openedAtMs = 0, lastAckMs = 0, attemptedAtMs = 0;
     std::deque<Queued> queue;
     uint64_t inFlightBytes = 0, queuedBytes = 0;
-    // r48: the records this session's peer refused, for any reason, and has not taken since. An answer to a later
+    // The records this session's peer refused, for any reason, and has not taken since. An answer to a later
     // append carries the peer's highest sequence, which can be above them: a record counts as held by a peer only
     // when the peer took it -- the answer to its last (or only) piece.
     std::set<uint64_t> refusedSeqs;
-    // r48: a record refused because the peer's buffer was full is sent again on the same session after a growing
+    // A record refused because the peer's buffer was full is sent again on the same session after a growing
     // wait (FULL_RETRY_FIRST_MS, doubled, at most FULL_RETRIES times) until it is taken or no longer waits.
     struct Retry { uint32_t attempts = 0; bool pending = false; };
     std::map<uint64_t, Retry> fullRetries;
@@ -634,10 +634,10 @@ private:
     std::map<std::string, std::set<uint64_t>, std::less<>> byObject;
     void forgetPosition(uint64_t sequence);
     std::set<uint64_t> isolated;          // a late append cannot undo DROP on a replacement stream
-    // r48: records refused as fenced that no drop or trim has covered. The sequence answered stays below the lowest of
+    // Records refused as fenced that no drop or trim has covered. The sequence answered stays below the lowest of
     // them, so no later record makes the refused one count as held at an owner that reads the answers cumulatively
-    // (one without r48). Only the fence holds answers back: a full buffer does not, or one refusal would stall every
-    // later record of the stream until the owner gives the refused one up.
+    // (an older implementation). Only the fence holds answers back: a full buffer does not, or one refusal would stall
+    // every later record of the stream until the owner gives the refused one up.
     std::set<uint64_t> fencedSeqs;
     bool holdsFramed(std::string_view framed) const;
     uint64_t answeredSeq() const {
@@ -723,7 +723,7 @@ private:
   void loseLease(const LeaseTracker::Judgment& judgment);
   void wakeForLease(double untilMs);
   // COWORKERD_SLOW_FLUSH_FOR_TEST names a file; a confirmation flush that finds it sleeps the milliseconds it holds,
-  // once, and removes it (r46 case 2). Without the variable nothing is read.
+  // once, and removes it. Without the variable nothing is read.
   void slowFlushOnceForTest();
   // Before a cut without a complete owner proof (fetchTails), each silent previous owner's heartbeat of that node epoch
   // is read once: shared by every recovery that asks about the same epoch within OWNER_REREAD_MS.
@@ -747,7 +747,7 @@ private:
       const std::string& reason, bool notifyShard);
   kj::Promise<void> openPeer(std::string nodeId);
   void retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence);
-  // r48: one read of a shard epoch's object at a time for each (namespace, shard, epoch); a failure is kept for
+  // One read of a shard epoch's object at a time for each (namespace, shard, epoch); a failure is kept for
   // OWNER_REREAD_MS (the tail is answered at once meanwhile) and read once more in the background.
   struct FenceCheck {
     kj::ForkedPromise<void> done;
@@ -760,9 +760,9 @@ private:
   // `reread`: 0 for the read requests wait for; 1.. for the background ones after a failure.
   kj::Promise<void> checkPeerFence(std::string namespaceId, uint32_t shard, uint64_t epoch, uint32_t reread,
       std::string reason);
-  // r49: a peer refused one of this node's records as fenced -- check whether the record's shard is lost.
+  // A peer refused one of this node's records as fenced -- check whether the record's shard is lost.
   void checkFencedShard(uint64_t sequence);
-  // r49: the shards such a refusal is being checked for, (namespace, shard) -> the refused record's epoch.
+  // The shards such a refusal is being checked for, (namespace, shard) -> the refused record's epoch.
   std::map<std::pair<std::string, uint32_t>, uint64_t> lostShardChecks;
 
   // ---- segments, manifests, snapshots ----
@@ -788,7 +788,7 @@ private:
   void scheduleIdleCheckpoint(Object& object);
   kj::Promise<void> checkpointIdleObjects(double now);
   kj::Promise<void> resealEarlier();
-  // b58: the next segment of an earlier epoch, chosen on the event loop in slices without encoding a record (or, for
+  // The next segment of an earlier epoch, chosen on the event loop in slices without encoding a record (or, for
   // an uploaded segment being published again, the objects it still names).
   struct EarlierSelection {
     EarlierSegmentInput input;
@@ -798,7 +798,7 @@ private:
     std::map<std::string, uint64_t> sourceEpochs;
   };
   kj::Promise<EarlierSelection> selectEarlier(uint64_t epoch, std::optional<ManifestSegment> cached);
-  // b58: the manifests naming one uploaded earlier segment, EARLIER_PUBLISH_CONCURRENCY objects at a time.
+  // The manifests naming one uploaded earlier segment, EARLIER_PUBLISH_CONCURRENCY objects at a time.
   kj::Promise<void> publishEarlierObjects(uint64_t epoch, const SegmentHeader& header, std::vector<std::string> names,
       const std::map<std::string, uint64_t>& sourceEpochs);
   kj::Promise<void> publishEarlierObject(uint64_t epoch, const SegmentHeader& header, std::string hostName,
@@ -808,7 +808,7 @@ private:
   void retireEarlierObject(uint64_t epoch, const std::string& hostName, uint64_t firstSeq, uint64_t lastSeq);
   void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
   void persistEarlierSeals();
-  // b58: the same, with the writes and their synchronization on a worker thread (the reseal's calls).
+  // The same, with the writes and their synchronization on a worker thread (the reseal's calls).
   kj::Promise<void> persistEarlierSealsAsync();
   kj::Promise<void> cleanupClosedEpoch();
   kj::Promise<void> dropColdFiles(uint64_t reservedBytes = 0);
@@ -908,7 +908,7 @@ private:
 
   Settings settings;
   std::optional<ObjectStore> store;
-  // b58: the store's configuration, for the clients of worker threads.
+  // The store's configuration, for the clients of worker threads.
   ObjectStoreConfig workerStoreConfig;
   bool persistingSeals = false, cleaningEpoch = false;
   kj::Network& network;
@@ -965,7 +965,7 @@ private:
     std::set<std::pair<std::string, uint64_t>> startupUnsealed;
     // Publication is tracked per shard, independently of the current batch.
     std::map<std::pair<std::string, uint32_t>, uint64_t> unpublishedShards;
-    // b58: the same count per object (a record's objectName: namespace/object id), for tail requests naming it,
+    // The same count per object (a record's objectName: namespace/object id), for tail requests naming it,
     // and per shard the part of unpublishedShards that these per-object counts account for (always all of it in a
     // running node; a request naming an object is answered for the shard when it is not).
     std::map<std::string, uint64_t> unpublishedObjects;
@@ -982,7 +982,7 @@ private:
   std::map<uint64_t, double> earlierRetryAfter;
   uint64_t earlierCursor = 0;
   std::deque<uint64_t> earlierPriority;
-  // b58: the objects (namespace/object id) whose earlier-epoch manifest a reseal is writing right now, one entry per
+  // The objects (namespace/object id) whose earlier-epoch manifest a reseal is writing right now, one entry per
   // write (two data epochs of one object may be written at once).
   std::multiset<std::string> earlierPublishing;
   // The reseal's selection yields after this many bytes of records (tests make it small).
@@ -1102,7 +1102,7 @@ private:
   uint64_t rebuilds = 0, rebuildFailures = 0, repairs = 0, filesDropped = 0, peerSwitches = 0, tailFetches = 0;
   uint64_t recordsTaken = 0, framesTaken = 0, bytesTaken = 0, overLimitAnswers = 0, recoverTimeouts = 0;
   uint64_t tailRecoveryBounded = 0, ownerSilentRecoveries = 0, lateTailRecords = 0;
-  // r46: records refused by the lease, confirmations that waited for a heartbeat in flight, epochs whose lease was
+  // Records refused by the lease, confirmations that waited for a heartbeat in flight, epochs whose lease was
   // lost here; cuts held back because a silent previous owner's heartbeat was still live or could not be judged.
   uint64_t leaseRefusals = 0, leaseWaits = 0, leaseLosses = 0;
   uint64_t cutsHeldOwnerLive = 0, cutsHeldOwnerUnknown = 0, ownerHeartbeatReads = 0;

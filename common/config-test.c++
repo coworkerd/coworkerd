@@ -89,7 +89,7 @@ void tenantBorrowConfiguration(Fixture& fixture) {
   KJ_REQUIRE(refusal.find("tenantBorrowBelowPercent") != std::string::npos);
 }
 
-// r46: with the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
+// With the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
 // refusal names every value. The defaults (15 s, 5 s, 10 s) and the small test configuration (5 s, 1 s, 3 s) start.
 void livenessGraceConfiguration(Fixture& fixture) {
   const auto load = [&](const std::string& membership) {

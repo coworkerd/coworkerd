@@ -103,7 +103,7 @@ struct DurableLogSession {
 interface DurableLogSink {
   # One or more records of the owner's log, in sequence order, each prefixed with its length (UInt32, little endian).
   # The answer is the highest sequence this node now holds of the stream -- kept below a record it refused as fenced
-  # until the owner drops that record (r48) --, which is what lets the owner open its output gate; `refused` names
+  # until the owner drops that record -- which is what lets the owner open its output gate; `refused` names
   # the reason when the records were not taken (the buffer is full, or the shard's epoch is not the one this node
   # knows: the owner has been fenced). `partial` carries a piece of what the next calls complete --
   # one transaction's frames can be larger than a message may be -- and holds the bytes until the call that is not
@@ -371,7 +371,7 @@ struct ServerConfig {
     # A failed upload of a segment or snapshot part is tried again after uploadRetryMs, doubling to uploadRetryMaxMs.
     uploadRetryMs @14 :UInt32 = 500;
     uploadRetryMaxMs @15 :UInt32 = 30000;
-    # How many parts of a snapshot or segments a rebuild downloads at once (R5: more than four 16 MiB reads at once met
+    # How many parts of a snapshot or segments a rebuild downloads at once (more than four 16 MiB reads at once met
     # errors on a volume server of SeaweedFS 3.97).
     recoverParallelism @16 :UInt32 = 4;
     # How many objects one durable process keeps resident. Past it the least recently used objects are evicted: a
@@ -719,8 +719,8 @@ struct PlacementConfig {
   loadBandForTest @7 :Text = "green";
   equalLimitsForTest @8 :Bool = false;
   # Stateless Service Binding fetch and method calls try the caller's node first, then the ordinary warm/home policy.
-  # R9 (lab results/r9/PROTOCOL.md, section 0) found lower local p99 at both tenant counts and all three RTTs, at the
-  # cost of additional svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.
+  # Measurements found lower local p99 at both tested tenant counts and all three RTTs, at the cost of additional
+  # svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.
   subcalls @9 :Text = "local";
   # Per-tenant limits for concurrent roots and nested calls, respectively, inside the node limits.
   # Zero keeps the corresponding per-tenant limit disabled.

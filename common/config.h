@@ -111,7 +111,7 @@ struct ProcessPoolConfig {
   void validate() const;
 };
 
-// With the object store's membership, livenessGraceMs must exceed heartbeatIntervalMs by more than this (r46): the
+// With the object store's membership, livenessGraceMs must exceed heartbeatIntervalMs by more than this: the
 // expiry check (100 ms), the ownership watcher (50 ms) and the store's whole-second Date (1,000 ms).
 constexpr uint32_t LIVENESS_GRACE_MARGIN_MS = 1150;
 

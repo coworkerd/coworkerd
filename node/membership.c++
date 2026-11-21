@@ -713,7 +713,7 @@ private:
   // One listing of members/: the member table, this id's newer epochs, this epoch's own heartbeat, the clock.
   kj::Promise<void> listMembers() {
     auto [listing, sample] = co_await timedList(MEMBERS_PREFIX);
-    // The recovery anchor (v54): once this node could not list the store for longer than the TTL, the staleness that
+    // The recovery anchor: once this node could not list the store for longer than the TTL, the staleness that
     // built up while it was blind is not counted -- an outage of the whole cluster stopped the others' heartbeats too.
     // Until the recovery + TTL + grace the members it had whose heartbeat objects are still listed stay (a newer epoch
     // of theirs takes their place as it appears); then, and for a member whose heartbeat object is gone, the usual rule.
@@ -753,8 +753,8 @@ private:
               (record ? record->instance : std::string("unreadable")) + ")");
       }
     }
-    // A listing that does not hold this node's own live heartbeat is not a listing of the members (v60's core
-    // regression: the first second of a stopped store answered 200 with an empty list, and two nodes dropped each
+    // A listing that does not hold this node's own live heartbeat is not a listing of the members (an observed
+    // failure: the first second of a stopped store answered 200 with an empty list, and two nodes dropped each
     // other on it). Nothing is judged by it: the member table stays as it was and the listing counts as a failure,
     // so the recovery anchor works exactly as before.
     if (epoch && !state.identityTaken && !state.selfExpired && lastHeartbeatOk != kj::origin<kj::TimePoint>() &&

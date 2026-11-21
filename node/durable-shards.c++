@@ -528,7 +528,7 @@ kj::Promise<ShardRoute> DurableShards::decide(std::string namespaceId, uint32_t 
     // another matter -- it left and came back, and the shard is its own again (the Owner::SELF branch below says the
     // same of an epoch it no longer holds). A node that is still draining is kept out by eligible() either way, so
     // nothing asks a leaving node to take its shards back. Without this, the only node of a one-node cluster could
-    // never serve its objects again after a restart (found by v63's same-boot reuse case).
+    // never serve its objects again after a restart.
     const bool mine = record.nodeId == settings.nodeId;
     co_return co_await takeOrForward(namespaceId, shard, std::move(latest), "released",
         mine ? std::string() : record.nodeId, designated, forwardedHere, backgroundWaitedMs);

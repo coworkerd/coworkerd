@@ -18,7 +18,7 @@ inline uint64_t oomKillsIn(std::string_view text) {
 }
 
 // A cgroup's memory.events, which the process pool reads every 10 ms: one descriptor kept open and read from its
-// start (the kernel regenerates the text at offset 0), not an open, read and close each time (v138 section 1).
+// start (the kernel regenerates the text at offset 0), not an open, read and close each time.
 class MemoryEventsReader {
 public:
   explicit MemoryEventsReader(std::string path): path(std::move(path)), fd(::open(this->path.c_str(), O_RDONLY | O_CLOEXEC)) {}

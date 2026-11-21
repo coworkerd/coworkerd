@@ -133,8 +133,8 @@ function workerResponses() {
   add(loadStatus, loadCode);
   add(unavailableStatus, runtimeUnavailable, 'Not executed', { dispatched: unavailableDispatched, retryable: unavailableRetryable });
   } else {
-    // S1 removes ordinary preparation and its 409/CODE_UNAVAILABLE HTTP
-    // producers. Do not import dead producers just to match the main table.
+    // Ordinary preparation and its 409/CODE_UNAVAILABLE HTTP
+    // producers are retired. Do not import dead producers just to match the main table.
     const [, loadCode, loadStatus] = evidence(generic,
       /refusal\("([A-Z_]+)", trialClean\(message, secrets, variables\), (\d{3}), root\)/);
     add(loadStatus, loadCode);

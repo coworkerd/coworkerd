@@ -184,7 +184,7 @@ function __coworkerdEntry(target, classes) {
   }
   return __coworkerdHas(target, "fetch") ? "object" : "unusable";
 }
-// Whether a call naming this entrypoint gets as far as tenant code (v40's load check): the bridge's own
+// Whether a call naming this entrypoint gets as far as tenant code: the bridge's own
 // checks before it calls the tenant, made from descriptors so that no getter runs, and as lenient as the
 // bridge (a WorkerEntrypoint class may define fetch per instance). False only where the call would fail
 // before any handler started.

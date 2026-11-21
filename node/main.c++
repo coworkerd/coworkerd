@@ -3801,8 +3801,8 @@ public:
     // catches; the exception detail makes it the error's `code` in workerd's JS conversion.
     // The description is built here and set as it is: KJ's macros label every argument that is not a string literal
     // with the expression it came from (`code.c_str() = ...`), and the label would stand between the `jsg.` prefix
-    // and the code -- workerd passes a message on only when the description starts with `jsg.` (v62 met the same
-    // thing on the Durable Object log's refusals).
+    // and the code -- workerd passes a message on only when the description starts with `jsg.` (the same
+    // applies to the Durable Object log's refusals).
     const auto message = "jsg.Error: " + code + ": " + body;
     kj::throwFatalException(tagRpcError(kj::Exception(kj::Exception::Type::FAILED,
         __FILE__, __LINE__, kj::heapString(message.c_str())), code.c_str()));
@@ -5448,7 +5448,7 @@ public:
   DurableLogSinkServer(coworkerd::DurableLog& log, uint64_t streamId): log(log), streamId(streamId) {}
 
   // Answered here, synchronously, in the order the calls arrive on the stream: the owner relies on getting the answers
-  // to one stream's appends in the order it sent them (r48: an answer then accounts only for its own record and those
+  // to one stream's appends in the order it sent them (an answer then accounts only for its own record and those
   // before it). Do not make this asynchronous without changing that accounting (DurableLog::pumpPeer).
   kj::Promise<void> append(AppendContext context) override {
     auto records = context.getParams().getRecords();
@@ -5520,7 +5520,7 @@ public:
           refusal.empty() ? "this node does not hold the epoch the request is for" : refusal.c_str());
       co_return;
     }
-    // r48: a request of a newer epoch of the shard than this node knows raises its peer floor first (checked against
+    // A request of a newer epoch of the shard than this node knows raises its peer floor first (checked against
     // the object store); the answer is computed after the raise, so it has every append taken before it.
     co_await durableLog.raisePeerFence(ask);
     auto result = context.getResults().initResult();
@@ -8773,7 +8773,7 @@ private:
 // WebSocket connections are told to go away (1001), the requests in flight get up to a second, and the durable processes
 // start again, empty -- every facet closed --, before another node can take a shard over (a TTL plus the grace after this
 // node's last heartbeat by the store's clock). Stateless calls go on as before.
-// `leaseDropped`: shards already given up synchronously when the lease ended at a confirmation or a heartbeat (r46);
+// `leaseDropped`: shards already given up synchronously when the lease ended at a confirmation or a heartbeat;
 // their objects' facets are closed here the same way.
 kj::Promise<void> watchShardOwnership(ServerCore& server, coworkerd::ProcessPool& runtime, coworkerd::DurableShards& shards,
     coworkerd::Membership& membership, kj::Timer& timer, uint32_t& leaseDropped) {
@@ -8950,7 +8950,7 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
 // configuration a Server reports is the one it runs; the pool applies the same values again.
 // The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares:
 // the threaded binary's sandbox, this machine's memory protection keys, address space and
-// vm.max_map_count lower each process's resident limit (never the process count, r50 §6.4).
+// vm.max_map_count lower each process's resident limit (never the process count).
 // A plan that refuses ends the start.
 void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
@@ -8969,7 +8969,7 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   pool.sandboxPlanJson = plan.json();
   pool.sandboxWarning = plan.warning;
   KJ_REQUIRE(plan.refusal.empty(), plan.refusal.c_str());
-  // The configured process count holds (r50 §6.4); only each process's resident limit is lowered.
+  // The configured process count holds; only each process's resident limit is lowered.
   pool.threadedResidentLimit = plan.residentLimit;
   if (plan.perProcessLimit != 0) pool.sandboxResidentLimit = plan.perProcessLimit;
   // A Wasm memory reserves its maximum in the 4 GiB buffer half of the isolate's sandbox.
@@ -9443,7 +9443,7 @@ int run(Launch launch) {
        [&shards](const std::string& namespaceId, uint32_t shard) { return shards.knownShardEpoch(namespaceId, shard); },
        [&runtime, &server, &timer](std::string reason) -> kj::Promise<void> {
          // workerd has no way to close one object: the durable processes are restarted, which closes every object of
-         // this node, and the files are only then replaced (v60 does the same when this node's membership expires).
+         // this node, and the files are only then replaced (the same happens when this node's membership expires).
          const auto killed = runtime.resetDurable(reason);
          const auto until = monotonicTimeMs() + 5000;
          while (runtime.durableInFlight() > 0 && monotonicTimeMs() < until) {
@@ -9467,7 +9467,7 @@ int run(Launch launch) {
   shards.onShardGone([&durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
     durableLog.shardGone(namespaceId, shard, reason);
   });
-  // The lease of this node's epoch is judged next to every confirmation (r46, node/durable-log.h). Once it ends --
+  // The lease of this node's epoch is judged next to every confirmation (node/durable-log.h). Once it ends --
   // judged there, at a heartbeat or by the membership's expiry check -- the shards are given up at once, synchronously,
   // after the refused records were answered; watchShardOwnership then closes their objects' facets.
   uint32_t leaseDroppedShards = 0;

@@ -1,4 +1,4 @@
-// b57: reading an object's segments through the shared decode cache gives each object exactly what the old
+// Reading an object's segments through the shared decode cache gives each object exactly what the old
 // per-object reader gave it -- the same records, order, exclusion evidence, log lines and errors -- while each
 // segment is downloaded and decoded once. The negative controls check that these assertions catch a wrong answer:
 // most change the answer, two change the implementation (the cache keys a segment without its node epoch, or the
@@ -299,7 +299,7 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
   expectSame(broken, fixture.objects.front(), "does not add up");
 }
 
-// The cache's own behaviour (b57 §6.1), on one seed's fixture. Each step names what it would catch.
+// The cache's own behaviour, on one seed's fixture. Each step names what it would catch.
 void runCacheCase(unsigned seed) {
   auto temp = (std::filesystem::temp_directory_path() / "b57-cache-XXXXXX").string();
   KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
