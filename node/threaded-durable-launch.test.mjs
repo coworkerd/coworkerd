@@ -9,14 +9,28 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-const [nodeBinary, workerd, runtime, scenario] = process.argv.slice(2);
-const exerciseEvents = scenario === 'events';
+const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64'] = process.argv.slice(2);
+const measure = scenario === 'measure';
+const exerciseEvents = scenario === 'events' || measure;
+const homeCount = Number(homeArg);
+const treesPerHome = Number(treeArg);
+if (measure) {
+  assert.ok(Number.isInteger(homeCount) && homeCount >= 1 && homeCount <= 32);
+  assert.ok(Number.isInteger(treesPerHome) && treesPerHome >= 2 && treesPerHome <= 128);
+}
 const exec = promisify(execFile);
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
-  ...(exerciseEvents ? { COWORKERD_CPU_LIMIT_MS: '250' } : {}),
+  ...(exerciseEvents && !measure ? {
+    COWORKERD_CPU_LIMIT_MS: '250',
+    COWORKERD_THREADED_TRACE_FOR_TEST: '1',
+  } : {}),
+  ...(measure ? {
+    COWORKERD_DO_TEST_HOME_COUNT: homeArg,
+    COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
+  } : {}),
 };
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
@@ -25,7 +39,9 @@ const workerId = 'counter';
 const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
-  durableObjects: { processes: 1, threadedTestStorage: true },
+  durableObjects: {
+    processes: 1, threadedTestStorage: true, ...(measure ? { residentObjects: 0 } : {}),
+  },
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
@@ -86,6 +102,15 @@ function readAdmission(socketPath) {
   });
 }
 
+async function readProcessResources(pid) {
+  const status = await readFile(`/proc/${pid}/status`, 'utf8');
+  return {
+    threads: Number(status.match(/^Threads:\s+(\d+)/m)[1]),
+    rssKiB: Number(status.match(/^VmRSS:\s+(\d+) kB/m)[1]),
+    descriptors: (await readdir(`/proc/${pid}/fd`)).length,
+  };
+}
+
 function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n) {
   return 'D' + JSON.stringify({
     namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition: 'fixture',
@@ -114,11 +139,12 @@ try {
   await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = exerciseEvents ? `
     import { DurableObject } from "cloudflare:workers";
-    const isolate = crypto.randomUUID();
+    let isolate;
     export class Counter extends DurableObject {
       instance = crypto.randomUUID();
       latch;
       async fetch(request) {
+        isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
         if (query.has("hold")) {
           this.latch = Promise.withResolvers();
@@ -130,6 +156,11 @@ try {
         if (query.has("nested")) {
           const next = this.env.COUNTERS.get(this.env.COUNTERS.idFromName("/other"));
           return Response.json(await next.value());
+        }
+        if (query.has("facet")) {
+          const facet = this.ctx.facets.get("facet", () => ({class: this.ctx.exports.Counter}));
+          return facet.fetch("https://fixture.invalid/", request.method === "POST"
+            ? { method: "POST", body: await request.text() } : {});
         }
         if (query.has("inputGate")) {
           await this.ctx.blockConcurrencyWhile(async () => {
@@ -235,13 +266,14 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents && !measure ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
   const paths = (await readdir(scratch)).filter(name => name.startsWith('coworkerd-durable-test-'));
   assert.equal(paths.length, 1);
-  const socketPath = join(scratch, paths[0], 'run', processInfo.socket);
+  const stack = join(scratch, paths[0]);
+  const socketPath = join(stack, 'run', processInfo.socket);
   const ordinary = await sendPreface(socketPath, 'T');
   ordinary.socket.destroy();
   assert.equal(ordinary.receipt, 'R');
@@ -301,7 +333,33 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (exerciseEvents) {
+  if (measure) {
+    const query = (index, body) => fetch(`http://127.0.0.1:${port}/occupy-${index}`, {
+      method: 'POST', body, signal: AbortSignal.timeout(5000),
+    });
+    const baseline = await readProcessResources(processInfo.pid);
+    const isolates = new Set();
+    const body = 'x'.repeat(4096);
+    const count = homeCount * treesPerHome;
+    const start = performance.now();
+    for (let i = 0; i < count; ++i) {
+      const reply = await query(i, body);
+      const payload = await reply.text();
+      assert.equal(reply.status, 200, payload + '\n' + diagnostics);
+      isolates.add(JSON.parse(payload).isolate);
+    }
+    const refusal = await query(count, body);
+    const reason = await refusal.text();
+    assert.equal(refusal.status, 502, reason + '\n' + diagnostics);
+    assert.equal(isolates.size, homeCount);
+    const loaded = await readAdmission(socketPath);
+    assert.equal(loaded.homes, homeCount);
+    assert.equal(loaded.residentRoots, count);
+    const full = await readProcessResources(processInfo.pid);
+    assert.equal((await query(0, 'still ready')).status, 200);
+    console.log(JSON.stringify({ homes: homeCount, treesPerHome, residentRoots: count,
+      bodyBytes: body.length, warmupMs: performance.now() - start, baseline, full, admission: loaded }));
+  } else if (exerciseEvents) {
     const request = async (path, options, status = 200) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         ...options, signal: AbortSignal.timeout(5000),
@@ -316,6 +374,11 @@ try {
     const other = await request('/other', { method: 'POST', body: 'other tree' });
     assert.notEqual(other.instance, initial.instance);
     assert.equal(other.isolate, initial.isolate);
+    const firstFacet = await request('/first?facet', { method: 'POST', body: 'fixture facet' });
+    assert.notEqual(firstFacet.instance, initial.instance);
+    assert.equal(firstFacet.isolate, initial.isolate);
+    assert.equal(firstFacet.counter, 'fixture facet');
+    assert.deepEqual(await request('/first?facet'), firstFacet);
     const waiting = request('/first?hold');
     waiting.catch(() => {});
     // Observe the first event in its await before issuing another event to the same actor.
@@ -375,6 +438,35 @@ try {
     assert.notEqual(reopened.instance, previous.instance);
     assert.equal(reopened.isolate, previous.isolate);
     assert.equal(reopened.counter, previous.counter);
+    const reopenedFacet = await request('/first?facet');
+    assert.notEqual(reopenedFacet.instance, firstFacet.instance);
+    assert.equal(reopenedFacet.isolate, reopened.isolate);
+    assert.equal(reopenedFacet.counter, firstFacet.counter);
+
+    const log = join(stack, 'logs', 'workerd.log');
+    let completeTrace = false;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      const lines = await readFile(log, 'utf8');
+      const records = Array.from(lines.matchAll(/\[threaded-durable-actor\] (\{[^\n]*\})/g),
+        match => JSON.parse(match[1]));
+      const closedFacet = records.find(record => record.facet !== 0 && record.phase === 'destroyed');
+      if (closedFacet) {
+        const root = records.find(record => record.tree === closedFacet.tree && record.facet === 0);
+        const actors = new Set(records.filter(record => record.tree === closedFacet.tree).map(record => record.actor));
+        for (const actor of actors) {
+          const turns = records.filter(record => record.actor === actor);
+          assert.ok(turns.every(record => record.home === root.home && record.tid === root.tid));
+        }
+        const rootEnd = records.findIndex(record => record.actor === root.actor && record.phase === 'destroyed');
+        if (rootEnd !== -1) {
+          assert.ok(rootEnd > records.indexOf(closedFacet));
+          completeTrace = true;
+          break;
+        }
+      }
+      await delay(25);
+    }
+    assert.ok(completeTrace, 'missing same-home facet and root destruction evidence');
   }
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
   child.kill('SIGTERM');

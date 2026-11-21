@@ -120,17 +120,23 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
-| `node-threaded-durable-events` (Linux only) | Both kernel binaries, for object fetch, RPC, idle retirement and reopening |
+| `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
 
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
 an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
 fixture deployments. Each threaded durable child starts without a persistent log channel.
+The fixture derives local namespaces from the active declarations and routes them only within the node.
+Each child generation opens a fresh SQLite volume inside the fixture stack.
 The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
 `COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
 `COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
 descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
+
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 8 64`
+to fill one durable child with eight copies of 64 real objects each. The tool checks the next object's refusal
+and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries

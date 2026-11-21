@@ -2300,6 +2300,7 @@ public:
 
   // ---- Durable Objects ----
   bool durableReady(const std::string& objectKey) { return runtime.durableAvailable(objectKey); }
+  bool usesDisposableDurableStorage() const { return serverConfig.processPool.threadedDurableTestStorage; }
   std::string durableProcessFor(const std::string& objectKey) const { return runtime.durableProcessFor(objectKey); }
   // How many Durable Object calls led to an object's requests: the most of those in flight, else its latest one's. A call
   // the object makes counts one more (DO_HOP_LIMIT beyond MAX_DURABLE_HOPS): the node's own count, whatever the tenant's
@@ -2411,28 +2412,30 @@ public:
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
-    trackRootNamespace(target.namespaceId);
-    if (!target.isDatabase()) {
-      // One installation registers every declared class, including classes never opened here.
-      for (const auto& name : version->declaredClasses)
-        if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
-            space != nullptr && space->status == "active") trackRootNamespace(space->id);
-    }
-    auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
-        target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
-    if (!checked.ready) {
-      std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
-                << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
-                << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
-                << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
-      if (checked.channelMissing) {
-        try { runtime.requestAutomaticRotation(process->processId, "channel"); }
-        catch (...) {
-          std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
-                    << "\",\"generation\":" << process->generation << "}" << std::endl;
-        }
+    if (!process->threadedDurableTestRole()) {
+      trackRootNamespace(target.namespaceId);
+      if (!target.isDatabase()) {
+        // One installation registers every declared class, including classes never opened here.
+        for (const auto& name : version->declaredClasses)
+          if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
+              space != nullptr && space->status == "active") trackRootNamespace(space->id);
       }
-      throw DurableDispatchRefused{std::move(checked)};
+      auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+          target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
+      if (!checked.ready) {
+        std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
+                  << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
+                  << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
+                  << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
+        if (checked.channelMissing) {
+          try { runtime.requestAutomaticRotation(process->processId, "channel"); }
+          catch (...) {
+            std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
+                      << "\",\"generation\":" << process->generation << "}" << std::endl;
+          }
+        }
+        throw DurableDispatchRefused{std::move(checked)};
+      }
     }
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
@@ -6495,6 +6498,16 @@ public:
     std::string code, reason;
     auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
+    if (server.usesDisposableDurableStorage()) {
+      if (request.target.isDatabase() || request.target.alarmAtUnixMs) {
+        co_return refused(server.refusal("NOT_SUPPORTED", "the durable test role supports object events", 501));
+      }
+      request.target.shardEpoch = 1;
+      request.target.dataEpoch = 1;
+      auto ran = co_await runHere(std::move(request), std::move(version), line, started, deadline);
+      if (ran.refusal) co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
+      co_return kj::mv(ran.dispatched);
+    }
     auto route = co_await shards.route(request.target.namespaceId, request.target.shard);
     for (uint32_t attempt = 1;; ++attempt) {
       if (route.kind == coworkerd::ShardRoute::Kind::REFUSE) {
@@ -6553,6 +6566,9 @@ public:
     rpc::EventDispatcher::Client dispatcher = nullptr;
   };
   kj::Promise<Received> receive(Request request, uint32_t shard, uint64_t expectedEpoch, std::string from) {
+    if (server.usesDisposableDurableStorage()) {
+      co_return Received{server.refusal("NOT_SUPPORTED", "the durable test role only accepts local dispatch", 501)};
+    }
     const auto started = monotonicTimeMs();
     const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
     Line line{request.workerId, {}, request.allocation ? "worker" :
@@ -6652,6 +6668,7 @@ private:
   kj::Promise<Ran> runHere(Request request, std::shared_ptr<const VersionDefinition> version, Line line, double started,
       double deadline) {
     const auto target = request.target;
+    const bool disposable = server.usesDisposableDurableStorage();
     auto refused = [&](const InvocationRejection& refusal) {
       server.observeLocalRefusal(refusal, "durableObject");
       log(line, target, nullptr, refusal.status, refusal.code, started);
@@ -6665,14 +6682,16 @@ private:
       if (auto capacity = server.admission(version->workerId, version->definitionHash, false, deadline,
               false, false, &target)) co_return refused(*capacity);
     }
-    auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
-        coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false,
-        target.alarmAtUnixMs != 0, target.alarmAtUnixMs == 0);
-    if (!ready.ready) {
-      line.recovered = ready.elapsedMs;
-      co_return refused(server.refusal(ready.code, ready.reason, ready.status));
+    if (!disposable) {
+      auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
+          coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false,
+          target.alarmAtUnixMs != 0, target.alarmAtUnixMs == 0);
+      if (!ready.ready) {
+        line.recovered = ready.elapsedMs;
+        co_return refused(server.refusal(ready.code, ready.reason, ready.status));
+      }
+      if (ready.rebuilt) line.recovered = ready.elapsedMs;
     }
-    if (ready.rebuilt) line.recovered = ready.elapsedMs;
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
@@ -6685,7 +6704,7 @@ private:
     slot->durable = true;
     slot->durableObject = {target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard};
-    slot->durableLog = &durableLog;
+    if (!disposable) slot->durableLog = &durableLog;
     slot->timing = request.timing;
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
@@ -6706,14 +6725,16 @@ private:
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
-      durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
-          target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
+      if (!disposable) {
+        durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+            target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
+      }
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
       server.objectBegin(target.key(), target.hops);
       slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops,
           log = slot->durableLog, object = slot->durableObject, processId = slot->process->processId,
           generation = slot->process->generation]() {
-        log->objectRequestFinished(object, processId, generation);
+        if (log != nullptr) log->objectRequestFinished(object, processId, generation);
         previous();
         server.objectEnd(key, hops);
       };
@@ -6747,7 +6768,7 @@ private:
   // line on the owner.
   void log(const Line& line, const DurableTarget& target, const coworkerd::ProcessCall* process, uint status, const std::string& code,
       double started) {
-    if (process != nullptr && status >= 500)
+    if (process != nullptr && !process->threadedDurableTestRole() && status >= 500)
       durableLog.objectFailed(target.namespaceId, target.objectId, target.shardEpoch, "request",
           code.empty() ? "HTTP " + std::to_string(status) : code);
     std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
@@ -9373,7 +9394,7 @@ int run(Launch launch) {
       serverConfig.peerListenAddress, serverConfig.peers,
       io.provider->getNetwork(), timer, *headerTable, serverConfig.desiredState.objectStore);
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
-      io.provider->getNetwork(), timer, *headerTable);
+      io.provider->getNetwork(), timer, *headerTable, serverConfig.processPool.threadedDurableTestStorage);
   const auto stackDirectory = launch.stackDirectory;
   coworkerd::checkRootStorageFormat(stackDirectory, true);
   // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).

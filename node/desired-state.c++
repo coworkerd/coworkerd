@@ -21,8 +21,10 @@ std::string quote(const std::string& value) {
 
 class FileDesiredState final: public DesiredState {
 public:
-  FileDesiredState(DesiredStateConfig config, std::filesystem::path manifest)
-      : settings(std::move(config)), manifest(std::move(manifest)) {
+  FileDesiredState(DesiredStateConfig config, std::filesystem::path manifest,
+      bool disposableDurableNamespaces)
+      : settings(std::move(config)), manifest(std::move(manifest)),
+        disposableDurableNamespaces(disposableDurableNamespaces) {
     if (settings.codeDirectory.empty()) settings.codeDirectory = this->manifest.parent_path();
   }
   kj::Promise<void> start() override { reload(); return kj::READY_NOW; }
@@ -42,6 +44,25 @@ public:
     }
     auto next = std::make_unique<DeploymentState>(DeploymentState::fromInput(input,
         current ? current->revision() + 1 : 1, current ? current->generation() + 1 : 1));
+    if (disposableDurableNamespaces) {
+      // The positional fixture has no control plane. Derive stable namespace IDs for
+      // its active classes so normal namespace selection can run against the scratch stack.
+      std::vector<DeploymentState::Change> changes;
+      for (const auto& [worker, pin] : input.active) {
+        const auto& version = *input.versions.at(worker + "@" + pin.versionId);
+        std::map<std::string, DurableObjectNamespace> spaces;
+        for (const auto& name : version.declaredClasses) {
+          spaces.emplace(name, DurableObjectNamespace{
+            deploymentSha256("coworkerd-durable-test-namespace:" + worker + ":" + name),
+            "active", 1,
+          });
+        }
+        if (!spaces.empty()) {
+          changes.push_back({deploymentNamespacesKey(worker), namespacesStateJson(spaces)});
+        }
+      }
+      if (!changes.empty()) next->apply(changes, false, next->revision());
+    }
     auto problem = next->firstProblem();
     KJ_REQUIRE(problem.empty(), problem.c_str());
     KJ_REQUIRE(!next->routes().empty(), "at least one route is required");
@@ -103,6 +124,7 @@ public:
 private:
   DesiredStateConfig settings;
   std::filesystem::path manifest;
+  const bool disposableDurableNamespaces;
   DefinitionIndex index;
   std::map<std::string, std::string> fingerprints;
   std::unique_ptr<DeploymentState> current;
@@ -142,11 +164,12 @@ std::string FileDesiredState::json(bool full) const {
 }  // namespace
 
 kj::Own<DesiredState> newDesiredState(const DesiredStateConfig& config, const std::filesystem::path& manifest,
-    kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headers) {
+    kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headers,
+    bool disposableDurableNamespaces) {
   KJ_REQUIRE(config.backend == "file" || config.backend == "objectStore", "unknown desired state backend", config.backend.c_str());
   KJ_REQUIRE(config.versionResolutionForTest.empty() || config.versionResolutionForTest == "per-call",
       "versionResolutionForTest must be empty or per-call");
   if (config.backend == "objectStore") return newObjectStoreDesiredState(config, network, timer);
-  return kj::heap<FileDesiredState>(config, manifest);
+  return kj::heap<FileDesiredState>(config, manifest, disposableDurableNamespaces);
 }
 }  // namespace coworkerd
