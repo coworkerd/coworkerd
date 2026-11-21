@@ -1659,7 +1659,8 @@ public:
     }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
-    if (serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
+    if (!(durable && serverConfig.processPool.threadedDurableTestStorage) &&
+        serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
       value.category = durable ? "paused-durable" : runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
       value.avoidMs = 0;
     }
@@ -1669,7 +1670,8 @@ public:
 
   uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
   bool durablePaused(const std::string& worker, const std::string& objectKey) {
-    return pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
+    return !serverConfig.processPool.threadedDurableTestStorage &&
+        pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
   }
   struct Admission {
     std::optional<InvocationRejection> refused;
@@ -1802,7 +1804,8 @@ public:
   std::string_view admissionTenant(const std::string& worker, const DurableTarget* durable = nullptr) const {
     // Worker identity comes from the selected deployment. Do not use an ingress header.
     // A scheduled alarm has no ingress caller; its scheduler continues to use the node-wide limits.
-    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) || (durable && durable->alarmAtUnixMs)) return {};
+    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) ||
+        (durable && (durable->alarmAtUnixMs || serverConfig.processPool.threadedDurableTestStorage))) return {};
     auto slash = worker.find('/');
     return slash == std::string::npos ? std::string_view() : std::string_view(worker).substr(0, slash);
   }
@@ -2394,6 +2397,9 @@ public:
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
+    if (process->threadedDurableTestRole() && (target.isDatabase() || target.alarmAtUnixMs)) {
+      throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", "the durable test role supports object requests"}};
+    }
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
       if (auto missing = secretRefusal(*version, false, true))
@@ -3394,7 +3400,8 @@ private:
     // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
     // (and the loader key of a Worker that names none has no limits segment).
     auto limits = namedLimits(version.workerId);
-    if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
+    if (process.threadedDurableTestRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
+    else if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
@@ -3466,7 +3473,28 @@ private:
       capnp::JsonCodec json;
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
-        const auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        if (process.threadedDurableTestRole()) {
+          capnp::MallocMessageBuilder planDocument;
+          auto plan = planDocument.initRoot<capnp::JsonValue>();
+          json.decodeRaw(kj::StringPtr(root->plan.c_str()).asArray(), plan);
+          const auto definition = coworkerd::json::field(plan.asReader(), "versionFingerprint");
+          KJ_REQUIRE(definition.isString(), "missing pinned durable test definition");
+          const auto storage = coworkerd::makeRootStorageRef(durable->namespaceId, durable->objectId, durable->dataEpoch);
+          KJ_REQUIRE(std::isfinite(expiresAtMonotonicMs) && expiresAtMonotonicMs > 0 &&
+              expiresAtMonotonicMs < double(INT64_MAX) / 1000000, "invalid durable test dispatch deadline");
+          std::ostringstream route;
+          route << ",\"durableTestRoute\":{\"namespaceId\":\"" << jsonEscape(durable->namespaceId)
+                << "\",\"objectId\":\"" << jsonEscape(durable->objectId) << "\",\"className\":\""
+                << jsonEscape(durable->className) << "\",\"definition\":\"" << jsonEscape(definition.getString().cStr())
+                << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
+                << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
+                << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
+                << "\",\"queuedBytes\":\"" << encoded.size() << "\",\"expiresMonotonicNs\":\""
+                << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
+          encoded.pop_back();
+          encoded += route.str();
+        }
         return kj::str(encoded.c_str());
       }
       return encodeNative(json.encode(descriptor.asReader()));

@@ -40,3 +40,4 @@
 0044-s1e-node-cost-and-long-operations.patch
 0045-threaded-durable-admission.patch
 0046-durable-test-routing.patch
+0047-durable-test-events.patch

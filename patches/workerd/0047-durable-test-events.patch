@@ -1,0 +1,1040 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 05:02:26 +0800
+Subject: [PATCH] Deliver opted-in durable test events on their home
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement-test.c++ b/src/workerd/server/factory/coworkerd-durable-placement-test.c++
+index a3af53c23b3dbd9219a5d47f95a114472284bc36..789cedc6845825b540c4405c3eafd1d80dd8e51c 100644
+--- a/src/workerd/server/factory/coworkerd-durable-placement-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-placement-test.c++
+@@ -60,5 +60,21 @@ KJ_TEST("durable home retains the partial bucket at the start of its rolling win
+   KJ_EXPECT((home.busyFor(origin + 4070ms) == 57ms));
+ }
+ 
++KJ_TEST("durable pressure evicts idle objects before closing placement and resets only on continuing pressure") {
++  using Action = DurablePressure::Action;
++  DurablePressure pressure;
++  KJ_EXPECT(pressure.sample(true, true, true) == Action::EVICT_IDLE);
++  KJ_EXPECT(pressure.accepting());
++  KJ_EXPECT(pressure.sample(false, false, false) == Action::ACCEPT);
++  KJ_EXPECT(pressure.sample(true, true, false) == Action::CLOSE_PLACEMENT);
++  KJ_EXPECT(!pressure.accepting());
++  KJ_EXPECT(pressure.sample(true, false, false) == Action::WAIT);
++  KJ_EXPECT(pressure.sample(true, true, false) == Action::RESET);
++  KJ_EXPECT(pressure.resetting());
++  KJ_EXPECT(pressure.sample(false, false, true) == Action::WAIT);
++  pressure.closed();
++  KJ_EXPECT(pressure.accepting());
++}
++
+ }  // namespace
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement.c++ b/src/workerd/server/factory/coworkerd-durable-placement.c++
+index 5cdf2ce86b1edcd52bf1611a7b2bf05c8d2ca96d..334094a476296bd154ead70bdb984abcea5333ce 100644
+--- a/src/workerd/server/factory/coworkerd-durable-placement.c++
++++ b/src/workerd/server/factory/coworkerd-durable-placement.c++
+@@ -74,4 +74,21 @@ std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate>
+   return selected == nullptr ? std::nullopt : std::optional(selected->home);
+ }
+ 
++DurablePressure::Action DurablePressure::sample(
++    bool abovePlacement, bool aboveHardLimit, bool idleTree) {
++  if (phase == Phase::RESETTING) return Action::WAIT;
++  if (!abovePlacement) {
++    phase = Phase::OPEN;
++    return Action::ACCEPT;
++  }
++  if (idleTree) return Action::EVICT_IDLE;
++  if (phase == Phase::OPEN) {
++    phase = Phase::CLOSED;
++    return Action::CLOSE_PLACEMENT;
++  }
++  if (!aboveHardLimit) return Action::WAIT;
++  phase = Phase::RESETTING;
++  return Action::RESET;
++}
++
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-placement.h b/src/workerd/server/factory/coworkerd-durable-placement.h
+index cfa62b2738023c269f0322e7b1e036ef6fbf0b21..160b7089482adf92fae22264e1008a557813edf1 100644
+--- a/src/workerd/server/factory/coworkerd-durable-placement.h
++++ b/src/workerd/server/factory/coworkerd-durable-placement.h
+@@ -61,4 +61,20 @@ std::optional<uint64_t> chooseDurableCopy(std::span<const DurableCopyCandidate>
+     std::string_view definition,
+     DurablePlacementLimits limits);
+ 
++// The caller samples again after idle trees are destroyed. A distinct observation
++// after closing placement is required before it can reset the copy.
++class DurablePressure {
++ public:
++  enum class Action { ACCEPT, EVICT_IDLE, CLOSE_PLACEMENT, WAIT, RESET };
++
++  Action sample(bool abovePlacement, bool aboveHardLimit, bool idleTree);
++  bool accepting() const { return phase == Phase::OPEN; }
++  bool resetting() const { return phase == Phase::RESETTING; }
++  void closed() { phase = Phase::OPEN; }
++
++ private:
++  enum class Phase { OPEN, CLOSED, RESETTING };
++  Phase phase = Phase::OPEN;
++};
++
+ }  // namespace workerd::server
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index e05b8897dddcd81efa71ba4ab12de73a46168b7d..344e9c2464569dda5eef74572d7d25b7ec1786d7 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -7,6 +7,7 @@ THREADED_DEPS = [
+     ":protocol_capnp",
+     "//src/workerd/api:memory-cache",
+     "//src/workerd/io",
++    "//src/workerd/io:actor",
+     "//src/workerd/io:compatibility-date",
+     "//src/workerd/io:worker-entrypoint",
+     "//src/workerd/jsg",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 4920d4b64b069bcf924a9ea8f1da5e0448354ea8..0f2e1e817e6644bbc66ca40ebf1bd36f0ccc2ed3 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4,9 +4,11 @@
+ 
+ #include "protocol.h"
+ 
++#include <workerd/api/actor-state.h>
+ #include <workerd/api/memory-cache.h>
+ #include <workerd/api/worker-rpc.h>
+ #include <workerd/io/actor-cache.h>
++#include <workerd/io/actor-sqlite.h>
+ #include <workerd/io/compatibility-date.h>
+ #include <workerd/io/io-channels.h>
+ #include <workerd/io/io-context.h>
+@@ -70,6 +72,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <limits>
+ #include <map>
+ #include <memory>
+@@ -1233,6 +1236,8 @@ struct Slot {
+   std::set<std::string> httpEntrypoints, entrypoints, actorClasses;
+   std::vector<std::string> loopbacks, loopbackActors;
+   std::atomic<uint> active{0}, maxActive{0}, creates{0};
++  std::function<void(bool)> homeTurn;
++  std::function<void(Worker::Actor&)> resetDurableRoot;
+ };
+ 
+ struct Entry {
+@@ -1284,11 +1289,19 @@ struct RequestLimits final: LimitEnforcer {
+       uint expected = 0;
+       KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
+       slot.maxActive.store(1);
++      if (slot.homeTurn) slot.homeTurn(true);
++      if (slot.resetDurableRoot) owner.durableTurnStart = cpu;
+     }
+     ~Scope() noexcept(false) {
++      KJ_DEFER(if (slot.homeTurn) slot.homeTurn(false));
+       execution.finish();
+       auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
+       measurement.totalCpu += used;
++      if (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU) {
++        auto expected = LimitCause::NONE;
++        measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
++      }
++      owner.sqlBudget.reset();
+       if (traceForTest()) {
+         char row[320];
+         int size = snprintf(row, sizeof(row),
+@@ -1318,7 +1331,20 @@ struct RequestLimits final: LimitEnforcer {
+     auto scope = kj::heap<Scope>(*this, context, js.v8Isolate);
+     return scope;
+   }
+-  void topUpActor() override {}
++  void topUpActor() override {
++    if (slot.resetDurableRoot && measurement.limitCause.load() == LimitCause::NONE) {
++      measurement.totalCpu = 0;
++    }
++  }
++  std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
++    if (!slot.resetDurableRoot || slot.limits->cpuMs == 0) return {};
++    if (!sqlBudget) {
++      const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
++      const auto left = maximum - kj::min(maximum, measurement.totalCpu);
++      sqlBudget = std::make_shared<SqlExecutionBudget>(maximum, durableTurnStart + left);
++    }
++    return sqlBudget;
++  }
+   void newSubrequest(bool) override {}
+   void newKvRequest(KvOpType) override {
+     unsupported("kv");
+@@ -1372,6 +1398,11 @@ struct RequestLimits final: LimitEnforcer {
+         identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
+         slot.limits->memory->peakUsedBytes.load());
+     if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
++    if (value == LimitCause::CPU && slot.resetDurableRoot) {
++      KJ_IF_SOME(actor, context.getActor()) {
++        slot.resetDurableRoot(actor);
++      }
++    }
+     context.abort(limitException(value));
+   }
+   kj::Maybe<EventOutcome> getLimitsExceeded() override {
+@@ -1402,6 +1433,8 @@ struct RequestLimits final: LimitEnforcer {
+   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
+   kj::ForkedPromise<void> failure;
+   bool published = false;
++  uint64_t durableTurnStart = 0;
++  std::shared_ptr<SqlExecutionBudget> sqlBudget;
+ };
+ 
+ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
+@@ -1454,6 +1487,15 @@ struct ThreadState {
+     if (decisionSpare >= 0) close(decisionSpare);
+   }
+   bool rejectOnly = false;
++  uint64_t durableHome = 0;
++  std::shared_ptr<Slot> durableSlot;
++  std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
++  struct DurableRoot {
++    kj::Own<Worker::Actor> actor;
++    server::DurableAdmission::Time lastUse;
++    bool resetting = false;
++  };
++  std::map<uint64_t, DurableRoot> durableRoots;
+ };
+ 
+ Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
+@@ -1496,6 +1538,7 @@ struct DurableRoute {
+   server::DurableAdmission::Key key;
+   server::DurableAdmission::Open open;
+   std::string invocation;
++  std::string uniqueKey, storageId;
+ 
+   bool operator==(const DurableRoute&) const = default;
+ };
+@@ -1507,6 +1550,12 @@ struct DurableIncoming {
+   server::DurableAdmission::Time deadline;
+ };
+ 
++uint64_t boundedDurableSetting(const char* name, uint64_t fallback, uint64_t maximum) {
++  const auto value = configuredCount(name, fallback);
++  KJ_REQUIRE(value > 0 && value <= maximum, "invalid durable test setting", name);
++  return value;
++}
++
+ uint64_t durableNumber(std::string_view encoded) {
+   uint64_t number;
+   auto [end, error] = std::from_chars(encoded.data(), encoded.data() + encoded.size(), number);
+@@ -1537,7 +1586,7 @@ DurableRoute readDurableRoute(Json::Reader value) {
+     {durableNumber(value, "generation"), durableNumber(value, "dataEpoch"),
+         durableNumber(value, "shardEpoch"), durableNumber(value, "openId"),
+         checkedText("definition", 256), checkedText("className", 255)},
+-    checkedText("invocationId", 255)};
++    checkedText("invocationId", 255), checkedText("uniqueKey", 100), identifier("storageId")};
+ }
+ 
+ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+@@ -1894,24 +1943,23 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+ 
+ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+  public:
+-  explicit DurableBootstrap(DurableRoute route): route(std::move(route)) {}
++  DurableBootstrap(ThreadedServer& server, ThreadState& state, DurableRoute route,
++      server::DurableAdmission::Ticket ticket, kj::Own<kj::PromiseFulfiller<void>> accepted)
++      : server(server), state(state), route(std::move(route)), ticket(ticket),
++        accepted(kj::mv(accepted)) {}
+ 
+-  kj::Promise<void> startEvent(StartEventContext context) override {
+-    return checkDescriptor(context.getParams().getCfBlobJson());
+-  }
+-  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override {
+-    return checkDescriptor(context.getParams().getCfBlobJson());
+-  }
++  kj::Promise<void> startEvent(StartEventContext context) override;
++  kj::Promise<void> startNativeEvent(StartNativeEventContext context) override;
+ 
+  private:
++  ThreadedServer& server;
++  ThreadState& state;
+   DurableRoute route;
++  server::DurableAdmission::Ticket ticket;
++  kj::Own<kj::PromiseFulfiller<void>> accepted;
++  bool used = false;
+ 
+-  kj::Promise<void> checkDescriptor(kj::StringPtr descriptor) {
+-    JsonDoc full(descriptor);
+-    KJ_REQUIRE(readDurableRoute(field(full.get(), "durableTestRoute")) == route,
+-        "durable routing descriptor mismatch");
+-    return unsupportedError("threaded durable event dispatch");
+-  }
++  kj::Promise<kj::Own<WorkerInterface>> prepare(kj::String descriptor, Frankenvalue props);
+ };
+ 
+ struct SubrequestBudget {
+@@ -1966,9 +2014,14 @@ struct ThreadedServer {
+   jsg::V8System v8{platform, {}, basePlatform.get()};
+   const std::string sourceAddress, identity;
+   const std::unique_ptr<server::DurableTestStorage> durableTestStorage;
++  const server::DurablePlacementLimits durablePlacement;
+   std::optional<server::DurableAdmission> durableAdmission;
+   std::mutex durableRoutingMutex;
++  using DurableWake = kj::Own<kj::CrossThreadPromiseFulfiller<void>>;
++  std::map<uint64_t, std::map<uint64_t, DurableWake>> durableWaiters;
+   std::atomic<uint64_t> durableHomeSessions{0};
++  std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
++  std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
+@@ -1988,7 +2041,7 @@ struct ThreadedServer {
+   std::shared_ptr<ResourceBudget> resources;
+   LifecycleChannel lifecycle;
+   std::shared_ptr<TenantBudget> tenantBudget;
+-  uint64_t nextInstance = 0;
++  std::atomic<uint64_t> nextInstance{0};
+   struct Thread {
+     const bool control;
+     const bool maintenanceOnly;
+@@ -2002,9 +2055,12 @@ struct ThreadedServer {
+       uint32_t reservedTrees = 0;
+       uint64_t memory = 0;
+       server::DurableHomeLoad load{std::chrono::seconds(4)};
++      server::DurablePressure pressure;
+       std::vector<DurableIncoming> incoming;
++      std::set<uint64_t> resident;
+     };
+     std::optional<DurableHome> home;
++    uint64_t homeId = 0;
+     Thread(bool control, bool maintenanceOnly)
+         : control(control),
+           maintenanceOnly(maintenanceOnly),
+@@ -2032,10 +2088,22 @@ struct ThreadedServer {
+       : sourceAddress(std::move(sourceAddress)),
+         identity(std::move(identity)),
+         durableTestStorage(durableTestStorage ? std::make_unique<server::DurableTestStorage>() : nullptr),
++        durablePlacement{
++          .treesPerCopy = durableTestStorage
++              ? uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_TREES_PER_COPY", 64, 65536))
++              : 0,
++          .placementBytes = durableTestStorage
++              ? configuredCount("COWORKERD_DO_TEST_PLACEMENT_BYTES", 64ull << 20)
++              : 0,
++          .busyThreshold = durableTestStorage
++              ? std::chrono::milliseconds(boundedDurableSetting("COWORKERD_DO_TEST_BUSY_MS", 3000, 4000))
++              : std::chrono::milliseconds(0),
++        },
+         pending(limit * 2),
+         limit(limit),
+         resources(std::make_shared<ResourceBudget>(
+-            configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30),
++            configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
++                (durableTestStorage ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8 : 0),
+             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
+             limit)),
+         tenantBudget(std::make_shared<TenantBudget>(
+@@ -2045,15 +2113,24 @@ struct ThreadedServer {
+     if (this->durableTestStorage) {
+       const auto colon = this->identity.rfind(':');
+       KJ_REQUIRE(colon != std::string::npos, "invalid durable child identity");
++      KJ_REQUIRE(durablePlacement.treesPerCopy != 0 && durablePlacement.placementBytes != 0 &&
++          durablePlacement.busyThreshold > std::chrono::milliseconds(0) &&
++          durablePlacement.busyThreshold <= std::chrono::seconds(4),
++          "invalid durable copy placement thresholds");
+       // Bound pre-execution admission independently of the existing ordinary queue.
++      rlimit files;
++      KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &files));
++      const auto fdHeadroom = boundedDurableSetting("COWORKERD_DO_TEST_FD_HEADROOM", 256, 65536) +
++          uint64_t(limit) * 5;
++      KJ_REQUIRE(files.rlim_cur > fdHeadroom, "durable test descriptors leave no admission headroom");
+       durableAdmission.emplace(server::DurableAdmission::Limits{
+-        .capacity = {.threads = limit, .descriptors = uint64_t(limit) * 8,
+-          .memory = resources->admissionMaximum - resources->baselineMemory},
++        .capacity = {.threads = limit, .descriptors = files.rlim_cur - fdHeadroom,
++          .memory = configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8},
+         .tree = {.descriptors = 3, .memory = 16 * 1024},
+         .event = {.descriptors = 1, .memory = 4096},
+         .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
+-        .mailboxDepth = 4,
+-        .mailboxBytes = 64 * 1024,
++        .mailboxDepth = uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_MAILBOX_EVENTS", 4, 65536)),
++        .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", 64 * 1024),
+       }, durableNumber(std::string_view(this->identity).substr(colon + 1)));
+     }
+     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
+@@ -2285,14 +2362,13 @@ struct ThreadedServer {
+         if (!threads[i]->home) continue;
+         auto& home = *threads[i]->home;
+         if (home.definition.empty()) {
+-          if (spare == 0) spare = i + 1;
++          if (spare == 0 && !home.pressure.resetting()) spare = i + 1;
+           continue;
+         }
+         candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
+-          home.load.busyFor(now), true});
++          home.load.busyFor(now), home.pressure.accepting()});
+       }
+-      auto choice = server::chooseDurableCopy(candidates, route.open.definition,
+-          {.treesPerCopy = 64, .placementBytes = 64ull << 20, .busyThreshold = std::chrono::seconds(3)});
++      auto choice = server::chooseDurableCopy(candidates, route.open.definition, durablePlacement);
+       if (!choice && spare == 0) return false;
+       assigned = choice.value_or(spare);
+       auto& home = *threads[*assigned - 1]->home;
+@@ -2301,28 +2377,89 @@ struct ThreadedServer {
+       ++home.reservedTrees;
+     }
+     auto& thread = *threads[*assigned - 1];
++    if (thread.home->pressure.resetting()) return false;
+     thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
+     wake(thread.wake);
+     return true;
+   }
+ 
++  void publishDurableRoot(uint64_t homeId, uint64_t tree) {
++    std::lock_guard lock(durableRoutingMutex);
++    KJ_ASSERT(durableAdmission->homeFor(tree) == homeId);
++    threads[homeId - 1]->home->resident.insert(tree);
++  }
++
+   void finishDurable(server::DurableAdmission::Ticket ticket) {
+     std::lock_guard lock(durableRoutingMutex);
+     durableAdmission->cancel(ticket);
++    wakeDurableTree(ticket.tree);
+     auto assigned = durableAdmission->homeFor(ticket.tree);
+     if (!assigned) {
+       durableAdmission->releaseUnassigned(ticket.tree);
+       return;
+     }
+     durableAdmission->complete(ticket, *assigned);
++    auto& home = *threads[*assigned - 1]->home;
++    if (home.resident.contains(ticket.tree)) return;
+     if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
+     KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
+-    auto& home = *threads[*assigned - 1]->home;
+     if (--home.reservedTrees == 0) home.definition.clear();
+   }
+ 
++  // durableRoutingMutex is held while checking the FIFO and installing or
++  // waking a waiter. Fulfillment just posts to the home loop.
++  void wakeDurableTree(uint64_t tree) {
++    auto at = durableWaiters.find(tree);
++    if (at == durableWaiters.end()) return;
++    for (auto& [event, signal] : at->second) {
++      if (signal->isWaiting()) signal->fulfill();
++    }
++    durableWaiters.erase(at);
++  }
++
++  kj::Promise<void> admitDurableEvent(ThreadState& state, const DurableRoute& route,
++      server::DurableAdmission::Ticket ticket) {
++    using Admission = server::DurableAdmission;
++    for (;;) {
++      auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
++      {
++        std::lock_guard lock(durableRoutingMutex);
++        auto first = durableAdmission->next(ticket.tree);
++        KJ_REQUIRE(first.has_value() && durableAdmission->homeFor(ticket.tree) == state.durableHome,
++            "durable routing credit is no longer live");
++        if (first == ticket) {
++          const auto delivery = durableAdmission->begin(
++              ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
++          if (delivery == Admission::Delivery::EXPIRED) {
++            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++                KJ_EXCEPTION(OVERLOADED, "durable routing lease expired"), "LEASE_EXPIRED"));
++          }
++          KJ_REQUIRE(delivery == Admission::Delivery::ACCEPTED, "durable event identity changed");
++          wakeDurableTree(ticket.tree);
++          co_return;
++        }
++        durableWaiters[ticket.tree].emplace(ticket.event, kj::mv(signal.fulfiller));
++      }
++      KJ_DEFER({
++        std::lock_guard lock(durableRoutingMutex);
++        auto at = durableWaiters.find(ticket.tree);
++        if (at != durableWaiters.end()) {
++          at->second.erase(ticket.event);
++          if (at->second.empty()) durableWaiters.erase(at);
++        }
++      });
++      co_await signal.promise;
++    }
++  }
++
+   kj::Promise<void> startDurableSession(ThreadState& state, DurableIncoming call) {
+-    KJ_DEFER(finishDurable(call.ticket));
++    KJ_DEFER({
++      auto root = state.durableRoots.find(call.ticket.tree);
++      if (root != state.durableRoots.end()) {
++        root->second.lastUse = server::DurableAdmission::Clock::now();
++      }
++      finishDurable(call.ticket);
++    });
+     const auto remaining =
+         std::chrono::duration_cast<std::chrono::nanoseconds>(
+             call.deadline - server::DurableAdmission::Clock::now());
+@@ -2330,9 +2467,147 @@ struct ThreadedServer {
+     durableHomeSessions.fetch_add(1);
+     KJ_DEFER(durableHomeSessions.fetch_sub(1));
+     auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
+-    capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(std::move(call.route)));
+-    co_await state.io.provider->getTimer().timeoutAfter(remaining.count() * kj::NANOSECONDS,
+-        session.accept(*stream)).catch_([](kj::Exception&&) {});
++    auto accepted = kj::newPromiseAndFulfiller<void>();
++    capnp::TwoPartyServer session(
++        kj::heap<DurableBootstrap>(
++            *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller)));
++    auto disconnected = session.accept(*stream).fork();
++    try {
++      co_await state.io.provider->getTimer().timeoutAfter(
++          remaining.count() * kj::NANOSECONDS, kj::mv(accepted.promise))
++          .exclusiveJoin(disconnected.addBranch());
++      // The RPC membrane keeps the socket alive after admission. Its live
++      // streams and capabilities are independent of the unanswered-open timer.
++      co_await disconnected.addBranch();
++    } catch (const kj::Exception&) {
++    }
++  }
++
++  void retireIdleDurableRoots(ThreadState& state) {
++    if (!state.durableSlot) return;
++    const auto now = server::DurableAdmission::Clock::now();
++    const auto homeId = state.durableHome;
++    auto& memory = *state.durableSlot->limits->memory;
++    const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
++    const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
++    const bool pressured = accounted() >= placementLimit;
++    bool reclaimed = false;
++    for (auto it = state.durableRoots.begin(); it != state.durableRoots.end();) {
++      auto current = it++;
++      if (!current->second.resetting && !pressured &&
++          now - current->second.lastUse < std::chrono::seconds(10)) continue;
++      auto& actor = *current->second.actor;
++      KJ_IF_SOME(context, actor.getIoContext()) {
++        if (context.hasCurrentIncomingRequest()) continue;
++      }
++      const auto tree = current->first;
++      {
++        std::lock_guard lock(durableRoutingMutex);
++        if (!durableAdmission->stopIdleTree(tree, homeId)) continue;
++      }
++      if (!current->second.resetting) {
++        if (pressured) {
++          durablePressureRetirements.fetch_add(1);
++          reclaimed = true;
++        } else {
++          durableIdleRetirements.fetch_add(1);
++        }
++      }
++      actor.shutdown(0);
++      state.durableRoots.erase(current);
++      {
++        std::lock_guard lock(durableRoutingMutex);
++        KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
++        auto& home = *threads[homeId - 1]->home;
++        home.resident.erase(tree);
++        if (--home.reservedTrees == 0) home.definition.clear();
++      }
++    }
++    if (reclaimed) {
++      // Account again after the idle actors and their storage have closed.
++      v8::Locker locker(memory.isolate);
++      v8::Isolate::Scope entered(memory.isolate);
++      memory.isolate->LowMemoryNotification();
++      memory.observe();
++    }
++    server::DurablePressure::Action pressureAction;
++    bool releaseCopy;
++    {
++      std::lock_guard lock(durableRoutingMutex);
++      auto& home = *threads[homeId - 1]->home;
++      home.memory = accounted();
++      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY;
++      pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
++          home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
++      const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
++      const auto lastUse = state.durableSlot->lastUseNs.load();
++      releaseCopy = home.reservedTrees == 0 && state.durableRoots.empty() &&
++          (home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
++    }
++    if (pressureAction == server::DurablePressure::Action::RESET) {
++      for (auto& [tree, root]: state.durableRoots) {
++        root.resetting = true;
++        root.actor->abort(limitException(LimitCause::MEMORY));
++      }
++    }
++    if (releaseCopy) {
++      state.durableSlot.reset();
++      std::lock_guard lock(durableRoutingMutex);
++      auto& home = *threads[homeId - 1]->home;
++      home.memory = 0;
++      if (home.pressure.resetting()) {
++        home.pressure.closed();
++        durableIsolateResets.fetch_add(1);
++      }
++    }
++  }
++
++  void trackDurableTurn(uint64_t homeId, bool entering, uint64_t memory = 0) {
++    std::lock_guard lock(durableRoutingMutex);
++    auto& home = *threads[homeId - 1]->home;
++    const auto now = server::DurableHomeLoad::Clock::now();
++    if (entering) {
++      home.load.begin(now);
++    } else {
++      home.load.end(now);
++      home.memory = memory;
++    }
++  }
++
++  void reportDurable(bool publish, std::string* appendTo = nullptr) {
++    std::lock_guard lock(durableRoutingMutex);
++    const auto state = durableAdmission->state();
++    size_t resident = 0, homes = 0;
++    if (ready.load(std::memory_order_acquire)) {
++      for (const auto& thread : threads) {
++        const auto& home = *thread->home;
++        homes += !home.definition.empty();
++        resident += home.resident.size();
++      }
++    }
++    auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
++        ",\"residentRoots\":" + std::to_string(resident) +
++        ",\"homes\":" + std::to_string(homes) +
++        ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
++        ",\"waiting\":" + std::to_string(state.waiting) +
++        ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
++        ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
++        ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
++        ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
++        ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
++        ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
++        ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
++        ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
++        ",\"overloaded\":" + std::to_string(state.overloads) +
++        ",\"expired\":" + std::to_string(state.expired) + "}}";
++    if (publish) {
++      lifecycle.publish("{\"durableServer\":\"threaded-test\"" + row,
++          state.active, durableHomeSessions.load(), state.waiting);
++    }
++    if (appendTo) {
++      appendTo->pop_back();
++      *appendTo += row;
++    }
+   }
+ 
+   void manage() {
+@@ -2346,6 +2621,7 @@ struct ThreadedServer {
+       for (uint i = 0; i < count; ++i) {
+         auto item = std::make_unique<Thread>(i >= limit, i == limit + CONTROL_THREADS - 1);
+         if (durableAdmission) item->home.emplace();
++        if (durableAdmission) item->homeId = i + 1;
+         auto *pointer = item.get();
+         liveThreads.fetch_add(1);
+         item->thread = std::thread([this, pointer]() { runThread(*pointer); });
+@@ -2476,6 +2752,7 @@ struct ThreadedServer {
+     }
+     auto &state = *storage;
+     state.rejectOnly = thread.control;
++    state.durableHome = thread.homeId;
+     thread.idleSince.store(nowNs());
+     thread.descriptor.store(-1, std::memory_order_release);
+     wake(managerWake);
+@@ -2485,7 +2762,9 @@ struct ThreadedServer {
+       auto signal = state.io.lowLevelProvider->wrapInputFd(thread.wake);
+       for (;;) {
+         kj::byte notifications[sizeof(uint64_t)];
+-        signal->read(kj::arrayPtr(notifications)).wait(state.io.waitScope);
++        signal->read(kj::arrayPtr(notifications))
++            .exclusiveJoin(state.io.provider->getTimer().afterDelay(250 * kj::MILLISECONDS))
++            .wait(state.io.waitScope);
+         std::vector<DurableIncoming> incoming;
+         {
+           std::lock_guard lock(durableRoutingMutex);
+@@ -2494,6 +2773,7 @@ struct ThreadedServer {
+         for (auto& call: incoming) {
+           state.tasks.add(startDurableSession(state, std::move(call)));
+         }
++        retireIdleDurableRoots(state);
+       }
+     }
+     for (;;) {
+@@ -2575,7 +2855,7 @@ struct ThreadedServer {
+     auto length =
+         KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
+     while (!slot.reservation->retainSource(length)) {
+-      if (!resources->reclaim(length * 5)) {
++      if (state.durableHome != 0 || !resources->reclaim(length * 5)) {
+         if (slot.reservation->retainSource(length)) break;
+         kj::throwRecoverableException(capacityError());
+       }
+@@ -2746,8 +3026,8 @@ struct ThreadedServer {
+         auto name = text(metadata, "binding");
+         auto global = globals[serviceCount + i];
+         global.setName(name);
+-        auto space =
+-            field(field(field(descriptor, "rootSelection"), "durableObjectBindings"), name);
++        auto space = slot.resetDurableRoot ? metadata
++            : field(field(field(descriptor, "rootSelection"), "durableObjectBindings"), name);
+         auto database = field(metadata, "database");
+         if (database.isString() && database.getString().size() != 0) {
+           auto wrapped = global.initWrapped();
+@@ -2833,6 +3113,67 @@ struct ThreadedServer {
+     return worker;
+   }
+ 
++  kj::Promise<std::shared_ptr<Slot>> loadDurableWorker(
++      ThreadState& state, kj::String descriptor, std::string definition) {
++    JsonDoc document(descriptor);
++    auto input = document.get();
++    auto reservation = std::make_shared<ResourceReservation>(
++        resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
++    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
++    auto slot = std::make_shared<Slot>();
++    slot->reservation = std::move(reservation);
++    slot->instance = ++nextInstance;
++    slot->workerId = str(input, "workerId");
++    slot->versionId = str(input, "versionId");
++    slot->planRevision = std::move(definition);
++    slot->isolateLabel = "coworkerd-durable:" + std::to_string(slot->instance);
++    slot->homeTurn = [this, homeId = state.durableHome, loaded = slot.get()](bool entering) {
++      const auto& memory = *loaded->limits->memory;
++      trackDurableTurn(homeId, entering, memory.heap.load() + memory.external.load());
++    };
++    slot->resetDurableRoot = [this, &state](Worker::Actor& actor) {
++      for (auto& [tree, root]: state.durableRoots) {
++        if (root.actor.get() == &actor) {
++          if (!root.resetting) durableActorResets.fetch_add(1);
++          root.resetting = true;
++          break;
++        }
++      }
++    };
++    auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
++    auto source = co_await fetchSource(input, state, *slot);
++    trackDurableTurn(state.durableHome, true);
++    KJ_DEFER({
++      const auto bytes = slot->limits
++          ? slot->limits->memory->heap.load() + slot->limits->memory->external.load()
++          : 0;
++      trackDurableTurn(state.durableHome, false, bytes);
++    });
++    slot->worker = compile(*slot, input, source);
++    slot->complete = true;
++    co_return slot;
++  }
++
++  kj::Promise<std::shared_ptr<Slot>> getDurableWorker(
++      ThreadState& state, kj::StringPtr descriptor, const std::string& definition) {
++    if (state.durableSlot && state.durableSlot->planRevision == definition) {
++      co_return state.durableSlot;
++    }
++    KJ_REQUIRE(state.durableRoots.empty(), "durable home still owns a different isolate");
++    state.durableSlot.reset();
++    if (!state.durableLoad) {
++      state.durableLoad.emplace(loadDurableWorker(state, kj::str(descriptor), definition).fork());
++    }
++    try {
++      state.durableSlot = co_await state.durableLoad->addBranch();
++      state.durableLoad.reset();
++      co_return state.durableSlot;
++    } catch (...) {
++      state.durableLoad.reset();
++      throw;
++    }
++  }
++
+   kj::Promise<std::shared_ptr<Slot>> getWorker(
+       Json::Reader descriptor, ThreadState &state, bool &coldLoaded) {
+     auto plan = field(descriptor, "rootPlan");
+@@ -2983,6 +3324,22 @@ struct ThreadedServer {
+   }
+ };
+ 
++class DurableTestHttp final: public kj::HttpService {
++ public:
++  explicit DurableTestHttp(kj::Own<WorkerInterface> worker): worker(kj::mv(worker)) {}
++
++  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
++      kj::AsyncInputStream& body, Response& response) override {
++    if (headers.get(kj::HttpHeaderId::UPGRADE) != kj::none) {
++      return unsupportedError("WebSockets in the durable test role");
++    }
++    return worker->request(method, url, headers, body, response);
++  }
++
++ private:
++  kj::Own<WorkerInterface> worker;
++};
++
+ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
+  public:
+   ChannelDispatcher(ThreadState &state, kj::Own<WorkerInterface> worker)
+@@ -2990,7 +3347,12 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
+         worker(kj::mv(worker)) {}
+   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
+-    context.getResults().setHttp(state.http.kjToCapnp(kj::mv(worker)));
++    auto& http = state.http;
++    if (state.durableHome) {
++      context.getResults().setHttp(http.kjToCapnp(kj::heap<DurableTestHttp>(kj::mv(worker))));
++    } else {
++      context.getResults().setHttp(http.kjToCapnp(kj::mv(worker)));
++    }
+     return kj::READY_NOW;
+   }
+   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+@@ -3424,7 +3786,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+     if (channel < count(all)) {
+       auto metadata = field(all.getArray()[channel], "metadata");
+       auto name = text(metadata, "binding");
+-      auto selected = field(field(field(input(), "rootSelection"), "durableObjectBindings"), name);
++      auto selected = state.durableHome ? metadata
++          : field(field(field(input(), "rootSelection"), "durableObjectBindings"), name);
+       return {
+         text(selected, "namespaceId"), text(metadata, "className"), text(metadata, "database")};
+     }
+@@ -3495,8 +3858,9 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+       descriptor = envelope(target, text(props, "entrypoint"), assets);
+     } else if (index < serviceCount + objectCount) {
+       auto route = index - serviceCount;
+-      auto name = text(field(objects().getArray()[route], "metadata"), "binding");
+-      auto selected = field(field(field(input(), "rootSelection"), "durableObjectBindings"), name);
++      auto metadata = field(objects().getArray()[route], "metadata");
++      auto selected = state.durableHome ? metadata : field(
++          field(field(input(), "rootSelection"), "durableObjectBindings"), text(metadata, "binding"));
+       descriptor = objectEnvelope(route, text(selected, "objectId"));
+     } else {
+       auto route = index - serviceCount - objectCount;
+@@ -3848,7 +4212,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     Frankenvalue props,
+     std::shared_ptr<ResourcePreparation> preparation,
+     std::shared_ptr<TenantPermit> tenant,
+-    kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>()) {
++    kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>(),
++    kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none) {
+   if (!preparation) preparation = server.prepareSlot(slot);
+   auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
+   invocation->measurement.preparation = std::move(preparation);
+@@ -3873,7 +4238,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+       entrypoint.empty() || entrypoint == "default"
+           ? kj::Maybe<kj::String>(kj::none)
+           : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
+-      kj::mv(props), kj::none,
++      kj::mv(props), kj::mv(actor),
+       kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer,
+           kj::str("\"workerId\":", encode(field(input, "workerId")),
+               ",\"versionId\":", encode(field(input, "versionId")),
+@@ -3884,6 +4249,85 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+   return {kj::mv(entry), kj::mv(invocation)};
+ }
+ 
++class TestActorLoopback final: public Worker::Actor::Loopback, public kj::Refcounted {
++ public:
++  kj::Own<WorkerInterface> getWorker(IoChannelFactory::SubrequestMetadata) override {
++    unsupported("actor loopback events in the test storage role");
++  }
++  kj::Own<Worker::Actor::Loopback> addRef() override { return kj::addRef(*this); }
++};
++
++kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
++    kj::String descriptor, Frankenvalue props) {
++  KJ_REQUIRE(!used, "one event per durable connection");
++  used = true;
++  JsonDoc full(descriptor);
++  auto input = full.get();
++  auto selection = field(input, "rootSelection");
++  auto plan = field(input, "rootPlan");
++  KJ_REQUIRE(readDurableRoute(field(input, "durableTestRoute")) == route &&
++      flag(selection, "dispatchChecked") &&
++      str(selection, "namespaceId") == route.key.namespaceId &&
++      str(selection, "objectId") == route.key.objectId &&
++      durableNumber(selection, "dataEpoch") == route.open.dataEpoch &&
++      text(plan, "kind") == "tenant" && str(plan, "versionFingerprint") == route.open.definition &&
++      route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
++      "durable routing descriptor mismatch");
++  co_await server.admitDurableEvent(state, route, ticket);
++  auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
++  KJ_REQUIRE(slot->actorClasses.contains(route.open.className), "durable class missing from pinned Worker");
++  auto found = state.durableRoots.find(ticket.tree);
++  if (found == state.durableRoots.end()) {
++    auto actorId = ObjectIdFactory(kj::StringPtr(route.key.namespaceId.c_str()))
++        .idFromString(kj::str(route.key.objectId.c_str()));
++    auto* storage = server.durableTestStorage.get();
++    auto makeCache = [storage, uniqueKey = kj::str(route.uniqueKey.c_str()),
++                         storageId = kj::str(route.storageId.c_str())](const ActorCache::SharedLru&,
++                         OutputGate& gate, ActorCache::Hooks&, SqliteObserver& observer)
++        -> kj::Maybe<kj::Own<ActorCacheInterface>> {
++      auto database = storage->open(uniqueKey, storageId, observer);
++      return kj::heap<ActorSqlite>(kj::mv(database), gate, [](SpanParent) -> kj::Promise<void> {
++        return kj::READY_NOW;
++      });
++    };
++    auto makeStorage = [](jsg::Lock& js, const Worker::Api&, ActorCacheInterface& cache) {
++      return js.alloc<api::DurableObjectStorage>(js, IoContext::current().addObject(cache), true);
++    };
++    auto actor = kj::refcounted<Worker::Actor>(*KJ_REQUIRE_NONNULL(slot->worker), kj::none,
++        Worker::Actor::Id(kj::mv(actorId)), true, kj::mv(makeCache),
++        kj::StringPtr(route.open.className.c_str()), Frankenvalue(), kj::mv(makeStorage),
++        kj::refcounted<TestActorLoopback>(), state.timer, kj::refcounted<ActorObserver>(),
++        kj::none, kj::none);
++    found = state.durableRoots.emplace(ticket.tree,
++        ThreadState::DurableRoot{kj::mv(actor), server::DurableAdmission::Clock::now()}).first;
++    server.publishDurableRoot(state.durableHome, ticket.tree);
++  }
++  if (found->second.resetting) {
++    kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++        KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
++  }
++  auto prepared = prepareInvocation(state, server, std::move(slot), input, descriptor, kj::mv(props),
++      nullptr, nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
++  co_return kj::mv(prepared.entry);
++}
++
++kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
++  auto params = context.getParams();
++  KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
++      "unsupported durable test event origin");
++  auto worker = co_await prepare(kj::str(params.getCfBlobJson()), Frankenvalue());
++  context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
++  if (accepted->isWaiting()) accepted->fulfill();
++}
++
++kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext context) {
++  auto params = context.getParams();
++  auto worker = co_await prepare(
++      kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()));
++  context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
++  if (accepted->isWaiting()) accepted->fulfill();
++}
++
+ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+   KJ_REQUIRE(!used, "one event per invocation");
+   used = true;
+@@ -4134,6 +4578,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+   };
+   std::map<int, Connection> connections;
+   std::map<uint64_t, int> durableWaiting;
++  uint64_t nextDurableReport = 0;
+   auto closeConnection = [&](auto found) {
+     const int fd = found->first;
+     if (auto credit = found->second.durableCredit) {
+@@ -4292,21 +4737,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+                 ",\"logDroppedBytes\":" + std::to_string(server.logDroppedBytes.load()) +
+                 ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
+                 ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
+-            if (server.durableAdmission) {
+-              const auto state = [&] {
+-                std::lock_guard lock(server.durableRoutingMutex);
+-                return server.durableAdmission->state();
+-              }();
+-              body.pop_back();
+-              body += ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
+-                  ",\"waiting\":" + std::to_string(state.waiting) +
+-                  ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+-                  ",\"homeSessions\":" + std::to_string(server.durableHomeSessions.load()) +
+-                  ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
+-                  ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
+-                  ",\"overloaded\":" + std::to_string(state.overloads) +
+-                  ",\"expired\":" + std::to_string(state.expired) + "}}";
+-            }
++            if (server.durableAdmission) server.reportDurable(false, &body);
+           }
+           auto status = server.ready.load(std::memory_order_acquire) ? "200 OK" : "503 Starting";
+           if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
+@@ -4351,6 +4782,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+         auto socket = durableWaiting.find(ticket.event);
+         if (socket != durableWaiting.end()) closeConnection(connections.find(socket->second));
+       }
++      if (nowNs() >= nextDurableReport) {
++        server.reportDurable(true);
++        nextDurableReport = nowNs() + 100000000;
++      }
+     }
+   }
+ }
+@@ -4386,6 +4821,14 @@ int main(int argc, char **argv) {
+     fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
+     return 78;
+   }
++  if (durableTestStorage) {
++    try {
++      limit = boundedDurableSetting("COWORKERD_DO_TEST_HOME_COUNT", limit, 16384);
++    } catch (...) {
++      fprintf(stderr, "invalid durable test home limit\n");
++      return 78;
++    }
++  }
+   if (!prepareDescriptors(limit)) return 78;
+   auto event = limitEventFd();
+   if (event >= 0) {
+diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
+index 1b1f93c2f7ac9fe8c56712de87f308fbc17366c2..ddc17f07f2031c7b0699480f3be1d9c34636186a 100644
+--- a/src/workerd/util/sqlite.c++
++++ b/src/workerd/util/sqlite.c++
+@@ -81,11 +81,15 @@ constexpr uint64_t SQL_CPU_SAMPLING_CAP_NS = 250000;
+ bool SqlExecutionBudget::isEnabled() { return sqlCpuLimitNs() != 0 || sqlWallLimitNs() != 0; }
+ SqlExecutionBudget::SqlExecutionBudget()
+     : cpuLimitNs(sqlCpuLimitNs()), wallLimitNs(sqlWallLimitNs()) {}
++SqlExecutionBudget::SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs)
++    : cpuLimitNs(eventCpuLimitNs), wallLimitNs(kj::maxValue), threadCpuDeadline(threadCpuDeadlineNs) {}
+ kj::String SqlExecutionBudget::describe() const {
+   const bool cpu = cause == Cause::CPU;
+   return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",
+       (cpu ? cpuLimitNs : wallLimitNs) / 1000000, "ms exceeded",
+-      cpu ? " (short SQL CPU is sampled; long native segments are measured)" : "");
++      cpu && threadCpuDeadline == kj::none
++          ? " (short SQL CPU is sampled; long native segments are measured)"
++          : "");
+ }
+ 
+ bool SqliteDatabase::sampleSqlExecution() {
+@@ -116,7 +120,7 @@ struct SqliteDatabase::ExecutionScope {
+         previous(database.activeExecutionScope) {
+     // Acquire entropy before installing this stack scope: the random source may throw.
+     const bool enter = budget && !check(CheckMode::BOUNDARY);
+-    if (enter) sampled = database.sampleSqlExecution();
++    if (enter && budget->threadCpuDeadline == kj::none) sampled = database.sampleSqlExecution();
+     if (previous != nullptr) previous->pause();
+     database.activeExecutionScope = this;
+     if (enter && !check(CheckMode::BOUNDARY)) resume();
+@@ -154,6 +158,14 @@ struct SqliteDatabase::ExecutionScope {
+   bool check(CheckMode mode = CheckMode::PROGRESS) noexcept {
+     if (!budget) return false;
+     if (budget->cause != SqlExecutionBudget::Cause::NONE) return true;
++    KJ_IF_SOME(deadline, budget->threadCpuDeadline) {
++      const auto wall = sqlWallNow();
++      if (mode == CheckMode::BOUNDARY || wall - lastCpuSampleWall >= SQL_CPU_SAMPLE_NS) {
++        lastCpuSampleWall = wall;
++        if (sqlCpuNow() >= deadline) budget->cause = SqlExecutionBudget::Cause::CPU;
++      }
++      return budget->cause != SqlExecutionBudget::Cause::NONE;
++    }
+     if (mode == CheckMode::BOUNDARY) {
+       if (budget->cpuUsedNs >= budget->cpuLimitNs) budget->cause = SqlExecutionBudget::Cause::CPU;
+       else if (budget->wallUsedNs >= budget->wallLimitNs) budget->cause = SqlExecutionBudget::Cause::WALL;
+@@ -177,6 +189,7 @@ struct SqliteDatabase::ExecutionScope {
+   }
+   bool progress() noexcept {
+     if (!budget) return false;
++    if (budget->threadCpuDeadline != kj::none) return check();
+     if (!sawCallback) {
+       sawCallback = true;
+       if (!sampled) {
+diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
+index 0dc2a8113c379ca65ddd7192583493319367f534..1b2ebe6ec00878b3f85c210f3fdc10338d9c1b83 100644
+--- a/src/workerd/util/sqlite.h
++++ b/src/workerd/util/sqlite.h
+@@ -38,11 +38,13 @@ class SqlExecutionBudget {
+   enum class Cause { NONE, CPU, WALL };
+   static bool isEnabled();
+   SqlExecutionBudget();
++  SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs);
+   Cause getCause() const { return cause; }
+   kj::String describe() const;
+ 
+  private:
+   uint64_t cpuLimitNs, wallLimitNs;
++  kj::Maybe<uint64_t> threadCpuDeadline;
+   uint64_t cpuUsedNs = 0, wallUsedNs = 0;
+   Cause cause = Cause::NONE;
+   friend class SqliteDatabase;

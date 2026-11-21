@@ -9,7 +9,8 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-const [nodeBinary, workerd, runtime] = process.argv.slice(2);
+const [nodeBinary, workerd, runtime, scenario] = process.argv.slice(2);
+const exerciseEvents = scenario === 'events';
 const exec = promisify(execFile);
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
@@ -19,12 +20,12 @@ const env = {
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
-const workerId = 'fixture/counter';
+const workerId = 'counter';
 const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
   durableObjects: { processes: 1, threadedTestStorage: true },
-  processPool: { count: 0, inFlightLimit: 8 },
+  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
   peerListenAddress: '127.0.0.1:0',
@@ -87,6 +88,7 @@ function readAdmission(socketPath) {
 function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n) {
   return 'D' + JSON.stringify({
     namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition: 'fixture',
+    uniqueKey: 'coworkerd-do-root-v1-' + 'a'.repeat(64), storageId: objectId,
     generation: '1', dataEpoch: '1', shardEpoch: '1', openId: '1',
     queuedBytes: String(queuedBytes), expiresMonotonicNs: String(expiry),
   }) + '\n';
@@ -109,15 +111,42 @@ try {
   await mkdir(modules, { recursive: true });
   await mkdir(join(fixture, 'runtime'));
   await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
-  const source = 'export default { fetch() { return new Response("fixture"); } };';
-  const contentHash = createHash('sha256').update(source).digest('hex');
+  const source = exerciseEvents ? `
+    import { DurableObject } from "cloudflare:workers";
+    const isolate = crypto.randomUUID();
+    export class Counter extends DurableObject {
+      instance = crypto.randomUUID();
+      async fetch(request) {
+        if (request.method === "POST") await this.ctx.storage.put("counter", await request.text());
+        return Response.json({instance: this.instance, isolate, counter: await this.ctx.storage.get("counter")});
+      }
+      async value() { return this.ctx.storage.get("counter"); }
+    }
+    export default { fetch(request, env) {
+      const url = new URL(request.url);
+      const counter = env.COUNTERS.get(env.COUNTERS.idFromName(url.pathname));
+      return url.searchParams.has("rpc")
+        ? counter.value().then(value => Response.json(value))
+        : counter.fetch(request);
+    } };
+  ` : 'export default { fetch() { return new Response("fixture"); } };';
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  const version = { versionId: 'v1', mainModule: 'index.js', contentHash: hash(source), bindings: [] };
   await writeFile(join(modules, 'index.js'), source);
+  if (exerciseEvents) {
+    const packageManifest = JSON.stringify({ modules: [
+      { bytes: Buffer.byteLength(source), name: 'index.js', sha256: hash(source), type: 'esm' },
+    ] });
+    await writeFile(join(modules, 'package.json'), packageManifest);
+    Object.assign(version, {
+      format: 'v2', compatibilityDate: '2026-08-27', contentHash: hash(packageManifest),
+      durableObjects: [{ binding: 'COUNTERS', className: 'Counter' }], classes: { declared: ['Counter'] },
+    });
+  }
   await writeFile(manifestPath, JSON.stringify({
     compatibilityDate: '2026-08-27',
     routes: [{ host: '*', pathPrefix: '/', workerId }],
-    workers: [{ workerId, activeVersion: 'v1', versions: [
-      { versionId: 'v1', mainModule: 'index.js', contentHash, bindings: [] },
-    ] }],
+    workers: [{ workerId, activeVersion: 'v1', versions: [version] }],
   }));
 
   await writeConfig({ ...config, storage: { endpoint: 'http://127.0.0.1:1' } });
@@ -161,7 +190,7 @@ try {
         headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(500),
       });
       const state = await response.json();
-      if (response.ok && state.processes.entries.some(entry => entry.state === 'ready')) {
+      if (response.ok && state.processes.entries.every(entry => entry.state === 'ready')) {
         ready = state.processes.entries;
         break;
       }
@@ -169,8 +198,8 @@ try {
     await delay(30);
   }
   assert.ok(ready, diagnostics);
-  assert.equal(ready.length, 1);
-  const [processInfo] = ready;
+  assert.equal(ready.length, exerciseEvents ? 2 : 1);
+  const processInfo = ready.find(entry => entry.processClass === 'durable');
   assert.equal(processInfo.processClass, 'durable');
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
@@ -237,9 +266,31 @@ try {
     headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(500),
   });
   const output = await live.json();
-  assert.equal(output.processes.entries[0].pid, processInfo.pid);
-  assert.equal(output.processes.entries[0].generation, processInfo.generation);
-  assert.equal(output.processes.entries[0].state, 'ready');
+  const durable = output.processes.entries.find(entry => entry.processClass === 'durable');
+  assert.equal(durable.pid, processInfo.pid);
+  assert.equal(durable.generation, processInfo.generation);
+  assert.equal(durable.state, 'ready');
+  if (exerciseEvents) {
+    const request = async (path, options) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, body + '\n' + diagnostics);
+      return JSON.parse(body);
+    };
+    const initial = await request('/first', { method: 'POST', body: 'confirmed in fixture SQLite' });
+    assert.deepEqual(await request('/first'), initial);
+    assert.equal(await request('/first?rpc'), initial.counter);
+    const other = await request('/other', { method: 'POST', body: 'other tree' });
+    assert.notEqual(other.instance, initial.instance);
+    assert.equal(other.isolate, initial.isolate);
+    await delay(11500);
+    const reopened = await request('/first');
+    assert.notEqual(reopened.instance, initial.instance);
+    assert.equal(reopened.isolate, initial.isolate);
+    assert.equal(reopened.counter, initial.counter);
+  }
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
   child.kill('SIGTERM');
   await exited;
