@@ -48,7 +48,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
+          sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git curl python3
       - name: Select OpenSSL on macOS
         if: runner.os == 'macOS'
         run: |
@@ -56,8 +56,31 @@ jobs:
           printf 'OPENSSL_ROOT_DIR=%s\n' "$openssl_root" >> "$GITHUB_ENV"
       - name: Install CLI dependencies
         run: npm ci --prefix cli --registry=https://registry.npmjs.org
+      - name: Test kernel archive verification
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-kernel-artifacts.py
+      - name: Read the Linux kernel pin
+        if: runner.os == 'Linux'
+        id: kernel-pin
+        run: |
+          digest=$(python3 scripts/fetch-kernel.py --arch linux-x86_64 --sha256)
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Cache the Linux kernel archive
+        if: runner.os == 'Linux'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/kernel/${{ steps.kernel-pin.outputs.sha256 }}
+          key: kernel-linux-x86_64-${{ steps.kernel-pin.outputs.sha256 }}
+      - name: Fetch and verify the Linux kernel
+        if: runner.os == 'Linux'
+        id: kernel
+        run: |
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+          printf 'workerd=%s/workerd\n' "$kernel" >> "$GITHUB_OUTPUT"
       - name: Build daemons
-        run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
+        env:
+          TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
+        run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$TEST_WORKERD" -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
       - name: Run unit and component tests
         run: cmake --build build --target check
       - name: Report executed tests
@@ -71,13 +94,18 @@ jobs:
           cases = root.findall('.//testcase')
           failed = [c for c in cases if c.find('failure') is not None or c.find('error') is not None]
           skipped = [c for c in cases if c.find('skipped') is not None]
+          required = ({'node-log-redaction', 'workerd-configuration', 'node-child-memory'}
+                      if os.environ['RUNNER_OS'] == 'Linux' else set())
+          missing = required - {c.get('name') for c in cases}
           summary = f'CTest: {len(cases)} tests, {len(failed)} failed, {len(skipped)} skipped.'
+          if missing:
+              summary += ' Missing kernel tests: ' + ', '.join(sorted(missing)) + '.'
           print(summary)
           guide = (os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY']
                    + '/blob/' + os.environ['GITHUB_SHA'] + '/CONTRIBUTING.md#ci-and-local-unit-tests')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
               output.write(summary + '\n\nSee [CONTRIBUTING.md](' + guide + ') '
-                           'for the kernel-dependent tests omitted pending #2.\n')
-          if not cases or failed or skipped:
-              raise SystemExit('Expected a nonempty test suite with no failures or skipped tests')
+                           'for kernel test prerequisites.\n')
+          if not cases or failed or skipped or missing:
+              raise SystemExit('Expected a nonempty test suite including all required tests, with no failures or skips')
           PY
