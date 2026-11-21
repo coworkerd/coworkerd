@@ -14,12 +14,24 @@ concurrency:
 
 jobs:
   build-and-unit-tests:
-    name: Build and unit tests (linux-x86_64)
-    runs-on: ubuntu-24.04
+    name: Build and unit tests (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            cc: clang-19
+            cxx: clang++-19
+          - platform: macos-arm64
+            runner: macos-26
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
     timeout-minutes: 45
     env:
-      CC: clang-19
-      CXX: clang++-19
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       WRANGLER_SEND_METRICS: 'false'
     steps:
@@ -32,17 +44,24 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
-      - name: Install public build dependencies
+      - name: Install Ubuntu build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
-          npm ci --prefix cli --registry=https://registry.npmjs.org
+      - name: Select OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          openssl_root="$(brew --prefix openssl@3)"
+          printf 'OPENSSL_ROOT_DIR=%s\n' "$openssl_root" >> "$GITHUB_ENV"
+      - name: Install CLI dependencies
+        run: npm ci --prefix cli --registry=https://registry.npmjs.org
       - name: Build daemons
         run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
       - name: Run unit and component tests
         run: cmake --build build --target check
       - name: Report executed tests
-        if: always() && hashFiles('build/test-results.xml') != ''
+        if: success() || (failure() && hashFiles('build/test-results.xml') != '')
         run: |
           python3 - <<'PY'
           import os

@@ -48,6 +48,33 @@ std::string readText(const char* path) {
   return text.str();
 }
 
+int openProbePipe(int (&fds)[2]) {
+#ifdef __linux__
+  if (pipe2(fds, O_CLOEXEC) != 0) return errno;
+#else
+  if (pipe(fds) != 0) return errno;
+  int error = 0;
+  if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) {
+    error = errno;
+  } else if (fds[1] == STDERR_FILENO) {
+    // macOS leaves FD_CLOEXEC set when a spawn dup2 action uses the same descriptor twice.
+    const int writeFd = fcntl(fds[1], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (writeFd < 0) {
+      error = errno;
+    } else {
+      close(fds[1]);
+      fds[1] = writeFd;
+    }
+  }
+  if (error != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return error;
+  }
+#endif
+  return 0;
+}
+
 }  // namespace
 
 SandboxBuildFacts parseSandboxFacts(const std::string& output, int exitStatus) {
@@ -83,21 +110,23 @@ SandboxBuildFacts parseSandboxFacts(const std::string& output, int exitStatus) {
 }
 
 SandboxBuildFacts probeSandboxBuild(const std::string& threadedExecutable) {
+  std::string program = threadedExecutable, option = "--sandbox-facts";
+  char* argv[] = {program.data(), option.data(), nullptr};
   int pipeFds[2];
-  if (pipe2(pipeFds, O_CLOEXEC) != 0) {
+  if (const int error = openProbePipe(pipeFds); error != 0) {
     SandboxBuildFacts facts;
-    facts.probeError = std::string("pipe: ") + std::strerror(errno);
+    facts.probeError = std::string("pipe: ") + std::strerror(error);
     return facts;
   }
   posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_adddup2(&actions, pipeFds[1], STDERR_FILENO);
-  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-  std::string program = threadedExecutable, option = "--sandbox-facts";
-  char* argv[] = {program.data(), option.data(), nullptr};
   pid_t pid = -1;
-  int spawned = posix_spawn(&pid, program.c_str(), &actions, nullptr, argv, environ);
-  posix_spawn_file_actions_destroy(&actions);
+  int spawned = posix_spawn_file_actions_init(&actions);
+  if (spawned == 0) {
+    spawned = posix_spawn_file_actions_adddup2(&actions, pipeFds[1], STDERR_FILENO);
+    if (spawned == 0) spawned = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    if (spawned == 0) spawned = posix_spawn(&pid, program.c_str(), &actions, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+  }
   close(pipeFds[1]);
   if (spawned != 0) {
     close(pipeFds[0]);

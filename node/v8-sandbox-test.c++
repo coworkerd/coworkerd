@@ -197,7 +197,7 @@ void parse() {
   KJ_REQUIRE(addressSpaceFromMaps("7fd1230000-7fd1251000 rw-p 0 0:0 0 [stack]\n") == (1ull << 39));
 }
 
-void probe() {
+void probe(const char* executable) {
   // This machine's facts, as the node reads them.
   const auto machine = probeMachine();
   const auto keys = probeProtectionKeys();
@@ -206,8 +206,12 @@ void probe() {
 #ifdef __linux__
   KJ_REQUIRE(machine.addressSpaceBytes >= (1ull << 39) && machine.maxMapCount > 0, machine.addressSpaceBytes, machine.maxMapCount);
 #endif
+  const auto captured = probeSandboxBuild(executable);
+  KJ_REQUIRE(captured.probed && captured.mode == "off" && captured.problem.empty(), captured.probeError.c_str());
+
   const auto missing = probeSandboxBuild("/nonexistent/coworkerd-threaded");
-  KJ_REQUIRE(!missing.probed && !missing.probeError.empty(), missing.probeError.c_str());
+  KJ_REQUIRE(!missing.probed && missing.probeError.starts_with("cannot run /nonexistent/coworkerd-threaded: "),
+      missing.probeError.c_str());
 }
 
 }  // namespace
@@ -216,7 +220,9 @@ int main(int argc, char** argv) {
   try {
     KJ_REQUIRE(argc == 2, "select a V8 sandbox test case");
     const std::string_view label = argv[1];
-    if (label == "guard-regions") guardRegions();
+    if (label == "--sandbox-facts") {
+      std::cerr << "[coworkerd-sandbox] {\"process\":true,\"mode\":\"off\"}\n";
+    } else if (label == "guard-regions") guardRegions();
     else if (label == "scale") scale();
     else if (label == "lowered") lowered();
     else if (label == "off-build") offBuild();
@@ -226,7 +232,7 @@ int main(int argc, char** argv) {
     else if (label == "machine-gaps") machineGaps();
     else if (label == "map-count-first") mapCountFirst();
     else if (label == "parse") parse();
-    else if (label == "probe") probe();
+    else if (label == "probe") probe(argv[0]);
     else KJ_FAIL_REQUIRE("unknown V8 sandbox test case", argv[1]);
   } catch (const kj::Exception& error) {
     std::cerr << error.getDescription().cStr() << '\n';
