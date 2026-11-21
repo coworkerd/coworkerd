@@ -77,7 +77,7 @@ def pins(identity):
     if any(record[key] != value for key, value in identity.items()):
         raise ValueError(f"kernel pins in {path.name} do not match this upstream and patch series")
     archives = record["archives"]
-    if archives.keys() != ARCHITECTURES.keys() or any(
+    if not isinstance(archives, dict) or archives.keys() != ARCHITECTURES.keys() or any(
         value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value))
         for value in archives.values()
     ):

@@ -2,6 +2,7 @@
 """Package both Bazel kernel executables and their generated syscall allowlist."""
 
 import argparse
+import fcntl
 import gzip
 import io
 import json
@@ -65,12 +66,16 @@ def package(args):
                     with (stage / name).open("rb") as stream:
                         info.size = (stage / name).stat().st_size
                         archive.addfile(info, stream)
-        pending.replace(archive_path)
-        sums = stage / "SHA256SUMS"
-        assets = [out / archive_name(published_arch) for published_arch in sorted(ARCHITECTURES)]
-        sums.write_text("".join(f"{sha256(asset)}  {asset.name}\n" for asset in assets if asset.is_file()))
-        sums.replace(out / sums.name)
-    print(f"{sha256(archive_path)}  {archive_path}")
+        digest = sha256(pending)
+        with (out / ".package.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            sums = stage / "SHA256SUMS"
+            assets = [out / archive_name(published_arch) for published_arch in sorted(ARCHITECTURES)]
+            sums.write_text("".join(f"{digest if asset == archive_path else sha256(asset)}  {asset.name}\n"
+                                    for asset in assets if asset == archive_path or asset.is_file()))
+            pending.replace(archive_path)
+            sums.replace(out / sums.name)
+    print(f"{digest}  {archive_path}")
     print(f"Release tag: {tag}", file=sys.stderr)
 
 

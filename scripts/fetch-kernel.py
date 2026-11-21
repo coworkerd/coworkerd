@@ -82,7 +82,7 @@ def install(args, arch, expected, digest, asset, url):
             elif not cached.is_file():
                 subprocess.run(["curl", "--disable", "--fail", "--location", "--silent", "--show-error",
                                 "--proto", "=https", "--proto-redir", "=https", "--retry", "3",
-                                "--output", str(download), url], check=True)
+                                "--connect-timeout", "15", "--output", str(download), url], check=True)
             source = download if download.is_file() else cached
             verify_archive(source, digest)
             with tarfile.open(source, "r:gz") as archive:
