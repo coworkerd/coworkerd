@@ -23,13 +23,13 @@
 
 ## CI and local unit tests
 
-The `CI` workflow runs on every pull request and on pushes to `main`, on a GitHub-hosted Ubuntu 24.04 x86_64
-runner. Its check is **`Build and unit tests (linux-x86_64)`** (`build-and-unit-tests` in
-[.github/workflows/ci.yml](.github/workflows/ci.yml)). It builds both daemons and the Linux launcher with
-`scripts/build.sh`, then builds and runs the `check` target. Dependencies come from Ubuntu, public GitHub
-(the pinned Cap'n Proto source) and the public npm registry (`cli/package-lock.json`). No private image or kernel
-build is needed. CTest fails on an empty suite or any failed test; CI also verifies the JUnit report has executed
-tests and no failures or skips.
+The `CI` workflow runs on every pull request and on pushes to `main`, on GitHub-hosted Ubuntu 24.04 x86_64
+and macOS 26 arm64 runners. Its checks are **`Build and unit tests (linux-x86_64)`** and
+**`Build and unit tests (macos-arm64)`** (`build-and-unit-tests` in [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+Both runners build the daemons with `scripts/build.sh` and run the `check` target. The Ubuntu runner also builds the
+Linux launcher. Build dependencies come from Ubuntu or the macOS runner image, with the pinned Cap'n Proto source
+from public GitHub and CLI dependencies from the public npm registry (`cli/package-lock.json`). CTest fails on an
+empty suite or any failed test. CI verifies that the JUnit report contains executed tests with no failures or skips.
 
 To run the same checks locally on Ubuntu 24.04, install Node.js 22 (a current 22.x release), then run from the
 repository root:
@@ -39,6 +39,17 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
 npm ci --prefix cli --registry=https://registry.npmjs.org
 export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
+bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
+cmake --build build --target check
+```
+
+On macOS, install the Xcode Command Line Tools, CMake, Ninja, OpenSSL 3 and a current Node.js 22 release.
+From the repository root, with OpenSSL installed through Homebrew:
+
+```bash
+npm ci --prefix cli --registry=https://registry.npmjs.org
+export CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
+export OPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
 cmake --build build --target check
 ```
