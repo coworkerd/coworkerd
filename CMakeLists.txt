@@ -183,8 +183,12 @@ add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-tes
 add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-test.c++ node/async-log.c++
   node/secret-dictionary.c++)
 target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
-set(COWORKERD_TEST_WORKERD "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd"
-  CACHE FILEPATH "Built workerd for the real Worker diagnostic redaction test")
+set(COWORKERD_TEST_WORKERD_DEFAULT "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+  set(COWORKERD_TEST_WORKERD_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+endif()
+set(COWORKERD_TEST_WORKERD "${COWORKERD_TEST_WORKERD_DEFAULT}"
+  CACHE FILEPATH "Patched workerd for kernel component tests; empty runs only kernel-independent tests")
 add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
 add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
 add_test(NAME node-log-many-values-equivalence COMMAND coworkerd-log-cleaning-test many-values-equivalence)
@@ -196,8 +200,7 @@ add_test(NAME node-secret-share COMMAND coworkerd-log-cleaning-test secret-share
 add_test(NAME node-secret-pinned-rotation COMMAND coworkerd-log-cleaning-test secret-pinned-rotation)
 add_test(NAME node-secret-rotation-cooldown COMMAND coworkerd-log-cleaning-test secret-rotation-cooldown)
 add_test(NAME node-log-stale COMMAND coworkerd-log-cleaning-test stale-lines)
-add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
-set_tests_properties(node-log-stream node-log-many-values node-log-redaction PROPERTIES TIMEOUT 30)
+set_tests_properties(node-log-stream node-log-many-values PROPERTIES TIMEOUT 30)
 set_tests_properties(node-log-generations node-secret-rotations node-secret-limits node-secret-share
   node-secret-pinned-rotation node-secret-rotation-cooldown node-log-stale PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
@@ -278,6 +281,8 @@ if(COWORKERD_TEST_WORKERD)
   if(NOT EXISTS "${COWORKERD_TEST_WORKERD}")
     message(FATAL_ERROR "COWORKERD_TEST_WORKERD does not exist: ${COWORKERD_TEST_WORKERD}")
   endif()
+  add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
+  set_tests_properties(node-log-redaction PROPERTIES TIMEOUT 30)
   add_test(NAME workerd-configuration COMMAND "${COWORKERD_TEST_NODE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/node/workerd-configuration.test.mjs" "${COWORKERD_TEST_WORKERD}")
   set_tests_properties(workerd-configuration PROPERTIES TIMEOUT 15)
@@ -288,6 +293,8 @@ if(COWORKERD_TEST_WORKERD)
     set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
     add_dependencies(check coworkerd)
   endif()
+else()
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
@@ -303,4 +310,6 @@ if(COWORKERD_NATIVE_TEST_LOG AND COWORKERD_NATIVE_TEST_RECEIPT)
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-native-error-contract.py"
     --native-source "${COWORKERD_NATIVE_SOURCE_DIR}" --receipt "${COWORKERD_NATIVE_TEST_RECEIPT}"
     --log "${COWORKERD_NATIVE_TEST_LOG}" --errors "${CMAKE_CURRENT_SOURCE_DIR}/docs/guide/errors.md")
+else()
+  message(STATUS "Native kernel test omitted (no log/receipt): native-error-contract")
 endif()
