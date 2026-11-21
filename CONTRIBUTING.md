@@ -83,12 +83,13 @@ Linux launcher. Build dependencies come from Ubuntu or the macOS runner image, w
 from public GitHub and CLI dependencies from the public npm registry (`cli/package-lock.json`). CTest fails on an
 empty suite or any failed test. CI verifies that the JUnit report contains executed tests with no failures or skips.
 
-To run the same checks locally on Ubuntu 24.04, install Node.js 22 (a current 22.x release), then run from the
-repository root:
+To run the same checks locally on Ubuntu 24.04 x86_64, install Node.js 22 (a current 22.x release), then run from
+the repository root. Clang 19 uses the GCC 14 standard library headers for C++23 `<print>` support.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git curl python3
+sudo apt-get install -y --no-install-recommends \
+  clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
 npm ci --prefix cli --registry=https://registry.npmjs.org
 export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
 kernel=$(python3 scripts/fetch-kernel.py)
