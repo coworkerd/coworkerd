@@ -1,4 +1,3 @@
-import assert from 'node:assert/strict';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -8,7 +7,11 @@ import { Cluster } from './cluster.mjs';
 async function main(args) {
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(cases).join('|')}]`;
   if (args[0] === '--help' && args.length === 1) return console.log(help);
-  assert.ok(args.length === 1 || (args.length === 2 && Object.hasOwn(cases, args[1])), help);
+  if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(cases, args[1]))) {
+    console.error(help);
+    process.exitCode = 2;
+    return;
+  }
   const selected = args[1] ? [[args[1], cases[args[1]]]] : Object.entries(cases);
   const controller = new AbortController();
   for (const signal of ['SIGTERM', 'SIGINT']) {
@@ -19,6 +22,7 @@ async function main(args) {
   let failed = 0;
   try {
     await cluster.start();
+    await cluster.reportMemory();
     for (const [name, test] of selected) {
       controller.signal.throwIfAborted();
       const started = performance.now();

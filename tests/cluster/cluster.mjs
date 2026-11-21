@@ -179,6 +179,18 @@ export class Cluster {
     }
   }
 
+  async reportMemory() {
+    try {
+      const running = await this.compose(['ps', '-q', '--status', 'running']);
+      const usage = await this.command('docker', [
+        'stats', '--no-stream', '--format', '{{.Name}} {{.MemUsage}}', ...running.split(/\s+/).filter(Boolean),
+      ], { timeout: 10000 });
+      console.log(`Docker memory before cases:\n${usage}`);
+    } catch (error) {
+      console.warn(`Docker memory sample unavailable: ${error.message}`);
+    }
+  }
+
   async close() {
     try {
       if (this.started) await this.compose(['down', '--volumes', '--remove-orphans', '--timeout', '5'], { cleanup: true });

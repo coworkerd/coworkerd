@@ -114,4 +114,12 @@ jobs:
         timeout-minutes: 12
         env:
           TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
-        run: node tests/cluster/run.mjs "$(dirname "$TEST_WORKERD")"
+        run: |
+          uname -sm
+          nproc
+          free -m
+          df -h "$PWD"
+          du -sh build
+          docker version --format 'Docker Engine {{.Server.Version}}'
+          docker compose version
+          node tests/cluster/run.mjs "$(dirname "$TEST_WORKERD")"
