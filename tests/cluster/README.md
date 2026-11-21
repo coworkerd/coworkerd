@@ -37,6 +37,18 @@ node tests/cluster/run.mjs --help
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
 setup or teardown exits nonzero. Linux pull-request CI uses the same entry point.
 
+## Measured time and resources
+
+A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose
+2.38.2 passed all six cases in 149.6 seconds, including image build, cluster startup and teardown. Building the
+daemons from a fresh checkout took another 2 minutes 30 seconds. The complete Linux CI job, including package
+installation and the unit tests, took about 8 minutes.
+
+The five running containers used about 586 MiB combined in the sample just after cluster startup. The `build/`
+tree, including the unpacked kernel and test binaries, occupied 470 MiB. Allow additional disk for the kernel
+archive, Docker images and temporary volumes. These are observed values from the
+[hosted run](https://github.com/coworkerd/coworkerd/actions/runs/44911045714/job/136866725293#step:14:15).
+
 ## Cases
 
 | Case | Product behavior whose regression fails the case |
