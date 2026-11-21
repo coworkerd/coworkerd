@@ -184,12 +184,25 @@ add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-te
   node/secret-dictionary.c++)
 target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
 set(COWORKERD_TEST_WORKERD "auto" CACHE STRING
-  "Patched workerd for kernel component tests: auto detects the in-tree binary; empty omits kernel tests")
+  "Patched workerd for kernel component tests: auto detects a fetched Linux or in-tree binary; empty omits kernel tests")
 # Resolve the cached choice on every configure: a kernel built later must enable
 # its tests in this same build tree. Keep an explicitly empty choice empty.
 set(COWORKERD_TEST_WORKERD_PATH "${COWORKERD_TEST_WORKERD}")
 if(COWORKERD_TEST_WORKERD STREQUAL "auto")
-  set(COWORKERD_TEST_WORKERD_PATH "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+  set(COWORKERD_TEST_WORKERD_PATH "")
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND
+      CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$" AND
+      IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/kernel")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/fetch-kernel.py" --installed
+      OUTPUT_VARIABLE COWORKERD_INSTALLED_KERNEL OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    if(COWORKERD_INSTALLED_KERNEL)
+      set(COWORKERD_TEST_WORKERD_PATH "${COWORKERD_INSTALLED_KERNEL}/workerd")
+    endif()
+  endif()
+  if(COWORKERD_TEST_WORKERD_PATH STREQUAL "")
+    set(COWORKERD_TEST_WORKERD_PATH "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+  endif()
   if(NOT EXISTS "${COWORKERD_TEST_WORKERD_PATH}")
     set(COWORKERD_TEST_WORKERD_PATH "")
   endif()

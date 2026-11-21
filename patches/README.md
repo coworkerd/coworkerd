@@ -72,8 +72,9 @@ the fork's history. Run `check` against the complete fork tree after exporting.
 The export is deterministic (no commit hashes, signatures or statistics): exporting the same commits twice gives the
 same files. A new series also needs the compatibility flags the node accepts regenerated
 (`python3 scripts/compatibility-flags.py`, into `common/generated/`), new workerd builds for both architectures,
-their system call allowlists (`scripts/syscall-profile.mjs`, then `scripts/syscall-allowlist.py`) and the pinned
-hashes in `scripts/release.sh`. `check` is the source side of checking a sync: the complete checkout tree differs
+their system call allowlists (`scripts/syscall-profile.mjs`, then `scripts/syscall-allowlist.py`) and the archive
+pins in `patches/workerd/artifacts.json`. Follow the [publishing steps](../CONTRIBUTING.md#publishing-a-changed-kernel-series).
+`check` is the source side of checking a sync: the complete checkout tree differs
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
 

@@ -82,9 +82,9 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 
 - **The daemons**: `scripts/build.sh` builds `coworkerd` and `coworkerd-apiserver` for the host with CMake and Ninja
   (it fetches Cap'n Proto and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff)); OpenSSL is required.
-- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261114.1`), checked out into `workerd/` with the series applied by
-  `python3 scripts/workerd-patches.py apply`; [patches/README.md](patches/README.md) explains the series and how it
-  is maintained.
+- **The Linux kernel binaries**: `python3 scripts/fetch-kernel.py` fetches and verifies the patched `workerd`
+  and `coworkerd-threaded` for the checkout. To build them from source, see
+  [CONTRIBUTING.md](CONTRIBUTING.md#building-the-kernel-from-source).
 - **A release**: `scripts/release.sh <version>` builds the Linux binaries in a toolchain container
   ([scripts/toolchain/](scripts/toolchain/)) and assembles the package and image; its header lists what it needs.
 
