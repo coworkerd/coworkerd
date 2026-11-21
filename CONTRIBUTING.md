@@ -8,9 +8,10 @@
   Linux only: there `build.sh` builds it too, which takes a C compiler as well.
 - **cowctl**: `npm ci --prefix cli` installs its dependencies (Node.js 22.5 or newer: the wrangler and Miniflare it
   pins require Node.js 22, and its adapter uses `path.matchesGlob`); `node cli/bin/cowctl.mjs` runs it.
-- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM` (`v1.20261012.1`), checked out into `workerd/` with `python3 scripts/workerd-patches.py apply`; build
-  `//src/workerd/server:workerd` with Bazel (`--config=release`). [patches/README.md](patches/README.md) describes the
-  series and how it is maintained.
+- **workerd**: the upstream tag recorded in `patches/workerd/UPSTREAM`, checked out into `workerd/` with `python3 scripts/workerd-patches.py apply`; build
+  `//src/workerd/server:workerd` and `//src/workerd/threaded:coworkerd-threaded` (the server of the ordinary Worker
+  processes; a node expects it beside `workerd`) with Bazel (`--config=release`). [patches/README.md](patches/README.md)
+  describes the series and how it is maintained.
 - **Linux binaries, a release package and its image**: `scripts/release.sh <version>` builds `coworkerd`,
   `coworkerd-apiserver` and `coworkerd-launcher` in a Linux toolchain container
   ([scripts/toolchain/](scripts/toolchain/) has its image and how to set it up), takes a prebuilt workerd whose SHA is pinned in the script
@@ -38,12 +39,17 @@ down -v` removes everything again. Without `--profile cluster` one node starts; 
 covers the configuration, the sandbox (sections 3 and 4: the default compose file runs workerd without it, a host
 prepared as section 4 describes runs it with `docker-compose.sandbox.yml`) and operations.
 
-The integration test suite -- the regression cases accumulated during development and the tools that run them
-against clusters -- is kept in a separate repository (`coworkerd/lab`, private); smoke tests in this repository will
-come in a later version.
+The integration tests -- cluster-level regression cases and the tool that runs them -- are not in this repository
+yet; [#1](https://github.com/coworkerd/coworkerd/issues/1) tracks adding them. Until then, say in the pull request
+how you checked the change on a local cluster.
 
 ## Sending a change
 
+- `main` is protected: a change lands through a pull request that passes the repository's checks (they are being
+  added, [#3](https://github.com/coworkerd/coworkerd/issues/3)) and that a maintainer has approved
+  ([.github/CODEOWNERS](.github/CODEOWNERS) lists the maintainers).
+- A larger change starts as an issue that says what should change and when it is done; a small fix can go straight
+  to a pull request. A pull request names the issue it closes.
 - One change per pull request, with a description of what changes and why. Commit messages say what changed.
 - Keep behavior changes and refactoring apart, and say in the description how you checked the change (for example
   the quickstart on a local cluster).
