@@ -18,6 +18,7 @@ The guide is for running Coworkerd and deploying to it; the design documents exp
 - [Control plane API](control-plane-api.md): tenants and Workers, the `/v1` endpoints, credentials, quotas, versions and deployments, routes, secrets, usage and the version promise.
 - [Cluster state](cluster-state.md): desired state and uploaded durable history in the object store and what it must guarantee, the object layout and who writes it, membership, deployment state and why a call tree sees one deployment, code distribution, placement, the control plane's write protocol, usage and suspects, and draining.
 - [Process isolation and resource governance](process-isolation.md): the process pool and watchdog, CPU and memory limits, culprits and quarantine, eviction, rotation, the launcher, the system call allowlist, and where isolation ends.
+- [Threaded Durable Object processes](threaded-durable-processes.md) describes the proposed runtime, migration steps, acceptance gates and measured baseline.
 - [Egress and authentication](egress-and-auth.md): tenants' outgoing requests through the node's policy point, the cluster key, an object storage identity for every node, the secrets key, tokens and credentials, and what is not done yet.
 - [Compatibility with Cloudflare Workers](compatibility.md): how a wrangler project becomes a version, how its code runs, what is refused and why, and where behaviour differs from Cloudflare.
 
