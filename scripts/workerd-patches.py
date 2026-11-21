@@ -164,6 +164,20 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/util/sqlite.h',
                               'src/workerd/util/sqlite.c++'} or
+                          name == '0048-durable-event-cpu.patch' and path in {
+                              'src/workerd/api/global-scope.c++',
+                              'src/workerd/api/node/async-hooks.c++',
+                              'src/workerd/api/worker-rpc.c++',
+                              'src/workerd/io/io-context.c++',
+                              'src/workerd/io/io-context.h',
+                              'src/workerd/io/limit-enforcer.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/jsg/async-context.c++',
+                              'src/workerd/jsg/async-context.h',
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

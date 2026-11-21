@@ -1367,11 +1367,13 @@ kj::Promise<void> ProcessCall::onExit() {
 bool ProcessCall::threadedServer() const { return process->threaded; }
 bool ProcessCall::threadedDurableTestRole() const { return process->durableTestStorage; }
 bool ProcessCall::cpuLimitExceeded() const {
-  if (process->durable) return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
+  if (process->durable && !process->durableTestStorage)
+    return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(0, invocationId, workerId, versionId);
 }
 bool ProcessCall::memoryLimitExceeded() const {
-  if (process->durable) return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
+  if (process->durable && !process->durableTestStorage)
+    return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(1, invocationId, workerId, versionId);
 }
 bool ProcessCall::processMemoryPressure() const {

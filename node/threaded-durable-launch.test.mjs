@@ -16,6 +16,7 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
+  ...(exerciseEvents ? { COWORKERD_CPU_LIMIT_MS: '250' } : {}),
 };
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
@@ -116,18 +117,48 @@ try {
     const isolate = crypto.randomUUID();
     export class Counter extends DurableObject {
       instance = crypto.randomUUID();
+      latch;
       async fetch(request) {
+        const query = new URL(request.url).searchParams;
+        if (query.has("hold")) {
+          this.latch = Promise.withResolvers();
+          await this.latch.promise;
+          this.latch = undefined;
+        }
+        if (query.has("waiting")) return Response.json(this.latch !== undefined);
+        if (query.has("release")) this.latch.resolve();
+        if (query.has("nested")) {
+          const next = this.env.COUNTERS.get(this.env.COUNTERS.idFromName("/other"));
+          return Response.json(await next.value());
+        }
+        if (query.has("inputGate")) {
+          await this.ctx.blockConcurrencyWhile(async () => {
+            await new Promise(resolve => setTimeout(resolve, 250));
+            await this.ctx.storage.put("counter", "after input gate");
+          });
+        }
+        if (query.has("cpu")) {
+          await Promise.resolve();
+          for (;;) {}
+        }
+        if (query.has("sqlCpu")) {
+          this.ctx.storage.sql.exec("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000000000) SELECT count(*) FROM n").one();
+        }
         if (request.method === "POST") await this.ctx.storage.put("counter", await request.text());
         return Response.json({instance: this.instance, isolate, counter: await this.ctx.storage.get("counter")});
       }
       async value() { return this.ctx.storage.get("counter"); }
     }
-    export default { fetch(request, env) {
+    export default { async fetch(request, env) {
       const url = new URL(request.url);
       const counter = env.COUNTERS.get(env.COUNTERS.idFromName(url.pathname));
-      return url.searchParams.has("rpc")
-        ? counter.value().then(value => Response.json(value))
-        : counter.fetch(request);
+      try {
+        return url.searchParams.has("rpc")
+          ? Response.json(await counter.value())
+          : await counter.fetch(request);
+      } catch (error) {
+        return Response.json({error: String(error)}, {status: 502});
+      }
     } };
   ` : 'export default { fetch() { return new Response("fixture"); } };';
   const hash = value => createHash('sha256').update(value).digest('hex');
@@ -204,7 +235,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -271,12 +302,12 @@ try {
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
   if (exerciseEvents) {
-    const request = async (path, options) => {
+    const request = async (path, options, status = 200) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         ...options, signal: AbortSignal.timeout(5000),
       });
       const body = await response.text();
-      assert.equal(response.status, 200, body + '\n' + diagnostics);
+      assert.equal(response.status, status, body + '\n' + diagnostics);
       return JSON.parse(body);
     };
     const initial = await request('/first', { method: 'POST', body: 'confirmed in fixture SQLite' });
@@ -285,11 +316,65 @@ try {
     const other = await request('/other', { method: 'POST', body: 'other tree' });
     assert.notEqual(other.instance, initial.instance);
     assert.equal(other.isolate, initial.isolate);
+    const waiting = request('/first?hold');
+    waiting.catch(() => {});
+    // Observe the first event in its await before issuing another event to the same actor.
+    let held = false;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      if (await request('/first?waiting')) {
+        held = true;
+        break;
+      }
+      await delay(10);
+    }
+    assert.ok(held);
+    assert.equal(await request('/first?rpc'), initial.counter);
+    assert.equal(await request('/first?nested'), other.counter);
+    await request('/first?release');
+    assert.deepEqual(await waiting, initial);
+
+    const gated = request('/first?inputGate');
+    gated.catch(() => {});
+    let running = false;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      if ((await readAdmission(socketPath)).running > 0) {
+        running = true;
+        break;
+      }
+      await delay(10);
+    }
+    assert.ok(running);
+    const [write, gatedRead] = await Promise.all([gated, request('/first?rpc')]);
+    assert.equal(write.counter, 'after input gate');
+    assert.equal(gatedRead, write.counter);
+
+    let previous = write;
+    let resets = (await readAdmission(socketPath)).actorResets;
+    for (const cause of ['cpu', 'sqlCpu']) {
+      const refused = await request('/first?' + cause, undefined, 502);
+      assert.match(refused.error, /CPU|503|aborted|disconnected/i);
+      let resetObserved = false;
+      for (const until = performance.now() + 2000; performance.now() < until;) {
+        if ((await readAdmission(socketPath)).actorResets === resets + 1) {
+          resetObserved = true;
+          break;
+        }
+        await delay(10);
+      }
+      assert.ok(resetObserved, diagnostics);
+      ++resets;
+      assert.deepEqual(await request('/other'), other);
+      const rebuilt = await request('/first');
+      assert.notEqual(rebuilt.instance, previous.instance);
+      assert.equal(rebuilt.isolate, previous.isolate);
+      assert.equal(rebuilt.counter, previous.counter);
+      previous = rebuilt;
+    }
     await delay(11500);
     const reopened = await request('/first');
-    assert.notEqual(reopened.instance, initial.instance);
-    assert.equal(reopened.isolate, initial.isolate);
-    assert.equal(reopened.counter, initial.counter);
+    assert.notEqual(reopened.instance, previous.instance);
+    assert.equal(reopened.isolate, previous.isolate);
+    assert.equal(reopened.counter, previous.counter);
   }
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
   child.kill('SIGTERM');
