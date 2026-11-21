@@ -38,16 +38,18 @@ epochs, and the admitted open identity to reject stale home references. Actor, i
 connection, cursors and callbacks never travel across threads.
 
 The main thread of the child accepts and demultiplexes work. Home threads run their own event loops. An object home
-holds exactly one isolate copy and the object trees placed in it. Copies of different Worker definitions never
-share a home, so a synchronous event can delay only objects of its own Worker that live in the same copy.
+holds one resident object tree, the object and its facets: it is taken from the pool when the tree becomes
+resident and returned when the tree is released. An isolate belongs to no thread. As on the ordinary path, a
+home enters its tree's isolate through the isolate's lock, so objects of one Worker in the same isolate copy
+take turns in JavaScript, and whatever else an object does on its own loop runs beside the others.
 Global thread, memory and descriptor reservations bound the pool. Budget the database, WAL and
 shared-memory descriptors per open and leave headroom for checkpoint and recovery work, the log channel
 and control traffic. Refuse new work before it consumes that headroom. A native
 database leases its own thread as long as its connection is resident. Other databases and actors use
-different threads. Close an idle connection before returning its thread to the pool. Object workers sharing a home
-have fair mailboxes and bounded synchronous execution. Each Worker definition may have multiple independent
-isolate copies in the child. Each copy has a home thread of its own, and a woken tree is placed with a copy
-that has safe capacity, or with a bounded new copy on a new home. A tree and its facets stay together.
+different threads. Close an idle connection before returning its thread to the pool. Objects sharing an isolate copy
+take its lock in turn, and one event holds it for at most its CPU limit. Each Worker definition may have
+multiple independent isolate copies in the child. A woken tree is placed with a copy
+that has safe capacity, or with a bounded new copy. A tree and its facets stay together, on one home.
 Choose placement before constructing the actor, and reserve thread, address space, heap and native charges
 before publishing it. Count initializing and closing trees against the backstop until their reservations
 are released. Include native databases in the process backstop, as database objects count today. Preserve the
@@ -162,7 +164,7 @@ at-least-once delivery and up to six retries starting at two seconds.
 | 1. Home threads | The durable role in the threaded server replaces the upstream actor-loop execution of the definitions in `runtime.js` and the old single-loop use of its SQLite shipper. Actor creation, use and disposal stay on one home. Node WAL append, peer coordination and history stay node-owned. Blocking file and SQLite work runs on the relevant home or existing disk workers, and control coordination multiplexes completions. |
 | 2. Native databases | The durable child routes the existing database identity to a native C++ SQLite handler on a database home. It replaces `SqlDatabase` and its runtime root, using workerd's `util/sqlite` and shipped storage hooks. Keep node/API forwarding and the D1 binding's API and envelope. |
 | 3. Idle lifecycle | Replace the shipped actor residency path in [patch 0014](../patches/workerd/0014-durable-object-hibernation-alarms.patch) as amended by [patch 0020](../patches/workerd/0020-root-loader.patch). The latter coordinates residency across namespaces, orders idle trees by last access and can exceed the configured target while active trees are protected. The child enforces timed retirement and reserves root slots against the process-wide 4,096 backstop before allocation. The node owns parked hibernatable sockets. |
-| 4. Multiple isolates per Worker | Replace reuse of one isolate for the installed Worker definition with an affinity-aware set of independent copies. Key by the full pinned definition, binding and limit identity. Give each copy a V8 group, a home and a bounded placement budget. A cold placement never enters an isolate on the wrong thread. |
+| 4. Multiple isolates per Worker | Replace reuse of one isolate for the installed Worker definition with a set of independent copies. Key by the full pinned definition, binding and limit identity. Give each copy a V8 group and a bounded placement budget. A copy belongs to no thread, and a tree stays with the copy it was placed in for as long as it is resident. |
 | 5. Event and SQL limits | Replace the durable 200 ms default from [configuration](../common/config.h) and the SQL-specific accounting and interrupts of [patch 0021](../patches/workerd/0021-sql-execution-limit.patch). Preserve the event boundaries from [patch 0012](../patches/workerd/0012-event-cpu-top-up.patch), including delivered messages, RPC entry and alarms. Use an event-scoped interrupt and reset in place of the old [CPU watchdog](../patches/workerd/0002-cpu-limit.patch). Charge actor SQL to its event's CPU, including compilation and row steps. Give native D1 a 30 s wall-time deadline shared by a whole batch. Account for SQL and result encoding under that deadline, with queueing and replication tracked separately. |
 | 6. Isolate memory | Replace the version-wide reset under memory pressure in [patch 0005](../patches/workerd/0005-memory-limit.patch). Evict idle trees from the pressured isolate first and sample accounting again. If still over the placement threshold, mark that isolate closed to new trees. Reset only on continuing pressure at the hard threshold and after stopping admission. Wait for safe close where possible, keeping other isolates live. |
 | 7. Queue per object | `ServerCore::admission` currently checks tenant ingress/nested quotas for durable dispatch. The separate process-local tenant-execution quota already applies only to non-durable selection. Replace the durable path's tenant concurrency admission with a bounded mailbox per object, and count limits in events and queued bytes before reading unbounded bodies. An overflow receives a pre-execution `503 OVERLOADED`. Expiring or canceled entries release their reservations. Node, process, disk, storage quota and ordinary ingress bounds still protect shared resources. |
@@ -176,10 +178,10 @@ Use idle time since the last delivered event finished, or since its last hiberna
 An active event, response/RPC stream, timer, outbound connection, pending IO or `waitUntil` work prevents
 hibernation, as does a standard `ws.accept()` socket. Re-evaluate blockers at the home before retirement, with
 a monotonic clock. A hibernatable tree with no pending work closes approximately 10 s after becoming eligible.
-Each retirement releases the object's home reservation. A home whose copy has no resident tree left keeps
-the copy warm for the idle time of ordinary Workers (`idleEvictMs`), so that a wake soon after a release does
-not pay for a cold isolate. After that time, or earlier under memory pressure, retire the copy and return the
-thread to the pool. If a tree has hibernatable sockets, atomically
+Each retirement releases the tree's reservations and returns its home thread to the pool. An isolate copy
+with no resident tree left is not retired at once: it is evicted by the idle rule of ordinary Workers
+(`idleEvictMs`), or earlier under memory pressure, so that a wake soon after a release does not pay for a
+cold isolate. If a tree has hibernatable sockets, atomically
 transfer its transport state before closing the actor. An otherwise idle ineligible tree gets a jittered deadline within 70–140 s. A pending operation can protect it for at most
 15 min from its start. Cancel expired work before final retirement and close non-hibernatable sockets when
 evicting. Active request wall limits and their invocation leases are separate. An event racing the retirement
@@ -264,7 +266,7 @@ decided.
 - **Pressure and host sizing.** Set pool size, per-object queue depth and bytes, placement thresholds,
   reservation headroom and the compatible treatment of `residentObjects: 0`. Current zero disables the
   residency pass. The new process needs a real backstop even in that case. Review the extent of isolation
-  between objects sharing a home. A synchronous object event can occupy that home for up to its budget.
+  between objects sharing an isolate copy. A synchronous object event can hold that copy's lock for up to its budget.
   Separate database execution homes provide the required cross-database behavior. A guarantee for every
   pair of actor events would need an additional scheduling or placement rule.
   An isolate reset under hard memory pressure can reset the remaining objects of that isolate. Prove
@@ -273,9 +275,11 @@ decided.
   [Residency coordinator](../patches/workerd/0020-root-loader.patch) ·
   [Threaded allocations](../patches/workerd/0044-s1e-node-cost-and-long-operations.patch).
 
-  **Decided.** An object home holds one isolate copy, as "Current execution and the proposed boundary" says,
-  so an event can delay only objects of its own Worker in the same copy. The final gates check this across
-  Workers. Pool size, queue depth and bytes per object, placement thresholds and headroom are configuration,
+  **Decided.** A home holds one object tree and an isolate belongs to no thread, as "Current execution and the
+  proposed boundary" says. A synchronous event holds its isolate's lock, so it can delay only the JavaScript of
+  objects of its own Worker in the same copy. The final gates check this across Workers. A home thread for
+  every resident tree costs memory and descriptors per resident object; step 1 measures that cost with the
+  child filled to its backstop and reports it. Pool size, queue depth and bytes per object, placement thresholds and headroom are configuration,
   with defaults that step 1's pull request proposes from measurement. Nothing is limited by a count per
   tenant. `residentObjects: 0` means no count target; the reservations still refuse before threads,
   descriptors or memory run out. Hard memory pressure may reset an isolate copy together with the objects
@@ -304,14 +308,16 @@ merging. It leaves functional coverage for the old backend until the final switc
 ### 1. Host Durable Object trees on threaded homes
 
 **Scope and deletion.** Implement durable role selection behind an opt-in used only with test storage.
-Add home routing, bounded reservations, multi-isolate placement, mailbox and timed idle release for trees with
-no sockets. Replace per-call thread selection and one-isolate lookup in this role. Replace the durable
+Add a home thread per resident tree, home routing, bounded reservations, multi-isolate placement, mailbox and
+timed idle release for trees with no sockets. Replace per-call thread selection and one-isolate lookup in this
+role, and keep the ordinary path's rule that an isolate is entered through its lock. Replace the durable
 tenant-admission wait and the 200 ms, shared-loop GC and watchdog design in the new path. Keep GC and V8
 observability, accounting and interruptibility. Land no deletions from the shipping backend at this step.
 
 **Unit and kernel gate.** Assert actor creation, execution and destruction IDs all match the home, even
-after a cross-thread cancellation. Fill one isolate and prove the next copy has a distinct ID and its own
-home. Force queue overflow and expiry. Assert that only waiting calls for that object get its overload and
+after a cross-thread cancellation. Fill one isolate and prove the next copy has a distinct ID. Place two trees
+in one copy and prove that they have different homes and that a home blocked outside JavaScript does not delay
+the other tree's events. Force queue overflow and expiry. Assert that only waiting calls for that object get its overload and
 that release returns reservations exactly once. Check input/output gates and a nested RPC during an await.
 Use two actors sharing one isolate to distinguish a CPU reset from an isolate reset. Use an injected CPU clock to test refills, lower
 and higher configured CPU limits, native SQLite CPU charging and legitimate long execution. Force idle-first
@@ -320,7 +326,8 @@ and re-entry races. Force thread, fd and memory reservation failures, including 
 refusal, and check that the child remains ready.
 
 **Cluster gate.** None at this step. A single node/child integration fixture tests readiness, cancellation
-and resource counters with disposable files. The opt-in cannot write production durable state yet.
+and resource counters with disposable files. It also fills the child to its backstop and records threads,
+resident memory and descriptors per resident tree. The opt-in cannot write production durable state yet.
 
 ### 2. Connect threaded homes to the durable log and recovery
 
