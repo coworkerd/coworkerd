@@ -8946,6 +8946,21 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   return launch;
 }
 
+fs::path makeDurableTestStack(const fs::path& fixtureStack) {
+#ifdef __linux__
+  std::error_code error;
+  const auto state = fs::symlink_status(fixtureStack / "do", error);
+  KJ_REQUIRE(state.type() == fs::file_type::not_found &&
+      (!error || error == std::errc::no_such_file_or_directory),
+      "durableObjects.threadedTestStorage refuses an existing Durable Object storage directory");
+  auto pattern = (fs::temp_directory_path() / "coworkerd-durable-test-XXXXXX").string();
+  KJ_REQUIRE(::mkdtemp(pattern.data()) != nullptr, "cannot create disposable durable test stack", strerror(errno));
+  return pattern;
+#else
+  KJ_FAIL_REQUIRE("durableObjects.threadedTestStorage requires Linux");
+#endif
+}
+
 // The process pool's own environment overrides (process-pool.c++), applied here as well so that the
 // configuration a Server reports is the one it runs; the pool applies the same values again.
 // The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares:
@@ -8956,11 +8971,12 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
-  if (pool.count + pool.quarantineProcesses == 0) return;
+  if (pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurableTestStorage) return;
   const auto threaded = pool.threadedExecutable.empty()
       ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
   auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
-      coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit, pool.count);
+      coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit,
+      pool.count + (pool.threadedDurableTestStorage ? pool.durableProcesses : 0));
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
   // so that a process fills until V8's own group creation refuses (the second line).
   if (const char* test = std::getenv("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST"); test != nullptr && plan.refusal.empty()) {
@@ -8980,9 +8996,12 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const std::string& workerdPath) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
+  if (pool.threadedDurableTestStorage) pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
+  KJ_REQUIRE(!pool.threadedDurableTestStorage || pool.durableProcesses > 0,
+      "durableObjects.threadedTestStorage requires a durable process");
   KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || pool.cpuLimitMs <= 300000,
       "ordinary cpuLimitMs is at most 300000 milliseconds");
   pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
@@ -8994,7 +9013,8 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
   if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
-  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
+  KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurableTestStorage) ||
+      (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
     // Include a replacement generation, private channels and prepared sockets;
@@ -9861,6 +9881,12 @@ int main(int argc, char** argv) {
     return coworkerd::runHostCheckChild(argc - 2, argv + 2);
   }
   coworkerd::MemoryWatermark::initializeDaemonThp();
+  std::optional<fs::path> durableTestStack;
+  const auto removeDurableTestStack = kj::defer([&] {
+    if (!durableTestStack) return;
+    std::error_code error;
+    fs::remove_all(*durableTestStack, error);
+  });
   std::unique_ptr<coworkerd::AsyncLog> logging;
   std::unique_ptr<coworkerd::WorkerdOutput> workerdOutput;
   try {
@@ -9888,6 +9914,10 @@ int main(int argc, char** argv) {
     });
     launch = !args.empty() && (args[0] == "--config" || args[0].starts_with("--config=")) ? serveLaunch(args, naive)
         : positionalLaunch(args, naive);
+    if (launch->config.processPool.threadedDurableTestStorage) {
+      durableTestStack = makeDurableTestStack(launch->stackDirectory);
+      launch->stackDirectory = *durableTestStack;
+    }
     // A process still listens on a socket of this stack's run directory: another Server runs in this
     // stack, and this one does not start -- before anything changes: no log file opened, no socket
     // removed, no member registered.

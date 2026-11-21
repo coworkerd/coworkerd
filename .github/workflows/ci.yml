@@ -95,7 +95,7 @@ jobs:
           cases = root.findall('.//testcase')
           failed = [c for c in cases if c.find('failure') is not None or c.find('error') is not None]
           skipped = [c for c in cases if c.find('skipped') is not None]
-          required = ({'node-log-redaction', 'workerd-configuration', 'node-child-memory'}
+          required = ({'node-log-redaction', 'workerd-configuration', 'node-child-memory', 'node-threaded-durable-launch'}
                       if os.environ['RUNNER_OS'] == 'Linux' else set())
           missing = required - {c.get('name') for c in cases}
           summary = f'CTest: {len(cases)} tests, {len(failed)} failed, {len(skipped)} skipped.'

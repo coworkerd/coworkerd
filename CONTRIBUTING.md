@@ -112,13 +112,19 @@ cmake --build build --target check
 object store components, the four `cli-*` suites and `node-error-contract`; their individual names and results
 appear in CTest's output and `build/test-results.xml`.
 
-Linux CI caches the archive by its pinned SHA-256 and verifies it before registering these three tests:
+Linux CI caches the archive by its pinned SHA-256 and verifies it before registering these tests:
 
 | CTest name | Required artifact |
 | --- | --- |
 | `node-log-redaction` | Patched `workerd`, for real Worker diagnostics |
 | `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
+| `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
+
+The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
+The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
+an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
+fixture deployments. Each threaded durable child starts without a persistent log channel.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries

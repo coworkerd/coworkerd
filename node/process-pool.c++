@@ -901,6 +901,7 @@ std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCal
 struct ProcessGeneration {
   std::string id;
   bool threaded = false;
+  bool durableTestStorage = false;
   uint32_t threadedProtocol = 0;
   bool threadedCulpritHandled = false;
   bool quarantine = false, durable = false;
@@ -1840,6 +1841,7 @@ public:
         << "\",\"threadedProtocol\":" << p.threadedProtocol
         << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
         << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol == 3 ? "true" : "false");
+    if (p.durable) out << ",\"durableServer\":\"" << (p.durableTestStorage ? "threaded-test" : "upstream") << '"';
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -2272,8 +2274,9 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
-    p->threaded = !s.durable;
-    if (p->threaded) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
+    p->durableTestStorage = s.durable && config.threadedDurableTestStorage;
+    p->threaded = !s.durable || p->durableTestStorage;
+    if (!s.durable) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -2383,7 +2386,7 @@ public:
     // The Durable Object log channel: the node keeps its own end and reads the frames the process ships.
     int durableLogFd = -1;
     auto closeDurableLog = kj::defer([&durableLogFd] { if (durableLogFd >= 0) ::close(durableLogFd); });
-    if (p->durable && durableChannelOpen) {
+    if (p->durable && !p->durableTestStorage && durableChannelOpen) {
       durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation)));
       if (durableLogFd >= 0) {
         inherit(actions, durableLogFd, DURABLE_LOG_FD);
@@ -2494,11 +2497,12 @@ public:
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
         p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
+    if (p->durableTestStorage) args.push_back("--durable-test-storage");
     std::string file = executable;
     bool thpResetViaLauncher = false;
 #ifdef __linux__
     if (p->launched) {
-      args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable);
+      args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable && !p->durableTestStorage);
       file = launcherExecutable();
       ++sandbox.launches;
       thpResetViaLauncher = true;
@@ -2637,11 +2641,21 @@ public:
             p->probeClient->request(kj::HttpMethod::GET, "/__coworkerd/probe", probeHeaders).response);
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
-        if (p->threaded) response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") p->threadedProtocol = 3;
-        });
         if (p->threaded) {
-          KJ_REQUIRE(p->threadedProtocol == 3, "native process protocol 3 is required");
+          bool matchesProtocol = false;
+          uint32_t roleHeaders = 0;
+          bool durableTestRole = false;
+          response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
+            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
+            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
+              ++roleHeaders;
+              durableTestRole = value == "durable-test";
+            }
+          });
+          KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
+          KJ_REQUIRE(p->durableTestStorage ? roleHeaders == 1 && durableTestRole : roleHeaders == 0,
+              "native process role does not match the slot");
+          p->threadedProtocol = 3;
           p->contextsVisible = true;
         }
         if (!p->binary.valid) {
