@@ -183,12 +183,17 @@ add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-tes
 add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-test.c++ node/async-log.c++
   node/secret-dictionary.c++)
 target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)
-set(COWORKERD_TEST_WORKERD_DEFAULT "")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
-  set(COWORKERD_TEST_WORKERD_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+set(COWORKERD_TEST_WORKERD "auto" CACHE STRING
+  "Patched workerd for kernel component tests: auto detects the in-tree binary; empty omits kernel tests")
+# Resolve the cached choice on every configure: a kernel built later must enable
+# its tests in this same build tree. Keep an explicitly empty choice empty.
+set(COWORKERD_TEST_WORKERD_PATH "${COWORKERD_TEST_WORKERD}")
+if(COWORKERD_TEST_WORKERD STREQUAL "auto")
+  set(COWORKERD_TEST_WORKERD_PATH "${CMAKE_CURRENT_SOURCE_DIR}/workerd/bazel-bin/src/workerd/server/workerd")
+  if(NOT EXISTS "${COWORKERD_TEST_WORKERD_PATH}")
+    set(COWORKERD_TEST_WORKERD_PATH "")
+  endif()
 endif()
-set(COWORKERD_TEST_WORKERD "${COWORKERD_TEST_WORKERD_DEFAULT}"
-  CACHE FILEPATH "Patched workerd for kernel component tests; empty runs only kernel-independent tests")
 add_test(NAME node-log-stream COMMAND coworkerd-log-cleaning-test streams)
 add_test(NAME node-log-many-values COMMAND coworkerd-log-cleaning-test many-values)
 add_test(NAME node-log-many-values-equivalence COMMAND coworkerd-log-cleaning-test many-values-equivalence)
@@ -277,19 +282,19 @@ if(NOT COWORKERD_TEST_NODE)
 endif()
 # A configured patched Workerd is external to the CMake targets. This component
 # starts a single process on a loopback port, with no node, control plane, or storage.
-if(COWORKERD_TEST_WORKERD)
-  if(NOT EXISTS "${COWORKERD_TEST_WORKERD}")
-    message(FATAL_ERROR "COWORKERD_TEST_WORKERD does not exist: ${COWORKERD_TEST_WORKERD}")
+if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
+  if(NOT EXISTS "${COWORKERD_TEST_WORKERD_PATH}")
+    message(FATAL_ERROR "COWORKERD_TEST_WORKERD does not exist: ${COWORKERD_TEST_WORKERD_PATH}")
   endif()
-  add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD}")
+  add_test(NAME node-log-redaction COMMAND coworkerd-log-cleaning-test "${COWORKERD_TEST_WORKERD_PATH}")
   set_tests_properties(node-log-redaction PROPERTIES TIMEOUT 30)
   add_test(NAME workerd-configuration COMMAND "${COWORKERD_TEST_NODE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/node/workerd-configuration.test.mjs" "${COWORKERD_TEST_WORKERD}")
+    "${CMAKE_CURRENT_SOURCE_DIR}/node/workerd-configuration.test.mjs" "${COWORKERD_TEST_WORKERD_PATH}")
   set_tests_properties(workerd-configuration PROPERTIES TIMEOUT 15)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME node-child-memory COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/node-child-memory.test.mjs" "$<TARGET_FILE:coworkerd>"
-      "${COWORKERD_TEST_WORKERD}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
     set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
     add_dependencies(check coworkerd)
   endif()

@@ -36,9 +36,9 @@ repository root:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends clang-18 cmake ninja-build libssl-dev git
+sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
 npm ci --prefix cli --registry=https://registry.npmjs.org
-export CC=clang-18 CXX=clang++-18 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
 cmake --build build --target check
 ```
@@ -58,15 +58,15 @@ tracked in [#2](https://github.com/coworkerd/coworkerd/issues/2):
 | `native-error-contract` | Native KJ contract-test log and receipt from a patched workerd source/build |
 
 To include the first three, pass `-DCOWORKERD_TEST_WORKERD=/absolute/path/to/workerd` to `scripts/build.sh`.
-A local `workerd/bazel-bin/src/workerd/server/workerd` is used by default if it exists; an explicitly configured
-missing binary remains an error. An empty `-DCOWORKERD_TEST_WORKERD=` selects the kernel-independent suite even
-when a local kernel exists. For `native-error-contract`, also configure `COWORKERD_NATIVE_TEST_LOG`,
+The default `COWORKERD_TEST_WORKERD=auto` checks for a local `workerd/bazel-bin/src/workerd/server/workerd` at every
+CMake configure, so building or removing the kernel updates the registered tests in the same build tree.
+An explicitly configured missing binary remains an error. An empty `-DCOWORKERD_TEST_WORKERD=` selects the
+kernel-independent suite even when a local kernel exists; `-DCOWORKERD_TEST_WORKERD=auto` restores automatic
+detection in an existing build tree. For `native-error-contract`, also configure `COWORKERD_NATIVE_TEST_LOG`,
 `COWORKERD_NATIVE_TEST_RECEIPT` and `COWORKERD_NATIVE_SOURCE_DIR` with the matching native run's outputs/source.
 Cluster smoke tests are tracked separately in [#1](https://github.com/coworkerd/coworkerd/issues/1).
 
-After the workflow has landed on `main`, a maintainer must require **`Build and unit tests (linux-x86_64)`**
-(GitHub Actions) in the ruleset targeting `main`. That repository setting is the remaining maintainer step in #3;
-adding the workflow does not configure it.
+`main` requires **`Build and unit tests (linux-x86_64)`** from GitHub Actions before a pull request can be merged.
 
 ## Trying a change on a local cluster
 

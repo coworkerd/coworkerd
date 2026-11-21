@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-unit-tests:
@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      CC: clang-18
-      CXX: clang++-18
+      CC: clang-19
+      CXX: clang++-19
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       WRANGLER_SEND_METRICS: 'false'
     steps:
@@ -35,14 +35,14 @@ jobs:
       - name: Install public build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-18 cmake ninja-build libssl-dev git
+          sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
           npm ci --prefix cli --registry=https://registry.npmjs.org
       - name: Build daemons
         run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
       - name: Run unit and component tests
         run: cmake --build build --target check
       - name: Report executed tests
-        if: always()
+        if: always() && hashFiles('build/test-results.xml') != ''
         run: |
           python3 - <<'PY'
           import os
@@ -54,9 +54,11 @@ jobs:
           skipped = [c for c in cases if c.find('skipped') is not None]
           summary = f'CTest: {len(cases)} tests, {len(failed)} failed, {len(skipped)} skipped.'
           print(summary)
+          guide = (os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY']
+                   + '/blob/' + os.environ['GITHUB_SHA'] + '/CONTRIBUTING.md#ci-and-local-unit-tests')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
-              output.write(summary + '\n\nKernel tests omitted pending #2: `node-log-redaction`, '
-                           '`workerd-configuration`, `node-child-memory`, `native-error-contract`.\n')
+              output.write(summary + '\n\nSee [CONTRIBUTING.md](' + guide + ') '
+                           'for the kernel-dependent tests omitted pending #2.\n')
           if not cases or failed or skipped:
               raise SystemExit('Expected a nonempty test suite with no failures or skipped tests')
           PY
