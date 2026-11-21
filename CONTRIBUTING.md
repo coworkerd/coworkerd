@@ -21,6 +21,53 @@
   only the version `cli/package.json` names, and it needs the toolchain container running with a configured CMake
   tree. The script checks the architecture-specific workerd pin and matching syscall profiles, and packages all six guides. A release is built on a machine of each architecture.
 
+## CI and local unit tests
+
+The `CI` workflow runs on every pull request and on pushes to `main`, on a GitHub-hosted Ubuntu 24.04 x86_64
+runner. Its check is **`Build and unit tests (linux-x86_64)`** (`build-and-unit-tests` in
+[.github/workflows/ci.yml](.github/workflows/ci.yml)). It builds both daemons and the Linux launcher with
+`scripts/build.sh`, then builds and runs the `check` target. Dependencies come from Ubuntu, public GitHub
+(the pinned Cap'n Proto source) and the public npm registry (`cli/package-lock.json`). No private image or kernel
+build is needed. CTest fails on an empty suite or any failed test; CI also verifies the JUnit report has executed
+tests and no failures or skips.
+
+To run the same checks locally on Ubuntu 24.04, install Node.js 22 (a current 22.x release), then run from the
+repository root:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends clang-19 cmake ninja-build libssl-dev git
+npm ci --prefix cli --registry=https://registry.npmjs.org
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
+bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
+cmake --build build --target check
+```
+
+`scripts/build.sh` forwards its arguments to CMake. The tests include native node/configuration, durable log and
+object store components, the four `cli-*` suites and `node-error-contract`; their individual names and results
+appear in CTest's output and `build/test-results.xml`.
+
+The following kernel-dependent tests are **not registered in this CI suite**, pending the public kernel artifacts
+tracked in [#2](https://github.com/coworkerd/coworkerd/issues/2):
+
+| CTest name | Required artifact |
+| --- | --- |
+| `node-log-redaction` | Patched `workerd`, for real Worker diagnostics |
+| `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
+| `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
+| `native-error-contract` | Native KJ contract-test log and receipt from a patched workerd source/build |
+
+To include the first three, pass `-DCOWORKERD_TEST_WORKERD=/absolute/path/to/workerd` to `scripts/build.sh`.
+The default `COWORKERD_TEST_WORKERD=auto` checks for a local `workerd/bazel-bin/src/workerd/server/workerd` at every
+CMake configure, so building or removing the kernel updates the registered tests in the same build tree.
+An explicitly configured missing binary remains an error. An empty `-DCOWORKERD_TEST_WORKERD=` selects the
+kernel-independent suite even when a local kernel exists; `-DCOWORKERD_TEST_WORKERD=auto` restores automatic
+detection in an existing build tree. For `native-error-contract`, also configure `COWORKERD_NATIVE_TEST_LOG`,
+`COWORKERD_NATIVE_TEST_RECEIPT` and `COWORKERD_NATIVE_SOURCE_DIR` with the matching native run's outputs/source.
+Cluster smoke tests are tracked separately in [#1](https://github.com/coworkerd/coworkerd/issues/1).
+
+`main` requires **`Build and unit tests (linux-x86_64)`** from GitHub Actions before a pull request can be merged.
+
 ## Trying a change on a local cluster
 
 Build a package and its image for your machine's architecture with `scripts/release.sh <version>` (on a Mac with Apple
@@ -45,8 +92,8 @@ how you checked the change on a local cluster.
 
 ## Sending a change
 
-- `main` is protected: a change lands through a pull request that passes the repository's checks (they are being
-  added, [#3](https://github.com/coworkerd/coworkerd/issues/3)) and that a maintainer has approved
+- `main` is protected: a change lands through a pull request that passes the repository's checks (listed above)
+  and that a maintainer has approved
   ([.github/CODEOWNERS](.github/CODEOWNERS) lists the maintainers).
 - A larger change starts as an issue that says what should change and when it is done; a small fix can go straight
   to a pull request. A pull request names the issue it closes.
