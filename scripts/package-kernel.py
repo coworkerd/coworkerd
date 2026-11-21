@@ -4,7 +4,9 @@
 import argparse
 import gzip
 import io
+import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -25,22 +27,31 @@ def package(args):
         [sys.executable, str(ROOT / "scripts/workerd-patches.py"), "check", "--checkout", str(args.checkout)],
         text=True,
     )
-    import json
     tree = json.loads(checked)["actualTree"]
     paths = {name: args.checkout / path for name, path in BINARIES.items()}
+    if args.workerd is not None:
+        paths["workerd"] = args.workerd
+    if args.threaded is not None:
+        paths["coworkerd-threaded"] = args.threaded
     for binary in paths.values():
         check_binary(binary, arch)
     paths.update({f"allowlist/{name}": args.allowlist / name for name in ALLOWLIST})
-    hashes = {name: sha256(path) for name, path in paths.items()}
-    check_allowlist(args.allowlist, hashes["workerd"], arch)
-    record = json_text({**identity, "patchSeries": series, "releaseTag": tag, "architecture": arch,
-                        "coworkerdCommit": source, "workerdTree": tree, "files": hashes}).encode()
-
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     archive_path = out / archive_name(arch)
     with tempfile.TemporaryDirectory(dir=out) as scratch:
-        pending = Path(scratch) / archive_path.name
+        stage = Path(scratch)
+        (stage / "allowlist").mkdir()
+        for name, path in paths.items():
+            if not path.is_file():
+                raise ValueError(f"{path} is not a regular file")
+            shutil.copyfile(path, stage / name)
+        hashes = {name: sha256(stage / name) for name in paths}
+        check_allowlist(stage / "allowlist", hashes["workerd"], arch)
+        record = json_text({**identity, "patchSeries": series, "releaseTag": tag, "architecture": arch,
+                            "coworkerdCommit": source, "workerdTree": tree, "files": hashes}).encode()
+
+        pending = stage / archive_path.name
         with pending.open("wb") as target, gzip.GzipFile(
             filename="", mode="wb", fileobj=target, mtime=0, compresslevel=9
         ) as compressed, tarfile.open(fileobj=compressed, mode="w|") as archive:
@@ -51,11 +62,11 @@ def package(args):
                     info.size = len(record)
                     archive.addfile(info, io.BytesIO(record))
                 else:
-                    with paths[name].open("rb") as stream:
-                        info.size = paths[name].stat().st_size
+                    with (stage / name).open("rb") as stream:
+                        info.size = (stage / name).stat().st_size
                         archive.addfile(info, stream)
         pending.replace(archive_path)
-        sums = Path(scratch) / "SHA256SUMS"
+        sums = stage / "SHA256SUMS"
         assets = [out / archive_name(published_arch) for published_arch in sorted(ARCHITECTURES)]
         sums.write_text("".join(f"{sha256(asset)}  {asset.name}\n" for asset in assets if asset.is_file()))
         sums.replace(out / sums.name)
@@ -67,6 +78,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=ARCHITECTURES, help="Linux target (default: this machine's architecture)")
     parser.add_argument("--checkout", type=Path, default=ROOT / "workerd", help="patched workerd checkout with Bazel outputs")
+    parser.add_argument("--workerd", type=Path, help="path to the built workerd (default: the Bazel output in --checkout)")
+    parser.add_argument("--threaded", type=Path, help="path to the built coworkerd-threaded (default: the Bazel output in --checkout)")
     parser.add_argument("--allowlist", required=True, type=Path, help="directory written by syscall-allowlist.py")
     parser.add_argument("--out", required=True, type=Path, help="local release directory for the archive and SHA256SUMS")
     try:

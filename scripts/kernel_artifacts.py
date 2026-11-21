@@ -7,6 +7,7 @@ import platform
 import re
 import struct
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,10 +87,11 @@ def pins(identity):
 
 def check_binary(path, arch):
     expected = ARCHITECTURES[arch][1]
+    if not path.is_file() or not path.stat().st_mode & 0o111:
+        raise ValueError(f"{path} is not an executable file")
     with path.open("rb") as stream:
         header = stream.read(64)
-    if (not path.is_file() or not path.stat().st_mode & 0o111 or len(header) != 64
-            or header[:7] != b"\x7fELF\x02\x01\x01"
+    if (len(header) != 64 or header[:7] != b"\x7fELF\x02\x01\x01"
             or struct.unpack_from("<HH", header, 16) not in ((2, expected), (3, expected))):
         raise ValueError(f"{path} is not an executable ELF64 for {arch}")
 
@@ -102,6 +104,6 @@ def check_allowlist(directory, workerd_sha256, arch):
         if record[kind]["file"] != name:
             raise ValueError(f"{directory}: expected {kind} allowlist file {name}")
     return subprocess.check_output(
-        ["python3", str(ROOT / "scripts/syscall-allowlist-check.py"), str(directory), workerd_sha256],
+        [sys.executable, str(ROOT / "scripts/syscall-allowlist-check.py"), str(directory), workerd_sha256],
         text=True,
     ).strip()
