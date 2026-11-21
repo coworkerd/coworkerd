@@ -43,10 +43,9 @@ bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= -DCOWORKERD_TEST_JUNIT="$PWD/bui
 cmake --build build --target check
 ```
 
-On macOS, install the host build dependencies listed above and Node.js 22, omit the `apt-get` commands and compiler
-overrides, then run the same npm, build and check commands. `scripts/build.sh` forwards its arguments to CMake.
-The tests include native node/configuration, durable log and object store components, the four `cli-*` suites and
-`node-error-contract`; their individual names and results appear in CTest's output and `build/test-results.xml`.
+`scripts/build.sh` forwards its arguments to CMake. The tests include native node/configuration, durable log and
+object store components, the four `cli-*` suites and `node-error-contract`; their individual names and results
+appear in CTest's output and `build/test-results.xml`.
 
 The following kernel-dependent tests are **not registered in this CI suite**, pending the public kernel artifacts
 tracked in [#2](https://github.com/coworkerd/coworkerd/issues/2):
