@@ -31,9 +31,11 @@ python3 scripts/workerd-patches.py check
 (cd workerd && bazel build --config=release //src/workerd/server:workerd //src/workerd/threaded:coworkerd-threaded)
 ```
 
-Generate the allowlist for that exact `workerd` on the target architecture using profiles from
-`scripts/syscall-profile.mjs` and `scripts/syscall-allowlist.py` as described in the system call allowlist
-section of the [installation guide](docs/guide/install.md).
+Generate the allowlist on the target architecture using profiles from `scripts/syscall-profile.mjs` and
+`scripts/syscall-allowlist.py` as described in the system call allowlist section of the
+[installation guide](docs/guide/install.md). Run the generator from a directory where you can pass relative
+paths for every `--workerd` and `--profile` input, because it writes those paths into `allowlist.json`.
+The generated allowlist must name the exact `workerd` being packaged.
 If `ALLOWLIST` is the generated directory, package and unpack your build into the same layout as the fetch command:
 
 ```bash
@@ -54,13 +56,17 @@ alongside them. Use `-DCOWORKERD_TEST_WORKERD="$KERNEL_DIR/workerd"` to test the
 
 An author who changes the kernel patch series or its upstream builds and tests that kernel locally. A maintainer
 checks out the PR head, builds and packages the release kernels on Linux x86_64 and arm64, and publishes the
-archives and `SHA256SUMS` on
-[this repository's Releases page](https://github.com/coworkerd/coworkerd/releases). Use the
+archives and `SHA256SUMS` on [this repository's Releases page](https://github.com/coworkerd/coworkerd/releases). Use the
 `kernel-<upstream tag>-<first 12 hex digits of the patch series SHA-256>` tag printed by the packaging script and
 mark the release as a pre-release. Run the packaging command once per architecture. In the final release directory,
 put the first archive in place before packaging or copying the second, then check that `SHA256SUMS` covers every
 published archive. Generate that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining
 archives packaged on separate machines.
+
+The publisher is responsible for building both binaries from the checked workerd source. The packaging script
+checks the source tree against the patch series and records that tree as `workerdTree` in `kernel.json`.
+`coworkerdCommit` records the commit in this repository where the packaging command ran, which may be the PR head.
+If the allowlist uses profiles from another build of the series, record that in the release notes.
 
 The maintainer posts the public release link and archive SHA-256 values on the PR. The author verifies the public
 downloads and records the upstream, full series SHA-256 and verified archive pins in
