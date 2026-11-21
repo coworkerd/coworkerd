@@ -8,7 +8,7 @@ import type { ValueOf } from "./shared";
 export type ObjectRow = {
 	key: string;
 	blob_id: string | null; // upload ID; legacy unchunked rows use the exact body name
-	chunk_size?: number; // 0 for legacy r32 rows
+	chunk_size?: number; // 0 for legacy single-blob rows
 	chunk_count?: number;
 	version: string;
 	size: number; // total size of object (all parts) in bytes

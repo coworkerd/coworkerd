@@ -1,6 +1,6 @@
 // The node's V8 sandbox plan (node/v8-sandbox.h): the mode, the per-process limit from the address
-// space and vm.max_map_count, the configured process count kept with a lowered resident limit
-// (r50 §6.4), and the refusals of sandbox.protectionKeys = required.
+// space and vm.max_map_count, the configured process count kept with a lowered resident limit,
+// and the refusals of sandbox.protectionKeys = required.
 #include "v8-sandbox.h"
 
 #include <kj/debug.h>
@@ -22,7 +22,7 @@ SandboxBuildFacts sandboxBuild() {
   build.groupPerIsolate = true;
   build.reservationBytes = 136 * GiB;
   build.capacityMeasured = true;
-  build.groupCapacity = 720;  // what --sandbox-facts measured on cwkd-p40
+  build.groupCapacity = 720;  // measured by --sandbox-facts on the 48-bit x86-64 machine described above
   return build;
 }
 MachineFacts machine48() { return {.addressSpaceBytes = 128ull << 40, .maxMapCount = 1048576}; }
@@ -46,7 +46,7 @@ void guardRegions() {
   // "off" plans the same: guard regions are this build's only mode.
   const auto off = planV8Sandbox("off", sandboxBuild(), noKeys(), machine48(), 1840, 1);
   KJ_REQUIRE(off.refusal.empty() && off.mode == "guard-regions" && off.perProcessLimit == 648);
-  // Keys present (S3b not in this build): auto still plans guard regions and says the keys are there.
+  // Keys present (key-based fencing is not in this build): auto still plans guard regions and says the keys are there.
   ProtectionKeyFacts keys{.cpu = true, .kernel = true, .usable = true};
   const auto keyed = planV8Sandbox("auto", sandboxBuild(), keys, machine48(), 1840, 1);
   KJ_REQUIRE(keyed.refusal.empty() && keyed.mode == "guard-regions" && keyed.keys == "available");
@@ -54,7 +54,7 @@ void guardRegions() {
 }
 
 void scale() {
-  // The node never starts more ordinary processes than configured (r50 §6.4), whatever the limit.
+  // The node never starts more ordinary processes than configured, whatever the limit.
   for (uint32_t count : {1u, 4u, 16u}) {
     const auto plan = planV8Sandbox("auto", sandboxBuild(), noKeys(), machine48(), 1840, count);
     KJ_REQUIRE(plan.processes == count && plan.configuredProcesses == count, count, plan.processes);
@@ -128,7 +128,7 @@ void unknown() {
   const auto plan = planV8Sandbox("auto", build, noKeys(), machine48(), 1840, 1);
   KJ_REQUIRE(plan.refusal.empty() && plan.mode == "unknown" && plan.residentLimit == 1840 && plan.processes == 1);
   KJ_REQUIRE(plan.json().find("cannot run coworkerd-threaded") != std::string::npos, plan.json().c_str());
-  // Said loudly (r50 §6.5): the node prints its warning line.
+  // A failed probe must appear in the node's warning.
   KJ_REQUIRE(plan.warning.find("the probe (coworkerd-threaded --sandbox-facts) failed (cannot run coworkerd-threaded)") !=
       std::string::npos, plan.warning.c_str());
 }
@@ -137,7 +137,7 @@ void machineGaps() {
   // No /proc: only the probe's measurement bounds it (90% of 720).
   const auto none = planV8Sandbox("auto", sandboxBuild(), noKeys(), MachineFacts{}, 1840, 1);
   KJ_REQUIRE(none.refusal.empty() && none.residentLimit == 648, none.refusal.c_str(), none.residentLimit);
-  // A probe that measured 0 groups holds no Worker (r50 §6.5): not the theoretical 934 x 90% = 840.
+  // A probe that measured 0 groups holds no Worker: not the theoretical 934 x 90% = 840.
   auto none0 = sandboxBuild();
   none0.groupCapacity = 0;
   const auto zero = planV8Sandbox("auto", none0, noKeys(), machine48(), 1840, 1);

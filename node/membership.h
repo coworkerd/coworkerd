@@ -34,7 +34,7 @@ struct Member {
 };
 
 // The lease of this process's membership epochs (objectStore), judged synchronously next to every confirmation of a
-// Durable Object write (results/r45/DESIGN.md section 10). All times are on the lease clock, leaseClockMs(), in ms.
+// Durable Object write. All times are on the lease clock, leaseClockMs(), in ms.
 //
 // S and D: the send time and the cadence slot of the last heartbeat whose success was handled before its end; T and I:
 // the TTL and the heartbeat interval. The epoch is HELD while now < S + T (equal is not). Past it, a heartbeat of the
@@ -180,7 +180,7 @@ struct MembershipView {
   std::string identityTakenReason;
   uint64_t ownHeartbeatChecks = 0, ownHeartbeatMissing = 0;
   // Listings that did not hold this node's own heartbeat although it had written one within the TTL: not a listing
-  // of the members, so nobody was dropped by it (v61, requirement 5c).
+  // of the members, so nobody was dropped by it.
   uint64_t incompleteListings = 0;
   uint64_t oldObjectsRemoved = 0;
   // This node's suspects object (members/<nodeId>/<epoch>.suspects): writes, removals and whether its current epoch has

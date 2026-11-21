@@ -14,8 +14,8 @@ bucket identities, blob targets, credentials or retirement positions.
 Objects are at most 1 GiB. Bodies use sequential, immutable blobs of at most
 8 MiB, named `<random-upload-id>/<zero-based-chunk-index>`. Empty objects have one
 empty chunk. The index stores `blob_id` (upload id), `chunk_size`, `chunk_count`
-and the original Miniflare metadata. Old r32 rows migrate with `chunk_size=0`,
-retaining their exact single-blob name until overwritten/deleted.
+and the original Miniflare metadata. Legacy single-blob rows migrate with
+`chunk_size=0`, retaining their exact single-blob name until overwritten/deleted.
 
 PUT streams one chunk at a time, with known-length FixedLengthStreams and running
 MD5/requested checksums. It retains a source packet and stream buffers rather
@@ -47,8 +47,8 @@ Successful acknowledgements remove rows transactionally. Each failed name keeps
 its own earliest retry time and delay (1 second, doubling to 60 seconds). A name
 in backoff does not hold up fresh work; when all names fail their individual
 attempt intervals grow without an idle alarm loop. Retry state survives restarts.
-Old r33 queue rows migrate in place; its old `_r2_gc_state` table, if present,
-is no longer consulted.
+Legacy retirement queue rows migrate in place; the old `_r2_gc_state` table,
+if present, is no longer consulted.
 
 Uploads expire seven days after creation. An alarm aborts expired in-progress
 uploads, queues all their parts and removes terminal upload records when their

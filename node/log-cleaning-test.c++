@@ -486,7 +486,7 @@ void manyValuesEquivalence() {
 
 // A value over several lines (a PEM key) printed by one process while another process's lines come in between:
 // the drainer keeps one cleaner state per process stream, so the value is still found whole and no line of it is
-// written (v137 section 6.23; with one state for all streams the other process's line broke the match).
+// written (with one state for all streams the other process's line broke the match).
 void multiLineValues() {
   TempDir directory;
   const auto body1 = syntheticValue(), body2 = syntheticValue();

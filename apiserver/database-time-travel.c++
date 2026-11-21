@@ -481,7 +481,7 @@ kj::Promise<ApiAnswer> DatabaseTimeTravel::progress(std::string tenant, std::str
       }
       // An old owner may still cache a failed attempt after the new owner has
       // finished. Read all known jobs before returning a failure. A completed
-      // immutable R1 receipt wins; otherwise an active attempt wins over failure.
+      // immutable receipt wins; otherwise an active attempt wins over failure.
       if (phase == "failed") failed = std::make_pair(phase, answer.body);
       else pending = std::make_pair(phase, answer.body);
     }

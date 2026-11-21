@@ -791,7 +791,7 @@ constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALA
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
 // How many of this node's unsealed records one answer to another node's rebuild carries.
 constexpr size_t TAIL_ANSWER_BYTES = 32u << 20;
-// The decoded segments a node keeps for its rebuilds, and how long one stays without a reader (b57).
+// The decoded segments a node keeps for its rebuilds, and how long one stays without a reader.
 constexpr uint64_t SEGMENT_CACHE_BYTES = 384ull << 20;
 constexpr double SEGMENT_CACHE_IDLE_MS = 30000;
 constexpr uint32_t SEGMENT_CACHE_SWEEP_MS = 5000;
@@ -2402,7 +2402,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
-  // r46: a record of an epoch whose lease is gone is refused before it enters the log (one that waits for a heartbeat
+  // A record of an epoch whose lease is gone is refused before it enters the log (one that waits for a heartbeat
   // in flight is taken; its confirmation waits). The same reading times the confirmation.
   const auto takenAtMs = leaseClockMs();
   if (const auto lease = leaseOf(takenAtMs);
@@ -2633,7 +2633,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
         current->lastRefusal = accepted.refusal;
         if (accepted.refusal.find("fenced") != std::string::npos) ++fencedRecords;
         if (accepted.refusal.starts_with("fenced:")) checkFencedShard(sequence);
-        // r48: a record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
+        // A record the peer refused, for any reason, never counts as held there (checkConfirmations) until the
         // peer takes it; a full buffer is tried again on this session after a growing wait.
         current->refusedSeqs.insert(sequence);
         if (accepted.refusal.starts_with("full") && inFlight.contains(sequence) && !isolated.contains(sequence)) {
@@ -2655,7 +2655,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
       }
       current->lastRefusal.clear();
       current->lastAckMs = monotonicTimeMs();
-      // r48: an answer accounts for its own record and those before it -- not for one sent after it whose own answer,
+      // An answer accounts for its own record and those before it -- not for one sent after it whose own answer,
       // possibly a refusal, has not come back yet (the peer's highest sequence can come from an earlier stream). A
       // piece that is not a record's last accounts only for the records before it: the record is held once its last
       // piece is taken.
@@ -2676,7 +2676,7 @@ void DurableLog::pumpPeer(PeerStream& peer) {
   }
 }
 
-// r49: a peer refused a record as fenced: it knows a newer epoch of the record's shard. That is believed once the object
+// A peer refused a record as fenced: it knows a newer epoch of the record's shard. That is believed once the object
 // store shows the next epoch after the record's (an epoch object is created only by the node that takes the shard),
 // and then this node has lost the shard: raising its own floor to that epoch (fenceOwner) refuses the shard's
 // pending and later writes at once, closes its objects here and drops it from the shards this node holds, so that
@@ -2706,7 +2706,7 @@ void DurableLog::checkFencedShard(uint64_t sequence) {
   tasks.add(raiseFloor(namespaceId, shard, epoch + 1, "a peer refused this node's append as fenced"));
 }
 
-// r48: a record the peer refused because its buffer was full, sent again on the same session while it still waits.
+// A record the peer refused because its buffer was full, sent again on the same session while it still waits.
 void DurableLog::retryRefused(const std::string& nodeId, uint64_t session, uint64_t sequence) {
   auto* current = currentPeer(nodeId, session);
   if (current == nullptr) return;
@@ -2761,7 +2761,7 @@ kj::Promise<void> DurableLog::openPeer(std::string nodeId) {
             "\",\"receiver\":" + quote(entry->identity) + ",\"firstSeq\":\"" + std::to_string(firstSeq) + "\"");
     for (const auto& [sequence, encoded] : records) {
       if (sequence < firstSeq || isolated.contains(sequence)) continue;
-      // r49: nor the records of a shard this node has given up (fenced): its newer owner has their tail already.
+      // Nor the records of a shard this node has given up (fenced): its newer owner has their tail already.
       if (!ownerFenceThrough.empty()) {
         if (const auto record = parsed.find(sequence); record != parsed.end() &&
             ownerFenced(record->second.objectName.substr(0, record->second.objectName.find('/')), record->second.shard,
@@ -2869,7 +2869,7 @@ void DurableLog::checkConfirmations() {
     auto* object = objectOf(key.substr(0, key.rfind('/')));
     if (object != nullptr) markRepair(*object, "the local log could not be flushed");
   }
-  // r46: the lease, judged by a reading of its clock taken just before each answer -- after the local flush above, with
+  // The lease, judged by a reading of its clock taken just before each answer -- after the local flush above, with
   // nothing that waits between it and the answer. A peer's acknowledgement never overrides it. Waiting for a heartbeat
   // in flight leaves the records unconfirmed until it settles or its end passes; a lost lease refuses them all.
   LeaseTracker::Judgment lease{LeaseTracker::Verdict::HELD, 0, ""};
@@ -3897,7 +3897,7 @@ kj::Promise<void> DurableLog::cleanupClosedEpoch() {
       if (state.healing) add(RecoveryKind::HEAL_BEGIN, state.rebuild);
       carried.push_back(name);
     }
-    // b58: appended here, synchronized on a worker thread before anything below relies on it.
+    // Appended here, synchronized on a worker thread before anything below relies on it.
     if (!appendRecovery(carry, false)) co_return;
     for (const auto& name : carried) carriedRecoveryObjects.insert(name);
     cleanup.reset();
@@ -3991,7 +3991,7 @@ void DurableLog::persistEarlierSeals() {
   }
 }
 
-// b58: what persistEarlierSeals does, with the appends and their fdatasync on a worker thread.
+// What persistEarlierSeals does, with the appends and their fdatasync on a worker thread.
 kj::Promise<void> DurableLog::persistEarlierSealsAsync() {
   if (recoveryWriteFailed || persistingSeals) co_return;
   struct Seal { uint64_t epoch, through; std::string path, framed; };
@@ -4119,7 +4119,7 @@ kj::Promise<void> DurableLog::resealEarlier() {
   const auto saved = earlierUploads.find(epoch);
   const auto cached = saved == earlierUploads.end() ? std::optional<ManifestSegment>() : saved->second;
   const bool reuse = cached.has_value();
-  // b58: before, this selection encoded every record (some 15,000 per segment here) and the segment was encoded and
+  // Before, this selection encoded every record (some 15,000 per segment here) and the segment was encoded and
   // hashed on the event loop, up to 0.86 s at a time. Now the loop only picks the records, in slices, with the same
   // boundaries (each record's encoded size is computed, not encoded); the background thread encodes, indexes,
   // assembles and hashes (buildEarlierSegment), and the loop uploads with that digest and publishes.
@@ -4252,7 +4252,7 @@ kj::Promise<DurableLog::EarlierSelection> DurableLog::selectEarlier(uint64_t epo
         sliced += size;
       }
       next = sequence + 1;
-      // A clock read costs about 1.4 us on cwkd-p40 (hpet): look at it every 16 records only.
+      // A clock read costs about 1.4 us with an hpet clock source: look at it every 16 records only.
       if (sliced >= earlierSliceBytes || ((++counted & 15) == 0 && monotonicTimeMs() - sliceStarted >= 0.5)) {
         more = true;
         break;
@@ -4267,11 +4267,12 @@ kj::Promise<DurableLog::EarlierSelection> DurableLog::selectEarlier(uint64_t epo
   }
 }
 
-// b58: before, the manifests were written one object after another (with a yield every 8): each write a listing, a
-// read and a create on the store (13 ms on cwkd-p40), then a scan of the whole epoch's records to retire the object's
-// (5 ms on the event loop); 4,638 writes over 5 segments took 94 s. Now up to EARLIER_PUBLISH_CONCURRENCY objects of
-// the segment are written at once, and retiring uses the per-object index. Each object still gets one manifest write
-// per segment, in segment order, and its records are retired only once that write succeeded.
+// Before, the manifests were written one object after another (with a yield every 8): each write a listing, a
+// read and a create on the store (measured at 13 ms per write), then a scan of the whole epoch's records to retire
+// the object's (5 ms on the event loop); 4,638 writes over 5 segments took 94 s. Now up to
+// EARLIER_PUBLISH_CONCURRENCY objects of the segment are written at once, and retiring uses the per-object index.
+// Each object still gets one manifest write per segment, in segment order, and its records are retired only once
+// that write succeeded.
 constexpr uint32_t EARLIER_PUBLISH_CONCURRENCY = 16;
 kj::Promise<void> DurableLog::publishEarlierObjects(uint64_t epoch, const SegmentHeader& header,
     std::vector<std::string> names, const std::map<std::string, uint64_t>& sourceEpochs) {
@@ -5110,7 +5111,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
           ",\"selectMs\":" + std::to_string(segmentStats.selectMs) + "}");
 }
 
-// A snapshot's parts, at most durableObjects.recoverParallelism at a time (R5: a volume server of SeaweedFS 3.97
+// A snapshot's parts, at most durableObjects.recoverParallelism at a time (a volume server of SeaweedFS 3.97
 // answered 7 of 1000 reads with an error at 32 at once), each written where it belongs in its facet's file.
 kj::Promise<void> DurableLog::downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
     const std::string& staging, std::function<void()> check, std::function<void(double)> observeFsync) {
@@ -5128,8 +5129,8 @@ kj::Promise<void> DurableLog::downloadSnapshotPart(const ObjectManifest& manifes
 // The segments a manifest names, in order, at most recoverParallelism downloads at a time; only the records of this
 // object are kept.
 // Each segment is downloaded and decoded once per node, off the event loop, and shared by the rebuilds that name it
-// (b57: one segment of a restarted owner's earlier epoch held every object of the shard, and each object's rebuild
-// decoded all of it on the loop again).
+// (previously, one segment of a restarted owner's earlier epoch held every object of the shard, and each object's
+// rebuild decoded all of it on the loop again).
 kj::Promise<std::vector<LogRecord>> DurableLog::readSegments(const ObjectManifest& manifest,
     const std::string& objectName, SegmentReadStats* stats) {
   if (!sweepingSegments) { sweepingSegments = true; tasks.add(sweepSegmentCache()); }
@@ -5583,7 +5584,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     co_await owners.addBranch();if (allOwners()) break;
     co_await peersDone.addBranch();
     if (state->discoveryAttempted && monotonicTimeMs() >= deadline) {
-      // r46: no cut while a silent previous owner's heartbeat shows its epoch still live, or cannot be judged.
+      // No cut while a silent previous owner's heartbeat shows its epoch still live, or cannot be judged.
       std::vector<std::pair<std::string, uint64_t>> silent;
       for (const auto& source : state->sources)
         if (!source.ownerComplete) silent.emplace_back(source.epoch.nodeId, source.epoch.nodeEpoch);
@@ -5644,7 +5645,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
   co_return out;
 }
 
-// r46 (results/r45/DESIGN.md 10.4): one read of each silent previous owner's heartbeat of its node epoch before a cut.
+// One read of each silent previous owner's heartbeat of its node epoch before a cut.
 // Its epoch still live by the membership's rule (the answer's Date minus its Last-Modified within TTL + grace) means a
 // heartbeat reached the store late: no cut yet, the recovery keeps asking. A failed read, an answer without both times,
 // or a record that names another node or epoch cannot allow a cut either. A heartbeat that is gone allows it, as
@@ -6651,8 +6652,8 @@ void DurableLog::shardTaken(const std::string& namespaceId, uint32_t shard, uint
 }
 
 // ---- What this machine's files are at, so the same boot reuses them ----
-// This machine's files are a cache, and v61 threw the cache away at the first request after a restart of the daemon
-// or of a durable process: the node kept "I have served this data epoch" in memory alone, so an object was rebuilt
+// This machine's files are a cache. Keeping "I have served this data epoch" in memory alone used to discard the
+// cache at the first request after a daemon or durable-process restart, so an object was rebuilt
 // from its whole history (a gibibyte took 19.5 s). The position beside the files says how far they are confirmed, so
 // a same-boot start can reuse a closed, admitted cache. A clean exit alone never
 // authorizes reuse after a machine reboot.
@@ -7025,7 +7026,7 @@ void DurableLog::fenceOwner(const std::string& namespaceId, uint32_t shard, uint
     log("owner-fenced", "\"namespaceId\":" + quote(namespaceId) + ",\"shard\":" + std::to_string(shard) +
         ",\"throughShardEpoch\":\"" + std::to_string(through) + "\",\"reason\":" + quote(reason));
   }
-  // r49: a shard a peer's fenced refusal made this node check is lost once the fence covers the refused record.
+  // A shard a peer's fenced refusal made this node check is lost once the fence covers the refused record.
   if (!lostShardChecks.empty()) {
     if (const auto watched = lostShardChecks.find({namespaceId, shard});
         watched != lostShardChecks.end() && watched->second <= boundary) {
@@ -7153,7 +7154,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     whole += std::string(bytes);
     bytes = whole;
   }
-  // r48: a record this node already holds, sent again after a reconnect, is taken again (as a duplicate) rather than
+  // A record this node already holds, sent again after a reconnect, is taken again (as a duplicate) rather than
   // refused for room it does not need.
   if (incomingBytes + bytes.size() > settings.config.peerBufferBytes && !buffer.holdsFramed(bytes)) {
     ++bufferRefusals;
@@ -7190,7 +7191,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
       result.refusal = "a record of another epoch of the owner";
       return result;
     }
-    // r49: a record this node already holds, sent again after the owner reconnected, was taken before any floor that
+    // A record this node already holds, sent again after the owner reconnected, was taken before any floor that
     // would refuse it now and is in a newer owner's tail: it is taken again as a duplicate, not refused -- refusing it
     // would hold back the owner's answers for its other shards until a trim. Only the same bytes are that record; a
     // different record under a held sequence is checked like any new one.
@@ -7201,7 +7202,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
       const auto known = knownEpoch(record->objectName.substr(0, record->objectName.find('/')), record->shard);
       if (known != 0 && record->shardEpoch < known) {
         ++fencedRecords;
-        // r48: the refused record is not held, so no answer of this stream may reach it until the owner drops it.
+        // The refused record is not held, so no answer of this stream may reach it until the owner drops it.
         if (record->nodeSeq > buffer.droppedTo && !buffer.isolated.contains(record->nodeSeq))
           buffer.fencedSeqs.insert(record->nodeSeq);
         result.accepted = buffer.answeredSeq();
@@ -7317,7 +7318,7 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
   return tailForPage(ask, remote, TAIL_ANSWER_BYTES);
 }
 
-// r48 (results/r45/DESIGN.md 10.4): a peer answering a newer owner's tail request first raises its floor for the shard,
+// A peer answering a newer owner's tail request first raises its floor for the shard,
 // so that an older owner -- one whose clock stood still while its machine was frozen, or an older version without the
 // lease check -- cannot have an append confirmed here after the newer owner has cut its tail. The number in the
 // request is believed only once the object store shows that epoch: an epoch object is created by the node that takes
@@ -7327,9 +7328,9 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
 // epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS. A request
 // for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before, except
-// that a restored epoch answers a request naming an object for that object without fencing (b58; the shard is
-// fenced when a proof is given for all of it) (r49
-// section 6.3; the check needs a wire signal or a new rule, in the backlog).
+// that a restored epoch answers a request naming an object for that object without fencing (the shard is
+// fenced when a proof is given for all of it). Checking an owner proof needs a wire signal or a new rule;
+// that check is in the backlog.
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
   co_await raiseFloor(ask.namespaceId, ask.shard, ask.shardEpoch, "a newer epoch of the shard asked for a tail");
@@ -7424,7 +7425,7 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
     const auto& info = predecessorLogs.at(ask.ownerNodeEpoch);
     const auto pending = info.unpublishedShards.find({ask.namespaceId, ask.shard});
     const bool shardPending = pending != info.unpublishedShards.end() && pending->second;
-    // b58: a request naming its object (b54) is answered for that object: once no record of it in this epoch is left
+    // A request naming its object is answered for that object: once no record of it in this epoch is left
     // unnamed by a manifest, the rest of the shard does not make the new owner wait. Never "nothing left" while any
     // record of the object is unpublished (restoredObjectPending). A request without an object is answered for the
     // shard, as before.

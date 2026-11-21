@@ -26,7 +26,7 @@ namespace coworkerd {
 // the trailing slash would let them through) and below cluster/, and its read of cluster/credentials/current, must be
 // refused with AccessDenied, while its own prefixes take a write and a removal and cluster/format/1 and a listing of
 // members/ stay readable. One JSON line per request, then the contract's line.
-// SeaweedFS 4.48, compared with 3.97 (v22, b8): an object PUT into a bucket that does not exist still answers 200 (so the
+// SeaweedFS 4.48, compared with 3.97: an object PUT into a bucket that does not exist still answers 200 (so the
 // bucket comes first, here and in init), but its gateway no longer keeps answering NoSuchBucket once the bucket exists,
 // and a read signed in the Authorization header no longer needs Write; it refuses the presigned read that also signs
 // x-amz-content-sha256 and x-amz-date, so the client presigns reads the standard way (host only, UNSIGNED-PAYLOAD), which

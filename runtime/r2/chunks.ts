@@ -9,7 +9,7 @@ import type { ObjectRow, InternalR2PutOptions, R2Range } from "./schemas.worker"
 export type BodyLayout = Pick<ObjectRow,"blob_id"|"chunk_size"|"chunk_count">;
 export function bodyNames(row: BodyLayout): string[] {
  if (!row.blob_id) return [];
- if (!row.chunk_size) return [row.blob_id]; // Existing r32 index, before migration.
+ if (!row.chunk_size) return [row.blob_id]; // Legacy single-blob index, before migration.
  return Array.from({length:row.chunk_count!},(_,i) => `${row.blob_id}/${i}`);
 }
 

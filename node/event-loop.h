@@ -17,7 +17,7 @@ namespace coworkerd {
 // Every poll is an epoll_wait and a clock read (on hosts whose clock is not in
 // the vDSO, another system call), so it runs every NODE_BUSY_POLL_INTERVAL
 // turns, not every other one: at 1 the node's main thread made about 500 of
-// its 619 system calls per request on cwkd-p40 (v138 §1).
+// its 619 system calls per request on a host with an hpet clock source.
 constexpr uint NODE_BUSY_POLL_INTERVAL = 64;
 inline void configureNodeEventLoop(kj::WaitScope& scope) {
   scope.setBusyPollInterval(NODE_BUSY_POLL_INTERVAL);

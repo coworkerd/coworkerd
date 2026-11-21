@@ -50,8 +50,8 @@ constexpr size_t PLATFORM_LOG_NEEDLE_MAX_BYTES = 65535;
 #define COWORKERD_CLEANER_AUTOMATON 1
 
 // Every needle at once (Aho-Corasick): one step per byte of output whatever the number of needles, where one
-// search per needle (KMP) took a step per byte per needle (v137 section 6.25, v138 section 4). Nodes are laid out
-// so that a needle's own continuation is the next node; only branch points keep a list of further children.
+// search per needle (KMP) took a step per byte per needle. Nodes are laid out so that a needle's own continuation
+// is the next node; only branch points keep a list of further children.
 class NeedleAutomaton {
 public:
   void build(const std::vector<std::string_view>& needles);
@@ -78,8 +78,8 @@ private:
 // Keep possible secret prefixes across records, pipe chunks and newlines, per
 // stream: a writer of several processes' output keeps one Stream for each of
 // their streams, so a value printed over several lines (a PEM key) is still
-// found when other processes' lines come in between (v137 section 6.23). The
-// needles are two automata the writer's streams share: those of the last full
+// found when other processes' lines come in between. The needles are two
+// automata the writer's streams share: those of the last full
 // load, and those appended since (rebuilt with every addition, merged into the
 // first once they reach a quarter of it), so an addition never rebuilds the
 // whole dictionary.

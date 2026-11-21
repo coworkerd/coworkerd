@@ -5,11 +5,11 @@
 
 // The V8 sandbox of the ordinary processes (kernel patch 0043): which mode this machine and build
 // run in, and how many Workers one process holds in it. With memory protection keys every isolate's
-// 8 GiB sandbox would be fenced by keys (S3b, not in this build); without them it is fenced by V8's
+// 8 GiB sandbox would be fenced by keys (not in this build); without them it is fenced by V8's
 // guard regions, and one isolate reserves 136 GiB of address space, so a process holds fewer than a
 // thousand. The node plans this once at startup (sandbox.protectionKeys: auto, off or required),
-// lowers the per-process resident limit to the plan's (the configured process count holds, r50
-// §6.4), and reports the plan, with the node's resident capacity, in its startup log and state.
+// lowers the per-process resident limit to the plan's (the configured process count holds), and reports the plan,
+// with the node's resident capacity, in its startup log and state.
 namespace coworkerd {
 
 // What the ordinary processes' binary reports about its V8 sandbox (coworkerd-threaded

@@ -26,7 +26,7 @@ struct ObjectStoreConfig {
   uint32_t timeoutMs = 30000;
   // Every request: establishing its connection (resolving the name included), then waiting for the answer and between
   // two reads of its body or two writes of the request's. A create-if-absent waits up to createTimeoutMs for its answer:
-  // SeaweedFS 4.48 queues the later writers of one key behind its owner's lock, about 1 s each (R5, experiment 23).
+  // SeaweedFS 4.48 queues the later writers of one key behind its owner's lock, about 1 s each.
   uint32_t connectTimeoutMs = 2000;
   uint32_t readTimeoutMs = 5000;
   uint32_t createTimeoutMs = 30000;
@@ -163,7 +163,7 @@ public:
   kj::Promise<ObjectResponse> get(std::string key);
   // PUT with `If-None-Match: *`: written only where the key does not exist. 412 (Precondition Failed) and 409 (a
   // conditional write to the same key in flight) both mean that it exists; any other status is an error. A create can
-  // take effect while its answer is lost (R5: 20 of 20 under a network cut), and then a second try meets 412: when the
+  // take effect while its answer is lost (20 of 20 under a network cut), and then a second try meets 412: when the
   // answer does not come back, the key is read back -- these very bytes there mean this create made it, which is why
   // every creator's bytes carry its own identity (a process instance and a random value of the write) -- and only an
   // absent key is created once more, on a new connection.

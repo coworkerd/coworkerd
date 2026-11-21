@@ -70,8 +70,8 @@ inline TenantAdmission tenantAdmission(uint32_t count, uint32_t limit, bool rese
 }
 
 // A Durable Object call nothing was sent for: SECRET_UNAVAILABLE when the node's secret dictionary could not take
-// its values -- the code its admission gives when the values do not fit, whichever of the two finds it (v138
-// section 4) -- and DO_UNAVAILABLE when the durable process is not ready.
+// its values -- the code its admission gives when the values do not fit, whichever of the two finds it -- and
+// DO_UNAVAILABLE when the durable process is not ready.
 inline const char* durableNotSentCode(bool secretDictionary) {
   return secretDictionary ? "SECRET_UNAVAILABLE" : "DO_UNAVAILABLE";
 }

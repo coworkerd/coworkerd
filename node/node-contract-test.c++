@@ -197,14 +197,14 @@ void eventLoopProgress() {
   KJ_REQUIRE(port.callbacks == 1000 && port.polls > 0 && port.largestBatch <= NODE_BUSY_POLL_INTERVAL + 1 &&
       port.largestBatch >= NODE_BUSY_POLL_INTERVAL / 4,
       "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
-  // The interval itself: 32 to 128 turns (v138 section 1), not the old 1 (a poll every other turn).
+  // The interval itself: 32 to 128 turns, not the old 1 (a poll every other turn).
   KJ_REQUIRE(NODE_BUSY_POLL_INTERVAL >= 32 && NODE_BUSY_POLL_INTERVAL <= 128, NODE_BUSY_POLL_INTERVAL);
   KJ_REQUIRE(port.largestBatch >= 8, "a poll every few turns is the waste v138 removed", port.largestBatch);
 }
 
 // A line its server already cut (the threaded server forwards at most 4,096 bytes of a message, and its size) is
-// marked truncated with its full size, as a line past the drainer's own limit is; a short line is not (b50's
-// log-quota-isolation: the threaded path lost the mark and the count).
+// marked truncated with its full size, as a line past the drainer's own limit is; a short line is not
+// (log-quota-isolation: the threaded path lost the mark and the count).
 void tenantLineTruncation() {
   auto parse = [](const std::string& text) { return parseTenantLine(std::string_view(text).substr(0, text.size() - 1)); };
   const auto earlier = tenantLineText("acme/noisy", "v1", "log", std::string(4096, 'x'), 5000);
@@ -338,7 +338,7 @@ std::string deadlineJson(double value) {
   return body.str();
 }
 void deadlines() {
-  // v133's archived 4.11 server log, parent s2.1-invocation-7, tree s1.1-tree-3.
+  // A fractional monotonic timestamp from a captured server log must survive JSON serialization.
   constexpr double historical = 116947232.28310399;
   KJ_REQUIRE(bool(deadlineJson(historical) == "{\"expiresAtMonotonicMs\":116947232.28310399}"));
   const double fractional = 123456789.12345678;

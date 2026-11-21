@@ -7,8 +7,8 @@
 // Cap'n Proto two-party connections whose network times its outgoing messages with the coarse monotonic clock.
 // TwoPartyVatNetwork reads its clock once per message sent, only to say how long the oldest queued message has
 // waited; capnp::TwoPartyClient and TwoPartyServer always give it the precise clock, which on a host whose clock
-// source has no vDSO reading (cwkd-p40's hpet: 1.4 microseconds a read) is a system call per message -- about ten
-// per request on the node's main thread (v138 section 1). The coarse clock is read from the vDSO whatever the clock
+// source has no vDSO reading (hpet: 1.4 microseconds a read) is a system call per message -- about ten
+// per request on the node's main thread. The coarse clock is read from the vDSO whatever the clock
 // source (14 ns there), at a resolution of one kernel tick.
 namespace coworkerd {
 

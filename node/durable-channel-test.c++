@@ -18,7 +18,7 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
-  // r46: the lease of a membership epoch, by the tracker alone (results/r45/DESIGN.md 10.1). TTL 5 s, interval 1 s.
+  // The lease of a membership epoch, by the tracker alone. TTL 5 s, interval 1 s.
   static void leaseTracker() {
     using V = LeaseTracker::Verdict;
     {
@@ -169,7 +169,7 @@ struct DurableLogChannelTest {
     }
   }
 
-  // r46: the confirmation path of the real log, with the lease hook a test controls. The log has no peers, so each
+  // The confirmation path of the real log, with the lease hook a test controls. The log has no peers, so each
   // record is confirmed by the local flush (the path that can block on a slow disk).
   static void leaseConfirm(const char* scenario) {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-lease-test-XXXXXX").string();
@@ -316,7 +316,7 @@ struct DurableLogChannelTest {
     log.closeChannel("d0");
   }
 
-  // r48: a peer that answers a newer epoch's tail request raises its floor for the shard (results/r45/DESIGN.md 10.4).
+  // A peer that answers a newer epoch's tail request raises its floor for the shard.
   // "raise": a verified newer epoch fences older appends; what was held stays and is answered; the sequence answered
   // stays below the refused record until the owner drops it. "unverified": numbers the store does not show raise
   // nothing, and the real newer owner still gets in. "old-ask": an older request lowers nothing.
@@ -471,7 +471,7 @@ struct DurableLogChannelTest {
     }
   }
 
-  // r48 sections 6.1-6.2: an owner reads a peer's answer as covering every record up to it. A record the peer refused
+  // An owner reads a peer's answer as covering every record up to it. A record the peer refused
   // -- fenced, its buffer full, or anything else -- must never count as held there unless the peer takes it later.
   // The rule is the owner's (it knows the record of every call); the peer holds its answers back for the fence only.
   static LogRecord testRecord(const std::string& ns, uint64_t ownerEpoch, uint64_t seq, uint32_t shard,
@@ -483,7 +483,8 @@ struct DurableLogChannelTest {
     return r;
   }
 
-  // Peer side, this node running r48. "fenced" (an owner of the older version, which reads answers cumulatively):
+  // Peer side, with fenced refusals holding back cumulative answers. "fenced" (an owner of the older version,
+  // which reads answers cumulatively):
   // record 1 taken, record 2 refused as fenced, record 3 (another shard) taken -- every answer stays below 2, through
   // a reconnect too, until a trim covers 2. "full": a full buffer does not hold the answers back (that would stall
   // every later record of the stream until the owner gives 2 up); the owner of this version does not count 2 anyway.
@@ -505,7 +506,7 @@ struct DurableLogChannelTest {
     log.settings.config.peerBufferBytes = 32768;
     uint64_t stream = 0;
     KJ_REQUIRE(log.openIncoming("owner", 2, "old", "9", 1, stream).empty());
-    uint64_t oldOwnerAcked = 0;  // what an owner without r48 counts: the highest answer it saw
+    uint64_t oldOwnerAcked = 0;  // what an owner using cumulative answers counts: the highest answer it saw
     auto send = [&](const LogRecord& r) {
       auto result = log.appendIncoming(stream, frameRecords({encodeLogRecord(r)}));
       oldOwnerAcked = std::max(oldOwnerAcked, result.accepted);
@@ -534,7 +535,7 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(later.refusal.empty() && later.accepted == 3 && log.incoming.at(stream).fencedSeqs.empty(),
           "a full buffer does not hold the answers back", later.accepted);
     } else if (name == "resend-held") {
-      // r49: a record this node holds, sent again after a reconnect once its shard's floor has gone up, is taken as a
+      // A record this node holds, sent again after a reconnect once its shard's floor has gone up, is taken as a
       // duplicate (it was taken before the floor and is in the newer owner's tail); a new record below the floor is
       // still refused, and the answers are not held back by the duplicate.
       KJ_REQUIRE(send(two).accepted == 2);
@@ -585,7 +586,7 @@ struct DurableLogChannelTest {
     std::deque<Call>& calls;
   };
 
-  // A peer in this process for the "pair" scenarios: the real append path of another DurableLog (r48 on both ends).
+  // A peer in this process for the "pair" scenarios: the real append path of another DurableLog.
   struct LocalSink final: DurableLog::PeerSink {
     LocalSink(DurableLog& peer, uint64_t stream): peer(peer), stream(stream) {}
     kj::Promise<Accepted> append(std::string records, bool partial) override {
@@ -601,13 +602,14 @@ struct DurableLogChannelTest {
     uint64_t stream;
   };
 
-  // Owner side, this node running r48. "<reason>" and "<reason>-reconnect" (reason: fenced, full, cut-short, limit,
-  // corrupt), with a peer of the older version that answers with its highest sequence: records 1, 2, 3 (three
-  // objects) go out; the peer answers 1 with 3, refuses 2 for the reason and takes 3. Only 1 and 3 may be confirmed;
+  // Owner side, with acknowledgements accounted for per record. "<reason>" and "<reason>-reconnect"
+  // (reason: fenced, full, cut-short, limit, corrupt), with a peer of the older version that answers with its
+  // highest sequence: records 1, 2, 3 (three objects) go out; the peer answers 1 with 3, refuses 2 for the reason
+  // and takes 3. Only 1 and 3 may be confirmed;
   // with "-reconnect" the session is then replaced and everything sent again, the peer answering as before. A full
   // buffer is tried again on the same session after FULL_RETRY_FIRST_MS: taken then, 2 is confirmed. "chunk": record
   // 2 is larger than APPEND_CHUNK_BYTES, its first piece answered with 3 and its last refused as fenced: 2 must not
-  // count from its first piece's answer. "pair-full", "pair-fenced": the peer is a real r48 DurableLog, its buffer too
+  // count from its first piece's answer. "pair-full", "pair-fenced": the peer is a real DurableLog, its buffer too
   // small for 2, or its floor above 2's shard epoch. Full: 3 is confirmed at once, 2 after a retry once the buffer
   // has room. Fenced: the peer holds its answers back, 3 waits until the owner gives 2 up (the stream is opened again
   // without it), then 3 is confirmed.
@@ -642,7 +644,7 @@ struct DurableLogChannelTest {
     peer.settings.config.peerBufferBytes = 32768;
     std::deque<FakeSink::Call> calls;
     uint32_t opened = 0;
-    std::map<uint32_t, uint64_t> knownFor;  // the shards' view of this node (r49 "fenced-known", "reacquired")
+    std::map<uint32_t, uint64_t> knownFor;  // the shards' view of this node ("fenced-known", "reacquired")
     DurableLog::Hooks hooks;
     hooks.knownShardEpoch = [&](const std::string&, uint32_t shard) {
       const auto found = knownFor.find(shard);
@@ -682,7 +684,7 @@ struct DurableLogChannelTest {
         name == "fenced-known" || name == "reacquired";
     const bool resend = name == "fenced-drop-resend";
     if (name == "fenced-drop" || name == "full-keeps" || resend) {
-      // r49: the store shows the next epoch of record 2's shard (4): another node has taken it.
+      // The store shows the next epoch of record 2's shard (4): another node has taken it.
       ShardEpoch next;
       next.namespaceId = ns; next.shard = 4; next.epoch = 2; next.nodeId = "node-3"; next.nodeEpoch = 7;
       next.dataEpoch = 1; next.reason = "timeout"; next.instance = "i"; next.nonce = "n"; next.acquiredAtUnixMs = 1;
@@ -731,7 +733,7 @@ struct DurableLogChannelTest {
       log.takeRecord(channel, std::move(record), request);
     };
     if (resend) {
-      // r49: records 1, 2, 3 (shards 3, 4, 5) are taken and confirmed; then a write to shard 4 is refused as fenced and
+      // Records 1, 2, 3 (shards 3, 4, 5) are taken and confirmed; then a write to shard 4 is refused as fenced and
       // the store shows epoch 2 of it -- the shard is given up. When the session reopens, the given-up shard's
       // confirmed record (2) is not sent again; the others are, and a new write to shard 5 is confirmed as usual.
       for (uint64_t i = 0; i < 3; ++i) calls[i].fulfiller->fulfill({i + 1, ""});
@@ -761,7 +763,7 @@ struct DurableLogChannelTest {
       answers();
       KJ_REQUIRE(acks.at(105) == 0 && log.confirmations == 4, "another shard's write is confirmed after the reopen");
     } else if (drop) {
-      // r49: "fenced-drop": a peer refuses record 2 as fenced and the store shows epoch 2 of its shard -- this node
+      // "fenced-drop": a peer refuses record 2 as fenced and the store shows epoch 2 of its shard -- this node
       // gives the shard up at once: record 2 fails now (not at confirmTimeoutMs), a later write to that object is
       // refused at once, the other shards are untouched. "fenced-unshown": the store does not show it -- nothing is
       // given up, until a background read finds it. "full-keeps": a full buffer gives nothing up and reads nothing,
@@ -1025,7 +1027,7 @@ struct DurableLogChannelTest {
     }
   }
 
-  // b58: the restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The
+  // The restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The
   // reference is the 42af4392 selection, which encoded every record on the loop; it runs on a copy of what is left
   // before each segment, then selectEarlier (sizes computed, records copied in slices) and buildEarlierSegment run on
   // the log itself, and the segment's objects are retired the way a published manifest retires them.
@@ -1184,7 +1186,7 @@ struct DurableLogChannelTest {
         segmentsSeen, yieldsSeen);
   }
 
-  // b58: a restored holder answers a tail request naming its object for that object. Random objects in two shards of
+  // A restored holder answers a tail request naming its object for that object. Random objects in two shards of
   // one earlier epoch, each published, partly published, being published (a manifest write in flight) or untouched,
   // some with an excluded record; every per-object and per-shard answer against the truth computed from what was
   // generated. With a deliberately wrong decision (shard-wide only, or a write in flight taken for done) some answer
@@ -1311,7 +1313,7 @@ struct DurableLogChannelTest {
       for (size_t i = 0; i < objects.size(); ++i) any = any || (objects[i].shard == shard && truth[i]);
       if (pending(ask(shard, "")) != any) matched = false;
     }
-    // A shard count the per-object counts do not account for (b54's durable-tail-equivalence makes one): requests
+    // A shard count the per-object counts do not account for (durable-tail-equivalence makes one): requests
     // naming an object are answered for the shard again.
     ++info.unpublishedShards[{ns, 0}];
     for (size_t i = 0; i < objects.size(); ++i)
@@ -1320,7 +1322,7 @@ struct DurableLogChannelTest {
   }
 
 
-  // b58: an object's records leave its earlier epoch only after the manifest that names them is written. A stand-in
+  // An object's records leave its earlier epoch only after the manifest that names them is written. A stand-in
   // for S3 (listing, reads, create-if-absent) holds or fails the manifest create of one object: while it is held a
   // request naming that object is still told there is more, and after a failed create the records stay.
   class HeldStore final: public kj::HttpService {

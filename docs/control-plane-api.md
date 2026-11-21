@@ -166,7 +166,7 @@ All operations use the existing tenant authorization. The source must be an acti
 - `GET /v1/tenants/{tenant}/database-restores/{operationId}` returns `{known:false}` after memory state is lost,
   or `{known:true,operationId,phase,point,node}` while working. A node failure has `phase:"failed"`, with
   `node.errorCode`, `node.error`, `node.resource`, `node.required` and `node.limit`. Completion is
-  `{known:true,phase:"completed",operationId,database,namespaceId,point}` after exact R1 verification and conditional
+  `{known:true,phase:"completed",operationId,database,namespaceId,point}` after exact manifest verification and conditional
   registration. Verification checks manifest identity/digest, the complete snapshot index and HEAD lengths for every
   part after the node reports completion. When a repeated start discovers manifest 1 itself, it also downloads and hashes
   all parts before registration. A competing name/quota change can still refuse registration. Retry the start with the same bookmark/id.
