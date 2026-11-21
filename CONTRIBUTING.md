@@ -50,9 +50,15 @@ how you checked the change on a local cluster.
   ([.github/CODEOWNERS](.github/CODEOWNERS) lists the maintainers).
 - A larger change starts as an issue that says what should change and when it is done; a small fix can go straight
   to a pull request. A pull request names the issue it closes.
+- An issue's "Done when" list is its finish line. What you find beyond it becomes another issue, not more of the same
+  pull request; a question the issue leaves open is asked in a comment on the issue.
 - One change per pull request, with a description of what changes and why. Commit messages say what changed.
 - Keep behavior changes and refactoring apart, and say in the description how you checked the change (for example
   the quickstart on a local cluster).
+- Issues, pull requests, commit messages, code and comments are in English. Comments and documents say what holds
+  for any reader on any machine: no names of your own hosts or paths, no references to notes kept outside this
+  repository.
+- After a review, add commits to the same branch instead of force-pushing it. A maintainer merges the pull request.
 - A change to workerd is a commit on the fork's branch and the same change exported to `patches/workerd/` (`python3
   scripts/workerd-patches.py export`, which takes one commit per patch named in `patches/workerd/series`, so a new
   patch is named there first; it works on the checkout `workerd/`, or the one `--checkout` names, which must be clean
@@ -62,3 +68,5 @@ how you checked the change on a local cluster.
   discussion first.
 - Never commit credentials, keys or tokens, including test values that look real.
 - Security issues are not reported in public issues: see [SECURITY.md](SECURITY.md).
+
+A coding agent follows the same process; [AGENTS.md](AGENTS.md) puts the steps in the order an agent takes them.
