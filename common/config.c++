@@ -60,7 +60,8 @@ void DurableLogConfig::validate() const {
 }
 
 void ProcessPoolConfig::validate() const {
-  KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
+  KJ_REQUIRE((count > 0 || threadedDurableTestStorage) && count <= 256 && inFlightLimit > 0,
+      "invalid process pool capacity");
   KJ_REQUIRE(ordinaryServer == "threaded",
       "processPool.ordinaryServer must be threaded; the ordinary upstream backend has been removed");
   KJ_REQUIRE(ordinaryServer != "threaded" || inFlightLimit <= 16384,

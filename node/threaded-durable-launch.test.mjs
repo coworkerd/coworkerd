@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -94,6 +94,9 @@ try {
   await refuseStart(/refuses an existing Durable Object storage directory/);
   assert.equal(await readFile(join(productionDirectory, 'format'), 'utf8'), 'existing state');
   await rm(productionDirectory, { recursive: true });
+  await symlink('missing-storage', productionDirectory);
+  await refuseStart(/refuses an existing Durable Object storage directory/);
+  await unlink(productionDirectory);
 
   const threaded = join(dirname(workerd), 'coworkerd-threaded');
   await assert.rejects(exec(threaded, ['4', 'unused', 'd0:1', '1', '--durable-test-storage'], {
