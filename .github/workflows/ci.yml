@@ -109,6 +109,11 @@ jobs:
           if not cases or failed or skipped or missing:
               raise SystemExit('Expected a nonempty test suite including all required tests, with no failures or skips')
           PY
+      - name: Validate single-case selection
+        if: runner.os == 'Linux'
+        env:
+          TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
+        run: node tests/cluster/run.mjs "$(dirname "$TEST_WORKERD")" sql-atomicity
       - name: Run cluster integration tests
         if: runner.os == 'Linux'
         timeout-minutes: 12

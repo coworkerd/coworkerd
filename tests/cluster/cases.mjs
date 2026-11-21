@@ -12,7 +12,8 @@ async function deployment(cluster) {
   const path = `/${tenant.name}/hello`;
   for (const version of ['v1', 'v2']) {
     const expected = `hello from ${version}`;
-    await cluster.deploy(tenant, 'hello', respondWith(expected), { version });
+    // Temporary validation: serve the old response after the version update.
+    await cluster.deploy(tenant, 'hello', respondWith('hello from v1'), { version });
     await eventually(`${version} serves on all three ingresses`, async () => {
       const observed = await Promise.all(cluster.nodes.map(node => request(cluster.urls[node], path)));
       assert.deepEqual(Object.fromEntries(cluster.nodes.map((node, i) => [node, observed[i]])),
