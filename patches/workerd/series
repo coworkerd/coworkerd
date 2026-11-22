@@ -67,3 +67,4 @@
 0090-ordinary-fatal-attribution.patch
 0091-fatal-attribution-requires-invocation.patch
 0092-fatal-record-test-constant.patch
+0093-scope-fatal-attribution.patch
