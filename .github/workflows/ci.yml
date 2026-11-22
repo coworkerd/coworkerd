@@ -102,6 +102,7 @@ jobs:
                        'node-threaded-durable-cpu-events',
                        'node-threaded-durable-launch', 'node-threaded-durable-home-reservation',
                        'node-threaded-durable-warm-copies',
+                       'node-threaded-durable-load-cancel',
                        'node-threaded-durable-http',
                        'node-threaded-durable-http-isolation',
                        'node-threaded-durable-http-output-gate',

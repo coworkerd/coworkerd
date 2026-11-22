@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sun, 22 Nov 2026 19:54:14 +0800
+Date: Sun, 22 Nov 2026 19:56:47 +0800
 Subject: [PATCH] Release durable copies after process-memory pressure
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..a9564310f209f8512aa6c74b3ea5a5c8bea993a3 100644
+index 8a8373db2082aebd9e1979e44d884229e95231b8..d7f8d488c31e675e91fcdd79191f7d697f88684e 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -756,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
@@ -22,7 +22,7 @@ index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..a9564310f209f8512aa6c74b3ea5a5c8
      if (currentCause) {
        auto expected = LimitCause::NONE;
        if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
-@@ -2762,6 +2765,7 @@ struct ThreadedServer {
+@@ -2788,6 +2791,7 @@ struct ThreadedServer {
            durableIdleRetirements.fetch_add(1);
          }
        }
@@ -30,7 +30,7 @@ index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..a9564310f209f8512aa6c74b3ea5a5c8
        current->second.stopFacets();
        actor.shutdown(0);
        state.durableRoots.erase(current);
-@@ -2788,7 +2792,8 @@ struct ThreadedServer {
+@@ -2814,7 +2818,8 @@ struct ThreadedServer {
        std::lock_guard lock(durableRoutingMutex);
        auto &home = *threads[homeId - 1]->home;
        home.memory = accounted();

@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 20:58:33 +0800
+Subject: [PATCH] Cancel a durable event's preparation with its session
+
+Cap'n Proto does not cancel a startEvent call when its connection goes
+away, because the interface does not allow cancellation. A session that
+ended while its event was still being prepared (its lease ran out during
+a cold load, for example) released its tree and its home, while the
+preparation ran on: it kept its place as a waiter of the cold load, and
+would later have created a root for a tree that no longer existed.
+
+The session now owns a scope that the bootstrap prepares its event in.
+When the session ends, the scope cancels the preparation before the tree
+and the home are released, which also takes the event's waiter off the
+cold load.
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 4f06fd15bf7fc60cc0585756d14c51b5c34c25c9..8fcf4919b3a80ce41e1debf82afba5257bc23714 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2114,18 +2114,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+   bool used = false;
+ };
+ 
++// An event that is still being prepared when its session ends is canceled with the session.
++// Cap'n Proto lets the startEvent call itself run on (its interface does not allow
++// cancellation), while the session's tree and home are released as soon as it has ended.
++struct DurableSessionScope {
++  kj::Canceler preparing;
++  bool ended = false;
++};
++
+ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+  public:
+   DurableBootstrap(ThreadedServer &server,
+       ThreadState &state,
+       DurableRoute route,
+       server::DurableAdmission::Ticket ticket,
+-      kj::Own<kj::PromiseFulfiller<void>> accepted)
++      kj::Own<kj::PromiseFulfiller<void>> accepted,
++      std::shared_ptr<DurableSessionScope> scope)
+       : server(server),
+         state(state),
+         route(std::move(route)),
+         ticket(ticket),
+-        accepted(kj::mv(accepted)) {}
++        accepted(kj::mv(accepted)),
++        scope(std::move(scope)) {}
+ 
+   kj::Promise<void> startEvent(StartEventContext context) override;
+   kj::Promise<void> startNativeEvent(StartNativeEventContext context) override;
+@@ -2136,6 +2146,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+   DurableRoute route;
+   server::DurableAdmission::Ticket ticket;
+   kj::Own<kj::PromiseFulfiller<void>> accepted;
++  std::shared_ptr<DurableSessionScope> scope;
+   bool used = false;
+ 
+   kj::Promise<kj::Own<WorkerInterface>> prepare(kj::String descriptor, Frankenvalue props);
+@@ -2690,6 +2701,13 @@ struct ThreadedServer {
+       }
+       finishDurable(call.ticket);
+     });
++    // Runs before the release above: an event this session was still preparing ends here,
++    // and with it the waiter it has on a cold load.
++    auto scope = std::make_shared<DurableSessionScope>();
++    KJ_DEFER({
++      scope->ended = true;
++      scope->preparing.cancel("durable session ended before its event was prepared");
++    });
+     const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+         call.deadline - server::DurableAdmission::Clock::now());
+     if (remaining.count() <= 0) co_return;
+@@ -2698,7 +2716,7 @@ struct ThreadedServer {
+     auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
+     auto accepted = kj::newPromiseAndFulfiller<void>();
+     capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(
+-        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller)));
++        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller), scope));
+     auto disconnected = session.accept(*stream).fork();
+     try {
+       co_await state.io.provider->getTimer()
+@@ -5011,7 +5029,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
+   KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
+       "unsupported durable test event origin");
+   try {
+-    auto worker = co_await prepare(kj::str(params.getCfBlobJson()), Frankenvalue());
++    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
++    auto worker =
++        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue()));
+     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
+     if (accepted->isWaiting()) accepted->fulfill();
+   } catch (const kj::Exception &error) {
+@@ -5023,8 +5043,9 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
+ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext context) {
+   auto params = context.getParams();
+   try {
+-    auto worker = co_await prepare(
+-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()));
++    KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
++    auto worker = co_await scope->preparing.wrap(prepare(
++        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
+     context.getResults().setDispatcher(kj::heap<ChannelDispatcher>(state, kj::mv(worker)));
+     if (accepted->isWaiting()) accepted->fulfill();
+   } catch (const kj::Exception &error) {

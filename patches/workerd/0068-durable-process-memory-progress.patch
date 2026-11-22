@@ -6,7 +6,7 @@ Subject: [PATCH] Refuse durable process pressure without waiting on an absent
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 46e2aade766bc91a8a412bd37b94fcac0fb75851..afe73ed0ab02b6d400b26b74c8f56f0e4a741c92 100644
+index bb0b1e04e3cd8995c6b680cf49b45c18affa7be5..8a8373db2082aebd9e1979e44d884229e95231b8 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -292,9 +292,14 @@ kj::Exception limitException(LimitCause cause);
@@ -43,7 +43,7 @@ index 46e2aade766bc91a8a412bd37b94fcac0fb75851..afe73ed0ab02b6d400b26b74c8f56f0e
      std::unique_lock lock(mutex);
      auto epoch = reclaimEpoch;
      requestReclaimLocked(additionalMemory);
-@@ -2291,7 +2299,9 @@ struct ThreadedServer {
+@@ -2310,7 +2318,9 @@ struct ThreadedServer {
                          ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
                          : 0),
              configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),

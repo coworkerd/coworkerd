@@ -5483,12 +5483,28 @@ public:
   // before it). Do not make this asynchronous without changing that accounting (DurableLog::pumpPeer).
   kj::Promise<void> append(AppendContext context) override {
     auto records = context.getParams().getRecords();
+    const bool partial = context.getParams().getPartial();
     auto result = log.appendIncoming(streamId,
         std::string_view(reinterpret_cast<const char*>(records.begin()), records.size()),
-        context.getParams().getPartial());
+        partial);
     context.getResults().setAccepted(result.accepted);
     if (!result.refusal.empty()) context.getResults().setRefused(result.refusal.c_str());
-    return kj::READY_NOW;
+    const bool acceptedRecord = !partial && result.refusal.empty() && result.accepted != 0;
+    const bool earlierReplyPending = pendingTestAcks && *pendingTestAcks != 0;
+    if (!earlierReplyPending && (!acceptedRecord || !log.peerAckGateClosedForTest())) {
+      return kj::READY_NOW;
+    }
+    // Gate only the reply. The peer has already applied this append. Maintain reply order
+    // on this stream even when a later append arrives while the fixture has the gate closed.
+    kj::Promise<void> previous = kj::READY_NOW;
+    if (earlierReplyPending) previous = KJ_ASSERT_NONNULL(testAckTail).addBranch();
+    if (!pendingTestAcks) pendingTestAcks = std::make_shared<size_t>(0);
+    ++*pendingTestAcks;
+    testAckTail = previous.then([&log = log, acceptedRecord]() -> kj::Promise<void> {
+      if (acceptedRecord) return log.waitForPeerAckGateForTest();
+      return kj::READY_NOW;
+    }).attach(kj::defer([count = pendingTestAcks]() { --*count; })).fork();
+    return KJ_ASSERT_NONNULL(testAckTail).addBranch();
   }
   kj::Promise<void> trim(TrimContext context) override {
     log.trimIncoming(streamId, context.getParams().getUpTo());
@@ -5504,6 +5520,8 @@ public:
 private:
   coworkerd::DurableLog& log;
   uint64_t streamId;
+  kj::Maybe<kj::ForkedPromise<void>> testAckTail;
+  std::shared_ptr<size_t> pendingTestAcks;
 };
 
 class PeerBootstrap final: public rpc::PeerServer::Server {
