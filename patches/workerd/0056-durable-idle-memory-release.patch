@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 14:55:56 +0800
+Subject: [PATCH] Drop deferred actor handles before durable pressure
+ collection
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 6bb333c8aafd2f2abb0ac95e8de6f2eab299c109..e36881dff4b5ac1ef5bb777fa7315c06da3e463e 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2718,11 +2718,13 @@ struct ThreadedServer {
+       }
+     }
+     if (reclaimed) {
+-      // Account again after the idle actors and their storage have closed.
+-      v8::Locker locker(memory.isolate);
+-      v8::Isolate::Scope entered(memory.isolate);
+-      memory.isolate->LowMemoryNotification();
+-      memory.observe();
++      // Actor teardown outside the isolate lock defers JSG handle destruction.
++      // Take the Worker lock to drop those roots before collecting their memory.
++      auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
++      worker.runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
++        lock.getIsolate()->LowMemoryNotification();
++        memory.observe(true);
++      });
+     }
+     server::DurablePressure::Action pressureAction;
+     bool releaseCopy;

@@ -477,8 +477,8 @@ try {
     const initial = await request('/memory-idle', {method: 'POST', body: 'idle value'});
     const moderateMiB = memoryPlacementMiB + 8;
     await request(`/memory-idle?allocateMiB=${moderateMiB}`);
-    const evicted = await untilState(state => state.pressureRetirements > 0 && state.trees === 0,
-      'idle-first memory eviction');
+    const evicted = await untilState(state => state.pressureRetirements > 0 && state.trees === 0 &&
+      state.maxHomeMemoryBytes < memoryPlacementMiB * 1024 * 1024, 'idle-first memory eviction');
     assert.equal(evicted.isolateResets, 0);
     assert.equal(evicted.reservedBytes, 0);
     resources.afterIdleEviction = await readProcessResources(processInfo.pid);
