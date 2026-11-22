@@ -17,6 +17,7 @@ const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
 const httpMemory = scenario === 'http-memory';
 const groupRefusal = scenario === 'group-refusal';
+const overlap = scenario === 'http-overlap';
 const memoryPlacementMiB = httpMemory ? Number(busyArg) : 64;
 if (httpMemory) assert.ok(Number.isInteger(memoryPlacementMiB) && memoryPlacementMiB >= 8 && memoryPlacementMiB <= 64);
 const boundedEvents = events || httpIsolation;
@@ -25,7 +26,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal;
+const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -42,6 +43,7 @@ const env = {
   TMPDIR: scratch,
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
+  ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -66,7 +68,7 @@ const config = {
   durableObjects: {
     processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
-  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
+  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8 },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
   peerListenAddress: '127.0.0.1:0',
@@ -208,8 +210,20 @@ try {
         }
         if (query.has("facet")) {
           const facet = this.ctx.facets.get("facet", () => ({class: this.ctx.exports.Counter}));
-          return facet.fetch("https://fixture.invalid/", request.method === "POST"
+          return facet.fetch(query.has("overlapHold")
+            ? "https://fixture.invalid/?overlapHold"
+            : query.has("overlapState") ? "https://fixture.invalid/?overlapState"
+            : "https://fixture.invalid/", request.method === "POST"
             ? { method: "POST", body: await request.text() } : {});
+        }
+        if (query.has("overlapState")) return Response.json(this.heldPayloads ?? 0);
+        if (query.has("overlapHold")) {
+          const payload = await request.text();
+          await this.ctx.storage.put("overlap", payload);
+          this.heldPayloads = (this.heldPayloads ?? 0) + 1;
+          try { await new Promise(resolve => setTimeout(resolve, 2500)); }
+          finally { --this.heldPayloads; }
+          return Response.json({instance: this.instance, isolate, bytes: payload.length});
         }
         if (query.has("inputGate")) {
           await this.ctx.blockConcurrencyWhile(async () => {
@@ -466,6 +480,73 @@ try {
     }
     console.log(JSON.stringify({scenario, pid: processInfo.pid, generation: processInfo.generation,
       wakes, admission: await readAdmission(socketPath)}));
+  } else if (overlap) {
+    const baseline = await readProcessResources(processInfo.pid);
+    const request = async (path, options, status = 200) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(6000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, status, body + '\n' + diagnostics);
+      return JSON.parse(body);
+    };
+    const facets = [];
+    for (let index = 0; index < 4; ++index) {
+      facets.push(await request(`/overlap-${index}?facet`, {method: 'POST', body: `facet ${index}`}));
+    }
+    const quiet = await waitForAdmission(socketPath, 0);
+    const warm = await readProcessResources(processInfo.pid);
+    const held = [];
+    const bodyBytes = 16 * 1024;
+    for (let index = 0; index < 4; ++index) {
+      for (let event = 0; event < 4; ++event) {
+        const promise = request(`/overlap-${index}?facet&overlapHold`, {
+          method: 'POST', body: 'x'.repeat(bodyBytes),
+        });
+        promise.catch(() => {});
+        held.push(promise);
+      }
+    }
+    let loaded, counts;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      counts = await Promise.all(facets.map((_, index) => request(`/overlap-${index}?facet&overlapState`)));
+      loaded = await readAdmission(socketPath);
+      if (counts.every(count => count === 4) && loaded.running === held.length) break;
+      await delay(10);
+    }
+    assert.deepEqual(counts, [4, 4, 4, 4], 'all bodies must be read and written before sampling');
+    assert.equal(loaded.running, 16, JSON.stringify(loaded));
+    assert.equal(loaded.residentRoots, 4);
+    const full = await readProcessResources(processInfo.pid);
+    // Mailbox limits apply to waiting events; these delivered events are suspended at await.
+    const interleaved = await request('/overlap-0');
+    assert.equal(interleaved.isolate, facets[0].isolate);
+    const neighbor = await request('/overlap-neighbor', {method: 'POST', body: 'still available'});
+    const replies = await Promise.all(held);
+    for (const [index, reply] of replies.entries()) {
+      assert.equal(reply.instance, facets[Math.floor(index / 4)].instance);
+      assert.equal(reply.bytes, bodyBytes);
+    }
+    for (let index = 0; index < 4; ++index) {
+      assert.deepEqual(await request(`/overlap-${index}?facet`), facets[index]);
+    }
+    assert.deepEqual(await request('/overlap-neighbor'), neighbor);
+    const drained = await waitForAdmission(socketPath, 0);
+    assert.equal(drained.running, 0);
+    assert.equal(drained.reservedBytes, quiet.reservedBytes + 16 * 1024);
+    assert.equal(drained.reservedDescriptors, quiet.reservedDescriptors + 4);
+    assert.equal(drained.actorResets, 0);
+    assert.equal(drained.isolateResets, 0);
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    console.log(JSON.stringify({scenario, roots: 4, facets: 4, events: held.length, bodyBytes,
+      baseline, warm, full, after: await readProcessResources(processInfo.pid),
+      quiet, loaded, drained, pid: sameChild.pid, generation: sameChild.generation}));
   } else if (groupRefusal) {
     const refused = await fetch(`http://127.0.0.1:${port}/group-refused`, {
       method: 'POST', body: 'must not reach the actor', signal: AbortSignal.timeout(5000),
