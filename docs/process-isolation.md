@@ -17,8 +17,8 @@ So each mechanism handles what the one before it cannot:
 | A request runs too long | The CPU limit terminates it inside its isolate; the process lives on |
 | It cannot be terminated (a long builtin) | The watchdog kills the process; workerd has already named the culprit |
 | An isolate allocates too much | The memory limit terminates it inside its isolate |
-| A single allocation too large to stop | V8 aborts the process; workerd writes the culprit first |
-| A tenant does it again | The tenant becomes a suspect; its stateless calls run in quarantine processes for a while |
+| V8 hits a fatal error | workerd writes any available attribution before exiting |
+| The node confirms a culprit | The tenant becomes a suspect and its stateless calls run in quarantine processes |
 | Idle isolates hold memory | Idle eviction, earlier and faster under the memory watermark |
 | A long-lived isolate's garbage collection runs inside a request | Its CPU is not charged to the request, within its Worker's budget; idle isolates are collected between requests |
 | A process's memory keeps growing | Process rotation replaces it with a new generation at a memory threshold |

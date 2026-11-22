@@ -1149,9 +1149,10 @@ struct ProcessGeneration {
       if (!crashEventPending) {
         // Scan each new byte once (plus a bounded overlap for a split marker),
         // never the accumulated tail on the per-call completion path.
-        constexpr std::string_view undetermined = "\"memory-oom-undetermined\"";
-        constexpr std::string_view culprit = "\"memory-culprit\"";
-        constexpr std::string_view fatal = "\"v8-fatal\"", fatalUnknown = "\"v8-fatal-undetermined\"";
+        constexpr std::string_view undetermined = "{\"event\":\"memory-oom-undetermined\"";
+        constexpr std::string_view culprit = "{\"event\":\"memory-culprit\"";
+        constexpr std::string_view fatal = "{\"event\":\"v8-fatal\"";
+        constexpr std::string_view fatalUnknown = "{\"event\":\"v8-fatal-undetermined\"";
         constexpr auto overlap = std::max({undetermined.size(), culprit.size(), fatal.size(), fatalUnknown.size()}) - 1;
         const auto start = previousSize > overlap ? previousSize - overlap : 0;
         crashEventPending = eventTail.find(undetermined, start) != std::string::npos ||
