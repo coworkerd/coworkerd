@@ -4953,6 +4953,23 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
 }
 
+std::optional<std::string> DurableLog::authorizeSocketOpen(const ObjectIdentity& identity,
+    uint64_t generation, uint64_t openId) const {
+  const auto key = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
+  auto found = objects.find(key);
+  const auto* object = found == objects.end() ? nullptr : &found->second;
+  if (!object || object->state != ObjectState::LOCAL || object->shardEpoch != identity.shardEpoch ||
+      object->definitionDrainStartedMs != 0) return std::nullopt;
+  auto channel = channels.find(object->dispatchedChannel);
+  if (channel == channels.end() || !channel->second.open || channel->second.draining ||
+      generation != channel->second.threadedGeneration || openId == 0 ||
+      channel->second.closeAsked.contains(openId)) return std::nullopt;
+  auto registration = channel->second.openFacets.find(key + "/0");
+  if (registration == channel->second.openFacets.end() || registration->second.id != openId)
+    return std::nullopt;
+  return channel->first.substr(0, channel->first.rfind('-'));
+}
+
 void DurableLog::askClose(Channel& channel, uint64_t openId) {
   if (!channel.closeAsked.insert(openId).second) return;
   std::string message;

@@ -419,6 +419,8 @@ public:
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
       uint64_t generation, std::string_view definition = {});
+  std::optional<std::string> authorizeSocketOpen(const ObjectIdentity&, uint64_t generation,
+      uint64_t openId) const;
   std::vector<std::string> drainThreadedNamespaces(const std::vector<std::string>& namespaces);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);

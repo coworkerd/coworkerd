@@ -104,7 +104,11 @@ webSocketError(ws, error) { console.error(String(error)); }
 
 Use `ctx.getWebSockets(tag?)`, `ctx.getTags(ws)` and `ctx.setWebSocketAutoResponse()` to manage accepted connections. An idle object's eviction leaves hibernatable connections open; the next delivered message constructs the object again with those connections and the same storage. Reconstruct in-memory state from storage in the constructor. Calling `ws.accept()` instead uses the ordinary WebSocket API and does not opt into this hibernation path.
 
-A process or node exit closes its connections: hibernation does not preserve a relay on a failed node. Draining and rotation close with `1001`, so clients reconnect. Incoming messages are at most 32 MiB; the ingress default is 1000 open connections per tenant per node (`429 WEBSOCKET_LIMIT` beyond it). There is no idle timeout or compression. A connection counts once in request usage; CPU is added as its messages execute.
+The upstream host keeps connections in its durable process. Process rotation, node drain and node exit end those connections. Incoming messages are at most 32 MiB and the ingress default is 1000 open connections per tenant per node (`429 WEBSOCKET_LIMIT` beyond it). Compression is disabled. CPU is charged as message handlers execute.
+
+On the experimental threaded host, an eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
+
+When a threaded tree retires, its node keeps hibernatable WebSockets, including tags and serialized attachments. The node answers WebSocket pings and matching `ctx.setWebSocketAutoResponse()` messages while the object sleeps. An application message or a close requiring a handler opens the object on its current shard owner. The node restores parked sockets before the constructor runs. Parked connections belong to that node and shard epoch. Node drain and loss of shard ownership close them with `1001` when the transport is still reachable, and the client must reconnect after a node exit.
 
 ## 5. Alarms
 

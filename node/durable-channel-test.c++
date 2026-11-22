@@ -1,5 +1,6 @@
 #include "durable-log.h"
 #include "durable-shards.h"
+#include "parked-websocket.h"
 
 #include "support.h"
 #include "json.h"
@@ -18,6 +19,47 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
+  static void parkedWebSocket() {
+    using Socket = ParkedWebSocket;
+    using Action = Socket::Frame::Action;
+    const Socket::Owner owner{4, 8}, staleOwner{4, 7};
+    const Socket::Home first{"upgrade", 11}, next{"wake", 12};
+    Socket socket(owner, first);
+    KJ_REQUIRE(socket.configure(owner, first, std::pair{std::string("ping"), std::string("pong")}));
+    const auto current = socket.receive(owner, "message");
+    KJ_REQUIRE(current.action == Action::FORWARD && current.position == 1);
+    KJ_REQUIRE(!socket.canPark(owner, first, current.position));
+    KJ_REQUIRE(socket.complete(owner, current.position));
+    KJ_REQUIRE(!socket.canPark(staleOwner, first, current.position));
+    KJ_REQUIRE(!socket.canPark(owner, first, current.position - 1));
+
+    const Socket::Snapshot saved{.tags = {"room", "member"}, .attachment = std::string("saved")};
+    KJ_REQUIRE(socket.park(owner, first, current.position, saved));
+    KJ_REQUIRE(!socket.authorized(owner, first));
+    const auto automatic = socket.receive(owner, "ping");
+    KJ_REQUIRE(automatic.action == Action::ANSWER && automatic.answer == "pong");
+    KJ_REQUIRE(!socket.complete(owner, automatic.position));
+    KJ_REQUIRE(socket.answered(owner, automatic.position, 1000));
+
+    const auto wake = socket.receive(owner, "ping ");
+    KJ_REQUIRE(wake.action == Action::WAKE && wake.position == automatic.position + 1);
+    KJ_REQUIRE(socket.receive(owner, std::nullopt).action == Action::BACKPRESSURE);
+    const auto* restored = socket.parked(owner);
+    KJ_REQUIRE(restored && restored->tags == saved.tags && restored->attachment == saved.attachment);
+    KJ_REQUIRE(restored->autoResponseTime == 1000);
+    KJ_REQUIRE(!socket.complete(staleOwner, wake.position));
+    socket.adopt(staleOwner, next);
+    KJ_REQUIRE(!socket.authorized(owner, next));
+    socket.adopt(owner, next);
+    KJ_REQUIRE(socket.authorized(owner, next));
+    KJ_REQUIRE(socket.complete(owner, wake.position));
+    KJ_REQUIRE(!socket.park(owner, first, wake.position, saved));
+    KJ_REQUIRE(socket.park(owner, next, wake.position, saved));
+    socket.fence(owner);
+    KJ_REQUIRE(socket.receive(owner, "ping").action == Action::REFUSE);
+    KJ_REQUIRE(!socket.parked(owner));
+  }
+
   static void threadedAlarms() {
     auto io = kj::setupAsyncIo();
     MembershipView membership;
@@ -1881,6 +1923,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
   else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
+  else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "restored-tail" || mode == "restored-tail-negative")

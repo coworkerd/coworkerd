@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import { unlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
@@ -834,12 +836,23 @@ async function threadedClassMigration(cluster) {
     export class ${className} extends DurableObject {
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path.endsWith('/alarm')) {
+          const at = await request.json();
+          await this.ctx.storage.setAlarm(at);
+          return Response.json(at);
+        }
+        if (path.endsWith('/socket')) {
+          const [client, socket] = Object.values(new WebSocketPair());
+          socket.accept();
+          socket.addEventListener('message', event => socket.send('${version}:' + event.data));
+          return new Response(null, { status: 101, webSocket: client });
+        }
         if (path.endsWith('/held')) {
           const encoder = new TextEncoder();
           return new Response(new ReadableStream({
             async start(controller) {
               controller.enqueue(encoder.encode('entered:'));
-              await scheduler.wait(8000);
+              await scheduler.wait(18000);
               controller.enqueue(encoder.encode('${version}'));
               controller.close();
             },
@@ -849,9 +862,11 @@ async function threadedClassMigration(cluster) {
         return Response.json({
           id: this.ctx.id.toString(),
           value: await this.ctx.storage.get('value'),
+          alarmVersion: (await this.ctx.storage.get('alarm-version')) ?? null,
           version: '${version}',
         });
       }
+      async alarm() { await this.ctx.storage.put('alarm-version', '${version}'); }
     }
     export default { fetch(request, env) { return env.OBJECT.getByName('stable').fetch(request); } };
   `;
@@ -865,7 +880,18 @@ async function threadedClassMigration(cluster) {
     return value;
   });
   const identity = (await namespace('Record')).namespaceId;
-  const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(25000) });
+  const socketUrl = new URL(url + '/socket', cluster.urls[ingress]);
+  socketUrl.protocol = 'ws:';
+  const socket = new WebSocket(socketUrl);
+  await once(socket, 'open', { signal: AbortSignal.timeout(5000) });
+  const echoed = once(socket, 'message', { signal: AbortSignal.timeout(5000) });
+  socket.send('probe');
+  assert.equal((await echoed)[0].data, 'v1:probe');
+  const socketClosed = once(socket, 'close', { signal: AbortSignal.timeout(25000) });
+  void socketClosed.catch(() => {});
+  const due = Date.now() + 12000;
+  assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
+  const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(30000) });
   assert.equal(held.status, 200);
   const reader = held.body.getReader();
   try {
@@ -886,8 +912,9 @@ async function threadedClassMigration(cluster) {
   await eventually('renamed class uses the existing threaded storage', async () => {
     assert.equal((await namespace('RenamedRecord')).namespaceId, identity);
     const entry = json(await call(''), 200, 'read v2');
-    assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2' });
+    assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2', alarmVersion: 'v2' });
   });
+  assert.equal((await socketClosed)[0].code, 1001, 'version drain closes the old connection');
   await cluster.deploy(tenant, name, respondWith('v3'), {
     version: 'v3', wrangler: { migrations: [initial, renamed, deleted] },
   });
@@ -903,6 +930,180 @@ async function threadedClassMigration(cluster) {
       assert.equal(gone.status, 404);
     }
   });
+}
+
+async function threadedSocketHibernation(cluster) {
+  const { WebSocket: PingSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const tenant = await cluster.tenant('threaded-hibernation');
+  const [ingress] = cluster.nodes;
+  const path = `/${tenant.name}/sleeper`;
+  const namespace = () => cluster.api(`${tenant.path}/workers/sleeper/namespaces/Sleeper`,
+    { token: tenant.token });
+  await cluster.deploy(tenant, 'sleeper', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Sleeper extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        this.constructedWith = ctx.getWebSockets('retained').length;
+        ctx.blockConcurrencyWhile(async () => {
+          this.instance = (await ctx.storage.get('constructors') ?? 0) + 1;
+          await ctx.storage.put('constructors', this.instance);
+        });
+      }
+      async fetch(request) {
+        if (new URL(request.url).pathname.endsWith('/terminal')) {
+          return Response.json(await this.ctx.storage.get('terminal') ?? null);
+        }
+        if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+          const [client, socket] = Object.values(new WebSocketPair());
+          this.ctx.acceptWebSocket(socket, ['retained']);
+          socket.serializeAttachment({ field: 42 });
+          this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'tock'));
+          return new Response(null, { status: 101, webSocket: client });
+        }
+        return Response.json({ instance: this.instance, sockets: this.ctx.getWebSockets('retained').length,
+          constructedWith: this.constructedWith });
+      }
+      webSocketMessage(socket, message) {
+        socket.send(JSON.stringify({
+          instance: this.instance, constructedWith: this.constructedWith,
+          message: typeof message === 'string' ? message : [...new Uint8Array(message)],
+          attachment: socket.deserializeAttachment(),
+          retained: this.ctx.getWebSockets('retained').length,
+          automatic: this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime(),
+        }));
+      }
+      async webSocketClose(socket, code, reason, wasClean) {
+        await this.ctx.storage.put('terminal', { code, reason, wasClean });
+        if (wasClean) socket.close(code, reason);
+      }
+      async webSocketError(socket, error) {
+        await this.ctx.storage.put('terminal', { error: String(error) });
+      }
+    }
+    export default {
+      fetch(request, env) { return env.TREE.getByName('parked').fetch(request); }
+    };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper'] }],
+    durable_objects: { bindings: [{ name: 'TREE', class_name: 'Sleeper' }] } } });
+
+  await eventually('the threaded object answers successfully', async () => {
+    assert.deepEqual(json(await request(cluster.urls[ingress], path), 200, 'open sleeper'),
+      { instance: 1, sockets: 0, constructedWith: 0 });
+  });
+  const owner = (await namespace()).owners[0];
+  assert.ok(owner && cluster.nodes.includes(owner.nodeId));
+  const activity = async () => (await durableGeneration(cluster, owner.nodeId)).lifecycle.durableAdmission;
+  const retired = after => eventually('the tree and its live sessions leave the home', async () => {
+    const state = await activity();
+    assert.ok(state.idleRetirements > after, JSON.stringify(state));
+    assert.equal(state.residentRoots, 0, JSON.stringify(state));
+    assert.equal(state.homeSessions, 0, JSON.stringify(state));
+    assert.equal(state.running, 0);
+    return state.idleRetirements;
+  }, { timeout: 25000 });
+
+  const socketUrl = new URL(path, cluster.urls[owner.nodeId]);
+  socketUrl.protocol = 'ws:';
+  const first = new PingSocket(socketUrl);
+  const second = new PingSocket(socketUrl);
+  const sockets = [first, second];
+  const next = async (socket, event, timeout = 7000) => {
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(new Error(`WebSocket ${event} timed out`)), timeout);
+    try {
+      return await once(socket, event, { signal: abort.signal });
+    } catch (error) {
+      if (abort.signal.aborted) throw abort.signal.reason;
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+    }
+  };
+  const ping = async (socket, text) => {
+    const pong = next(socket, 'pong');
+    socket.ping(text);
+    assert.equal((await pong)[0].toString(), text);
+  };
+  const send = async (socket, text) => {
+    const answer = next(socket, 'message');
+    socket.send(text);
+    return (await answer)[0].toString();
+  };
+  let paused = false;
+  try {
+    await Promise.all(sockets.map(socket => next(socket, 'open')));
+    await ping(first, 'before');
+    assert.equal(await send(first, 'tick'), 'tock');
+    const firstEvent = JSON.parse(await send(first, 'warm'));
+    assert.equal(firstEvent.instance, 1);
+    assert.equal(firstEvent.retained, 2);
+    assert.deepEqual(firstEvent.attachment, { field: 42 });
+    assert.ok(Number.isSafeInteger(firstEvent.automatic));
+
+    const firstRetirement = await retired(0);
+    const parked = (await cluster.state(owner.nodeId)).webSockets;
+    assert.equal(parked.parked, 2);
+    await ping(second, 'while parked');
+    assert.equal(await send(second, 'tick'), 'tock');
+    const afterAutomatic = await activity();
+    assert.equal(afterAutomatic.residentRoots, 0);
+    assert.equal(afterAutomatic.homeSessions, 0);
+    assert.equal(afterAutomatic.idleRetirements, firstRetirement);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.socketWakes, parked.socketWakes);
+    assert.deepEqual(json(await request(cluster.urls[owner.nodeId], path), 200, 'normal HTTP wake'),
+      { instance: 2, sockets: 2, constructedWith: 2 }, 'a normal reopen restores both sockets before the constructor runs');
+
+    const secondRetirement = await retired(firstRetirement);
+    assert.equal(await send(first, 'tick'), 'tock');
+    const wake = JSON.parse(await send(first, 'wake'));
+    assert.equal(wake.instance, 3);
+    assert.equal(wake.message, 'wake');
+    assert.equal(wake.retained, 2);
+    assert.equal(wake.constructedWith, 2);
+    assert.deepEqual(wake.attachment, { field: 42 });
+    assert.ok(wake.automatic > firstEvent.automatic);
+    assert.deepEqual(JSON.parse(await send(second, Buffer.from([0, 128, 255]))).message, [0, 128, 255]);
+
+    const readTerminal = async () => json(await request(cluster.urls[owner.nodeId], path + '/terminal'),
+      200, 'socket termination');
+    const clean = new PingSocket(socketUrl);
+    await next(clean, 'open');
+    const cleanClose = next(clean, 'close');
+    clean.close(1000, 'finished');
+    assert.equal((await cleanClose)[0], 1000);
+    await eventually('the actor receives the clean close code and its reason', async () => {
+      assert.deepEqual(await readTerminal(), { code: 1000, reason: 'finished', wasClean: true });
+    }, { timeout: 7000 });
+    const interrupted = new PingSocket(socketUrl);
+    await next(interrupted, 'open');
+    interrupted.terminate();
+    await eventually('the actor receives one abnormal close', async () => {
+      const terminal = await readTerminal();
+      assert.equal(terminal?.code, 1006);
+      assert.equal(terminal.wasClean, false);
+    }, { timeout: 7000 });
+    await retired(secondRetirement);
+
+    const survivor = cluster.nodes.find(node => node !== owner.nodeId);
+    const closed = sockets.map(socket => next(socket, 'close', 45000));
+    closed.forEach(promise => void promise.catch(() => {}));
+    await cluster.compose(['pause', owner.nodeId]);
+    paused = true;
+    await eventually('a surviving node takes the parked socket shard', async () => {
+      const read = json(await request(cluster.urls[survivor], path, { timeout: 7000 }), 200, 'takeover wake');
+      assert.deepEqual(read, { instance: 4, sockets: 0, constructedWith: 0 });
+      const nextOwner = (await namespace()).owners[0];
+      assert.notEqual(nextOwner.nodeId, owner.nodeId);
+      assert.ok(BigInt(nextOwner.epoch) > BigInt(owner.epoch));
+    }, { timeout: 35000 });
+    await cluster.compose(['unpause', owner.nodeId]);
+    paused = false;
+    for (const close of closed) assert.equal((await close)[0], 1001, 'loss of shard fences the parked socket');
+  } finally {
+    if (paused) await cluster.compose(['unpause', owner.nodeId]);
+    for (const socket of sockets) socket.terminate();
+  }
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
@@ -925,4 +1126,8 @@ export const durableGatedCases = {
     confirmTimeoutMs: 25000,
   },
   'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
+  'durable-threaded-hibernation': {
+    test: threadedSocketHibernation, nodes: ['node-1', 'node-2', 'node-3'],
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
 };

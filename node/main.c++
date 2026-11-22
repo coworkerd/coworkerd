@@ -19,6 +19,7 @@
 #include "durable-log.h"
 #include "database-seed.h"
 #include "durable-shards.h"
+#include "parked-websocket.h"
 #include "object-state.h"
 #include "deployment.h"
 #include "desired-state.h"
@@ -398,9 +399,25 @@ struct DurableTarget {
   uint32_t alarmRetryCount = 0;
   uint32_t alarmFacetId = 1;
   bool clearAlarm = false;
+  std::string socketId;
+  uint64_t socketFrame = 0;
+  size_t socketBytes = 0;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
+
+struct DurableSocketEvent {
+  coworkerd::DurableLog::ObjectIdentity object;
+  std::string socketId;
+  uint64_t frame;
+  kj::WebSocket::Message message;
+  std::optional<uint64_t> autoResponseTime;
+  bool disconnected = false;
+  bool transportError = false;
+};
+using DurableSocketDispatch =
+    std::function<kj::Promise<bool>(DurableSocketEvent)>;
+constexpr const char* MANAGED_SOCKET_HEADER = "x-coworkerd-managed-socket";
 // More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
 constexpr uint16_t MAX_DURABLE_HOPS = 8;
 
@@ -490,6 +507,7 @@ struct AdmissionSlot {
   bool durable = false;
   coworkerd::DurableLog::ObjectIdentity durableObject;
   coworkerd::DurableLog* durableLog = nullptr;
+  std::string durableDefinition;
   std::function<void(uint status, const std::string& code)> outcome;
   // Only the platform runtime receives this receipt. A tenant response cannot
   // turn an uncertain execution into a refusal that placement may retry.
@@ -554,6 +572,9 @@ public:
   public:
     virtual void goAway(const std::string& cause) = 0;
     virtual const coworkerd::DurableLog::ObjectIdentity* durableIdentity() const = 0;
+    virtual std::string_view managedId() const { return {}; }
+    virtual bool parked() const { return false; }
+    virtual bool matchesDurableDefinition(const DurableTarget&, std::string_view) const { return false; }
     Role role = Role::INGRESS;
     std::string tenant, processId;
     uint64_t generation = 0;
@@ -591,11 +612,23 @@ public:
   }
   void opened(Relay& relay) {
     relays.insert(&relay);
+    if (const auto id = relay.managedId(); !id.empty()) {
+      KJ_ASSERT(managed.emplace(std::string(id), &relay).second);
+      auto& object = *relay.durableIdentity();
+      byObject[{object.namespaceId, object.objectId}].insert(&relay);
+    }
     ++open[index(relay.role)][relay.tenant];
     ++openedTotal[index(relay.role)];
   }
   void closed(Relay& relay, const Ended& ended) {
     relays.erase(&relay);
+    if (const auto id = relay.managedId(); !id.empty()) {
+      managed.erase(std::string(id));
+      auto& object = *relay.durableIdentity();
+      auto found = byObject.find({object.namespaceId, object.objectId});
+      found->second.erase(&relay);
+      if (found->second.empty()) byObject.erase(found);
+    }
     auto& tenants = open[index(relay.role)];
     if (auto found = tenants.find(relay.tenant); found != tenants.end() && --found->second == 0) tenants.erase(found);
     auto& totals = closedTotals[index(relay.role)];
@@ -603,6 +636,32 @@ public:
     if (!ended.cause.empty()) ++totals.causes[ended.cause];
     totals.toWorker += ended.toWorker;
     totals.toClient += ended.toClient;
+  }
+  Relay* managedSocket(std::string_view id) {
+    const auto found = managed.find(id);
+    return found == managed.end() ? nullptr : found->second;
+  }
+  const std::set<Relay*>& managedObject(const std::string& ns, const std::string& object) const {
+    static const std::set<Relay*> empty;
+    auto found = byObject.find({ns, object});
+    return found == byObject.end() ? empty : found->second;
+  }
+  bool validateSocketDefinition(const DurableTarget& target, std::string_view definition) {
+    bool valid = target.socketId.empty();
+    for (auto* relay : managedObject(target.namespaceId, target.objectId)) {
+      if (relay->matchesDurableDefinition(target, definition)) {
+        if (relay->managedId() == target.socketId) valid = true;
+      } else {
+        relay->goAway("definition-changed");
+      }
+    }
+    return valid;
+  }
+  void goAwayNamespaces(const std::vector<std::string>& namespaces) {
+    goAwayWhere("definition-changed", [&](const Relay& relay) {
+      auto* object = relay.durableIdentity();
+      return object && std::find(namespaces.begin(), namespaces.end(), object->namespaceId) != namespaces.end();
+    });
   }
   // Every relay here (the drain), or those executing on one process generation (its rotation), told to go away.
   uint32_t goAway(const std::string& cause) { return goAwayWhere(cause, [](const Relay&) { return true; }); }
@@ -629,6 +688,7 @@ public:
           object->shardEpoch == target.shardEpoch;
     });
   }
+  void recordSocketWake() { ++socketWakes; }
   size_t openCount() const { return relays.size(); }
   size_t openCount(Role role) const {
     return static_cast<size_t>(std::count_if(relays.begin(), relays.end(), [role](const Relay* relay) { return relay->role == role; }));
@@ -649,8 +709,11 @@ public:
           ",\"endedBy\":" + counts(closedTotals[i].causes) + ",\"messages\":{\"toWorker\":" + std::to_string(closedTotals[i].toWorker) +
           ",\"toClient\":" + std::to_string(closedTotals[i].toClient) + "}}";
     }
+    const auto parked = std::count_if(managed.begin(), managed.end(),
+        [](const auto& entry) { return entry.second->parked(); });
     return out + ",\"places\":" + counts({places.begin(), places.end()}) + ",\"refused\":" + counts(refusedByTenant) +
-        ",\"toldToGoAway\":" + counts(goneAway) + "}";
+        ",\"toldToGoAway\":" + counts(goneAway) + ",\"parked\":" + std::to_string(parked) +
+        ",\"socketWakes\":" + std::to_string(socketWakes) + "}";
   }
 
 private:
@@ -666,6 +729,9 @@ private:
   struct Totals { std::map<std::string, uint64_t> codes, causes; uint64_t toWorker = 0, toClient = 0; };
   const uint32_t perTenant;
   std::set<Relay*> relays;
+  std::map<std::string, Relay*, std::less<>> managed;
+  std::map<std::pair<std::string, std::string>, std::set<Relay*>> byObject;
+  uint64_t socketWakes = 0;
   std::map<std::string, uint32_t> places;
   std::array<std::map<std::string, uint64_t>, 2> open;
   std::array<uint64_t, 2> openedTotal{};
@@ -1302,6 +1368,9 @@ public:
 
   // ---- Inbound WebSocket connections ----
   WebSocketRegistry& webSockets() { return webSocketRegistry; }
+  void setDurableSocketDispatch(DurableSocketDispatch dispatch) { durableSocketDispatch = std::move(dispatch); }
+  const DurableSocketDispatch& socketDispatch() const { return durableSocketDispatch; }
+  const kj::HttpHeaderTable& responseHeaders() const { return headers; }
   kj::Timer& clock() { return timer; }
 
   // ---- Where a stateless subcall executes (placement.subcalls) ----
@@ -2438,6 +2507,11 @@ public:
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
+    if (process->threadedDurableRole()) {
+      if (!webSocketRegistry.validateSocketDefinition(target, root->fingerprint))
+        throw DurableDispatchRefused{{false, 409, "DO_SOCKET_STALE", "the socket lost its pinned definition"}};
+      slot->durableDefinition = root->fingerprint;
+    }
     if (!process->threadedDurableTestRole()) {
       trackRootNamespace(target.namespaceId);
       if (!target.isDatabase()) {
@@ -3517,13 +3591,19 @@ private:
                 << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
                 << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
                 << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
-                << "\",\"queuedBytes\":\"" << encoded.size() << "\",\"expiresMonotonicNs\":\""
+                << "\",\"queuedBytes\":\"" << encoded.size() + durable->socketBytes << "\",\"expiresMonotonicNs\":\""
                 << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
           encoded.pop_back();
           if (durable->alarmAtUnixMs) {
             encoded += ",\"durableAlarm\":{\"scheduledTime\":\"" + std::to_string(durable->alarmAtUnixMs) +
                 "\",\"retryCount\":\"" + std::to_string(durable->clearAlarm ? 0 : durable->alarmRetryCount) +
                 "\",\"clear\":" + (durable->clearAlarm ? "true" : "false") + "}";
+          }
+          if (!webSocketRegistry.managedObject(durable->namespaceId, durable->objectId).empty())
+            encoded += ",\"hasNodeSockets\":true";
+          if (!durable->socketId.empty()) {
+            encoded += ",\"durableSocket\":{\"id\":\"" + jsonEscape(durable->socketId) +
+                "\",\"frame\":\"" + std::to_string(durable->socketFrame) + "\"}";
           }
           encoded += route.str();
         }
@@ -3610,6 +3690,7 @@ private:
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
   WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerTenant};
+  DurableSocketDispatch durableSocketDispatch;
   // What the forked log writers hide on this node, and which calls with secrets it starts
   // (node/secret-dictionary.h). Mutable: encodeDescriptor() records what each descriptor carries.
   mutable coworkerd::SecretDictionary secretDictionary{[this] {
@@ -3976,6 +4057,7 @@ InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
 // One [websocket] line when the relay starts and one when it ends.
 class WebSocketRelay final: public WebSocketRegistry::Relay {
 public:
+  using ManagedSocket = coworkerd::ParkedWebSocket;
   static constexpr size_t MAX_MESSAGE_BYTES = 32u << 20;
   static constexpr uint32_t CLOSE_GRACE_MS = 2000;
   // The close capnp's HTTP-over-capnp sends on a WebSocket whose request failed with OVERLOADED: workerd ends a request
@@ -4003,7 +4085,8 @@ public:
     this->tenant = coworkerd::tenantOf(this->identity.workerId);
   }
   ~WebSocketRelay() noexcept(false) {
-    if (durableLog != nullptr)
+    managedCommands.cancel("the node closed the socket");
+    if (durableLog != nullptr && !durableProcessId.empty())
       durableLog->objectConnectionClosed(durableObject, durableProcessId, durableGeneration);
     if (!started) return;
     // Ended from outside before its own end: the request it runs in was canceled -- at the executing node, because the
@@ -4026,6 +4109,75 @@ public:
   const coworkerd::DurableLog::ObjectIdentity* durableIdentity() const override {
     return durableLog ? &durableObject : nullptr;
   }
+  std::string_view managedId() const override {
+    return managed ? std::string_view(identity.invocationId) : std::string_view();
+  }
+  bool managedAuthority(uint64_t nodeEpoch, rpc::ThreadedSocketAuthority::Reader authority) const {
+    return managed && !closing && authority.getDataEpoch() == durableObject.dataEpoch &&
+        managed->authorized({nodeEpoch, authority.getShardEpoch()},
+            {authority.getInvocationId().cStr(), authority.getGeneration()});
+  }
+  bool matchesDurableDefinition(const DurableTarget& target, std::string_view definition) const override {
+    return managed && managed->alive(managedOwner) && managedDefinition == definition &&
+        target.dataEpoch == durableObject.dataEpoch && target.shardEpoch == durableObject.shardEpoch;
+  }
+  void useNodeTransport(uint64_t nodeEpoch, DurableSocketDispatch dispatch, std::string definition) {
+    KJ_REQUIRE(durableLog != nullptr && dispatch);
+    managedOwner = {nodeEpoch, durableObject.shardEpoch};
+    managed.emplace(managedOwner, ManagedSocket::Home{identity.invocationId, generation});
+    dispatchManaged = std::move(dispatch);
+    managedDefinition = std::move(definition);
+    innerBroken = true;
+  }
+  kj::Promise<void> managedSend(kj::WebSocket::Message message) {
+    ++managedWrites;
+    auto writing = kj::defer([this] { --managedWrites; });
+    KJ_IF_SOME(close, message.tryGet<kj::WebSocket::Close>()) {
+      return managedCommands.wrap(closeFrom(false, close.code, close.reason.cStr()).attach(kj::mv(writing)));
+    }
+    ++toClient;
+    return managedCommands.wrap(outerWriter.send(kj::mv(message)).attach(kj::mv(writing)));
+  }
+  bool belongsTo(const coworkerd::DurableLog::ObjectIdentity& object) const {
+    return object.namespaceId == durableObject.namespaceId && object.objectId == durableObject.objectId &&
+        object.dataEpoch == durableObject.dataEpoch && object.shardEpoch == durableObject.shardEpoch;
+  }
+  bool canPark(const coworkerd::DurableLog::ObjectIdentity& object, uint64_t generation, uint64_t position) const {
+    return managed && !closing && managedWrites == 0 && belongsTo(object) &&
+        managed->canParkOpen(managedOwner, generation, position);
+  }
+  void park(uint64_t generation, ManagedSocket::Snapshot snapshot) {
+    managed->parkOpen(managedOwner, generation, std::move(snapshot));
+    if (!durableProcessId.empty()) {
+      durableLog->objectConnectionClosed(durableObject, durableProcessId, durableGeneration);
+      durableProcessId.clear();
+      processId.clear();
+    }
+  }
+  bool parked() const override { return managed && managed->parked(managedOwner); }
+  const ManagedSocket::Snapshot* parked(const coworkerd::DurableLog::ObjectIdentity& object) const {
+    return managed && !closing && belongsTo(object) ? managed->parked(managedOwner) : nullptr;
+  }
+  void adopt(ManagedSocket::Home home, std::string process) {
+    setPlace(process, home.generation);
+    holdObject(*durableLog, durableObject, process, home.generation);
+    managed->adopt(managedOwner, std::move(home));
+  }
+  const auto& automaticResponse() const { return managed->automatic(); }
+  bool configureManaged(uint64_t nodeEpoch, rpc::ThreadedSocketAuthority::Reader authority,
+      std::optional<std::pair<std::string, std::string>> response) {
+    if (!managedAuthority(nodeEpoch, authority)) return false;
+    const auto configured = managed->configure({nodeEpoch, authority.getShardEpoch()},
+        {authority.getInvocationId().cStr(), authority.getGeneration()}, std::move(response));
+    if (configured && attached.fulfiller->isWaiting()) {
+      // The HTTP-over-Cap'n-Proto response still owns one end of the unused
+      // upgrade pipe. Finish its response pump so this invocation releases the
+      // home, while the node's relay continues on the real transport.
+      inner->disconnect();
+      attached.fulfiller->fulfill();
+    }
+    return configured;
+  }
   // Until both directions have ended -- each with its close frame, or one abruptly --, or the grace after the first
   // close ran out.
   kj::Promise<void> run() {
@@ -4033,10 +4185,23 @@ public:
     startedAt = monotonicTimeMs();
     registry.opened(*this);
     log("open");
-    co_await kj::joinPromises(kj::arr(pump(true), pump(false))).exclusiveJoin(end.addBranch());
+    if (managed) {
+      try {
+        co_await pumpManaged().exclusiveJoin(end.addBranch());
+      } catch (const kj::Exception& error) {
+        if (!closing) {
+          KJ_LOG(WARNING, "Durable Object socket transport failed", cleanReason(error.getDescription().cStr()).c_str());
+          nodeClose(1011, "Durable Object socket transport failed", "transport-failed");
+        }
+      }
+      if (closing && endFulfiller->isWaiting()) co_await end.addBranch();
+    } else {
+      co_await kj::joinPromises(kj::arr(pump(true), pump(false))).exclusiveJoin(end.addBranch());
+    }
     runEnded = true;
   }
   void goAway(const std::string& why) override {
+    if (managed) managed->fence(managedOwner);
     if (closing) return;
     nodeClose(1001, why == "drain" ? "the node is draining" : why == "owner-expired" ? "the node no longer owns this object"
         : why == "definition-changed" ? "the Durable Object definition changed" : "the process is being replaced", why);
@@ -4088,6 +4253,57 @@ private:
   };
 
   // One direction: toward the Worker reads `outer` and writes `inner`, toward the client the other way round.
+  kj::Promise<void> pumpManaged() {
+    using Action = ManagedSocket::Frame::Action;
+    co_await timer.timeoutAfter(10 * kj::SECONDS, kj::mv(attached.promise));
+    while (!closing || (innerClosed && !outerClosed)) {
+      kj::WebSocket::Message message;
+      bool disconnected = false, transportError = false;
+      try {
+        message = co_await outer->receive(MAX_MESSAGE_BYTES);
+      } catch (const kj::Exception& error) {
+        transportError = error.getType() != kj::Exception::Type::DISCONNECTED;
+        message = kj::WebSocket::Close{1006, kj::str("client disconnected")};
+        disconnected = outerBroken = true;
+      }
+      if (closing && !message.is<kj::WebSocket::Close>()) continue;
+      std::optional<std::string_view> text;
+      KJ_IF_SOME(value, message.tryGet<kj::String>()) text.emplace(value.begin(), value.size());
+      const auto action = managed->receive(managedOwner, text);
+      if (action.action == Action::REFUSE) co_return;
+      if (action.action == Action::ANSWER) {
+        co_await outerWriter.send(kj::str(kj::arrayPtr(action.answer.data(), action.answer.size())));
+        managed->answered(managedOwner, action.position, wallTimeMsForTest());
+        ++toClient;
+        continue;
+      }
+      KJ_REQUIRE(action.action != Action::BACKPRESSURE, "socket already has a frame in progress");
+      if (action.action == Action::WAKE) registry.recordSocketWake();
+      const bool closingFrame = message.is<kj::WebSocket::Close>();
+      const auto closeCode = closingFrame ? message.get<kj::WebSocket::Close>().code : 0;
+      const auto closeReason = closingFrame ? std::string(message.get<kj::WebSocket::Close>().reason.cStr()) : std::string();
+      if (!closingFrame) ++toWorker;
+      const bool delivered = co_await dispatchManaged({durableObject, identity.invocationId, action.position,
+          kj::mv(message), managed->autoResponseTime(), disconnected, transportError});
+      managed->complete(managedOwner, action.position);
+      if (!delivered) {
+        nodeClose(1013, "Durable Object socket wake refused", "wake-refused");
+        co_await end.addBranch();
+        co_return;
+      }
+      if (closingFrame) {
+        if (disconnected) {
+          direction = "client";
+          cause = "ingress-lost";
+        } else {
+          co_await closeFrom(true, closeCode, closeReason);
+          co_await outerWriter.close(closeCode, closeReason);
+        }
+        co_return;
+      }
+    }
+  }
+
   kj::Promise<void> pump(bool towardWorker) {
     auto& from = towardWorker ? *outer : *inner;
     auto& to = towardWorker ? innerWriter : outerWriter;
@@ -4235,6 +4451,13 @@ private:
   uint64_t durableGeneration = 0;
   kj::Own<kj::WebSocket> outer, inner;
   Writer outerWriter, innerWriter;
+  std::optional<ManagedSocket> managed;
+  ManagedSocket::Owner managedOwner{};
+  DurableSocketDispatch dispatchManaged;
+  kj::PromiseFulfillerPair<void> attached = kj::newPromiseAndFulfiller<void>();
+  std::string managedDefinition;
+  uint64_t managedWrites = 0;
+  kj::Canceler managedCommands;
   struct Errors final: public kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } errors;
   kj::TaskSet tasks{errors};
   static kj::ForkedPromise<void> fulfilledBy(kj::Own<kj::PromiseFulfiller<void>>& fulfiller) {
@@ -4331,11 +4554,17 @@ public:
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
     pathMark(slot->timing, "workerd-headers");
     slot->decide(true);
-    auto ingress = inner.acceptWebSocket(headers);
-    started = true;
     auto& server = *slot->server;
     auto process = slot->process;
     KJ_ASSERT(process != nullptr, "a WebSocket answered without a process call");
+    const bool nodeTransport = slot->durableLog && process->threadedDurableRole() && server.socketDispatch() &&
+        headerValue(headers, MANAGED_SOCKET_HEADER) == process->invocationId;
+    kj::HttpHeaders publicHeaders(server.responseHeaders());
+    headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+      if (strcasecmp(name.cStr(), MANAGED_SOCKET_HEADER) != 0) publicHeaders.addPtrPtr(name, value);
+    });
+    auto ingress = inner.acceptWebSocket(publicHeaders);
+    started = true;
     WebSocketRelay::Identity identity;
     identity.nodeId = server.placementConfig().serverId;
     identity.workerId = process->workerId; identity.versionId = process->versionId;
@@ -4364,7 +4593,9 @@ public:
     relay->setPlace(process->processId, process->generation);
     if (slot->durable && slot->durableLog != nullptr)
       relay->holdObject(*slot->durableLog, slot->durableObject, process->processId, process->generation);
-    server.holdLease(invocation);
+    if (nodeTransport) relay->useNodeTransport(std::strtoull(server.epoch().c_str(), nullptr, 10),
+        server.socketDispatch(), slot->durableDefinition);
+    if (!nodeTransport) server.holdLease(invocation);
     // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
     // leave it; its request context stays open in workerd until the connection ends.
     slot->finish();
@@ -4373,6 +4604,7 @@ public:
   }
   bool hasStarted() const { return started; }
   bool upgraded() const { return relay.get() != nullptr; }
+  bool nodeOwned() const { return upgraded() && !relay->managedId().empty(); }
   // The request toward workerd ended (its failure, if it failed): the relay may still be closing the connection.
   kj::Promise<void> settled(kj::Maybe<kj::Exception> failure) {
     relay->innerSettled(kj::mv(failure));
@@ -4446,6 +4678,7 @@ private:
       failure = error.getDescription().cStr();
     }
     if (tracked->upgraded()) {
+      if (tracked->nodeOwned()) inner = nullptr;
       co_await tracked->settled(kj::mv(failed));
       co_return;
     }
@@ -4486,6 +4719,10 @@ public:
     const auto started = monotonicTimeMs();
     pathMark(slot->timing, "http-service");
     auto call = inner.getHttpServiceRequest().send();
+    // The threaded durable dispatcher permits one event. Its HTTP capability
+    // now owns the invocation, so retaining the dispatcher here would keep
+    // the old home alive if an outer relay still holds this membrane.
+    if (slot->durable && slot->process && slot->process->threadedDurableRole()) inner = nullptr;
     context.initResults().setHttp(factory.kjToCapnp(kj::heap<AdmissionHttpService>(
         factory.capnpToKj(call.getHttp()), slot, headers)));
     phaseTiming("in-flight-wrapper", started, slot->process);
@@ -6608,20 +6845,40 @@ public:
     }
   }
 
-  kj::Promise<BindingDispatch::Dispatched> dispatchLocalAlarm(Request request, const coworkerd::DurableAlarm& alarm) {
+  kj::Promise<BindingDispatch::Dispatched> dispatchLocalEvent(Request request, uint32_t shard,
+      const coworkerd::DurableAlarm* alarm = nullptr) {
     Line line{request.workerId, {}, "node", "local", {}};
     const auto deadline = server.rootDeadline();
     std::string code, reason;
     auto version = checked(request, line, code, reason);
-    if (!version || request.target.shard != alarm.shard) {
-      const auto refusal = version ? server.refusal("DO_SHARD_EPOCH_MISMATCH", "the alarm shard changed", 409)
+    if (!version || request.target.shard != shard ||
+        shards.heldShardEpoch(request.target.namespaceId, shard) != request.target.shardEpoch) {
+      const auto refusal = version ? server.refusal("DO_SHARD_EPOCH_MISMATCH", "the event shard changed", 409)
                                    : server.refusal(code, reason, 409);
       co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, refusal, deadline)};
     }
-    auto ran = co_await runHere(std::move(request), std::move(version), line, monotonicTimeMs(), deadline, &alarm);
+    auto ran = co_await runHere(std::move(request), std::move(version), line, monotonicTimeMs(), deadline, alarm);
     if (ran.refusal)
       co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
     co_return kj::mv(ran.dispatched);
+  }
+
+  struct SocketOpen {
+    coworkerd::DurableLog::ObjectIdentity object;
+    std::string process;
+  };
+  std::optional<SocketOpen> authorizeSocketOpen(rpc::ThreadedSocketOpen::Reader open) {
+    const std::string ns = open.getNamespaceId().cStr();
+    const std::string id = open.getObjectId().cStr();
+    auto owner = server.namespaceOwner(ns);
+    if (!owner || !owner->active() || owner->isDatabase()) return std::nullopt;
+    const auto shard = coworkerd::durableShardOf(id, owner->shards);
+    if (shards.heldShardEpoch(ns, shard) != open.getShardEpoch()) return std::nullopt;
+    coworkerd::DurableLog::ObjectIdentity object{ns, id, owner->tenant, open.getDataEpoch(),
+        open.getShardEpoch(), shard};
+    auto process = durableLog.authorizeSocketOpen(object, open.getGeneration(), open.getWalOpenId());
+    if (!process) return std::nullopt;
+    return SocketOpen{std::move(object), std::move(*process)};
   }
 
   // A request another node sent here (PeerServer.openObjectInvocation), expecting this node to hold the object's shard at
@@ -6789,15 +7046,13 @@ private:
         deadline, false, false, &target, target.alarmAtUnixMs == 0, slot);
     if (current.refused) co_return refused(*current.refused);
     if (alarm) {
-      std::string code, reason;
-      const auto active = server.durableVersion(version->workerId, target, code, reason);
-      if (!active) co_return refused(server.refusal(code, reason, 409));
-      if (coworkerd::versionPin(*active) != coworkerd::versionPin(*version) ||
-          shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch ||
+      if (shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch ||
           !durableLog.alarmFireIsCurrent(*alarm)) {
         co_return refused(server.refusal("DO_ALARM_STALE", "the alarm lost its dispatch authority", 409));
       }
     }
+    if (!target.socketId.empty() && shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch)
+      co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the socket shard changed before dispatch", 409));
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
@@ -6904,6 +7159,7 @@ kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOv
 // The path the runtime answers for an alarm, and for one SQL statement on a database's object.
 // Absolute: the runtime remakes the request for the object's facet, and a Request is made from a full URL.
 constexpr const char* DURABLE_ALARM_PATH = "http://coworkerd-node/__coworkerd/durable-alarm";
+constexpr const char* DURABLE_SOCKET_PATH = "http://coworkerd-node/__coworkerd/durable-socket";
 // The object answers D1's own protocol, so a statement from the control plane goes to /query like one from a
 // d1_databases Binding does (src/cloudflare/internal/d1-api.ts).
 
@@ -6990,7 +7246,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     if (threaded) {
       request.target.shardEpoch = route.epoch;
       request.target.dataEpoch = route.dataEpoch;
-      auto dispatched = co_await durable.dispatchLocalAlarm(std::move(request), alarm);
+      auto dispatched = co_await durable.dispatchLocalEvent(std::move(request), alarm.shard, &alarm);
       answer = co_await collectObjectResponse(kj::mv(dispatched), factory, headerTable, DURABLE_ALARM_PATH, "{}");
     } else {
       answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
@@ -7030,6 +7286,48 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
       reason.empty() ? "the object answered " + std::to_string(answer.status) : reason};
+}
+
+kj::Promise<bool> deliverDurableSocket(DurableDispatch& durable, ServerCore& server,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headers, DurableSocketEvent event) {
+  auto owner = server.namespaceOwner(event.object.namespaceId);
+  if (!owner || !owner->active() || owner->isDatabase()) co_return false;
+  DurableDispatch::Request request;
+  request.workerId = owner->workerId;
+  request.target.namespaceId = event.object.namespaceId;
+  request.target.objectId = event.object.objectId;
+  request.target.className = owner->className;
+  request.target.tenant = owner->tenant;
+  request.target.dataEpoch = event.object.dataEpoch;
+  request.target.shardEpoch = event.object.shardEpoch;
+  request.target.socketId = event.socketId;
+  request.target.socketFrame = event.frame;
+
+  using coworkerd::json::quote;
+  std::ostringstream body;
+  body << "{\"connection\":" << quote(event.socketId) << ",\"position\":" << quote(std::to_string(event.frame));
+  KJ_SWITCH_ONEOF(event.message) {
+    KJ_CASE_ONEOF(text, kj::String) {
+      request.target.socketBytes = text.size();
+      body << ",\"text\":" << quote(std::string(text.begin(), text.size()));
+    }
+    KJ_CASE_ONEOF(binary, kj::Array<kj::byte>) {
+      request.target.socketBytes = binary.size();
+      const std::string bytes(reinterpret_cast<const char*>(binary.begin()), binary.size());
+      body << ",\"binary\":" << quote(coworkerd::json::base64(bytes));
+    }
+    KJ_CASE_ONEOF(close, kj::WebSocket::Close) {
+      body << ",\"code\":" << close.code << ",\"reason\":" << quote(close.reason.cStr())
+           << ",\"wasClean\":" << (event.disconnected ? "false" : "true");
+    }
+  }
+  if (event.autoResponseTime)
+    body << ",\"autoResponseUnixMs\":" << quote(std::to_string(*event.autoResponseTime));
+  if (event.transportError) body << ",\"error\":true";
+  body << '}';
+  auto opened = co_await durable.dispatchLocalEvent(std::move(request), event.object.shard);
+  auto result = co_await collectObjectResponse(kj::mv(opened), factory, headers, DURABLE_SOCKET_PATH, body.str());
+  co_return result.status == 204;
 }
 
 // One SQL statement on a database's object (POST /v1/tenants/{t}/databases/{d}/query, forwarded by the control
@@ -7170,6 +7468,147 @@ private:
   bool used = false;
 };
 
+class DurableSocketControl final: public rpc::ThreadedSocketControl::Server {
+public:
+  DurableSocketControl(ServerCore& server, DurableDispatch& durable): server(server), durable(durable) {}
+
+  kj::Promise<void> send(SendContext context) override {
+    const auto params = context.getParams();
+    const auto authority = params.getAuthority();
+    auto* relay = find(authority);
+    KJ_REQUIRE(relay != nullptr && relay->managedAuthority(epoch(), authority), "stale Durable Object socket");
+    const auto frame = params.getFrame();
+    switch (frame.which()) {
+      case rpc::ThreadedSocketFrame::TEXT:
+        KJ_REQUIRE(frame.getText().size() <= WebSocketRelay::MAX_MESSAGE_BYTES);
+        co_await relay->managedSend(kj::str(frame.getText()));
+        break;
+      case rpc::ThreadedSocketFrame::BINARY: {
+        auto binary = frame.getBinary();
+        KJ_REQUIRE(binary.size() <= WebSocketRelay::MAX_MESSAGE_BYTES);
+        co_await relay->managedSend(kj::heapArray<kj::byte>(kj::arrayPtr(binary.begin(), binary.size())));
+        break;
+      }
+      case rpc::ThreadedSocketFrame::CLOSE: {
+        auto close = frame.getClose();
+        KJ_REQUIRE(close.getReason().size() <= 123);
+        co_await relay->managedSend(kj::WebSocket::Close{close.getCode(), kj::str(close.getReason())});
+        break;
+      }
+    }
+  }
+
+  kj::Promise<void> setAutoResponse(SetAutoResponseContext context) override {
+    const auto params = context.getParams();
+    const auto authority = params.getAuthority();
+    auto* relay = find(authority);
+    std::optional<std::pair<std::string, std::string>> response;
+    if (params.getEnabled()) {
+      const auto request = params.getRequest();
+      const auto reply = params.getResponse();
+      KJ_REQUIRE(request.size() <= 2048 && reply.size() <= 2048);
+      response.emplace(std::string(request.begin(), request.size()), std::string(reply.begin(), reply.size()));
+    }
+    context.getResults().setAccepted(relay != nullptr &&
+        relay->configureManaged(epoch(), authority, std::move(response)));
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> park(ParkContext context) override {
+    struct Socket {
+      WebSocketRelay* relay;
+      WebSocketRelay::ManagedSocket::Snapshot snapshot;
+    };
+    const auto params = context.getParams();
+    const auto open = params.getOpen();
+    const auto current = durable.authorizeSocketOpen(open);
+    if (!current) return kj::READY_NOW;
+    std::vector<Socket> prepared;
+    std::set<WebSocketRelay*> unique;
+    for (const auto entry : params.getSockets()) {
+      auto* relay = find(entry.getAuthority());
+      // A closed node transport no longer needs a snapshot. A live relay
+      // with an outstanding application frame keeps the whole home active.
+      if (!relay) continue;
+      if (!unique.insert(relay).second || !relay->canPark(current->object, open.getGeneration(), entry.getLastFrame()))
+        return kj::READY_NOW;
+      const auto tags = entry.getTags();
+      const auto attachment = entry.getAttachment();
+      KJ_REQUIRE(tags.size() <= 10 && attachment.size() <= 16 * 1024);
+      WebSocketRelay::ManagedSocket::Snapshot snapshot;
+      for (const auto tag : tags) {
+        KJ_REQUIRE(tag.size() <= 256);
+        snapshot.tags.emplace_back(tag.begin(), tag.size());
+      }
+      if (entry.getHasAttachment())
+        snapshot.attachment.emplace(reinterpret_cast<const char*>(attachment.begin()), attachment.size());
+      snapshot.lastFrame = entry.getLastFrame();
+      snapshot.closedOutgoing = entry.getClosedOutgoing();
+      prepared.push_back({relay, std::move(snapshot)});
+    }
+    for (auto& entry : prepared) entry.relay->park(open.getGeneration(), std::move(entry.snapshot));
+    context.getResults().setAccepted(true);
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> adopt(AdoptContext context) override {
+    const auto open = context.getParams().getOpen();
+    const auto current = durable.authorizeSocketOpen(open);
+    KJ_REQUIRE(current.has_value(), "a stale Durable Object open cannot adopt sockets");
+    const auto invocation = open.getInvocationId();
+    KJ_REQUIRE(invocation.size() > 0 && invocation.size() <= 255);
+    std::vector<std::pair<WebSocketRelay*, const WebSocketRelay::ManagedSocket::Snapshot*>> selected;
+    for (auto* candidate : server.webSockets().managedObject(current->object.namespaceId, current->object.objectId)) {
+      auto* relay = static_cast<WebSocketRelay*>(candidate);
+      if (const auto* snapshot = relay->parked(current->object)) {
+        selected.emplace_back(relay, snapshot);
+      } else if (relay->belongsTo(current->object)) {
+        // This root is a successor. A connection left attached without
+        // parking lost its previous actor and cannot be adopted.
+        relay->goAway("home-closed");
+      }
+    }
+    auto result = context.getResults().initSockets(selected.size());
+    for (size_t i = 0; i < selected.size(); ++i) {
+      const auto [relay, snapshot] = selected[i];
+      auto out = result[i];
+      auto authority = out.initAuthority();
+      const auto id = relay->managedId();
+      authority.setSocketId(kj::str(kj::arrayPtr(id.begin(), id.size())));
+      authority.setInvocationId(invocation);
+      out.setLastFrame(snapshot->lastFrame);
+      out.setClosedOutgoing(snapshot->closedOutgoing);
+      auto tags = out.initTags(snapshot->tags.size());
+      for (size_t j = 0; j < snapshot->tags.size(); ++j) {
+        const auto& tag = snapshot->tags[j];
+        tags.set(j, kj::str(kj::arrayPtr(tag.data(), tag.size())));
+      }
+      if (const auto& attachment = snapshot->attachment) {
+        out.setHasAttachment(true);
+        out.setAttachment(kj::arrayPtr(attachment->data(), attachment->size()).asBytes());
+      }
+      if (snapshot->autoResponseTime) out.setAutoResponseUnixMs(*snapshot->autoResponseTime);
+      if (const auto& pair = relay->automaticResponse()) {
+        out.setAutoResponseEnabled(true);
+        out.setAutoRequest(kj::str(kj::arrayPtr(pair->first.data(), pair->first.size())));
+        out.setAutoResponse(kj::str(kj::arrayPtr(pair->second.data(), pair->second.size())));
+      }
+    }
+    for (const auto& [relay, _] : selected)
+      relay->adopt({invocation.cStr(), open.getGeneration()}, current->process);
+    return kj::READY_NOW;
+  }
+
+private:
+  uint64_t epoch() const { return std::strtoull(server.epoch().c_str(), nullptr, 10); }
+  WebSocketRelay* find(rpc::ThreadedSocketAuthority::Reader authority) const {
+    const auto id = authority.getSocketId();
+    return dynamic_cast<WebSocketRelay*>(server.webSockets().managedSocket({id.begin(), id.size()}));
+  }
+  ServerCore& server;
+  DurableDispatch& durable;
+};
+
 class BindingBootstrap final: public rpc::ThreadedBootstrap::Server {
 public:
   BindingBootstrap(
@@ -7184,6 +7623,12 @@ public:
         assets(server, headerTable),
         dispatcher(server, peerForwarder, factory, headerTable),
         durable(durable) {}
+
+  kj::Promise<void> socketControl(SocketControlContext context) override {
+    KJ_REQUIRE(server.placementConfig().processPool.threadedDurableStorage);
+    context.getResults().setControl(kj::heap<DurableSocketControl>(server, durable));
+    return kj::READY_NOW;
+  }
 
   // A Binding call's own event: the descriptor the caller's runtime sent, decoded, then either a call to a Durable
   // Object of the Worker or a Service Binding call -- allocated in the caller's call tree, placed, dispatched. The
@@ -9660,6 +10105,9 @@ int run(Launch launch) {
     durableLog.shardTaken(namespaceId, shard, shardEpoch, owner ? owner->tenant : std::string());
   });
   DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable, timer);
+  server.setDurableSocketDispatch([&durable, &server, &httpOverCapnpFactory, &headerTable](DurableSocketEvent event) {
+    return deliverDurableSocket(durable, server, httpOverCapnpFactory, *headerTable, std::move(event));
+  });
   durableLog.setAlarmTakeoverHook([&shards, &server](std::string ns, uint32_t shard, uint32_t waited) {
     const auto owner = server.namespaceOwner(ns);
     if (!owner || !owner->active() || shard >= owner->shards) return kj::Promise<coworkerd::ShardRoute>(
@@ -9744,7 +10192,10 @@ int run(Launch launch) {
   runtime.setRootMaintenance([&server, &durableLog]() {
     auto pending = server.rootMaintenanceRequest();
     if (!server.placementConfig().processPool.threadedDurableStorage) return pending;
-    if (pending && !pending->empty()) server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));
+    if (pending && !pending->empty()) {
+      server.webSockets().goAwayNamespaces(*pending);
+      server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));
+    }
     return std::shared_ptr<const std::vector<std::string>>{};
   },
       [&server](const auto& ids) { server.rootsMaintained(ids); });
