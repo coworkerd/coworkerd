@@ -180,6 +180,14 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++'} or
                           name == '0049-durable-test-facets.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0050-durable-format.patch' and path in {
+                              'src/workerd/api/worker-rpc.c++',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/jsg/async-context.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
