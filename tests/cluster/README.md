@@ -7,10 +7,10 @@ network, image tag and temporary projects when it exits.
 
 ## Requirements and commands
 
-Use Linux x86-64 with [Docker Engine 28 or later and Docker Compose](../../docs/guide/install.md), Node.js 22.5 or
-later, Python 3.9 or later and the daemon build tools. The Docker client must be able to build images and run
-containers on the local engine. The first run downloads the pinned kernel and base images and needs access to
-the public build and package repositories.
+Use Linux x86-64 or arm64 with [Docker Engine 28 or later and Docker Compose](../../docs/guide/install.md),
+Node.js 22.5 or later, Python 3.9 or later and the daemon build tools. The Docker client must be able to build
+images and run containers on the local engine. The first run needs access to the public build and package
+repositories to download dependencies and base images.
 
 For a clean Ubuntu 24.04 system with Node.js and Docker already installed:
 
@@ -20,13 +20,14 @@ sudo apt-get install -y --no-install-recommends \
   clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
 export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
 npm ci --prefix cli --registry=https://registry.npmjs.org
-kernel=$(python3 scripts/fetch-kernel.py)
+kernel="${KERNEL_DIR:-$(python3 scripts/fetch-kernel.py)}"
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd"
 node tests/cluster/run.mjs "$kernel"
 ```
 
-To use a kernel you built, set `kernel` to the directory containing `workerd`, `coworkerd-threaded` and
-the two `allowlist/coworkerd-syscalls-*.txt` files. See [building the kernel from source](../../CONTRIBUTING.md#building-the-kernel-from-source).
+The commands fetch the architecture's pinned kernel by default. To use a kernel you built, set `KERNEL_DIR` to
+the directory containing `workerd`, `coworkerd-threaded` and the two `allowlist/coworkerd-syscalls-*.txt` files.
+See [building the kernel from source](../../CONTRIBUTING.md#building-the-kernel-from-source).
 For a single case, pass its name after the kernel directory:
 
 ```sh

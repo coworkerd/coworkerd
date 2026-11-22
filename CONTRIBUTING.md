@@ -23,6 +23,9 @@
 
 ### Building the kernel from source
 
+On Linux, install Bazelisk as `bazel`, Git, Python 3 and the libxml2 runtime library (`libxml2.so.2`).
+Bazel downloads the compiler, linker and sysroot. The downloaded linker loads libxml2 from the host.
+
 Clone and apply the exact upstream tag and series using the commands in [patches/README.md](patches/README.md).
 On Linux, run from the repository root:
 
@@ -70,8 +73,7 @@ If the allowlist uses profiles from another build of the series, record that in 
 
 The maintainer posts the public release link and archive SHA-256 values on the PR. The author verifies the public
 downloads and records the upstream, full series SHA-256 and verified archive pins in
-`patches/workerd/artifacts.json` on the same PR. The initial arm64 archive is tracked in
-[#25](https://github.com/coworkerd/coworkerd/issues/25).
+`patches/workerd/artifacts.json` on the same PR.
 
 ## CI and local unit tests
 
@@ -83,8 +85,9 @@ Linux launcher. Build dependencies come from Ubuntu or the macOS runner image, w
 from public GitHub and CLI dependencies from the public npm registry (`cli/package-lock.json`). CTest fails on an
 empty suite or any failed test. CI verifies that the JUnit report contains executed tests with no failures or skips.
 
-To run the same checks locally on Ubuntu 24.04 x86_64, install Node.js 22 (a current 22.x release), then run from
-the repository root. Clang 19 uses the GCC 14 standard library headers for C++23 `<print>` support.
+To run the same checks locally on Ubuntu 24.04 x86-64 or arm64, install a current Node.js 22 release and run the
+commands below from the repository root. Clang 19 uses the GCC 14 standard library headers for C++23 `<print>`
+support. Set `KERNEL_DIR` to your unpacked kernel directory if you [built it from source](#building-the-kernel-from-source).
 
 ```bash
 sudo apt-get update
@@ -92,7 +95,7 @@ sudo apt-get install -y --no-install-recommends \
   clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
 npm ci --prefix cli --registry=https://registry.npmjs.org
 export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4 WRANGLER_SEND_METRICS=false
-kernel=$(python3 scripts/fetch-kernel.py)
+kernel="${KERNEL_DIR:-$(python3 scripts/fetch-kernel.py)}"
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd" -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
 cmake --build build --target check
 ```
