@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 
@@ -209,8 +208,12 @@ async function durableTakeover(cluster) {
     import { DurableObject } from 'cloudflare:workers';
     export class Record extends DurableObject {
       async fetch(request) {
-        if (request.method === 'POST') await this.ctx.storage.put('value', await request.text());
-        return Response.json({ value: (await this.ctx.storage.get('value')) ?? null });
+        if (request.method === 'POST') {
+          const id = await request.json();
+          await this.ctx.storage.put(String(id), true);
+          return Response.json(id);
+        }
+        return Response.json(Array.from((await this.ctx.storage.list()).keys(), Number));
       }
     }
     export default { fetch(request, env) { return env.RECORDS.getByName('takeover').fetch(request); } };
@@ -221,7 +224,7 @@ async function durableTakeover(cluster) {
   const [node] = cluster.nodes;
   const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
   await eventually('object and its shard are ready', async () => {
-    assert.deepEqual(json(await workerCall(cluster, node, tenant, 'object'), 200, 'initial object read'), { value: null });
+    assert.deepEqual(json(await workerCall(cluster, node, tenant, 'object'), 200, 'initial object read'), []);
   });
   const original = await eventually('public namespace state identifies the owner', async () => {
     const { owners } = await namespace();
@@ -235,18 +238,70 @@ async function durableTakeover(cluster) {
     for (const peer of cluster.nodes.filter(id => id !== original.nodeId)) assert.ok(peers.includes(peer), `missing ${peer}`);
   });
 
-  const value = randomUUID();
-  const write = await fetch(`${cluster.urls[node]}/${tenant.name}/object`, {
-    method: 'POST', body: value, signal: AbortSignal.timeout(10000),
-  });
-  assert.deepEqual(json({ status: write.status, text: await write.text() }, 200, 'confirmed object write'), { value });
-  await cluster.compose(['kill', '-s', 'SIGKILL', original.nodeId]);
   const survivor = cluster.nodes.find(id => id !== original.nodeId);
+  const concurrency = 16;
+  const warm = Promise.withResolvers();
+  const acknowledged = new Set();
+  let sent = 0;
+  let pending = 0;
+  let interrupted = 0;
+  let writing = true;
+  let killing = false;
+  const writers = Promise.allSettled(Array.from({ length: concurrency }, async () => {
+    try {
+      while (writing) {
+        const id = ++sent;
+        ++pending;
+        let response;
+        try {
+          response = await workerCall(cluster, survivor, tenant, 'object', { method: 'POST', body: id, timeout: 10000 });
+        } catch (error) {
+          if (!killing) throw error;
+        } finally {
+          --pending;
+        }
+        if (killing && (!response || response.status >= 500)) {
+          ++interrupted;
+          writing = false;
+          return;
+        }
+        assert.equal(json(response, 200, `object write ${id}`), id);
+        acknowledged.add(id);
+        if (acknowledged.size === concurrency) warm.resolve();
+      }
+    } catch (error) {
+      writing = false;
+      warm.reject(error);
+      throw error;
+    }
+  }));
+  let inFlightAtKill;
+  let results;
+  try {
+    await warm.promise;
+    inFlightAtKill = pending;
+    assert.ok(inFlightAtKill > 0, 'writes are in flight when the kill is requested');
+    killing = true;
+    await cluster.compose(['kill', '-s', 'SIGKILL', original.nodeId]);
+  } finally {
+    writing = false;
+    results = await writers;
+  }
+  for (const result of results) {
+    if (result.status === 'rejected') throw result.reason;
+  }
+  console.log(`Durable writes through ${survivor} to ${original.nodeId}: ${acknowledged.size}/${sent} acknowledged, ` +
+    `${inFlightAtKill} pending at kill request, ${interrupted} interrupted`);
+  assert.ok(interrupted > 0, 'the owner loss interrupted at least one write');
+
   const recovered = await eventually('a surviving node serves a read after owner loss', async () => {
     const read = await workerCall(cluster, survivor, tenant, 'object', { timeout: 35000 });
     return json(read, 200, 'takeover read');
   }, { timeout: 100000, interval: 1000 });
-  assert.deepEqual(recovered, { value }, 'the first successful read after takeover contains the acknowledged write');
+  const stored = new Set(recovered);
+  const missing = [...acknowledged].filter(id => !stored.has(id));
+  assert.equal(missing.length, 0, `takeover lost acknowledged writes: ${missing.join(', ')}`);
+  assert.ok(recovered.every(id => Number.isSafeInteger(id) && id > 0 && id <= sent), 'takeover returned an unsent write');
   await eventually('the shard has a new live owner and a later epoch', async () => {
     const { owners } = await namespace();
     const owner = owners.find(entry => entry.shard === original.shard);

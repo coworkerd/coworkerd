@@ -59,9 +59,12 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
-| `durable-takeover` | Another live node cannot take ownership after the original owner is killed, or it cannot read the exact write acknowledged before the kill. |
+| `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. This case does not establish how quickly recovery must happen or what survives the loss of multiple nodes. |
 
 Tests deploy code with `cowctl` and observe the product through ingress HTTP, `/v1` and documented management
 endpoints. The fixture disables stateless ingress forwarding so the CPU and process tests exercise the receiving
-node's single ordinary slot. Docker delivers the two `SIGKILL` faults. The owner-loss case runs last and waits for
-the regular membership expiry and recovery intervals.
+node's single ordinary slot. Docker delivers the two `SIGKILL` faults. The owner-loss case runs last. It sends
+unique write IDs to one Durable Object through a surviving node, with up to 16 concurrent requests. The test
+requests the owner kill after the first 16 successes while writes are still pending. It drains the outstanding
+requests, reports the number of successes out of all writes sent, and checks the recovered IDs after the regular
+membership expiry and recovery intervals.
