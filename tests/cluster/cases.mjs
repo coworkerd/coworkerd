@@ -258,7 +258,12 @@ async function durablePeerAck(cluster) {
   const before = await cluster.state(owner);
   assert.equal(before.durableLog.peers.want, peers.length);
   const gate = join(cluster.peerAckGate, 'hold');
+  const earlyResponses = [];
   for (const [suffix, value] of [['', 'http'], ['/rpc', 'rpc']]) {
+    await eventually('both peers finished releasing earlier acknowledgements', async () => {
+      const observations = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest === 0));
+    });
     await writeFile(gate, '');
     let receivedHeaders = false;
     const write = fetch(cluster.urls[ingress] + path + suffix, {
@@ -274,10 +279,9 @@ async function durablePeerAck(cluster) {
         const observations = await Promise.all(peers.map(node => cluster.state(node)));
         assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest > 0));
       }, { timeout: 3000, interval: 25 });
-      assert.equal(receivedHeaders, false, `${value} response headers before peer acknowledgement`);
       assert.deepEqual(await read('/neighbor'), { status: 200, text: 'neighbor' });
       await delay(250);
-      assert.equal(receivedHeaders, false, `${value} response headers while peer acknowledgements are held`);
+      if (receivedHeaders) earlyResponses.push(value);
     } finally {
       await unlink(gate);
       result = await write;
@@ -286,6 +290,7 @@ async function durablePeerAck(cluster) {
     assert.equal(json(result, 200, `${value} write after acknowledgement release`), value);
     assert.equal(json(await read(''), 200, `${value} stored value`), value);
   }
+  assert.deepEqual(earlyResponses, [], 'responses arrived while both peers held their acknowledgements');
 }
 
 async function durableTakeover(cluster) {
