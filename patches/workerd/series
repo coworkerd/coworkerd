@@ -56,3 +56,4 @@
 0060-durable-http-only-boundary.patch
 0061-durable-home-before-ack.patch
 0062-durable-warm-copies.patch
+0063-durable-storage-lifecycle-test.patch

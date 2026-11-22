@@ -309,6 +309,10 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/node-child-memory.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
     set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
+    add_test(NAME node-threaded-durable-storage-lifecycle COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-storage-lifecycle.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
+    set_tests_properties(node-threaded-durable-storage-lifecycle PROPERTIES TIMEOUT 35)
     add_test(NAME node-threaded-durable-launch COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
