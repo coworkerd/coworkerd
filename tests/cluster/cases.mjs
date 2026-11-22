@@ -538,6 +538,14 @@ async function mixedDurableStorage(cluster) {
           await this.ctx.storage.setAlarm(at);
           return Response.json(at);
         }
+        if (path.endsWith('/clone-facet')) {
+          try {
+            this.ctx.facets.clone('source', 'destination');
+            return Response.json({ cloned: true });
+          } catch (error) {
+            return Response.json({ error: String(error) });
+          }
+        }
         if (request.method === 'POST') return Response.json(this.write(await request.json()));
         const value = await this.ctx.storage.get('value');
         const fired = await this.ctx.storage.get('fired');
@@ -581,6 +589,7 @@ async function mixedDurableStorage(cluster) {
     method: 'POST', body: value,
   }), 200, 'mixed durable write');
   assert.equal(await write('', 'warm'), 'warm');
+  assert.match((await write('/clone-facet', null)).error, /NOT_SUPPORTED/);
   const first = await eventually('separate definitions occupy two homes in the same threaded generation', async () => {
     const generation = await durableGeneration(cluster, threaded);
     assert.equal(generation.lifecycle?.durableServer, 'threaded');

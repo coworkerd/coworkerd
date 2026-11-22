@@ -2714,9 +2714,12 @@ public:
             }
           });
           KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
-          KJ_REQUIRE(p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0,
+          const bool roleNegotiated = p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0;
+          const bool walNegotiated = p->durable && !p->durableTestStorage
+              ? walHeaders == 1 && matchesWal : walHeaders == 0;
+          KJ_REQUIRE(roleNegotiated,
               "native process role does not match the slot");
-          KJ_REQUIRE(p->durable && !p->durableTestStorage ? walHeaders == 1 && matchesWal : walHeaders == 0,
+          KJ_REQUIRE(walNegotiated,
               "native process WAL protocol does not match the slot");
           p->threadedProtocol = 3;
           p->contextsVisible = true;

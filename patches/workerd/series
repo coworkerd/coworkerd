@@ -63,3 +63,4 @@
 0083-threaded-wal-open-proof.patch
 0084-prepare-threaded-wal-off-home.patch
 0085-threaded-facet-mutations.patch
+0086-refuse-persistent-facet-cloning.patch
