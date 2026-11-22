@@ -493,6 +493,15 @@ try {
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
   if (homeReservation) {
+    const homeThreads = async () => {
+      const tasks = join('/proc', String(processInfo.pid), 'task');
+      const rows = await Promise.all((await readdir(tasks)).map(async tid =>
+        [(await readFile(join(tasks, tid, 'comm'), 'utf8')).trim(), Number(tid)]));
+      return rows.filter(([name]) => name === 'cwkd-call').map(([, tid]) => tid).sort((a, b) => a - b);
+    };
+    // Observe actual Linux home loops, not just the reservation table's thread dimension.
+    const originalThreads = await homeThreads();
+    assert.equal(originalThreads.length, 2);
     const keep = [];
     const claim = async (id, definition) => {
       const connection = await sendPreface(socketPath,
@@ -508,6 +517,7 @@ try {
       }
       const occupied = await waitForAdmission(socketPath, 2, 2);
       assert.equal(occupied.homes, 2);
+      assert.deepEqual(await homeThreads(), originalThreads);
       const refused = await claim('3', 'definition-three');
       assert.equal(refused.receipt, 'R',
         'a definition without a reservable home must be refused before acknowledgement');
@@ -517,6 +527,7 @@ try {
       assert.equal(bounded.homes, 2);
       assert.equal(bounded.reservedBytes, occupied.reservedBytes);
       assert.equal(bounded.reservedDescriptors, occupied.reservedDescriptors);
+      assert.deepEqual(await homeThreads(), originalThreads, 'refusal must not create another home thread');
     } finally {
       for (const socket of keep) socket.destroy();
     }
@@ -538,7 +549,9 @@ try {
     assert.equal(live.pid, processInfo.pid);
     assert.equal(live.generation, processInfo.generation);
     assert.equal(live.state, 'ready');
-    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2, refusedDefinitions: 1}));
+    assert.deepEqual(await homeThreads(), originalThreads);
+    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2,
+      homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
   } else if (warmCopies) {
     const request = async (path, options) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
