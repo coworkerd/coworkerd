@@ -232,6 +232,7 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
   spaces << ']';
   if (!selected) return std::nullopt;
   std::ostringstream plan;
+  std::string fingerprint;
   plan << "{\"kind\":" << quote(database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
       << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
       << ",\"compatibilityDate\":" << quote(version.compatibilityDate) << ",\"compatibilityFlags\":[],\"modules\":[]"
@@ -273,8 +274,8 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
       const auto* value = catalog.secret(version.workerId, name);
       environment << quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
     }
-    plan << ",\"versionFingerprint\":" << quote(version.definitionHash+":"+
-        sha256Hex(plan.str()+environment.str()));
+    fingerprint = version.definitionHash + ":" + sha256Hex(plan.str() + environment.str());
+    plan << ",\"versionFingerprint\":" << quote(fingerprint);
   }
   plan << '}';
   std::ostringstream selection;
@@ -282,7 +283,7 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
       << ",\"dataEpoch\":" << quote(std::to_string(dataEpoch)) << ",\"dispatchChecked\":true";
   if (alarmAtUnixMs) selection << ",\"alarmFacetId\":" << alarmFacetId;
   selection << '}';
-  return RootDispatch{plan.str(), selection.str()};
+  return RootDispatch{plan.str(), selection.str(), std::move(fingerprint)};
 }
 
 std::string RootDispatch::descriptor(std::string encoded) const {

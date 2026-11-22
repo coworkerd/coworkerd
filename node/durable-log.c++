@@ -2199,11 +2199,15 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         }
       }
       if (openId != 0) {
+        const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
+            (facetId == 0 && object->definitionDrainStartedMs != 0);
+        const bool authorized = object->state == ObjectState::LOCAL && !fenced;
         std::string opened;
         putU8(opened, TO_OPENED);
         putU64(opened, openId);
-        putU8(opened, object->state == ObjectState::LOCAL ? ACK_OK : ACK_UNAVAILABLE);
+        putU8(opened, authorized ? ACK_OK : ACK_UNAVAILABLE);
         sendToChannel(channel, std::move(opened));
+        if (fenced && facetId == 0) askClose(channel, openId);
       }
       return;
     }
@@ -4604,7 +4608,8 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
 // ---- Opening an object: its files are brought up to date with its replicated history first ----
 
 DurableLog::ObjectReady DurableLog::checkObjectDispatch(
-    const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
+    const ObjectIdentity& identity, const std::string& processId, uint64_t generation,
+    std::string_view definition) {
   if (!enabled()) return {};
   if ((startupAttempted && !startupReady) || recoveryWriteFailed)
     return {false, 503, "STORAGE_UNAVAILABLE", "the node's recovery log is not ready"};
@@ -4631,9 +4636,50 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
     if (channel.open && channelHasOpenObject(channel, *object))
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
   }
+  if (!definition.empty() && !object->threadedDefinition.empty() &&
+      (definition != object->threadedDefinition || object->definitionDrainStartedMs != 0)) {
+    const auto now = monotonicTimeMs();
+    auto old = channels.find(object->dispatchedChannel);
+    if (old != channels.end()) {
+      if (object->definitionDrainStartedMs == 0) object->definitionDrainStartedMs = now;
+      if (auto open = old->second.openFacets.find(object->objectName + "/0"); open != old->second.openFacets.end())
+        askClose(old->second, open->second.id);
+      const bool holdsCalls = hasLiveHolders(*object);
+      if (!old->second.open || hasLiveOpenFacets(*object) || holdsCalls || object->dispatchPending) {
+        ObjectReady result{false, 503, "DO_VERSION_DRAINING", "the previous Durable Object definition is draining"};
+        result.generationMustClose = !holdsCalls &&
+            now - object->definitionDrainStartedMs >= settings.config.confirmTimeoutMs;
+        return result;
+      }
+    }
+    object->definitionDrainStartedMs = 0;
+  }
   if (auto error = prepareOpen(*object, &target))
     return {false, 503, "STORAGE_UNAVAILABLE", *error};
+  if (!definition.empty()) object->threadedDefinition.assign(definition);
   return {};
+}
+
+std::vector<std::string> DurableLog::drainThreadedNamespaces(const std::vector<std::string>& namespaces) {
+  std::vector<std::string> drained;
+  for (const auto& ns : namespaces) {
+    auto prefix = ns + "/";
+    bool open = false;
+    for (auto& [id, channel] : channels) {
+      if (channel.threadedGeneration == 0) continue;
+      if (!channel.open) {
+        open = true;
+        continue;
+      }
+      for (auto it = channel.openFacets.lower_bound(prefix);
+          it != channel.openFacets.end() && it->first.starts_with(prefix); ++it) {
+        open = true;
+        if (it->first.ends_with("/0")) askClose(channel, it->second.id);
+      }
+    }
+    if (!open) drained.push_back(ns);
+  }
+  return drained;
 }
 
 void DurableLog::objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation) {
