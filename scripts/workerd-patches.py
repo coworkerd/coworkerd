@@ -216,7 +216,8 @@ def allowed_path(name, path):
                                    '0067-durable-facet-reset-lifetime.patch',
                                    '0068-durable-process-memory-progress.patch',
                                    '0069-durable-process-memory-recovery.patch',
-                                   '0070-durable-rpc-binding.patch'} and
+                                   '0070-durable-rpc-binding.patch',
+                                   '0091-fatal-attribution-requires-invocation.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0090-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',

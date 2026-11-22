@@ -65,3 +65,4 @@
 0069-durable-process-memory-recovery.patch
 0070-durable-rpc-binding.patch
 0090-ordinary-fatal-attribution.patch
+0091-fatal-attribution-requires-invocation.patch

@@ -46,8 +46,10 @@ kernel test. Then pass the test executable to the cluster runner from the produc
 
 ```sh
 (cd workerd && bazel build --config=release //src/workerd/threaded:coworkerd-threaded-fatal-test)
+fatal_test_line=$(awk '/^KJ_TEST\("fatal record identifies/ { print NR; exit }' \
+  workerd/src/workerd/threaded/threaded-server-test.c++)
 (cd workerd && bazel test --config=release '//src/workerd/threaded:threaded-server-test@' \
-  --test_arg=--filter='*fatal record identifies*')
+  --test_arg="--filter=threaded-server-test.c++:$fatal_test_line")
 COWORKERD_CLUSTER_FATAL_TEST_BINARY="$PWD/workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded-fatal-test" \
   node tests/cluster/run.mjs "$kernel" fatal-attribution
 ```
