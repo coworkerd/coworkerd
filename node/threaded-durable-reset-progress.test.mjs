@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,8 +14,10 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-reset-progress-'));
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
-const env = {...Object.fromEntries(Object.entries(process.env)
-  .filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))), TMPDIR: scratch, COWORKERD_DO_TEST_HOME_COUNT: '1'};
+const env = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
+  TMPDIR: scratch, COWORKERD_DO_TEST_HOME_COUNT: '1', COWORKERD_CPU_LIMIT_MS: '250',
+};
 const token = 'fixture-management-placeholder';
 const hash = value => createHash('sha256').update(value).digest('hex');
 let child, closed, diagnostics = '';
@@ -104,7 +106,13 @@ try {
       instance = crypto.randomUUID();
       async fetch(request) {
         isolate ??= crypto.randomUUID();
-        if (new URL(request.url).searchParams.has("abort")) this.ctx.abort("fixture application reset");
+        const query = new URL(request.url).searchParams;
+        if (query.has("abort")) this.ctx.abort("fixture application reset");
+        if (query.has("cpu")) {
+          let checksum = 1;
+          for (let i = 0; i < 200000000; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+          this.checksum = checksum;
+        }
         if (request.method === "POST") await this.ctx.storage.put("value", await request.text());
         return Response.json({id: this.ctx.id.toString(), instance: this.instance, isolate,
           value: await this.ctx.storage.get("value") ?? null});
@@ -137,38 +145,45 @@ try {
   await writeFile(configPath, config);
 
   const originalChild = await start();
-  const initial = await successful('/reset', 'retained after abort');
+  let initial = await successful('/reset', 'retained after abort');
   const neighbor = await successful('/neighbor', 'neighbor retained');
   assert.equal(initial.isolate, neighbor.isolate);
-  const aborted = await request('/reset?abort');
-  assert.ok([502, 503].includes(aborted.status), JSON.stringify(aborted));
-  assert.match(JSON.stringify(aborted.body), /fixture application reset/);
-  const started = performance.now();
-  const statuses = {};
-  let recovered;
-  // The two-second deadline is below the ten-second idle retirement delay.
-  // Failed sessions must not postpone abort cleanup when requests keep arriving.
-  while (performance.now() - started < 2000) {
-    const result = await request('/reset');
-    statuses[result.status] = (statuses[result.status] ?? 0) + 1;
-    if (result.status === 200) { recovered = result.body; break; }
-    assert.ok([502, 503].includes(result.status), JSON.stringify(result));
-    await delay(10);
+  for (const cause of ['abort', 'cpu']) {
+    const aborted = await request('/reset?' + cause);
+    assert.ok([502, 503].includes(aborted.status), JSON.stringify(aborted));
+    if (cause === 'abort') assert.match(JSON.stringify(aborted.body), /fixture application reset/);
+    else {
+      assert.equal(aborted.status, 503);
+      assert.equal(aborted.body.code, 'CPU_LIMIT_EXCEEDED');
+    }
+    const started = performance.now();
+    const statuses = {};
+    let recovered;
+    // The two-second deadline is below the ten-second idle retirement delay.
+    // Failed sessions must not postpone abort cleanup when requests keep arriving.
+    while (performance.now() - started < 2000) {
+      const result = await request('/reset');
+      statuses[result.status] = (statuses[result.status] ?? 0) + 1;
+      if (result.status === 200) { recovered = result.body; break; }
+      assert.ok([502, 503].includes(result.status), JSON.stringify(result));
+      await delay(10);
+    }
+    const currentChild = (await state()).find(entry => entry.processClass === 'durable');
+    assert.equal(currentChild.pid, originalChild.pid);
+    assert.equal(currentChild.generation, originalChild.generation);
+    assert.equal(currentChild.state, 'ready');
+    assert.deepEqual(await successful('/neighbor'), neighbor);
+    const elapsedMs = performance.now() - started;
+    console.log(JSON.stringify({event: 'durable-reset-retries', cause, elapsedMs, statuses,
+      recovered: Boolean(recovered), sameChild: true, neighborPreserved: true}));
+    assert.ok(recovered, 'an aborted tree did not recover under steady retries within two seconds');
+    assert.notEqual(recovered.instance, initial.instance);
+    assert.equal(recovered.isolate, initial.isolate);
+    assert.equal(recovered.id, initial.id);
+    assert.equal(recovered.value, initial.value);
+    assert.deepEqual(await successful('/reset'), recovered);
+    initial = recovered;
   }
-  const currentChild = (await state()).find(entry => entry.processClass === 'durable');
-  assert.equal(currentChild.pid, originalChild.pid);
-  assert.equal(currentChild.generation, originalChild.generation);
-  assert.equal(currentChild.state, 'ready');
-  assert.deepEqual(await successful('/neighbor'), neighbor);
-  const elapsedMs = performance.now() - started;
-  console.log(JSON.stringify({event: 'non-cpu-abort-retries', elapsedMs, statuses,
-    recovered: Boolean(recovered), sameChild: true, neighborPreserved: true}));
-  assert.ok(recovered, 'an aborted tree did not recover under steady retries within two seconds');
-  assert.notEqual(recovered.instance, initial.instance);
-  assert.equal(recovered.isolate, initial.isolate);
-  assert.equal(recovered.id, initial.id);
-  assert.equal(recovered.value, initial.value);
-  assert.deepEqual(await successful('/reset'), recovered);
   await stop();
 
 } finally {
