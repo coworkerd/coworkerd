@@ -62,6 +62,8 @@ Add to the Worker project's Wrangler configuration:
 
 `cowctl deploy` builds the project and the migrations declare the class. Each class gets a random namespace id recorded in the tenant manifest. `new_classes` also declares a SQLite class; `renamed_classes` preserves its namespace id, `deleted_classes` marks it deleting, and migration tags are applied in order. A binding may name only a class of this Worker (`script_name`, if given, must name itself); `transferred_classes` is refused. An active object request uses the Worker's currently active version, so redeployment changes the class code on the same namespace and data. Keep schema changes compatible with that data.
 
+On the experimental threaded host, a running request keeps its code version. When a request selects a new definition, the previous tree drains and its facets close before the new home can open the same storage. Calls during that drain may receive `503 DO_VERSION_DRAINING`. A class rename preserves object IDs and the existing databases. After the node applies a class deletion, it refuses old-generation opens for that namespace.
+
 ```bash
 cowctl do list
 cowctl do inspect Counter

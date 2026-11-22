@@ -40,6 +40,7 @@ std::string rootLoaderBinding(bool durable);
 std::string rootLoaderService(bool durable, const std::string& storageDirectory);
 struct RootDispatch {
   std::string plan, selection;
+  std::string fingerprint;
   std::string descriptor(std::string encoded) const;
 };
 
