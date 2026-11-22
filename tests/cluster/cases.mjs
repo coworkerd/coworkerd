@@ -502,6 +502,94 @@ async function durableThreadedFence(cluster) {
   assert.ok(saved.includes(1), 'the later owner keeps the earlier confirmed write');
 }
 
+async function threadedAlarmTakeover(cluster) {
+  const tenant = await cluster.tenant('threaded-alarm-fence');
+  const [entry] = cluster.nodes;
+  const namespace = () => cluster.api(`${tenant.path}/workers/alarms/namespaces/Alarm`,
+    { token: tenant.token });
+  await cluster.deploy(tenant, 'alarms', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Alarm extends DurableObject {
+      async fetch(request) {
+        if (request.method === 'POST') {
+          const at = await request.json();
+          await this.ctx.storage.setAlarm(at);
+          return Response.json(at);
+        }
+        if (request.method === 'DELETE') {
+          await this.ctx.storage.deleteAlarm();
+          return Response.json(await this.ctx.storage.getAlarm());
+        }
+        return Response.json({
+          at: await this.ctx.storage.getAlarm(),
+          fired: (await this.ctx.storage.get('fired')) ?? 0,
+        });
+      }
+      async alarm() {
+        await this.ctx.storage.put('fired', ((await this.ctx.storage.get('fired')) ?? 0) + 1);
+      }
+    }
+    export default { fetch(request, env) {
+      const name = new URL(request.url).searchParams.get('object');
+      return env.ALARMS.getByName(name).fetch(request);
+    } };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Alarm'] }],
+    durable_objects: { bindings: [{ name: 'ALARMS', class_name: 'Alarm' }] } } });
+  const { namespaceId, shards } = await namespace();
+  const shardOf = name => {
+    const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest('hex');
+    return Number(BigInt(`0x${id.slice(0, 16)}`) % BigInt(shards));
+  };
+  const confirmed = 'confirmed';
+  const shard = shardOf(confirmed);
+  const unconfirmed = Array.from({ length: shards * 16 }, (_, i) => `unconfirmed-${i}`)
+    .find(name => shardOf(name) === shard);
+  assert.ok(unconfirmed, 'both test objects must route to the same shard');
+  const ownerOfShard = async () => (await namespace()).owners.find(owner => owner.shard === shard && !owner.released);
+  const call = (node, object, options) => workerCall(cluster, node, tenant, `alarms?object=${object}`, options);
+  const at = Date.now() + 45000;
+  await eventually('both original schedules are confirmed under the same shard owner', async () => {
+    for (const object of [confirmed, unconfirmed]) {
+      assert.equal(json(await call(entry, object, { method: 'POST', body: at }), 200, object), at);
+    }
+  });
+  const original = await ownerOfShard();
+  assert.ok(original && cluster.nodes.includes(original.nodeId));
+  const peers = cluster.nodes.filter(node => node !== original.nodeId);
+  const [survivor] = peers;
+  const clear = { method: 'DELETE', timeout: 30000 };
+  assert.equal(json(await call(entry, confirmed, clear), 200, 'confirmed clear'), null);
+  const gate = join(cluster.peerAckGate, 'hold');
+  await writeFile(gate, '');
+  const pending = call(survivor, unconfirmed, clear).catch(error => ({ error }));
+  let paused = false;
+  try {
+    await eventually('the old owner has started a clear that cannot be confirmed', async () => {
+      const states = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+      assert.equal((await cluster.state(original.nodeId)).durableLog.confirm.unconfirmed, 1);
+    }, { timeout: 3000, interval: 25 });
+    await cluster.compose(['pause', original.nodeId]);
+    paused = true;
+    await eventually('the surviving owner reopens the alarm shard at a higher epoch', async () => {
+      assert.equal((await call(survivor, confirmed, { timeout: 7000 })).status, 200);
+      const owner = await ownerOfShard();
+      assert.ok(owner && peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(original.epoch));
+    }, { timeout: 30000 });
+  } finally {
+    await unlink(gate);
+    if (paused) await cluster.compose(['unpause', original.nodeId]);
+  }
+  const result = await pending;
+  assert.ok(result.error || result.status >= 400, 'the fenced clear never returns success');
+  await eventually('the surviving owner delivers the alarm whose clear was unconfirmed', async () => {
+    assert.deepEqual(json(await call(survivor, unconfirmed), 200, 'unconfirmed clear recovery'),
+      { at: null, fired: 1 });
+    assert.deepEqual(json(await call(survivor, confirmed), 200, 'confirmed clear recovery'),
+      { at: null, fired: 0 });
+  }, { timeout: 60000, interval: 250 });
+}
+
 async function durableGeneration(cluster, node) {
   const { processes } = await cluster.state(node);
   const durable = processes.entries.filter(entry => entry.processClass === 'durable');
@@ -828,6 +916,11 @@ export const durableGatedCases = {
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-fence': {
     test: durableThreadedFence, nodes: ['node-1', 'node-2', 'node-3'],
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+    confirmTimeoutMs: 25000,
+  },
+  'durable-threaded-alarm-fence': {
+    test: threadedAlarmTakeover, nodes: ['node-1', 'node-2', 'node-3'],
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
     confirmTimeoutMs: 25000,
   },

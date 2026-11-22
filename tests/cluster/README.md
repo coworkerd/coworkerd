@@ -76,3 +76,4 @@ unique write IDs to one Durable Object through a surviving node, with up to 16 c
 requests the owner kill after the first 16 successes while writes are still pending. It drains the outstanding
 requests, reports the number of successes out of all writes sent, and checks the recovered IDs after the regular
 membership expiry and recovery intervals.
+| `durable-threaded-alarm-fence` | When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. A previously confirmed clear survives the same takeover. |
