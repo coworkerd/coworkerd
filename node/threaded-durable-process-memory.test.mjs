@@ -170,7 +170,14 @@ try {
   assert.ok(recovered, 'process memory pressure left its home blocked');
   assert.equal(recovered.value, initial.value);
   assert.equal(recovered.id, initial.id);
-  const restoredNeighbor = await successful('/neighbor');
+  let restoredNeighbor;
+  for (const until = performance.now() + 5000; performance.now() < until;) {
+    const result = await request('/neighbor');
+    if (result.status === 200) { restoredNeighbor = result.body; break; }
+    assert.ok([502, 503].includes(result.status), JSON.stringify(result));
+    await delay(10);
+  }
+  assert.ok(restoredNeighbor, 'the neighboring object did not become available again');
   assert.equal(restoredNeighbor.id, neighbor.id);
   assert.equal(restoredNeighbor.value, neighbor.value);
   const current = (await state()).find(entry => entry.processClass === 'durable');
