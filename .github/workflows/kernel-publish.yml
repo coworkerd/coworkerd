@@ -1,0 +1,109 @@
+name: Publish Linux kernel archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful build run ID
+        required: true
+        type: string
+      run_attempt:
+        description: Successful build attempt number
+        required: true
+        type: string
+      source_commit:
+        description: Full reviewed source commit SHA from the build summary
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: kernel-publish-${{ inputs.run_id }}-${{ inputs.run_attempt }}
+
+jobs:
+  verify:
+    if: github.repository == 'coworkerd/coworkerd' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact: ${{ steps.candidate.outputs.artifact }}
+      workflow_commit: ${{ steps.candidate.outputs.workflow_commit }}
+      tag: ${{ steps.archive.outputs.tag }}
+    steps:
+      - name: Identify the finished build
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          if [[ ! $RUN_ID =~ ^[1-9][0-9]*$ || ! $RUN_ATTEMPT =~ ^[1-9][0-9]*$ || ! $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Provide a run ID, attempt number and full lowercase source commit SHA.' >&2
+            exit 1
+          fi
+          workflow=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/kernel-build.yml" --jq .id)
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT")
+          if ! jq -e --argjson workflow "$workflow" --argjson attempt "$RUN_ATTEMPT" \
+            --arg branch "$DEFAULT_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
+            .workflow_id == $workflow and .run_attempt == $attempt and .head_branch == $branch and
+            .head_repository.full_name == $repo and .event == "workflow_dispatch" and
+            .status == "completed" and .conclusion == "success"
+          ' <<< "$run" > /dev/null; then
+            echo 'Select a successful manual kernel build attempt dispatched from the default branch.' >&2
+            exit 1
+          fi
+          commit=$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' <<< "$run")
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?name=kernel-release-$RUN_ATTEMPT" \
+            | jq -er --arg name "kernel-release-$RUN_ATTEMPT" '
+              [.artifacts[] | select(.name == $name and .expired == false)]
+              | select(length == 1) | .[0].id')
+          printf 'artifact=%s\nworkflow_commit=%s\n' "$artifact" "$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          artifact-ids: ${{ steps.candidate.outputs.artifact }}
+          path: release
+      - name: Verify release files against source and run
+        id: archive
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ steps.candidate.outputs.workflow_commit }}
+        run: |
+          python3 scripts/kernel-release.py verify release --commit "$SOURCE_COMMIT" \
+            --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --workflow-commit "$WORKFLOW_COMMIT"
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          artifact-ids: ${{ needs.verify.outputs.artifact }}
+          path: release
+      - name: Publish the verified files as a kernel pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ inputs.run_attempt }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.verify.outputs.workflow_commit }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        run: python3 scripts/publish-kernel.py release

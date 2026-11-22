@@ -6,6 +6,7 @@ import fcntl
 import gzip
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,20 +16,27 @@ import tempfile
 
 from kernel_artifacts import (
     ALLOWLIST, ARCHITECTURES, BINARIES, MODES, RECORD, ROOT, archive_name,
-    architecture, check_allowlist, check_binary, json_text, release_tag, series_identity, sha256,
+    architecture, check_allowlist, check_binary, json_text, release_tag, run_identity, series_identity, sha256,
 )
 
 
 def package(args):
     arch = architecture(args.arch)
-    identity, series = series_identity()
+    patches = args.source / "patches/workerd"
+    identity, series = series_identity(patches)
     tag = release_tag(identity)
-    source = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    source = subprocess.check_output(["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
     checked = subprocess.check_output(
-        [sys.executable, str(ROOT / "scripts/workerd-patches.py"), "check", "--checkout", str(args.checkout)],
+        [sys.executable, str(args.source / "scripts/workerd-patches.py"), "check", "--checkout", str(args.checkout)],
         text=True,
     )
     tree = json.loads(checked)["actualTree"]
+    provenance = {}
+    if args.github_run:
+        provenance["githubActions"] = run_identity(
+            os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"],
+            os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_WORKFLOW_SHA"],
+        )
     paths = {name: args.checkout / path for name, path in BINARIES.items()}
     if args.workerd is not None:
         paths["workerd"] = args.workerd
@@ -49,7 +57,7 @@ def package(args):
             shutil.copyfile(path, stage / name)
         hashes = {name: sha256(stage / name) for name in paths}
         check_allowlist(stage / "allowlist", hashes["workerd"], arch)
-        record = json_text({**identity, "patchSeries": series, "releaseTag": tag, "architecture": arch,
+        record = json_text({**identity, **provenance, "patchSeries": series, "releaseTag": tag, "architecture": arch,
                             "coworkerdCommit": source, "workerdTree": tree, "files": hashes}).encode()
 
         pending = stage / archive_path.name
@@ -82,7 +90,9 @@ def package(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=ARCHITECTURES, help="Linux target (default: this machine's architecture)")
+    parser.add_argument("--source", type=Path, default=ROOT, help="Coworkerd checkout containing the patch series")
     parser.add_argument("--checkout", type=Path, default=ROOT / "workerd", help="patched workerd checkout with Bazel outputs")
+    parser.add_argument("--github-run", action="store_true", help="record provenance from the GitHub Actions environment")
     parser.add_argument("--workerd", type=Path, help="path to the built workerd (default: the Bazel output in --checkout)")
     parser.add_argument("--threaded", type=Path, help="path to the built coworkerd-threaded (default: the Bazel output in --checkout)")
     parser.add_argument("--allowlist", required=True, type=Path, help="directory written by syscall-allowlist.py")

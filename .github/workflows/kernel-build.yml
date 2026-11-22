@@ -1,0 +1,133 @@
+name: Build Linux kernel archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: 'Pull request number, including a fork PR.'
+        type: string
+      source_commit:
+        description: 'Full source commit SHA. Required for a PR. Defaults to the selected branch head.'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: github.repository == 'coworkerd/coworkerd'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pull_request }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          sha=${SOURCE_COMMIT:-$GITHUB_SHA}
+          if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Provide a full lowercase source commit SHA.' >&2
+            exit 1
+          fi
+          if [[ -n $PR ]]; then
+            if [[ ! $PR =~ ^[1-9][0-9]*$ || -z $SOURCE_COMMIT ]]; then
+              echo 'Provide the pull request number and its full lowercase head SHA.' >&2
+              exit 1
+            fi
+            head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
+            if [[ $sha != "$head" ]]; then
+              echo 'The pull request head changed. Review its current SHA before building.' >&2
+              exit 1
+            fi
+            printf 'Pull request #%s\n\n' "$PR" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'Coworkerd source commit %s\n' "$sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: source
+    name: Build kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux-x86_64
+            runner: ubuntu-24.04
+            bazelisk: amd64
+            bazelisk-sha256: a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8
+          - arch: linux-arm64
+            runner: ubuntu-24.04-arm
+            bazelisk: arm64
+            bazelisk-sha256: b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f
+    steps:
+      - name: Check out build tools at the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Check out the source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Build, profile and test the kernel archive
+        working-directory: source
+        env:
+          BAZELISK_ARCH: ${{ matrix.bazelisk }}
+          BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
+          KERNEL_ARCH: ${{ matrix.arch }}
+          KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
+          bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/test-hosted-kernel.sh
+      - name: Upload the verified architecture archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: source/build/kernel-ci/archive/coworkerd-kernel-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  assemble:
+    needs: [source, build]
+    name: Verify and assemble both archives
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: kernel-linux-*-${{ github.run_attempt }}
+          path: release
+          merge-multiple: true
+      - name: Verify source, provenance, profiles and checksums
+        env:
+          KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
+        run: python3 scripts/kernel-release.py assemble release --commit "$KERNEL_COMMIT"
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-release-${{ github.run_attempt }}
+          path: |
+            release/coworkerd-kernel-linux-x86_64.tar.gz
+            release/coworkerd-kernel-linux-arm64.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0

@@ -5,6 +5,7 @@ import json
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -46,12 +47,12 @@ def architecture(value):
     return result
 
 
-def series_identity():
-    upstream = dict(line.split("=", 1) for line in (PATCHES / "UPSTREAM").read_text().splitlines() if line)
+def series_identity(patches=PATCHES):
+    upstream = dict(line.split("=", 1) for line in (patches / "UPSTREAM").read_text().splitlines() if line)
     tag, commit = upstream["tag"], upstream["commit"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag) or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("invalid upstream tag or commit in patches/workerd/UPSTREAM")
-    names = [line for line in (PATCHES / "series").read_text().splitlines() if line and not line.startswith("#")]
+    names = [line for line in (patches / "series").read_text().splitlines() if line and not line.startswith("#")]
     if not names or len(names) != len(set(names)) or any(
         PurePosixPath(name).name != name or not name.endswith(".patch") for name in names
     ):
@@ -59,12 +60,26 @@ def series_identity():
     # Preserve the release.sh algorithm: hash the concatenated patch bytes in series order.
     digest = hashlib.sha256()
     for name in names:
-        sha256(PATCHES / name, digest)
+        sha256(patches / name, digest)
     return {"upstream": tag, "upstreamCommit": commit, "patchSeriesSha256": digest.hexdigest()}, names
 
 
 def release_tag(identity):
     return f"kernel-{identity['upstream']}-{identity['patchSeriesSha256'][:12]}"
+
+
+def run_identity(repository, run_id, attempt, workflow_commit):
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+            or not re.fullmatch(r"[1-9][0-9]*", run_id) or not re.fullmatch(r"[1-9][0-9]*", attempt)
+            or not re.fullmatch(r"[0-9a-f]{40}", workflow_commit)):
+        raise ValueError("invalid GitHub Actions run identity")
+    return {"repository": repository, "runId": int(run_id), "runAttempt": int(attempt),
+            "workflowCommit": workflow_commit,
+            "url": f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}"}
+
+
+def hosted_release_tag(identity, run):
+    return f"{release_tag(identity)}-run-{run['runId']}-{run['runAttempt']}"
 
 
 def archive_name(arch):
@@ -82,7 +97,13 @@ def pins(identity):
         for value in archives.values()
     ):
         raise ValueError(f"invalid archive pins in {path.name}")
-    return archives
+    tag = release_tag(identity)
+    download_tag = record.get("releaseTag", tag)
+    if not isinstance(download_tag, str) or (download_tag != tag and not re.fullmatch(
+        re.escape(tag) + r"-run-[1-9][0-9]*-[1-9][0-9]*", download_tag
+    )):
+        raise ValueError(f"invalid release tag in {path.name}")
+    return archives, download_tag
 
 
 def check_binary(path, arch):
@@ -107,3 +128,48 @@ def check_allowlist(directory, workerd_sha256, arch):
         [sys.executable, str(ROOT / "scripts/syscall-allowlist-check.py"), str(directory), workerd_sha256],
         text=True,
     ).strip()
+
+
+def verify_archive(path, expected):
+    actual = sha256(path)
+    if actual != expected:
+        raise ValueError(f"{path.name}: SHA-256 mismatch (expected {expected}, got {actual})")
+
+
+def metadata(archive, expected):
+    member = archive.next()
+    if member is None or member.name != RECORD or not member.isfile() or member.size > 65536:
+        raise ValueError(f"archive must start with its {RECORD} build record")
+    with archive.extractfile(member) as stream:
+        data = stream.read()
+    record = json.loads(data)
+    if any(record[key] != value for key, value in expected.items()) or set(record["files"]) != set(FILES):
+        raise ValueError("kernel build record does not match this checkout, architecture or layout")
+    return data, record["files"]
+
+
+def check_install(directory, record, files, arch):
+    if (directory / RECORD).read_bytes() != record:
+        raise ValueError(f"{directory / RECORD} does not match the verified archive")
+    for name, digest in files.items():
+        if sha256(directory / name) != digest:
+            raise ValueError(f"{directory / name} does not match the verified archive")
+    for name in BINARIES:
+        check_binary(directory / name, arch)
+    check_allowlist(directory / "allowlist", files["workerd"], arch)
+
+
+def unpack(archive, directory, record):
+    (directory / "allowlist").mkdir(parents=True)
+    (directory / RECORD).write_bytes(record)
+    remaining = set(FILES)
+    while (member := archive.next()) is not None:
+        if member.name not in remaining or not member.isfile():
+            raise ValueError(f"unexpected archive entry {member.name!r}")
+        remaining.remove(member.name)
+        path = directory / member.name
+        with archive.extractfile(member) as source, path.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        path.chmod(MODES[member.name])
+    if remaining:
+        raise ValueError(f"missing archive entries: {', '.join(sorted(remaining))}")
