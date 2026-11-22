@@ -325,6 +325,10 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-output-gate)
     set_tests_properties(node-threaded-durable-http-output-gate PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-group-refusal COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" group-refusal)
+    set_tests_properties(node-threaded-durable-group-refusal PROPERTIES TIMEOUT 20)
     add_test(NAME node-threaded-durable-http-memory COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-memory 4 64 64)
@@ -352,7 +356,7 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
     add_dependencies(check coworkerd)
   endif()
 else()
-  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-events, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http-memory, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-events, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http-memory, node-threaded-durable-group-refusal, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")

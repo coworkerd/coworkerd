@@ -16,6 +16,7 @@ const events = scenario === 'events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
 const httpMemory = scenario === 'http-memory';
+const groupRefusal = scenario === 'group-refusal';
 const memoryPlacementMiB = httpMemory ? Number(busyArg) : 64;
 if (httpMemory) assert.ok(Number.isInteger(memoryPlacementMiB) && memoryPlacementMiB >= 8 && memoryPlacementMiB <= 64);
 const boundedEvents = events || httpIsolation;
@@ -24,7 +25,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory;
+const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -40,6 +41,7 @@ const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
+  ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -464,6 +466,44 @@ try {
     }
     console.log(JSON.stringify({scenario, pid: processInfo.pid, generation: processInfo.generation,
       wakes, admission: await readAdmission(socketPath)}));
+  } else if (groupRefusal) {
+    const refused = await fetch(`http://127.0.0.1:${port}/group-refused`, {
+      method: 'POST', body: 'must not reach the actor', signal: AbortSignal.timeout(5000),
+    });
+    const refusal = await refused.text();
+    assert.equal(refused.status, 502, refusal + '\n' + diagnostics);
+    assert.match(JSON.parse(refusal).error, /OVERLOADED/);
+    const empty = await waitForAdmission(socketPath, 0);
+    assert.equal(empty.groupCreationRefusals, 1);
+    for (const field of ['trees', 'residentRoots', 'homes', 'running', 'reservedBytes',
+      'reservedDescriptors']) assert.equal(empty[field], 0, field);
+    const request = async (path, options) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, body + '\n' + diagnostics);
+      return JSON.parse(body);
+    };
+    const retry = await request('/group-refused');
+    assert.equal(retry.counter, undefined, 'the refused request entered the actor');
+    const saved = await request('/group-refused', {method: 'POST', body: 'after group refusal'});
+    assert.deepEqual(await request('/group-refused'), saved);
+    const neighbor = await request('/group-neighbor', {method: 'POST', body: 'neighbor'});
+    assert.equal(neighbor.isolate, saved.isolate);
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    const final = await waitForAdmission(socketPath, 0);
+    assert.equal(final.groupCreationRefusals, 1);
+    assert.equal(final.actorResets, 0);
+    assert.equal(final.isolateResets, 0);
+    console.log(JSON.stringify({scenario, injectedFactoryRefusal: true, refusedBeforeActor: true,
+      retried: true, pid: sameChild.pid, generation: sameChild.generation, admission: final}));
   } else if (httpMemory) {
     const request = async (path, options, status = 200) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
