@@ -509,8 +509,16 @@ try {
     const hardInitial = await request('/memory-hard', {method: 'POST', body: 'hard value'});
     const resetting = request('/memory-hard?allocateMiB=118&hold', undefined, 503);
     resetting.catch(() => {});
-    const hard = await untilState(state => state.isolateResets === 1, 'hard isolate reset');
-    assert.equal((await resetting).code, 'MEMORY_LIMIT_EXCEEDED');
+    let hardPeakBytes = 0;
+    const hard = await untilState(state => {
+      hardPeakBytes = Math.max(hardPeakBytes, state.maxHomeMemoryBytes);
+      return state.isolateResets === 1;
+    }, 'hard isolate reset');
+    // This is a copy-pressure reset below the 128 MiB allocation ceiling. An already
+    // connected call interrupted by that close has the existing uncertain-result contract.
+    assert.ok(hardPeakBytes >= 128 * 1024 * 1024 * 0.9, String(hardPeakBytes));
+    assert.ok(hardPeakBytes < 128 * 1024 * 1024, String(hardPeakBytes));
+    assert.equal((await resetting).code, 'RESULT_UNCERTAIN');
     assert.equal(hard.actorResets, 0);
     const recovered = await request('/memory-hard');
     assert.notEqual(recovered.instance, hardInitial.instance);
@@ -527,7 +535,7 @@ try {
     const final = await waitForAdmission(socketPath, 0);
     assert.equal(final.isolateResets, 1);
     console.log(JSON.stringify({scenario, memoryPlacementMiB, moderateMiB, resources,
-      idleFirst: evicted, closed, hard, final, pid: sameChild.pid, generation: sameChild.generation}));
+      idleFirst: evicted, closed, hardPeakBytes, hard, final, pid: sameChild.pid, generation: sameChild.generation}));
   } else if (httpOutputGate) {
     // Warm the actor and drain initialization before observing the unawaited write.
     const initial = await fetch(`http://127.0.0.1:${port}/output`, {
