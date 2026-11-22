@@ -146,14 +146,28 @@ idle interval, then observes three real idle retirements and wakes. Each first w
 between a read and a write that verifies the previous stored value before replacing it. Repeated reads
 check the new instance and stored value, while the child must retain its ready PID and generation.
 It does not send JavaScript RPC calls.
+The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
+copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
+waiting mailbox defaults to four events/64 KiB. Reservations keep 256 descriptors plus five per home
+outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
+declared waiting bytes. Facets reserve their own metadata and descriptors. These test-role defaults are
+supported by the source-tagged capacity, queue, pressure and overlap measurements in PR #43; actual
+body execution remains subject to the copy/process memory limits.
+The `http-overlap` mode observes 16 fully read and written 16 KiB bodies held across four facets while
+same-object and neighboring-object requests continue. It records RSS, threads and descriptors, verifies
+facet state and exact event-credit return, and checks the original child remains ready. The ordinary
+ingress fixture uses 32 call slots so its concurrency limit does not hide durable overlap.
+The `group-refusal` mode injects one empty V8-group factory result only in the disposable role, then
+requires returned reservations, successful retry and the original ready child. This does not simulate
+physical address-space exhaustion; `COWORKERD_DO_TEST_REFUSE_GROUP` is zero by default.
 The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
 `COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
 `COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
 descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
 
-On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 8 64`
-to fill one durable child with eight copies of 64 real objects each. The tool checks the next object's refusal
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 4 64`
+to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
 and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
 
 The `placement` mode alternates bounded synchronous work on one object with requests to new objects.

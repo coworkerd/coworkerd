@@ -348,6 +348,8 @@ try {
   assert.equal(paths.length, 1);
   const stack = join(scratch, paths[0]);
   const socketPath = join(stack, 'run', processInfo.socket);
+  assert.equal((await readAdmission(socketPath)).workerThreads,
+    Number(env.COWORKERD_DO_TEST_HOME_COUNT ?? Math.min(4, config.processPool.inFlightLimit)));
   const ordinary = await sendPreface(socketPath, 'T');
   ordinary.socket.destroy();
   assert.equal(ordinary.receipt, 'R');
@@ -509,12 +511,20 @@ try {
     }
     let loaded, counts;
     for (const until = performance.now() + 2000; performance.now() < until;) {
-      counts = await Promise.all(facets.map((_, index) => request(`/overlap-${index}?facet&overlapState`)));
       loaded = await readAdmission(socketPath);
-      if (counts.every(count => count === 4) && loaded.running === held.length) break;
+      // Wait until delivery has freed the four waiting slots before adding observation calls.
+      if (loaded.running === held.length) {
+        counts = await Promise.all(facets.map((_, index) => request(`/overlap-${index}?facet&overlapState`)));
+        if (counts.every(count => count === 4)) break;
+      }
       await delay(10);
     }
     assert.deepEqual(counts, [4, 4, 4, 4], 'all bodies must be read and written before sampling');
+    for (const until = performance.now() + 500; performance.now() < until;) {
+      loaded = await readAdmission(socketPath);
+      if (loaded.running === held.length) break;
+      await delay(10);
+    }
     assert.equal(loaded.running, 16, JSON.stringify(loaded));
     assert.equal(loaded.residentRoots, 4);
     const full = await readProcessResources(processInfo.pid);
@@ -545,7 +555,7 @@ try {
     assert.equal(sameChild.generation, processInfo.generation);
     assert.equal(sameChild.state, 'ready');
     console.log(JSON.stringify({scenario, roots: 4, facets: 4, events: held.length, bodyBytes,
-      baseline, warm, full, after: await readProcessResources(processInfo.pid),
+      confirmedBodies: counts.reduce((sum, count) => sum + count, 0), baseline, warm, full, after: await readProcessResources(processInfo.pid),
       quiet, loaded, drained, pid: sameChild.pid, generation: sameChild.generation}));
   } else if (groupRefusal) {
     const refused = await fetch(`http://127.0.0.1:${port}/group-refused`, {
