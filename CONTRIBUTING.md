@@ -122,6 +122,8 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
 | `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
+| `node-threaded-durable-queues` (Linux only) | Both kernel binaries, for per-object mailbox count/byte bounds and returned event and descriptor credits |
+| `node-threaded-durable-fd-limit` (Linux only) | Both kernel binaries, for bounded refusal before exhausting the child's file descriptors |
 
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
@@ -149,6 +151,15 @@ duration plus the child's thread count, RSS, descriptors, and admission counters
 include transport and scheduling, so they are not direct samples of the kernel's synchronous busy clock.
 With `placement-control 4 64 4000`, the same workload runs 32 rounds and must keep one copy;
 the four-second threshold excludes busy-triggered splitting while leaving capacity and memory limits unchanged.
+
+The `queues 4 64` mode measures admission for 64 objects with four events each, declaring 16 KiB per
+event. It checks the four-event count limit separately using one-byte declarations, with another object
+still admitted. This is a measurement before request bodies are read, not an actor execution or payload
+allocation workload. It records reservations, RSS, threads and descriptors, cancels the queued calls,
+and checks that reservations and descriptors return to baseline. The final argument varies the object count.
+The `queue-limit 4 64` mode must run with a descriptor limit of 512; the CTest wrapper sets that limit
+only for its own process tree. It asserts refusal at the reservation ceiling, continued control access,
+256 descriptors of headroom and full credit return. Neither mode executes a Worker event.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries

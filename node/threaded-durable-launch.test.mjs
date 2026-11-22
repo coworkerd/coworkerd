@@ -11,6 +11,8 @@ import { promisify } from 'node:util';
 
 const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
+const queueLimit = scenario === 'queue-limit';
+const queues = scenario === 'queues' || queueLimit;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
 const exerciseEvents = scenario === 'events' || measure || placement;
@@ -22,11 +24,13 @@ if (measure || placement) {
   assert.ok(Number.isInteger(treesPerHome) && treesPerHome >= 2 && treesPerHome <= 128);
 }
 if (placementControl) assert.equal(Number(busyArg), 4000);
+if (queues) assert.ok(Number.isInteger(treesPerHome) && treesPerHome >= 1 && treesPerHome <= 4096);
 const exec = promisify(execFile);
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
+  ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(exerciseEvents && !measure && !placement ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
@@ -45,7 +49,7 @@ const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure || placement ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, ...(measure || placement || queues ? { residentObjects: 0 } : {}),
   },
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
@@ -347,7 +351,78 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (placement) {
+  if (queues) {
+    const deadline = process.hrtime.bigint() + 30_000_000_000n;
+    const keep = [];
+    const queue = async (id, sequence, bytes, expected) => {
+      const connection = await sendPreface(socketPath, durablePreface(id, sequence, bytes, deadline));
+      keep.push(connection.socket);
+      assert.equal(connection.receipt, expected);
+    };
+    const depthId = 'd'.repeat(64);
+    try {
+      for (let event = 0; event < 4; ++event) await queue(depthId, `depth-${event}`, 1, 'A');
+      await queue(depthId, 'depth-overflow', 1, 'R');
+      await queue('e'.repeat(64), 'depth-unrelated', 1, 'A');
+      const depth = await readAdmission(socketPath);
+      assert.equal(depth.waiting, 5);
+      assert.equal(depth.waitingBytes, 5);
+    } finally {
+      for (const socket of keep.splice(0)) socket.destroy();
+    }
+    await waitForAdmission(socketPath, 0);
+    const baseline = await readProcessResources(processInfo.pid);
+    const start = performance.now();
+    let full, reserved;
+    let accepted = 0, refused = false;
+    try {
+      filling: for (let object = 0; object < treesPerHome; ++object) {
+        const id = (object + 1000).toString(16).padStart(64, '0');
+        for (let event = 0; event < 4; ++event) {
+          const connection = await sendPreface(socketPath,
+            durablePreface(id, `mailbox-${object}-${event}`, 16384, deadline));
+          keep.push(connection.socket);
+          if (queueLimit && connection.receipt === 'R') { refused = true; break filling; }
+          assert.equal(connection.receipt, 'A');
+          ++accepted;
+        }
+      }
+      reserved = await readAdmission(socketPath);
+      assert.equal(reserved.trees, Math.ceil(accepted / 4));
+      assert.equal(reserved.waiting, accepted);
+      assert.equal(reserved.waitingBytes, accepted * 16384);
+      assert.equal(reserved.reservedDescriptors, reserved.trees * 4 + accepted);
+      assert.equal(reserved.reservedBytes, reserved.trees * 16384 + accepted * 20480);
+      full = await readProcessResources(processInfo.pid);
+      if (queueLimit) {
+        assert.ok(refused, 'descriptor reservation ceiling was not reached');
+        const limits = await readFile(`/proc/${processInfo.pid}/limits`, 'utf8');
+        const maxFiles = Number(limits.match(/^Max open files\s+(\d+)/m)[1]);
+        const remaining = maxFiles - 256 - homeCount * 5 - reserved.reservedDescriptors;
+        assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 5 : 1));
+        assert.ok(full.descriptors <= maxFiles - 256, 'fixed descriptor headroom consumed');
+      } else {
+        assert.equal(accepted, treesPerHome * 4);
+      }
+    } finally {
+      for (const socket of keep) socket.destroy();
+    }
+    const released = await waitForAdmission(socketPath, 0);
+    assert.equal(released.trees, 0);
+    assert.equal(released.reservedDescriptors, 0);
+    assert.equal(released.reservedBytes, 0);
+    let drained;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      drained = await readProcessResources(processInfo.pid);
+      if (drained.descriptors === baseline.descriptors) break;
+      await delay(20);
+    }
+    assert.equal(drained.descriptors, baseline.descriptors);
+    assert.equal(drained.threads, baseline.threads);
+    console.log(JSON.stringify({scenario, objects: reserved.trees, events: accepted, refused,
+      declaredBytesPerEvent: 16384, elapsedMs: performance.now() - start,
+      baseline, full, drained, reserved, released}));
+  } else if (placement) {
     const request = async path => {
       const start = performance.now();
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
