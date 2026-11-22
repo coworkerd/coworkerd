@@ -436,8 +436,9 @@ async function durableThreadedFence(cluster) {
     assert.equal(json(await workerCall(cluster, first, tenant, 'object', { method: 'POST', body: 1 }),
       200, 'baseline write'), 1);
   });
-  const { owners: [old] } = await namespace();
+  const { namespaceId, owners: [old] } = await namespace();
   assert.ok(old && cluster.nodes.includes(old.nodeId));
+  const objectId = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update('takeover').digest('hex');
   const peers = cluster.nodes.filter(node => node !== old.nodeId);
   const [ingress] = peers;
   await eventually('both peers are reachable before the fence', async () => {
@@ -447,6 +448,8 @@ async function durableThreadedFence(cluster) {
   });
   const child = await durableGeneration(cluster, old.nodeId);
   assert.equal(child.lifecycle?.durableServer, 'threaded');
+  const { durableLog: before } = await cluster.state(old.nodeId);
+  const sequence = (BigInt(before.log.nextSeq) + 1n).toString();
   const gate = join(cluster.peerAckGate, 'hold');
   await writeFile(gate, '');
   const sentAt = performance.now();
@@ -458,6 +461,9 @@ async function durableThreadedFence(cluster) {
     await eventually('the old generation has a write waiting on two peers', async () => {
       const states = await Promise.all(peers.map(peer => cluster.state(peer)));
       assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+      const { durableLog } = await cluster.state(old.nodeId);
+      assert.equal(durableLog.log.nextSeq, sequence);
+      assert.equal(durableLog.confirm.unconfirmed, 1);
     }, { timeout: 3000, interval: 25 });
     await cluster.compose(['pause', old.nodeId]);
     paused = true;
@@ -477,6 +483,20 @@ async function durableThreadedFence(cluster) {
   }
   const result = await staleWrite;
   assert.ok(result.error || result.status >= 400, 'a write from the fenced generation never returned success');
+  await eventually('the old owner excludes the pending write because it lost ownership', async () => {
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', old.nodeId]);
+    const prefix = '[do-log] ';
+    const events = logs.split('\n').filter(line => line.startsWith(prefix))
+      .map(line => JSON.parse(line.slice(prefix.length)));
+    const fence = events.find(row => row.event === 'owner-fenced' && row.namespaceId === namespaceId &&
+      row.shard === old.shard && BigInt(row.throughShardEpoch) >= BigInt(old.epoch));
+    assert.ok(fence, `no fence for shard ${old.shard} epoch ${old.epoch} on ${old.nodeId}`);
+    const excluded = events.find(row => row.event === 'isolated' && row.object.startsWith(`${namespaceId}/${objectId}/`) &&
+      row.records === 1 && row.from === sequence);
+    assert.ok(excluded, `no isolation for held sequence ${sequence} on ${old.nodeId}`);
+    assert.ok(excluded.reason === fence.reason || excluded.reason === 'the node\'s membership lease ended before confirmation',
+      `unexpected reason for isolating sequence ${sequence} on ${old.nodeId}: ${excluded.reason}`);
+  });
   const saved = await recovery;
   if (saved.error) throw saved.error;
   assert.ok(saved.includes(1), 'the later owner keeps the earlier confirmed write');

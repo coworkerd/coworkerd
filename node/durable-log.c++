@@ -4625,7 +4625,7 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
   if (selectedChannel->second.draining)
     return {false, 503, "DO_UNAVAILABLE", "the selected durable generation is draining"};
   for (const auto& [id, channel] : channels) {
-    if (id == target) continue;
+    if (id == target || (!channel.open && channel.threadedGeneration == 0)) continue;
     if (object->dispatchedChannel == id)
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
     if (channel.open && channelHasOpenObject(channel, *object))
@@ -4977,8 +4977,9 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     isolateObjectPending(*object, "pending records cannot outlive the image used by recovery");
     KJ_REQUIRE(!recoveryWriteFailed, "pending exclusions could not be made durable");
     const auto dispatched = channels.find(object->dispatchedChannel);
-    const bool channelLost = dispatched != channels.end() && !dispatched->second.open;
-    const bool closeLive = channelLost || hasLiveOpenFacets(*object) ||
+    const bool threadedChannelLost = dispatched != channels.end() && dispatched->second.threadedGeneration != 0 &&
+        !dispatched->second.open;
+    const bool closeLive = threadedChannelLost || hasLiveOpenFacets(*object) ||
         (hasLiveDispatch(*object) && object->dispatchPending) || hasLiveHolders(*object);
     object->rebuildGeneration = {nodeEpoch, ++recoverySerial};
     KJ_REQUIRE(appendRecovery({recoveryEvent(RecoveryKind::REBUILD_BEGIN, *object, object->rebuildGeneration)}, false),

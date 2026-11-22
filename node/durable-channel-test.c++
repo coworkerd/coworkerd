@@ -1033,6 +1033,58 @@ struct DurableLogChannelTest {
     }
   }
 
+  static void upstreamChannelEof() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-upstream-channel-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    size_t closeCalls = 0;
+    DurableLog::Hooks hooks;
+    hooks.closeObjects = [&](std::string) -> kj::Promise<void> { ++closeCalls; co_return; };
+    DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), timer,
+        *io.lowLevelProvider, membership, std::move(hooks));
+    log.setNodeEpoch(1);
+    const int old = log.openChannel("d0-1"), active = log.openChannel("d0-2");
+    KJ_REQUIRE(old >= 0 && active >= 0);
+    KJ_DEFER({ ::close(old); ::close(active); });
+    auto& channel = log.channels.at("d0-1");
+
+    const std::string ns(64, '1'), damagedId(64, '2'), closedId(64, '3');
+    const auto makeObject = [&](const std::string& id) -> DurableLog::Object& {
+      const auto name = durableHostName(ns, id, 1);
+      auto& object = log.objects[name];
+      log.locate(object, ns, id, 1);
+      std::filesystem::create_directories(object.positionPath(temp).parent_path());
+      object.objectName = name;
+      object.state = DurableLog::ObjectState::LOCAL;
+      object.shardEpoch = object.openEpoch = object.openGeneration = 1;
+      object.dispatchedChannel = channel.processId;
+      return object;
+    };
+    auto& damaged = makeObject(damagedId);
+    auto& facet = damaged.facets[0];
+    facet.processId = channel.processId;
+    facet.open = true;
+    channel.openFacets[damaged.objectName + "/0"] = {{damaged.openEpoch, damaged.openGeneration}, 0};
+    auto& closed = makeObject(closedId);
+    log.channelEnded(channel, "upstream fixture EOF before reap");
+    KJ_REQUIRE(!channel.open && log.channels.contains("d0-1"));
+    KJ_REQUIRE(damaged.state == DurableLog::ObjectState::REPAIR && !facet.open);
+    const DurableLog::ObjectIdentity identity{ns, closedId, "tenant", 1, 1, 0};
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 2).ready,
+        "an ended upstream channel cannot block dispatch to the replacement");
+    KJ_REQUIRE(closed.dispatchedChannel.empty());
+    // The directory fixture has no remote history. Exercise the rebuild's decision before the storage read.
+    auto rebuild = log.rebuildAttempt(damaged.objectName, "upstream fixture recovery", 0);
+    (void)rebuild.poll(io.waitScope);
+    KJ_REQUIRE(damaged.state == DurableLog::ObjectState::REBUILDING && closeCalls == 0,
+        "an ended upstream channel cannot make this rebuild reset live generations");
+  }
+
   static void threadedChannel() {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-threaded-channel-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
@@ -1047,7 +1099,7 @@ struct DurableLogChannelTest {
     log.setNodeEpoch(1);
     const int peer = log.openChannel("d0-7", 7);
     KJ_REQUIRE(peer >= 0);
-    KJ_DEFER(::close(peer));
+    auto child = io.lowLevelProvider->wrapSocketFd(peer, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
     auto& channel = log.channels.at("d0-7");
     const auto integer = [](std::string& out, uint64_t value, int size) {
       for (int i = 0; i < size; ++i) out.push_back(char(value >> (i * 8)));
@@ -1055,6 +1107,24 @@ struct DurableLogChannelTest {
     const auto text = [&](std::string& out, std::string_view value) {
       integer(out, value.size(), 2);
       out += value;
+    };
+    const auto receive = [&]() {
+      auto& timer = io.provider->getTimer();
+      kj::byte length[4];
+      timer.timeoutAfter(kj::SECONDS, child->read(kj::arrayPtr(length, sizeof(length)))).wait(io.waitScope);
+      uint32_t size = 0;
+      for (unsigned i = 0; i < sizeof(length); ++i) size |= uint32_t(length[i]) << (8 * i);
+      KJ_REQUIRE(size > 0 && size <= 1024, "invalid node WAL reply length", size);
+      std::string reply(size, '\0');
+      timer.timeoutAfter(kj::SECONDS,
+          child->read(kj::arrayPtr(reinterpret_cast<kj::byte*>(reply.data()), reply.size()))).wait(io.waitScope);
+      return reply;
+    };
+    const auto expectReply = [&](uint8_t type, uint64_t id, std::optional<uint8_t> status = {}) {
+      std::string expected(1, char(type));
+      integer(expected, id, 8);
+      if (status) integer(expected, *status, 1);
+      KJ_REQUIRE(receive() == expected, "unexpected node WAL reply", type, id);
     };
     const auto hello = [&](uint64_t generation) {
       std::string body(1, '\x01');
@@ -1072,6 +1142,10 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(channel.pid == 0);
     log.onMessage(channel, hello(7));
     KJ_REQUIRE(channel.pid == 321);
+    std::string ready(1, '\x05');
+    integer(ready, 1, 4);
+    integer(ready, 7, 8);
+    KJ_REQUIRE(receive() == ready);
 
     const std::string ns(64, '1'), id(64, '2');
     const auto name = durableHostName(ns, id, 1);
@@ -1090,7 +1164,7 @@ struct DurableLogChannelTest {
       text(body, key);
       return body;
     };
-    const auto open = [&](uint64_t openId) {
+    const auto open = [&](uint64_t openId, uint32_t frames = 0) {
       auto body = forOpen(3, openId);
       text(body, name);
       text(body, object.storageId);
@@ -1099,7 +1173,7 @@ struct DurableLogChannelTest {
       text(body, "");
       integer(body, 0, 4); // salts
       integer(body, 0, 4);
-      integer(body, 0, 4); // WAL frames
+      integer(body, frames, 4);
       integer(body, 0, 8); // WAL bytes
       integer(body, 8192, 8); // database bytes
       log.onMessage(channel, body);
@@ -1118,8 +1192,26 @@ struct DurableLogChannelTest {
       log.onMessage(channel, body);
     };
     open(11);
+    expectReply(7, 11, 0);
     close(11, 8192);
     open(21);
+    expectReply(7, 21, 0);
+    std::string staleFrames(1, '\x02');
+    integer(staleFrames, 11, 8); // old open ID
+    integer(staleFrames, 101, 8); // request ID
+    text(staleFrames, key);
+    text(staleFrames, name);
+    text(staleFrames, object.storageId);
+    integer(staleFrames, 0, 4); // root facet
+    integer(staleFrames, 0, 4); // parent
+    text(staleFrames, "");
+    integer(staleFrames, 1, 8); // WAL generation
+    for (const auto value : {0, 0, 4096, 1, 1, 1}) integer(staleFrames, value, 4);
+    for (unsigned i = 0; i < 3; ++i) integer(staleFrames, 0, 8); // timestamps
+    staleFrames.append(1 + 24 + 4096, '\0'); // no WAL header, one frame
+    log.onMessage(channel, staleFrames);
+    expectReply(1, 101, 1);
+    KJ_REQUIRE(channel.frames == 0 && log.nextSeq == 0, "a stale open cannot submit frames");
     checkpoint(21, 12288);
     checkpoint(11, 1);
     close(11, 2);
@@ -1127,17 +1219,29 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(object.facets.at(0).databaseBytes == 12288 && log.checkpoints == 1);
     KJ_REQUIRE(!log.drainChannel("d0-7") && channel.draining,
         "drain must wait for the current SQLite open");
+    expectReply(6, 21);
     close(21, 16384);
     KJ_REQUIRE(!channel.openFacets.contains(key) && !object.facets.at(0).open && !object.cacheOpen);
     KJ_REQUIRE(object.facets.at(0).databaseBytes == 16384);
     KJ_REQUIRE(log.drainChannel("d0-7"), "the current database close completes the drain");
 
     channel.draining = false;
+    open(29, 1);
+    std::string broken(1, '\x03');
+    integer(broken, 29, 8);
+    KJ_REQUIRE(receive().starts_with(broken), "the node must report the position mismatch to this open");
+    expectReply(7, 29, 1);
+    KJ_REQUIRE(object.state == DurableLog::ObjectState::REPAIR);
+    close(29, 16384);
+
+    object.state = DurableLog::ObjectState::LOCAL;
     open(30);
+    expectReply(7, 30, 0);
     object.state = DurableLog::ObjectState::REBUILDING;
     object.holders[channel.processId].requests = 1;
     auto closing = log.closeThreadedObject(name);
     KJ_REQUIRE(!closing.poll(io.waitScope), "recovery must wait for SQLite to close");
+    expectReply(6, 30);
     close(30, 16384);
     clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
     KJ_REQUIRE(!closing.poll(io.waitScope), "a dispatched call still holds the old image");
@@ -1147,15 +1251,20 @@ struct DurableLogChannelTest {
 
     object.state = DurableLog::ObjectState::LOCAL;
     open(31);
+    expectReply(7, 31, 0);
     object.state = DurableLog::ObjectState::REBUILDING;
     auto lost = log.closeThreadedObject(name);
     KJ_REQUIRE(!lost.poll(io.waitScope));
-    auto interrupted = forOpen(4, 31);
-    integer(channel.inbox, interrupted.size() + 32, 4);
-    channel.inbox += interrupted;
+    expectReply(6, 31);
+    // Deliver a whole message with a truncated checkpoint body before EOF.
+    const auto incompleteCheckpoint = forOpen(4, 31);
+    integer(channel.inbox, incompleteCheckpoint.size(), 4);
+    channel.inbox += incompleteCheckpoint;
     const auto completedCheckpoints = log.checkpoints;
+    const auto receivedMessages = channel.messages;
     log.channelEnded(channel, "test channel EOF");
-    KJ_REQUIRE(log.checkpoints == completedCheckpoints, "a partial checkpoint reports no completed image");
+    KJ_REQUIRE(channel.messages == receivedMessages + 1 && log.checkpoints == completedCheckpoints,
+        "a truncated checkpoint report cannot advance the checkpoint state");
     clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
     KJ_REQUIRE(lost.poll(io.waitScope) && !lost.wait(io.waitScope),
         "EOF without process exit is not proof of close");
@@ -1645,6 +1754,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
+  else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "restored-tail" || mode == "restored-tail-negative")

@@ -284,11 +284,18 @@ Append acknowledgements identify requests, and checkpoint, seal, break, and clos
 the exact database open. A home reports closure after SQLite closes the connection. For recovery the
 node blocks new dispatch and waits for those closes or for the pool to reap the generation before
 replacing its files. Rotation and node drain also ask for those closes before process termination.
+When recovery has to reset the durable processes, both backends wait for the pool to reap those
+generations. The recovery attempt fails if any affected generation is still unreaped after five seconds.
 Both backends use the same peer protocol, confirmation rules, and log, segment, and manifest formats.
 The threaded child's file-preparation thread scans the WAL of a cold open in buffers of at most
 1 MiB. The home still opens its SQLite connection and runs idle or threshold-triggered checkpoints
 on that connection. `durableLog.threadedHomeIo` reports sample counts and observed maxima for the
 local SQLite open, the checkpoint time, and the WAL bytes present before the checkpoint.
+The size trigger is `durableObjects.checkpointBytes` (4 MiB by default). The transaction that crosses
+the threshold can add up to one transaction's frames before the first checkpoint attempt. Pending
+work or a busy connection can defer the checkpoint.
+In the x86-64 release acceptance workload, the slowest sampled open took 2.600 ms and a checkpoint
+of a 90,672-byte WAL took 0.250 ms.
 
 - **The commit path.** The durable process ships the frames of each committed transaction over a descriptor it
   inherited at startup (workerd's patch 0013; nothing is opened by path). The node writes the record -- the node's
