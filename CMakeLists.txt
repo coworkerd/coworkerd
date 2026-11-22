@@ -317,10 +317,14 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" events)
     set_tests_properties(node-threaded-durable-events PROPERTIES TIMEOUT 45)
+    add_test(NAME node-threaded-durable-placement COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" placement 4 64 3000)
+    set_tests_properties(node-threaded-durable-placement PROPERTIES TIMEOUT 30)
     add_dependencies(check coworkerd)
   endif()
 else()
-  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch and node-threaded-durable-events (Linux only)")
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-events and node-threaded-durable-placement (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")

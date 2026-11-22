@@ -121,6 +121,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
+| `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
 
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
@@ -137,6 +138,17 @@ descriptor headroom before accounting for the home loops. These settings apply t
 On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 8 64`
 to fill one durable child with eight copies of 64 real objects each. The tool checks the next object's refusal
 and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
+
+The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
+It checks quiet-copy reuse, a distinct copy after the home becomes busy, pinned existing actors,
+returned event credits, and an unchanged ready child without actor resets or idle retirement.
+For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js placement 4 64 3000`
+uses four homes, 64 roots per copy, and a 3000 ms busy threshold in the four-second window.
+The last argument can vary the threshold for measurements; output includes every work and cold-request
+duration plus the child's thread count, RSS, descriptors, and admission counters. These request durations
+include transport and scheduling, so they are not direct samples of the kernel's synchronous busy clock.
+With `placement-control 4 64 4000`, the same workload runs 32 rounds and must keep one copy;
+the four-second threshold excludes busy-triggered splitting while leaving capacity and memory limits unchanged.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries

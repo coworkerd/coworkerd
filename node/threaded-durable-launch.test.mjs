@@ -9,27 +9,32 @@ import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64'] = process.argv.slice(2);
+const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
-const exerciseEvents = scenario === 'events' || measure;
+const placementControl = scenario === 'placement-control';
+const placement = scenario === 'placement' || placementControl;
+const exerciseEvents = scenario === 'events' || measure || placement;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
-if (measure) {
+if (measure || placement) {
   assert.ok(Number.isInteger(homeCount) && homeCount >= 1 && homeCount <= 32);
+  assert.ok(Number.isInteger(Number(busyArg)) && Number(busyArg) > 0 && Number(busyArg) <= 4000);
   assert.ok(Number.isInteger(treesPerHome) && treesPerHome >= 2 && treesPerHome <= 128);
 }
+if (placementControl) assert.equal(Number(busyArg), 4000);
 const exec = promisify(execFile);
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
-  ...(exerciseEvents && !measure ? {
+  ...(exerciseEvents && !measure && !placement ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
-  ...(measure ? {
+  ...(measure || placement ? {
     COWORKERD_DO_TEST_HOME_COUNT: homeArg,
     COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
+    ...(placement ? { COWORKERD_DO_TEST_BUSY_MS: busyArg } : {}),
   } : {}),
 };
 const fixture = join(scratch, 'fixture');
@@ -40,7 +45,7 @@ const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, ...(measure || placement ? { residentObjects: 0 } : {}),
   },
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
@@ -146,6 +151,15 @@ try {
       async fetch(request) {
         isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
+        if (query.has("work")) {
+          const iterations = Number(query.get("work"));
+          if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000) {
+            return new Response("invalid work size", {status: 400});
+          }
+          let checksum = 1;
+          for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+          return Response.json({instance: this.instance, isolate, checksum});
+        }
         if (query.has("hold")) {
           this.latch = Promise.withResolvers();
           await this.latch.promise;
@@ -266,7 +280,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents && !measure ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents && !measure && !placement ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -333,7 +347,66 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (measure) {
+  if (placement) {
+    const request = async path => {
+      const start = performance.now();
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, body + '\n' + diagnostics);
+      return { value: JSON.parse(body), elapsedMs: performance.now() - start };
+    };
+    const root = (await request('/busy')).value;
+    const quiet = (await request('/quiet')).value;
+    assert.equal(quiet.isolate, root.isolate);
+    // Adjust bounded work for host speed while keeping each event short.
+    let iterations = 15000000;
+    const baseline = await readProcessResources(processInfo.pid);
+    const before = await waitForAdmission(socketPath, 0);
+    const start = performance.now();
+    const workMs = [], workIterations = [], coldMs = [];
+    let split;
+    for (let i = 0; performance.now() - start < 10000 && (!placementControl || i < 32); ++i) {
+      const work = await request(`/busy?work=${iterations}`);
+      assert.equal(work.value.instance, root.instance);
+      assert.equal(work.value.isolate, root.isolate);
+      workMs.push(work.elapsedMs);
+      workIterations.push(iterations);
+      iterations = Math.min(200000000, Math.max(1000000,
+        Math.round(iterations * 120 / Math.max(1, work.elapsedMs))));
+      const cold = await request(`/probe-${i}`);
+      coldMs.push(cold.elapsedMs);
+      if (placementControl) {
+        assert.equal(cold.value.isolate, root.isolate, 'control unexpectedly split');
+        split = cold.value;
+      } else if (cold.value.isolate !== root.isolate) { split = cold.value; break; }
+      assert.ok(i < treesPerHome - 3, 'capacity reached before busy threshold');
+    }
+    if (placementControl) assert.equal(coldMs.length, 32);
+    else assert.ok(split, 'busy home did not divert a cold tree');
+    const elapsedMs = performance.now() - start;
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.homes, before.homes + (placementControl ? 0 : 1));
+    assert.equal(after.idleRetirements, before.idleRetirements);
+    assert.equal(after.actorResets, before.actorResets);
+    assert.equal(after.isolateResets, before.isolateResets);
+    assert.ok(after.residentRoots < treesPerHome);
+    const pinned = (await request('/busy')).value;
+    assert.equal(pinned.instance, root.instance);
+    assert.equal(pinned.isolate, root.isolate);
+    assert.equal((await request(`/probe-${coldMs.length - 1}`)).value.instance, split.instance);
+    const finalState = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const finalChild = finalState.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(finalChild.pid, processInfo.pid);
+    assert.equal(finalChild.generation, processInfo.generation);
+    assert.equal(finalChild.state, 'ready');
+    console.log(JSON.stringify({scenario, busyThresholdMs: Number(busyArg),
+      elapsedMs, workMs, workIterations, coldMs, baseline,
+      full: await readProcessResources(processInfo.pid), before, after}));
+  } else if (measure) {
     const query = (index, body) => fetch(`http://127.0.0.1:${port}/occupy-${index}`, {
       method: 'POST', body, signal: AbortSignal.timeout(5000),
     });
