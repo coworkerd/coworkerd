@@ -1077,6 +1077,7 @@ async function threadedSocketHibernation(cluster) {
     }, { timeout: 7000 });
     const interrupted = new PingSocket(socketUrl);
     await next(interrupted, 'open');
+    assert.equal(JSON.parse(await send(interrupted, 'armed')).message, 'armed');
     interrupted.terminate();
     await eventually('the actor receives one abnormal close', async () => {
       const terminal = await readTerminal();

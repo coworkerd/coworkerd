@@ -688,6 +688,10 @@ public:
           object->shardEpoch == target.shardEpoch;
     });
   }
+  void keepManagedTransport(kj::Promise<void> transport) {
+    managedTransports.add(kj::mv(transport));
+  }
+  void stopManagedTransports() { managedTransports.clear(); }
   void recordSocketWake() { ++socketWakes; }
   size_t openCount() const { return relays.size(); }
   size_t openCount(Role role) const {
@@ -737,6 +741,10 @@ private:
   std::array<uint64_t, 2> openedTotal{};
   std::array<Totals, 2> closedTotals;
   std::map<std::string, uint64_t> refusedByTenant, goneAway;
+  struct ManagedTransportErrors final: kj::TaskSet::ErrorHandler {
+    void taskFailed(kj::Exception&&) override {}
+  } managedTransportErrors;
+  kj::TaskSet managedTransports{managedTransportErrors};
 };
 
 // =====================================================================================================================
@@ -4599,15 +4607,24 @@ public:
     // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
     // leave it; its request context stays open in workerd until the connection ends.
     slot->finish();
-    running = relay->run().fork();
+    if (nodeTransport) {
+      usesNodeTransport = true;
+      auto runningTransport = relay->run().attach(kj::mv(relay)).fork();
+      // A canceled ingress or peer RPC still drops the real socket, but the
+      // owner needs to observe that disconnect and deliver its terminal event.
+      server.webSockets().keepManagedTransport(runningTransport.addBranch());
+      running = kj::mv(runningTransport);
+    } else {
+      running = relay->run().fork();
+    }
     return kj::mv(pipe.ends[0]);
   }
   bool hasStarted() const { return started; }
-  bool upgraded() const { return relay.get() != nullptr; }
-  bool nodeOwned() const { return upgraded() && !relay->managedId().empty(); }
+  bool upgraded() const { return running != kj::none; }
+  bool nodeOwned() const { return usesNodeTransport; }
   // The request toward workerd ended (its failure, if it failed): the relay may still be closing the connection.
   kj::Promise<void> settled(kj::Maybe<kj::Exception> failure) {
-    relay->innerSettled(kj::mv(failure));
+    if (!usesNodeTransport) relay->innerSettled(kj::mv(failure));
     return KJ_ASSERT_NONNULL(running).addBranch();
   }
 
@@ -4616,8 +4633,9 @@ private:
   std::shared_ptr<AdmissionSlot> slot;
   double startedAt;
   bool started = false;
+  bool usesNodeTransport = false;
   kj::Own<WebSocketRelay> relay;
-  kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relay
+  kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relayed response
 };
 
 class AdmissionHttpService final: public kj::HttpService {
@@ -10105,6 +10123,7 @@ int run(Launch launch) {
     durableLog.shardTaken(namespaceId, shard, shardEpoch, owner ? owner->tenant : std::string());
   });
   DurableDispatch durable(server, peerForwarder, shards, durableLog, httpOverCapnpFactory, *headerTable, timer);
+  KJ_DEFER(server.webSockets().stopManagedTransports());
   server.setDurableSocketDispatch([&durable, &server, &httpOverCapnpFactory, &headerTable](DurableSocketEvent event) {
     return deliverDurableSocket(durable, server, httpOverCapnpFactory, *headerTable, std::move(event));
   });
