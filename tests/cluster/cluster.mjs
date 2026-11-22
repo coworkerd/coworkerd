@@ -43,7 +43,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 }
 
 export class Cluster {
-  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [] } = {}) {
+  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
@@ -61,6 +61,8 @@ export class Cluster {
     this.override = join(directory, 'compose.json');
     this.peerAckGate = holdPeerAcks ? join(directory, 'peer-acks') : null;
     this.threadedNodes = new Set(threadedNodes);
+    this.membership = membership;
+    this.confirmTimeoutMs = confirmTimeoutMs;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -110,8 +112,9 @@ export class Cluster {
         egress: { clusterAddresses: ['apiserver:8940'] },
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1 },
+        membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
-          durableObjects: { threadedStorage: true },
+          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
         } : {}),
       }));
@@ -125,6 +128,9 @@ export class Cluster {
       if (this.peerAckGate) {
         const gate = '/tmp/cluster-test-peer-acks';
         overrides[node].environment.COWORKERD_HOLD_PEER_ACK_FOR_TEST = `${gate}/hold`;
+        if (this.threadedNodes.has(node)) {
+          overrides[node].environment.COWORKERD_CUT_DURABLE_CHANNEL_FOR_TEST = `${gate}/loss-${node}`;
+        }
         overrides[node].volumes.push({ type: 'bind', source: this.peerAckGate, target: gate, read_only: true });
       }
     }

@@ -61,3 +61,5 @@
 0081-threaded-durable-storage.patch
 0082-threaded-durable-fixture-state.patch
 0083-threaded-wal-open-proof.patch
+0084-prepare-threaded-wal-off-home.patch
+0085-threaded-facet-mutations.patch

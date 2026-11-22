@@ -1150,7 +1150,12 @@ struct DurableLogChannelTest {
     object.state = DurableLog::ObjectState::REBUILDING;
     auto lost = log.closeThreadedObject(name);
     KJ_REQUIRE(!lost.poll(io.waitScope));
+    auto interrupted = forOpen(4, 31);
+    integer(channel.inbox, interrupted.size() + 32, 4);
+    channel.inbox += interrupted;
+    const auto completedCheckpoints = log.checkpoints;
     log.channelEnded(channel, "test channel EOF");
+    KJ_REQUIRE(log.checkpoints == completedCheckpoints, "a partial checkpoint reports no completed image");
     clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
     KJ_REQUIRE(lost.poll(io.waitScope) && !lost.wait(io.waitScope),
         "EOF without process exit is not proof of close");

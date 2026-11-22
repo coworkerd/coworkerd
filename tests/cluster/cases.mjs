@@ -303,8 +303,8 @@ async function durablePeerAck(cluster) {
   assert.deepEqual(earlyResponses, [], 'responses arrived while both peers held their acknowledgements');
 }
 
-async function durableTakeover(cluster) {
-  const tenant = await cluster.tenant('durable-test');
+async function takeoverWriter(cluster, tenantName) {
+  const tenant = await cluster.tenant(tenantName);
   await cluster.deploy(tenant, 'object', `
     import { DurableObject } from 'cloudflare:workers';
     export class Record extends DurableObject {
@@ -322,6 +322,11 @@ async function durableTakeover(cluster) {
     durable_objects: { bindings: [{ name: 'RECORDS', class_name: 'Record' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Record'] }],
   } });
+  return tenant;
+}
+
+async function durableTakeover(cluster) {
+  const tenant = await takeoverWriter(cluster, 'durable-test');
   const [node] = cluster.nodes;
   const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
   await eventually('object and its shard are ready', async () => {
@@ -423,6 +428,60 @@ async function durableTakeover(cluster) {
   });
 }
 
+async function durableThreadedFence(cluster) {
+  const tenant = await takeoverWriter(cluster, 'fenced-durable-test');
+  const [first] = cluster.nodes;
+  const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
+  await eventually('the object serves a confirmed write', async () => {
+    assert.equal(json(await workerCall(cluster, first, tenant, 'object', { method: 'POST', body: 1 }),
+      200, 'baseline write'), 1);
+  });
+  const { owners: [old] } = await namespace();
+  assert.ok(old && cluster.nodes.includes(old.nodeId));
+  const peers = cluster.nodes.filter(node => node !== old.nodeId);
+  const [ingress] = peers;
+  await eventually('both peers are reachable before the fence', async () => {
+    const { durableLog } = await cluster.state(old.nodeId);
+    assert.equal(durableLog.peers.want, 2);
+    assert.ok(peers.every(peer => durableLog.peers.streams.some(stream => stream.nodeId === peer && stream.open)));
+  });
+  const child = await durableGeneration(cluster, old.nodeId);
+  assert.equal(child.lifecycle?.durableServer, 'threaded');
+  const gate = join(cluster.peerAckGate, 'hold');
+  await writeFile(gate, '');
+  const sentAt = performance.now();
+  const staleWrite = workerCall(cluster, ingress, tenant, 'object', { method: 'POST', body: 2, timeout: 30000 })
+    .catch(error => ({ error }));
+  let paused = false;
+  let recovery;
+  try {
+    await eventually('the old generation has a write waiting on two peers', async () => {
+      const states = await Promise.all(peers.map(peer => cluster.state(peer)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    }, { timeout: 3000, interval: 25 });
+    await cluster.compose(['pause', old.nodeId]);
+    paused = true;
+    recovery = eventually('the survivor can read after acquiring the shard', async () =>
+      json(await workerCall(cluster, ingress, tenant, 'object', { timeout: 10000 }), 200, 'fenced takeover read'),
+    { timeout: 45000, interval: 100 }).catch(error => ({ error }));
+    await eventually('a different node acquires a higher epoch while the old child stays frozen', async () => {
+      const { owners } = await namespace();
+      const owner = owners.find(entry => entry.shard === old.shard);
+      assert.ok(owner && peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(old.epoch));
+    }, { timeout: 18000, interval: 100 });
+    assert.ok(performance.now() - sentAt < cluster.confirmTimeoutMs - 1000,
+      'the old write has time left on its confirmation deadline when the new epoch is known');
+  } finally {
+    await unlink(gate);
+    if (paused) await cluster.compose(['unpause', old.nodeId]);
+  }
+  const result = await staleWrite;
+  assert.ok(result.error || result.status >= 400, 'a write from the fenced generation never returned success');
+  const saved = await recovery;
+  if (saved.error) throw saved.error;
+  assert.ok(saved.includes(1), 'the later owner keeps the earlier confirmed write');
+}
+
 async function durableGeneration(cluster, node) {
   const { processes } = await cluster.state(node);
   const durable = processes.entries.filter(entry => entry.processClass === 'durable');
@@ -431,13 +490,23 @@ async function durableGeneration(cluster, node) {
   return durable[0];
 }
 
-async function rotateDurable(cluster, node, before, drainOutcome) {
-  const management = async (url, options) =>
-    json(await request(cluster.urls[node], url, { token: cluster.management, ...options }), 200, url);
-  const { requests: [rotation] } = await management(`/__coworkerd/rotate?process=${before.processId}`, { method: 'POST' });
+async function rotationRequest(cluster, node, slot) {
+  const { requests: [rotation] } = json(await request(cluster.urls[node], `/__coworkerd/rotate?process=${slot}`, {
+    method: 'POST', token: cluster.management,
+  }), 200, 'durable rotation request');
+  return rotation.requestId;
+}
+
+async function rotationStatus(cluster, node, requestId) {
+  return json(await request(cluster.urls[node], `/__coworkerd/rotation?requests=${requestId}`, {
+    token: cluster.management,
+  }), 200, 'durable rotation status');
+}
+
+async function waitForDurableRotation(cluster, node, before, requestId, drainOutcome) {
   await eventually(`durable generation ${before.generation} rotates after ${drainOutcome}`, async () => {
     const { requests: [status], records: [record] } =
-      await management(`/__coworkerd/rotation?requests=${rotation.requestId}`);
+      await rotationStatus(cluster, node, requestId);
     assert.equal(status.status, 'completed');
     assert.equal(record.oldGeneration, before.generation);
     assert.equal(record.drainOutcome, drainOutcome);
@@ -459,6 +528,11 @@ async function mixedDurableStorage(cluster) {
       }
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path.endsWith('/checkpoint')) {
+          const payload = await request.json();
+          await this.ctx.storage.put('blob', payload);
+          return Response.json(payload.length);
+        }
         if (path.endsWith('/alarm')) {
           const at = await request.json();
           await this.ctx.storage.setAlarm(at);
@@ -523,13 +597,52 @@ async function mixedDurableStorage(cluster) {
   }
   assert.deepEqual(early, [], 'threaded responses escaped while both upstream peers held acknowledgements');
   assert.equal((await target.read()).value, 'threaded-rpc');
-  await rotateDurable(cluster, threaded, first, 'drained');
-  assert.equal((await target.read()).value, 'threaded-rpc', 'clean child rotation reopens confirmed state');
+  assert.equal(await write('/checkpoint', 'x'.repeat(65536)), 65536);
+  const io = await eventually('the threaded SQLite open and checkpoint are measured', async () => {
+    const { durableLog } = await cluster.state(threaded);
+    const io = durableLog.threadedHomeIo;
+    assert.ok(io.openSamples > 0 && io.maxOpenNs > 0);
+    assert.ok(io.checkpointSamples > 0 && io.maxCheckpointNs > 0 && io.maxCheckpointWalBytes >= 65536);
+    return io;
+  });
+  console.log(`Threaded home I/O for the isolated workload ${JSON.stringify(io)}`);
+  let rotation;
+  const confirmed = 'committed-during-drain';
+  assert.equal(await heldPeerWrite(cluster, peers, cluster.urls[ingress] + target.path(''), confirmed, async () => {
+    rotation = await rotationRequest(cluster, threaded, first.processId);
+    await eventually('rotation waits in its drain phase while the write is unconfirmed', async () => {
+      const { requests: [status], records: [record] } = await rotationStatus(cluster, threaded, rotation);
+      assert.equal(status.status, 'active');
+      assert.equal(record.phase, 'draining');
+    }, { timeout: 1500, interval: 25 });
+  }), false);
+  await waitForDurableRotation(cluster, threaded, first, rotation, 'drained');
+  assert.equal((await target.read()).value, confirmed, 'clean child rotation reopens the value committed during drain');
+
+  const beforeLoss = await durableGeneration(cluster, threaded);
+  const loss = join(cluster.peerAckGate, `loss-${threaded}`);
+  const channelId = `${beforeLoss.processId}-${beforeLoss.generation}`;
+  await writeFile(loss, channelId);
+  try {
+    await eventually('the daemon cuts the WAL socket of the live child', async () => {
+      const logs = await cluster.compose(['logs', '--no-color', '--tail', '120', threaded]);
+      assert.ok(logs.split('\n').some(line => line.includes('"event":"channel-cut-for-test"') &&
+        line.endsWith(`"processId":"${channelId}","pid":${beforeLoss.pid}}`)));
+    });
+  } finally {
+    await unlink(loss);
+  }
+  await eventually('channel loss recovery reopens the confirmed value after replacing the child', async () => {
+    assert.equal((await target.read()).value, confirmed);
+    const afterLoss = await durableGeneration(cluster, threaded);
+    assert.ok(afterLoss.generation > beforeLoss.generation && afterLoss.pid !== beforeLoss.pid);
+  }, { timeout: 45000 });
 
   const stalled = await durableGeneration(cluster, threaded);
   await cluster.compose(['exec', '-T', threaded, '/bin/sh', '-c', 'kill -STOP "$1"', 'sh', String(stalled.pid)]);
-  await rotateDurable(cluster, threaded, stalled, 'timeout');
-  assert.equal((await target.read()).value, 'threaded-rpc', 'unresponsive generation exits before the image reopens');
+  const stalledRotation = await rotationRequest(cluster, threaded, stalled.processId);
+  await waitForDurableRotation(cluster, threaded, stalled, stalledRotation, 'timeout');
+  assert.equal((await target.read()).value, confirmed, 'unresponsive generation exits before the image reopens');
 
   const at = Date.now() + 500;
   assert.equal(await write('/alarm', at), at);
@@ -542,7 +655,7 @@ async function mixedDurableStorage(cluster) {
     'the threaded node completed its drain before Compose stopped it');
   const upstreamOwner = await eventually('an upstream owner recovers the threaded write and fires the due alarm', async () => {
     const saved = await target.read();
-    assert.equal(saved.value, 'threaded-rpc');
+    assert.equal(saved.value, confirmed);
     assert.equal(saved.fired, true);
     const owner = await target.owner();
     assert.ok(peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(startingOwner.epoch));
@@ -580,4 +693,9 @@ export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation
 export const durableThreadedCases = {
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
+  'durable-threaded-fence': {
+    test: durableThreadedFence, nodes: ['node-1', 'node-2', 'node-3'],
+    membership: { ttlSeconds: 4, heartbeatIntervalMs: 800, livenessGraceMs: 1000, listIntervalMs: 200 },
+    confirmTimeoutMs: 20000,
+  },
 };

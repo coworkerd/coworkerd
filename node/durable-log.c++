@@ -930,6 +930,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureAlarmCpu = std::string_view(v) == "1";
   if (const auto* v = std::getenv("COWORKERD_SLOW_FLUSH_FOR_TEST"); v != nullptr && *v != '\0') slowFlushForTest = v;
   if (const auto* v = std::getenv("COWORKERD_HOLD_PEER_ACK_FOR_TEST"); v != nullptr) peerAckGateForTest = v;
+  if (const auto* v = std::getenv("COWORKERD_CUT_DURABLE_CHANNEL_FOR_TEST"); v != nullptr) cutChannelForTest = v;
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
     workerStoreConfig = storeConfig;
@@ -2134,6 +2135,12 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       const auto walBytes = in.u64();
       const auto databaseBytes = in.u64();
       if (!in.ok) return;
+      if (openId != 0 && message.size() - in.at >= 16) {
+        in.u64();  // child's monotonic time
+        const auto localOpenNs = in.u64();
+        ++threadedHomeOpenSamples;
+        threadedHomeOpenMaxNs = std::max(threadedHomeOpenMaxNs, localOpenNs);
+      }
       auto* object = objectOf(objectName);
       if (openId != 0) {
         KJ_REQUIRE(object != nullptr && object->dispatchedChannel == channel.processId &&
@@ -2210,6 +2217,17 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       in.u32();  // of those, confirmed
       const auto databaseBytes = in.u64();
       if (!in.ok) return;
+      if (openId != 0 && message.size() - in.at >= 18) {
+        in.u64();  // checkpoint start
+        const auto tookNs = in.u64();
+        in.text();  // checkpoint reason
+        const auto bytes = in.u64();
+        if (in.ok) {
+          ++threadedHomeCheckpointSamples;
+          threadedHomeCheckpointMaxNs = std::max(threadedHomeCheckpointMaxNs, tookNs);
+          threadedHomeCheckpointMaxWalBytes = std::max(threadedHomeCheckpointMaxWalBytes, bytes);
+        }
+      }
       ++checkpoints;
       const auto split = key.rfind('/');
       if (split == std::string::npos) return;
@@ -2312,6 +2330,14 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       }
       auto* object = objectOf(objectName);
       if (object == nullptr) return;
+      if (openId != 0) {
+        const auto prefix = objectName + "/";
+        auto sender = channel.openFacets.lower_bound(prefix);
+        for (; sender != channel.openFacets.end() && sender->first.starts_with(prefix); ++sender) {
+          if (sender->second.id == openId) break;
+        }
+        if (sender == channel.openFacets.end() || !sender->first.starts_with(prefix)) return;
+      }
       LogRecord record;
       record.kind = LogRecordKind::DELETED;
       record.objectName = objectName;
@@ -2669,6 +2695,26 @@ void DurableLog::drivePeers() {
 
 kj::Promise<void> DurableLog::peerLoop() {
   while (!stopped) {
+    if (!cutChannelForTest.empty()) {
+      std::error_code error;
+      const auto size = std::filesystem::file_size(cutChannelForTest, error);
+      if (!error && size > 0 && size <= 128) {
+        std::string processId;
+        KJ_IF_SOME(readError, kj::runCatchingExceptions([&] { processId = readFile(cutChannelForTest); })) {
+          log("channel-test-trigger-read-failed", "\"reason\":" + quote(readError.getDescription().cStr()));
+        }
+        auto found = channels.find(processId);
+        if (found != channels.end() && found->second.threadedGeneration != 0 && found->second.open) {
+          auto& channel = found->second;
+          channel.reader = nullptr;
+          channelEnded(channel, "fixture cut the durable channel");
+          channel.writeChain = nullptr;
+          channel.stream = nullptr;
+          log("channel-cut-for-test", "\"processId\":" + quote(processId) + ",\"pid\":" +
+              std::to_string(channel.pid));
+        }
+      }
+    }
     drivePeers();
     co_await timer.afterDelay(100 * kj::MILLISECONDS);
   }
@@ -7814,7 +7860,12 @@ std::string DurableLog::json() const {
       << ",\"fenced\":" << manifestFences << ",\"failures\":" << manifestFailures << ",\"lastError\":"
       << quote(lastManifestError) << "},\"snapshots\":{\"taken\":" << snapshots << ",\"bytes\":\""
       << snapshotBytesWritten << "\",\"failures\":" << snapshotFailures << "},\"checkpoints\":{\"done\":"
-      << checkpoints << ",\"asked\":" << checkpointAsks << "},\"objects\":{\"known\":" << objects.size()
+      << checkpoints << ",\"asked\":" << checkpointAsks << "},\"threadedHomeIo\":{\"openSamples\":"
+      << threadedHomeOpenSamples << ",\"maxOpenNs\":" << threadedHomeOpenMaxNs
+      << ",\"checkpointSamples\":" << threadedHomeCheckpointSamples
+      << ",\"maxCheckpointNs\":" << threadedHomeCheckpointMaxNs
+      << ",\"maxCheckpointWalBytes\":" << threadedHomeCheckpointMaxWalBytes
+      << "},\"objects\":{\"known\":" << objects.size()
       << ",\"local\":" << local << ",\"rebuilding\":" << rebuildingNow << ",\"repairing\":" << repairing
       << ",\"activeRebuilds\":" << activeRebuilds << ",\"queuedRebuilds\":" << queuedRebuilds + queuedBackgroundRebuilds
       << ",\"activeBackgroundRebuilds\":" << activeBackgroundRebuilds << ",\"queuedBackgroundRebuilds\":" << queuedBackgroundRebuilds

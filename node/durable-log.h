@@ -1042,7 +1042,11 @@ private:
   double leaseWakeAtMs = 0;
   std::string slowFlushForTest;
   std::filesystem::path peerAckGateForTest;
+  std::filesystem::path cutChannelForTest;
   uint32_t heldPeerAcksForTest = 0;
+  uint64_t threadedHomeOpenSamples = 0, threadedHomeOpenMaxNs = 0;
+  uint64_t threadedHomeCheckpointSamples = 0, threadedHomeCheckpointMaxNs = 0;
+  uint64_t threadedHomeCheckpointMaxWalBytes = 0;
   struct OwnerRead {
     kj::ForkedPromise<OwnerHeartbeat> answer;
     double atMs;

@@ -220,6 +220,10 @@ def allowed_path(name, path):
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0083-threaded-wal-open-proof.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0084-prepare-threaded-wal-off-home.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0085-threaded-facet-mutations.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

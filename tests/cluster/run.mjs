@@ -57,9 +57,9 @@ async function main(args) {
         holdPeerAcks: regular.some(([name]) => name === 'durable-peer-ack'),
       });
     }
-    for (const [name, { test, nodes }] of threaded) {
+    for (const [name, { test, nodes, membership, confirmTimeoutMs }] of threaded) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
-        threadedNodes: nodes, holdPeerAcks: true,
+        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs,
       });
     }
     console.log(`${regular.length + threaded.length} executed, ${failed} failed`);

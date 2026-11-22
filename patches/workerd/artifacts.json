@@ -1,7 +1,7 @@
 {
   "upstream": "v1.20261114.1",
   "upstreamCommit": "3d3093c8f01b9b53f4d36d20a8e4ea0a39787992",
-  "patchSeriesSha256": "8e4fea8a878170f5e2889d0e37c1f06854d24b7a873b291f25225885623af3bb",
+  "patchSeriesSha256": "0729f0d86a5dd47f62e595b6bd40a32e5fe518cdfa07b68b9ed7e4fa26fc002e",
   "archives": {
     "linux-x86_64": null,
     "linux-arm64": null

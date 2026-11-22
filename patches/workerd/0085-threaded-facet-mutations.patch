@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 21:15:12 +0800
+Subject: [PATCH] Report persistent facet deletion and reset through the WAL
+ channel
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+index 20f6cee346b1fcfc305841915f827df2a2707349..5e0b0b3ff5f2a3bc99d1e9d93268ab31ac40fcff 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+@@ -79,10 +79,12 @@ kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(
+ }
+ 
+ void DurableStorage::deleteFacet(
+-    kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const {
++    kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet,
++    kj::Maybe<kj::Function<void(uint)>&> report) const {
+   KJ_REQUIRE(facet != 0, "expected a facet ID");
+   index.forEachChild(
+-      facet, [&](uint child, kj::StringPtr) { deleteFacet(uniqueKey, storageId, index, child); });
++      facet, [&](uint child, kj::StringPtr) { deleteFacet(uniqueKey, storageId, index, child, report); });
++  KJ_IF_SOME(deleted, report) deleted(facet);
+   for (auto suffix: {""_kj, "-wal"_kj, "-shm"_kj}) {
+     directory->tryRemove(databasePath(uniqueKey, storageId, facet, suffix));
+   }
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+index 8d8b3d2dd4787cc681eae1b2995dca052518231e..1717ccc0225bc41f3ee630123eefed2345555ff3 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.h
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+@@ -33,8 +33,8 @@ class DurableStorage {
+   WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
+ 
+   kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
+-  void deleteFacet(
+-      kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet) const;
++  void deleteFacet(kj::StringPtr uniqueKey, kj::StringPtr storageId, FacetTreeIndex& index, uint facet,
++      kj::Maybe<kj::Function<void(uint)>&> report = kj::none) const;
+   void cloneFacet(kj::StringPtr uniqueKey,
+       kj::StringPtr storageId,
+       FacetTreeIndex& index,
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+index 0aca3dd85ee30ca181943790c600cafef1da7e52..b8f42b9cd06d92a44538fcd039cfe8565a7015fa 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -407,17 +407,16 @@ bool durableLogEnabled() {
+   return settings().fd >= 0;
+ }
+ 
+-void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
+-  if (!durableLogEnabled()) return;
++namespace {
++
++kj::Array<kj::byte> deletedFacetMessage(kj::StringPtr objectName, uint facetId, uint64_t openId) {
+   Writer w;
+   w.u8(MSG_DELETED);
+   w.str(kj::str(objectName, "/", facetId));
+   w.u64(monoNs());
+-  Replicator::get().send(w.finish());
++  return w.finish(openId);
+ }
+ 
+-namespace {
+-
+ kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
+     kj::Maybe<kj::Date> scheduledTime, uint64_t openId) {
+   Writer w;
+@@ -438,6 +437,10 @@ kj::Array<kj::byte> alarmMessage(kj::StringPtr objectName, uint facetId,
+ 
+ }  // namespace
+ 
++void durableLogFacetDeleted(kj::StringPtr objectName, uint facetId) {
++  if (durableLogEnabled()) Replicator::get().send(deletedFacetMessage(objectName, facetId, 0));
++}
++
+ void durableLogAlarm(kj::StringPtr objectName, uint facetId, kj::Maybe<kj::Date> scheduledTime) {
+   if (durableLogEnabled()) Replicator::get().send(alarmMessage(objectName, facetId, scheduledTime, 0));
+ }
+@@ -607,6 +610,10 @@ void DurableLogShipper::reportAlarm(kj::Maybe<kj::Date> scheduledTime) {
+   channel.send(openId, alarmMessage(name.objectName, name.facetId, scheduledTime, openId));
+ }
+ 
++void DurableLogShipper::reportFacetDeleted(uint facet) {
++  channel.send(openId, deletedFacetMessage(name.objectName, facet, openId));
++}
++
+ int DurableLogShipper::walHook(void* arg, sqlite3*, const char*, int frames) {
+   auto& self = *reinterpret_cast<DurableLogShipper*>(arg);
+   if (frames >= 0) self.hookFrames = uint32_t(frames);
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.h b/src/workerd/server/factory/coworkerd-wal-shipper.h
+index e81b7c14a13e5e9faaa020d48906d282cdd8582e..9432902f7dc56f33cb68e9090f56c78d17fadff3 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.h
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.h
+@@ -133,6 +133,7 @@ class DurableLogShipper {
+   // again and the node is told to start the object from empty.
+   void afterReset(SqliteDatabase& db);
+   void reportAlarm(kj::Maybe<kj::Date> scheduledTime);
++  void reportFacetDeleted(uint facet);
+ 
+   kj::StringPtr getKey() {
+     return key;
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 675e1ef5837d3b4396574e6e250b5c45423ba977..6fbe2fcd4c1672880ff430a47a6914e9db87677e 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4834,7 +4834,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+     requireIdle(name);
+     abortFacet(name, KJ_EXCEPTION(DISCONNECTED, "Facet was deleted."));
+     auto &index = tree->facetIndex();
+-    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, index.getId(facet, name));
++    deleteStoredFacet(index, index.getId(facet, name));
+   }
+ 
+   void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {
+@@ -4845,7 +4845,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+     auto &index = tree->facetIndex();
+     const auto from = index.getId(facet, source);
+     const auto to = index.getId(facet, destination);
+-    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, to);
++    deleteStoredFacet(index, to);
+     tree->storage().cloneFacet(tree->uniqueKey, tree->storageId, index, from, to);
+   }
+ 
+@@ -4867,7 +4867,26 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+     }
+   }
+ 
++  void resetStorage(SqliteDatabase& database, server::DurableLogShipper& shipper) {
++    for (const auto& [name, child]: children) {
++      KJ_REQUIRE(!child->busy(), "cannot reset storage with a live descendant facet");
++    }
++    stop();
++    database.run("PRAGMA journal_mode=WAL;");
++    shipper.afterReset(database);
++    auto& index = tree->facetIndex();
++    index.forEachChild(facet, [&](uint child, kj::StringPtr) { deleteStoredFacet(index, child); });
++  }
++
+  private:
++  void deleteStoredFacet(server::FacetTreeIndex& index, uint target) {
++    kj::Function<void(uint)> report = [&](uint deleted) {
++      auto shipper = tree->shippers.find(facet);
++      if (shipper != tree->shippers.end()) shipper->second->reportFacetDeleted(deleted);
++    };
++    tree->storage().deleteFacet(tree->uniqueKey, tree->storageId, index, target, report);
++  }
++
+   void requireIdle(kj::StringPtr name) {
+     auto at = children.find(std::string(name.begin(), name.size()));
+     KJ_REQUIRE(at == children.end() || !at->second->busy(), "durable test facet is busy");
+@@ -4963,7 +4982,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
+   auto *borrowedObserver = observer.get();
+   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
+-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position](const ActorCache::SharedLru &, OutputGate &gate,
++  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position, borrowedHooks](const ActorCache::SharedLru &, OutputGate &gate,
+                        ActorCache::Hooks &,
+                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
+     const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
+@@ -4976,9 +4995,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+       auto* current = shipper.get();
+       KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
+       shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
+-      database->afterReset([current](SqliteDatabase& reset) {
+-        reset.run("PRAGMA journal_mode=WAL;");
+-        current->afterReset(reset);
++      database->afterReset([current, borrowedHooks](SqliteDatabase& reset) {
++        borrowedHooks->resetStorage(reset, *current);
+       });
+       auto alarms = kj::heap<DurableAlarmReporter>(*current, facet);
+       if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
