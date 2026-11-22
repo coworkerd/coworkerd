@@ -200,6 +200,8 @@ def allowed_path(name, path):
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0056-durable-idle-memory-release.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0057-durable-idle-clock-tests.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

@@ -50,3 +50,4 @@
 0054-durable-test-confirmation.patch
 0055-durable-memory-observation.patch
 0056-durable-idle-memory-release.patch
+0057-durable-idle-clock-tests.patch
