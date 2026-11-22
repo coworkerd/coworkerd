@@ -57,7 +57,9 @@ COWORKERD_CLUSTER_FATAL_TEST_BINARY="$PWD/workerd/bazel-bin/src/workerd/threaded
 ```
 
 The fixture mounts a read-only controller directory into one node. The controller selects the process and
-Worker before issuing a normal HTTP call. The synthetic event hook exists only in the test executable.
+Worker before issuing a normal HTTP call. The synthetic event hook exists only in the test executable. The first confirmed
+exit is an API check that V8 reports through the isolate's fatal handler, so the case also fails when another
+handler replaces the kernel's.
 
 ## Measured time and resources
 

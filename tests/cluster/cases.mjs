@@ -207,7 +207,8 @@ export async function fatalAttribution(cluster) {
       assert.equal(current.pid, before.pid);
       assert.equal(current.inFlight, 1);
     }, { timeout: 5000, interval: 30 });
-    await syntheticExit(before, 'fatal');
+    // V8 reports this one itself, through the fatal handler the isolate ended up with.
+    await syntheticExit(before, 'api-check');
     // Send the first call before polling state or waiting for an ordinary replacement.
     assert.deepEqual(await hello(), { status: 200, text: 'hello' });
     firstRoute = await pool();
