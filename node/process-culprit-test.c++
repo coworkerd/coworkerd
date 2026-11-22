@@ -67,7 +67,9 @@ void fatal() {
         ",\"workerId\":\"" + std::string(worker) + "\",\"versionId\":\"" + std::string(version) +
         "\",\"invocationId\":\"call\",\"isolate\":\"" + std::string(isolate) + "\"}";
   };
-  auto good = [&] { report(11, "tenant/worker", "v1", "coworkerd-v1:tenant/worker@v1#7"); };
+  const std::string digest(64, 'a');
+  const std::string label = "coworkerd-v1:tenant/worker@v1#" + digest;
+  auto good = [&] { report(11, "tenant/worker", "v1", label); };
   int confirmations = 0;
   auto run = [&](bool fatalExit = true) {
     return confirmedFatalCulprit(process, fatalExit, [&](const std::string& worker, const std::string& invocation) {
@@ -78,10 +80,11 @@ void fatal() {
   KJ_REQUIRE(run() == "null");
   good(); KJ_REQUIRE(run(false) == "null");
   active.dispatched = false; KJ_REQUIRE(run() == "null"); active.dispatched = true;
-  report(12, "tenant/worker", "v1", "coworkerd-v1:tenant/worker@v1#7"); KJ_REQUIRE(run() == "null");
-  report(11, "other/worker", "v1", "coworkerd-v1:other/worker@v1#7"); KJ_REQUIRE(run() == "null");
-  report(11, "tenant/worker", "v2", "coworkerd-v1:tenant/worker@v2#7"); KJ_REQUIRE(run() == "null");
-  report(11, "tenant/worker", "v1", "coworkerd-v1:other/worker@v1#7"); KJ_REQUIRE(run() == "null");
+  report(12, "tenant/worker", "v1", label); KJ_REQUIRE(run() == "null");
+  report(11, "other/worker", "v1", "coworkerd-v1:other/worker@v1#" + digest); KJ_REQUIRE(run() == "null");
+  report(11, "tenant/worker", "v2", "coworkerd-v1:tenant/worker@v2#" + digest); KJ_REQUIRE(run() == "null");
+  report(11, "tenant/worker", "v1", "coworkerd-v1:other/worker@v1#" + digest); KJ_REQUIRE(run() == "null");
+  report(11, "tenant/worker", "v1", "coworkerd-v1:tenant/worker@v1#7"); KJ_REQUIRE(run() == "null");
   process.fatalCulpritRow = "{\"event\":\"v8-fatal-undetermined\",\"pid\":11}";
   KJ_REQUIRE(run() == "null" && confirmations == 0);
   good(); KJ_REQUIRE(run() != "null" && confirmations == 1);

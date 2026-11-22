@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 02:44:08 +0800
+Subject: [PATCH] Use the supported KJ string constructor in the fatal test
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 058a61eb4a36493f7649ba1d8cb770b3cb6c5661..6265dcf47e0eec3c9935a170b9c32c4d2ecf2264 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -57,7 +57,7 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread")
+   auto checkUnknown = [&] {
+     KJ_EXPECT(readRecord() == kj::str("{\"event\":\"v8-fatal-undetermined\",\"pid\":", getpid(), "}\n"));
+   };
+-  constexpr kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
++  const kj::StringPtr identity = "\"workerId\":\"tenant/w\",\"versionId\":\"v1\","
+       "\"invocationId\":\"call\",\"isolate\":\"coworkerd-v1:tenant/w@v1#5\",";
+   FatalInvocation invocation(isolate, identity);
+   writeFatalRecord(fds[1]);

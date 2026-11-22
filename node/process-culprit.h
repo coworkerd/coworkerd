@@ -89,8 +89,8 @@ std::string confirmedFatalCulprit(const Process& p, bool fatalExit, Confirmed co
     std::string_view isolate = value.getIsolate().cStr();
     if (!isolate.starts_with(prefix)) return "null";
     isolate.remove_prefix(prefix.size());
-    if (isolate.empty() || !std::all_of(isolate.begin(), isolate.end(), [](char digit) {
-          return digit >= '0' && digit <= '9';
+    if (isolate.size() != 64 || !std::all_of(isolate.begin(), isolate.end(), [](char digit) {
+          return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
         })) return "null";
     auto row = capnp::JsonCodec().encode(value.asReader());
     confirmed(worker, invocation);

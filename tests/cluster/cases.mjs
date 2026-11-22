@@ -156,6 +156,15 @@ export async function fatalAttribution(cluster) {
   const pool = async (at = node) => (await cluster.state(at)).processes;
   const sameGeneration = (entry, process) => entry.processId === process.processId && entry.generation === process.generation;
   const assertUncertain = (result, description) => assert.equal(json(result, 503, description).code, 'RESULT_UNCERTAIN');
+  const assertQuarantineRoute = async (at, process) => {
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', at]);
+    const prefix = '[execution] ';
+    const call = logs.split('\n').filter(line => line.startsWith(prefix))
+      .map(line => JSON.parse(line.slice(prefix.length)))
+      .findLast(entry => entry.kind === 'ingress' && entry.target === `${target}@v1`);
+    assert.equal(call?.processId, process.processId);
+    assert.equal(call.processGeneration, process.generation);
+  };
   const recovered = (process) => eventually('a new ordinary process is ready', async () => {
     const current = await ordinaryProcess(cluster, node);
     assert.equal(current.processId, process.processId);
@@ -197,12 +206,10 @@ export async function fatalAttribution(cluster) {
       assert.equal(current.pid, before.pid);
       assert.equal(current.inFlight, 1);
     }, { timeout: 5000, interval: 30 });
-    const prior = (await pool()).quarantineDispatches;
     await syntheticExit(before, 'fatal');
     // Send the first call before polling state or waiting for an ordinary replacement.
     assert.deepEqual(await hello(), { status: 200, text: 'hello' });
     firstRoute = await pool();
-    assert.equal(firstRoute.quarantineDispatches, prior + 1);
   } finally {
     await held;
   }
@@ -213,6 +220,9 @@ export async function fatalAttribution(cluster) {
   assert.equal(first?.culpritStatus, 'confirmed');
   assert.equal(first.culprit.workerId, target);
   assert.ok(first.inFlight.some(call => call.workerId === `${neighbor.name}/hello`));
+  const quarantine = firstRoute.entries.find(entry => entry.processClass === 'quarantine');
+  assert.equal(quarantine?.state, 'ready');
+  await assertQuarantineRoute(node, quarantine);
   const replacement = await recovered(before);
   assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
 
@@ -222,10 +232,8 @@ export async function fatalAttribution(cluster) {
     return view;
   });
   assert.deepEqual(await hello(peer), { status: 200, text: 'hello' });
-  assert.equal((await pool(peer)).quarantineDispatches, adopted.quarantineDispatches + 1);
+  await assertQuarantineRoute(peer, adopted.entries.find(entry => entry.processClass === 'quarantine'));
 
-  const quarantine = firstRoute.entries.find(entry => entry.processClass === 'quarantine');
-  assert.equal(quarantine?.state, 'ready');
   await syntheticExit(quarantine, 'fatal');
   const second = (await pool()).recentFatalExits.find(entry => sameGeneration(entry, quarantine));
   assert.equal(second?.culpritStatus, 'confirmed');
