@@ -694,12 +694,13 @@ async function mixedDurableStorage(cluster) {
   }, { timeout: 140000, interval: 1000 });
 }
 
-// The only node-level fault runs last so earlier cases keep all three nodes.
+// The profiler uses the standard cluster. Its node-level fault runs last.
 export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
-  'durable-peer-ack': durablePeerAck, 'durable-takeover': durableTakeover };
+  'durable-takeover': durableTakeover };
 
-export const durableThreadedCases = {
+export const durableGatedCases = {
+  'durable-peer-ack': { test: durablePeerAck },
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-fence': {

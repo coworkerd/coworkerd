@@ -36,9 +36,9 @@ node tests/cluster/run.mjs --help
 ```
 
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
-setup or teardown exits nonzero. Linux pull-request CI uses the same entry point. Cases beginning with
-`durable-threaded-` each start a fresh Compose project with the experimental backend enabled on the nodes
-specified by the case. The standard cases run with upstream durable processes.
+setup or teardown exits nonzero. Linux pull-request CI uses the same entry point. Each case that holds
+peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
+Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
 ## Measured time and resources
