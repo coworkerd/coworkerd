@@ -389,6 +389,8 @@ struct ServerConfig {
     alarmFireConcurrency @22 :UInt32 = 2;
     # Select the experimental threaded durable role in a disposable, single-node fixture.
     threadedTestStorage @23 :Bool = false;
+    # Experimental threaded Worker-object backend with the node's durable log.
+    threadedStorage @24 :Bool = false;
   }
 
   struct IngressConfig {

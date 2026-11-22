@@ -278,6 +278,14 @@ before the object's answer goes out, merges the frames of all its objects into s
 each object's manifest naming what makes it up. A node that takes a shard over rebuilds its objects from that history
 and never reads the previous owner's files.
 
+The experimental threaded backend negotiates its role and WAL protocol revision for each child
+generation. Its homes share the inherited WAL socket through one I/O owner with bounded queues.
+Append acknowledgements identify requests, and checkpoint, seal, break, and close messages identify
+the exact database open. A home reports closure after SQLite closes the connection. For recovery the
+node blocks new dispatch and waits for those closes or for the pool to reap the generation before
+replacing its files. Rotation and node drain also ask for those closes before process termination.
+Both backends use the same peer protocol, confirmation rules, and log, segment, and manifest formats.
+
 - **The commit path.** The durable process ships the frames of each committed transaction over a descriptor it
   inherited at startup (workerd's patch 0013; nothing is opened by path). The node writes the record -- the node's
   epoch and the shard's, the object, which of its databases, the transaction number, the frames as the database wrote

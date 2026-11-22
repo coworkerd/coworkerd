@@ -211,6 +211,11 @@ def allowed_path(name, path):
                           name in {'0061-durable-home-before-ack.patch',
                                    '0062-durable-warm-copies.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0081-threaded-durable-storage.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
