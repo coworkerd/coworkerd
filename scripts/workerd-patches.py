@@ -235,6 +235,10 @@ def allowed_path(name, path):
                                    '0088-check-live-facets-on-reset.patch',
                                    '0089-use-durable-home-memory-reclaim.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0100-threaded-durable-alarms.patch' and path in {
+                              'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/io/actor-sqlite.h',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

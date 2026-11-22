@@ -39,6 +39,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `0081-threaded-durable-storage.patch` connects the threaded server and its Bazel target to the
   inherited WAL channel. Its two SQLite utility changes report a synchronous connection close to the
   embedder only after SQLite confirms that no dependent handles remain.
+  `0100-threaded-durable-alarms.patch` dispatches node-authorized alarm events on threaded homes. Its
+  `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
+  after WAL confirmation for this host.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

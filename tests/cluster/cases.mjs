@@ -555,6 +555,7 @@ async function mixedDurableStorage(cluster) {
         }
         if (path.endsWith('/alarm')) {
           const at = await request.json();
+          await this.ctx.storage.put('fired', false);
           await this.ctx.storage.setAlarm(at);
           return Response.json(at);
         }
@@ -682,10 +683,16 @@ async function mixedDurableStorage(cluster) {
   await waitForDurableRotation(cluster, threaded, stalled, stalledRotation, 'timeout');
   assert.equal((await target.read()).value, confirmed, 'unresponsive generation exits before the image reopens');
 
-  const at = Date.now() + 500;
+  const localAlarm = Date.now() + 500;
+  assert.equal(await write('/alarm', localAlarm), localAlarm);
+  await eventually('the threaded owner delivers a due alarm', async () => {
+    assert.equal((await target.read()).fired, true);
+    assert.equal((await target.owner()).nodeId, threaded);
+  });
+
+  const at = Date.now() + 15000;
   assert.equal(await write('/alarm', at), at);
-  await delay(1600);
-  assert.equal((await target.read()).fired, false, 'the threaded generation does not deliver a due alarm');
+  assert.equal((await target.read()).fired, false, 'the replacement alarm is still pending');
   const startingOwner = await target.owner();
   await cluster.compose(['stop', '--timeout', '45', threaded], { timeout: 70000 });
   const drained = await cluster.compose(['ps', '-a', '-q', threaded]);
