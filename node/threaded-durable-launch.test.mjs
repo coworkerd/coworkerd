@@ -6,6 +6,12 @@ one actor interleave across awaits: their combined CPU must exceed a single even
 each stays below it, then one event alone exceeds its budget across repeated awaits. The latter
 must reset only its actor tree, preserving stored state, the neighboring object and the ready child.
 
+The `load-cancel` mode holds the first definition's cold load open with the source delay hook
+until its caller's lease has run out (`COWORKERD_LEASE_TTL_MS`), which ends the home's session and
+the load's only waiter. It then wakes a second definition on the same home. The second definition
+must answer with its own code, the abandoned load must be counted as canceled, and the first
+definition must still load afterwards on the other home.
+
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
 an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
@@ -89,6 +95,7 @@ const homeReservation = scenario === 'home-reservation';
 const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
 const cpuEvents = scenario === 'cpu-events';
+const loadCancel = scenario === 'load-cancel';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
 const httpMemory = scenario === 'http-memory';
@@ -102,7 +109,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
+const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -121,6 +128,8 @@ const env = {
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
   ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
+  ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
+    COWORKERD_LEASE_TTL_MS: '4000' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -192,19 +201,23 @@ function sendPreface(path, preface) {
   });
 }
 
-function readAdmission(socketPath) {
+function readThreaded(socketPath) {
   return new Promise((resolve, reject) => {
     get({ socketPath, path: '/__coworkerd/threaded' }, async response => {
       try {
         assert.equal(response.statusCode, 200);
         const chunks = [];
         for await (const chunk of response) chunks.push(chunk);
-        resolve(JSON.parse(Buffer.concat(chunks).toString()).durableAdmission);
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
       } catch (error) {
         reject(error);
       }
     }).once('error', reject);
   });
+}
+
+async function readAdmission(socketPath) {
+  return (await readThreaded(socketPath)).durableAdmission;
 }
 
 async function readProcessResources(pid) {
@@ -245,6 +258,7 @@ try {
   await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = exerciseEvents ? `
     import { DurableObject } from "cloudflare:workers";
+    const DEFINITION = "first";
     let isolate;
     export class Counter extends DurableObject {
       instance = crypto.randomUUID();
@@ -252,6 +266,7 @@ try {
       async fetch(request) {
         isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
+        if (query.has("definition")) return Response.json({definition: DEFINITION, isolate});
         if (query.has("sliceWaiting")) return Response.json(this.slicePart ?? 0);
         if (query.has("sliceRelease")) {
           this.sliceLatch.resolve();
@@ -384,11 +399,13 @@ try {
   }
   const routes = [{ host: '*', pathPrefix: '/', workerId }];
   const workers = [{ workerId, activeVersion: 'v1', versions: [version] }];
-  if (warmCopies) {
+  if (warmCopies || loadCancel) {
     const secondId = 'second-counter';
     const secondModules = join(fixture, 'workers', secondId, 'v1');
     await mkdir(secondModules, {recursive: true});
-    const secondSource = source + '\n// A distinct fixture definition.\n';
+    const secondSource = source.replace('DEFINITION = "first"', 'DEFINITION = "second"') +
+      '\n// A distinct fixture definition.\n';
+    assert.ok(secondSource.includes('DEFINITION = "second"'));
     const secondPackage = JSON.stringify({modules: [
       {bytes: Buffer.byteLength(secondSource), name: 'index.js', sha256: hash(secondSource), type: 'esm'},
     ]});
@@ -680,6 +697,57 @@ try {
     assert.equal(sameChild.state, 'ready');
     console.log(JSON.stringify({scenario, samples, interleavedCpuMs, isolatedEventCpu: true,
       cumulativeCpuAcrossAwaits: true, neighborPreserved: true, admission: after}));
+  } else if (loadCancel) {
+    const request = async path => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {signal: AbortSignal.timeout(8000)});
+      const body = await response.text();
+      assert.equal(response.status, 200, `${path}: ${body}\n${diagnostics}`);
+      return JSON.parse(body);
+    };
+    const before = await readThreaded(socketPath);
+    assert.equal(before.durableAdmission.trees, 0);
+    // Each child delays its first source fetch. The ordinary child spends its delay first, so
+    // the durable child's delayed cold load is still open when the request's lease runs out.
+    // The home then ends the session, and with it the only waiter of that load.
+    const started = performance.now();
+    const expired = await fetch(`http://127.0.0.1:${port}/first?definition`, {
+      signal: AbortSignal.timeout(Number(env.COWORKERD_LEASE_TTL_MS) + 8000),
+    });
+    const expiredBody = await expired.text();
+    assert.notEqual(expired.status, 200, `the first request outlived its lease: ${expiredBody}`);
+    const expiredAfterMs = Math.round(performance.now() - started);
+    let drained;
+    for (const until = performance.now() + 3000; performance.now() < until;) {
+      drained = await readAdmission(socketPath);
+      if (drained.trees === 0 && drained.running === 0) break;
+      await delay(10);
+    }
+    assert.equal(drained.trees, 0, `the expired caller must release its tree: ${JSON.stringify(drained)}`);
+    assert.equal(drained.running, 0);
+    assert.equal(drained.residentRoots, 0);
+    // The second definition is placed on the home whose cold load lost its only waiter.
+    const second = await request('/warm-second?definition');
+    assert.equal(second.definition, 'second',
+      'a tree must never receive the isolate of a cold load canceled for another definition');
+    assert.equal((await readThreaded(socketPath)).canceledLoads, before.canceledLoads + 1,
+      'a cold load must end with its last waiter');
+    const first = await request('/first?definition');
+    assert.equal(first.definition, 'first');
+    assert.notEqual(first.isolate, second.isolate);
+    assert.deepEqual(await request('/warm-second?definition'), second);
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.homes, 2);
+    assert.equal(after.actorResets, 0);
+    assert.equal(after.isolateResets, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const sameChild = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    console.log(JSON.stringify({scenario, canceledColdLoad: true, definitionsKeptApart: true,
+      expiredAfterMs, expiredStatus: expired.status, admission: after}));
   } else if (warmCopies) {
     const request = async (path, options) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
