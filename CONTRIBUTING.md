@@ -135,6 +135,9 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-warm-copies` (Linux only) | Both kernel binaries, for reusing matching warm copies after idle retirement in reverse definition order while preserving stored state |
 | `node-threaded-durable-load-cancel` (Linux only) | Both kernel binaries, for a cold load whose only caller's lease runs out: the load ends, and a different definition placed on that home runs its own code |
 | `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
+| `node-threaded-durable-rpc-events` (Linux only) | Both kernel binaries, for an independent RPC held by the actor input gate, nested calls to and from a peer during an await, and admission credit return |
+| `node-threaded-durable-rpc-output-gate` (Linux only) | Both kernel binaries, for an RPC result held while a disposable SQLite write awaits confirmation and a separate read of the saved value |
+| `node-threaded-durable-rpc-cpu` (Linux only) | Both kernel binaries, for interleaved RPC methods with independent CPU accounts, a cumulative limit across awaits, one tree reset and an intact neighbor |
 | `node-threaded-durable-http-isolation` (Linux only) | Both kernel binaries, for HTTP input gates, interleaving during an await, caller cancellation with home lifecycle tracing, facet storage/lifecycle, and JavaScript/SQLite event CPU resets with a surviving neighboring actor |
 | `node-threaded-durable-http-output-gate` (Linux only) | Both kernel binaries, for an HTTP response held behind delayed test-storage confirmation and the saved value after release |
 | `node-threaded-durable-http-overlap` (Linux only) | Both kernel binaries, for 16 overlapping HTTP bodies on four facets, continued interleaving, exact event-credit return and resource samples |

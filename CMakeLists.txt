@@ -345,8 +345,18 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" load-cancel)
     set_tests_properties(node-threaded-durable-load-cancel PROPERTIES TIMEOUT 30)
-    # The positive RPC/events fixture is retained for the next PR of issue #36.
-    # This HTTP-only step refuses durable JavaScript RPC before entering that path.
+    add_test(NAME node-threaded-durable-rpc-events COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" events)
+    set_tests_properties(node-threaded-durable-rpc-events PROPERTIES TIMEOUT 40)
+    add_test(NAME node-threaded-durable-rpc-output-gate COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" rpc-output-gate)
+    set_tests_properties(node-threaded-durable-rpc-output-gate PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-rpc-cpu COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" rpc-cpu-events)
+    set_tests_properties(node-threaded-durable-rpc-cpu PROPERTIES TIMEOUT 30)
     add_test(NAME node-threaded-durable-http-isolation COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-isolation)
@@ -390,7 +400,7 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
     add_dependencies(check coworkerd)
   endif()
 else()
-  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http-memory, node-threaded-durable-http-overlap, node-threaded-durable-group-refusal, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-rpc-events, node-threaded-durable-rpc-output-gate, node-threaded-durable-rpc-cpu, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http-memory, node-threaded-durable-http-overlap, node-threaded-durable-group-refusal, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
