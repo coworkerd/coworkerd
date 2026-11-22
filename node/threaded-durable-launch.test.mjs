@@ -804,9 +804,13 @@ try {
       for (let attempt = 0; attempt < 3; ++attempt) {
         const before = await waitForAdmission(socketPath, 0);
         assert.equal(before.running, 0);
-        const controller = new AbortController();
-        const aborted = fetch(`http://127.0.0.1:${port}/first?hold&cancelable`, {
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+        let caller;
+        const aborted = new Promise((resolve, reject) => {
+          caller = get(`http://127.0.0.1:${port}/first?hold&cancelable`, response => {
+            response.resume();
+            reject(new Error('canceled request unexpectedly produced a response'));
+          });
+          caller.once('error', resolve);
         });
         aborted.catch(() => {});
         let observed = false;
@@ -819,8 +823,10 @@ try {
         }
         assert.ok(observed, 'the canceled request never reached the actor');
         assert.ok((await readAdmission(socketPath)).running > 0);
-        controller.abort();
-        await assert.rejects(aborted, {name: 'AbortError'});
+        // A TCP reset makes disconnection observable while response headers are pending.
+        // Aborting fetch alone may close only its write side, which still permits a response.
+        caller.socket.resetAndDestroy();
+        assert.equal((await aborted).code, 'ECONNRESET');
         const drained = await waitForAdmission(socketPath, 0);
         assert.equal(drained.running, 0);
         for (const field of ['reservedBytes', 'reservedDescriptors', 'residentRoots',
