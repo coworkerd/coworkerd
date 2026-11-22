@@ -145,6 +145,7 @@ async function waitForAdmission(path, waiting, homeSessions = 0) {
 }
 
 let child, exited;
+let diagnostics = '';
 try {
   const modules = join(fixture, 'workers', workerId, 'v1');
   await mkdir(modules, { recursive: true });
@@ -261,7 +262,6 @@ try {
 
   const port = await reservePort();
   child = spawn(nodeBinary, args(port), { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  let diagnostics = '';
   for (const stream of [child.stdout, child.stderr]) {
     stream.on('data', bytes => { diagnostics = (diagnostics + bytes).slice(-5000); });
   }
@@ -384,11 +384,13 @@ try {
         assert.deepEqual((await request(path)).value, records[index]);
       }
     }
+    console.log(JSON.stringify({event: 'http-writes-reads-passed', objects: paths.length}));
     // A brief idle interval must preserve the still-resident actor's instance.
     await delay(4200);
     for (const [index, path] of paths.entries()) {
       assert.deepEqual((await request(path)).value, records[index]);
     }
+    console.log(JSON.stringify({event: 'http-brief-idle-passed'}));
     const wakes = [];
     for (let round = 0; round < 3; ++round) {
       const before = await waitForAdmission(socketPath, 0);
@@ -398,6 +400,7 @@ try {
         if (idle.residentRoots === 0 && idle.idleRetirements >= before.idleRetirements + paths.length) break;
         await delay(100);
       }
+      console.log(JSON.stringify({event: 'http-idle-observed', round, admission: idle}));
       assert.equal(idle.residentRoots, 0, JSON.stringify(idle));
       assert.equal(idle.trees, 0);
       assert.equal(idle.reservedBytes, 0);
@@ -709,6 +712,9 @@ try {
   await exited;
   assert.equal(child.exitCode, 0);
   assert.deepEqual(await readdir(scratch), ['fixture']);
+} catch (error) {
+  console.error(diagnostics);
+  throw error;
 } finally {
   if (child?.pid && child.exitCode === null && child.signalCode === null) {
     try { process.kill(-child.pid, 'SIGTERM'); } catch {}

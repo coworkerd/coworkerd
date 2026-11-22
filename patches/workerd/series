@@ -45,3 +45,4 @@
 0049-durable-test-facets.patch
 0050-durable-format.patch
 0051-durable-cold-load-lifetime.patch
+0052-durable-context-lifetime.patch
