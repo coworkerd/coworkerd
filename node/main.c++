@@ -4080,6 +4080,14 @@ public:
     std::string protocol;
     double handshakeMs = 0;
   };
+  struct ManagedInput {
+    void abort() {
+      aborted = true;
+      read.cancel(KJ_EXCEPTION(DISCONNECTED, "the ingress request was canceled"));
+    }
+    bool aborted = false;
+    kj::Canceler read;
+  };
   struct Hooks {
     std::function<void()> message;           // each message toward the Worker
     std::function<std::string()> limitCode;  // the code a limit ended the request with, "" when none did
@@ -4129,13 +4137,15 @@ public:
     return managed && managed->alive(managedOwner) && managedDefinition == definition &&
         target.dataEpoch == durableObject.dataEpoch && target.shardEpoch == durableObject.shardEpoch;
   }
-  void useNodeTransport(uint64_t nodeEpoch, DurableSocketDispatch dispatch, std::string definition) {
+  std::shared_ptr<ManagedInput> useNodeTransport(
+      uint64_t nodeEpoch, DurableSocketDispatch dispatch, std::string definition) {
     KJ_REQUIRE(durableLog != nullptr && dispatch);
     managedOwner = {nodeEpoch, durableObject.shardEpoch};
     managed.emplace(managedOwner, ManagedSocket::Home{identity.invocationId, generation});
     dispatchManaged = std::move(dispatch);
     managedDefinition = std::move(definition);
     innerBroken = true;
+    return managedInput = std::make_shared<ManagedInput>();
   }
   kj::Promise<void> managedSend(kj::WebSocket::Message message) {
     ++managedWrites;
@@ -4268,7 +4278,9 @@ private:
       kj::WebSocket::Message message;
       bool disconnected = false, transportError = false;
       try {
-        message = co_await outer->receive(MAX_MESSAGE_BYTES);
+        if (managedInput->aborted)
+          kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "the ingress request was canceled"));
+        message = co_await managedInput->read.wrap(outer->receive(MAX_MESSAGE_BYTES));
       } catch (const kj::Exception& error) {
         transportError = error.getType() != kj::Exception::Type::DISCONNECTED;
         message = kj::WebSocket::Close{1006, kj::str("client disconnected")};
@@ -4371,6 +4383,7 @@ private:
       try { co_await outerWriter.close(1011, code); } catch (const kj::Exception&) {}
       co_return;
     }
+    if (!innerSide && !innerBroken) inner->abort();
     if (cause.empty()) {
       cause = innerSide ? (identity.forwarded ? "peer-lost" : "worker-lost") : (role == WebSocketRegistry::Role::INGRESS ? "client-lost" : "ingress-lost");
       if (direction.empty()) direction = innerSide ? "worker" : "client";
@@ -4462,6 +4475,7 @@ private:
   std::optional<ManagedSocket> managed;
   ManagedSocket::Owner managedOwner{};
   DurableSocketDispatch dispatchManaged;
+  std::shared_ptr<ManagedInput> managedInput;
   kj::PromiseFulfillerPair<void> attached = kj::newPromiseAndFulfiller<void>();
   std::string managedDefinition;
   uint64_t managedWrites = 0;
@@ -4550,6 +4564,9 @@ class ExecutionResponse final: public kj::HttpService::Response {
 public:
   ExecutionResponse(Response& inner, std::shared_ptr<AdmissionSlot> slot)
       : inner(inner), slot(std::move(slot)), startedAt(monotonicTimeMs()) {}
+  ~ExecutionResponse() noexcept(false) {
+    if (managedInput) managedInput->abort();
+  }
   kj::Own<kj::AsyncOutputStream> send(
       uint status, kj::StringPtr statusText, const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
@@ -4601,14 +4618,13 @@ public:
     relay->setPlace(process->processId, process->generation);
     if (slot->durable && slot->durableLog != nullptr)
       relay->holdObject(*slot->durableLog, slot->durableObject, process->processId, process->generation);
-    if (nodeTransport) relay->useNodeTransport(std::strtoull(server.epoch().c_str(), nullptr, 10),
+    if (nodeTransport) managedInput = relay->useNodeTransport(std::strtoull(server.epoch().c_str(), nullptr, 10),
         server.socketDispatch(), slot->durableDefinition);
     if (!nodeTransport) server.holdLease(invocation);
     // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
     // leave it; its request context stays open in workerd until the connection ends.
     slot->finish();
     if (nodeTransport) {
-      usesNodeTransport = true;
       auto runningTransport = relay->run().attach(kj::mv(relay)).fork();
       // A canceled ingress or peer RPC still drops the real socket, but the
       // owner needs to observe that disconnect and deliver its terminal event.
@@ -4621,10 +4637,10 @@ public:
   }
   bool hasStarted() const { return started; }
   bool upgraded() const { return running != kj::none; }
-  bool nodeOwned() const { return usesNodeTransport; }
+  bool nodeOwned() const { return managedInput != nullptr; }
   // The request toward workerd ended (its failure, if it failed): the relay may still be closing the connection.
   kj::Promise<void> settled(kj::Maybe<kj::Exception> failure) {
-    if (!usesNodeTransport) relay->innerSettled(kj::mv(failure));
+    if (!nodeOwned()) relay->innerSettled(kj::mv(failure));
     return KJ_ASSERT_NONNULL(running).addBranch();
   }
 
@@ -4633,7 +4649,7 @@ private:
   std::shared_ptr<AdmissionSlot> slot;
   double startedAt;
   bool started = false;
-  bool usesNodeTransport = false;
+  std::shared_ptr<WebSocketRelay::ManagedInput> managedInput;
   kj::Own<WebSocketRelay> relay;
   kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relayed response
 };
