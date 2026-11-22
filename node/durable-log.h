@@ -403,6 +403,7 @@ public:
     double elapsedMs = 0;
     bool rebuilt = false;
     bool channelMissing = false;
+    bool generationMustClose = false;
   };
   // Before a request reaches a durable process: the object's files are brought up to date with its replicated
   // history when this node has not served it at this data epoch (a shard taken over, or a repair), and the answer
@@ -413,7 +414,9 @@ public:
   kj::Promise<void> waitForAlarmRebuild(const ObjectIdentity&);
   kj::Promise<void> waitForAlarmRebuild(const std::string& ns, const std::string& object);
   // After selecting a durable generation, before any request is sent or accounted for.
-  ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
+  ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
+      uint64_t generation, std::string_view definition = {});
+  std::vector<std::string> drainThreadedNamespaces(const std::vector<std::string>& namespaces);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
   void objectRequestFinished(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
@@ -525,6 +528,8 @@ private:
     uint64_t openEpoch = 0, openGeneration = 0, positionNodeEpoch = 0;
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
+    std::string threadedDefinition;
+    double definitionDrainStartedMs = 0;
     struct Holders { uint64_t requests = 0, connections = 0; };
     std::map<std::string, Holders> holders;
     bool dispatchPending = false;
