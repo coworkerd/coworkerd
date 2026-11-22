@@ -57,23 +57,24 @@ alongside them. Use `-DCOWORKERD_TEST_WORKERD="$KERNEL_DIR/workerd"` to test the
 
 ### Publishing a changed kernel series
 
-An author who changes the kernel patch series or its upstream builds and tests that kernel locally. A maintainer
-checks out the PR head, builds and packages the release kernels on Linux x86_64 and arm64, and publishes the
-archives and `SHA256SUMS` on [this repository's Releases page](https://github.com/coworkerd/coworkerd/releases). Use the
+An author who changes the kernel patch series or its upstream builds and tests that kernel, then packages those
+same binaries with `scripts/package-kernel.py`. Publish the Linux x86_64 archive and `SHA256SUMS` on
+[this repository's Releases page](https://github.com/coworkerd/coworkerd/releases), using the
 `kernel-<upstream tag>-<first 12 hex digits of the patch series SHA-256>` tag printed by the packaging script and
-mark the release as a pre-release. Run the packaging command once per architecture. In the final release directory,
-put the first archive in place before packaging or copying the second, then check that `SHA256SUMS` covers every
-published archive. Generate that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining
-archives packaged on separate machines.
+marking the release as a pre-release. Do not rebuild an already tested kernel just to publish it. An arm64 archive
+is not required for a pull request; build and test it once before the product release. A missing architecture must
+have a null pin, never an archive from a different patch series.
 
 The publisher is responsible for building both binaries from the checked workerd source. The packaging script
 checks the source tree against the patch series and records that tree as `workerdTree` in `kernel.json`.
 `coworkerdCommit` records the commit in this repository where the packaging command ran, which may be the PR head.
 If the allowlist uses profiles from another build of the series, record that in the release notes.
 
-The maintainer posts the public release link and archive SHA-256 values on the PR. The author verifies the public
-downloads and records the upstream, full series SHA-256 and verified archive pins in
-`patches/workerd/artifacts.json` on the same PR.
+Post the public release link and archive SHA-256 values on the PR, verify the public downloads, and record the
+upstream, full series SHA-256 and verified archive pins in `patches/workerd/artifacts.json` on the same PR.
+When adding an architecture to the release later, check that `SHA256SUMS` covers every published archive. Generate
+that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining archives packaged on separate
+machines. Maintainers review the source, evidence and published artifacts and perform the final merge.
 
 ## CI and local unit tests
 
