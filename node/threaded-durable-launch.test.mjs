@@ -14,13 +14,14 @@ const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const events = scenario === 'events';
 const httpIsolation = scenario === 'http-isolation';
+const httpOutputGate = scenario === 'http-output-gate';
 const boundedEvents = events || httpIsolation;
 const queueLimit = scenario === 'queue-limit';
 const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle;
+const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -35,6 +36,7 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
+  ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
   ...(boundedEvents ? {
@@ -192,6 +194,13 @@ try {
             await new Promise(resolve => setTimeout(resolve, 250));
             await this.ctx.storage.put("counter", "after input gate");
           });
+        }
+        if (query.has("outputGate")) {
+          this.ctx.storage.put("outputGate", "http write");
+          return Response.json("http committed");
+        }
+        if (query.has("readOutputGate")) {
+          return Response.json(await this.ctx.storage.get("outputGate"));
         }
         if (query.has("cpu")) {
           await Promise.resolve();
@@ -433,6 +442,52 @@ try {
     }
     console.log(JSON.stringify({scenario, pid: processInfo.pid, generation: processInfo.generation,
       wakes, admission: await readAdmission(socketPath)}));
+  } else if (httpOutputGate) {
+    // Warm the actor and drain initialization before observing the unawaited write.
+    const initial = await fetch(`http://127.0.0.1:${port}/output`, {
+      method: 'POST', body: 'initial value', signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(initial.status, 200);
+    assert.equal((await initial.json()).counter, 'initial value');
+    assert.equal((await waitForAdmission(socketPath, 0)).pendingCommits, 0);
+    let replied = false;
+    const pending = fetch(`http://127.0.0.1:${port}/output?outputGate`, {
+      signal: AbortSignal.timeout(5000),
+    }).then(async response => {
+      replied = true;
+      assert.equal(response.status, 200);
+      return response.json();
+    });
+    pending.catch(() => {});
+    let confirmationObserved = false;
+    for (const until = performance.now() + 2000; performance.now() < until;) {
+      if ((await readAdmission(socketPath)).pendingCommits > 0) {
+        confirmationObserved = true;
+        assert.equal(replied, false, 'HTTP response arrived before test storage confirmation');
+        break;
+      }
+      await delay(10);
+    }
+    assert.ok(confirmationObserved, 'no pending test storage confirmation was observed');
+    assert.equal(await pending, 'http committed');
+    const saved = await fetch(`http://127.0.0.1:${port}/output?readOutputGate`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(await saved.json(), 'http write');
+    const counters = await waitForAdmission(socketPath, 0);
+    assert.equal(counters.pendingCommits, 0);
+    assert.equal(counters.actorResets, 0);
+    assert.equal(counters.isolateResets, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    console.log(JSON.stringify({scenario, confirmationObserved, responseWaited: true,
+      savedValue: 'http write', pid: sameChild.pid, generation: sameChild.generation, admission: counters}));
   } else if (queues) {
     const deadline = process.hrtime.bigint() + 30_000_000_000n;
     const keep = [];

@@ -321,6 +321,10 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-isolation)
     set_tests_properties(node-threaded-durable-http-isolation PROPERTIES TIMEOUT 45)
+    add_test(NAME node-threaded-durable-http-output-gate COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-output-gate)
+    set_tests_properties(node-threaded-durable-http-output-gate PROPERTIES TIMEOUT 20)
     add_test(NAME node-threaded-durable-http COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http 4 64)
@@ -344,7 +348,7 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
     add_dependencies(check coworkerd)
   endif()
 else()
-  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-events, node-threaded-durable-http-isolation, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-events, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")

@@ -123,6 +123,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
 | `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
 | `node-threaded-durable-http-isolation` (Linux only) | Both kernel binaries, for HTTP input gates, interleaving during an await, facet storage/lifecycle, and JavaScript/SQLite event CPU resets with a surviving neighboring actor |
+| `node-threaded-durable-http-output-gate` (Linux only) | Both kernel binaries, for an HTTP response held behind delayed test-storage confirmation and the saved value after release |
 | `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
 | `node-threaded-durable-queues` (Linux only) | Both kernel binaries, for per-object mailbox count/byte bounds and returned event and descriptor credits |
 | `node-threaded-durable-fd-limit` (Linux only) | Both kernel binaries, for bounded refusal before exhausting the child's file descriptors |
@@ -134,6 +135,9 @@ an existing Durable Object storage directory in the fixture stack. Use this sett
 fixture deployments. Each threaded durable child starts without a persistent log channel.
 The fixture derives local namespaces from the active declarations and routes them only within the node.
 Each child generation opens a fresh SQLite volume inside the fixture stack.
+The `http-output-gate` mode delays the test-storage completion callback by 300 ms and observes its pending
+counter before accepting a response to an unawaited write. This default-zero hook is limited to the test
+role and at most 1000 ms; it does not simulate peer acknowledgments, a durable log or crash recovery.
 The `http 4 64` fixture mode writes and reads two objects, checks unchanged instances after a brief
 idle interval, then observes three real idle retirements and wakes. Each first wake request alternates
 between a read and a write that verifies the previous stored value before replacing it. Repeated reads
