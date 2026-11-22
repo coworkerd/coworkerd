@@ -32,23 +32,15 @@ jobs:
       workflow_commit: ${{ steps.candidate.outputs.workflow_commit }}
       tag: ${{ steps.archive.outputs.tag }}
     steps:
-      - name: Verify maintainer access and identify the finished build
+      - name: Identify the finished build
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUN_ID: ${{ inputs.run_id }}
           RUN_ATTEMPT: ${{ inputs.run_attempt }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
-          for actor in "$GITHUB_ACTOR" "$TRIGGERING_ACTOR"; do
-            role=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq .role_name)
-            if [[ $role != admin && $role != maintain ]]; then
-              echo 'A repository maintainer must start this workflow.' >&2
-              exit 1
-            fi
-          done
           if [[ ! $RUN_ID =~ ^[1-9][0-9]*$ || ! $RUN_ATTEMPT =~ ^[1-9][0-9]*$ || ! $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
             echo 'Provide a run ID, attempt number and full lowercase source commit SHA.' >&2
             exit 1

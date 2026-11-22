@@ -66,7 +66,8 @@ def bundle(args, expected, run):
              f"Source commit `{args.commit}` · workerd tree `{first['workerdTree']}`", "",
              f"Upstream `{first['upstream']}` at `{first['upstreamCommit']}`", "",
              f"Patch series SHA-256 `{first['patchSeriesSha256']}`", "",
-             f"[Build run]({run['url']}) · Pre-release tag `{tag}`", "", "```text", content.rstrip(), "```", ""]
+             f"[Run {run['runId']}, attempt {run['runAttempt']}]({run['url']}) · Pre-release tag `{tag}`",
+             "", "```text", content.rstrip(), "```", ""]
     report = "\n".join(lines)
     print(report)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

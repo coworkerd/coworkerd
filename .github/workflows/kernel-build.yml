@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       pull_request:
-        description: 'Pull request number, including a fork PR. Leave empty to build the selected branch.'
+        description: 'Pull request number, including a fork PR.'
         type: string
-      expected_head:
-        description: 'Full reviewed PR head SHA. Required when building a pull request.'
+      source_commit:
+        description: 'Full source commit SHA. Required for a PR. Defaults to the selected branch head.'
         type: string
 
 permissions:
@@ -23,29 +23,25 @@ jobs:
     outputs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
-      - name: Check maintainer access and resolve source
+      - name: Resolve source
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
-          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           PR: ${{ inputs.pull_request }}
-          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
-          for actor in "$GITHUB_ACTOR" "$TRIGGERING_ACTOR"; do
-            role=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$actor/permission" --jq .role_name)
-            if [[ $role != admin && $role != maintain ]]; then
-              echo 'A repository maintainer must start this workflow.' >&2
-              exit 1
-            fi
-          done
-          sha=$GITHUB_SHA
-          if [[ -n $PR || -n $EXPECTED_HEAD ]]; then
-            if [[ ! $PR =~ ^[1-9][0-9]*$ || ! $EXPECTED_HEAD =~ ^[0-9a-f]{40}$ ]]; then
+          sha=${SOURCE_COMMIT:-$GITHUB_SHA}
+          if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Provide a full lowercase source commit SHA.' >&2
+            exit 1
+          fi
+          if [[ -n $PR ]]; then
+            if [[ ! $PR =~ ^[1-9][0-9]*$ || -z $SOURCE_COMMIT ]]; then
               echo 'Provide the pull request number and its full lowercase head SHA.' >&2
               exit 1
             fi
-            sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
-            if [[ $sha != "$EXPECTED_HEAD" ]]; then
+            head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
+            if [[ $sha != "$head" ]]; then
               echo 'The pull request head changed. Review its current SHA before building.' >&2
               exit 1
             fi
