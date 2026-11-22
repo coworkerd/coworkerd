@@ -657,11 +657,12 @@ try {
     assert.equal(write.counter, 'after input gate');
     assert.equal(httpIsolation ? gatedRead.counter : gatedRead, write.counter);
 
+    console.log(JSON.stringify({event: 'http-input-gate-and-interleaving-passed', scenario}));
     let previous = write;
     let resets = (await readAdmission(socketPath)).actorResets;
     for (const cause of ['cpu', 'sqlCpu']) {
-      const refused = await request('/first?' + cause, undefined, 502);
-      assert.match(refused.error, /CPU|503|aborted|disconnected/i);
+      const refused = await request('/first?' + cause, undefined, 503);
+      assert.equal(refused.code, 'CPU_LIMIT_EXCEEDED');
       let resetObserved = false;
       for (const until = performance.now() + 2000; performance.now() < until;) {
         if ((await readAdmission(socketPath)).actorResets === resets + 1) {
@@ -678,6 +679,7 @@ try {
       assert.equal(rebuilt.isolate, previous.isolate);
       assert.equal(rebuilt.counter, previous.counter);
       previous = rebuilt;
+      console.log(JSON.stringify({event: 'http-actor-cpu-reset-passed', cause, resets}));
     }
     await delay(11500);
     const reopened = await request('/first');
