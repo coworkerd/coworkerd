@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 19:54:14 +0800
+Subject: [PATCH] Release durable copies after process-memory pressure
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..08f8e26e3e9d8f0e85b6c7caed4fb2d4781d66ba 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -756,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
+   v8::ArrayBuffer::Allocator *inner;
+   v8::Isolate *isolate = nullptr;
+   std::atomic<bool> pendingPressure{false};
++  std::atomic<bool> durableProcessPressure{false};
+   // How many times this isolate's ceiling was raised (install()).
+   std::atomic<uint32_t> ceilingRaised{0};
+   std::atomic<LimitCause> *currentCause = nullptr;  // isolate-lock protected
+   void pressure() {
++    if (reservation && reservation->budget->reclaimMode == ResourceBudget::ReclaimMode::NONE)
++      durableProcessPressure.store(true);
+     if (currentCause) {
+       auto expected = LimitCause::NONE;
+       if (currentCause->compare_exchange_strong(expected, LimitCause::PROCESS_MEMORY))
+@@ -2762,6 +2765,7 @@ struct ThreadedServer {
+           durableIdleRetirements.fetch_add(1);
+         }
+       }
++      if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
+       current->second.stopFacets();
+       actor.shutdown(0);
+       state.durableRoots.erase(current);
+@@ -2788,7 +2792,8 @@ struct ThreadedServer {
+       std::lock_guard lock(durableRoutingMutex);
+       auto &home = *threads[homeId - 1]->home;
+       home.memory = accounted();
+-      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY;
++      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY ||
++          memory.durableProcessPressure.load();
+       pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
+           home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
+       const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);

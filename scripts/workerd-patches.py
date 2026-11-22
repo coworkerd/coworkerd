@@ -212,7 +212,8 @@ def allowed_path(name, path):
                                    '0062-durable-warm-copies.patch',
                                    '0064-durable-reset-progress.patch',
                                    '0065-durable-facet-reset-lifetime.patch',
-                                   '0066-durable-process-memory-progress.patch'} and
+                                   '0066-durable-process-memory-progress.patch',
+                                   '0067-durable-process-memory-recovery.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
