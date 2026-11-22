@@ -5,7 +5,7 @@ Subject: [PATCH] Release durable copies after process-memory pressure
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..08f8e26e3e9d8f0e85b6c7caed4fb2d4781d66ba 100644
+index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..a9564310f209f8512aa6c74b3ea5a5c8bea993a3 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -756,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
@@ -35,8 +35,8 @@ index afe73ed0ab02b6d400b26b74c8f56f0e4a741c92..08f8e26e3e9d8f0e85b6c7caed4fb2d4
        auto &home = *threads[homeId - 1]->home;
        home.memory = accounted();
 -      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY;
-+      const bool rejectedGrowth = memory.cause->load() == LimitCause::MEMORY ||
-+          memory.durableProcessPressure.load();
++      const bool rejectedGrowth =
++          memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
        pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
            home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
        const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
