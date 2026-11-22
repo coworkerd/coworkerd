@@ -12,7 +12,8 @@ import { promisify } from 'node:util';
 const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
 const queueLimit = scenario === 'queue-limit';
-const queues = scenario === 'queues' || queueLimit;
+const queueMemory = scenario === 'queue-memory';
+const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
 const exerciseEvents = scenario === 'events' || measure || placement;
@@ -31,6 +32,7 @@ const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
+  ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
   ...(exerciseEvents && !measure && !placement ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
@@ -382,7 +384,7 @@ try {
           const connection = await sendPreface(socketPath,
             durablePreface(id, `mailbox-${object}-${event}`, 16384, deadline));
           keep.push(connection.socket);
-          if (queueLimit && connection.receipt === 'R') { refused = true; break filling; }
+          if ((queueLimit || queueMemory) && connection.receipt === 'R') { refused = true; break filling; }
           assert.equal(connection.receipt, 'A');
           ++accepted;
         }
@@ -401,6 +403,10 @@ try {
         const remaining = maxFiles - 256 - homeCount * 5 - reserved.reservedDescriptors;
         assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 5 : 1));
         assert.ok(full.descriptors <= maxFiles - 256, 'fixed descriptor headroom consumed');
+      } else if (queueMemory) {
+        assert.ok(refused, 'memory reservation ceiling was not reached');
+        const remaining = 16 * 1024 * 1024 - reserved.reservedBytes;
+        assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 36864 : 20480));
       } else {
         assert.equal(accepted, treesPerHome * 4);
       }
@@ -419,6 +425,13 @@ try {
     }
     assert.equal(drained.descriptors, baseline.descriptors);
     assert.equal(drained.threads, baseline.threads);
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
     console.log(JSON.stringify({scenario, objects: reserved.trees, events: accepted, refused,
       declaredBytesPerEvent: 16384, elapsedMs: performance.now() - start,
       baseline, full, drained, reserved, released}));

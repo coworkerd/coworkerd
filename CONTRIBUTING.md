@@ -124,6 +124,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
 | `node-threaded-durable-queues` (Linux only) | Both kernel binaries, for per-object mailbox count/byte bounds and returned event and descriptor credits |
 | `node-threaded-durable-fd-limit` (Linux only) | Both kernel binaries, for bounded refusal before exhausting the child's file descriptors |
+| `node-threaded-durable-memory-reservation` (Linux only) | Both kernel binaries, for bounded refusal at the admission memory reservation ceiling |
 
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
@@ -159,7 +160,9 @@ allocation workload. It records reservations, RSS, threads and descriptors, canc
 and checks that reservations and descriptors return to baseline. The final argument varies the object count.
 The `queue-limit 4 64` mode must run with a descriptor limit of 512; the CTest wrapper sets that limit
 only for its own process tree. It asserts refusal at the reservation ceiling, continued control access,
-256 descriptors of headroom and full credit return. Neither mode executes a Worker event.
+256 descriptors of headroom and full credit return. `queue-memory 4 256` sets a 128 MiB process budget
+and checks refusal at its 16 MiB admission memory ceiling. These queue modes verify the original ready
+PID and generation after release. They do not execute Worker events or exercise V8 allocation failure.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries
