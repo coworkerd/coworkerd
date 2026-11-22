@@ -435,22 +435,12 @@ void memoryCulprit() {
   Call queued{"queued", "tenant/worker", "v1", false};
   std::map<std::string, const Call*> live{{active.invocationId, &active}, {queued.invocationId, &queued}};
   std::vector<Call> recent{{"completed", "tenant/worker", "v1", true}};
-  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "in-flight", "tenant/worker", "v1"));
-  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v2"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/other", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "not-dispatched", "tenant/worker", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
-  // The native OOM row's isolate heap: an isolate far below its own limit did not
-  // cause the exit (other isolates filled the shared pointer cage). Rows without
-  // the field (stock workerd) keep their attribution.
-  KJ_REQUIRE(memoryCulpritOwnsOom(false, 0, 128));
-  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 110 * 1024, 128));
-  // A reported 0 (an isolate that died in its first collection) is not an old row.
-  KJ_REQUIRE(!memoryCulpritOwnsOom(true, 0, 128));
-  KJ_REQUIRE(!memoryCulpritOwnsOom(true, (uint64_t(128) << 20) - 1, 128));
-  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(128) << 20, 128));
-  KJ_REQUIRE(memoryCulpritOwnsOom(true, uint64_t(1100) << 20, 128));
+  KJ_REQUIRE(crashCulpritDispatch(live, recent, "in-flight", "tenant/worker", "v1"));
+  KJ_REQUIRE(crashCulpritDispatch(live, recent, "completed", "tenant/worker", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "completed", "tenant/worker", "v2"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "completed", "tenant/other", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "not-dispatched", "tenant/worker", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
   // The production decoder reads the field the native server writes.
   capnp::MallocMessageBuilder message;
   auto report = message.initRoot<v1::rpc::CpuReport>();
@@ -458,12 +448,21 @@ void memoryCulprit() {
       "\"versionId\":\"v1\",\"invocationId\":\"in-flight\",\"isolate\":\"i\",\"memoryLimitMiB\":128,"
       "\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":110592}"), report);
   KJ_REQUIRE(report.getOomIsolateHeapReported() && report.getOomIsolateHeapBytes() == 110592 &&
-      !memoryCulpritOwnsOom(report.getOomIsolateHeapReported(), report.getOomIsolateHeapBytes(), report.getMemoryLimitMiB()));
+      !memoryCulpritOwnsOom(report.asReader()));
+  const auto limitBytes = uint64_t(128) << 20;
+  report.setOomIsolateHeapBytes(limitBytes);
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()), "last allocator in a shared cage, even at its limit");
+  report.setOomIsolateLocal(true);
+  KJ_REQUIRE(memoryCulpritOwnsOom(report.asReader()));
+  report.setOomIsolateHeapBytes(limitBytes - 1);
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()));
+  report.setOomIsolateHeapBytes(limitBytes);
+  report.setOomIsolateHeapReported(false);
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()));
   capnp::MallocMessageBuilder stock;
   auto old = stock.initRoot<v1::rpc::CpuReport>();
   capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"memoryLimitMiB\":128}"), old);
-  KJ_REQUIRE(!old.getOomIsolateHeapReported() &&
-      memoryCulpritOwnsOom(old.getOomIsolateHeapReported(), old.getOomIsolateHeapBytes(), old.getMemoryLimitMiB()));
+  KJ_REQUIRE(!old.getOomIsolateHeapReported() && !memoryCulpritOwnsOom(old.asReader()));
 }
 void package() {
   TempDir path;

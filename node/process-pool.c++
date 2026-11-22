@@ -938,6 +938,7 @@ struct ProcessGeneration {
   bool threadedCulpritHandled = false;
   bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
+  kj::Timer* timer = nullptr;
   uint64_t generation;
   // Its egress token: in its configuration only; the egress service attributes a request to it by this.
   std::string egressToken;
@@ -959,7 +960,7 @@ struct ProcessGeneration {
   std::map<std::string, ProcessCall*> calls;
   // RPC failure may finish the calls before waitpid observes the crash. This is
   // diagnostic data only: it never holds a ProcessCall or delays its release.
-  std::optional<std::string> memoryCrashInFlight;
+  std::optional<std::string> crashInFlight;
   std::string inFlightJson() const {
     std::ostringstream out;
     out << std::setprecision(17) << '[';
@@ -1002,7 +1003,7 @@ struct ProcessGeneration {
   // The problem a process that refused to start for its V8 sandbox wrote to its event channel
   // (kernel patch 0043: a sandbox-refused row before it exits with 78).
   std::string sandboxRefusal;
-  bool fatalMemoryEventPending = false;
+  bool crashEventPending = false;
   std::vector<LimitEvent> unappliedEvents;
   std::array<std::deque<std::pair<std::string, std::string>>, 3> terminatedCallOrder;
   std::array<std::set<std::string>, 3> terminatedCalls;  // CPU, isolate memory, process pressure: pid, invocation, Worker, version
@@ -1014,6 +1015,8 @@ struct ProcessGeneration {
   // The evidence rows: the latest CPU culprit (withdrawn by a later terminated row of the same
   // invocation: the termination took effect after all), the OOM row, the OOM identity row.
   std::string culpritRow, culpritInvocation, oomCulpritRow;
+  std::string fatalCulpritRow;
+  bool fatalSignalled = false;
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
@@ -1143,15 +1146,17 @@ struct ProcessGeneration {
       if (eventDigest) EVP_DigestUpdate(eventDigest, buffer, size_t(n));
       const auto previousSize = eventTail.size();
       eventTail.append(buffer, n);
-      if (!fatalMemoryEventPending) {
+      if (!crashEventPending) {
         // Scan each new byte once (plus a bounded overlap for a split marker),
         // never the accumulated tail on the per-call completion path.
         constexpr std::string_view undetermined = "\"memory-oom-undetermined\"";
         constexpr std::string_view culprit = "\"memory-culprit\"";
-        constexpr auto overlap = std::max(undetermined.size(), culprit.size()) - 1;
+        constexpr std::string_view fatal = "\"v8-fatal\"", fatalUnknown = "\"v8-fatal-undetermined\"";
+        constexpr auto overlap = std::max({undetermined.size(), culprit.size(), fatal.size(), fatalUnknown.size()}) - 1;
         const auto start = previousSize > overlap ? previousSize - overlap : 0;
-        fatalMemoryEventPending = eventTail.find(undetermined, start) != std::string::npos ||
-            eventTail.find(culprit, start) != std::string::npos;
+        crashEventPending = eventTail.find(undetermined, start) != std::string::npos ||
+            eventTail.find(culprit, start) != std::string::npos || eventTail.find(fatal, start) != std::string::npos ||
+            eventTail.find(fatalUnknown, start) != std::string::npos;
       }
     }
   }
@@ -1166,14 +1171,13 @@ struct ProcessGeneration {
     EVP_MD_CTX_free(copy);
     return value;
   }
-  void snapshotMemoryCrashCalls() {
-    if (memoryCrashInFlight) return;
+  void snapshotCrashCalls() {
+    if (crashInFlight) return;
     // Ordinary completions only inspect these fixed-size flags. The observer
     // maintains them as bytes arrive; exceptional completions may drain first.
-    if (!eventsEnded && !oomSignalled && oomCulpritRow.empty() &&
-        !fatalMemoryEventPending) return;
+    if (!eventsEnded && !crashEventPending) return;
     pullEvents();
-    if (eventsEnded || oomSignalled || !oomCulpritRow.empty()) memoryCrashInFlight = inFlightJson();
+    if (eventsEnded || fatalSignalled || oomSignalled || !oomCulpritRow.empty()) crashInFlight = inFlightJson();
   }
   static std::string callKey(uint64_t pid, std::string_view invocation, std::string_view worker, std::string_view version) {
     return std::to_string(pid).append(1, '\n').append(invocation).append(1, '\n').append(worker).append(1, '\n').append(version);
@@ -1284,6 +1288,11 @@ struct ProcessGeneration {
         }
         if (event == "memory-oom-undetermined") oomSignalled = true;
         if (event == "memory-culprit") oomCulpritRow = row;
+        if (event == "v8-fatal" || event == "v8-fatal-undetermined") {
+          if (!fatalSignalled && event == "v8-fatal") fatalCulpritRow = row;
+          else fatalCulpritRow.clear();  // Competing fatal records cannot prove which thread ended the process.
+          fatalSignalled = true;
+        }
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
             report.getMemoryLimitMiB(), report.getPeakUsedBytes(), report.getPauseNs(),
             event == "gc-pause" ? row : std::string()});
@@ -1314,19 +1323,28 @@ ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string
 }
 ProcessCall::~ProcessCall() { finish(); }
 void ProcessCall::snapshotAfterFailure() noexcept {
-  if (process->memoryCrashInFlight) return;
+  if (process->crashInFlight) return;
   try {
     // RPC rejection can beat the pipe observer. This read is confined to the
     // exceptional path and precedes the existing call release.
     process->drainEvents();
-    process->snapshotMemoryCrashCalls();
+    process->snapshotCrashCalls();
   } catch (...) {
     // Diagnostics must not replace the request's original failure.
   }
 }
+kj::Promise<void> ProcessCall::rejectAfterCrash(kj::Exception&& error) {
+  snapshotAfterFailure();
+  if (process->pid == 0 || !process->fatalSignalled || process->durable) return kj::mv(error);
+  // A socket can close before the node reaps its child. Apply the suspect mark
+  // before returning the failed call, so its next call uses the quarantine route.
+  return process->timer->timeoutAfter(1000 * kj::MILLISECONDS, KJ_ASSERT_NONNULL(process->exitSignal).addBranch())
+      .catch_([](kj::Exception&&) {})
+      .then([error = kj::mv(error)]() mutable -> kj::Promise<void> { return kj::mv(error); });
+}
 void ProcessCall::finish() {
   if (finished) return;
-  process->snapshotMemoryCrashCalls();
+  process->snapshotCrashCalls();
   finished = true;
   KJ_ASSERT(process->inFlight > 0);
   --process->inFlight;
@@ -1462,6 +1480,7 @@ public:
   std::vector<Slot> slots;
   std::deque<std::string> kills;
   std::deque<std::string> memoryCrashes;
+  std::deque<std::string> fatalExits;
   // The latest gc-pause rows of any generation (gc.longPauseMs).
   std::deque<std::string> recentGcPauses;
   // The limit event channel of the last exited generations: what the Server read, to the end.
@@ -2315,6 +2334,7 @@ public:
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
+    p->timer = &provider.getTimer();
     p->socketName = p->id + "-" + std::to_string(p->generation) + ".sock";
     p->socketPath = runDirectory + "/" + p->socketName;
     // The channels (see process-pool.h): created here, inherited by the child under fixed numbers,
@@ -2893,7 +2913,7 @@ public:
       // A completed row can be buffered before a fatal row or an unobserved exit.
       // Examine the whole batch, then inspect without consuming the reaper's status.
       bool alive = p.pid > 0 && p.state != "killed" && !p.closing && !p.eventsEnded &&
-          !p.fatalMemoryEventPending && !p.oomSignalled && p.oomCulpritRow.empty() && p.culpritRow.empty() &&
+          !p.crashEventPending && p.culpritRow.empty() &&
           p.runtime && !p.runtime->disconnected;
       if (alive) {
         siginfo_t info = {};
@@ -2955,27 +2975,28 @@ public:
   }
   // The OOM rows workerd's OOM handler wrote to the event pipe before the process died: the bare
   // OOM row, then the identity of the execution that hit it (when one was executing).
-  void memoryExit(Slot& slot, ProcessGeneration& p, int status) {
+  bool memoryExit(Slot& slot, ProcessGeneration& p, int status) {
     const auto& row = p.oomCulpritRow;
     std::string offender = "null";
-    bool v8Oom = p.oomSignalled;
+    const bool oomExit = !p.threaded || (WIFEXITED(status) && WEXITSTATUS(status) == 74);
+    bool v8Oom = oomExit && p.oomSignalled;
     uint64_t oomIsolateHeap = 0;
     bool oomIsolateHeapReported = false;
     if (!row.empty() && row.size() <= 16384) try {
       capnp::MallocMessageBuilder message;
       auto report = message.initRoot<v1::rpc::CpuReport>();
       capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), report);
-      const auto stateOom = report.getPid() == static_cast<uint32_t>(p.pid) &&
+      const auto stateOom = oomExit && report.getPid() == static_cast<uint32_t>(p.pid) &&
           (report.getEvent() == "memory-culprit" || report.getEvent() == "memory-oom-undetermined");
       v8Oom = v8Oom || stateOom;
       const std::string rowWorker = report.getWorkerId().cStr();
       oomIsolateHeap = report.getOomIsolateHeapBytes();
       oomIsolateHeapReported = report.getOomIsolateHeapReported();
       if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB &&
-          memoryCulpritOwnsOom(oomIsolateHeapReported, oomIsolateHeap, report.getMemoryLimitMiB())) {
+          memoryCulpritOwnsOom(report.asReader())) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
-        const auto dispatched = memoryCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
+        const auto dispatched = crashCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
         if (dispatched && !worker.empty() && !version.empty() && !invocation.empty() &&
             labelledIsolate(p, report.getIsolate().cStr(), worker, version)) {
           offender = capnp::JsonCodec().encode(report.asReader()).cStr();
@@ -2992,7 +3013,7 @@ public:
       unattributedOomKills.pop_front();
       ++poolOomKills;
     }
-    if (!v8Oom && !kernelOom) return;
+    if (!v8Oom && !kernelOom) return false;
     slot.lastExitCategory = "memory-oom";
     p.lastReason = kernelOom ? "kernel memory OOM" : "V8 memory OOM";
     std::ostringstream out;
@@ -3001,10 +3022,32 @@ public:
         << ",\"reason\":\"" << p.lastReason << "\",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
         << "\",\"culprit\":" << offender << ",\"oomIsolateHeapReported\":" << (oomIsolateHeapReported ? "true" : "false")
         << ",\"oomIsolateHeapBytes\":" << oomIsolateHeap
-        << ",\"inFlight\":" << p.memoryCrashInFlight.value_or(p.inFlightJson()) << "}";
+        << ",\"inFlight\":" << p.crashInFlight.value_or(p.inFlightJson()) << "}";
     if (memoryCrashes.size() == 32) memoryCrashes.pop_front();
     memoryCrashes.push_back(out.str());
     std::cout << "[process-memory-crash] " << out.str() << std::endl;
+    return true;
+  }
+  void fatalExit(Slot& slot, ProcessGeneration& p, int status) {
+    const bool v8Fatal = p.fatalSignalled && !p.oomSignalled && p.oomCulpritRow.empty() &&
+        WIFEXITED(status) && WEXITSTATUS(status) == 75;
+    auto offender = confirmedFatalCulprit(p, v8Fatal, [&](const std::string& worker, const std::string& invocation) {
+      suspects.confirm(worker, p.id, p.generation, invocation);
+    });
+    if (v8Fatal) {
+      slot.lastExitCategory = "v8-fatal";
+      p.lastReason = "V8 fatal error";
+    }
+    std::ostringstream out;
+    out << "{\"processId\":\"" << p.id << "\",\"processClass\":\"" << processClass(p)
+        << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"observedAtUnixMs\":" << wall()
+        << ",\"reason\":" << json::quote(v8Fatal ? p.lastReason : p.exitStatus)
+        << ",\"exitStatus\":" << json::quote(p.exitStatus)
+        << ",\"culpritStatus\":\"" << (offender == "null" ? "undetermined" : "confirmed")
+        << "\",\"culprit\":" << offender << ",\"inFlight\":" << p.crashInFlight.value_or(p.inFlightJson()) << "}";
+    if (fatalExits.size() == 32) fatalExits.pop_front();
+    fatalExits.push_back(out.str());
+    std::cout << "[process-fatal-exit] " << out.str() << std::endl;
   }
   // The latest culprit row the watchdog thread wrote and no termination has withdrawn since.
   std::string culprit(ProcessGeneration& p) {
@@ -3095,7 +3138,8 @@ public:
       recordSyscallDenial(s, *p);
     } else if (!p->plannedExit) {
       s.lastExitCategory = p->lastReason == "watchdog timeout" ? "cpu-watchdog" : "other";
-      if (config.memoryLimitMiB && p->lastReason.empty()) memoryExit(s, *p, status);
+      if (p->lastReason.empty() && !(config.memoryLimitMiB && memoryExit(s, *p, status)) && p->threaded && !p->durable)
+        fatalExit(s, *p, status);
     }
     auto reason = p->lastReason.empty() ? p->exitStatus : p->lastReason;
     event(*p, "exit", reason);
@@ -4019,8 +4063,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     if (call->onCapacityRejected) call->onCapacityRejected();
   });
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
-    call->snapshotAfterFailure();
-    return kj::mv(error);
+    return call->rejectAfterCrash(kj::mv(error));
   }).attach(std::shared_ptr<ProcessCall>(call));
   return result;
 }
@@ -4174,6 +4217,8 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"unattributed\":" << impl->unattributedOomKills.size() << "}";
   out << ",\"recentMemoryCrashes\":[";
   for (size_t j = 0; j < impl->memoryCrashes.size(); ++j) { if (j) out << ','; out << impl->memoryCrashes[j]; }
+  out << "],\"recentFatalExits\":[";
+  for (size_t j = 0; j < impl->fatalExits.size(); ++j) { if (j) out << ','; out << impl->fatalExits[j]; }
   out << "],\"recentChannelExits\":[";
   for (size_t j = 0; j < impl->channelExits.size(); ++j) { if (j) out << ','; out << impl->channelExits[j]; }
   out << "],\"sandbox\":" << impl->sandboxStateJson() << ",\"recentLaunchFailures\":[";
@@ -4194,6 +4239,11 @@ std::string ProcessPool::culpritRecordsJson() const {
   for (size_t i = 0; i < impl->memoryCrashes.size(); ++i) {
     if (i) out += ',';
     out += impl->memoryCrashes[i];
+  }
+  out += "],\"recentFatalExits\":[";
+  for (size_t i = 0; i < impl->fatalExits.size(); ++i) {
+    if (i) out += ',';
+    out += impl->fatalExits[i];
   }
   out += "],\"recentKills\":[";
   for (size_t i = 0; i < impl->kills.size(); ++i) {

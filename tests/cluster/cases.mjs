@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unlink, writeFile } from 'node:fs/promises';
+import { rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
@@ -130,8 +130,109 @@ async function processReplacement(cluster) {
     assert.equal(after.state, 'ready');
     assert.equal((await request(cluster.urls[node], '/__coworkerd/ready')).status, 200);
   });
+  const { processes } = await cluster.state(node);
+  const exit = processes.recentFatalExits.find(entry => entry.pid === before.pid && entry.generation === before.generation);
+  assert.equal(exit?.culpritStatus, 'undetermined', 'a process exit without evidence leaves the tenant unmarked');
+  assert.equal(exit.culprit, null);
+  assert.ok(!processes.suspects.entries.some(entry => entry.tenant === tenant.name));
   assert.deepEqual(await workerCall(cluster, node, tenant, 'hello'), { status: 200, text: 'alive' },
     'the first Worker call after the replacement is ready succeeds');
+}
+
+async function fatalAttribution(cluster) {
+  const [node, peer] = cluster.nodes;
+  const tenant = await cluster.tenant('fatal-test');
+  const neighbor = await cluster.tenant('fatal-neighbor');
+  const target = `${tenant.name}/hello`;
+  await cluster.deploy(tenant, 'hello', respondWith('hello'));
+  await cluster.deploy(neighbor, 'hello', `export default { async fetch(request) {
+    if (new URL(request.url).pathname.endsWith('/held')) {
+      await new Promise(resolve => setTimeout(resolve, 15000));
+    }
+    return new Response('neighbor');
+  } };`);
+  const hello = (at = node) => workerCall(cluster, at, tenant, 'hello');
+  const near = (worker = 'hello') => workerCall(cluster, node, neighbor, worker, { timeout: 18000 });
+  const pool = async (at = node) => (await cluster.state(at)).processes;
+  const sameGeneration = (entry, process) => entry.processId === process.processId && entry.generation === process.generation;
+  const assertUncertain = (result, description) => assert.equal(json(result, 503, description).code, 'RESULT_UNCERTAIN');
+  const recovered = (process) => eventually('a new ordinary process is ready', async () => {
+    const current = await ordinaryProcess(cluster, node);
+    assert.equal(current.processId, process.processId);
+    assert.ok(current.generation > process.generation);
+    assert.equal(current.state, 'ready');
+    return current;
+  });
+  const syntheticExit = async (process, event) => {
+    const command = join(cluster.fatalControl, `command.${process.pid}`);
+    const pending = `${command}.pending`;
+    await writeFile(pending, `${event}\n${target}`, { flag: 'wx', mode: 0o644 });
+    await rename(pending, command);
+    try {
+      assertUncertain(await hello(), `synthetic ${event} from ${process.processClass}`);
+    } finally {
+      await unlink(command);
+    }
+  };
+  await eventually('both tenants run before the fault', async () => {
+    assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+    assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+    assert.deepEqual(await hello(peer), { status: 200, text: 'hello' });
+  });
+
+  const initial = await ordinaryProcess(cluster, node);
+  await syntheticExit(initial, 'shared-oom');
+  const before = await recovered(initial);
+  const oom = (await pool()).recentMemoryCrashes.find(entry => sameGeneration(entry, initial));
+  assert.equal(oom?.culpritStatus, 'undetermined');
+  assert.equal(oom.culprit, null);
+  assert.ok(!(await pool()).suspects.entries.some(entry => entry.tenant === tenant.name));
+  assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+
+  const held = near('hello/held').then(response => ({ response }), error => ({ error }));
+  let firstRoute;
+  try {
+    await eventually('the other tenant is in flight in the ordinary process', async () => {
+      const current = await ordinaryProcess(cluster, node);
+      assert.equal(current.pid, before.pid);
+      assert.equal(current.inFlight, 1);
+    }, { timeout: 5000, interval: 30 });
+    const prior = (await pool()).quarantineDispatches;
+    await syntheticExit(before, 'fatal');
+    // Send the first call before polling state or waiting for an ordinary replacement.
+    assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+    firstRoute = await pool();
+    assert.equal(firstRoute.quarantineDispatches, prior + 1);
+  } finally {
+    await held;
+  }
+  const { response, error } = await held;
+  if (error) throw error;
+  assertUncertain(response, 'neighbor affected by the ordinary exit');
+  const first = firstRoute.recentFatalExits.find(entry => sameGeneration(entry, before));
+  assert.equal(first?.culpritStatus, 'confirmed');
+  assert.equal(first.culprit.workerId, target);
+  assert.ok(first.inFlight.some(call => call.workerId === `${neighbor.name}/hello`));
+  const replacement = await recovered(before);
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+
+  const adopted = await eventually('another node learns which tenant to quarantine', async () => {
+    const view = await pool(peer);
+    assert.ok(view.suspects.entries.some(entry => entry.tenant === tenant.name && entry.workerId === target));
+    return view;
+  });
+  assert.deepEqual(await hello(peer), { status: 200, text: 'hello' });
+  assert.equal((await pool(peer)).quarantineDispatches, adopted.quarantineDispatches + 1);
+
+  const quarantine = firstRoute.entries.find(entry => entry.processClass === 'quarantine');
+  assert.equal(quarantine?.state, 'ready');
+  await syntheticExit(quarantine, 'fatal');
+  const second = (await pool()).recentFatalExits.find(entry => sameGeneration(entry, quarantine));
+  assert.equal(second?.culpritStatus, 'confirmed');
+  assert.equal(second.culprit.workerId, target);
+  assert.equal(second.processClass, 'quarantine');
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+  assert.equal((await ordinaryProcess(cluster, node)).pid, replacement.pid);
 }
 
 async function logQuota(cluster) {
@@ -403,5 +504,5 @@ async function durableTakeover(cluster) {
 
 // The only node-level fault runs last so earlier cases keep all three nodes.
 export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
-  'process-replacement': processReplacement, 'log-quota': logQuota,
+  'process-replacement': processReplacement, 'fatal-attribution': fatalAttribution, 'log-quota': logQuota,
   'durable-peer-ack': durablePeerAck, 'durable-takeover': durableTakeover };

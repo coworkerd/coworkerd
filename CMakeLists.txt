@@ -180,6 +180,7 @@ add_executable(coworkerd-process-culprit-test EXCLUDE_FROM_ALL node/process-culp
 target_link_libraries(coworkerd-process-culprit-test PRIVATE common)
 add_test(NAME node-threaded-cpu-culprit COMMAND coworkerd-process-culprit-test cpu)
 add_test(NAME node-threaded-memory-culprit COMMAND coworkerd-process-culprit-test memory)
+add_test(NAME node-threaded-fatal-culprit COMMAND coworkerd-process-culprit-test fatal)
 add_executable(coworkerd-log-cleaning-test EXCLUDE_FROM_ALL node/log-cleaning-test.c++ node/async-log.c++
   node/secret-dictionary.c++)
 target_link_libraries(coworkerd-log-cleaning-test PRIVATE common)

@@ -39,6 +39,22 @@ The runner reports every case, its elapsed time, and the total with cluster setu
 setup or teardown exits nonzero. Linux pull-request CI uses the same entry point.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+### Fatal attribution with the test kernel
+
+In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
+kernel test. Then pass the test executable to the cluster runner from the product checkout.
+
+```sh
+(cd workerd && bazel build --config=release //src/workerd/threaded:coworkerd-threaded-fatal-test)
+(cd workerd && bazel test --config=release '//src/workerd/threaded:threaded-server-test@' \
+  --test_arg=--filter='*fatal record identifies*')
+COWORKERD_CLUSTER_FATAL_TEST_BINARY="$PWD/workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded-fatal-test" \
+  node tests/cluster/run.mjs "$kernel" fatal-attribution
+```
+
+The fixture mounts a read-only controller directory into one node. The controller selects the process and
+Worker before issuing a normal HTTP call. The synthetic event hook exists only in the test executable.
+
 ## Measured time and resources
 
 A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose
@@ -58,7 +74,8 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
-| `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
+| `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
+| `fatal-attribution` (test kernel) | A confirmed fatal exit fails to route the tenant's next call to quarantine, a peer fails to apply the suspect mark, a repeat exit affects the ordinary process, an unrelated tenant fails to recover, or shared-cage exhaustion marks the last allocator. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
 | `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |

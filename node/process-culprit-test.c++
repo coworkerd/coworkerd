@@ -9,7 +9,7 @@ struct Call { std::string workerId, versionId, invocationId; bool dispatched = f
 struct Process {
   bool threaded = true, durable = false;
   uint32_t pid = 11;
-  std::string culpritRow;
+  std::string culpritRow, fatalCulpritRow;
   std::map<std::string, Call*> calls;
   std::deque<Call> recentDispatched;
   void pullEvents() {}
@@ -51,12 +51,43 @@ void memory() {
   Call active{"tenant/worker", "v1", "active", true}, queued{"tenant/worker", "v1", "queued", false};
   std::map<std::string, Call*> live{{"active", &active}, {"queued", &queued}};
   std::deque<Call> recent{{"tenant/worker", "v1", "completed", true}};
-  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "active", "tenant/worker", "v1"));
-  KJ_REQUIRE(memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "tenant/worker", "v2"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "completed", "other/worker", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
-  KJ_REQUIRE(!memoryCulpritDispatch(live, recent, "missing", "tenant/worker", "v1"));
+  KJ_REQUIRE(crashCulpritDispatch(live, recent, "active", "tenant/worker", "v1"));
+  KJ_REQUIRE(crashCulpritDispatch(live, recent, "completed", "tenant/worker", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "completed", "tenant/worker", "v2"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "completed", "other/worker", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "queued", "tenant/worker", "v1"));
+  KJ_REQUIRE(!crashCulpritDispatch(live, recent, "missing", "tenant/worker", "v1"));
+}
+void fatal() {
+  Process process;
+  Call active{"tenant/worker", "v1", "call", true};
+  process.calls.emplace("call", &active);
+  auto report = [&](int pid, std::string_view worker, std::string_view version, std::string_view isolate) {
+    process.fatalCulpritRow = "{\"event\":\"v8-fatal\",\"pid\":" + std::to_string(pid) +
+        ",\"workerId\":\"" + std::string(worker) + "\",\"versionId\":\"" + std::string(version) +
+        "\",\"invocationId\":\"call\",\"isolate\":\"" + std::string(isolate) + "\"}";
+  };
+  auto good = [&] { report(11, "tenant/worker", "v1", "coworkerd-v1:tenant/worker@v1#7"); };
+  int confirmations = 0;
+  auto run = [&](bool fatalExit = true) {
+    return confirmedFatalCulprit(process, fatalExit, [&](const std::string& worker, const std::string& invocation) {
+      KJ_ASSERT(worker == "tenant/worker" && invocation == "call");
+      ++confirmations;
+    });
+  };
+  KJ_REQUIRE(run() == "null");
+  good(); KJ_REQUIRE(run(false) == "null");
+  active.dispatched = false; KJ_REQUIRE(run() == "null"); active.dispatched = true;
+  report(12, "tenant/worker", "v1", "coworkerd-v1:tenant/worker@v1#7"); KJ_REQUIRE(run() == "null");
+  report(11, "other/worker", "v1", "coworkerd-v1:other/worker@v1#7"); KJ_REQUIRE(run() == "null");
+  report(11, "tenant/worker", "v2", "coworkerd-v1:tenant/worker@v2#7"); KJ_REQUIRE(run() == "null");
+  report(11, "tenant/worker", "v1", "coworkerd-v1:other/worker@v1#7"); KJ_REQUIRE(run() == "null");
+  process.fatalCulpritRow = "{\"event\":\"v8-fatal-undetermined\",\"pid\":11}";
+  KJ_REQUIRE(run() == "null" && confirmations == 0);
+  good(); KJ_REQUIRE(run() != "null" && confirmations == 1);
+  process.calls.clear(); process.recentDispatched.push_back(active);
+  KJ_REQUIRE(run() != "null" && confirmations == 2);
+  process.recentDispatched.clear(); KJ_REQUIRE(run() == "null" && confirmations == 2);
 }
 }  // namespace
 }  // namespace coworkerd
@@ -64,5 +95,6 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   if (std::string_view(argv[1]) == "cpu") coworkerd::cpu();
   else if (std::string_view(argv[1]) == "memory") coworkerd::memory();
+  else if (std::string_view(argv[1]) == "fatal") coworkerd::fatal();
   else KJ_FAIL_REQUIRE("unknown culprit test");
 }

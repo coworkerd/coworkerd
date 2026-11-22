@@ -12,7 +12,13 @@ async function main(args) {
     process.exitCode = 2;
     return;
   }
-  const selected = args[1] ? [[args[1], cases[args[1]]]] : Object.entries(cases);
+  const fatalTest = args[1] === 'fatal-attribution';
+  const testBinary = process.env.COWORKERD_CLUSTER_FATAL_TEST_BINARY;
+  if (fatalTest && !testBinary) {
+    throw new Error('fatal-attribution requires COWORKERD_CLUSTER_FATAL_TEST_BINARY');
+  }
+  const selected = args[1] ? [[args[1], cases[args[1]]]]
+    : Object.entries(cases).filter(([name]) => name !== 'fatal-attribution');
   const controller = new AbortController();
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
@@ -20,6 +26,7 @@ async function main(args) {
   const start = performance.now();
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), resolve(args[0]), controller.signal, {
     holdPeerAcks: selected.some(([name]) => name === 'durable-peer-ack'),
+    fatalTestBinary: fatalTest ? resolve(testBinary) : undefined,
   });
   let failed = 0;
   try {

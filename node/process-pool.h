@@ -35,6 +35,7 @@ public:
   void finish();
   // Exceptional completion only: capture a dying generation before its calls are released.
   void snapshotAfterFailure() noexcept;
+  kj::Promise<void> rejectAfterCrash(kj::Exception&& error);
   kj::Promise<void> onExit();
   bool threadedServer() const;
   bool threadedDurableTestRole() const;
