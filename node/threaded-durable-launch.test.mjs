@@ -188,10 +188,17 @@ try {
         }
         if (query.has("hold")) {
           this.latch = Promise.withResolvers();
+          if (query.has("cancelable")) {
+            request.signal.addEventListener("abort", () => {
+              this.aborts = (this.aborts ?? 0) + 1;
+              this.latch.resolve();
+            }, {once: true});
+          }
           await this.latch.promise;
           this.latch = undefined;
         }
         if (query.has("waiting")) return Response.json(this.latch !== undefined);
+        if (query.has("aborts")) return Response.json(this.aborts ?? 0);
         if (query.has("release")) this.latch.resolve();
         if (query.has("nested")) {
           const next = this.env.COUNTERS.get(this.env.COUNTERS.idFromName("/other"));
@@ -252,6 +259,8 @@ try {
     await writeFile(join(modules, 'package.json'), packageManifest);
     Object.assign(version, {
       format: 'v2', compatibilityDate: '2026-08-27', contentHash: hash(packageManifest),
+      // Incoming cancellation and forwarding its signal are opt-ins for this date.
+      ...(httpIsolation ? {compatibilityFlags: ['enable_request_signal', 'request_signal_passthrough']} : {}),
       durableObjects: [{ binding: 'COUNTERS', className: 'Counter' }], classes: { declared: ['Counter'] },
     });
   }
@@ -796,7 +805,7 @@ try {
         const before = await waitForAdmission(socketPath, 0);
         assert.equal(before.running, 0);
         const controller = new AbortController();
-        const aborted = fetch(`http://127.0.0.1:${port}/first?hold`, {
+        const aborted = fetch(`http://127.0.0.1:${port}/first?hold&cancelable`, {
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
         });
         aborted.catch(() => {});
@@ -816,6 +825,7 @@ try {
         assert.equal(drained.running, 0);
         for (const field of ['reservedBytes', 'reservedDescriptors', 'residentRoots',
           'actorResets', 'isolateResets']) assert.equal(drained[field], before[field], field);
+        assert.equal(await request('/first?aborts'), attempt + 1);
         assert.deepEqual(await request('/first'), initial);
         assert.deepEqual(await request('/other'), other);
       }
