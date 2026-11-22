@@ -281,7 +281,7 @@ class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
 public:
   RuntimeConnection(): tasks(*this) {}
   bool threaded = false;
-  bool durableTestStorage = false;
+  bool threadedDurable = false;
   uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
   static constexpr size_t IDLE_CONNECTIONS = 32;
@@ -353,7 +353,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   replenish();
   try {
     // No Cap'n Proto bytes may precede this raw routing prefix.
-    if (durableTestStorage) {
+    if (threadedDurable) {
       capnp::MallocMessageBuilder builder;
       capnp::JsonCodec codec;
       auto root = builder.initRoot<capnp::JsonValue>();
@@ -375,18 +375,18 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         onCapacityRejected();
         kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
       }
-      if (durableTestStorage && decision == 'E') {
+      if (threadedDurable && decision == 'E') {
         kj::throwRecoverableException(tagRpcError(
             KJ_EXCEPTION(OVERLOADED, "durable routing lease expired before dispatch"), "LEASE_EXPIRED"));
       }
-      if (durableTestStorage && decision == 'S') {
+      if (threadedDurable && decision == 'S') {
         kj::throwRecoverableException(tagRpcError(
             KJ_EXCEPTION(OVERLOADED, "durable routing identity is stale"), "DO_UNAVAILABLE"));
       }
       KJ_REQUIRE(decision == 'A', "invalid native admission response");
     }
     onDispatched();
-    if (!durableTestStorage) ready->fulfill();
+    if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
     v1::rpc::EventDispatcher::Client dispatcher = nullptr;
@@ -395,19 +395,19 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       request.setCfBlobJson(descriptor);
       request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
       auto response = request.send();
-      if (durableTestStorage) dispatcher = (co_await kj::mv(response)).getDispatcher();
+      if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
       else dispatcher = response.getDispatcher();
     } else {
       auto request = connection->bootstrap.startEventRequest();
       request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
       auto response = request.send();
-      if (durableTestStorage) dispatcher = (co_await kj::mv(response)).getDispatcher();
+      if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
       else dispatcher = response.getDispatcher();
     }
-    if (durableTestStorage) ready->fulfill();
+    if (threadedDurable) ready->fulfill();
     co_return capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
   } catch (const kj::Exception& error) {
-    if (durableTestStorage && ready->isWaiting()) ready->reject(error.clone());
+    if (threadedDurable && ready->isWaiting()) ready->reject(error.clone());
     throw;
   }
 }
@@ -1366,13 +1366,14 @@ kj::Promise<void> ProcessCall::onExit() {
 // row whose pid is the generation's current pid (none once the exit was observed).
 bool ProcessCall::threadedServer() const { return process->threaded; }
 bool ProcessCall::threadedDurableTestRole() const { return process->durableTestStorage; }
+bool ProcessCall::threadedDurableRole() const { return process->durable && process->threaded; }
 bool ProcessCall::cpuLimitExceeded() const {
-  if (process->durable && !process->durableTestStorage)
+  if (process->durable && !process->threaded)
     return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(0, invocationId, workerId, versionId);
 }
 bool ProcessCall::memoryLimitExceeded() const {
-  if (process->durable && !process->durableTestStorage)
+  if (process->durable && !process->threaded)
     return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(1, invocationId, workerId, versionId);
 }
@@ -1455,8 +1456,9 @@ public:
   int bandFd = -1;  // the Server's own copy of the band's shared memory, above PARENT_FD
   uint64_t quarantineDispatches = 0, trialDispatches = 0, durableDispatches = 0;
   // The Durable Object log channel of each durable generation (node/durable-log.h).
-  std::function<int(const std::string&)> durableChannelOpen;
+  std::function<int(const std::string&, uint64_t)> durableChannelOpen;
   std::function<void(const std::string&)> durableChannelClose;
+  std::function<bool(const std::string&)> durableChannelDrain;
   DurableLogConfig durableLog;
   std::shared_ptr<TenantCpu> cpuUsage = std::make_shared<TenantCpu>();
   std::vector<Slot> slots;
@@ -1876,7 +1878,8 @@ public:
         << "\",\"threadedProtocol\":" << p.threadedProtocol
         << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
         << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol == 3 ? "true" : "false");
-    if (p.durable) out << ",\"durableServer\":\"" << (p.durableTestStorage ? "threaded-test" : "upstream") << '"';
+    if (p.durable) out << ",\"durableServer\":\"" <<
+        (p.durableTestStorage ? "threaded-test" : p.threaded ? "threaded" : "upstream") << '"';
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -2310,7 +2313,7 @@ public:
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
     p->durableTestStorage = s.durable && config.threadedDurableTestStorage;
-    p->threaded = !s.durable || p->durableTestStorage;
+    p->threaded = !s.durable || config.threadedDurable();
     if (!s.durable) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
@@ -2422,7 +2425,8 @@ public:
     int durableLogFd = -1;
     auto closeDurableLog = kj::defer([&durableLogFd] { if (durableLogFd >= 0) ::close(durableLogFd); });
     if (p->durable && !p->durableTestStorage && durableChannelOpen) {
-      durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation)));
+      durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation),
+          p->threaded ? p->generation : 0));
       if (durableLogFd >= 0) {
         inherit(actions, durableLogFd, DURABLE_LOG_FD);
       }
@@ -2496,6 +2500,8 @@ public:
     }
     if (p->durableTestStorage) {
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
+    }
+    if (p->durable && p->threaded) {
       for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
@@ -2503,6 +2509,10 @@ public:
                "COWORKERD_DO_TEST_REFUSE_GROUP"}) {
         if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
       }
+    }
+    if (p->durable && p->threaded && !p->durableTestStorage) {
+      KJ_REQUIRE(durableLogFd >= 0, "cannot start a persistent durable home without a WAL channel");
+      childEnvironment.push_back("COWORKERD_DO_STORAGE_DIR=" + durableDirectory());
     }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.
@@ -2543,6 +2553,7 @@ public:
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
         p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
     if (p->durableTestStorage) args.push_back("--durable-test-storage");
+    else if (p->durable && p->threaded) args.push_back("--durable-storage");
     std::string file = executable;
     bool thpResetViaLauncher = false;
 #ifdef __linux__
@@ -2689,17 +2700,27 @@ public:
         if (p->threaded) {
           bool matchesProtocol = false;
           uint32_t roleHeaders = 0;
-          bool durableTestRole = false;
+          uint32_t walHeaders = 0;
+          bool matchesRole = false, matchesWal = false;
           response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
               ++roleHeaders;
-              durableTestRole = value == "durable-test";
+              matchesRole = value == (p->durableTestStorage ? "durable-test" : "durable");
+            }
+            if (strcasecmp(name.cStr(), "x-coworkerd-wal-protocol") == 0) {
+              ++walHeaders;
+              matchesWal = value == "1";
             }
           });
           KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
-          KJ_REQUIRE((p->durableTestStorage ? roleHeaders == 1 && durableTestRole : roleHeaders == 0),
+          const bool roleNegotiated = p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0;
+          const bool walNegotiated = p->durable && !p->durableTestStorage
+              ? walHeaders == 1 && matchesWal : walHeaders == 0;
+          KJ_REQUIRE(roleNegotiated,
               "native process role does not match the slot");
+          KJ_REQUIRE(walNegotiated,
+              "native process WAL protocol does not match the slot");
           p->threadedProtocol = 3;
           p->contextsVisible = true;
         }
@@ -2718,7 +2739,7 @@ public:
         r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
         if (p->threaded) {
           r->threaded = true;
-          r->durableTestStorage = p->durableTestStorage;
+          r->threadedDurable = p->durable;
           r->threadedProtocol = p->threadedProtocol;
           r->deferredDeletes = &tasks;
           co_await r->fill();
@@ -3244,7 +3265,12 @@ public:
   // tracked (the next one joins `retiring`) and are closed with all the others.
   // The close of every generation of the slots `which` picks: the Server's connections first, then SIGTERM, then SIGKILL
   // after the termination grace (closeAll(), closeDurable()); resolves with the record once all exited.
-  kj::Promise<std::string> closeGenerations(std::function<bool(const Slot&)> which);
+  kj::Promise<std::string> closeGenerations(std::function<bool(const Slot&)> which, double deadline = 0);
+
+  bool durableStorageDrained(const ProcessGeneration& process) {
+    return !process.durable || !process.threaded || process.durableTestStorage || !durableChannelDrain ||
+        durableChannelDrain(process.id + "-" + std::to_string(process.generation));
+  }
   void abortRotation(double now, const std::string& why = "the Server is shutting down") {
     auto& r = *rotation;
     auto& s = slots[r.slot];
@@ -3344,8 +3370,10 @@ public:
     return generationDrained(*r.old, r.switchedAt, now, drainAllowance(*r.old), r.lastLifecycleCheck, r.clearedContexts);
   }
   uint64_t drainAllowance(const ProcessGeneration& process) const {
-    return process.threaded ? std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs)
-                            : config.rotationDrainTimeoutMs;
+    if (process.threaded && (!process.durable || process.durableTestStorage)) {
+      return std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs);
+    }
+    return config.rotationDrainTimeoutMs;
   }
   // The same criterion for any generation; `since` stands for the moment it stopped taking
   // new calls. The Server's exit applies it to every live generation.
@@ -3440,7 +3468,7 @@ public:
         finish(now, "completed");
         return;
       }
-      if (drained(r, now)) {
+      if (drained(r, now) && durableStorageDrained(*r.old)) {
         r.drainOutcome = r.old->contextsVisible ? "drained" : "waited";
         r.drainedAt = now; r.drainedAtUnixMs = wall();
         r.old->closing = true; r.old->plannedExit = true;
@@ -3787,10 +3815,26 @@ uint32_t ProcessPool::resetDurable(const std::string& reason) {
   }
   return killed;
 }
-void ProcessPool::setDurableChannel(std::function<int(const std::string&)> open,
-    std::function<void(const std::string&)> close, const DurableLogConfig& settings) {
+kj::Promise<uint32_t> ProcessPool::resetDurableAndWait(const std::string& reason, kj::Duration timeout) {
+  impl->refresh();
+  kj::Vector<kj::Promise<void>> exits;
+  for (auto& slot : impl->slots) {
+    if (!slot.durable) continue;
+    Impl::eachGeneration(slot, [&](const auto& generation) {
+      if (generation->pid != 0) exits.add(KJ_ASSERT_NONNULL(generation->exitSignal).addBranch());
+    });
+  }
+  const auto killed = resetDurable(reason);
+  co_await impl->provider.getTimer().timeoutAfter(timeout, kj::joinPromises(exits.releaseAsArray()));
+  co_return killed;
+}
+
+void ProcessPool::setDurableChannel(std::function<int(const std::string&, uint64_t)> open,
+    std::function<void(const std::string&)> close, std::function<bool(const std::string&)> drain,
+    const DurableLogConfig& settings) {
   impl->durableChannelOpen = std::move(open);
   impl->durableChannelClose = std::move(close);
+  impl->durableChannelDrain = std::move(drain);
   impl->durableLog = settings;
 }
 void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
@@ -4369,13 +4413,13 @@ kj::Promise<std::string> ProcessPool::closeDurable(double deadline) {
     remaining << '}';
   });
   remaining << "]}";
-  auto closed = co_await impl->closeGenerations([](const Impl::Slot& s) { return s.durable; });
+  auto closed = co_await impl->closeGenerations([](const Impl::Slot& s) { return s.durable; }, deadline);
   KJ_ASSERT(!closed.empty() && closed.back() == '}');
   closed.pop_back();
   co_return closed + ",\"drain\":" + remaining.str() + '}';
 }
 
-kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(const Slot&)> which) {
+kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(const Slot&)> which, double deadline) {
   auto* impl = this;
   const auto started = mono();
   const auto startedAtUnixMs = wall();
@@ -4407,6 +4451,7 @@ kj::Promise<std::string> ProcessPool::Impl::closeGenerations(std::function<bool(
       exited = false;
       if (c.terminatedAt == 0) {
         if (c.p->probePending) continue;
+        if (now < deadline && !impl->durableStorageDrained(*c.p)) continue;
         // A generation that never became ready is still in its startup probe, which owns
         // the probe client: it only gets the signal (its startup then ends with the exit).
         if (c.p->readyAt > 0) impl->closeConnections(*c.p);

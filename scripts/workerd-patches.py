@@ -218,6 +218,23 @@ def allowed_path(name, path):
                                    '0069-durable-process-memory-recovery.patch',
                                    '0070-durable-rpc-binding.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0081-threaded-durable-storage.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite.c++'} or
+                          name == '0082-threaded-durable-fixture-state.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0083-threaded-wal-open-proof.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0084-prepare-threaded-wal-off-home.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name in {'0085-threaded-facet-mutations.patch',
+                                   '0086-refuse-persistent-facet-cloning.patch',
+                                   '0087-allow-threaded-wal-registration.patch',
+                                   '0088-check-live-facets-on-reset.patch',
+                                   '0089-use-durable-home-memory-reclaim.patch'} and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

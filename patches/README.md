@@ -36,6 +36,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   constructor continues to use the shipped SQL accounting.
   `0048-durable-event-cpu.patch` adds opt-in api/io/jsg hooks that carry delivered-event CPU
   accounting and lease authority through actor entry and asynchronous callbacks.
+  `0081-threaded-durable-storage.patch` connects the threaded server and its Bazel target to the
+  inherited WAL channel. Its two SQLite utility changes report a synchronous connection close to the
+  embedder only after SQLite confirms that no dependent handles remain.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

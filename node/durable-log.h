@@ -386,8 +386,9 @@ public:
   // ---- The durable processes ----
   // The node's end of a durable process's channel is kept and read; the descriptor returned is the one the process
   // inherits, or -1 when this node ships nothing.
-  int openChannel(const std::string& processId);
+  int openChannel(const std::string& processId, uint64_t threadedGeneration = 0);
   void closeChannel(const std::string& processId);
+  bool drainChannel(const std::string& processId);
 
   // ---- The objects ----
   struct ObjectIdentity {
@@ -583,12 +584,19 @@ private:
   };
   // A durable process's channel.
   struct Channel {
+    struct Open {
+      std::pair<uint64_t, uint64_t> position;
+      uint64_t id = 0;
+    };
     std::string processId;
     kj::Own<kj::AsyncIoStream> stream;
     std::string inbox;
     uint64_t pid = 0, messages = 0, frames = 0, bytes = 0;
+    uint64_t threadedGeneration = 0;
+    bool draining = false;
     bool open = false;
-    std::map<std::string, std::pair<uint64_t, uint64_t>> openFacets;
+    std::map<std::string, Open, std::less<>> openFacets;
+    std::set<uint64_t> closeAsked;
     kj::Promise<void> writeChain = nullptr;
     kj::Promise<void> reader = nullptr;
   };
@@ -700,6 +708,9 @@ private:
   bool consumeChannelInbox(Channel& channel, bool sliced);
   void onMessage(Channel& channel, std::string_view message);
   void sendToChannel(Channel& channel, std::string message);
+  void sendToOpenChannels(uint8_t type, const std::string& key, const std::string& payload);
+  kj::Promise<bool> closeThreadedObject(const std::string& objectName);
+  void askClose(Channel& channel, uint64_t openId);
   void answer(Channel& channel, uint64_t request, uint8_t status);
   void tellSealed(const std::string& key, uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void tellBreak(const std::string& key, const std::string& reason);
@@ -1031,7 +1042,11 @@ private:
   double leaseWakeAtMs = 0;
   std::string slowFlushForTest;
   std::filesystem::path peerAckGateForTest;
+  std::filesystem::path cutChannelForTest;
   uint32_t heldPeerAcksForTest = 0;
+  uint64_t threadedHomeOpenSamples = 0, threadedHomeOpenMaxNs = 0;
+  uint64_t threadedHomeCheckpointSamples = 0, threadedHomeCheckpointMaxNs = 0;
+  uint64_t threadedHomeCheckpointMaxWalBytes = 0;
   struct OwnerRead {
     kj::ForkedPromise<OwnerHeartbeat> answer;
     double atMs;

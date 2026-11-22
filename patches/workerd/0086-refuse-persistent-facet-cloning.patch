@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 21:27:12 +0800
+Subject: [PATCH] Refuse facet cloning in the persistent durable role
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 766faaa09ee4238c7d639b6f70dd65ff0c6ac910..f83692207df6c5d4eec23d89b64e44e4709f2f42 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4938,6 +4938,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+   }
+ 
+   void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {
++    if (tree->state.wal) unsupported("cloning a persistent Durable Object facet");
+     requireIdle(source);
+     requireIdle(destination);
+     abortFacet(destination, KJ_EXCEPTION(DISCONNECTED, "Facet was cloned over."));

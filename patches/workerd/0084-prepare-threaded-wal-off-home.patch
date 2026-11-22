@@ -1,0 +1,473 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 21:09:07 +0800
+Subject: [PATCH] Scan cold WAL images off the actor homes
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+index ea69932083a12082144cd8e2f7d05040ca11e680..20f6cee346b1fcfc305841915f827df2a2707349 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+@@ -53,16 +53,23 @@ kj::Own<SqliteDatabase> DurableStorage::open(
+ 
+ kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
+     DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
+-    DurableWalChannel& channel) const {
++    DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const {
+   auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
+   auto image = databasePath(uniqueKey, name.storageId, name.facetId);
+   database.run("PRAGMA journal_mode=WAL;");
+   auto shipper = kj::heap<DurableLogShipper>(*directory, kj::mv(wal), kj::mv(image),
+-      kj::mv(name), database, timer, channel);
++      kj::mv(name), database, timer, channel, kj::mv(position), localOpenStartedNs);
+   shipper->reportAfterDatabaseClose();
+   return shipper;
+ }
+ 
++DurableStorage::WalImage DurableStorage::walImage(
++    kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const {
++  KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
++          isDigest(storageId), "invalid durable storage identity");
++  return {*directory, databasePath(uniqueKey, storageId, facet, "-wal"_kj)};
++}
++
+ kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(
+     kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
+   ensureNamespace(uniqueKey, storageId);
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+index 6ae359ba11fd4771079a8ea8c5cbd776c2f67cc3..8d8b3d2dd4787cc681eae1b2995dca052518231e 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.h
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+@@ -25,7 +25,12 @@ class DurableStorage {
+ 
+   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
+       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
+-      DurableWalChannel& channel) const;
++      DurableWalChannel& channel, DurableWalPosition position, uint64_t localOpenStartedNs) const;
++  struct WalImage {
++    const kj::Directory& directory;
++    kj::Path path;
++  };
++  WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
+ 
+   kj::Own<FacetTreeIndex> openFacetIndex(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
+   void deleteFacet(
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+index 4353a9ed2dd85e729f8f333cefc6bbbd86f3d6a5..012238142551dbce67ad31071fc072276489ff65 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -111,6 +111,12 @@ struct Command {
+   std::shared_ptr<Inbox> inbox;
+ };
+ 
++struct OpenPreparation {
++  const kj::Directory& directory;
++  kj::Path path;
++  kj::Own<kj::CrossThreadPromiseFulfiller<DurableWalPosition>> result;
++};
++
+ struct Shared {
+   explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
+ 
+@@ -400,12 +406,30 @@ struct ThreadedWalLog::Impl {
+     } catch (const kj::Exception& error) {
+       KJ_LOG(ERROR, "threaded WAL channel closed", error);
+     }
++  }), prepare([this] {
++    auto io = kj::setupAsyncIo();
++    for (;;) {
++      auto next = opens.next().wait(io.waitScope);
++      if (next == kj::none) return;
++      auto& open = KJ_ASSERT_NONNULL(next);
++      if (!open.result->isWaiting()) continue;
++      try {
++        open.result->fulfill(readDurableWalPosition(open.directory, open.path));
++      } catch (kj::Exception& error) {
++        open.result->reject(kj::mv(error));
++      }
++    }
+   }) {}
+ 
+-  ~Impl() noexcept(false) { shared->stop(); }
++  ~Impl() noexcept(false) {
++    opens.close();
++    shared->stop();
++  }
+ 
+   std::shared_ptr<Shared> shared;
++  Mailbox<OpenPreparation> opens;
+   kj::Thread owner;
++  kj::Thread prepare;
+ };
+ 
+ ThreadedWalLog::ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout)
+@@ -418,4 +442,12 @@ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t
+   return kj::heap<Home>(impl->shared, kj::mv(requestClose));
+ }
+ 
++kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
++    const kj::Directory& directory, kj::Path path) {
++  auto paf = kj::newPromiseAndCrossThreadFulfiller<DurableWalPosition>();
++  KJ_REQUIRE(ready() && impl->opens.push({directory, kj::mv(path), kj::mv(paf.fulfiller)}, 1, 1024),
++      STORAGE_UNAVAILABLE);
++  return kj::mv(paf.promise);
++}
++
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
+index 68aa7239aba071d0d81eb6d83aab031972c60e29..7b42c712aeffd64c07a33dd6a94ce417a007e46e 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.h
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
+@@ -14,6 +14,7 @@ class ThreadedWalLog {
+ 
+   bool ready() const;
+   kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t)> requestClose);
++  kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
+ 
+  private:
+   struct Impl;
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+index 71d139e1841e79885c883e894e89b11b8b65316f..0aca3dd85ee30ca181943790c600cafef1da7e52 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -116,6 +116,27 @@ void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_
+   s2 = b;
+ }
+ 
++void readWalHeader(const kj::ReadableFile& file, DurableWalPosition& position) {
++  KJ_REQUIRE(file.read(0, kj::arrayPtr(position.header.data(), position.header.size())) == 32);
++  const auto* header = position.header.data();
++  position.magic = getBe32(header);
++  KJ_REQUIRE((position.magic & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", position.magic);
++  walChecksum(position.magic & 1, header, 24, position.checksum1, position.checksum2);
++  KJ_REQUIRE(position.checksum1 == getBe32(header + 24) && position.checksum2 == getBe32(header + 28),
++      "WAL header checksum");
++  position.pageSize = getBe32(header + 8);
++  position.salt1 = getBe32(header + 16);
++  position.salt2 = getBe32(header + 20);
++}
++
++bool readWalFrame(const kj::byte* frame, uint32_t magic, uint32_t pageSize,
++    uint32_t salt1, uint32_t salt2, uint32_t& s1, uint32_t& s2) {
++  if (getBe32(frame + 8) != salt1 || getBe32(frame + 12) != salt2 || getBe32(frame) == 0) return false;
++  walChecksum(magic & 1, frame, 8, s1, s2);
++  walChecksum(magic & 1, frame + 24, pageSize, s1, s2);
++  return s1 == getBe32(frame + 16) && s2 == getBe32(frame + 20);
++}
++
+ kj::LowLevelAsyncIoProvider* logProvider = nullptr;
+ 
+ // The one channel to the node's replicator: the descriptor the process inherited. Every database's shipper writes
+@@ -337,6 +358,42 @@ class Replicator final: public DurableWalChannel, private kj::TaskSet::ErrorHand
+ 
+ }  // namespace
+ 
++DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path) {
++  DurableWalPosition position;
++  auto file = directory.tryOpenFile(path);
++  auto& wal = *KJ_UNWRAP_OR(file, return position);
++  const uint64_t size = wal.stat().size;
++  if (size < 32) return position;
++  readWalHeader(wal, position);
++  const auto pageSize = position.pageSize;
++  KJ_REQUIRE(pageSize >= 512 && pageSize <= 65536 && (pageSize & (pageSize - 1)) == 0,
++      "invalid WAL page size");
++  const size_t frameSize = 24 + pageSize;
++  auto buffer = kj::heapArray<kj::byte>(((1u << 20) / frameSize) * frameSize);
++  uint32_t s1 = position.checksum1, s2 = position.checksum2, frameCount = 0;
++  uint64_t offset = 32;
++  while (size - offset >= frameSize) {
++    const size_t bytes = kj::min<uint64_t>(size - offset, buffer.size());
++    const size_t frames = wal.read(offset, buffer.first(bytes)) / frameSize;
++    if (frames == 0) break;
++    for (size_t i = 0; i < frames; ++i) {
++      const auto* frame = buffer.begin() + i * frameSize;
++      if (!readWalFrame(frame, position.magic, pageSize, position.salt1, position.salt2, s1, s2)) {
++        return position;
++      }
++      KJ_REQUIRE(frameCount < UINT32_MAX, "WAL exceeds SQLite frame index");
++      ++frameCount;
++      if (getBe32(frame + 4) != 0) {
++        position.frames = frameCount;
++        position.checksum1 = s1;
++        position.checksum2 = s2;
++      }
++    }
++    offset += frames * frameSize;
++  }
++  return position;
++}
++
+ void setDurableLogProvider(kj::LowLevelAsyncIoProvider& provider) {
+   logProvider = &provider;
+ }
+@@ -432,7 +489,9 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+     DurableObjectName name,
+     SqliteDatabase& db,
+     kj::Timer& timer,
+-    DurableWalChannel& channel)
++    DurableWalChannel& channel,
++    kj::Maybe<DurableWalPosition> prepared,
++    uint64_t localOpenStartedNs)
+     : directory(directory),
+       walPath(kj::mv(walPath)),
+       databasePath(kj::mv(databasePath)),
+@@ -446,7 +505,19 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
+   // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
+   // object when they differ: the frames it never confirmed must not be read by anybody.
+-  if (walBytes() >= 32) {
++  KJ_IF_SOME(position, prepared) {
++    if (position.pageSize != 0) {
++      haveHeader = true;
++      magic = position.magic;
++      pageSize = position.pageSize;
++      salt1 = position.salt1;
++      salt2 = position.salt2;
++      cksum1 = position.checksum1;
++      cksum2 = position.checksum2;
++      readFrames = ackedFrames = hookFrames = position.frames;
++      header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
++    }
++  } else if (walBytes() >= 32) {
+     readNewFrames();
+     pendingFrames.clear();
+     pendingCount = 0;
+@@ -456,7 +527,7 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+   }
+   openId = channel.registerShipper(*this);
+   try {
+-    sendOpen();
++    sendOpen(localOpenStartedNs == 0 ? 0 : uint64_t(monoNs()) - localOpenStartedNs);
+   } catch (...) {
+     channel.unregisterShipper(*this);
+     throw;
+@@ -554,20 +625,15 @@ void DurableLogShipper::readNewFrames() {
+   uint64_t size = file->stat().size;
+   if (!haveHeader) {
+     if (size < 32) return;
+-    auto h = kj::heapArray<kj::byte>(32);
+-    KJ_REQUIRE(file->read(0, h) == 32);
+-    uint32_t m = getBe32(h.begin());
+-    KJ_REQUIRE((m & 0xFFFFFFFE) == 0x377f0682, "not a WAL header", m);
+-    uint32_t s1 = 0, s2 = 0;
+-    walChecksum(m & 1, h.begin(), 24, s1, s2);
+-    KJ_REQUIRE(s1 == getBe32(h.begin() + 24) && s2 == getBe32(h.begin() + 28), "WAL header checksum");
+-    magic = m;
+-    pageSize = getBe32(h.begin() + 8);
+-    salt1 = getBe32(h.begin() + 16);
+-    salt2 = getBe32(h.begin() + 20);
+-    cksum1 = s1;
+-    cksum2 = s2;
+-    header = kj::mv(h);
++    DurableWalPosition position;
++    readWalHeader(*file, position);
++    magic = position.magic;
++    pageSize = position.pageSize;
++    salt1 = position.salt1;
++    salt2 = position.salt2;
++    cksum1 = position.checksum1;
++    cksum2 = position.checksum2;
++    header = kj::heapArray(kj::arrayPtr(position.header.data(), position.header.size()));
+     haveHeader = true;
+     headerSent = false;
+     readFrames = 0;
+@@ -589,11 +655,7 @@ void DurableLogShipper::readNewFrames() {
+   uint32_t commitsHere = 0;
+   for (uint64_t i = 0; i < available; i++) {
+     const kj::byte* f = buffer.begin() + i * frameSize;
+-    if (getBe32(f + 8) != salt1 || getBe32(f + 12) != salt2) break;
+-    if (getBe32(f) == 0) break;
+-    walChecksum(magic & 1, f, 8, s1, s2);
+-    walChecksum(magic & 1, f + 24, pageSize, s1, s2);
+-    if (s1 != getBe32(f + 16) || s2 != getBe32(f + 20)) break;
++    if (!readWalFrame(f, magic, pageSize, salt1, salt2, s1, s2)) break;
+     if (getBe32(f + 4) != 0) {
+       lastCommitEnd = (i + 1) * frameSize;
+       lastCommitCk1 = s1;
+@@ -735,7 +797,7 @@ uint64_t DurableLogShipper::databaseBytes() {
+   return 0;
+ }
+ 
+-void DurableLogShipper::sendOpen() {
++void DurableLogShipper::sendOpen(uint64_t localOpenNs) {
+   if (!channel.enabled()) return;
+   Writer w;
+   w.u8(MSG_OPEN);
+@@ -751,6 +813,7 @@ void DurableLogShipper::sendOpen() {
+   w.u64(walBytes());
+   w.u64(databaseBytes());
+   w.u64(monoNs());
++  if (openId != 0) w.u64(localOpenNs);
+   channel.send(openId, w.finish(openId));
+ }
+ 
+@@ -789,6 +852,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
+   w.u64(start);
+   w.u64(took);
+   w.str(reason);
++  if (openId != 0) w.u64(bytes);
+   channel.send(openId, w.finish(openId));
+   // The next commit opens a new generation: a new header at the head of the truncated file, new salts, frames from
+   // one again.
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.h b/src/workerd/server/factory/coworkerd-wal-shipper.h
+index 389c14ab9dce2ad180986fd84e5f441ca7b42b9d..e81b7c14a13e5e9faaa020d48906d282cdd8582e 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.h
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.h
+@@ -20,6 +20,8 @@
+ #include <kj/map.h>
+ #include <kj/timer.h>
+ 
++#include <array>
++
+ namespace workerd::server {
+ 
+ // Registered by Bootstrap before serving; the inherited descriptor uses this provider.
+@@ -68,6 +70,15 @@ struct DurableObjectName {
+   }
+ };
+ 
++struct DurableWalPosition {
++  std::array<kj::byte, 32> header{};
++  uint32_t magic = 0, pageSize = 0, salt1 = 0, salt2 = 0;
++  uint32_t checksum1 = 0, checksum2 = 0, frames = 0;
++};
++
++// Reads the committed prefix of a cold image before its home opens SQLite.
++DurableWalPosition readDurableWalPosition(const kj::Directory& directory, const kj::Path& path);
++
+ class DurableLogShipper;
+ 
+ // A WAL shipper and its notifications stay on the SQLite connection's event loop.
+@@ -100,7 +111,9 @@ class DurableLogShipper {
+       DurableObjectName name,
+       SqliteDatabase& db,
+       kj::Timer& timer,
+-      DurableWalChannel& channel);
++      DurableWalChannel& channel,
++      kj::Maybe<DurableWalPosition> prepared = kj::none,
++      uint64_t localOpenStartedNs = 0);
+   ~DurableLogShipper() noexcept(false);
+   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
+ 
+@@ -188,7 +201,7 @@ class DurableLogShipper {
+   void maybeCheckpoint(kj::StringPtr reason);
+   uint64_t walBytes();
+   uint64_t databaseBytes();
+-  void sendOpen();
++  void sendOpen(uint64_t localOpenNs);
+ };
+ 
+ }  // namespace workerd::server
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 011ef2fb0904c062113d12ee52361c07bd3f5c9c..146ee13368100c65dacb141541f25d69a711aa5f 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1671,6 +1671,11 @@ struct ThreadState {
+   };
+   std::optional<DurableLoad> durableLoad;
+   kj::Own<server::DurableWalChannel> wal;
++  struct WalPreparation {
++    explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
++    kj::ForkedPromise<server::DurableWalPosition> ready;
++  };
++  std::map<uint64_t, std::weak_ptr<WalPreparation>> preparingWal;
+   struct DurableRoot {
+     kj::Own<Worker::Actor> actor;
+     server::DurableAdmission::Time lastUse;
+@@ -4817,7 +4822,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+     uint depth,
+     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
+     uint parentFacet = 0,
+-    kj::StringPtr facetName = ""_kj);
++    kj::StringPtr facetName = ""_kj,
++    server::DurableWalPosition position = {});
+ 
+ class LocalFacet final: public IoChannelFactory::ActorChannel {
+  public:
+@@ -5013,8 +5019,14 @@ kj::Promise<void> LocalFacet::initialize() {
+   KJ_REQUIRE(!stopped && binding != nullptr && slot && slot == binding->slot.lock(),
+       "durable test facets require a class in the original isolate copy");
+   className = kj::str(binding->name);
++  server::DurableWalPosition position;
++  if (tree->state.wal) {
++    auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
++    position = co_await tree->server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path));
++    KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
++  }
+   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
+-      binding->props.clone(), facet, depth, reservation, parentFacet, name);
++      binding->props.clone(), facet, depth, reservation, parentFacet, name, position);
+   if (tree->state.wal) co_await tree->state.wal->waitForOpen(
+       tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
+ }
+@@ -5044,21 +5056,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+     uint depth,
+     std::shared_ptr<DurableFacetReservation> reservation,
+     uint parentFacet,
+-    kj::StringPtr facetName) {
++    kj::StringPtr facetName,
++    server::DurableWalPosition position) {
+   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
+   auto *borrowedHooks = hooks.get();
+   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
+   auto *borrowedObserver = observer.get();
+   if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
+-  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName)](const ActorCache::SharedLru &, OutputGate &gate,
++  auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName), position](const ActorCache::SharedLru &, OutputGate &gate,
+                        ActorCache::Hooks &,
+                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
++    const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
+     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet);
+     if (tree->state.wal) {
+       auto shipper = tree->storage().ship(tree->uniqueKey,
+           {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
+             .facetId = facet, .parentFacetId = parentFacet, .facetName = kj::str(name)},
+-          *database, tree->state.io.provider->getTimer(), *tree->state.wal);
++          *database, tree->state.io.provider->getTimer(), *tree->state.wal, position, localOpenStartedNs);
+       auto* current = shipper.get();
+       KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
+       shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
+@@ -5096,6 +5110,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+   return {kj::mv(actor), borrowedHooks};
+ }
+ 
++kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
++    ThreadState& state, const DurableRoute& route, uint64_t tree) {
++  auto& slot = state.preparingWal[tree];
++  auto preparation = slot.lock();
++  if (!preparation) {
++    auto wal = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
++    preparation = std::make_shared<ThreadState::WalPreparation>(
++        server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path)));
++    slot = preparation;
++  }
++  KJ_DEFER(if (preparation.use_count() == 1) state.preparingWal.erase(tree));
++  co_return co_await preparation->ready.addBranch();
++}
++
+ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+     kj::String descriptor, Frankenvalue props) {
+   KJ_REQUIRE(!used, "one event per durable connection");
+@@ -5119,6 +5147,11 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
+       "durable class missing from pinned Worker");
+   auto found = state.durableRoots.find(ticket.tree);
++  server::DurableWalPosition position;
++  if (found == state.durableRoots.end() && state.wal) {
++    position = co_await prepareRootWal(server, state, route, ticket.tree);
++    found = state.durableRoots.find(ticket.tree);
++  }
+   if (found == state.durableRoots.end()) {
+     auto actorId = ObjectIdFactory(kj::StringPtr(route.key.namespaceId.c_str()))
+                        .idFromString(kj::str(route.key.objectId.c_str()));
+@@ -5133,7 +5166,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       {},
+     });
+     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
+-        Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0);
++        Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
++        nullptr, 0, ""_kj, position);
+     found = state.durableRoots
+                 .emplace(ticket.tree,
+                     ThreadState::DurableRoot{
