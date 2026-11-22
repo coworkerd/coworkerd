@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 
@@ -202,6 +204,95 @@ async function logQuota(cluster) {
     'new entries evict the oldest line across Workers of the same tenant');
 }
 
+async function durablePeerAck(cluster) {
+  const tenant = await cluster.tenant('durable-ack-test');
+  const worker = 'object';
+  await cluster.deploy(tenant, worker, `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Record extends DurableObject {
+      write(value) {
+        void this.ctx.storage.put('value', value);
+        return value;
+      }
+      read() { return this.ctx.storage.get('value'); }
+      async fetch(request) {
+        if (request.method === 'POST') return Response.json(this.write(await request.json()));
+        return Response.json(await this.read() ?? null);
+      }
+    }
+    export class Neighbor extends DurableObject {
+      fetch() { return new Response('neighbor'); }
+    }
+    export default {
+      async fetch(request, env) {
+        const path = new URL(request.url).pathname;
+        if (path.endsWith('/neighbor')) return env.NEIGHBORS.getByName('neighbor').fetch(request);
+        const record = env.RECORDS.getByName('record');
+        if (path.endsWith('/rpc')) return Response.json(await record.write(await request.json()));
+        return record.fetch(request);
+      },
+    };
+  `, { wrangler: {
+    durable_objects: { bindings: [
+      { name: 'RECORDS', class_name: 'Record' },
+      { name: 'NEIGHBORS', class_name: 'Neighbor' },
+    ] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Record', 'Neighbor'] }],
+  } });
+  const [ingress] = cluster.nodes;
+  const path = `/${tenant.name}/${worker}`;
+  const read = suffix => request(cluster.urls[ingress], path + suffix);
+  await eventually('both objects serve reads', async () => {
+    assert.equal(json(await read(''), 200, 'warm record read'), null);
+    assert.deepEqual(await read('/neighbor'), { status: 200, text: 'neighbor' });
+  });
+  const owner = await eventually('record has a live owner', async () => {
+    const { owners } = await cluster.api(`${tenant.path}/workers/${worker}/namespaces/Record`, { token: tenant.token });
+    assert.equal(owners.length, 1);
+    assert.ok(!owners[0].released && cluster.nodes.includes(owners[0].nodeId));
+    return owners[0].nodeId;
+  });
+  const peers = cluster.nodes.filter(node => node !== owner);
+  const warm = await workerCall(cluster, ingress, tenant, worker, { method: 'POST', body: 'warm' });
+  assert.equal(json(warm, 200, 'warm write'), 'warm');
+  const before = await cluster.state(owner);
+  assert.equal(before.durableLog.peers.want, peers.length);
+  const gate = join(cluster.peerAckGate, 'hold');
+  const earlyResponses = [];
+  for (const [suffix, value] of [['', 'http'], ['/rpc', 'rpc']]) {
+    await eventually('both peers finished releasing earlier acknowledgements', async () => {
+      const observations = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest === 0));
+    });
+    await writeFile(gate, '');
+    let receivedHeaders = false;
+    const write = fetch(cluster.urls[ingress] + path + suffix, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(value), signal: AbortSignal.timeout(10000),
+    }).then(async response => {
+      receivedHeaders = true;
+      return { status: response.status, text: await response.text() };
+    }).catch(error => ({ error }));
+    let result;
+    try {
+      await eventually(`both peers hold positive append acknowledgements for the ${value} write`, async () => {
+        const observations = await Promise.all(peers.map(node => cluster.state(node)));
+        assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest > 0));
+      }, { timeout: 3000, interval: 25 });
+      assert.deepEqual(await read('/neighbor'), { status: 200, text: 'neighbor' });
+      await delay(250);
+      if (receivedHeaders) earlyResponses.push(value);
+    } finally {
+      await unlink(gate);
+      result = await write;
+    }
+    if (result.error) throw result.error;
+    assert.equal(json(result, 200, `${value} write after acknowledgement release`), value);
+    assert.equal(json(await read(''), 200, `${value} stored value`), value);
+  }
+  assert.deepEqual(earlyResponses, [], 'responses arrived while both peers held their acknowledgements');
+}
+
 async function durableTakeover(cluster) {
   const tenant = await cluster.tenant('durable-test');
   await cluster.deploy(tenant, 'object', `
@@ -312,4 +403,5 @@ async function durableTakeover(cluster) {
 
 // The only node-level fault runs last so earlier cases keep all three nodes.
 export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
-  'process-replacement': processReplacement, 'log-quota': logQuota, 'durable-takeover': durableTakeover };
+  'process-replacement': processReplacement, 'log-quota': logQuota,
+  'durable-peer-ack': durablePeerAck, 'durable-takeover': durableTakeover };

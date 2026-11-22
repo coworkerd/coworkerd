@@ -189,7 +189,7 @@ covers the configuration, the sandbox (sections 3 and 4: the default compose fil
 prepared as section 4 describes runs it with `docker-compose.sandbox.yml`) and operations.
 
 The [cluster integration suite](tests/cluster/README.md) starts its own three-node cluster and object store. Use its
-runner to check a change on Linux, with all six cases or a single case. Linux pull-request CI runs the same command.
+runner to check a change on Linux, with all cases or a single case. Linux pull-request CI runs the same command.
 
 ## Sending a change
 

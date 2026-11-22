@@ -440,6 +440,8 @@ public:
     std::string refusal;
   };
   AppendResult appendIncoming(uint64_t streamId, std::string_view records, bool partial = false);
+  bool peerAckGateClosedForTest() const;
+  kj::Promise<void> waitForPeerAckGateForTest();
   void trimIncoming(uint64_t streamId, uint64_t upTo);
   void dropIncoming(uint64_t streamId, const std::vector<uint64_t>& sequences);
   void closeIncoming(uint64_t streamId);
@@ -1028,6 +1030,8 @@ private:
   uint64_t leaseLostEpoch = 0, leaseWakeGeneration = 0;
   double leaseWakeAtMs = 0;
   std::string slowFlushForTest;
+  std::filesystem::path peerAckGateForTest;
+  uint32_t heldPeerAcksForTest = 0;
   struct OwnerRead {
     kj::ForkedPromise<OwnerHeartbeat> answer;
     double atMs;
