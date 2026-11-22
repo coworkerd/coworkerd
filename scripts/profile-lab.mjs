@@ -42,7 +42,8 @@ let server = null;
 export function binaries(directory = BIN) {
   const hash = path => existsSync(path) ? sha256(readFileSync(path)) : null;
   return { coworkerdServer: hash(`${directory}/coworkerd-server`), coworkerdLauncher: hash(`${directory}/coworkerd-launcher`),
-    workerd: hash(`${directory}/workerd`), runtime: hash(`${REPO}/runtime/runtime.js`) };
+    workerd: hash(`${directory}/workerd`), coworkerdThreaded: hash(`${directory}/coworkerd-threaded`),
+    runtime: hash(`${REPO}/runtime/runtime.js`) };
 }
 
 export async function request(path, options = {}) {

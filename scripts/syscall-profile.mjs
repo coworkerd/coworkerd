@@ -21,7 +21,7 @@
 //           change); then the Server's SIGTERM (the exit)
 //     idle  idle eviction at 2 s: an isolate removed, destroyed and recreated
 // Environment: V45_BIN (the binaries to profile), V45_STACK, V45_MACHINE (names kept from the tool's first version).
-import { chmod, mkdir, readdir } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import * as h from "./profile-lab.mjs";
 import * as w from "./profile-workers.mjs";
@@ -36,8 +36,17 @@ await mkdir(traceDir, { recursive: true });
 // directory it cannot write would leave every wrapper waiting for a tracer that never attaches.
 await chmod(traceDir, 0o777);
 const workerd = `${h.BIN}/workerd`;
+const threaded = `${h.BIN}/coworkerd-threaded`;
+// The node launches ordinary processes through the sibling threaded executable.
+// Keep both wrappers together and trace each binary under its actual process identity.
+const wrappers = `${output}/wrappers`;
+await mkdir(wrappers, { recursive: true });
+for (const name of ["workerd", "coworkerd-threaded"]) {
+  await copyFile(`${h.REPO}/scripts/syscall-trace-wrapper.sh`, `${wrappers}/${name}`);
+  await chmod(`${wrappers}/${name}`, 0o755);
+}
 const data = { schemaVersion: 1, round: "v45", kind: "profile", run, machine: process.env.V45_MACHINE ?? null,
-  traceProgram: workerd, startedAtUnixMs: Date.now(), windows: [], passed: false };
+  traceProgram: workerd, traceThreadedProgram: threaded, startedAtUnixMs: Date.now(), windows: [], passed: false };
 const windows = data.windows;
 const t0 = Date.now();
 const note = (...values) => console.error(`[v45-profile] ${((Date.now() - t0) / 1000).toFixed(1)}s`, ...values);
@@ -85,7 +94,8 @@ async function census() {
     state: e.state, sandbox: e.sandbox, observed: h.observe(e.pid, process.pid) }));
 }
 
-const environment = { COWORKERD_TRACE_DIR: traceDir, COWORKERD_TRACE_PROGRAM: workerd };
+const environment = { COWORKERD_TRACE_DIR: traceDir, COWORKERD_TRACE_PROGRAM: workerd,
+  COWORKERD_TRACE_THREADED_PROGRAM: threaded };
 try {
   if (run === "main") {
     const workers = { ordinary: w.ordinary, "bytes-heavy": w.bytesHeavy, probe: w.sandboxProbe, "cpu-tenant": w.cpuTenant,
@@ -94,7 +104,7 @@ try {
       "gc-tenant": w.gcTenant };
     for (const id of w.isolateIds(20)) workers[id] = w.ordinary;
     Object.assign(data, await h.setup({ sandbox: "off", workers, env: environment, trace: true,
-      workerdPath: `${h.REPO}/scripts/syscall-trace-wrapper.sh` }));
+      workerdPath: `${wrappers}/workerd`, config: { cpuLimitMs: 200 } }));
     data.afterStartup = await census();
     await window("idle", async () => { await h.delay(10000); return {}; });
     await window("cold", async () => {
@@ -143,7 +153,7 @@ try {
     data.beforeShutdown = await census();
   } else if (run === "idle") {
     Object.assign(data, await h.setup({ sandbox: "off", workers: { ordinary: w.ordinary }, env: environment, trace: true,
-      workerdPath: `${h.REPO}/scripts/syscall-trace-wrapper.sh`,
+      workerdPath: `${wrappers}/workerd`,
       config: { idleEvictMs: 2000, placement: { homeProbability: 0, idleMs: 1000 } } }));
     data.afterStartup = await census();
     await window("first", () => repeat("/ordinary", 3));

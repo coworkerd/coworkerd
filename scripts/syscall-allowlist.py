@@ -196,7 +196,8 @@ def main() -> int:
         profiles.append({"path": os.path.relpath(path, ROOT) if str(path).startswith(str(ROOT)) else str(path),
                          "run": run, "sha256": digest(Path(path)),
                          "windows": [w.get("name") for w in data.get("windows", [])],
-                         "processes": data.get("processes"), "workerdSha256": data.get("workerdSha256")})
+                         "processes": data.get("processes"), "workerdSha256": data.get("workerdSha256"),
+                         "coworkerdThreadedSha256": data.get("coworkerdThreadedSha256")})
         for phase, counts in data["totals"].items():
             for call, count in counts.items():
                 (startup if phase == "startup" else steady).add(call)
