@@ -6,9 +6,10 @@ one actor interleave across awaits: their combined CPU must exceed a single even
 each stays below it, then one event alone exceeds its budget across repeated awaits. The latter
 must reset only its actor tree, preserving stored state, the neighboring object and the ready child.
 
-The `load-cancel` mode holds the first definition's cold load open with the source delay hook,
-resets its only caller, and then wakes a second definition on the same home. The second definition
-must answer with its own code, the canceled load must be counted as canceled, and the first
+The `load-cancel` mode holds the first definition's cold load open with the source delay hook
+until its caller's lease has run out (`COWORKERD_LEASE_TTL_MS`), which ends the home's session and
+the load's only waiter. It then wakes a second definition on the same home. The second definition
+must answer with its own code, the abandoned load must be counted as canceled, and the first
 definition must still load afterwards on the other home.
 
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
@@ -127,7 +128,8 @@ const env = {
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
   ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
-  ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2000' } : {}),
+  ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
+    COWORKERD_LEASE_TTL_MS: '4000' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -702,40 +704,25 @@ try {
       assert.equal(response.status, 200, `${path}: ${body}\n${diagnostics}`);
       return JSON.parse(body);
     };
-    const sourceDelayMs = Number(env.COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST);
     const before = await readThreaded(socketPath);
     assert.equal(before.durableAdmission.trees, 0);
-    // Each child delays its first source fetch. The ordinary child spends its delay first;
-    // the durable child's delay then holds the first definition's cold load open.
-    let caller;
-    const aborted = new Promise((resolve, reject) => {
-      caller = get(`http://127.0.0.1:${port}/first?definition`, response => {
-        response.resume();
-        reject(new Error('the canceled request unexpectedly produced a response'));
-      });
-      caller.once('error', resolve);
+    // Each child delays its first source fetch. The ordinary child spends its delay first, so
+    // the durable child's delayed cold load is still open when the request's lease runs out.
+    // The home then ends the session, and with it the only waiter of that load.
+    const started = performance.now();
+    const expired = await fetch(`http://127.0.0.1:${port}/first?definition`, {
+      signal: AbortSignal.timeout(Number(env.COWORKERD_LEASE_TTL_MS) + 8000),
     });
-    aborted.catch(() => {});
-    let loading;
-    for (const until = performance.now() + sourceDelayMs + 4000; performance.now() < until;) {
-      if ((await readAdmission(socketPath)).running === 1) {
-        loading = performance.now();
-        break;
-      }
-      await delay(10);
-    }
-    assert.ok(loading, `the first definition never reached its home\n${diagnostics}`);
-    await delay(100);
-    // A TCP reset makes the disconnection observable while response headers are pending.
-    caller.socket.resetAndDestroy();
-    assert.equal((await aborted).code, 'ECONNRESET');
+    const expiredBody = await expired.text();
+    assert.notEqual(expired.status, 200, `the first request outlived its lease: ${expiredBody}`);
+    const expiredAfterMs = Math.round(performance.now() - started);
     let drained;
-    for (const until = loading + sourceDelayMs - 500; performance.now() < until;) {
+    for (const until = performance.now() + 3000; performance.now() < until;) {
       drained = await readAdmission(socketPath);
       if (drained.trees === 0 && drained.running === 0) break;
       await delay(10);
     }
-    assert.equal(drained.trees, 0, 'the canceled caller must release its tree while the cold load is held open');
+    assert.equal(drained.trees, 0, `the expired caller must release its tree: ${JSON.stringify(drained)}`);
     assert.equal(drained.running, 0);
     assert.equal(drained.residentRoots, 0);
     // The second definition is placed on the home whose cold load lost its only waiter.
@@ -759,7 +746,8 @@ try {
     assert.equal(sameChild.pid, processInfo.pid);
     assert.equal(sameChild.generation, processInfo.generation);
     assert.equal(sameChild.state, 'ready');
-    console.log(JSON.stringify({scenario, canceledColdLoad: true, definitionsKeptApart: true, admission: after}));
+    console.log(JSON.stringify({scenario, canceledColdLoad: true, definitionsKeptApart: true,
+      expiredAfterMs, expiredStatus: expired.status, admission: after}));
   } else if (warmCopies) {
     const request = async (path, options) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
