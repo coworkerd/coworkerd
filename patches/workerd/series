@@ -59,6 +59,10 @@
 0063-durable-storage-lifecycle-test.patch
 0064-durable-load-waiters.patch
 0065-durable-session-scope.patch
+0066-durable-reset-progress.patch
+0067-durable-facet-reset-lifetime.patch
+0068-durable-process-memory-progress.patch
+0069-durable-process-memory-recovery.patch
 0080-threaded-wal-channel.patch
 0081-threaded-durable-storage.patch
 0082-threaded-durable-fixture-state.patch

@@ -20,10 +20,10 @@ index b57824f563705e1ca1b22c89e3dec20ebd8be31d..7ffc9eb8f52a9e4866c067f43de1f576
          "//src/workerd/util:sqlite",
          "@capnp-cpp//src/kj",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 93e3a521e390b39f0de0b74a4c4c4508a0a247ed..9ecb73ff763db7cd0cf1cc3f0712cdd61a0778aa 100644
+index 493a41072c9fc0471731dfe8a56f20c3c8eeb731..7252936e58098d6198f467dc73f6ecf45cb9d003 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2876,7 +2876,8 @@ struct ThreadedServer {
+@@ -2903,7 +2903,8 @@ struct ThreadedServer {
          ",\"overloaded\":" + std::to_string(state.overloads) +
          ",\"expired\":" + std::to_string(state.expired) + "}}";
      if (publish) {
@@ -33,7 +33,7 @@ index 93e3a521e390b39f0de0b74a4c4c4508a0a247ed..9ecb73ff763db7cd0cf1cc3f0712cdd6
            durableHomeSessions.load(), state.waiting);
      }
      if (appendTo) {
-@@ -3031,7 +3032,7 @@ struct ThreadedServer {
+@@ -3058,7 +3059,7 @@ struct ThreadedServer {
      if (thread.home && durableLog) {
        state.wal = durableLog->attachHome([&state](uint64_t openId) {
          for (auto& [id, root]: state.durableRoots) {
@@ -42,7 +42,7 @@ index 93e3a521e390b39f0de0b74a4c4c4508a0a247ed..9ecb73ff763db7cd0cf1cc3f0712cdd6
            root.closeRequested = true;
            break;
          }
-@@ -5010,7 +5011,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5040,7 +5041,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
        if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
        auto& alarmHooks = *alarms;
        return kj::heap<ActorSqlite>(kj::mv(database), gate,

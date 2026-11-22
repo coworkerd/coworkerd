@@ -5,10 +5,10 @@ Subject: [PATCH] Refuse facet cloning in the persistent durable role
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e747e48c9ddc9b73bc5f9839cfcfc70378fd977a..7f8f8bbf704c021f42b78c60ae0171be52f6a7ef 100644
+index 03bcf99b5fef0413767aea11fe13d04bdaa1c8b0..e95897e47d85953b0840ee2dc1a2881c37d92c2b 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -4881,6 +4881,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4911,6 +4911,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
    }
  
    void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {

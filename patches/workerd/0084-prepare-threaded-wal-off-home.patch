@@ -360,10 +360,10 @@ index 389c14ab9dce2ad180986fd84e5f441ca7b42b9d..e81b7c14a13e5e9faaa020d48906d282
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135b41b1de5 100644
+index 79089ed5be3ca077230b804f14481a14e5b7b2ea..e5783c31920786c393fe0b18dd754aef445c810d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1660,6 +1660,11 @@ struct ThreadState {
+@@ -1671,6 +1671,11 @@ struct ThreadState {
    };
    std::optional<DurableLoad> durableLoad;
    kj::Own<server::DurableWalChannel> wal;
@@ -375,7 +375,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
    struct DurableRoot {
      kj::Own<Worker::Actor> actor;
      server::DurableAdmission::Time lastUse;
-@@ -4760,7 +4765,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -4790,7 +4795,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      uint depth,
      std::shared_ptr<DurableFacetReservation> reservation = nullptr,
      uint parentFacet = 0,
@@ -385,7 +385,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
  
  class LocalFacet final: public IoChannelFactory::ActorChannel {
   public:
-@@ -4956,8 +4962,14 @@ kj::Promise<void> LocalFacet::initialize() {
+@@ -4986,8 +4992,14 @@ kj::Promise<void> LocalFacet::initialize() {
    KJ_REQUIRE(!stopped && binding != nullptr && slot && slot == binding->slot.lock(),
        "durable test facets require a class in the original isolate copy");
    className = kj::str(binding->name);
@@ -401,7 +401,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
    if (tree->state.wal) co_await tree->state.wal->waitForOpen(
        tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
  }
-@@ -4987,21 +4999,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5017,21 +5029,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      uint depth,
      std::shared_ptr<DurableFacetReservation> reservation,
      uint parentFacet,
@@ -428,7 +428,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
        auto* current = shipper.get();
        KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
        shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
-@@ -5039,6 +5053,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5069,6 +5083,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    return {kj::mv(actor), borrowedHooks};
  }
  
@@ -449,7 +449,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
  kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
      kj::String descriptor, Frankenvalue props) {
    KJ_REQUIRE(!used, "one event per durable connection");
-@@ -5062,6 +5090,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5092,6 +5120,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
        "durable class missing from pinned Worker");
    auto found = state.durableRoots.find(ticket.tree);
@@ -461,7 +461,7 @@ index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135
    if (found == state.durableRoots.end()) {
      auto actorId = ObjectIdFactory(kj::StringPtr(route.key.namespaceId.c_str()))
                         .idFromString(kj::str(route.key.objectId.c_str()));
-@@ -5076,7 +5109,8 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5106,7 +5139,8 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
        {},
      });
      auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),

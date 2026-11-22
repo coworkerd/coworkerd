@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 19:06:00 +0800
+Subject: [PATCH] Refuse durable process pressure without waiting on an absent
+ reclaimer
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index bb0b1e04e3cd8995c6b680cf49b45c18affa7be5..8a8373db2082aebd9e1979e44d884229e95231b8 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -292,9 +292,14 @@ kj::Exception limitException(LimitCause cause);
+ constexpr uint64_t OWN_CAGE_HEAP = (4ull << 30) - (256ull << 20);
+ 
+ struct ResourceBudget {
++  enum class ReclaimMode { BACKGROUND, NONE };
+   static constexpr uint64_t MiB = 1ull << 20;
+-  ResourceBudget(uint64_t maximum, uint32_t residents, uint32_t callThreads)
+-      : memoryMaximum(maximum),
++  ResourceBudget(uint64_t maximum,
++      uint32_t residents,
++      uint32_t callThreads,
++      ReclaimMode reclaimMode = ReclaimMode::BACKGROUND)
++      : reclaimMode(reclaimMode),
++        memoryMaximum(maximum),
+         admissionMaximum(maximum -
+             kj::min(maximum / 10, kj::max<uint64_t>(8 * MiB, uint64_t(callThreads) * MiB))),
+         addressMaximum(v8::IsolateGroup::CanCreateNewGroups()
+@@ -312,6 +317,7 @@ struct ResourceBudget {
+     KJ_REQUIRE(residents > 0 && residents <= (v8::IsolateGroup::CanCreateNewGroups() ? 65536 : 1840),
+         "invalid resident budget for this build");
+   }
++  const ReclaimMode reclaimMode;
+   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
+   // The node's per-process limit, and the one in force: the first time the address space has no
+   // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
+@@ -352,6 +358,8 @@ struct ResourceBudget {
+     pass();
+   }
+   bool reclaim(uint64_t additionalMemory = 0) {
++    // Durable homes reclaim their own actors on the event loop; none can finish this wait.
++    if (reclaimMode == ReclaimMode::NONE) return false;
+     std::unique_lock lock(mutex);
+     auto epoch = reclaimEpoch;
+     requestReclaimLocked(additionalMemory);
+@@ -2310,7 +2318,9 @@ struct ThreadedServer {
+                         ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
+                         : 0),
+             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
+-            limit)),
++            limit,
++            this->durableTestStorage ? ResourceBudget::ReclaimMode::NONE
++                                     : ResourceBudget::ReclaimMode::BACKGROUND)),
+         tenantBudget(std::make_shared<TenantBudget>(
+             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
+         subrequestBudget(limit, tenantBudget->limit) {

@@ -127,6 +127,8 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
 | `node-threaded-durable-storage-lifecycle` (Linux only) | Both kernel binaries, for same-object writes/reads, empty storage after actual child and node restarts, and unchanged configuration |
+| `node-threaded-durable-process-memory` (Linux only) | Both kernel binaries, for prompt process-budget refusal and recovery after buffer and heap allocations, preserving stored values and child |
+| `node-threaded-durable-reset-progress` (Linux only) | Both kernel binaries, for application-abort and CPU-reset recovery under HTTP retries within two seconds, with storage, neighbor and child preserved |
 | `node-threaded-durable-cpu-events` (Linux only) | Both kernel binaries, for actual per-event CPU attribution during interleaved HTTP awaits and cumulative CPU enforcement on the original event |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-home-reservation` (Linux only) | Both kernel binaries, for home reservation before acknowledgement, refusal with all homes occupied, and credit return on cancellation |
