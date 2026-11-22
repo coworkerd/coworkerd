@@ -15,13 +15,16 @@ const httpLifecycle = scenario === 'http';
 const events = scenario === 'events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
+const httpMemory = scenario === 'http-memory';
+const memoryPlacementMiB = httpMemory ? Number(busyArg) : 64;
+if (httpMemory) assert.ok(Number.isInteger(memoryPlacementMiB) && memoryPlacementMiB >= 8 && memoryPlacementMiB <= 64);
 const boundedEvents = events || httpIsolation;
 const queueLimit = scenario === 'queue-limit';
 const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate;
+const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -37,13 +40,14 @@ const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
+  ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
   ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
-  ...(measure || placement || httpLifecycle ? {
+  ...(measure || placement || httpLifecycle || httpMemory ? {
     COWORKERD_DO_TEST_HOME_COUNT: homeArg,
     COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
     ...(placement ? { COWORKERD_DO_TEST_BUSY_MS: busyArg } : {}),
@@ -56,8 +60,9 @@ const workerId = 'counter';
 const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
+  ...(httpMemory ? { memoryLimitMiB: 128 } : {}),
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
@@ -172,6 +177,14 @@ try {
           let checksum = 1;
           for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
           return Response.json({instance: this.instance, isolate, checksum});
+        }
+        if (query.has("allocateMiB")) {
+          const size = Number(query.get("allocateMiB"));
+          if (!Number.isInteger(size) || size < 1 || size > 120) {
+            return new Response("invalid allocation size", {status: 400});
+          }
+          this.allocation = new Uint8Array(size * 1024 * 1024);
+          this.allocation.fill(1);
         }
         if (query.has("hold")) {
           this.latch = Promise.withResolvers();
@@ -442,6 +455,79 @@ try {
     }
     console.log(JSON.stringify({scenario, pid: processInfo.pid, generation: processInfo.generation,
       wakes, admission: await readAdmission(socketPath)}));
+  } else if (httpMemory) {
+    const request = async (path, options, status = 200) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, status, `${path}: ${body}\n${diagnostics}`);
+      return JSON.parse(body);
+    };
+    const untilState = async (condition, label) => {
+      let state;
+      for (const until = performance.now() + 4000; performance.now() < until;) {
+        state = await readAdmission(socketPath);
+        if (condition(state)) return state;
+        await delay(10);
+      }
+      assert.fail(`${label}: ${JSON.stringify(state)}`);
+    };
+    const resources = {baseline: await readProcessResources(processInfo.pid)};
+    const initial = await request('/memory-idle', {method: 'POST', body: 'idle value'});
+    const moderateMiB = memoryPlacementMiB + 8;
+    await request(`/memory-idle?allocateMiB=${moderateMiB}`);
+    const evicted = await untilState(state => state.pressureRetirements > 0 && state.trees === 0,
+      'idle-first memory eviction');
+    assert.equal(evicted.isolateResets, 0);
+    assert.equal(evicted.reservedBytes, 0);
+    resources.afterIdleEviction = await readProcessResources(processInfo.pid);
+    const reopened = await request('/memory-idle');
+    assert.notEqual(reopened.instance, initial.instance);
+    assert.equal(reopened.counter, initial.counter);
+    console.log(JSON.stringify({event: 'http-idle-first-memory-eviction-passed', admission: evicted}));
+
+    const heldInitial = await request('/memory-held', {method: 'POST', body: 'held value'});
+    const held = request(`/memory-held?allocateMiB=${moderateMiB}&hold`);
+    held.catch(() => {});
+    const closed = await untilState(state => state.placementClosedHomes > 0, 'closed memory placement');
+    assert.equal(closed.isolateResets, 0);
+    assert.ok(closed.maxHomeMemoryBytes >= memoryPlacementMiB * 1024 * 1024);
+    assert.equal(await request('/memory-held?waiting'), true);
+    const cold = await request('/memory-cold', {method: 'POST', body: 'other copy'});
+    assert.notEqual(cold.isolate, heldInitial.isolate);
+    resources.closedPlacement = await readProcessResources(processInfo.pid);
+    await request('/memory-held?release');
+    assert.deepEqual(await held, heldInitial);
+    const reclaimed = await untilState(state => state.pressureRetirements > closed.pressureRetirements &&
+      state.placementClosedHomes === 0, 'reclaim released memory');
+    assert.equal(reclaimed.isolateResets, 0);
+    assert.deepEqual(await request('/memory-cold'), cold);
+    console.log(JSON.stringify({event: 'http-memory-placement-passed', admission: closed,
+      coldIsolate: cold.isolate, heldIsolate: heldInitial.isolate}));
+
+    const hardInitial = await request('/memory-hard', {method: 'POST', body: 'hard value'});
+    const resetting = request('/memory-hard?allocateMiB=118&hold', undefined, 503);
+    resetting.catch(() => {});
+    const hard = await untilState(state => state.isolateResets === 1, 'hard isolate reset');
+    assert.equal((await resetting).code, 'MEMORY_LIMIT_EXCEEDED');
+    assert.equal(hard.actorResets, 0);
+    const recovered = await request('/memory-hard');
+    assert.notEqual(recovered.instance, hardInitial.instance);
+    assert.notEqual(recovered.isolate, hardInitial.isolate);
+    assert.equal(recovered.counter, hardInitial.counter);
+    resources.afterReset = await readProcessResources(processInfo.pid);
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    const final = await waitForAdmission(socketPath, 0);
+    assert.equal(final.isolateResets, 1);
+    console.log(JSON.stringify({scenario, memoryPlacementMiB, moderateMiB, resources,
+      idleFirst: evicted, closed, hard, final, pid: sameChild.pid, generation: sameChild.generation}));
   } else if (httpOutputGate) {
     // Warm the actor and drain initialization before observing the unawaited write.
     const initial = await fetch(`http://127.0.0.1:${port}/output`, {
