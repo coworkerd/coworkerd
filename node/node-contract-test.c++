@@ -448,21 +448,27 @@ void memoryCulprit() {
       "\"versionId\":\"v1\",\"invocationId\":\"in-flight\",\"isolate\":\"i\",\"memoryLimitMiB\":128,"
       "\"oomIsolateHeapReported\":true,\"oomIsolateHeapBytes\":110592}"), report);
   KJ_REQUIRE(report.getOomIsolateHeapReported() && report.getOomIsolateHeapBytes() == 110592 &&
-      !memoryCulpritOwnsOom(report.asReader()));
+      !memoryCulpritOwnsOom(report.asReader(), false));
   const auto limitBytes = uint64_t(128) << 20;
   report.setOomIsolateHeapBytes(limitBytes);
-  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()), "last allocator in a shared cage, even at its limit");
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader(), false), "last allocator in a shared cage, even at its limit");
   report.setOomIsolateLocal(true);
-  KJ_REQUIRE(memoryCulpritOwnsOom(report.asReader()));
+  KJ_REQUIRE(memoryCulpritOwnsOom(report.asReader(), false));
   report.setOomIsolateHeapBytes(limitBytes - 1);
-  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader(), false));
   report.setOomIsolateHeapBytes(limitBytes);
   report.setOomIsolateHeapReported(false);
-  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader()));
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader(), false));
   capnp::MallocMessageBuilder stock;
   auto old = stock.initRoot<v1::rpc::CpuReport>();
   capnp::JsonCodec().decode(kj::StringPtr("{\"event\":\"memory-culprit\",\"pid\":7,\"memoryLimitMiB\":128}"), old);
-  KJ_REQUIRE(!old.getOomIsolateHeapReported() && !memoryCulpritOwnsOom(old.asReader()));
+  KJ_REQUIRE(!old.getOomIsolateHeapReported() && !memoryCulpritOwnsOom(old.asReader(), false));
+  KJ_REQUIRE(memoryCulpritOwnsOom(old.asReader(), true), "legacy durable OOM evidence");
+  report.setOomIsolateLocal(false);
+  report.setOomIsolateHeapReported(true);
+  KJ_REQUIRE(memoryCulpritOwnsOom(report.asReader(), true), "threaded durable heap evidence");
+  report.setOomIsolateHeapBytes(limitBytes - 1);
+  KJ_REQUIRE(!memoryCulpritOwnsOom(report.asReader(), true));
 }
 void package() {
   TempDir path;

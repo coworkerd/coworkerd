@@ -1,13 +1,14 @@
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { cases } from './cases.mjs';
+import { cases, fatalAttribution } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
 
 async function main(args) {
-  const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(cases).join('|')}]`;
+  const all = { ...cases, 'fatal-attribution': fatalAttribution };
+  const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
   if (args[0] === '--help' && args.length === 1) return console.log(help);
-  if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(cases, args[1]))) {
+  if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(all, args[1]))) {
     console.error(help);
     process.exitCode = 2;
     return;
@@ -17,8 +18,7 @@ async function main(args) {
   if (fatalTest && !testBinary) {
     throw new Error('fatal-attribution requires COWORKERD_CLUSTER_FATAL_TEST_BINARY');
   }
-  const selected = args[1] ? [[args[1], cases[args[1]]]]
-    : Object.entries(cases).filter(([name]) => name !== 'fatal-attribution');
+  const selected = args[1] ? [[args[1], all[args[1]]]] : Object.entries(cases);
   const controller = new AbortController();
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));

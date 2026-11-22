@@ -51,10 +51,12 @@ std::string confirmedCpuCulprit(Process& p, Limits limits, Labelled labelled, Co
 
 // The last allocator's heap sample cannot prove ownership of a shared-cage OOM,
 // even when the sample reaches the Worker's limit.
-inline bool memoryCulpritOwnsOom(v1::rpc::CpuReport::Reader report) {
-  return report.getOomIsolateLocal() && report.getOomIsolateHeapReported() &&
-      report.getMemoryLimitMiB() > 0 &&
-      report.getOomIsolateHeapBytes() >= (uint64_t(report.getMemoryLimitMiB()) << 20);
+inline bool memoryCulpritOwnsOom(v1::rpc::CpuReport::Reader report, bool durable) {
+  const bool heapReported = report.getOomIsolateHeapReported();
+  const auto limit = report.getMemoryLimitMiB();
+  const bool heapAtLimit = report.getOomIsolateHeapBytes() >= (uint64_t(limit) << 20);
+  if (durable) return !heapReported || heapAtLimit;
+  return report.getOomIsolateLocal() && heapReported && limit > 0 && heapAtLimit;
 }
 
 // A fatal row can match a completed dispatch in the same process generation.

@@ -139,7 +139,7 @@ async function processReplacement(cluster) {
     'the first Worker call after the replacement is ready succeeds');
 }
 
-async function fatalAttribution(cluster) {
+export async function fatalAttribution(cluster) {
   const [node, peer] = cluster.nodes;
   const tenant = await cluster.tenant('fatal-test');
   const neighbor = await cluster.tenant('fatal-neighbor');
@@ -504,5 +504,5 @@ async function durableTakeover(cluster) {
 
 // The only node-level fault runs last so earlier cases keep all three nodes.
 export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
-  'process-replacement': processReplacement, 'fatal-attribution': fatalAttribution, 'log-quota': logQuota,
+  'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-peer-ack': durablePeerAck, 'durable-takeover': durableTakeover };

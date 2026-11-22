@@ -2979,7 +2979,7 @@ public:
   bool memoryExit(Slot& slot, ProcessGeneration& p, int status) {
     const auto& row = p.oomCulpritRow;
     std::string offender = "null";
-    const bool oomExit = !p.threaded || (WIFEXITED(status) && WEXITSTATUS(status) == 74);
+    const bool oomExit = p.durable || !p.threaded || (WIFEXITED(status) && WEXITSTATUS(status) == 74);
     bool v8Oom = oomExit && p.oomSignalled;
     uint64_t oomIsolateHeap = 0;
     bool oomIsolateHeapReported = false;
@@ -2994,7 +2994,7 @@ public:
       oomIsolateHeap = report.getOomIsolateHeapBytes();
       oomIsolateHeapReported = report.getOomIsolateHeapReported();
       if (stateOom && report.getEvent() == "memory-culprit" && report.getMemoryLimitMiB() == limitsOf(rowWorker).memoryMiB &&
-          memoryCulpritOwnsOom(report.asReader())) {
+          memoryCulpritOwnsOom(report.asReader(), p.durable)) {
         const std::string worker = rowWorker, version = report.getVersionId().cStr();
         const std::string invocation = report.getInvocationId().cStr();
         const auto dispatched = crashCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version);
