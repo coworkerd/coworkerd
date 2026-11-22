@@ -542,14 +542,20 @@ async function threadedAlarmTakeover(cluster) {
   };
   const confirmed = 'confirmed';
   const shard = shardOf(confirmed);
-  const unconfirmed = Array.from({ length: shards * 16 }, (_, i) => `unconfirmed-${i}`)
-    .find(name => shardOf(name) === shard);
-  assert.ok(unconfirmed, 'both test objects must route to the same shard');
+  const sameShard = label => {
+    for (let i = 0; i < shards * 16; ++i) {
+      const name = `${label}-${i}`;
+      if (shardOf(name) === shard) return name;
+    }
+    assert.fail(`no ${label} object maps to shard ${shard}`);
+  };
+  const unconfirmed = sameShard('unconfirmed');
+  const rescheduled = sameShard('rescheduled');
   const ownerOfShard = async () => (await namespace()).owners.find(owner => owner.shard === shard && !owner.released);
   const call = (node, object, options) => workerCall(cluster, node, tenant, `alarms?object=${object}`, options);
   const at = Date.now() + 45000;
   await eventually('both original schedules are confirmed under the same shard owner', async () => {
-    for (const object of [confirmed, unconfirmed]) {
+    for (const object of [confirmed, unconfirmed, rescheduled]) {
       assert.equal(json(await call(entry, object, { method: 'POST', body: at }), 200, object), at);
     }
   });
@@ -580,6 +586,10 @@ async function threadedAlarmTakeover(cluster) {
     await unlink(gate);
     if (paused) await cluster.compose(['unpause', original.nodeId]);
   }
+  const newTime = at + 120000;
+  assert.ok(Date.now() < at, 'the successor replaces the alarm before its former due time');
+  assert.equal(json(await call(survivor, rescheduled, { method: 'POST', body: newTime }),
+    200, 'replace the inherited schedule'), newTime);
   const result = await pending;
   assert.ok(result.error || result.status >= 400, 'the fenced clear never returns success');
   await eventually('the surviving owner delivers the alarm whose clear was unconfirmed', async () => {
@@ -587,6 +597,8 @@ async function threadedAlarmTakeover(cluster) {
       { at: null, fired: 1 });
     assert.deepEqual(json(await call(survivor, confirmed), 200, 'confirmed clear recovery'),
       { at: null, fired: 0 });
+    assert.deepEqual(json(await call(survivor, rescheduled), 200, 'superseded alarm hint'),
+      { at: newTime, fired: 0 }, 'the previous due time cannot fire the replacement schedule');
   }, { timeout: 60000, interval: 250 });
 }
 
