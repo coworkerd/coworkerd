@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 14:09:32 +0800
+Subject: [PATCH] Finish durable cold-load accounting before returning its slot
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index ff82c83fed897a543389d0846e0c24c234d86bad..74ea0c08f960c089f6ffe0cc41cb090d8cf01951 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3346,14 +3346,17 @@ struct ThreadedServer {
+     };
+     auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
+     auto source = co_await fetchSource(input, state, *slot);
+-    trackDurableTurn(state.durableHome, true);
+-    KJ_DEFER({
+-      const auto bytes = slot->limits
+-          ? slot->limits->memory->heap.load() + slot->limits->memory->external.load()
+-          : 0;
+-      trackDurableTurn(state.durableHome, false, bytes);
+-    });
+-    slot->worker = compile(*slot, input, source);
++    // End turn accounting before co_return moves the local slot into its result.
++    {
++      trackDurableTurn(state.durableHome, true);
++      KJ_DEFER({
++        const auto bytes = slot->limits
++            ? slot->limits->memory->heap.load() + slot->limits->memory->external.load()
++            : 0;
++        trackDurableTurn(state.durableHome, false, bytes);
++      });
++      slot->worker = compile(*slot, input, source);
++    }
+     slot->complete = true;
+     co_return slot;
+   }

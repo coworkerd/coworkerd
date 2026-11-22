@@ -96,7 +96,7 @@ jobs:
           failed = [c for c in cases if c.find('failure') is not None or c.find('error') is not None]
           skipped = [c for c in cases if c.find('skipped') is not None]
           required = ({'node-log-redaction', 'workerd-configuration', 'node-child-memory',
-                       'node-threaded-durable-launch', 'node-threaded-durable-events',
+                       'node-threaded-durable-launch', 'node-threaded-durable-events', 'node-threaded-durable-http',
                        'node-threaded-durable-placement', 'node-threaded-durable-queues',
                        'node-threaded-durable-fd-limit', 'node-threaded-durable-memory-reservation'}
                       if os.environ['RUNNER_OS'] == 'Linux' else set())

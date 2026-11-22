@@ -11,12 +11,14 @@ import { promisify } from 'node:util';
 
 const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
+const httpLifecycle = scenario === 'http';
+const events = scenario === 'events';
 const queueLimit = scenario === 'queue-limit';
 const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = scenario === 'events' || measure || placement;
+const exerciseEvents = events || measure || placement || httpLifecycle;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -33,11 +35,11 @@ const env = {
   TMPDIR: scratch,
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
-  ...(exerciseEvents && !measure && !placement ? {
+  ...(events ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
-  ...(measure || placement ? {
+  ...(measure || placement || httpLifecycle ? {
     COWORKERD_DO_TEST_HOME_COUNT: homeArg,
     COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
     ...(placement ? { COWORKERD_DO_TEST_BUSY_MS: busyArg } : {}),
@@ -51,7 +53,7 @@ const token = 'fixture-management-placeholder';
 const config = {
   nodeId: 'fixture',
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure || placement || queues ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle ? { residentObjects: 0 } : {}),
   },
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: 8 },
   quarantineProcesses: 0,
@@ -195,6 +197,9 @@ try {
         if (query.has("sqlCpu")) {
           this.ctx.storage.sql.exec("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000000000) SELECT count(*) FROM n").one();
         }
+        if (query.has("expect") && await this.ctx.storage.get("counter") !== query.get("expect")) {
+          return new Response("previous value mismatch", {status: 409});
+        }
         if (request.method === "POST") await this.ctx.storage.put("counter", await request.text());
         return Response.json({instance: this.instance, isolate, counter: await this.ctx.storage.get("counter")});
       }
@@ -286,7 +291,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, exerciseEvents && !measure && !placement ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, events ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -353,7 +358,77 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (queues) {
+  if (httpLifecycle) {
+    const request = async (path, options) => {
+      const started = performance.now();
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, `${path}: ${body}\n${diagnostics}`);
+      return {value: JSON.parse(body), elapsedMs: performance.now() - started};
+    };
+    const paths = ['/http-first', '/http-second'];
+    const records = [];
+    for (const path of paths) {
+      const value = `saved at startup: ${path}`;
+      const initial = await request(path, {method: 'POST', body: value});
+      assert.equal(initial.value.counter, value);
+      assert.deepEqual((await request(path)).value, initial.value);
+      records.push(initial.value);
+    }
+    assert.equal(records[0].isolate, records[1].isolate);
+    assert.notEqual(records[0].instance, records[1].instance);
+    for (let i = 0; i < 10; ++i) {
+      for (const [index, path] of paths.entries()) {
+        assert.deepEqual((await request(path)).value, records[index]);
+      }
+    }
+    // A brief idle interval must preserve the still-resident actor's instance.
+    await delay(4200);
+    for (const [index, path] of paths.entries()) {
+      assert.deepEqual((await request(path)).value, records[index]);
+    }
+    const wakes = [];
+    for (let round = 0; round < 3; ++round) {
+      const before = await waitForAdmission(socketPath, 0);
+      let idle;
+      for (const until = performance.now() + 20000; performance.now() < until;) {
+        idle = await readAdmission(socketPath);
+        if (idle.residentRoots === 0 && idle.idleRetirements >= before.idleRetirements + paths.length) break;
+        await delay(100);
+      }
+      assert.equal(idle.residentRoots, 0, JSON.stringify(idle));
+      assert.equal(idle.trees, 0);
+      assert.equal(idle.reservedBytes, 0);
+      assert.ok(idle.idleRetirements >= before.idleRetirements + paths.length);
+      for (const [index, path] of paths.entries()) {
+        const previous = records[index];
+        const writing = (round + index) % 2 === 1;
+        const value = writing ? `saved at wake ${round}: ${path}` : previous.counter;
+        const first = await request(writing ? `${path}?expect=${encodeURIComponent(previous.counter)}` : path,
+          writing ? {method: 'POST', body: value} : undefined);
+        assert.notEqual(first.value.instance, previous.instance);
+        assert.equal(first.value.counter, value);
+        assert.deepEqual((await request(path)).value, first.value);
+        records[index] = first.value;
+        wakes.push({round, method: writing ? 'POST' : 'GET', elapsedMs: first.elapsedMs,
+          oldInstance: previous.instance, instance: first.value.instance, statePreserved: true});
+      }
+      const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+        headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+      }).then(reply => reply.json());
+      const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+      assert.equal(sameChild.pid, processInfo.pid);
+      assert.equal(sameChild.generation, processInfo.generation);
+      assert.equal(sameChild.state, 'ready');
+      const after = await waitForAdmission(socketPath, 0);
+      assert.equal(after.actorResets, before.actorResets);
+      assert.equal(after.isolateResets, before.isolateResets);
+    }
+    console.log(JSON.stringify({scenario, pid: processInfo.pid, generation: processInfo.generation,
+      wakes, admission: await readAdmission(socketPath)}));
+  } else if (queues) {
     const deadline = process.hrtime.bigint() + 30_000_000_000n;
     const keep = [];
     const queue = async (id, sequence, bytes, expected) => {

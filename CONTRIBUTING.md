@@ -121,6 +121,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
+| `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
 | `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
 | `node-threaded-durable-queues` (Linux only) | Both kernel binaries, for per-object mailbox count/byte bounds and returned event and descriptor credits |
 | `node-threaded-durable-fd-limit` (Linux only) | Both kernel binaries, for bounded refusal before exhausting the child's file descriptors |
@@ -132,6 +133,11 @@ an existing Durable Object storage directory in the fixture stack. Use this sett
 fixture deployments. Each threaded durable child starts without a persistent log channel.
 The fixture derives local namespaces from the active declarations and routes them only within the node.
 Each child generation opens a fresh SQLite volume inside the fixture stack.
+The `http 4 64` fixture mode writes and reads two objects, checks unchanged instances after a brief
+idle interval, then observes three real idle retirements and wakes. Each first wake request alternates
+between a read and a write that verifies the previous stored value before replacing it. Repeated reads
+check the new instance and stored value, while the child must retain its ready PID and generation.
+It does not send JavaScript RPC calls.
 The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
 `COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
 `COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
