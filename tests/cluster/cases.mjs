@@ -567,6 +567,15 @@ async function mixedDurableStorage(cluster) {
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Record'] }],
   };
   for (const name of ['writer', 'reader']) await cluster.deploy(tenant, name, worker, { wrangler });
+  const { workerId, versions: [{ versionId, definitionHash, contentHash }] } =
+    await cluster.api(`${tenant.path}/workers/writer`, { token: tenant.token });
+  const trial = json(await request(cluster.urls[threaded], '/__coworkerd/trial-load', {
+    method: 'POST', token: cluster.management, timeout: 10000,
+    body: { workerId, versionId, definitionHash, contentHash, routed: true },
+  }), 200, 'trial load on a threaded node');
+  assert.equal(trial.ok, true, trial.message);
+  assert.equal(trial.dispatched, true);
+  assert.match(trial.processId, /^q\d+$/);
   const findObject = async name => {
     const namespace = () => cluster.api(`${tenant.path}/workers/${name}/namespaces/Record`, { token: tenant.token });
     const { namespaceId, shards } = await namespace();

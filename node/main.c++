@@ -8069,7 +8069,10 @@ private:
         auto probeInvocation = invocationId;
         try {
           report = co_await probe(*version, process, invocationId, deadline);
-          if (process->threadedServer() && version->format == "v2" && !version->declaredClasses.empty()) {
+          // The second probe exercises the root bridge in runtime.js. The quarantine trial
+          // already validates durable class exports for homes that use the native loader.
+          if (process->threadedServer() && !config.processPool.threadedDurable() &&
+              version->format == "v2" && !version->declaredClasses.empty()) {
             capnp::MallocMessageBuilder message;
             auto json = message.initRoot<capnp::JsonValue>();
             capnp::JsonCodec().decodeRaw(kj::arrayPtr(report.data(), report.size()), json);
