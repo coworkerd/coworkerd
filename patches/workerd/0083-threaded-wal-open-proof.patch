@@ -147,10 +147,10 @@ index 622ebd4c76c410232b6ca7c977cd2d0e25df1df7..3a5c53e6a35fa5d7861b718b1c57526c
  // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
  // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7252936e58098d6198f467dc73f6ecf45cb9d003..79089ed5be3ca077230b804f14481a14e5b7b2ea 100644
+index f4862ad2b84d719e0b8ee967ab4056d1ba66136a..011ef2fb0904c062113d12ee52361c07bd3f5c9c 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -4988,13 +4988,15 @@ kj::Promise<void> LocalFacet::initialize() {
+@@ -5015,13 +5015,15 @@ kj::Promise<void> LocalFacet::initialize() {
    className = kj::str(binding->name);
    actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
        binding->props.clone(), facet, depth, reservation, parentFacet, name);
@@ -169,7 +169,7 @@ index 7252936e58098d6198f467dc73f6ecf45cb9d003..79089ed5be3ca077230b804f14481a14
    }
    KJ_REQUIRE(!stopped, "durable test facet is closed");
    auto slot = tree->slot.lock();
-@@ -5124,7 +5126,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5151,7 +5153,11 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        tree->server.beginDurableReset(tree->state, tree->tree);
      }).eagerlyEvaluate(nullptr);
    }

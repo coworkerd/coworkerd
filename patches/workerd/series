@@ -63,6 +63,7 @@
 0067-durable-facet-reset-lifetime.patch
 0068-durable-process-memory-progress.patch
 0069-durable-process-memory-recovery.patch
+0070-durable-rpc-binding.patch
 0080-threaded-wal-channel.patch
 0081-threaded-durable-storage.patch
 0082-threaded-durable-fixture-state.patch
@@ -73,4 +74,3 @@
 0087-allow-threaded-wal-registration.patch
 0088-check-live-facets-on-reset.patch
 0089-use-durable-home-memory-reclaim.patch
-0090-bind-threaded-durable-rpc.patch

@@ -215,7 +215,8 @@ def allowed_path(name, path):
                                    '0066-durable-reset-progress.patch',
                                    '0067-durable-facet-reset-lifetime.patch',
                                    '0068-durable-process-memory-progress.patch',
-                                   '0069-durable-process-memory-recovery.patch'} and
+                                   '0069-durable-process-memory-recovery.patch',
+                                   '0070-durable-rpc-binding.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0081-threaded-durable-storage.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
@@ -232,8 +233,7 @@ def allowed_path(name, path):
                                    '0086-refuse-persistent-facet-cloning.patch',
                                    '0087-allow-threaded-wal-registration.patch',
                                    '0088-check-live-facets-on-reset.patch',
-                                   '0089-use-durable-home-memory-reclaim.patch',
-                                   '0090-bind-threaded-durable-rpc.patch'} and
+                                   '0089-use-durable-home-memory-reclaim.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or

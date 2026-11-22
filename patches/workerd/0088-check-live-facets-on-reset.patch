@@ -9,10 +9,10 @@ Content-Transfer-Encoding: 8bit
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 42c7a7c76216c0c62cd86c36f34932670eb3e0ca..8d47d62039378e2cf2a04c8c85c82b4be7beda9b 100644
+index 4c0767ce0456c37f8bff66e3529b437ebd8fdbec..aac4f5f1c10fb441dbc13770e74cacae11dee568 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -4942,7 +4942,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4969,7 +4969,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
    }
  
    void resetStorage(SqliteDatabase& database, server::DurableLogShipper& shipper) {

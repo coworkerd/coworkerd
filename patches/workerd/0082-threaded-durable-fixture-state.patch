@@ -20,7 +20,7 @@ index b57824f563705e1ca1b22c89e3dec20ebd8be31d..7ffc9eb8f52a9e4866c067f43de1f576
          "//src/workerd/util:sqlite",
          "@capnp-cpp//src/kj",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 493a41072c9fc0471731dfe8a56f20c3c8eeb731..7252936e58098d6198f467dc73f6ecf45cb9d003 100644
+index 7e2658178095d399d6f1712a2beb5242ae2aee69..f4862ad2b84d719e0b8ee967ab4056d1ba66136a 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2903,7 +2903,8 @@ struct ThreadedServer {
@@ -42,7 +42,7 @@ index 493a41072c9fc0471731dfe8a56f20c3c8eeb731..7252936e58098d6198f467dc73f6ecf4
            root.closeRequested = true;
            break;
          }
-@@ -5040,7 +5041,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5067,7 +5068,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
        if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
        auto& alarmHooks = *alarms;
        return kj::heap<ActorSqlite>(kj::mv(database), gate,

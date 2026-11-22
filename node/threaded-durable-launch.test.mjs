@@ -16,10 +16,10 @@ The positional single-node fixture opts in with `durableObjects.threadedTestStor
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
 an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
 fixture deployments. Each threaded durable child starts without a persistent log channel.
-The initial host supports HTTP events. Durable JavaScript RPC is explicitly `NOT_SUPPORTED`; RPC input/output
-gates and nested RPC remain for the next PR of issue #36. The positive `events` fixture stays in source
-as that follow-up's acceptance test, but is not registered in the current CTest/CI suite. The HTTP
-isolation test verifies RPC refusal and subsequent HTTP availability in the same child.
+The `events` mode checks an RPC read, input gating, and an RPC round trip through a neighboring
+object that calls back while its caller is suspended. The `rpc-output-gate` mode observes a pending
+storage confirmation before the RPC result can arrive, then independently reads the written value.
+The `rpc-cpu-events` mode applies the calibrated CPU checks to method calls across awaits.
 The fixture derives local namespaces from the active declarations and routes them only within the node.
 Each child generation opens a fresh SQLite volume inside the fixture stack.
 The `http-output-gate` mode delays the test-storage completion callback by 300 ms and observes its pending
@@ -94,10 +94,12 @@ const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
 const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
-const cpuEvents = scenario === 'cpu-events';
+const rpcCpu = scenario === 'rpc-cpu-events';
+const cpuEvents = scenario === 'cpu-events' || rpcCpu;
 const loadCancel = scenario === 'load-cancel';
 const httpIsolation = scenario === 'http-isolation';
-const httpOutputGate = scenario === 'http-output-gate';
+const rpcOutputGate = scenario === 'rpc-output-gate';
+const outputGate = scenario === 'http-output-gate' || rpcOutputGate;
 const httpMemory = scenario === 'http-memory';
 const groupRefusal = scenario === 'group-refusal';
 const overlap = scenario === 'http-overlap';
@@ -109,7 +111,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
+const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || outputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -124,7 +126,9 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
-  ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
+  // The outer actor must be able to delegate one call and allow its peer to call back.
+  ...(events ? { COWORKERD_SUBREQUEST_GRANT: '2' } : {}),
+  ...(outputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
   ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
@@ -260,6 +264,7 @@ try {
     import { DurableObject } from "cloudflare:workers";
     const DEFINITION = "first";
     let isolate;
+    let inputGate = "idle";
     export class Counter extends DurableObject {
       instance = crypto.randomUUID();
       latch;
@@ -273,32 +278,9 @@ try {
           return Response.json("released");
         }
         if (query.has("sliceWork")) {
-          const iterations = Number(query.get("sliceWork"));
-          const parts = Number(query.get("parts"));
-          if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000 ||
-              ![2, 4].includes(parts)) return new Response("invalid slices", {status: 400});
-          this.sliceChecksum = 1;
-          for (let part = 1; part <= parts; ++part) {
-            let checksum = 1;
-            for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
-            this.sliceChecksum = checksum;
-            this.slicePart = part;
-            if (part < parts) {
-              this.sliceLatch = Promise.withResolvers();
-              await this.sliceLatch.promise;
-            }
-          }
-          this.slicePart = 0;
+          return Response.json(await this.sliceWork(Number(query.get("sliceWork")), Number(query.get("parts"))));
         }
-        if (query.has("work")) {
-          const iterations = Number(query.get("work"));
-          if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000) {
-            return new Response("invalid work size", {status: 400});
-          }
-          let checksum = 1;
-          for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
-          return Response.json({instance: this.instance, isolate, checksum});
-        }
+        if (query.has("work")) return Response.json(this.work(Number(query.get("work"))));
         if (query.has("allocateMiB")) {
           const size = Number(query.get("allocateMiB"));
           if (!Number.isInteger(size) || size < 1 || size > 120) {
@@ -342,10 +324,18 @@ try {
           finally { --this.heldPayloads; }
           return Response.json({instance: this.instance, isolate, bytes: payload.length});
         }
+        if (query.has("gateState")) return Response.json(inputGate);
+        if (query.has("releaseGate")) {
+          inputGate = "released";
+          return Response.json(inputGate);
+        }
         if (query.has("inputGate")) {
           await this.ctx.blockConcurrencyWhile(async () => {
-            await new Promise(resolve => setTimeout(resolve, 250));
-            await this.ctx.storage.put("counter", "after input gate");
+            inputGate = "held";
+            try {
+              while (inputGate === "held") await scheduler.wait(5);
+              await this.ctx.storage.put("counter", "after input gate");
+            } finally { inputGate = "idle"; }
           });
         }
         if (query.has("outputGate")) {
@@ -368,17 +358,63 @@ try {
         if (request.method === "POST") await this.ctx.storage.put("counter", await request.text());
         return Response.json({instance: this.instance, isolate, counter: await this.ctx.storage.get("counter")});
       }
+      work(iterations) {
+        if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000) {
+          throw new Error("invalid work size");
+        }
+        let checksum = 1;
+        for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+        return {instance: this.instance, isolate, checksum};
+      }
+      async sliceWork(iterations, parts) {
+        if (![2, 4].includes(parts)) throw new Error("invalid slices");
+        for (let part = 1; part <= parts; ++part) {
+          this.sliceChecksum = this.work(iterations).checksum;
+          this.slicePart = part;
+          if (part < parts) {
+            this.sliceLatch = Promise.withResolvers();
+            await this.sliceLatch.promise;
+          }
+        }
+        this.slicePart = 0;
+        return {instance: this.instance, isolate, counter: await this.ctx.storage.get("counter")};
+      }
+      writeThroughRpc() {
+        this.ctx.storage.put("outputGate", "rpc write");
+        return "rpc committed";
+      }
+      async roundTrip() {
+        this.order = ["begin"];
+        const peer = this.env.COUNTERS.get(this.env.COUNTERS.idFromName("/other"));
+        const instance = await peer.callBack();
+        this.order.push("end");
+        return {order: this.order, instance};
+      }
+      async callBack() {
+        const caller = this.env.COUNTERS.get(this.env.COUNTERS.idFromName("/first"));
+        return await caller.recordNested();
+      }
+      recordNested() { this.order.push("nested"); return this.instance; }
       async value() { return this.ctx.storage.get("counter"); }
     }
     export default { async fetch(request, env) {
       const url = new URL(request.url);
       const counter = env.COUNTERS.get(env.COUNTERS.idFromName(url.pathname));
       try {
-        return url.searchParams.has("rpc")
+        const query = url.searchParams;
+        if (query.has("rpcWrite")) return Response.json(await counter.writeThroughRpc());
+        if (query.has("roundTrip")) return Response.json(await counter.roundTrip());
+        if (query.has("rpcCpu")) {
+          return Response.json(query.has("work")
+            ? await counter.work(Number(query.get("work")))
+            : await counter.sliceWork(Number(query.get("sliceWork")), Number(query.get("parts"))));
+        }
+        return query.has("rpc")
           ? Response.json(await counter.value())
           : await counter.fetch(request);
       } catch (error) {
-        return Response.json({error: String(error)}, {status: 502});
+        return Response.json({error: String(error), code: error.code},
+          {status: error.code === "CPU_LIMIT_EXCEEDED" ? 503 : 502});
       }
     } };
   ` : 'export default { fetch() { return new Response("fixture"); } };';
@@ -602,6 +638,7 @@ try {
       homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
   } else if (cpuEvents) {
     const request = async (path, options, accepted = [200]) => {
+      if (rpcCpu && /[?&](work|sliceWork)=/.test(path)) path += '&rpcCpu';
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         ...options, signal: AbortSignal.timeout(5000),
       });
@@ -1059,7 +1096,7 @@ try {
     assert.equal(final.isolateResets, 1);
     console.log(JSON.stringify({scenario, memoryPlacementMiB, moderateMiB, resources,
       idleFirst: evicted, closed, hardPeakBytes, hard, final, pid: sameChild.pid, generation: sameChild.generation}));
-  } else if (httpOutputGate) {
+  } else if (outputGate) {
     // Warm the actor and drain initialization before observing the unawaited write.
     const initial = await fetch(`http://127.0.0.1:${port}/output`, {
       method: 'POST', body: 'initial value', signal: AbortSignal.timeout(5000),
@@ -1068,11 +1105,15 @@ try {
     assert.equal((await initial.json()).counter, 'initial value');
     assert.equal((await waitForAdmission(socketPath, 0)).pendingCommits, 0);
     let replied = false;
-    const pending = fetch(`http://127.0.0.1:${port}/output?outputGate`, {
+    const method = rpcOutputGate ? 'rpc' : 'http';
+    const query = rpcOutputGate ? 'rpcWrite' : 'outputGate';
+    const pending = fetch(`http://127.0.0.1:${port}/output?${query}`, {
       signal: AbortSignal.timeout(5000),
     }).then(async response => {
       replied = true;
       assert.equal(response.status, 200);
+      assert.equal((await readAdmission(socketPath)).pendingCommits, 0,
+        method + ' result arrived before test storage confirmation');
       return response.json();
     });
     pending.catch(() => {});
@@ -1080,18 +1121,19 @@ try {
     for (const until = performance.now() + 2000; performance.now() < until;) {
       if ((await readAdmission(socketPath)).pendingCommits > 0) {
         confirmationObserved = true;
-        assert.equal(replied, false, 'HTTP response arrived before test storage confirmation');
         break;
       }
+      if (replied) break;
       await delay(10);
     }
     assert.ok(confirmationObserved, 'no pending test storage confirmation was observed');
-    assert.equal(await pending, 'http committed');
+    assert.equal(await pending, method + ' committed');
     const saved = await fetch(`http://127.0.0.1:${port}/output?readOutputGate`, {
       signal: AbortSignal.timeout(5000),
     });
     assert.equal(saved.status, 200);
-    assert.equal(await saved.json(), 'http write');
+    const savedValue = await saved.json();
+    assert.equal(savedValue, method + ' write');
     const counters = await waitForAdmission(socketPath, 0);
     assert.equal(counters.pendingCommits, 0);
     assert.equal(counters.actorResets, 0);
@@ -1104,7 +1146,7 @@ try {
     assert.equal(sameChild.generation, processInfo.generation);
     assert.equal(sameChild.state, 'ready');
     console.log(JSON.stringify({scenario, confirmationObserved, responseWaited: true,
-      savedValue: 'http write', pid: sameChild.pid, generation: sameChild.generation, admission: counters}));
+      savedValue, pid: sameChild.pid, generation: sameChild.generation, admission: counters}));
   } else if (queues) {
     const deadline = process.hrtime.bigint() + 30_000_000_000n;
     const keep = [];
@@ -1283,12 +1325,7 @@ try {
     };
     const initial = await request('/first', { method: 'POST', body: 'confirmed in fixture SQLite' });
     assert.deepEqual(await request('/first'), initial);
-    if (!httpIsolation) assert.equal(await request('/first?rpc'), initial.counter);
-    else {
-      const unsupported = await request('/first?rpc', undefined, 502);
-      assert.match(unsupported.error, /NOT_SUPPORTED.*JavaScript RPC in the durable test role/);
-      assert.deepEqual(await request('/first'), initial);
-    }
+    assert.equal(await request('/first?rpc'), 'confirmed in fixture SQLite');
     const other = await request('/other', { method: 'POST', body: 'other tree' });
     assert.notEqual(other.instance, initial.instance);
     assert.equal(other.isolate, initial.isolate);
@@ -1318,6 +1355,13 @@ try {
     }
     await request('/first?release');
     assert.deepEqual(await waiting, initial);
+    if (events) {
+      assert.deepEqual(await request('/first?roundTrip'),
+        {order: ['begin', 'nested', 'end'], instance: initial.instance});
+      const drained = await waitForAdmission(socketPath, 0);
+      assert.equal(drained.running, 0);
+      assert.equal(drained.waitingBytes, 0);
+    }
 
     if (httpIsolation) {
       for (let attempt = 0; attempt < 3; ++attempt) {
@@ -1359,16 +1403,28 @@ try {
 
     const gated = request('/first?inputGate');
     gated.catch(() => {});
-    let running = false;
-    for (const until = performance.now() + 2000; performance.now() < until;) {
-      if ((await readAdmission(socketPath)).running > 0) {
-        running = true;
-        break;
+    const observe = async condition => {
+      for (const until = performance.now() + 2000; performance.now() < until;) {
+        if (await condition()) return;
+        await delay(5);
       }
-      await delay(10);
+      assert.fail('the input gate or the independent call was never observed');
+    };
+    await observe(async () => (await request('/other?gateState')) === 'held');
+    let replied = false;
+    const read = request(httpIsolation ? '/first' : '/first?rpc').then(value => {
+      replied = true;
+      return value;
+    });
+    read.catch(() => {});
+    try {
+      await observe(async () => replied || (await readAdmission(socketPath)).running >= 2);
+      assert.deepEqual(await request('/other'), other);
+      assert.equal(replied, false, 'independent call returned while the input gate was closed');
+    } finally {
+      await request('/other?releaseGate');
     }
-    assert.ok(running);
-    const [write, gatedRead] = await Promise.all([gated, request(httpIsolation ? '/first' : '/first?rpc')]);
+    const [write, gatedRead] = await Promise.all([gated, read]);
     assert.equal(write.counter, 'after input gate');
     assert.equal(httpIsolation ? gatedRead.counter : gatedRead, write.counter);
 

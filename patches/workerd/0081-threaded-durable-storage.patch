@@ -521,7 +521,7 @@ index 019b6299a951a6682023542d692199bcb828715c..339f03ed092c134624fd395bd30351a5
      "//src/workerd/util:entropy",
      "@capnp-cpp//src/capnp:capnp-rpc",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3c8eeb731 100644
+index 13e9e75235a83db02b49284b62e57113c2abd864..7e2658178095d399d6f1712a2beb5242ae2aee69 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -26,6 +26,7 @@
@@ -650,16 +650,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      thread.idleSince.store(nowNs());
      thread.descriptor.store(-1, std::memory_order_release);
      wake(managerWake);
-@@ -3709,7 +3726,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
-     return kj::READY_NOW;
-   }
-   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
--    if (state.durableHome) unsupported("JavaScript RPC in the durable test role");
-+    if (state.durableHome && !state.wal) unsupported("JavaScript RPC in the durable test role");
-     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
-     return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
-   }
-@@ -4650,12 +4667,13 @@ struct DurableTreeContext {
+@@ -4677,12 +4694,13 @@ struct DurableTreeContext {
    ThreadedServer &server;
    std::weak_ptr<Slot> slot;
    uint64_t tree;
@@ -676,7 +667,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
    }
  
    server::FacetTreeIndex &facetIndex() {
-@@ -4746,6 +4764,22 @@ struct DurableActorHandle {
+@@ -4773,6 +4791,22 @@ struct DurableActorHandle {
    DurableActorHooks *hooks;
  };
  
@@ -699,7 +690,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
  DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &tree,
      Worker &worker,
      Worker::Actor::Id id,
-@@ -4753,7 +4787,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -4780,7 +4814,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      Frankenvalue props,
      uint facet,
      uint depth,
@@ -710,7 +701,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
  
  class LocalFacet final: public IoChannelFactory::ActorChannel {
   public:
-@@ -4762,12 +4798,16 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -4789,12 +4825,16 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    LocalFacet(std::shared_ptr<DurableTreeContext> tree,
        uint facet,
        uint depth,
@@ -727,7 +718,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
          getStartInfo(kj::mv(getStartInfo)) {}
  
    kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata) override;
-@@ -4803,6 +4843,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -4830,6 +4870,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    std::shared_ptr<DurableFacetReservation> reservation;
    uint facet;
    uint depth;
@@ -736,7 +727,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
    kj::Function<kj::Promise<StartInfo>()> getStartInfo;
    kj::Maybe<kj::ForkedPromise<void>> starting;
    kj::Maybe<DurableActorHandle> actor;
-@@ -4842,7 +4884,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4869,7 +4911,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
      auto reservation = std::make_shared<DurableFacetReservation>(tree);
      const auto id = tree->facetIndex().getId(facet, name);
      auto child =
@@ -745,7 +736,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      children.emplace(key, child.addRef());
      return child;
    }
-@@ -4874,6 +4916,8 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4901,6 +4943,8 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
    }
  
    bool busy() {
@@ -754,7 +745,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      for (auto &[name, child]: children) {
        if (child->busy()) return true;
      }
-@@ -4942,7 +4986,7 @@ kj::Promise<void> LocalFacet::initialize() {
+@@ -4969,7 +5013,7 @@ kj::Promise<void> LocalFacet::initialize() {
        "durable test facets require a class in the original isolate copy");
    className = kj::str(binding->name);
    actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
@@ -763,7 +754,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
  }
  
  kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
-@@ -4968,16 +5012,37 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -4995,16 +5039,37 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      Frankenvalue props,
      uint facet,
      uint depth,
@@ -803,7 +794,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      return kj::heap<ActorSqlite>(kj::mv(database), gate,
          [state = &tree->state, server = &tree->server](SpanParent) -> kj::Promise<void> {
        if (server->durableCommitDelayMs == 0) co_return;
-@@ -5001,6 +5066,7 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5028,6 +5093,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      kj::String descriptor, Frankenvalue props) {
    KJ_REQUIRE(!used, "one event per durable connection");
    used = true;
@@ -811,7 +802,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
    JsonDoc full(descriptor);
    auto input = full.get();
    auto selection = field(input, "rootSelection");
-@@ -5029,6 +5095,7 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5056,6 +5122,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        ticket.tree,
        kj::str(route.uniqueKey.c_str()),
        kj::str(route.storageId.c_str()),
@@ -819,7 +810,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
        {},
      });
      auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
-@@ -5040,6 +5107,10 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5067,6 +5134,10 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                        .lastUse = server::DurableAdmission::Clock::now(),
                        .facetsBusy = [hooks = actor.hooks] { return hooks->busy(); },
                        .stopFacets = [hooks = actor.hooks] { hooks->stop(); },
@@ -830,7 +821,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
                      })
                  .first;
      server.publishDurableRoot(state.durableHome, ticket.tree);
-@@ -5048,7 +5119,7 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5075,7 +5146,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        tree->server.beginDurableReset(tree->state, tree->tree);
      }).eagerlyEvaluate(nullptr);
    }
@@ -839,7 +830,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
          KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
    }
-@@ -5419,7 +5490,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5442,7 +5513,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
            (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
            epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
            connections.erase(found);
@@ -848,7 +839,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
            auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
            if (sent != 1 || admission == 'R')
              ::close(fd);
-@@ -5444,6 +5515,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5467,6 +5538,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
              JsonDoc frame(kj::StringPtr(connection.input.c_str() + 1, connection.input.size() - 1));
              auto input = frame.get();
              auto route = readDurableRoute(input);
@@ -856,7 +847,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
              const auto deadlineNs = durableNumber(input, "expiresMonotonicNs");
              KJ_REQUIRE(deadlineNs <= uint64_t(std::numeric_limits<int64_t>::max()),
                  "invalid durable routing deadline");
-@@ -5497,7 +5569,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5520,7 +5592,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                  ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
              if (server.durableAdmission) server.reportDurable(false, &body);
            }
@@ -867,7 +858,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
            if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
                !connection.input.starts_with("GET /__coworkerd/threaded ")) {
              status = "501 Not Implemented";
-@@ -5506,7 +5580,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5529,7 +5603,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
            }
            connection.output = "HTTP/1.1 " + std::string(status) +
                "\r\nX-Coworkerd-Threaded-Protocol: 3" +
@@ -878,7 +869,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
                "\r\nContent-Length: " + std::to_string(body.size()) +
                "\r\nConnection: close\r\n\r\n" + body;
          }
-@@ -5565,21 +5641,22 @@ int main(int argc, char **argv) {
+@@ -5588,21 +5664,22 @@ int main(int argc, char **argv) {
        fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
      return 0;
    }
@@ -906,7 +897,7 @@ index d7f8d488c31e675e91fcdd79191f7d697f88684e..493a41072c9fc0471731dfe8a56f20c3
      try {
        limit = boundedDurableSetting("COWORKERD_DO_TEST_HOME_COUNT", std::min(limit, 4ul), 16384);
      } catch (...) {
-@@ -5619,9 +5696,29 @@ int main(int argc, char **argv) {
+@@ -5642,9 +5719,29 @@ int main(int argc, char **argv) {
    const int listener = strtol(argv[1], nullptr, 10);
    ThreadedServer *server;
    try {

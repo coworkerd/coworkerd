@@ -100,10 +100,10 @@ index e81b7c14a13e5e9faaa020d48906d282cdd8582e..9432902f7dc56f33cb68e9090f56c78d
    kj::StringPtr getKey() {
      return key;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e5783c31920786c393fe0b18dd754aef445c810d..03bcf99b5fef0413767aea11fe13d04bdaa1c8b0 100644
+index 146ee13368100c65dacb141541f25d69a711aa5f..766faaa09ee4238c7d639b6f70dd65ff0c6ac910 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -4907,7 +4907,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4934,7 +4934,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
      requireIdle(name);
      abortFacet(name, KJ_EXCEPTION(DISCONNECTED, "Facet was deleted."));
      auto &index = tree->facetIndex();
@@ -112,7 +112,7 @@ index e5783c31920786c393fe0b18dd754aef445c810d..03bcf99b5fef0413767aea11fe13d04b
    }
  
    void cloneFacet(kj::StringPtr source, kj::StringPtr destination) override {
-@@ -4918,7 +4918,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4945,7 +4945,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
      auto &index = tree->facetIndex();
      const auto from = index.getId(facet, source);
      const auto to = index.getId(facet, destination);
@@ -121,7 +121,7 @@ index e5783c31920786c393fe0b18dd754aef445c810d..03bcf99b5fef0413767aea11fe13d04b
      tree->storage().cloneFacet(tree->uniqueKey, tree->storageId, index, from, to);
    }
  
-@@ -4940,7 +4940,26 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -4967,7 +4967,26 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
      }
    }
  
@@ -148,7 +148,7 @@ index e5783c31920786c393fe0b18dd754aef445c810d..03bcf99b5fef0413767aea11fe13d04b
    void requireIdle(kj::StringPtr name) {
      auto at = children.find(std::string(name.begin(), name.size()));
      KJ_REQUIRE(at == children.end() || !at->second->busy(), "durable test facet is busy");
-@@ -5036,7 +5055,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5063,7 +5082,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
    auto *borrowedObserver = observer.get();
    if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
@@ -157,7 +157,7 @@ index e5783c31920786c393fe0b18dd754aef445c810d..03bcf99b5fef0413767aea11fe13d04b
                         ActorCache::Hooks &,
                         SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
      const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
-@@ -5049,9 +5068,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5076,9 +5095,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
        auto* current = shipper.get();
        KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
        shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
