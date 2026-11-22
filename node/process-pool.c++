@@ -2500,6 +2500,8 @@ public:
     }
     if (p->durableTestStorage) {
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
+    }
+    if (p->durable && p->threaded) {
       for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
@@ -3365,8 +3367,10 @@ public:
     return generationDrained(*r.old, r.switchedAt, now, drainAllowance(*r.old), r.lastLifecycleCheck, r.clearedContexts);
   }
   uint64_t drainAllowance(const ProcessGeneration& process) const {
-    return process.threaded ? std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs)
-                            : config.rotationDrainTimeoutMs;
+    if (process.threaded && (!process.durable || process.durableTestStorage)) {
+      return std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs);
+    }
+    return config.rotationDrainTimeoutMs;
   }
   // The same criterion for any generation; `since` stands for the moment it stopped taking
   // new calls. The Server's exit applies it to every live generation.

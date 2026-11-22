@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 20:56:02 +0800
+Subject: [PATCH] Expose the persistent backend in lifecycle observations
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index b57824f563705e1ca1b22c89e3dec20ebd8be31d..7ffc9eb8f52a9e4866c067f43de1f5768b93616d 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -82,6 +82,10 @@ wd_cc_library(
+     name = "coworkerd-wal",
+     srcs = ["coworkerd-wal-shipper.c++"],
+     hdrs = ["coworkerd-wal-shipper.h", "coworkerd-wal-wire.h"],
++    visibility = [
++        "//src/workerd/server:__subpackages__",
++        "//src/workerd/threaded:__pkg__",
++    ],
+     deps = [
+         "//src/workerd/util:sqlite",
+         "@capnp-cpp//src/kj",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 8cadd19f8ff4eb2ce2d0390126763a52cb0451ab..20b35cd765ecbb457e65a2727bb05e7ab75932df 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2850,7 +2850,8 @@ struct ThreadedServer {
+         ",\"overloaded\":" + std::to_string(state.overloads) +
+         ",\"expired\":" + std::to_string(state.expired) + "}}";
+     if (publish) {
+-      lifecycle.publish("{\"durableServer\":\"threaded-test\"" + row, state.active,
++      const std::string role = durableLog ? "threaded" : "threaded-test";
++      lifecycle.publish("{\"durableServer\":\"" + role + "\"" + row, state.active,
+           durableHomeSessions.load(), state.waiting);
+     }
+     if (appendTo) {
+@@ -3005,7 +3006,7 @@ struct ThreadedServer {
+     if (thread.home && durableLog) {
+       state.wal = durableLog->attachHome([&state](uint64_t openId) {
+         for (auto& [id, root]: state.durableRoots) {
+-          if (root.rootOpenId() != openId) continue;
++          if (!root.rootOpenId || root.rootOpenId() != openId) continue;
+           root.closeRequested = true;
+           break;
+         }
+@@ -4967,7 +4968,11 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+       if (facet == 0) current->reportAlarm(server::readDurableAlarm(*database));
+       auto& alarmHooks = *alarms;
+       return kj::heap<ActorSqlite>(kj::mv(database), gate,
+-          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); }, alarmHooks)
++          [shipper = kj::mv(shipper), &server = tree->server](SpanParent) mutable {
++        auto confirmation = shipper->onCommit();
++        server.durablePendingCommits.fetch_add(1);
++        return confirmation.attach(kj::defer([&server] { server.durablePendingCommits.fetch_sub(1); }));
++      }, alarmHooks)
+           .attach(kj::mv(alarms));
+     }
+     return kj::heap<ActorSqlite>(kj::mv(database), gate,

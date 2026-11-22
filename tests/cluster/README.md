@@ -36,7 +36,9 @@ node tests/cluster/run.mjs --help
 ```
 
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
-setup or teardown exits nonzero. Linux pull-request CI uses the same entry point.
+setup or teardown exits nonzero. Linux pull-request CI uses the same entry point. Cases beginning with
+`durable-threaded-` each start a fresh Compose project with the experimental backend enabled on the nodes
+specified by the case. The standard cases run with upstream durable processes.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
 ## Measured time and resources
@@ -62,6 +64,8 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
 | `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
+| `durable-threaded-mixed` | Both upstream and threaded peers must confirm writes. On the threaded owner, HTTP and RPC replies wait for the held acknowledgements while a different home serves a read. Clean rotation and rotation of a stopped child must reopen the data. A due alarm survives the threaded node's drain and fires on an upstream owner. After the threaded node rejoins, it must recover an upstream write in a later ownership epoch. |
+| `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
 
 Tests deploy code with `cowctl` and observe the product through ingress HTTP, `/v1` and documented management
 endpoints. The fixture disables stateless ingress forwarding so the CPU and process tests exercise the receiving
