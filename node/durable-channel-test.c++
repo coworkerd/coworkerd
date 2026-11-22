@@ -1226,6 +1226,38 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(log.drainChannel("d0-7"), "the current database close completes the drain");
 
     channel.draining = false;
+    const DurableLog::ObjectIdentity identity{ns, id, "tenant", 1, 1, 0};
+    object.shardEpoch = 1;
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "old-definition").ready);
+    log.objectDispatched(identity, "d0", 7);
+    open(25);
+    expectReply(7, 25, 0);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "new-definition").code == "DO_VERSION_DRAINING");
+    expectReply(6, 25);
+    close(25, 16384);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "new-definition").code == "DO_VERSION_DRAINING",
+        "the live call keeps its old definition even after SQLite close");
+    log.objectRequestFinished(identity, "d0", 7);
+    const auto stored = object.storageId;
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "new-definition").ready &&
+        object.threadedDefinition == "new-definition" && object.storageId == stored);
+    log.objectDispatched(identity, "d0", 7);
+    bool namespaceActive = true;
+    log.setNamespaceHook([&](const std::string&) { return namespaceActive; });
+    open(26);
+    expectReply(7, 26, 0);
+    namespaceActive = false;
+    KJ_REQUIRE(log.drainThreadedNamespaces({ns}).empty());
+    expectReply(6, 26);
+    close(26, 16384);
+    log.objectRequestFinished(identity, "d0", 7);
+    open(27);  // A descriptor sent just before the deletion reached the child late.
+    expectReply(7, 27, 1);
+    expectReply(6, 27);
+    close(27, 16384);
+    KJ_REQUIRE(log.drainThreadedNamespaces({ns}) == std::vector<std::string>{ns});
+    namespaceActive = true;
+
     open(29, 1);
     std::string broken(1, '\x03');
     integer(broken, 29, 8);

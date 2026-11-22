@@ -552,6 +552,7 @@ public:
   class Relay {
   public:
     virtual void goAway(const std::string& cause) = 0;
+    virtual const coworkerd::DurableLog::ObjectIdentity* durableIdentity() const = 0;
     Role role = Role::INGRESS;
     std::string tenant, processId;
     uint64_t generation = 0;
@@ -611,6 +612,20 @@ public:
   uint32_t goAwayGeneration(const std::string& processId, uint64_t generation, const std::string& cause) {
     return goAwayWhere(cause, [&](const Relay& relay) {
       return relay.role == Role::EXECUTION && relay.processId == processId && relay.generation == generation;
+    });
+  }
+  uint32_t goAwayShard(const std::string& namespaceId, uint32_t shard) {
+    return goAwayWhere("owner-expired", [&](const Relay& relay) {
+      const auto* object = relay.durableIdentity();
+      return object && object->namespaceId == namespaceId && object->shard == shard;
+    });
+  }
+  uint32_t goAwayObject(const DurableTarget& target) {
+    return goAwayWhere("definition-changed", [&](const Relay& relay) {
+      const auto* object = relay.durableIdentity();
+      return object && object->namespaceId == target.namespaceId &&
+          object->objectId == target.objectId && object->dataEpoch == target.dataEpoch &&
+          object->shardEpoch == target.shardEpoch;
     });
   }
   size_t openCount() const { return relays.size(); }
@@ -2407,6 +2422,14 @@ public:
     }
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
+      if (process->threadedDurableRole()) {
+        std::string code, reason;
+        const auto active = durableVersion(version->workerId, target, code, reason);
+        if (!active) throw DurableDispatchRefused{{false, 409, code, reason}};
+        if (coworkerd::versionPin(*active) != coworkerd::versionPin(*version))
+          throw DurableDispatchRefused{{false, 409, "VERSION_UNAVAILABLE",
+              "the prepared Durable Object version was superseded"}};
+      }
       if (auto missing = secretRefusal(*version, false, true))
         throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
     }
@@ -2425,14 +2448,16 @@ public:
               space != nullptr && space->status == "active") trackRootNamespace(space->id);
       }
       auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
-          target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
+          target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation,
+          process->threadedDurableRole() ? std::string_view(root->fingerprint) : std::string_view());
       if (!checked.ready) {
+        if (checked.code == "DO_VERSION_DRAINING") webSocketRegistry.goAwayObject(target);
         std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
                   << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
                   << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
                   << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
-        if (checked.channelMissing) {
-          try { runtime.requestAutomaticRotation(process->processId, "channel"); }
+        if (checked.channelMissing || checked.generationMustClose) {
+          try { runtime.requestAutomaticRotation(process->processId, checked.channelMissing ? "channel" : "object-definition-drain"); }
           catch (...) {
             std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
                       << "\",\"generation\":" << process->generation << "}" << std::endl;
@@ -3482,18 +3507,14 @@ private:
       if (root != nullptr) {
         auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
         if (process.threadedDurableRole()) {
-          capnp::MallocMessageBuilder planDocument;
-          auto plan = planDocument.initRoot<capnp::JsonValue>();
-          json.decodeRaw(kj::StringPtr(root->plan.c_str()).asArray(), plan);
-          const auto definition = coworkerd::json::field(plan.asReader(), "versionFingerprint");
-          KJ_REQUIRE(definition.isString(), "missing pinned durable definition");
+          KJ_REQUIRE(!root->fingerprint.empty(), "missing pinned durable definition");
           const auto storage = coworkerd::makeRootStorageRef(durable->namespaceId, durable->objectId, durable->dataEpoch);
           KJ_REQUIRE(std::isfinite(expiresAtMonotonicMs) && expiresAtMonotonicMs > 0 &&
               expiresAtMonotonicMs < double(INT64_MAX) / 1000000, "invalid durable dispatch deadline");
           std::ostringstream route;
           route << ",\"durableTestRoute\":{\"namespaceId\":\"" << jsonEscape(durable->namespaceId)
                 << "\",\"objectId\":\"" << jsonEscape(durable->objectId) << "\",\"className\":\""
-                << jsonEscape(durable->className) << "\",\"definition\":\"" << jsonEscape(definition.getString().cStr())
+                << jsonEscape(durable->className) << "\",\"definition\":\"" << jsonEscape(root->fingerprint)
                 << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
                 << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
                 << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
@@ -3998,6 +4019,9 @@ public:
     log.objectConnectionOpened(durableObject, durableProcessId, durableGeneration);
     durableLog = &log;
   }
+  const coworkerd::DurableLog::ObjectIdentity* durableIdentity() const override {
+    return durableLog ? &durableObject : nullptr;
+  }
   // Until both directions have ended -- each with its close frame, or one abruptly --, or the grace after the first
   // close ran out.
   kj::Promise<void> run() {
@@ -4011,7 +4035,7 @@ public:
   void goAway(const std::string& why) override {
     if (closing) return;
     nodeClose(1001, why == "drain" ? "the node is draining" : why == "owner-expired" ? "the node no longer owns this object"
-        : "the process is being replaced", why);
+        : why == "definition-changed" ? "the Durable Object definition changed" : "the process is being replaced", why);
   }
   // The executing node: the request toward workerd ended -- its failure, if it failed.
   void innerSettled(kj::Maybe<kj::Exception> failure) {
@@ -9566,7 +9590,9 @@ int run(Launch launch) {
       [&durableLog](const std::string& processId) { durableLog.closeChannel(processId); },
       [&durableLog](const std::string& processId) { return durableLog.drainChannel(processId); },
       server.placementConfig().durableLog);
-  shards.onShardGone([&durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
+  shards.onShardGone([&server, &durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
+    if (server.placementConfig().processPool.threadedDurableStorage)
+      server.webSockets().goAwayShard(namespaceId, shard);
     durableLog.shardGone(namespaceId, shard, reason);
   });
   // The lease of this node's epoch is judged next to every confirmation (node/durable-log.h). Once it ends --
@@ -9673,7 +9699,12 @@ int run(Launch launch) {
   runtime.setRetiring([&server](const std::string& processId, uint64_t generation) {
     return server.webSockets().goAwayGeneration(processId, generation, "rotation");
   });
-  runtime.setRootMaintenance([&server]() { return server.rootMaintenanceRequest(); },
+  runtime.setRootMaintenance([&server, &durableLog]() {
+    auto pending = server.rootMaintenanceRequest();
+    if (!server.placementConfig().processPool.threadedDurableStorage) return pending;
+    if (pending && !pending->empty()) server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));
+    return std::shared_ptr<const std::vector<std::string>>{};
+  },
       [&server](const auto& ids) { server.rootsMaintained(ids); });
   server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {

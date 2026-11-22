@@ -832,6 +832,93 @@ async function mixedDurableStorage(cluster) {
   }, { timeout: 140000, interval: 1000 });
 }
 
+async function threadedClassMigration(cluster) {
+  const [ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('threaded-migration');
+  const name = 'records';
+  const url = `/${tenant.name}/${name}`;
+  const call = (path, options) => request(cluster.urls[ingress], url + path, options);
+  const namespace = className => cluster.api(`${tenant.path}/workers/${name}/namespaces/${className}`,
+    { token: tenant.token });
+  const initial = { tag: 'v1', new_sqlite_classes: ['Record'] };
+  const renamed = { tag: 'v2', renamed_classes: [{ from: 'Record', to: 'RenamedRecord' }] };
+  const deleted = { tag: 'v3', deleted_classes: ['RenamedRecord'] };
+  const source = (className, version) => `
+    import { DurableObject } from 'cloudflare:workers';
+    export class ${className} extends DurableObject {
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path.endsWith('/held')) {
+          const encoder = new TextEncoder();
+          return new Response(new ReadableStream({
+            async start(controller) {
+              controller.enqueue(encoder.encode('entered:'));
+              await scheduler.wait(8000);
+              controller.enqueue(encoder.encode('${version}'));
+              controller.close();
+            },
+          }));
+        }
+        if (request.method === 'POST') await this.ctx.storage.put('value', await request.json());
+        return Response.json({
+          id: this.ctx.id.toString(),
+          value: await this.ctx.storage.get('value'),
+          version: '${version}',
+        });
+      }
+    }
+    export default { fetch(request, env) { return env.OBJECT.getByName('stable').fetch(request); } };
+  `;
+  const deploy = (version, className, migrations) => cluster.deploy(tenant, name, source(className, version), {
+    version, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
+  });
+  await deploy('v1', 'Record', [initial]);
+  const first = await eventually('v1 creates a threaded record', async () => {
+    const value = json(await call('', { method: 'POST', body: 'retained' }), 200, 'write v1');
+    assert.equal(value.version, 'v1');
+    return value;
+  });
+  const identity = (await namespace('Record')).namespaceId;
+  const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(25000) });
+  assert.equal(held.status, 200);
+  const reader = held.body.getReader();
+  try {
+    const firstChunk = await reader.read();
+    assert.equal(Buffer.from(firstChunk.value).toString(), 'entered:');
+    await deploy('v2', 'RenamedRecord', [initial, renamed]);
+    const versions = [];
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      versions.push(Buffer.from(chunk.value));
+    }
+    assert.equal(Buffer.concat(versions).toString(), 'v1', 'an open stream keeps its code pin');
+  } finally {
+    await reader.cancel();
+  }
+
+  await eventually('renamed class uses the existing threaded storage', async () => {
+    assert.equal((await namespace('RenamedRecord')).namespaceId, identity);
+    const entry = json(await call(''), 200, 'read v2');
+    assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2' });
+  });
+  await cluster.deploy(tenant, name, respondWith('v3'), {
+    version: 'v3', wrangler: { migrations: [initial, renamed, deleted] },
+  });
+  await eventually('deletion removes admission to the renamed namespace', async () => {
+    assert.deepEqual(await call(''), { status: 200, text: 'v3' });
+    const gone = await request(cluster.urls.apiserver,
+      `${tenant.path}/workers/${name}/namespaces/RenamedRecord`, { token: tenant.token });
+    if (gone.status === 200) {
+      const record = JSON.parse(gone.text);
+      assert.equal(record.namespaceId, identity);
+      assert.ok(record.status === 'deleting' || record.status === 'deleted');
+    } else {
+      assert.equal(gone.status, 404);
+    }
+  });
+}
+
 // The profiler uses the standard cluster. Its node-level fault runs last.
 export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
@@ -846,4 +933,5 @@ export const durableGatedCases = {
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
     confirmTimeoutMs: 25000,
   },
+  'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
 };
