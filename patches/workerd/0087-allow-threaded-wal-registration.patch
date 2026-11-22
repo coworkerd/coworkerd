@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 22:21:21 +0800
+Subject: [PATCH] Allow the threaded server to register WAL homes and opens
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index afb576fd6ead7d0793f779872d276e93c1865afb..7da3610e1fbfddebd79cb88def978b9fb1efe079 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2194,7 +2194,7 @@ struct ThreadedServer {
+   jsg::V8System v8{platform, {}, basePlatform.get()};
+   const std::string sourceAddress, identity;
+   const std::unique_ptr<server::DurableStorage> durableStorage;
+-  const kj::Own<server::ThreadedWalLog> durableLog;
++  kj::Own<server::ThreadedWalLog> durableLog;
+   const server::DurablePlacementLimits durablePlacement;
+   std::optional<server::DurableAdmission> durableAdmission;
+   std::mutex durableRoutingMutex;

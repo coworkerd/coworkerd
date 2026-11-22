@@ -64,3 +64,4 @@
 0084-prepare-threaded-wal-off-home.patch
 0085-threaded-facet-mutations.patch
 0086-refuse-persistent-facet-cloning.patch
+0087-allow-threaded-wal-registration.patch

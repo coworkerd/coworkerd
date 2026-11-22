@@ -223,7 +223,8 @@ def allowed_path(name, path):
                           name == '0084-prepare-threaded-wal-off-home.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name in {'0085-threaded-facet-mutations.patch',
-                                   '0086-refuse-persistent-facet-cloning.patch'} and
+                                   '0086-refuse-persistent-facet-cloning.patch',
+                                   '0087-allow-threaded-wal-registration.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
