@@ -94,8 +94,7 @@ async function census() {
     state: e.state, sandbox: e.sandbox, observed: h.observe(e.pid, process.pid) }));
 }
 
-const environment = { COWORKERD_TRACE_DIR: traceDir, COWORKERD_TRACE_PROGRAM: workerd,
-  COWORKERD_TRACE_THREADED_PROGRAM: threaded };
+const environment = { COWORKERD_TRACE_DIR: traceDir, COWORKERD_TRACE_PROGRAM: workerd };
 try {
   if (run === "main") {
     const workers = { ordinary: w.ordinary, "bytes-heavy": w.bytesHeavy, probe: w.sandboxProbe, "cpu-tenant": w.cpuTenant,

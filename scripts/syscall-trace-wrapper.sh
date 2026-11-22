@@ -8,7 +8,7 @@
 # calls (their unwinding alone would exceed the Server's 15 s startup budget).
 program=${COWORKERD_TRACE_PROGRAM:?}
 if [ "${0##*/}" = coworkerd-threaded ]; then
-  program=${COWORKERD_TRACE_THREADED_PROGRAM:?}
+  program=${program%/*}/coworkerd-threaded
   # This startup capability probe is not a node-managed process in the profile.
   if [ "${1:-}" = --sandbox-facts ]; then exec "$program" "$@"; fi
 fi
