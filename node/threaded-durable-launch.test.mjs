@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
+const homeReservation = scenario === 'home-reservation';
 const events = scenario === 'events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
@@ -44,6 +45,7 @@ const env = {
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
+  ...(homeReservation ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -137,9 +139,9 @@ async function readProcessResources(pid) {
   };
 }
 
-function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n) {
+function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n, definition = 'fixture') {
   return 'D' + JSON.stringify({
-    namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition: 'fixture',
+    namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition,
     uniqueKey: 'coworkerd-do-root-v1-' + 'a'.repeat(64), storageId: objectId,
     generation: '1', dataEpoch: '1', shardEpoch: '1', openId: '1',
     queuedBytes: String(queuedBytes), expiresMonotonicNs: String(expiry),
@@ -409,7 +411,54 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (httpLifecycle) {
+  if (homeReservation) {
+    const keep = [];
+    const claim = async (id, definition) => {
+      const connection = await sendPreface(socketPath,
+        durablePreface(id.repeat(64), `home-${id}`, 0, undefined, definition));
+      keep.push(connection.socket);
+      return connection;
+    };
+    try {
+      for (const [id, definition] of [['1', 'definition-one'], ['2', 'definition-two']]) {
+        const connection = await claim(id, definition);
+        assert.equal(connection.receipt, 'A');
+        connection.socket.write(Buffer.alloc(1));
+      }
+      const occupied = await waitForAdmission(socketPath, 2, 2);
+      assert.equal(occupied.homes, 2);
+      const refused = await claim('3', 'definition-three');
+      assert.equal(refused.receipt, 'R',
+        'a definition without a reservable home must be refused before acknowledgement');
+      const bounded = await readAdmission(socketPath);
+      assert.equal(bounded.trees, 2);
+      assert.equal(bounded.waiting, 2);
+      assert.equal(bounded.homes, 2);
+      assert.equal(bounded.reservedBytes, occupied.reservedBytes);
+      assert.equal(bounded.reservedDescriptors, occupied.reservedDescriptors);
+    } finally {
+      for (const socket of keep) socket.destroy();
+    }
+    const drained = await waitForAdmission(socketPath, 0);
+    assert.equal(drained.trees, 0);
+    assert.equal(drained.reservedBytes, 0);
+    assert.equal(drained.reservedDescriptors, 0);
+    const retry = await claim('3', 'definition-three');
+    try {
+      assert.equal(retry.receipt, 'A');
+      const reserved = await readAdmission(socketPath);
+      assert.equal(reserved.homes, 1, 'the home must already be reserved when acknowledgement arrives');
+    } finally { retry.socket.destroy(); }
+    await waitForAdmission(socketPath, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const live = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(live.pid, processInfo.pid);
+    assert.equal(live.generation, processInfo.generation);
+    assert.equal(live.state, 'ready');
+    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2, refusedDefinitions: 1}));
+  } else if (httpLifecycle) {
     const request = async (path, options) => {
       const started = performance.now();
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
