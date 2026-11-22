@@ -127,11 +127,21 @@ try {
     // The idle collection: requests that each leave 2 MiB more in the old generation, then idle time; the
     // process reports its idle collections in its lifecycle snapshot (gc.idleCollections).
     await window("idle-gc", async () => {
-      const idleCollections = async () => (await h.state()).processes.entries
-        .reduce((sum, e) => sum + (e.gc?.generation?.idleCollections ?? 0), 0);
+      const idleCollections = async () => {
+        const values = (await h.state()).processes.entries
+          .filter(e => e.processClass === "ordinary")
+          .map(e => e.gc?.generation?.idleCollections);
+        return values.length && values.every(value => typeof value === "number")
+          ? values.reduce((sum, value) => sum + value, 0) : null;
+      };
       const before = await idleCollections();
       const statuses = [];
       for (let n = 0; n < 6; n++) { statuses.push((await h.request("/gc-tenant?keep=2")).status); await h.delay(300); }
+      if (before === null) {
+        await h.delay(1000);
+        return { statuses, idleCollectionObserved: false,
+          reason: "the threaded lifecycle does not expose the legacy idleCollections counter" };
+      }
       const waited = await h.waitFor(async () => (await idleCollections()) > before, "an idle collection", 15000, 200);
       return { statuses, idleCollectionsBefore: before, idleCollectionsAfter: await idleCollections(), waitedMs: waited.elapsedMs };
     });
