@@ -1,0 +1,39 @@
+name: Build Linux kernel archives
+
+on:
+  # Start the initial runner measurements from the maintainer's working branch.
+  push:
+    branches: [codex/issue-44-kernel-workflow]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'coworkerd/coworkerd'
+    name: Build kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux-x86_64
+            runner: ubuntu-24.04
+            bazelisk: amd64
+            bazelisk-sha256: a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8
+          - arch: linux-arm64
+            runner: ubuntu-24.04-arm
+            bazelisk: arm64
+            bazelisk-sha256: b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Measure a cold kernel build
+        env:
+          BAZELISK_ARCH: ${{ matrix.bazelisk }}
+          BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
+        run: bash scripts/measure-kernel-build.sh bash scripts/build-kernel.sh
