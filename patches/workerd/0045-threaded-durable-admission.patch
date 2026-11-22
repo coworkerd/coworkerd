@@ -1,0 +1,687 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 04:10:27 +0800
+Subject: [PATCH] Add threaded durable test admission and role negotiation
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index d7dc20b8d3c92b8ccd280d755d957574ef2df64c..fcfa9508eb99ac8d4ce692d568ae3034c40f30d5 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -4,6 +4,19 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
+ 
+ package(default_visibility = ["//src/workerd/server:__subpackages__"])
+ 
++wd_cc_library(
++    name = "coworkerd-durable-admission",
++    srcs = ["coworkerd-durable-admission.c++"],
++    hdrs = ["coworkerd-durable-admission.h"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++    deps = ["@capnp-cpp//src/kj"],
++)
++
++kj_test(
++    src = "coworkerd-durable-admission-test.c++",
++    deps = [":coworkerd-durable-admission"],
++)
++
+ # The declarations the server crate's bridge header needs. Header-only: the bridge library depends
+ # on it, and :worker-factory depends on the bridge library, so the two cannot be one target.
+ wd_cc_library(
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..81083964ea58231f514a48e66f5a10778056398e
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -0,0 +1,174 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-admission.h"
++
++#include <kj/test.h>
++
++namespace workerd::server {
++namespace {
++
++using Admission = DurableAdmission;
++using Status = Admission::Status;
++using Delivery = Admission::Delivery;
++using Cancellation = Admission::Cancellation;
++using namespace std::chrono_literals;
++
++const Admission::Key first{"namespace", "first"};
++const Admission::Key second{"namespace", "second"};
++const Admission::Open open{1, 2, 3, 4, "definition", "Counter"};
++constexpr Admission::Time now{};
++constexpr Admission::Time deadline = now + 10s;
++constexpr Admission::Limits limits{
++  .capacity = {8, 50, 3000, 100},
++  .tree = {1, 3, 50, 10},
++  .event = {0, 1, 10, 0},
++  .residentTarget = 4,
++  .mailboxDepth = 2,
++  .mailboxBytes = 100,
++};
++
++Admission::Ticket queued(Admission::Result result, bool needsHome) {
++  KJ_REQUIRE(result.status == Status::QUEUED);
++  KJ_EXPECT(result.needsHome == needsHome);
++  KJ_REQUIRE(result.ticket.has_value());
++  return *result.ticket;
++}
++
++KJ_TEST("durable admission fences the generation, identity, home and queued event") {
++  Admission table(limits, 1);
++  auto stale = open;
++  stale.generation = 2;
++  KJ_EXPECT(table.queue(first, stale, 40, deadline, now).status == Status::STALE);
++  const auto event = queued(table.queue(first, open, 40, deadline, now), true);
++  const auto queuedAfter = queued(table.queue(first, open, 30, deadline, now), false);
++  KJ_EXPECT(!table.next(event.tree).has_value());
++  KJ_EXPECT(table.begin(event, 9, first, open, now) == Delivery::STALE);
++  KJ_EXPECT(table.publishHome(event.tree, 9));
++  KJ_EXPECT(!table.publishHome(event.tree, 10));
++  KJ_EXPECT((table.homeFor(event.tree) == 9));
++  KJ_EXPECT((table.next(event.tree) == event));
++
++  for (auto changed: {&Admission::Open::dataEpoch, &Admission::Open::shardEpoch,
++         &Admission::Open::openId}) {
++    stale = open;
++    ++(stale.*changed);
++    KJ_EXPECT(table.queue(first, stale, 10, deadline, now).status == Status::STALE);
++    KJ_EXPECT(table.begin(event, 9, first, stale, now) == Delivery::STALE);
++  }
++  stale = open;
++  stale.definition = "another definition";
++  KJ_EXPECT(table.begin(event, 9, first, stale, now) == Delivery::STALE);
++  stale = open;
++  stale.className = "OtherCounter";
++  KJ_EXPECT(table.begin(event, 9, first, stale, now) == Delivery::STALE);
++  KJ_EXPECT(table.begin(event, 9, second, open, now) == Delivery::STALE);
++  KJ_EXPECT(table.begin(event, 10, first, open, now) == Delivery::STALE);
++  KJ_EXPECT(table.begin(queuedAfter, 9, first, open, now) == Delivery::STALE);
++  KJ_EXPECT(table.begin(event, 9, first, open, now) == Delivery::ACCEPTED);
++  KJ_EXPECT(table.begin(event, 9, first, open, now) == Delivery::STALE);
++  KJ_EXPECT(table.begin(queuedAfter, 9, first, open, now) == Delivery::ACCEPTED);
++  KJ_EXPECT(table.state().active == 2);
++}
++
++KJ_TEST("durable admission bounds waiting events and bytes per object") {
++  Admission table(limits, 1);
++  const auto firstEvent = queued(table.queue(first, open, 70, deadline, now), true);
++  KJ_EXPECT(table.queue(first, open, 31, deadline, now).status == Status::OVERLOADED);
++  const auto other = queued(table.queue(second, open, 100, deadline, now), true);
++  const auto secondEvent = queued(table.queue(first, open, 30, deadline, now), false);
++  KJ_EXPECT(table.queue(first, open, 0, deadline, now).status == Status::OVERLOADED);
++  KJ_EXPECT(table.state().waiting == 3);
++  KJ_EXPECT(table.state().waitingBytes == 200);
++  KJ_EXPECT(table.publishHome(firstEvent.tree, 1));
++  KJ_EXPECT(table.begin(firstEvent, 1, first, open, now) == Delivery::ACCEPTED);
++  KJ_EXPECT((table.next(firstEvent.tree) == secondEvent));
++  KJ_EXPECT(table.state().waitingBytes == 130);
++  queued(table.queue(first, open, 70, deadline, now), false);
++  KJ_EXPECT((table.failOpen(other.tree) == std::vector{other}));
++  KJ_EXPECT(table.state().waitingBytes == 100);
++  KJ_EXPECT(table.state().overloads == 2);
++}
++
++KJ_TEST("durable admission expires queued events and releases each reservation once") {
++  Admission table(limits, 1);
++  KJ_EXPECT(table.queue(first, open, 50, now, now).status == Status::EXPIRED);
++  const auto active = queued(table.queue(first, open, 70, deadline, now), true);
++  KJ_EXPECT(table.publishHome(active.tree, 1));
++  KJ_EXPECT(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
++  const auto expiring = queued(table.queue(first, open, 80, deadline, now), false);
++  const auto canceled = queued(table.queue(first, open, 20, deadline, now), false);
++  KJ_EXPECT(table.cancel(canceled) == Cancellation::RELEASED);
++  KJ_EXPECT(table.cancel(canceled) == Cancellation::GONE);
++  KJ_EXPECT(table.expire(deadline - 1ms).empty());
++  KJ_EXPECT((table.expire(deadline) == std::vector{expiring}));
++  KJ_EXPECT(table.expire(deadline).empty());
++  KJ_EXPECT(table.state().active == 1);
++  KJ_EXPECT(table.state().waiting == 0);
++  KJ_EXPECT(table.cancel(active) == Cancellation::SIGNAL_HOME);
++  KJ_EXPECT(table.cancel(active) == Cancellation::GONE);
++  KJ_EXPECT(table.state().reserved.descriptors == 4);
++  KJ_EXPECT(!table.stopIdleTree(active.tree, 1));
++  KJ_EXPECT(!table.complete(active, 2));
++  KJ_EXPECT(table.complete(active, 1));
++  KJ_EXPECT(!table.complete(active, 1));
++  KJ_EXPECT((table.state().reserved == limits.tree));
++  const auto late = queued(table.queue(first, open, 100, deadline + 1s, deadline), false);
++  KJ_EXPECT(table.begin(late, 1, first, open, deadline + 1s) == Delivery::EXPIRED);
++  KJ_EXPECT(table.state().expired == 3);
++  KJ_EXPECT((table.state().reserved == limits.tree));
++}
++
++KJ_TEST("durable admission retains a closing tree until its home acknowledges release") {
++  Admission table(limits, 1);
++  const auto old = queued(table.queue(first, open, 30, deadline, now), true);
++  KJ_EXPECT(table.publishHome(old.tree, 1));
++  KJ_EXPECT(table.cancel(old) == Cancellation::RELEASED);
++  KJ_EXPECT(!table.stopIdleTree(old.tree, 2));
++  KJ_EXPECT(table.stopIdleTree(old.tree, 1));
++  KJ_EXPECT(table.queue(first, open, 30, deadline, now).status == Status::STALE);
++  KJ_EXPECT(!table.releaseTree(old.tree, 2));
++  KJ_EXPECT(table.state().trees == 1);
++  KJ_EXPECT((table.state().reserved == limits.tree));
++  KJ_EXPECT(table.releaseTree(old.tree, 1));
++  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++
++  auto nextOpen = open;
++  ++nextOpen.openId;
++  const auto replacement = queued(table.queue(first, nextOpen, 30, deadline, now), true);
++  KJ_EXPECT(replacement.tree != old.tree);
++  KJ_EXPECT(table.publishHome(replacement.tree, 1));
++  KJ_EXPECT(!table.releaseTree(old.tree, 1));
++  KJ_EXPECT(table.begin(replacement, 1, first, nextOpen, now) == Delivery::ACCEPTED);
++}
++
++KJ_TEST("each durable reservation ceiling refuses before publishing a new tree") {
++  auto below = limits;
++  // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.
++  below.residentTarget = 0;
++  for (auto dimension: {&Admission::Resources::threads, &Admission::Resources::descriptors,
++         &Admission::Resources::memory, &Admission::Resources::addressSpace}) {
++    below.capacity = limits.capacity;
++    below.capacity.*dimension = limits.tree.*dimension + limits.event.*dimension;
++    Admission table(below, 1);
++    const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
++    const auto before = table.state().reserved;
++    KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
++    KJ_EXPECT(table.state().trees == 1);
++    KJ_EXPECT((table.state().reserved == before));
++    KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
++    KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++    queued(table.queue(second, open, 0, deadline, now), true);
++  }
++  below = limits;
++  below.residentTarget = 1;
++  Admission table(below, 1);
++  const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
++  KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
++  KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
++  queued(table.queue(second, open, 0, deadline, now), true);
++}
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6da16bdaa2349213eb48338a68c28a2bec6319b
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -0,0 +1,251 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-admission.h"
++
++#include <kj/debug.h>
++
++#include <algorithm>
++
++namespace workerd::server {
++namespace {
++
++using Resources = DurableAdmission::Resources;
++
++bool reserve(Resources& used, Resources limit, Resources amount) {
++  // Compare against the remaining capacity to avoid overflow.
++  if (amount.threads > limit.threads - used.threads ||
++      amount.descriptors > limit.descriptors - used.descriptors ||
++      amount.memory > limit.memory - used.memory ||
++      amount.addressSpace > limit.addressSpace - used.addressSpace) {
++    return false;
++  }
++  used.threads += amount.threads;
++  used.descriptors += amount.descriptors;
++  used.memory += amount.memory;
++  used.addressSpace += amount.addressSpace;
++  return true;
++}
++
++void release(Resources& used, Resources amount) {
++  KJ_ASSERT(used.threads >= amount.threads && used.descriptors >= amount.descriptors &&
++      used.memory >= amount.memory && used.addressSpace >= amount.addressSpace);
++  used.threads -= amount.threads;
++  used.descriptors -= amount.descriptors;
++  used.memory -= amount.memory;
++  used.addressSpace -= amount.addressSpace;
++}
++
++}  // namespace
++
++DurableAdmission::DurableAdmission(Limits limits, uint64_t generation)
++    : limits(limits), generation(generation) {
++  KJ_REQUIRE(limits.mailboxDepth > 0 && limits.mailboxBytes > 0 && generation > 0,
++      "invalid durable admission limits or generation");
++  KJ_REQUIRE(limits.tree.memory > 0 && limits.event.memory > 0,
++      "durable tree and event metadata require memory reservations");
++}
++
++DurableAdmission::Result DurableAdmission::queue(
++    const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now) {
++  if (open.generation != generation) return {Status::STALE};
++  if (deadline <= now) {
++    ++counters.expired;
++    return {Status::EXPIRED};
++  }
++  auto existing = objects.find(key);
++  auto* tree = existing == objects.end() ? nullptr : &trees.at(existing->second);
++  if (tree != nullptr && (tree->open != open || tree->closing)) return {Status::STALE};
++
++  auto refuse = [&]() -> Result {
++    ++counters.overloads;
++    return {Status::OVERLOADED};
++  };
++  if (bytes > limits.mailboxBytes ||
++      (tree != nullptr && (tree->waiting >= limits.mailboxDepth ||
++          bytes > limits.mailboxBytes - tree->waitingBytes))) {
++    return refuse();
++  }
++  auto reserved = counters.reserved;
++  if (!reserve(reserved, limits.capacity, limits.event) ||
++      !reserve(reserved, limits.capacity, {.memory = bytes})) {
++    return refuse();
++  }
++  const bool newTree = tree == nullptr;
++  if (newTree && ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
++      !reserve(reserved, limits.capacity, limits.tree))) {
++    return refuse();
++  }
++
++  KJ_ASSERT(nextTree != 0 && nextEvent != 0);
++  const uint64_t treeId = newTree ? nextTree++ : existing->second;
++  const uint64_t eventId = nextEvent++;
++  if (newTree) {
++    Tree fresh{key, open, {}};
++    fresh.events.emplace(eventId, Event{bytes, deadline});
++    auto index = objects.emplace(key, treeId).first;
++    try {
++      tree = &trees.emplace(treeId, std::move(fresh)).first->second;
++    } catch (...) {
++      objects.erase(index);
++      throw;
++    }
++    ++counters.trees;
++  } else {
++    tree->events.emplace(eventId, Event{bytes, deadline});
++  }
++  counters.reserved = reserved;
++  ++tree->waiting;
++  tree->waitingBytes += bytes;
++  ++counters.waiting;
++  counters.waitingBytes += bytes;
++  return {Status::QUEUED, Ticket{treeId, eventId}, newTree};
++}
++
++bool DurableAdmission::publishHome(uint64_t tree, uint64_t home) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || entry->second.home != 0 || home == 0) return false;
++  entry->second.home = home;
++  return true;
++}
++
++std::optional<uint64_t> DurableAdmission::homeFor(uint64_t tree) const {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || entry->second.home == 0) return std::nullopt;
++  return entry->second.home;
++}
++
++std::optional<DurableAdmission::Ticket> DurableAdmission::next(uint64_t tree) const {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || entry->second.home == 0 || entry->second.closing) {
++    return std::nullopt;
++  }
++  const auto& events = entry->second.events;
++  auto pending = std::find_if(events.begin(), events.end(),
++      [](const auto& event) { return event.second.phase == Phase::WAITING; });
++  if (pending == events.end()) return std::nullopt;
++  return Ticket{tree, pending->first};
++}
++
++DurableAdmission::Delivery DurableAdmission::begin(
++    Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now) {
++  auto entry = trees.find(ticket.tree);
++  if (entry == trees.end() || home == 0 || entry->second.home != home ||
++      entry->second.key != key || entry->second.open != open || next(ticket.tree) != ticket) {
++    return Delivery::STALE;
++  }
++  auto& tree = entry->second;
++  auto event = tree.events.find(ticket.event);
++  if (event->second.deadline <= now) {
++    ++counters.expired;
++    releaseEvent(tree, event);
++    return Delivery::EXPIRED;
++  }
++  releaseWaiting(tree, event->second);
++  event->second.phase = Phase::ACTIVE;
++  ++counters.active;
++  return Delivery::ACCEPTED;
++}
++
++DurableAdmission::Cancellation DurableAdmission::cancel(Ticket ticket) {
++  auto entry = trees.find(ticket.tree);
++  if (entry == trees.end()) return Cancellation::GONE;
++  auto& tree = entry->second;
++  auto event = tree.events.find(ticket.event);
++  if (event == tree.events.end() || event->second.phase == Phase::CANCELING) {
++    return Cancellation::GONE;
++  }
++  if (event->second.phase == Phase::ACTIVE) {
++    event->second.phase = Phase::CANCELING;
++    return Cancellation::SIGNAL_HOME;
++  }
++  releaseEvent(tree, event);
++  return Cancellation::RELEASED;
++}
++
++bool DurableAdmission::complete(Ticket ticket, uint64_t home) {
++  auto entry = trees.find(ticket.tree);
++  if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
++  auto& tree = entry->second;
++  auto event = tree.events.find(ticket.event);
++  if (event == tree.events.end() || event->second.phase == Phase::WAITING) return false;
++  releaseEvent(tree, event);
++  return true;
++}
++
++std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
++  std::vector<Ticket> expired;
++  for (auto& [treeId, tree]: trees) {
++    for (auto it = tree.events.begin(); it != tree.events.end();) {
++      auto event = it++;
++      if (event->second.phase != Phase::WAITING || event->second.deadline > now) continue;
++      expired.push_back({treeId, event->first});
++      releaseEvent(tree, event);
++      ++counters.expired;
++    }
++  }
++  return expired;
++}
++
++bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || home == 0 || entry->second.home != home ||
++      entry->second.closing || !entry->second.events.empty()) {
++    return false;
++  }
++  entry->second.closing = true;
++  return true;
++}
++
++bool DurableAdmission::releaseTree(uint64_t tree, uint64_t home) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || !entry->second.closing || entry->second.home != home) {
++    return false;
++  }
++  eraseTree(entry);
++  return true;
++}
++
++std::vector<DurableAdmission::Ticket> DurableAdmission::failOpen(uint64_t tree) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || entry->second.home != 0) return {};
++  auto& pending = entry->second;
++  std::vector<Ticket> refused;
++  refused.reserve(pending.events.size());
++  while (!pending.events.empty()) {
++    auto event = pending.events.begin();
++    refused.push_back({tree, event->first});
++    releaseEvent(pending, event);
++  }
++  eraseTree(entry);
++  return refused;
++}
++
++void DurableAdmission::releaseWaiting(Tree& tree, const Event& event) {
++  --tree.waiting;
++  tree.waitingBytes -= event.bytes;
++  --counters.waiting;
++  counters.waitingBytes -= event.bytes;
++  release(counters.reserved, {.memory = event.bytes});
++}
++
++void DurableAdmission::releaseEvent(Tree& tree, std::map<uint64_t, Event>::iterator event) {
++  if (event->second.phase == Phase::WAITING) {
++    releaseWaiting(tree, event->second);
++  } else {
++    --counters.active;
++  }
++  release(counters.reserved, limits.event);
++  tree.events.erase(event);
++}
++
++void DurableAdmission::eraseTree(std::map<uint64_t, Tree>::iterator entry) {
++  KJ_ASSERT(entry->second.events.empty());
++  objects.erase(entry->second.key);
++  trees.erase(entry);
++  --counters.trees;
++  release(counters.reserved, limits.tree);
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2a95ec94c1e656d0eec3d914e6d6baea3ff31e1
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -0,0 +1,137 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <chrono>
++#include <compare>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace workerd::server {
++
++// One router owns this table. The home loops report closure and completion by ID.
++// Neither the table nor its event credits own actor or isolate state.
++class DurableAdmission {
++ public:
++  using Clock = std::chrono::steady_clock;
++  using Time = Clock::time_point;
++
++  struct Resources {
++    uint64_t threads = 0;
++    uint64_t descriptors = 0;
++    uint64_t memory = 0;
++    uint64_t addressSpace = 0;
++    bool operator==(const Resources&) const = default;
++  };
++
++  struct Limits {
++    // Capacity available to the dispatcher after withholding control and shutdown headroom.
++    Resources capacity;
++    Resources tree;
++    Resources event;
++    uint32_t residentTarget;
++    uint32_t mailboxDepth;
++    uint64_t mailboxBytes;
++  };
++
++  struct Key {
++    std::string namespaceId;
++    std::string objectId;
++    auto operator<=>(const Key&) const = default;
++  };
++
++  struct Open {
++    uint64_t generation;
++    uint64_t dataEpoch;
++    uint64_t shardEpoch;
++    uint64_t openId;
++    std::string definition;
++    std::string className;
++    bool operator==(const Open&) const = default;
++  };
++
++  struct Ticket {
++    uint64_t tree;
++    uint64_t event;
++    bool operator==(const Ticket&) const = default;
++  };
++
++  enum class Status { QUEUED, OVERLOADED, EXPIRED, STALE };
++  struct Result {
++    Status status;
++    std::optional<Ticket> ticket = std::nullopt;
++    bool needsHome = false;
++  };
++
++  enum class Cancellation { GONE, RELEASED, SIGNAL_HOME };
++  enum class Delivery { ACCEPTED, EXPIRED, STALE };
++
++  struct State {
++    Resources reserved = {};
++    uint64_t trees = 0;
++    uint64_t waiting = 0;
++    uint64_t waitingBytes = 0;
++    uint64_t active = 0;
++    uint64_t overloads = 0;
++    uint64_t expired = 0;
++  };
++
++  DurableAdmission(Limits limits, uint64_t generation);
++
++  Result queue(const Key& key, const Open& open, uint64_t bytes, Time deadline, Time now);
++  bool publishHome(uint64_t tree, uint64_t home);
++  std::optional<uint64_t> homeFor(uint64_t tree) const;
++  // Check the full descriptor and route the first live waiting event to an already published home.
++  // Starting an event returns waiting credit while retaining its execution reservation.
++  std::optional<Ticket> next(uint64_t tree) const;
++  Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
++  Cancellation cancel(Ticket ticket);
++  bool complete(Ticket ticket, uint64_t home);
++  std::vector<Ticket> expire(Time now);
++
++  // A home starts closing only after its mailbox is empty. Reject admission during close,
++  // and keep the tree's reservation until the home confirms that its handles are gone.
++  bool stopIdleTree(uint64_t tree, uint64_t home);
++  bool releaseTree(uint64_t tree, uint64_t home);
++  // The home failed to open. Releases all waiting credits without a close acknowledgement.
++  std::vector<Ticket> failOpen(uint64_t tree);
++
++  State state() const { return counters; }
++
++ private:
++  enum class Phase { WAITING, ACTIVE, CANCELING };
++
++  struct Event {
++    uint64_t bytes;
++    Time deadline;
++    Phase phase = Phase::WAITING;
++  };
++
++  struct Tree {
++    Key key;
++    Open open;
++    std::map<uint64_t, Event> events;
++    uint64_t home = 0;
++    uint64_t waitingBytes = 0;
++    uint32_t waiting = 0;
++    bool closing = false;
++  };
++
++  void releaseWaiting(Tree& tree, const Event& event);
++  void releaseEvent(Tree& tree, std::map<uint64_t, Event>::iterator event);
++  void eraseTree(std::map<uint64_t, Tree>::iterator tree);
++
++  const Limits limits;
++  const uint64_t generation;
++  State counters;
++  uint64_t nextTree = 1, nextEvent = 1;
++  std::map<Key, uint64_t> objects;
++  std::map<uint64_t, Tree> trees;
++};
++
++}  // namespace workerd::server
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index d8295d11e322c9dbe65627b31a6f7859f36edaa9..67de7fde2e8eeaf3e10d87812c43af64b1625fa8 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1890,6 +1890,7 @@ struct ThreadedServer {
+   server::WorkerdPlatform platform{*basePlatform};
+   jsg::V8System v8{platform, {}, basePlatform.get()};
+   const std::string sourceAddress, identity;
++  const bool durableTestStorage;
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
+@@ -1940,9 +1941,11 @@ struct ThreadedServer {
+   std::atomic<bool> delayedSourceForTest{false};
+   std::thread manager;
+ 
+-  ThreadedServer(uint limit, std::string sourceAddress, std::string identity)
++  ThreadedServer(uint limit, std::string sourceAddress, std::string identity,
++      bool durableTestStorage = false)
+       : sourceAddress(std::move(sourceAddress)),
+         identity(std::move(identity)),
++        durableTestStorage(durableTestStorage),
+         pending(limit * 2),
+         limit(limit),
+         resources(std::make_shared<ResourceBudget>(
+@@ -3991,7 +3994,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+           (void)!recv(fd, &prefix, 1, MSG_DONTWAIT);
+           epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+           connections.erase(found);
+-          char admission = server.pending.hasSpace() ? 'A' : 'R';
++          char admission = !server.durableTestStorage && server.pending.hasSpace() ? 'A' : 'R';
+           auto sent = send(fd, &admission, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+           if (sent != 1 || admission == 'R')
+             ::close(fd);
+@@ -4044,7 +4047,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+                    "lifecycle controls require S1c\"}";
+           }
+           connection.output = "HTTP/1.1 " + std::string(status) +
+-              "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +
++              "\r\nX-Coworkerd-Threaded-Protocol: 3" +
++              (server.durableTestStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
++              "\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+         }
+       }
+@@ -4090,15 +4095,20 @@ int main(int argc, char **argv) {
+       fprintf(stderr, "[coworkerd-sandbox] {\"capacity\":true,\"groups\":%zu}\n", server::measureGroupCapacity());
+     return 0;
+   }
+-  if (argc != 5) {
++  const bool durableTestStorage = argc == 6 && strcmp(argv[5], "--durable-test-storage") == 0;
++  if (argc != 5 && !durableTestStorage) {
+     fprintf(stderr,
+         "usage: coworkerd-threaded LISTEN_FD SOURCE_ADDRESS "
+-        "IDENTITY INFLIGHT\n");
++        "IDENTITY INFLIGHT [--durable-test-storage]\n");
+     return 64;
+   }
+   char *end = nullptr;
+   auto limit = strtoul(argv[4], &end, 10);
+   if (!*argv[4] || !end || *end || limit == 0 || limit > 16384) return 64;
++  if (durableTestStorage && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
++    fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
++    return 78;
++  }
+   if (!prepareDescriptors(limit)) return 78;
+   auto event = limitEventFd();
+   if (event >= 0) {
+@@ -4130,7 +4140,7 @@ int main(int argc, char **argv) {
+   setenv("COWORKERD_THREADED", "1", 1);
+   ThreadedServer *server;
+   try {
+-    server = new ThreadedServer(limit, argv[2], argv[3]);
++    server = new ThreadedServer(limit, argv[2], argv[3], durableTestStorage);
+   } catch (...) {
+     fprintf(stderr,
+         "[threaded-start] "

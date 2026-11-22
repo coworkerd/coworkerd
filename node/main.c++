@@ -1659,7 +1659,8 @@ public:
     }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
-    if (serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
+    if (!(durable && serverConfig.processPool.threadedDurableTestStorage) &&
+        serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
       value.category = durable ? "paused-durable" : runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
       value.avoidMs = 0;
     }
@@ -1669,7 +1670,8 @@ public:
 
   uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
   bool durablePaused(const std::string& worker, const std::string& objectKey) {
-    return pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
+    return !serverConfig.processPool.threadedDurableTestStorage &&
+        pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
   }
   struct Admission {
     std::optional<InvocationRejection> refused;
@@ -1802,7 +1804,8 @@ public:
   std::string_view admissionTenant(const std::string& worker, const DurableTarget* durable = nullptr) const {
     // Worker identity comes from the selected deployment. Do not use an ingress header.
     // A scheduled alarm has no ingress caller; its scheduler continues to use the node-wide limits.
-    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) || (durable && durable->alarmAtUnixMs)) return {};
+    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) ||
+        (durable && (durable->alarmAtUnixMs || serverConfig.processPool.threadedDurableTestStorage))) return {};
     auto slash = worker.find('/');
     return slash == std::string::npos ? std::string_view() : std::string_view(worker).substr(0, slash);
   }
@@ -2297,6 +2300,7 @@ public:
 
   // ---- Durable Objects ----
   bool durableReady(const std::string& objectKey) { return runtime.durableAvailable(objectKey); }
+  bool usesDisposableDurableStorage() const { return serverConfig.processPool.threadedDurableTestStorage; }
   std::string durableProcessFor(const std::string& objectKey) const { return runtime.durableProcessFor(objectKey); }
   // How many Durable Object calls led to an object's requests: the most of those in flight, else its latest one's. A call
   // the object makes counts one more (DO_HOP_LIMIT beyond MAX_DURABLE_HOPS): the node's own count, whatever the tenant's
@@ -2394,6 +2398,9 @@ public:
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
+    if (process->threadedDurableTestRole() && (target.isDatabase() || target.alarmAtUnixMs)) {
+      throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", "the durable test role supports object requests"}};
+    }
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
       if (auto missing = secretRefusal(*version, false, true))
@@ -2405,28 +2412,30 @@ public:
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
-    trackRootNamespace(target.namespaceId);
-    if (!target.isDatabase()) {
-      // One installation registers every declared class, including classes never opened here.
-      for (const auto& name : version->declaredClasses)
-        if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
-            space != nullptr && space->status == "active") trackRootNamespace(space->id);
-    }
-    auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
-        target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
-    if (!checked.ready) {
-      std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
-                << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
-                << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
-                << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
-      if (checked.channelMissing) {
-        try { runtime.requestAutomaticRotation(process->processId, "channel"); }
-        catch (...) {
-          std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
-                    << "\",\"generation\":" << process->generation << "}" << std::endl;
-        }
+    if (!process->threadedDurableTestRole()) {
+      trackRootNamespace(target.namespaceId);
+      if (!target.isDatabase()) {
+        // One installation registers every declared class, including classes never opened here.
+        for (const auto& name : version->declaredClasses)
+          if (const auto* space = desiredState.state().durableNamespace(version->workerId, name);
+              space != nullptr && space->status == "active") trackRootNamespace(space->id);
       }
-      throw DurableDispatchRefused{std::move(checked)};
+      auto checked = durableLog.checkObjectDispatch({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+          target.dataEpoch, target.shardEpoch, target.shard}, process->processId, process->generation);
+      if (!checked.ready) {
+        std::cout << "[do-dispatch-refused] {\"object\":\"" << jsonEscape(target.key())
+                  << "\",\"processId\":\"" << jsonEscape(process->processId) << "\",\"generation\":" << process->generation
+                  << ",\"status\":" << checked.status << ",\"code\":\"" << jsonEscape(checked.code)
+                  << "\",\"reason\":\"" << jsonEscape(cleanReason(checked.reason)) << "\"}" << std::endl;
+        if (checked.channelMissing) {
+          try { runtime.requestAutomaticRotation(process->processId, "channel"); }
+          catch (...) {
+            std::cout << "[do-channel-rotation-failed] {\"processId\":\"" << process->processId
+                      << "\",\"generation\":" << process->generation << "}" << std::endl;
+          }
+        }
+        throw DurableDispatchRefused{std::move(checked)};
+      }
     }
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
@@ -3394,7 +3403,8 @@ private:
     // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
     // (and the loader key of a Worker that names none has no limits segment).
     auto limits = namedLimits(version.workerId);
-    if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
+    if (process.threadedDurableTestRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
+    else if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
@@ -3466,7 +3476,28 @@ private:
       capnp::JsonCodec json;
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
-        const auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        if (process.threadedDurableTestRole()) {
+          capnp::MallocMessageBuilder planDocument;
+          auto plan = planDocument.initRoot<capnp::JsonValue>();
+          json.decodeRaw(kj::StringPtr(root->plan.c_str()).asArray(), plan);
+          const auto definition = coworkerd::json::field(plan.asReader(), "versionFingerprint");
+          KJ_REQUIRE(definition.isString(), "missing pinned durable test definition");
+          const auto storage = coworkerd::makeRootStorageRef(durable->namespaceId, durable->objectId, durable->dataEpoch);
+          KJ_REQUIRE(std::isfinite(expiresAtMonotonicMs) && expiresAtMonotonicMs > 0 &&
+              expiresAtMonotonicMs < double(INT64_MAX) / 1000000, "invalid durable test dispatch deadline");
+          std::ostringstream route;
+          route << ",\"durableTestRoute\":{\"namespaceId\":\"" << jsonEscape(durable->namespaceId)
+                << "\",\"objectId\":\"" << jsonEscape(durable->objectId) << "\",\"className\":\""
+                << jsonEscape(durable->className) << "\",\"definition\":\"" << jsonEscape(definition.getString().cStr())
+                << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
+                << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
+                << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
+                << "\",\"queuedBytes\":\"" << encoded.size() << "\",\"expiresMonotonicNs\":\""
+                << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
+          encoded.pop_back();
+          encoded += route.str();
+        }
         return kj::str(encoded.c_str());
       }
       return encodeNative(json.encode(descriptor.asReader()));
@@ -6467,6 +6498,16 @@ public:
     std::string code, reason;
     auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
+    if (server.usesDisposableDurableStorage()) {
+      if (request.target.isDatabase() || request.target.alarmAtUnixMs) {
+        co_return refused(server.refusal("NOT_SUPPORTED", "the durable test role supports object events", 501));
+      }
+      request.target.shardEpoch = 1;
+      request.target.dataEpoch = 1;
+      auto ran = co_await runHere(std::move(request), std::move(version), line, started, deadline);
+      if (ran.refusal) co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
+      co_return kj::mv(ran.dispatched);
+    }
     auto route = co_await shards.route(request.target.namespaceId, request.target.shard);
     for (uint32_t attempt = 1;; ++attempt) {
       if (route.kind == coworkerd::ShardRoute::Kind::REFUSE) {
@@ -6525,6 +6566,9 @@ public:
     rpc::EventDispatcher::Client dispatcher = nullptr;
   };
   kj::Promise<Received> receive(Request request, uint32_t shard, uint64_t expectedEpoch, std::string from) {
+    if (server.usesDisposableDurableStorage()) {
+      co_return Received{server.refusal("NOT_SUPPORTED", "the durable test role only accepts local dispatch", 501)};
+    }
     const auto started = monotonicTimeMs();
     const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
     Line line{request.workerId, {}, request.allocation ? "worker" :
@@ -6624,6 +6668,7 @@ private:
   kj::Promise<Ran> runHere(Request request, std::shared_ptr<const VersionDefinition> version, Line line, double started,
       double deadline) {
     const auto target = request.target;
+    const bool disposable = server.usesDisposableDurableStorage();
     auto refused = [&](const InvocationRejection& refusal) {
       server.observeLocalRefusal(refusal, "durableObject");
       log(line, target, nullptr, refusal.status, refusal.code, started);
@@ -6637,14 +6682,16 @@ private:
       if (auto capacity = server.admission(version->workerId, version->definitionHash, false, deadline,
               false, false, &target)) co_return refused(*capacity);
     }
-    auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
-        coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false,
-        target.alarmAtUnixMs != 0, target.alarmAtUnixMs == 0);
-    if (!ready.ready) {
-      line.recovered = ready.elapsedMs;
-      co_return refused(server.refusal(ready.code, ready.reason, ready.status));
+    if (!disposable) {
+      auto ready = co_await durableLog.openObject({target.namespaceId, target.objectId,
+          coworkerd::tenantOf(version->workerId), target.dataEpoch, target.shardEpoch, target.shard}, false,
+          target.alarmAtUnixMs != 0, target.alarmAtUnixMs == 0);
+      if (!ready.ready) {
+        line.recovered = ready.elapsedMs;
+        co_return refused(server.refusal(ready.code, ready.reason, ready.status));
+      }
+      if (ready.rebuilt) line.recovered = ready.elapsedMs;
     }
-    if (ready.rebuilt) line.recovered = ready.elapsedMs;
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
@@ -6657,7 +6704,7 @@ private:
     slot->durable = true;
     slot->durableObject = {target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
         target.dataEpoch, target.shardEpoch, target.shard};
-    slot->durableLog = &durableLog;
+    if (!disposable) slot->durableLog = &durableLog;
     slot->timing = request.timing;
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
@@ -6678,14 +6725,16 @@ private:
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
-      durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
-          target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
+      if (!disposable) {
+        durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
+            target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
+      }
       // The object's request is in flight until its slot is released (its response complete, or its WebSocket answered).
       server.objectBegin(target.key(), target.hops);
       slot->release = [previous = std::move(slot->release), &server = server, key = target.key(), hops = target.hops,
           log = slot->durableLog, object = slot->durableObject, processId = slot->process->processId,
           generation = slot->process->generation]() {
-        log->objectRequestFinished(object, processId, generation);
+        if (log != nullptr) log->objectRequestFinished(object, processId, generation);
         previous();
         server.objectEnd(key, hops);
       };
@@ -6719,7 +6768,7 @@ private:
   // line on the owner.
   void log(const Line& line, const DurableTarget& target, const coworkerd::ProcessCall* process, uint status, const std::string& code,
       double started) {
-    if (process != nullptr && status >= 500)
+    if (process != nullptr && !process->threadedDurableTestRole() && status >= 500)
       durableLog.objectFailed(target.namespaceId, target.objectId, target.shardEpoch, "request",
           code.empty() ? "HTTP " + std::to_string(status) : code);
     std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
@@ -8946,6 +8995,21 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   return launch;
 }
 
+fs::path makeDurableTestStack(const fs::path& fixtureStack) {
+#ifdef __linux__
+  std::error_code error;
+  const auto state = fs::symlink_status(fixtureStack / "do", error);
+  KJ_REQUIRE(state.type() == fs::file_type::not_found &&
+      (!error || error == std::errc::no_such_file_or_directory),
+      "durableObjects.threadedTestStorage refuses an existing Durable Object storage directory");
+  auto pattern = (fs::temp_directory_path() / "coworkerd-durable-test-XXXXXX").string();
+  KJ_REQUIRE(::mkdtemp(pattern.data()) != nullptr, "cannot create disposable durable test stack", strerror(errno));
+  return pattern;
+#else
+  KJ_FAIL_REQUIRE("durableObjects.threadedTestStorage requires Linux");
+#endif
+}
+
 // The process pool's own environment overrides (process-pool.c++), applied here as well so that the
 // configuration a Server reports is the one it runs; the pool applies the same values again.
 // The V8 sandbox of the ordinary processes (node/v8-sandbox.h), planned before the memory shares:
@@ -8956,11 +9020,12 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
-  if (pool.count + pool.quarantineProcesses == 0) return;
+  if (pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurableTestStorage) return;
   const auto threaded = pool.threadedExecutable.empty()
       ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
   auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
-      coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit, pool.count);
+      coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit,
+      pool.count + (pool.threadedDurableTestStorage ? pool.durableProcesses : 0));
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
   // so that a process fills until V8's own group creation refuses (the second line).
   if (const char* test = std::getenv("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST"); test != nullptr && plan.refusal.empty()) {
@@ -8980,9 +9045,12 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const std::string& workerdPath) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
+  if (pool.threadedDurableTestStorage) pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
+  KJ_REQUIRE(!pool.threadedDurableTestStorage || pool.durableProcesses > 0,
+      "durableObjects.threadedTestStorage requires a durable process");
   KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || pool.cpuLimitMs <= 300000,
       "ordinary cpuLimitMs is at most 300000 milliseconds");
   pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
@@ -8994,7 +9062,8 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
   if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
-  KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
+  KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurableTestStorage) ||
+      (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
     // Include a replacement generation, private channels and prepared sockets;
@@ -9325,7 +9394,7 @@ int run(Launch launch) {
       serverConfig.peerListenAddress, serverConfig.peers,
       io.provider->getNetwork(), timer, *headerTable, serverConfig.desiredState.objectStore);
   auto desiredState = coworkerd::newDesiredState(serverConfig.desiredState, manifestPath,
-      io.provider->getNetwork(), timer, *headerTable);
+      io.provider->getNetwork(), timer, *headerTable, serverConfig.processPool.threadedDurableTestStorage);
   const auto stackDirectory = launch.stackDirectory;
   coworkerd::checkRootStorageFormat(stackDirectory, true);
   // The suspects ride the membership (its objects beside the heartbeat; adopted in its listing cycle).
@@ -9861,6 +9930,12 @@ int main(int argc, char** argv) {
     return coworkerd::runHostCheckChild(argc - 2, argv + 2);
   }
   coworkerd::MemoryWatermark::initializeDaemonThp();
+  std::optional<fs::path> durableTestStack;
+  const auto removeDurableTestStack = kj::defer([&] {
+    if (!durableTestStack) return;
+    std::error_code error;
+    fs::remove_all(*durableTestStack, error);
+  });
   std::unique_ptr<coworkerd::AsyncLog> logging;
   std::unique_ptr<coworkerd::WorkerdOutput> workerdOutput;
   try {
@@ -9888,6 +9963,10 @@ int main(int argc, char** argv) {
     });
     launch = !args.empty() && (args[0] == "--config" || args[0].starts_with("--config=")) ? serveLaunch(args, naive)
         : positionalLaunch(args, naive);
+    if (launch->config.processPool.threadedDurableTestStorage) {
+      durableTestStack = makeDurableTestStack(launch->stackDirectory);
+      launch->stackDirectory = *durableTestStack;
+    }
     // A process still listens on a socket of this stack's run directory: another Server runs in this
     // stack, and this one does not start -- before anything changes: no log file opened, no socket
     // removed, no member registered.

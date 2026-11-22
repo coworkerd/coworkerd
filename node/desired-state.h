@@ -56,6 +56,7 @@ public:
 
 kj::Own<DesiredState> newDesiredState(
     const DesiredStateConfig& config, const std::filesystem::path& manifest,
-    kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headerTable);
+    kj::Network& network, kj::Timer& timer, const kj::HttpHeaderTable& headerTable,
+    bool disposableDurableNamespaces = false);
 
 }  // namespace coworkerd

@@ -387,6 +387,8 @@ struct ServerConfig {
     alarmTakeoverConcurrency @21 :UInt32 = 4;
     # Background alarm dispatches per node; ordinary process and tenant admission still applies.
     alarmFireConcurrency @22 :UInt32 = 2;
+    # Select the experimental threaded durable role in a disposable, single-node fixture.
+    threadedTestStorage @23 :Bool = false;
   }
 
   struct IngressConfig {

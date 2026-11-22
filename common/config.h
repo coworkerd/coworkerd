@@ -87,9 +87,10 @@ struct ProcessPoolConfig {
   // COWORKERD_SANDBOX_STEADY_ALLOWLIST override them.
   std::string steadySyscallsMode = "off";
   std::string steadyAllowlistPath;
-  // Selects the ordinary and quarantine backend; durable processes use upstream.
+  // Selects the ordinary and quarantine backend.
   std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
+  bool threadedDurableTestStorage = false;
   // Experimental per-tenant calls per native process; disabled unless explicitly configured.
   uint32_t tenantInFlightLimit = 0;
   uint32_t tenantAdmissionWaitMs = 1000;

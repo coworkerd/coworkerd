@@ -5,6 +5,7 @@
 #include "memory-events.h"
 #include "process-heat.h"
 #include "root-objects.h"
+#include "rpc-error.h"
 #include "memory-observation.h"
 #include "tenancy.h"
 #include "support.h"
@@ -280,6 +281,7 @@ class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
 public:
   RuntimeConnection(): tasks(*this) {}
   bool threaded = false;
+  bool durableTestStorage = false;
   uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
   static constexpr size_t IDLE_CONNECTIONS = 32;
@@ -349,35 +351,65 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
   if (idle.empty()) connection->stream = co_await address->connect();
   else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
   replenish();
-  // No Cap'n Proto bytes may precede this raw routing prefix.
-  co_await connection->stream->write(kj::StringPtr("T").asBytes());
-  KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
-  {
-    char decision;
-    auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
-    KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
-    if (decision == 'R') {
-      onCapacityRejected();
-      kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
+  try {
+    // No Cap'n Proto bytes may precede this raw routing prefix.
+    if (durableTestStorage) {
+      capnp::MallocMessageBuilder builder;
+      capnp::JsonCodec codec;
+      auto root = builder.initRoot<capnp::JsonValue>();
+      codec.decodeRaw(descriptor.asArray(), root);
+      const auto route = json::field(root.asReader(), "durableTestRoute");
+      KJ_REQUIRE(route.isObject(), "missing durable test routing identity");
+      auto preface = kj::str("D", codec.encodeRaw(route), "\n");
+      KJ_REQUIRE(preface.size() <= 4096, "durable routing preface is too large");
+      co_await connection->stream->write(preface.asBytes());
+    } else {
+      co_await connection->stream->write(kj::StringPtr("T").asBytes());
     }
-    KJ_REQUIRE(decision == 'A', "invalid native admission response");
+    KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
+    {
+      char decision;
+      auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
+      KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
+      if (decision == 'R') {
+        onCapacityRejected();
+        kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
+      }
+      if (durableTestStorage && decision == 'E') {
+        kj::throwRecoverableException(tagRpcError(
+            KJ_EXCEPTION(OVERLOADED, "durable routing lease expired before dispatch"), "LEASE_EXPIRED"));
+      }
+      if (durableTestStorage && decision == 'S') {
+        kj::throwRecoverableException(tagRpcError(
+            KJ_EXCEPTION(OVERLOADED, "durable routing identity is stale"), "DO_UNAVAILABLE"));
+      }
+      KJ_REQUIRE(decision == 'A', "invalid native admission response");
+    }
+    onDispatched();
+    if (!durableTestStorage) ready->fulfill();
+    connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
+    connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
+    v1::rpc::EventDispatcher::Client dispatcher = nullptr;
+    if (nativeProps) {
+      auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
+      request.setCfBlobJson(descriptor);
+      request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+      auto response = request.send();
+      if (durableTestStorage) dispatcher = (co_await kj::mv(response)).getDispatcher();
+      else dispatcher = response.getDispatcher();
+    } else {
+      auto request = connection->bootstrap.startEventRequest();
+      request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+      auto response = request.send();
+      if (durableTestStorage) dispatcher = (co_await kj::mv(response)).getDispatcher();
+      else dispatcher = response.getDispatcher();
+    }
+    if (durableTestStorage) ready->fulfill();
+    co_return capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
+  } catch (const kj::Exception& error) {
+    if (durableTestStorage && ready->isWaiting()) ready->reject(error.clone());
+    throw;
   }
-  onDispatched();
-  ready->fulfill();
-  connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
-  connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
-  v1::rpc::EventDispatcher::Client dispatcher = nullptr;
-  if (nativeProps) {
-    auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
-    request.setCfBlobJson(descriptor);
-    request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
-    dispatcher = request.send().getDispatcher();
-  } else {
-    auto request = connection->bootstrap.startEventRequest();
-    request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
-    dispatcher = request.send().getDispatcher();
-  }
-  co_return capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
 }
 
 // The identity of an executable file as stat() sees it; content hashes are keyed by it.
@@ -901,6 +933,7 @@ std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCal
 struct ProcessGeneration {
   std::string id;
   bool threaded = false;
+  bool durableTestStorage = false;
   uint32_t threadedProtocol = 0;
   bool threadedCulpritHandled = false;
   bool quarantine = false, durable = false;
@@ -1332,12 +1365,15 @@ kj::Promise<void> ProcessCall::onExit() {
 // A failed call is classified against this generation's events: a matching
 // row whose pid is the generation's current pid (none once the exit was observed).
 bool ProcessCall::threadedServer() const { return process->threaded; }
+bool ProcessCall::threadedDurableTestRole() const { return process->durableTestStorage; }
 bool ProcessCall::cpuLimitExceeded() const {
-  if (process->durable) return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
+  if (process->durable && !process->durableTestStorage)
+    return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(0, invocationId, workerId, versionId);
 }
 bool ProcessCall::memoryLimitExceeded() const {
-  if (process->durable) return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
+  if (process->durable && !process->durableTestStorage)
+    return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(1, invocationId, workerId, versionId);
 }
 bool ProcessCall::processMemoryPressure() const {
@@ -1840,6 +1876,7 @@ public:
         << "\",\"threadedProtocol\":" << p.threadedProtocol
         << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
         << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol == 3 ? "true" : "false");
+    if (p.durable) out << ",\"durableServer\":\"" << (p.durableTestStorage ? "threaded-test" : "upstream") << '"';
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -2272,8 +2309,9 @@ public:
   // own socket name, so the two never collide.
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
-    p->threaded = !s.durable;
-    if (p->threaded) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
+    p->durableTestStorage = s.durable && config.threadedDurableTestStorage;
+    p->threaded = !s.durable || p->durableTestStorage;
+    if (!s.durable) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
     const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
@@ -2383,7 +2421,7 @@ public:
     // The Durable Object log channel: the node keeps its own end and reads the frames the process ships.
     int durableLogFd = -1;
     auto closeDurableLog = kj::defer([&durableLogFd] { if (durableLogFd >= 0) ::close(durableLogFd); });
-    if (p->durable && durableChannelOpen) {
+    if (p->durable && !p->durableTestStorage && durableChannelOpen) {
       durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation)));
       if (durableLogFd >= 0) {
         inherit(actions, durableLogFd, DURABLE_LOG_FD);
@@ -2456,6 +2494,16 @@ public:
       childEnvironment.push_back("COWORKERD_DO_CHECKPOINT_BYTES=" + std::to_string(durableLog.checkpointBytes));
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
+    if (p->durableTestStorage) {
+      childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
+      for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
+               "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
+               "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
+               "COWORKERD_DO_TEST_FD_HEADROOM", "COWORKERD_DO_TEST_COMMIT_DELAY_MS",
+               "COWORKERD_DO_TEST_REFUSE_GROUP"}) {
+        if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
+      }
+    }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.
     childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));
@@ -2494,11 +2542,12 @@ public:
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
         p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
+    if (p->durableTestStorage) args.push_back("--durable-test-storage");
     std::string file = executable;
     bool thpResetViaLauncher = false;
 #ifdef __linux__
     if (p->launched) {
-      args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable);
+      args = launcherCommand(false, args, programDigest(p->spawnBinary), p->durable && !p->durableTestStorage);
       file = launcherExecutable();
       ++sandbox.launches;
       thpResetViaLauncher = true;
@@ -2637,11 +2686,21 @@ public:
             p->probeClient->request(kj::HttpMethod::GET, "/__coworkerd/probe", probeHeaders).response);
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
-        if (p->threaded) response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") p->threadedProtocol = 3;
-        });
         if (p->threaded) {
-          KJ_REQUIRE(p->threadedProtocol == 3, "native process protocol 3 is required");
+          bool matchesProtocol = false;
+          uint32_t roleHeaders = 0;
+          bool durableTestRole = false;
+          response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
+            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
+            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
+              ++roleHeaders;
+              durableTestRole = value == "durable-test";
+            }
+          });
+          KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
+          KJ_REQUIRE((p->durableTestStorage ? roleHeaders == 1 && durableTestRole : roleHeaders == 0),
+              "native process role does not match the slot");
+          p->threadedProtocol = 3;
           p->contextsVisible = true;
         }
         if (!p->binary.valid) {
@@ -2659,6 +2718,7 @@ public:
         r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
         if (p->threaded) {
           r->threaded = true;
+          r->durableTestStorage = p->durableTestStorage;
           r->threadedProtocol = p->threadedProtocol;
           r->deferredDeletes = &tasks;
           co_await r->fill();

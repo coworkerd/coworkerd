@@ -4,7 +4,7 @@
 // unprivileged user (uid 10001, as in the image and the systemd unit), the harness as root reads every process's /proc.
 // The binary directory needs a `coworkerd-server` that executes the node daemon `coworkerd` with its arguments: this
 // environment starts the node by that name (a two-line shell script will do).
-//   V45_BIN    the node, the launcher, workerd and the two system call tables (Linux, this machine's architecture)
+//   V45_BIN    the node, the launcher, workerd, coworkerd-threaded and the two system call tables (Linux, this machine's architecture)
 //   V45_STACK  the stack directory (default /tmp/coworkerd-lab-stack, inside the container)
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -42,7 +42,8 @@ let server = null;
 export function binaries(directory = BIN) {
   const hash = path => existsSync(path) ? sha256(readFileSync(path)) : null;
   return { coworkerdServer: hash(`${directory}/coworkerd-server`), coworkerdLauncher: hash(`${directory}/coworkerd-launcher`),
-    workerd: hash(`${directory}/workerd`), runtime: hash(`${REPO}/runtime/runtime.js`) };
+    workerd: hash(`${directory}/workerd`), coworkerdThreaded: hash(`${directory}/coworkerd-threaded`),
+    runtime: hash(`${REPO}/runtime/runtime.js`) };
 }
 
 export async function request(path, options = {}) {

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 15:25:59 +0800
+Subject: [PATCH] Allow a one-shot V8 group refusal in disposable durable tests
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 44af36d96b36dd4c0c55e9e31a0938ef2d99d27a..2e189837085cb5bd0b11e466608c91f35cc72f88 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2195,6 +2195,7 @@ struct ThreadedServer {
+   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
+   std::atomic<uint64_t> nextDurableActor{0};
+   std::atomic<uint64_t> durablePendingCommits{0};
++  std::atomic<bool> refuseDurableGroupForTest{false};
+   const uint64_t durableCommitDelayMs;
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+@@ -2295,6 +2296,9 @@ struct ThreadedServer {
+     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
+     if (this->durableTestStorage) {
+       KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
++      const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
++      KJ_REQUIRE(refuseGroup <= 1, "invalid durable test group refusal");
++      refuseDurableGroupForTest.store(refuseGroup == 1);
+       const auto colon = this->identity.rfind(':');
+       KJ_REQUIRE(colon != std::string::npos, "invalid durable child identity");
+       KJ_REQUIRE(durablePlacement.treesPerCopy != 0 && durablePlacement.placementBytes != 0 &&
+@@ -2799,6 +2803,7 @@ struct ThreadedServer {
+         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
+         ",\"pendingCommits\":" + std::to_string(durablePendingCommits.load()) +
++        ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
+         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
+         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
+         ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
+@@ -3160,10 +3165,15 @@ struct ThreadedServer {
+         slot.isolateLabel.c_str(), "\",");
+     // With a V8 sandbox per isolate, an address space without room for another one refuses this
+     // Worker (the node's per-process limit normally refuses first), never ends the process.
+-    auto group = KJ_UNWRAP_OR(server::tryNewIsolateGroup(), {
+-      noSandboxRoom(*resources);
+-      kj::throwFatalException(capacityError());
+-    });
++    // Inject the factory's empty result once, only for disposable durable storage, so the
++    // real refusal cleanup/retry path can be exercised without exhausting host address space.
++    auto group = KJ_UNWRAP_OR(slot.resetDurableRoot && refuseDurableGroupForTest.exchange(false)
++            ? kj::Maybe<v8::IsolateGroup>(kj::none)
++            : server::tryNewIsolateGroup(),
++        {
++          noSandboxRoom(*resources);
++          kj::throwFatalException(capacityError());
++        });
+     auto limits = kj::refcounted<IsolateLimits>(
+         workerLimit(descriptor, "cpuLimitMs", "COWORKERD_CPU_LIMIT_MS"),
+         workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity),

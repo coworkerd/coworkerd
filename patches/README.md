@@ -31,6 +31,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `patches/v8/0055` and `0057`, the build configuration (`.bazelrc`, `build/deps/v8.MODULE.bazel`),
   four jsg hooks (`jsg.h`, `jsg.c++`, `v8-platform-wrapper.h`, `sandbox.h`, `sandbox.c++`,
   `setup.c++`, `BUILD.bazel`) and the threaded server of 0042; see its section below.
+  For the threaded durable test role, `0047-durable-test-events.patch` lets the embedder pass an
+  absolute thread CPU deadline to SQLite through `src/workerd/util/sqlite.{h,c++}`. The existing
+  constructor continues to use the shipped SQL accounting.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 14:28:07 +0800
+Subject: [PATCH] Keep durable request limits backed for the actor context
+ lifetime
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 74ea0c08f960c089f6ffe0cc41cb090d8cf01951..236a078415595ef2de29e207e65c4cdfb8792d5f 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4489,14 +4489,19 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     observer = kj::refcounted<DurableEventObserver>(
+         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+   }
++  auto limits = kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
++  if (slot->resetDurableRoot) {
++    // Actors retain their IoContext after the first entrypoint's reference (and its
++    // ioContextDependency attachment) is gone. Keep the referenced measurement and
++    // slot alive until the context destroys its limit enforcer.
++    limits = kj::mv(limits).attach(kj::addRef(*invocation));
++  }
+   auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
+       entrypoint.empty() || entrypoint == "default"
+           ? kj::Maybe<kj::String>(kj::none)
+           : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
+-      kj::mv(props), kj::mv(actor),
+-      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity)),
+-      kj::addRef(*invocation), kj::mv(channels), kj::mv(observer), state.tasks, true,
+-      kj::mv(tracer), kj::mv(cf), kj::none);
++      kj::mv(props), kj::mv(actor), kj::mv(limits), kj::addRef(*invocation), kj::mv(channels),
++      kj::mv(observer), state.tasks, true, kj::mv(tracer), kj::mv(cf), kj::none);
+   return {kj::mv(entry), kj::mv(invocation)};
+ }
+ 

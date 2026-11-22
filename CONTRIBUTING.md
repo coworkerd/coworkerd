@@ -38,7 +38,11 @@ Generate the allowlist on the target architecture using profiles from `scripts/s
 `scripts/syscall-allowlist.py` as described in the system call allowlist section of the
 [installation guide](docs/guide/install.md). Run the generator from a directory where you can pass relative
 paths for every `--workerd` and `--profile` input, because it writes those paths into `allowlist.json`.
-The generated allowlist must name the exact `workerd` being packaged.
+The profiling binary directory must contain both `workerd` and its sibling `coworkerd-threaded`.
+The profiler records their separate hashes and selects the traced program by process role. A legacy GC
+counter absent from the threaded lifecycle is recorded as unobserved, not as a successful collection.
+The generated allowlist must name the exact `workerd` being packaged; keep the paired threaded hash
+in the profile provenance with the archive record.
 If `ALLOWLIST` is the generated directory, package and unpack your build into the same layout as the fetch command:
 
 ```bash
@@ -57,23 +61,24 @@ alongside them. Use `-DCOWORKERD_TEST_WORKERD="$KERNEL_DIR/workerd"` to test the
 
 ### Publishing a changed kernel series
 
-An author who changes the kernel patch series or its upstream builds and tests that kernel locally. A maintainer
-checks out the PR head, builds and packages the release kernels on Linux x86_64 and arm64, and publishes the
-archives and `SHA256SUMS` on [this repository's Releases page](https://github.com/coworkerd/coworkerd/releases). Use the
+An author who changes the kernel patch series or its upstream builds and tests that kernel, then packages those
+same binaries with `scripts/package-kernel.py`. Publish the Linux x86_64 archive and `SHA256SUMS` on
+[this repository's Releases page](https://github.com/coworkerd/coworkerd/releases), using the
 `kernel-<upstream tag>-<first 12 hex digits of the patch series SHA-256>` tag printed by the packaging script and
-mark the release as a pre-release. Run the packaging command once per architecture. In the final release directory,
-put the first archive in place before packaging or copying the second, then check that `SHA256SUMS` covers every
-published archive. Generate that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining
-archives packaged on separate machines.
+marking the release as a pre-release. Do not rebuild an already tested kernel just to publish it. An arm64 archive
+is not required for a pull request; build and test it once before the product release. A missing architecture must
+have a null pin, never an archive from a different patch series.
 
 The publisher is responsible for building both binaries from the checked workerd source. The packaging script
 checks the source tree against the patch series and records that tree as `workerdTree` in `kernel.json`.
 `coworkerdCommit` records the commit in this repository where the packaging command ran, which may be the PR head.
 If the allowlist uses profiles from another build of the series, record that in the release notes.
 
-The maintainer posts the public release link and archive SHA-256 values on the PR. The author verifies the public
-downloads and records the upstream, full series SHA-256 and verified archive pins in
-`patches/workerd/artifacts.json` on the same PR.
+Post the public release link and archive SHA-256 values on the PR, verify the public downloads, and record the
+upstream, full series SHA-256 and verified archive pins in `patches/workerd/artifacts.json` on the same PR.
+When adding an architecture to the release later, check that `SHA256SUMS` covers every published archive. Generate
+that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining archives packaged on separate
+machines. Maintainers review the source, evidence and published artifacts and perform the final merge.
 
 ## CI and local unit tests
 
@@ -115,13 +120,88 @@ cmake --build build --target check
 object store components, the four `cli-*` suites and `node-error-contract`; their individual names and results
 appear in CTest's output and `build/test-results.xml`.
 
-Linux CI caches the archive by its pinned SHA-256 and verifies it before registering these three tests:
+Linux CI caches the archive by its pinned SHA-256 and verifies it before registering these tests:
 
 | CTest name | Required artifact |
 | --- | --- |
 | `node-log-redaction` | Patched `workerd`, for real Worker diagnostics |
 | `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
+| `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
+| `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
+| `node-threaded-durable-http-isolation` (Linux only) | Both kernel binaries, for HTTP input gates, interleaving during an await, caller cancellation with home lifecycle tracing, facet storage/lifecycle, and JavaScript/SQLite event CPU resets with a surviving neighboring actor |
+| `node-threaded-durable-http-output-gate` (Linux only) | Both kernel binaries, for an HTTP response held behind delayed test-storage confirmation and the saved value after release |
+| `node-threaded-durable-http-overlap` (Linux only) | Both kernel binaries, for 16 overlapping HTTP bodies on four facets, continued interleaving, exact event-credit return and resource samples |
+| `node-threaded-durable-group-refusal` (Linux only) | Both kernel binaries, for one injected empty V8-group factory result, returned reservations, successful retry and the original child remaining ready |
+| `node-threaded-durable-http-memory` (Linux only) | Both kernel binaries, for idle-first memory eviction, closed placement to another copy, and a hard isolate reset with the original child ready |
+| `node-threaded-durable-placement` (Linux only) | Both kernel binaries, for busy-home cold placement and pinned existing actors under HTTP traffic |
+| `node-threaded-durable-queues` (Linux only) | Both kernel binaries, for per-object mailbox count/byte bounds and returned event and descriptor credits |
+| `node-threaded-durable-fd-limit` (Linux only) | Both kernel binaries, for bounded refusal before exhausting the child's file descriptors |
+| `node-threaded-durable-memory-reservation` (Linux only) | Both kernel binaries, for bounded refusal at the admission memory reservation ceiling |
+
+The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
+The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
+an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
+fixture deployments. Each threaded durable child starts without a persistent log channel.
+This PR supports HTTP events. Durable JavaScript RPC is explicitly `NOT_SUPPORTED`; RPC input/output
+gates and nested RPC remain for the next PR of issue #36. The positive `events` fixture stays in source
+as that follow-up's acceptance test, but is not registered in the current CTest/CI suite. The HTTP
+isolation test verifies RPC refusal and subsequent HTTP availability in the same child.
+The fixture derives local namespaces from the active declarations and routes them only within the node.
+Each child generation opens a fresh SQLite volume inside the fixture stack.
+The `http-output-gate` mode delays the test-storage completion callback by 300 ms and observes its pending
+counter before accepting a response to an unawaited write. This default-zero hook is limited to the test
+role and at most 1000 ms; it does not simulate peer acknowledgments, a durable log or crash recovery.
+The `http 4 64` fixture mode writes and reads two objects, checks unchanged instances after a brief
+idle interval, then observes three real idle retirements and wakes. Each first wake request alternates
+between a read and a write that verifies the previous stored value before replacing it. Repeated reads
+check the new instance and stored value, while the child must retain its ready PID and generation.
+It does not send JavaScript RPC calls.
+The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
+copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
+waiting mailbox defaults to four events/64 KiB. Reservations keep 256 descriptors plus five per home
+outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
+declared waiting bytes. Facets reserve their own metadata and descriptors. These test-role defaults are
+supported by the source-tagged capacity, queue, pressure and overlap measurements in PR #43; actual
+body execution remains subject to the copy/process memory limits.
+The `http-overlap` mode observes 16 fully read and written 16 KiB bodies held across four facets while
+same-object and neighboring-object requests continue. It records RSS, threads and descriptors, verifies
+facet state and exact event-credit return, and checks the original child remains ready. The ordinary
+ingress fixture uses 32 call slots so its concurrency limit does not hide durable overlap.
+The `group-refusal` mode injects one empty V8-group factory result only in the disposable role, then
+requires returned reservations, successful retry and the original ready child. This does not simulate
+physical address-space exhaustion; `COWORKERD_DO_TEST_REFUSE_GROUP` is zero by default.
+The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
+`COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
+`COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
+`COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
+descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
+
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 4 64`
+to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
+and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
+
+The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
+It checks quiet-copy reuse, a distinct copy after the home becomes busy, pinned existing actors,
+returned event credits, and an unchanged ready child without actor resets or idle retirement.
+For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js placement 4 64 3000`
+uses four homes, 64 roots per copy, and a 3000 ms busy threshold in the four-second window.
+The last argument can vary the threshold for measurements; output includes every work and cold-request
+duration plus the child's thread count, RSS, descriptors, and admission counters. These request durations
+include transport and scheduling, so they are not direct samples of the kernel's synchronous busy clock.
+With `placement-control 4 64 4000`, the same workload runs 32 rounds and must keep one copy;
+the four-second threshold excludes busy-triggered splitting while leaving capacity and memory limits unchanged.
+
+The `queues 4 64` mode measures admission for 64 objects with four events each, declaring 16 KiB per
+event. It checks the four-event count limit separately using one-byte declarations, with another object
+still admitted. This is a measurement before request bodies are read, not an actor execution or payload
+allocation workload. It records reservations, RSS, threads and descriptors, cancels the queued calls,
+and checks that reservations and descriptors return to baseline. The final argument varies the object count.
+The `queue-limit 4 64` mode must run with a descriptor limit of 512; the CTest wrapper sets that limit
+only for its own process tree. It asserts refusal at the reservation ceiling, continued control access,
+256 descriptors of headroom and full credit return. `queue-memory 4 256` sets a 128 MiB process budget
+and checks refusal at its 16 MiB admission memory ceiling. These queue modes verify the original ready
+PID and generation after release. They do not execute Worker events or exercise V8 allocation failure.
 
 At configure time `COWORKERD_TEST_WORKERD=auto` first looks for the verified installation on Linux, then for
 `workerd/bazel-bin/src/workerd/server/workerd`. For the Linux child test, use a directory with both binaries

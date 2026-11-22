@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 14:44:03 +0800
+Subject: [PATCH] Expose bounded test-storage confirmation delay for
+ output-gate checks
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index fbb86c9698bbca6e95059b8808addb85086163cd..7a6106fd53acdacdefa63332431f82e074be2a72 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2194,6 +2194,8 @@ struct ThreadedServer {
+   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
+   std::atomic<uint64_t> nextDurableActor{0};
++  std::atomic<uint64_t> durablePendingCommits{0};
++  const uint64_t durableCommitDelayMs;
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
+@@ -2276,6 +2278,8 @@ struct ThreadedServer {
+                     boundedDurableSetting("COWORKERD_DO_TEST_BUSY_MS", 3000, 4000))
+               : std::chrono::milliseconds(0),
+         },
++        durableCommitDelayMs(
++            this->durableTestStorage ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
+         pending(limit * 2),
+         limit(limit),
+         resources(std::make_shared<ResourceBudget>(
+@@ -2290,6 +2294,7 @@ struct ThreadedServer {
+         subrequestBudget(limit, tenantBudget->limit) {
+     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
+     if (this->durableTestStorage) {
++      KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
+       const auto colon = this->identity.rfind(':');
+       KJ_REQUIRE(colon != std::string::npos, "invalid durable child identity");
+       KJ_REQUIRE(durablePlacement.treesPerCopy != 0 && durablePlacement.placementBytes != 0 &&
+@@ -2781,6 +2786,7 @@ struct ThreadedServer {
+         ",\"running\":" + std::to_string(state.active) +
+         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
++        ",\"pendingCommits\":" + std::to_string(durablePendingCommits.load()) +
+         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
+         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
+         ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
+@@ -4839,8 +4845,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+                        ActorCache::Hooks &,
+                        SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
+     auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet);
+-    return kj::heap<ActorSqlite>(
+-        kj::mv(database), gate, [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; });
++    return kj::heap<ActorSqlite>(kj::mv(database), gate,
++        [state = &tree->state, server = &tree->server](SpanParent) -> kj::Promise<void> {
++      if (server->durableCommitDelayMs == 0) co_return;
++      server->durablePendingCommits.fetch_add(1);
++      KJ_DEFER(server->durablePendingCommits.fetch_sub(1));
++      co_await state->io.provider->getTimer().afterDelay(
++          server->durableCommitDelayMs * kj::MILLISECONDS);
++    });
+   };
+   auto makeStorage = [](jsg::Lock &js, const Worker::Api &, ActorCacheInterface &cache) {
+     return js.alloc<api::DurableObjectStorage>(js, IoContext::current().addObject(cache), true);

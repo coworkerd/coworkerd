@@ -44,13 +44,16 @@ def demangle(symbol):
 processes = []
 for name in sorted(os.listdir(os.path.join(directory, 'traces'))):
     pid = int(name.split('-')[1].split('.')[0])
+    program = record.get('traceProgram')
+    if identity.get(pid, {}).get('processClass') in ('ordinary', 'quarantine'):
+        program = record.get('traceThreadedProgram') or program
     with open(os.path.join(directory, 'traces', name), errors='replace') as stream:
         attached = bool(record.get('stack'))  # stack runs attach after the processes are ready (all steady)
         # The trace of a process begins at the execve of the workerd file the profile names, which is
         # the program the record carries (the wrapper execs it); the default is of no use here.
         summary = syscall_trace.summarise(stream, 0 if attached else ready.get(pid), windows,
                                      demangle if record.get('stack') else None, attached,
-                                     record.get('traceProgram'))
+                                     program)
     processes.append({'trace': name, 'pid': pid, **identity.get(pid, {}), 'readyUnixS': ready.get(pid), 'exit': exits.get(pid), **summary})
 
 totals = collections.defaultdict(collections.Counter)
@@ -65,7 +68,9 @@ steady = set().union(*[set(c) for phase, c in totals.items() if phase != 'startu
 print(json.dumps({'processes': len(processes), 'startupCalls': len(startup), 'steadyCalls': len(steady),
                   'startupOnly': sorted(startup - steady), 'steadyOnly': sorted(steady - startup)}, indent=1))
 json.dump({'record': os.path.basename(record_path), 'run': record.get('run'), 'stack': record.get('stack'),
-           'workerdSha256': record.get('binaries', {}).get('workerd'), 'program': record.get('traceProgram'),
+           'workerdSha256': record.get('binaries', {}).get('workerd'),
+           'coworkerdThreadedSha256': record.get('binaries', {}).get('coworkerdThreaded'),
+           'program': record.get('traceProgram'), 'threadedProgram': record.get('traceThreadedProgram'),
            'windows': [{'name': w['name'], 'startUnixMs': w['startUnixMs'], 'endUnixMs': w['endUnixMs']} for w in windows],
            'processes': processes,
            'totals': {k: dict(v) for k, v in totals.items()},
