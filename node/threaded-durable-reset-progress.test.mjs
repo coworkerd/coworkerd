@@ -152,6 +152,8 @@ try {
   const originalChild = await start();
   let initial = await successful('/reset', 'retained after abort');
   const neighbor = await successful('/neighbor', 'neighbor retained');
+  assert.equal(initial.value, 'retained after abort');
+  assert.equal(neighbor.value, 'neighbor retained');
   assert.equal(initial.isolate, neighbor.isolate);
   for (const cause of ['abort', 'cpu', 'facet']) {
     const aborted = await request('/reset?' + cause);

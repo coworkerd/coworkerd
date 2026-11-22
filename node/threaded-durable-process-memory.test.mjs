@@ -148,6 +148,8 @@ try {
   const originalChild = await start();
   const initial = await successful('/pressure', 'value before process pressure');
   const neighbor = await successful('/neighbor', 'neighbor value');
+  assert.equal(initial.value, 'value before process pressure');
+  assert.equal(neighbor.value, 'neighbor value');
   const started = performance.now();
   let refused;
   try { refused = await request('/pressure?' + kind); }
