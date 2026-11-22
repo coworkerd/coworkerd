@@ -154,6 +154,60 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server-test.c++',
                               'build/deps/v8.MODULE.bazel',
                               'patches/v8/0056-Let-JSON-parse-and-split-take-interrupts.patch'} or
+                          name == '0045-threaded-durable-admission.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0046-durable-test-routing.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0047-durable-test-events.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite.c++'} or
+                          name == '0048-durable-event-cpu.patch' and path in {
+                              'src/workerd/api/global-scope.c++',
+                              'src/workerd/api/node/async-hooks.c++',
+                              'src/workerd/api/worker-rpc.c++',
+                              'src/workerd/io/io-context.c++',
+                              'src/workerd/io/io-context.h',
+                              'src/workerd/io/limit-enforcer.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/jsg/async-context.c++',
+                              'src/workerd/jsg/async-context.h',
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0049-durable-test-facets.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0050-durable-format.patch' and path in {
+                              'src/workerd/api/worker-rpc.c++',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/jsg/async-context.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++'} or
+                          name == '0051-durable-cold-load-lifetime.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0052-durable-context-lifetime.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0053-durable-context-format.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0054-durable-test-confirmation.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0055-durable-memory-observation.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0056-durable-idle-memory-release.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0057-durable-idle-clock-tests.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0058-durable-group-refusal-test.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0059-durable-default-home-count.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0060-durable-http-only-boundary.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

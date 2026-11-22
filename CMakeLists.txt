@@ -309,10 +309,56 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/node-child-memory.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
     set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
+    add_test(NAME node-threaded-durable-launch COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
+    set_tests_properties(node-threaded-durable-launch PROPERTIES TIMEOUT 20)
+    # The positive RPC/events fixture is retained for the next PR of issue #36.
+    # This HTTP-only step refuses durable JavaScript RPC before entering that path.
+    add_test(NAME node-threaded-durable-http-isolation COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-isolation)
+    set_tests_properties(node-threaded-durable-http-isolation PROPERTIES TIMEOUT 45)
+    add_test(NAME node-threaded-durable-http-output-gate COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-output-gate)
+    set_tests_properties(node-threaded-durable-http-output-gate PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-http-overlap COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-overlap)
+    set_tests_properties(node-threaded-durable-http-overlap PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-group-refusal COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" group-refusal)
+    set_tests_properties(node-threaded-durable-group-refusal PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-http-memory COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http-memory 4 64 64)
+    set_tests_properties(node-threaded-durable-http-memory PROPERTIES TIMEOUT 30)
+    add_test(NAME node-threaded-durable-http COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" http 4 64)
+    set_tests_properties(node-threaded-durable-http PROPERTIES TIMEOUT 75)
+    add_test(NAME node-threaded-durable-placement COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" placement 4 64 3000)
+    set_tests_properties(node-threaded-durable-placement PROPERTIES TIMEOUT 30)
+    add_test(NAME node-threaded-durable-queues COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queues 4 64)
+    add_test(NAME node-threaded-durable-fd-limit COMMAND /bin/sh
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-fd-limit.test.sh" "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queue-limit 4 64)
+    set_tests_properties(node-threaded-durable-queues node-threaded-durable-fd-limit PROPERTIES TIMEOUT 30)
+    add_test(NAME node-threaded-durable-memory-reservation COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queue-memory 4 256)
+    set_tests_properties(node-threaded-durable-memory-reservation PROPERTIES TIMEOUT 30)
     add_dependencies(check coworkerd)
   endif()
 else()
-  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory (Linux only)")
+  message(STATUS "Kernel tests omitted (no COWORKERD_TEST_WORKERD): node-log-redaction, workerd-configuration, node-child-memory, node-threaded-durable-launch, node-threaded-durable-http-isolation, node-threaded-durable-http-output-gate, node-threaded-durable-http-memory, node-threaded-durable-http-overlap, node-threaded-durable-group-refusal, node-threaded-durable-http, node-threaded-durable-placement, node-threaded-durable-queues, node-threaded-durable-fd-limit and node-threaded-durable-memory-reservation (Linux only)")
 endif()
 foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")

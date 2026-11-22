@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 22 Nov 2026 14:32:27 +0800
+Subject: [PATCH] Format durable context limit construction
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 236a078415595ef2de29e207e65c4cdfb8792d5f..fbb86c9698bbca6e95059b8808addb85086163cd 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4489,7 +4489,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     observer = kj::refcounted<DurableEventObserver>(
+         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+   }
+-  auto limits = kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
++  auto limits =
++      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
+   if (slot->resetDurableRoot) {
+     // Actors retain their IoContext after the first entrypoint's reference (and its
+     // ioContextDependency attachment) is gone. Keep the referenced measurement and

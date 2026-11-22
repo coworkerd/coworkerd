@@ -60,7 +60,8 @@ void DurableLogConfig::validate() const {
 }
 
 void ProcessPoolConfig::validate() const {
-  KJ_REQUIRE(count > 0 && count <= 256 && inFlightLimit > 0, "invalid process pool capacity");
+  KJ_REQUIRE((count > 0 || threadedDurableTestStorage) && count <= 256 && inFlightLimit > 0,
+      "invalid process pool capacity");
   KJ_REQUIRE(ordinaryServer == "threaded",
       "processPool.ordinaryServer must be threaded; the ordinary upstream backend has been removed");
   KJ_REQUIRE(ordinaryServer != "threaded" || inFlightLimit <= 16384,
@@ -266,6 +267,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.rebuildConcurrency = durable.getRebuildConcurrency();
   result.durableLog.alarmFireConcurrency = durable.getAlarmFireConcurrency();
   result.durableLog.residentObjects = durable.getResidentObjects();
+  result.processPool.threadedDurableTestStorage = durable.getThreadedTestStorage();
   result.durableLog.usagePublishMs = durable.getUsagePublishMs();
   result.durableLog.alarmDiscoveryIntervalMs = durable.getAlarmDiscoveryIntervalMs();
   result.durableLog.alarmTakeoverConcurrency = durable.getAlarmTakeoverConcurrency();
@@ -358,6 +360,12 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.workerdPath = root.getWorkerdPath().cStr();
   result.runtimePath = root.getRuntimePath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
+  if (result.processPool.threadedDurableTestStorage) {
+    KJ_REQUIRE(!given({"storage"}) && !given({"desiredState", "objectStore"}) &&
+        result.membership.backend == "file" && result.desiredState.backend == "file" &&
+        result.peers.empty() && !result.servePathsGiven(),
+        "durableObjects.threadedTestStorage requires the positional single-node fixture and disposable local storage");
+  }
   if (given({"advertisedAddress"})) {
     const std::string address = root.getAdvertisedAddress().cStr();
     auto nested = given({"membership", "advertisedAddress"});

@@ -37,6 +37,7 @@ public:
   void snapshotAfterFailure() noexcept;
   kj::Promise<void> onExit();
   bool threadedServer() const;
+  bool threadedDurableTestRole() const;
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;
   bool processMemoryPressure() const;

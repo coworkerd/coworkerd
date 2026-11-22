@@ -1,0 +1,806 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 05:21:40 +0800
+Subject: [PATCH] Account durable CPU and lease authority by delivered event
+
+
+diff --git a/src/workerd/api/global-scope.c++ b/src/workerd/api/global-scope.c++
+index 96418fb3a4e68e81241889a9e3db496949446127..59da009f0d87fa9bbfd8e992b38a1a2854e2cd55 100644
+--- a/src/workerd/api/global-scope.c++
++++ b/src/workerd/api/global-scope.c++
+@@ -1146,6 +1146,8 @@ void ServiceWorkerGlobalScope::queueMicrotask(jsg::Lock& js, jsg::Function<void(
+             // Released after the callback rather than when the closure is collected, to keep
+             // tracker calls out of GC.
+             KJ_DEFER(asyncTraceResource.release());
++            jsg::AsyncContextFrame::notifyObserver(js.v8Isolate);
++            KJ_DEFER(jsg::AsyncContextFrame::notifyObserver(js.v8Isolate, false));
+             asyncTraceResource.settle(AsyncOutcome::OK);
+             AsyncTracker::CallbackScope asyncTraceScope(asyncTraceResource);
+             JSG_TRY(js) {
+diff --git a/src/workerd/api/node/async-hooks.c++ b/src/workerd/api/node/async-hooks.c++
+index 47a3a04f481e94b66a42e23560170a8d7d965618..76514a580eefe8fcf3aa03360e060d0240e0dc07 100644
+--- a/src/workerd/api/node/async-hooks.c++
++++ b/src/workerd/api/node/async-hooks.c++
+@@ -171,7 +171,7 @@ v8::Local<v8::Value> AsyncResource::runInAsyncScope(jsg::Lock& js,
+   }
+   fn.setReceiver(js.v8Ref<v8::Value>(receiver));
+   validateIoContext(js, originIoContextId);
+-  jsg::AsyncContextFrame::Scope scope(js, getFrame());
++  jsg::AsyncContextFrame::Scope scope(js, getFrame(), jsg::AsyncContextFrame::Scope::Kind::USER);
+   return fn(js, kj::mv(args));
+ }
+ 
+diff --git a/src/workerd/api/worker-rpc.c++ b/src/workerd/api/worker-rpc.c++
+index 31fe6b4a670850a55de4616681b106452e4c3b89..0265ca4ed65c9656c415f6e282f0ffad95258b04 100644
+--- a/src/workerd/api/worker-rpc.c++
++++ b/src/workerd/api/worker-rpc.c++
+@@ -2159,15 +2159,16 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server, public kj::PtrTarget {
+ 
+   // Constructor use by EntrypointJsRpcTarget, which is revoked and destroyed before the IoContext
+   // can possibly be canceled. It can just use ctx.run().
+-  JsRpcTargetBase(IoContext& ctx, CantOutliveIncomingRequest)
++  JsRpcTargetBase(IoContext& ctx, IoContext::IncomingRequest& request, CantOutliveIncomingRequest)
+       : durableObjectId(getCurrentDurableObjectId()),
+-        enterIsolateAndCall([this, &ctx](CallContext callContext) {
++        enterIsolateAndCall([this, &ctx, &request](CallContext callContext) {
+           // Note: No need to topUpActor() since this is the start of a top-level request, so the
+           // actor will already have been topped up by IncomingRequest::delivered().
+-          return ctx.run([weakThis = addWeakToThis(), callContext](
++          return ctx.run([weakThis = addWeakToThis(), callContext, &request](
+                              Worker::Lock& lock, IoContext& ctx) mutable {
+-            return KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran")
+-                .callImpl(lock, ctx, callContext);
++            auto& self = KJ_REQUIRE_NONNULL(weakThis.tryGet(), "RPC target destroyed before call ran");
++            auto limitScope = request.enterActorEvent(lock);
++            return self.callImpl(lock, ctx, callContext);
+           });
+         }),
+         externalPusher(ctx.getExternalPusher()) {}
+@@ -3367,7 +3368,7 @@ class EntrypointJsRpcTarget final: public JsRpcTargetBase {
+       kj::Maybe<kj::Rc<BaseTracer>> tracer,
+       IoContext::IncomingRequest& incomingRequest,
+       bool isDynamicDispatch)
+-      : JsRpcTargetBase(ioCtx, CantOutliveIncomingRequest()),
++      : JsRpcTargetBase(ioCtx, incomingRequest, CantOutliveIncomingRequest()),
+         ioCtx(ioCtx),
+         metrics(kj::mv(metrics)),
+         // Most of the time we don't really have to clone this but it's hard to fully prove, so
+diff --git a/src/workerd/io/io-context.c++ b/src/workerd/io/io-context.c++
+index 7465e069fe27bbe2dbea8d8bd2638956039b3528..4319b4dc69818e2166177641f84da191f1066d02 100644
+--- a/src/workerd/io/io-context.c++
++++ b/src/workerd/io/io-context.c++
+@@ -344,6 +344,10 @@ void IoContext::IncomingRequest::delivered(kj::SourceLocation location) {
+   delivered(location.function, DropQueuedCrossContextActions::NO, location);
+ }
+ 
++kj::Own<void> IoContext::IncomingRequest::enterActorEvent(jsg::Lock& lock) {
++  return context->limitEnforcer->enterActorEvent(lock, *this);
++}
++
+ void IoContext::IncomingRequest::delivered(kj::StringPtr eventType,
+     DropQueuedCrossContextActions dropQueuedActions,
+     kj::SourceLocation location) {
+@@ -393,7 +397,7 @@ void IoContext::IncomingRequest::delivered(kj::StringPtr eventType,
+     context->limitEnforcer->topUpActor();
+ 
+     // Run the Actor's constructor if it hasn't been run already.
+-    a.ensureConstructed(*context);
++    a.ensureConstructed(*context, *this);
+ 
+     // Record a new incoming request to actor metrics.
+     a.getMetrics().startRequest();
+diff --git a/src/workerd/io/io-context.h b/src/workerd/io/io-context.h
+index 56fe16525ecfbe8349cf954f22ba5bd4ad392af1..54c38d0868e7390ff6516af84d74fa2209002e11 100644
+--- a/src/workerd/io/io-context.h
++++ b/src/workerd/io/io-context.h
+@@ -144,6 +144,8 @@ class IoContext_IncomingRequest final: public kj::PtrTarget {
+     return *context;
+   }
+ 
++  kj::Own<void> enterActorEvent(jsg::Lock& lock);
++
+   // Invoked when the request is actually delivered.
+   //
+   // If, for some reason, this is not invoked before the object is destroyed, this indicate that
+@@ -1359,6 +1361,9 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler
+   // TODO(later): this is made public for Python Workers. It should be possible to make this private
+   // again later.
+   IoChannelFactory& getIoChannelFactory() {
++    KJ_IF_SOME(request, limitEnforcer->getActorEventRequest()) {
++      return *request.ioChannelFactory;
++    }
+     return *getCurrentIncomingRequest().ioChannelFactory;
+   }
+ 
+diff --git a/src/workerd/io/limit-enforcer.h b/src/workerd/io/limit-enforcer.h
+index 2d65a8a2a1ec40c124d6968124ecdd2c2c8e05f9..4905aa9d4ed5a65b8638b07379688709a2ad672c 100644
+--- a/src/workerd/io/limit-enforcer.h
++++ b/src/workerd/io/limit-enforcer.h
+@@ -22,6 +22,7 @@ class TrackedWasmInstanceList;
+ 
+ struct ActorCacheSharedLruOptions;
+ class IoContext;
++class IoContext_IncomingRequest;
+ class SqlExecutionBudget;
+ 
+ namespace jsg {
+@@ -139,6 +140,15 @@ class LimitEnforcer {
+   // be dropped when JavaScript is done, before unlocking the isolate.
+   virtual kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) = 0;
+ 
++  // Actor contexts can outlive individual requests. Embedders that account for each event
++  // separately can tag the initial callback so asynchronous work inherits its request.
++  virtual kj::Own<void> enterActorEvent(jsg::Lock&, IoContext_IncomingRequest&) {
++    return {};
++  }
++  virtual kj::Maybe<IoContext_IncomingRequest&> getActorEventRequest() {
++    return kj::none;
++  }
++
+   // Called on each new event delivered that should cause an actor's resource limits to be
+   // "topped up". This method does nothing if the IoContext is not an actor. Note that this must
+   // not be called while in a JS scope, i.e. when `enterJs()` has been called and the returned
+diff --git a/src/workerd/io/worker-entrypoint.c++ b/src/workerd/io/worker-entrypoint.c++
+index cbb32d83caecb8167e662343046d5fb5d3dcbfaf..e0a9082fcd0d65bda16ad552bf857718c9fd97b7 100644
+--- a/src/workerd/io/worker-entrypoint.c++
++++ b/src/workerd/io/worker-entrypoint.c++
+@@ -502,11 +502,12 @@ kj::Promise<void> WorkerEntrypoint::requestImpl(kj::HttpMethod method,
+         api::DeferredProxy<void> deferredProxy = co_await context.run(
+             [this, method, url, &headers, &requestBody, &wrappedResponse = *wrappedResponse,
+                 entrypointName = entrypointName.clone(),
+-                metrics = kj::addRef(incomingRequest->getMetrics())](
++                metrics = kj::addRef(incomingRequest->getMetrics()), &request = *incomingRequest](
+                 Worker::Lock& lock, IoContext& context) mutable {
+           TRACE_EVENT_END("workerd", PERFETTO_TRACK_FROM_POINTER(&context));
+           TRACE_EVENT(
+               "workerd", "WorkerEntrypoint::request() run", PERFETTO_FLOW_FROM_POINTER(this));
++          auto limitScope = request.enterActorEvent(lock);
+           auto traceScope = context.makeRequestTraceScope(lock);
+ 
+           kj::Maybe<jsg::Ref<api::AbortSignal>> signal;
+diff --git a/src/workerd/io/worker.c++ b/src/workerd/io/worker.c++
+index b46026b08810d487265f6b81a7735b99197324ff..30769832f3f0d1bd305a8128ba90e0a27dc33514 100644
+--- a/src/workerd/io/worker.c++
++++ b/src/workerd/io/worker.c++
+@@ -4465,7 +4465,7 @@ Worker::Actor::Actor(const Worker& worker,
+   }
+ }
+ 
+-void Worker::Actor::ensureConstructed(IoContext& context) {
++void Worker::Actor::ensureConstructed(IoContext& context, IoContext_IncomingRequest& request) {
+   KJ_IF_SOME(info, impl->classInstance.tryGet<ActorClassInfo*>()) {
+     // IMPORTANT: We need to set the state to "Initializing" synchronously, before
+     // ensureConstructedImpl() actually executes and acquires the input lock.
+@@ -4480,7 +4480,7 @@ void Worker::Actor::ensureConstructed(IoContext& context) {
+     //
+     // So the "actor still initializing" error in getHandler() should be impossible
+     // unless a code path is bypassing the input lock mechanism.
+-    context.addWaitUntil(ensureConstructedImpl(context, *info));
++    context.addWaitUntil(ensureConstructedImpl(context, *info, request.addWeak()));
+     impl->classInstance = Impl::Initializing();
+   }
+ }
+@@ -4512,7 +4512,8 @@ kj::Maybe<jsg::JsRef<jsg::JsFunction>> readOnHibernateHandler(
+ 
+ }  // namespace
+ 
+-kj::Promise<void> Worker::Actor::ensureConstructedImpl(IoContext& context, ActorClassInfo& info) {
++kj::Promise<void> Worker::Actor::ensureConstructedImpl(
++    IoContext& context, ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request) {
+   InputGate::Lock inputLock = co_await impl->inputGate.wait(context.getCurrentTraceSpan());
+ 
+   try {
+@@ -4532,7 +4533,12 @@ kj::Promise<void> Worker::Actor::ensureConstructedImpl(IoContext& context, Actor
+       containerRunning = status.getRunning();
+     }
+ 
+-    co_await context.run([this, &info, containerRunning](Worker::Lock& lock, IoContext& context) {
++    co_await context.run([this, &info, containerRunning, &request](
++                             Worker::Lock& lock, IoContext& context) {
++      kj::Own<void> event;
++      KJ_IF_SOME(r, request.tryGet()) {
++        event = r.enterActorEvent(lock);
++      }
+       jsg::Lock& js = lock;
+ 
+       kj::Maybe<jsg::Ref<api::DurableObjectStorage>> storage;
+diff --git a/src/workerd/io/worker.h b/src/workerd/io/worker.h
+index 8867f3ed565f8857d67982b631971574208a3bf4..eec23131b842d037acea3a95cc017570a80a768f 100644
+--- a/src/workerd/io/worker.h
++++ b/src/workerd/io/worker.h
+@@ -1111,7 +1111,7 @@ class Worker::Actor final: public kj::Refcounted {
+   //
+   // This is used only for modules-syntax actors (which most are, since that's the only format we
+   // support publicly).
+-  void ensureConstructed(IoContext&);
++  void ensureConstructed(IoContext&, IoContext_IncomingRequest& request);
+ 
+   // Whether the actor's class instance has an onHibernate handler. Always false without the
+   // experimental compatibility flag. Reads state that requests modify, so only call it while the
+@@ -1283,7 +1283,8 @@ class Worker::Actor final: public kj::Refcounted {
+   kj::Maybe<api::ExportedHandler&> getHandler();
+   friend class Worker;
+ 
+-  kj::Promise<void> ensureConstructedImpl(IoContext&, ActorClassInfo& info);
++  kj::Promise<void> ensureConstructedImpl(IoContext&,
++      ActorClassInfo& info, kj::Weak<IoContext_IncomingRequest> request);
+ 
+   kj::Promise<void> runOnHibernateImpl(HibernationReason reason,
+       kj::Rc<IoChannelFactory> ioChannelFactory,
+diff --git a/src/workerd/jsg/async-context.c++ b/src/workerd/jsg/async-context.c++
+index a8dae39cc5eaf739ef31bb52d0fe3478f79d3f78..cee26a96334c3d7e561aac5e364afbe7cc24e95a 100644
+--- a/src/workerd/jsg/async-context.c++
++++ b/src/workerd/jsg/async-context.c++
+@@ -116,7 +116,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrapSnapshot(Lock& js, jsg::Function<
+             argv[n - 1] = args[n];
+             }
+ 
+-            AsyncContextFrame::Scope scope(js, frame);
++            AsyncContextFrame::Scope scope(js, frame, Scope::Kind::USER);
+             return check(fn->Call(context, context->Global(), argv.size(), argv.data()));
+           }));
+ }
+@@ -141,7 +141,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrap(Lock& js,
+             argv[n] = args[n];
+             }
+ 
+-            AsyncContextFrame::Scope scope(js, *frame.get());
++            AsyncContextFrame::Scope scope(js, *frame.get(), Scope::Kind::USER);
+             return check(
+                 function->Call(js.v8Context(), thisArg.getHandle(js), argv.size(), argv.data()));
+           }));
+@@ -162,7 +162,7 @@ v8::Local<v8::Function> AsyncContextFrame::wrapRoot(
+             argv[n] = args[n];
+             }
+ 
+-            AsyncContextFrame::Scope scope(js, kj::none);
++            AsyncContextFrame::Scope scope(js, kj::none, Scope::Kind::USER);
+             return check(
+                 function->Call(js.v8Context(), thisArg.getHandle(js), argv.size(), argv.data()));
+           }));
+@@ -237,23 +237,62 @@ void AsyncContextFrame::upsertStorageEntry(StorageEntry entry) {
+   }
+ }
+ 
+-AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource)
+-    : Scope(js.v8Isolate, resource) {}
++thread_local AsyncContextFrame::ChangeObserver* AsyncContextFrame::ChangeObserver::current =
++    nullptr;
++
++AsyncContextFrame::ChangeObserver::ChangeObserver(
++    void* data, Notify notify, const kj::Arc<StorageKey>& protectedKey)
++    : previous(current), data(data), notify(notify), protectedKey(protectedKey) {
++  current = this;
++}
++
++AsyncContextFrame::ChangeObserver::~ChangeObserver() {
++  current = previous;
++}
++
++AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<AsyncContextFrame&> resource, Kind kind)
++    : isolate(js.v8Isolate), prior(AsyncContextFrame::currentRef(js)) {
++  if (kind == Kind::USER && ChangeObserver::current != nullptr) {
++    // AsyncLocalStorage and AsyncResource may install an arbitrary user frame.
++    // The embedder's event identity follows the caller through that frame.
++    const auto& key = ChangeObserver::current->protectedKey;
++    kj::Maybe<Value&> currentEntry;
++    KJ_IF_SOME(frame, prior) {
++      currentEntry = frame->get(*key);
++    }
++    auto value = currentEntry.map([&](Value& value) { return value.addRef(js); })
++                     .orDefault([&] { return js.v8Ref(v8::Undefined(isolate).As<v8::Value>()); });
++    maybeSetV8ContinuationContext(isolate, resource);
++    try {
++      userFrame.emplace(AsyncContextFrame::create(js, StorageEntry(key.addRef(), kj::mv(value))));
++      resource = *KJ_ASSERT_NONNULL(userFrame);
++    } catch (...) {
++      maybeSetV8ContinuationContext(isolate, prior.map([](auto& frame) -> AsyncContextFrame& {
++        return *frame;
++      }));
++      throw;
++    }
++  }
++  maybeSetV8ContinuationContext(isolate, resource);
++  notifyObserver(isolate);
++}
+ 
+ AsyncContextFrame::Scope::Scope(v8::Isolate* ptr, kj::Maybe<AsyncContextFrame&> maybeFrame)
+     : isolate(ptr),
+       prior(AsyncContextFrame::currentRef(ptr)) {
+   maybeSetV8ContinuationContext(isolate, maybeFrame);
++  notifyObserver(isolate);
+ }
+ 
+-AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& resource)
+-    : Scope(js.v8Isolate, resource.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& {
++AsyncContextFrame::Scope::Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& resource, Kind kind)
++    : Scope(js, resource.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& {
+         return *frame.get();
+-      })) {}
++      }), kind) {}
+ 
+ AsyncContextFrame::Scope::~Scope() noexcept(false) {
+   maybeSetV8ContinuationContext(isolate,
+       prior.map([](Ref<AsyncContextFrame>& frame) -> AsyncContextFrame& { return *frame; }));
++  notifyObserver(isolate);
+ }
+ 
+ AsyncContextFrame::StorageScope::StorageScope(Lock& js, kj::Arc<StorageKey> key, Value store)
+diff --git a/src/workerd/jsg/async-context.h b/src/workerd/jsg/async-context.h
+index 231792556f438b06f345347d53c4c4b03363ede6..a55315adca7e99444d7ab0ecaef9f663915581c5 100644
+--- a/src/workerd/jsg/async-context.h
++++ b/src/workerd/jsg/async-context.h
+@@ -138,6 +138,29 @@ class AsyncContextFrame final: public Wrappable {
+   static kj::Maybe<Ref<AsyncContextFrame>> currentRef(Lock& js);
+   static kj::Maybe<Ref<AsyncContextFrame>> currentRef(v8::Isolate* isolate);
+ 
++  // A native turn can observe changes to its continuation context. Promise reactions restore
++  // the context inside V8 and notify the same observer from their promise hook.
++  class ChangeObserver {
++   public:
++    using Notify = void (*)(void*, v8::Isolate*, bool) noexcept;
++    ChangeObserver(void* data, Notify notify, const kj::Arc<StorageKey>& protectedKey);
++    ~ChangeObserver();
++    KJ_DISALLOW_COPY_AND_MOVE(ChangeObserver);
++
++   private:
++    friend class AsyncContextFrame;
++    static thread_local ChangeObserver* current;
++    ChangeObserver* previous;
++    void* data;
++    Notify notify;
++    const kj::Arc<StorageKey>& protectedKey;
++  };
++  static void notifyObserver(v8::Isolate* isolate, bool useFrame = true) noexcept {
++    if (auto* observer = ChangeObserver::current) {
++      observer->notify(observer->data, isolate, useFrame);
++    }
++  }
++
+   // Create a new AsyncContextFrame. The new frame inherits the storage context of the current
+   // frame (if any) and the given StorageEntry is added.
+   static Ref<AsyncContextFrame> create(Lock& js, StorageEntry storageEntry);
+@@ -176,14 +199,16 @@ class AsyncContextFrame final: public Wrappable {
+   // AsyncContextFrame::Scope makes the given AsyncContextFrame the current in the
+   // stack until the scope is destroyed.
+   struct Scope {
++    enum class Kind { INTERNAL, USER };
+     v8::Isolate* isolate;
+     kj::Maybe<Ref<AsyncContextFrame>> prior;
++    kj::Maybe<Ref<AsyncContextFrame>> userFrame;
+     // If frame is nullptr, the root frame is assumed.
+-    Scope(Lock& js, kj::Maybe<AsyncContextFrame&> frame = kj::none);
++    Scope(Lock& js, kj::Maybe<AsyncContextFrame&> frame = kj::none, Kind kind = Kind::INTERNAL);
+     // If frame is nullptr, the root frame is assumed.
+     Scope(v8::Isolate* isolate, kj::Maybe<AsyncContextFrame&> frame = kj::none);
+     // If frame is nullptr, the root frame is assumed.
+-    Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& frame);
++    Scope(Lock& js, kj::Maybe<Ref<AsyncContextFrame>>& frame, Kind kind = Kind::INTERNAL);
+     ~Scope() noexcept(false);
+     KJ_DISALLOW_COPY(Scope);
+   };
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 4cae4622991c020090ba7847287132ad7c631392..a34d94dfe79b964b44208312664052c9d91b0eb6 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -17,6 +17,17 @@ kj_test(
+     deps = [":coworkerd-durable-admission"],
+ )
+ 
++wd_cc_library(
++    name = "coworkerd-durable-cpu",
++    hdrs = ["coworkerd-durable-cpu.h"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++)
++
++kj_test(
++    src = "coworkerd-durable-cpu-test.c++",
++    deps = [":coworkerd-durable-cpu"],
++)
++
+ wd_cc_library(
+     name = "coworkerd-durable-placement",
+     srcs = ["coworkerd-durable-placement.c++"],
+diff --git a/src/workerd/server/factory/coworkerd-durable-cpu-test.c++ b/src/workerd/server/factory/coworkerd-durable-cpu-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..80a032cc5ca8ec28862b95cba4bd4ccf80cfa4c4
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-cpu-test.c++
+@@ -0,0 +1,42 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "coworkerd-durable-cpu.h"
++
++#include <kj/test.h>
++
++namespace workerd::server {
++namespace {
++
++KJ_TEST("Durable CPU follows the same event after interleaved work") {
++  DurableCpuAccount first;
++  DurableCpuAccount second;
++  uint64_t clock = 0;
++  auto run = [&](DurableCpuAccount& account, uint64_t cpu) {
++    const auto start = clock;
++    clock += cpu;
++    account.charge(start, clock);
++  };
++
++  run(first, 8);
++  run(second, 3);
++  // A suspended event spends no CPU while other objects run on the home.
++  clock += 400;
++  run(first, 3);
++  KJ_EXPECT(first.remaining(10) == 0);
++  KJ_EXPECT(second.remaining(10) == 7);
++  KJ_EXPECT(DurableCpuAccount().remaining(10) == 10);
++}
++
++KJ_TEST("A durable CPU account honors both lower and higher configured limits") {
++  constexpr uint64_t second = 1000000000;
++  DurableCpuAccount event;
++  event.charge(4 * second, 29 * second);
++  KJ_EXPECT(event.consumed() == 25 * second);
++  KJ_EXPECT(event.remaining(5 * second) == 0);
++  KJ_EXPECT(event.remaining(30 * second) == 5 * second);
++}
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-durable-cpu.h b/src/workerd/server/factory/coworkerd-durable-cpu.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8163b61441a52a4e3425673673e5ff101e5e06d5
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-durable-cpu.h
+@@ -0,0 +1,32 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++
++namespace workerd::server {
++
++// Each delivered event owns one account. The home supplies thread CPU clock samples at
++// execution boundaries, including native SQLite work within a JavaScript turn.
++class DurableCpuAccount {
++ public:
++  void charge(uint64_t start, uint64_t end) {
++    used += end - start;
++  }
++
++  uint64_t consumed() const {
++    return used;
++  }
++
++  uint64_t remaining(uint64_t maximum) const {
++    return maximum - std::min(maximum, used);
++  }
++
++ private:
++  uint64_t used = 0;
++};
++
++}  // namespace workerd::server
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 344e9c2464569dda5eef74572d7d25b7ec1786d7..019b6299a951a6682023542d692199bcb828715c 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -14,6 +14,7 @@ THREADED_DEPS = [
+     "//src/workerd/server:v8-platform-impl",
+     "//src/workerd/server:workerd-api",
+     "//src/workerd/server/factory:coworkerd-durable-admission",
++    "//src/workerd/server/factory:coworkerd-durable-cpu",
+     "//src/workerd/server/factory:coworkerd-durable-placement",
+     "//src/workerd/server/factory:coworkerd-durable-test-storage",
+     "//src/workerd/server/factory:coworkerd-sandbox",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 0f2e1e817e6644bbc66ca40ebf1bd36f0ccc2ed3..a0ce95f57019979e612e3d598591b67fd52dc32e 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -19,9 +19,11 @@
+ #include <workerd/io/tracked-wasm-instance.h>
+ #include <workerd/io/worker-entrypoint.h>
+ #include <workerd/io/worker-interface.h>
++#include <workerd/jsg/async-context.h>
+ #include <workerd/jsg/coworkerd-rpc-code.h>
+ #include <workerd/jsg/setup.h>
+ #include <workerd/server/factory/coworkerd-durable-admission.h>
++#include <workerd/server/factory/coworkerd-durable-cpu.h>
+ #include <workerd/server/factory/coworkerd-durable-placement.h>
+ #include <workerd/server/factory/coworkerd-durable-test-storage.h>
+ #include <workerd/server/factory/coworkerd-sandbox.h>
+@@ -942,6 +944,18 @@ class CpuWatchdog {
+     KJ_REQUIRE(found != entries.end());
+     entries.erase(found);
+   }
++  bool switchAccount(Entry& entry, uint64_t started, uint64_t used, kj::StringPtr identity) {
++    std::lock_guard lock(mutex);
++    if (entry.cause.load() != LimitCause::NONE) return false;
++    const uint64_t maximum = uint64_t(entry.cpuMs) * 1000000;
++    entry.started = started;
++    entry.previousCpu = used;
++    entry.allowance = maximum == 0 ? UINT64_MAX : maximum - std::min(maximum, used);
++    entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
++    entry.identity = identity;
++    changed.notify_one();
++    return true;
++  }
+ 
+  private:
+   std::mutex mutex;
+@@ -1087,6 +1101,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+   v8::IsolateGroup group;
+   // The name in this isolate's [coworkerd-sandbox] row.
+   std::string sandboxName = "threaded";
++  bool durableEvents = false;
+   LimitState memoryState = std::make_shared<std::atomic<LimitCause>>(LimitCause::NONE);
+   std::shared_ptr<MemoryBudget> memory;
+   mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
+@@ -1106,6 +1121,16 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+   void customizeIsolate(v8::Isolate *value) override {
+     server::requireSecureIsolateSandbox(value, sandboxName.c_str());
+     if (memory) memory->install(value);
++    if (durableEvents) {
++      // V8 restores continuation-preserved data before kBefore and retains it
++      // through kAfter. The full amount belongs to the reaction's event.
++      value->SetPromiseHook([](v8::PromiseHookType type, v8::Local<v8::Promise>,
++                                v8::Local<v8::Value>) {
++        auto* isolate = v8::Isolate::GetCurrent();
++        if (type == v8::PromiseHookType::kBefore) jsg::AsyncContextFrame::notifyObserver(isolate);
++        if (type == v8::PromiseHookType::kAfter) jsg::AsyncContextFrame::notifyObserver(isolate, false);
++      });
++    }
+   }
+   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
+     return {};
+@@ -1256,6 +1281,21 @@ struct Measurement {
+   kj::Maybe<kj::ForkedPromise<void>> responseEnded;
+ };
+ 
++struct DurableEventCpu {
++  DurableEventCpu(kj::String identity, uint32_t memoryMiB)
++      : identity(kj::mv(identity)), oomReport(oomReportText(this->identity, memoryMiB)) {}
++
++  kj::String identity, oomReport;
++  kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
++  server::DurableCpuAccount account;
++};
++
++class DurableEventObserver final: public RequestObserver {
++ public:
++  explicit DurableEventObserver(std::shared_ptr<DurableEventCpu> cpu): cpu(std::move(cpu)) {}
++  std::shared_ptr<DurableEventCpu> cpu;
++};
++
+ struct RequestLimits final: LimitEnforcer {
+   RequestLimits(Slot &slot, Measurement &measurement, Timer &timer, kj::String identity)
+       : slot(slot),
+@@ -1281,7 +1321,7 @@ struct RequestLimits final: LimitEnforcer {
+               measurement.limitCause,
+               slot.limits->memoryState,
+               slot.limits->memory,
+-              measurement.totalCpu,
++              slot.resetDurableRoot ? 0 : measurement.totalCpu,
+               slot.limits->cpuMs,
+               slot.limits->memoryMiB,
+               owner.identity,
+@@ -1290,10 +1330,19 @@ struct RequestLimits final: LimitEnforcer {
+       KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
+       slot.maxActive.store(1);
+       if (slot.homeTurn) slot.homeTurn(true);
+-      if (slot.resetDurableRoot) owner.durableTurnStart = cpu;
++      if (slot.resetDurableRoot) {
++        owner.scope = this;
++        observer.emplace(this, &contextChanged, owner.eventKey());
++      }
+     }
+     ~Scope() noexcept(false) {
+       KJ_DEFER(if (slot.homeTurn) slot.homeTurn(false));
++      observer.reset();
++      owner.scope = nullptr;
++      if (slot.resetDurableRoot) {
++        charge(nowNs(CLOCK_THREAD_CPUTIME_ID));
++        if (measurement.limitCause.load() == LimitCause::CPU) owner.failedEvent = event;
++      }
+       execution.finish();
+       auto used = nowNs(CLOCK_THREAD_CPUTIME_ID) - cpu;
+       measurement.totalCpu += used;
+@@ -1315,6 +1364,48 @@ struct RequestLimits final: LimitEnforcer {
+       slot.active.fetch_sub(1);
+       owner.publish(context);
+     }
++    server::DurableCpuAccount& account() { return event ? event->account : turnOverhead; }
++    void charge(uint64_t now) {
++      auto& charged = account();
++      charged.charge(segmentStart, now);
++      const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
++      if ((maximum != 0 && charged.remaining(maximum) == 0) ||
++          (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
++        auto expected = LimitCause::NONE;
++        measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
++      }
++      segmentStart = now;
++      owner.sqlBudget.reset();
++    }
++    static void contextChanged(void* ptr, v8::Isolate* isolate, bool useFrame) noexcept {
++      auto& self = *static_cast<Scope*>(ptr);
++      if (self.isolate != isolate || self.measurement.limitCause.load() != LimitCause::NONE) return;
++      // This also runs inside V8's promise hook. Only native bookkeeping
++      // and reads of the frame's opaque token are allowed here.
++      KJ_IF_SOME(exception, kj::runCatchingExceptions([&] {
++        self.selectEvent(useFrame ? self.owner.eventFromFrame(isolate) : nullptr);
++      })) {
++        KJ_LOG(ERROR, "cannot account for durable event continuation", exception);
++        self.measurement.limitCause.store(LimitCause::CPU);
++        isolate->TerminateExecution();
++      }
++    }
++    void selectEvent(std::shared_ptr<DurableEventCpu> next) {
++      if (event == next) return;
++      const auto now = nowNs(CLOCK_THREAD_CPUTIME_ID);
++      charge(now);
++      if (measurement.limitCause.load() == LimitCause::CPU) {
++        isolate->TerminateExecution();
++        return;
++      }
++      const auto used = (next ? next->account : turnOverhead).consumed();
++      if (execution.registered && !CpuWatchdog::instance().switchAccount(
++              execution.entry, now, used, next ? next->identity : owner.identity)) {
++        return;
++      }
++      currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
++      event = std::move(next);
++    }
+     RequestLimits &owner;
+     IoContext &context;
+     Slot &slot;
+@@ -1322,26 +1413,59 @@ struct RequestLimits final: LimitEnforcer {
+     v8::Isolate *isolate;
+     uint64_t start, cpu;
+     CpuExecution execution;
++    uint64_t segmentStart = cpu;
++    server::DurableCpuAccount turnOverhead;
++    std::shared_ptr<DurableEventCpu> event;
++    std::optional<jsg::AsyncContextFrame::ChangeObserver> observer;
+   };
+   kj::Own<void> enterJs(jsg::Lock &js, IoContext &context) override {
+     requireLimitsNotExceeded();
+     // runImpl synchronizes before waiting for the isolate; sample again after
+     // that wait, while its lock is held and before this turn enters JavaScript.
+     timer.syncTime();
+-    auto scope = kj::heap<Scope>(*this, context, js.v8Isolate);
+-    return scope;
+-  }
+-  void topUpActor() override {
+-    if (slot.resetDurableRoot && measurement.limitCause.load() == LimitCause::NONE) {
+-      measurement.totalCpu = 0;
++    return kj::heap<Scope>(*this, context, js.v8Isolate);
++  }
++  void topUpActor() override {}
++  kj::Own<void> enterActorEvent(jsg::Lock& js, IoContext::IncomingRequest& request) override {
++    if (!slot.resetDurableRoot) return {};
++    auto* observer = dynamic_cast<DurableEventObserver*>(&request.getMetrics());
++    KJ_REQUIRE(observer != nullptr, "durable event has no CPU account");
++    auto& event = observer->cpu;
++    if (event->request == kj::none) event->request = request.addWeak();
++    auto token = jsg::wrapOpaque(js.v8Context(), EventToken{eventOwner, event});
++    return kj::heap<jsg::AsyncContextFrame::StorageScope>(js, eventKey().addRef(), js.v8Ref(token));
++  }
++  kj::Maybe<IoContext::IncomingRequest&> getActorEventRequest() override {
++    if (scope == nullptr || !scope->event) return kj::none;
++    return KJ_REQUIRE_NONNULL(KJ_REQUIRE_NONNULL(scope->event->request).tryGet(),
++        "the durable event that started this work has ended");
++  }
++  struct EventToken {
++    const std::weak_ptr<int> owner;
++    const std::shared_ptr<DurableEventCpu> event;
++  };
++  static const kj::Arc<jsg::AsyncContextFrame::StorageKey>& eventKey() {
++    static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
++    return key;
++  }
++  std::shared_ptr<DurableEventCpu> eventFromFrame(v8::Isolate* isolate) {
++    v8::HandleScope handles(isolate);
++    KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(isolate)) {
++      KJ_IF_SOME(value, frame.get(*eventKey())) {
++        auto handle = value.getHandle(jsg::Lock::from(isolate));
++        if (handle->IsUndefined()) return nullptr;
++        const auto& token = jsg::unwrapOpaqueRef<EventToken>(isolate, handle);
++        if (token.owner.lock() == eventOwner) return token.event;
++      }
+     }
++    return nullptr;
+   }
+   std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
+-    if (!slot.resetDurableRoot || slot.limits->cpuMs == 0) return {};
++    if (!scope || slot.limits->cpuMs == 0) return {};
+     if (!sqlBudget) {
+       const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
+-      const auto left = maximum - kj::min(maximum, measurement.totalCpu);
+-      sqlBudget = std::make_shared<SqlExecutionBudget>(maximum, durableTurnStart + left);
++      const auto left = scope->account().remaining(maximum);
++      sqlBudget = std::make_shared<SqlExecutionBudget>(maximum, scope->segmentStart + left);
+     }
+     return sqlBudget;
+   }
+@@ -1385,7 +1509,8 @@ struct RequestLimits final: LimitEnforcer {
+                                                                   : measurement.limitCause.load();
+   }
+   void publish(IoContext &context) {
+-    if (slot.limits->cpuMs != 0 && measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
++    if (!slot.resetDurableRoot && slot.limits->cpuMs != 0 &&
++        measurement.totalCpu >= uint64_t(slot.limits->cpuMs) * 1000000) {
+       auto expected = LimitCause::NONE;
+       measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
+     }
+@@ -1395,7 +1520,9 @@ struct RequestLimits final: LimitEnforcer {
+     writeLimitRow(value == LimitCause::MEMORY     ? "memory-terminated"
+             : value == LimitCause::PROCESS_MEMORY ? "process-memory-pressure"
+                                                   : "terminated",
+-        identity, measurement.totalCpu, slot.limits->cpuMs, slot.limits->memoryMiB,
++        failedEvent ? failedEvent->identity : identity,
++        failedEvent ? failedEvent->account.consumed() : measurement.totalCpu,
++        slot.limits->cpuMs, slot.limits->memoryMiB,
+         slot.limits->memory->peakUsedBytes.load());
+     if (failurePair.fulfiller->isWaiting()) failurePair.fulfiller->reject(limitException(value));
+     if (value == LimitCause::CPU && slot.resetDurableRoot) {
+@@ -1433,7 +1560,10 @@ struct RequestLimits final: LimitEnforcer {
+   kj::PromiseFulfillerPair<void> failurePair = kj::newPromiseAndFulfiller<void>();
+   kj::ForkedPromise<void> failure;
+   bool published = false;
+-  uint64_t durableTurnStart = 0;
++  // The weak token distinguishes actor contexts even if an old frame is restored later.
++  std::shared_ptr<int> eventOwner = slot.resetDurableRoot ? std::make_shared<int>() : nullptr;
++  std::shared_ptr<DurableEventCpu> failedEvent;
++  Scope* scope = nullptr;
+   std::shared_ptr<SqlExecutionBudget> sqlBudget;
+ };
+ 
+@@ -2590,6 +2720,7 @@ struct ThreadedServer {
+         ",\"homes\":" + std::to_string(homes) +
+         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
+         ",\"waiting\":" + std::to_string(state.waiting) +
++        ",\"running\":" + std::to_string(state.active) +
+         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
+         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
+@@ -2962,6 +3093,7 @@ struct ThreadedServer {
+         workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), kj::mv(identity),
+         slot.reservation, group);
+     limits->sandboxName = slot.isolateLabel;
++    limits->durableEvents = bool(slot.resetDurableRoot);
+     slot.limits = limits.get();
+     slot.limitsOwner = kj::addRef(*limits);
+     OomReportScope oom(
+@@ -4234,16 +4366,20 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+       str(input, "format"), field(input, "entrypoint").isString() ? str(input, "entrypoint") : "");
+   auto channels = kj::rc<Channels>(state, server, slot, raw);
+   auto tracer = kj::rc<TenantTracer>(channels.addRef());
++  auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
++      ",\"versionId\":", encode(field(input, "versionId")),
++      ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
++      slot->isolateLabel.c_str(), "\",");
++  if (slot->resetDurableRoot) {
++    observer = kj::refcounted<DurableEventObserver>(
++        std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
++  }
+   auto entry = newWorkerEntrypoint(state.context, kj::mv(worker),
+       entrypoint.empty() || entrypoint == "default"
+           ? kj::Maybe<kj::String>(kj::none)
+           : kj::Maybe<kj::String>(kj::str(entrypoint.c_str())),
+       kj::mv(props), kj::mv(actor),
+-      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer,
+-          kj::str("\"workerId\":", encode(field(input, "workerId")),
+-              ",\"versionId\":", encode(field(input, "versionId")),
+-              ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
+-              slot->isolateLabel.c_str(), "\",")),
++      kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity)),
+       kj::addRef(*invocation), kj::mv(channels), kj::mv(observer), state.tasks, true,
+       kj::mv(tracer), kj::mv(cf), kj::none);
+   return {kj::mv(entry), kj::mv(invocation)};

@@ -21,7 +21,7 @@
 //           change); then the Server's SIGTERM (the exit)
 //     idle  idle eviction at 2 s: an isolate removed, destroyed and recreated
 // Environment: V45_BIN (the binaries to profile), V45_STACK, V45_MACHINE (names kept from the tool's first version).
-import { chmod, mkdir, readdir } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import * as h from "./profile-lab.mjs";
 import * as w from "./profile-workers.mjs";
@@ -36,8 +36,17 @@ await mkdir(traceDir, { recursive: true });
 // directory it cannot write would leave every wrapper waiting for a tracer that never attaches.
 await chmod(traceDir, 0o777);
 const workerd = `${h.BIN}/workerd`;
+const threaded = `${h.BIN}/coworkerd-threaded`;
+// The node launches ordinary processes through the sibling threaded executable.
+// Keep both wrappers together and trace each binary under its actual process identity.
+const wrappers = `${output}/wrappers`;
+await mkdir(wrappers, { recursive: true });
+for (const name of ["workerd", "coworkerd-threaded"]) {
+  await copyFile(`${h.REPO}/scripts/syscall-trace-wrapper.sh`, `${wrappers}/${name}`);
+  await chmod(`${wrappers}/${name}`, 0o755);
+}
 const data = { schemaVersion: 1, round: "v45", kind: "profile", run, machine: process.env.V45_MACHINE ?? null,
-  traceProgram: workerd, startedAtUnixMs: Date.now(), windows: [], passed: false };
+  traceProgram: workerd, traceThreadedProgram: threaded, startedAtUnixMs: Date.now(), windows: [], passed: false };
 const windows = data.windows;
 const t0 = Date.now();
 const note = (...values) => console.error(`[v45-profile] ${((Date.now() - t0) / 1000).toFixed(1)}s`, ...values);
@@ -94,7 +103,7 @@ try {
       "gc-tenant": w.gcTenant };
     for (const id of w.isolateIds(20)) workers[id] = w.ordinary;
     Object.assign(data, await h.setup({ sandbox: "off", workers, env: environment, trace: true,
-      workerdPath: `${h.REPO}/scripts/syscall-trace-wrapper.sh` }));
+      workerdPath: `${wrappers}/workerd`, config: { cpuLimitMs: 200 } }));
     data.afterStartup = await census();
     await window("idle", async () => { await h.delay(10000); return {}; });
     await window("cold", async () => {
@@ -118,11 +127,21 @@ try {
     // The idle collection: requests that each leave 2 MiB more in the old generation, then idle time; the
     // process reports its idle collections in its lifecycle snapshot (gc.idleCollections).
     await window("idle-gc", async () => {
-      const idleCollections = async () => (await h.state()).processes.entries
-        .reduce((sum, e) => sum + (e.gc?.generation?.idleCollections ?? 0), 0);
+      const idleCollections = async () => {
+        const values = (await h.state()).processes.entries
+          .filter(e => e.processClass === "ordinary")
+          .map(e => e.gc?.generation?.idleCollections);
+        return values.length && values.every(value => typeof value === "number")
+          ? values.reduce((sum, value) => sum + value, 0) : null;
+      };
       const before = await idleCollections();
       const statuses = [];
       for (let n = 0; n < 6; n++) { statuses.push((await h.request("/gc-tenant?keep=2")).status); await h.delay(300); }
+      if (before === null) {
+        await h.delay(1000);
+        return { statuses, idleCollectionObserved: false,
+          reason: "the threaded lifecycle does not expose the legacy idleCollections counter" };
+      }
       const waited = await h.waitFor(async () => (await idleCollections()) > before, "an idle collection", 15000, 200);
       return { statuses, idleCollectionsBefore: before, idleCollectionsAfter: await idleCollections(), waitedMs: waited.elapsedMs };
     });
@@ -143,7 +162,7 @@ try {
     data.beforeShutdown = await census();
   } else if (run === "idle") {
     Object.assign(data, await h.setup({ sandbox: "off", workers: { ordinary: w.ordinary }, env: environment, trace: true,
-      workerdPath: `${h.REPO}/scripts/syscall-trace-wrapper.sh`,
+      workerdPath: `${wrappers}/workerd`,
       config: { idleEvictMs: 2000, placement: { homeProbability: 0, idleMs: 1000 } } }));
     data.afterStartup = await census();
     await window("first", () => repeat("/ordinary", 3));

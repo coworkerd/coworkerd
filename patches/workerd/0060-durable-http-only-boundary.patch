@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 15:45:49 +0800
+Subject: [PATCH] Refuse durable JavaScript RPC in the initial HTTP-only host
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 6d048d142e4d10337366b55310ee5cb16c02d9b1..39610fc917c3df3dbbc7b412f9bd0b3c557b6353 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3599,6 +3599,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
+     return kj::READY_NOW;
+   }
+   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
++    if (state.durableHome) unsupported("JavaScript RPC in the durable test role");
+     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
+     return api::JsRpcSessionCustomEvent::receiveRpc(kj::mv(context), kj::mv(worker));
+   }

@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 15:12:16 +0800
+Subject: [PATCH] Exercise durable idle races and higher CPU budgets
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+index d612c02c3db2dc18a5d96e1ce6f153718c58866a..20138ab88b9057d51e7da448fd720ac3ff361488 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -156,6 +156,50 @@ KJ_TEST("durable admission returns an unassigned tree only when its final waitin
+   KJ_EXPECT((table.state().reserved == Admission::Resources{}));
+ }
+ 
++KJ_TEST("durable idle retirement fences reentry and cancellation at the clock boundary") {
++  Admission table(limits, 1);
++  auto clock = now;
++  auto lastUse = clock;
++  const auto firstCall = queued(table.queue(first, open, 0, clock + 30s, clock), true);
++  KJ_ASSERT(table.publishHome(firstCall.tree, 1));
++  KJ_ASSERT(table.begin(firstCall, 1, first, open, clock) == Delivery::ACCEPTED);
++  KJ_ASSERT(table.complete(firstCall, 1));
++
++  clock = now + 10s - 1ns;
++  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
++  clock += 1ns;
++  // Reentry wins the routing lock at the idle deadline. A timer with an old
++  // last-use sample cannot close a tree that now owns a waiting event.
++  const auto reentry = queued(table.queue(first, open, 20, clock + 30s, clock), false);
++  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
++  KJ_ASSERT(table.begin(reentry, 1, first, open, clock) == Delivery::ACCEPTED);
++  clock += 20s;
++  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
++  KJ_EXPECT(table.cancel(reentry) == Cancellation::SIGNAL_HOME);
++  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
++  KJ_ASSERT(table.complete(reentry, 1));
++  lastUse = clock;
++  KJ_EXPECT(!table.stopIdleTree(firstCall.tree, 1, lastUse, clock + 10s - 1ns));
++
++  clock += 10s;
++  // Retirement wins this time. The old reservation is held until home close;
++  // a stale completion must not affect the replacement's independent identity.
++  KJ_ASSERT(table.stopIdleTree(firstCall.tree, 1, lastUse, clock));
++  KJ_EXPECT(table.queue(first, open, 0, clock + 30s, clock).status == Status::STALE);
++  KJ_EXPECT((table.state().reserved == limits.tree));
++  KJ_ASSERT(table.releaseTree(firstCall.tree, 1));
++  const auto reopened = queued(table.queue(first, open, 0, clock + 30s, clock), true);
++  KJ_EXPECT(reopened.tree != firstCall.tree);
++  KJ_ASSERT(table.publishHome(reopened.tree, 2));
++  KJ_EXPECT(!table.complete(reentry, 1));
++  KJ_EXPECT(!table.releaseTree(firstCall.tree, 1));
++  KJ_EXPECT(table.begin(reopened, 2, first, open, clock) == Delivery::ACCEPTED);
++  KJ_ASSERT(table.complete(reopened, 2));
++  KJ_ASSERT(table.stopIdleTree(reopened.tree, 2, clock, clock + 10s));
++  KJ_ASSERT(table.releaseTree(reopened.tree, 2));
++  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++}
++
+ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree") {
+   auto below = limits;
+   // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index 214c42d7023db50d98ee13de6b6485e7bebf72a5..a14d3456c50c8bcd4b57fada58daaf6b9b87e8db 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -211,6 +211,10 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
+   return true;
+ }
+ 
++bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now) {
++  return now - lastUse >= IDLE_DELAY && stopIdleTree(tree, home);
++}
++
+ bool DurableAdmission::releaseTree(uint64_t tree, uint64_t home) {
+   auto entry = trees.find(tree);
+   if (entry == trees.end() || !entry->second.closing || entry->second.home != home) {
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index 3186a218ff9a04170c1492819c1daf947a87a503..02a537fb70304cd83f5b0b26082431974b9155c4 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -20,6 +20,7 @@ class DurableAdmission {
+  public:
+   using Clock = std::chrono::steady_clock;
+   using Time = Clock::time_point;
++  static constexpr auto IDLE_DELAY = std::chrono::seconds(10);
+ 
+   struct Resources {
+     uint64_t threads = 0;
+@@ -97,6 +98,9 @@ class DurableAdmission {
+   // A home starts closing only after its mailbox is empty. Reject admission during close,
+   // and keep the tree's reservation until the home confirms that its handles are gone.
+   bool stopIdleTree(uint64_t tree, uint64_t home);
++  // Normal retirement checks the idle deadline as well as mailbox/active ownership.
++  // Pressure retirement uses the unconditional overload above.
++  bool stopIdleTree(uint64_t tree, uint64_t home, Time lastUse, Time now);
+   bool releaseTree(uint64_t tree, uint64_t home);
+   // The home failed to open. Releases all waiting credits without a close acknowledgement.
+   std::vector<Ticket> failOpen(uint64_t tree);
+diff --git a/src/workerd/server/factory/coworkerd-durable-cpu-test.c++ b/src/workerd/server/factory/coworkerd-durable-cpu-test.c++
+index 80a032cc5ca8ec28862b95cba4bd4ccf80cfa4c4..ca73e2819a552b2477b203663b66952e4b30c717 100644
+--- a/src/workerd/server/factory/coworkerd-durable-cpu-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-cpu-test.c++
+@@ -38,5 +38,19 @@ KJ_TEST("A durable CPU account honors both lower and higher configured limits")
+   KJ_EXPECT(event.remaining(30 * second) == 5 * second);
+ }
+ 
++KJ_TEST("A higher durable CPU budget permits legitimate work beyond thirty seconds") {
++  constexpr uint64_t second = 1000000000;
++  DurableCpuAccount event;
++  event.charge(0, 35 * second);
++  KJ_EXPECT(event.remaining(30 * second) == 0);
++  KJ_EXPECT(event.remaining(45 * second) == 10 * second);
++  // The same delivered event resumes; an await did not give it a fresh budget.
++  event.charge(100 * second, 109 * second);
++  KJ_EXPECT(event.remaining(45 * second) == second);
++  event.charge(200 * second, 202 * second);
++  KJ_EXPECT(event.remaining(45 * second) == 0);
++  KJ_EXPECT(DurableCpuAccount().remaining(45 * second) == 45 * second);
++}
++
+ }  // namespace
+ }  // namespace workerd::server
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index e36881dff4b5ac1ef5bb777fa7315c06da3e463e..44af36d96b36dd4c0c55e9e31a0938ef2d99d27a 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2685,7 +2685,7 @@ struct ThreadedServer {
+     for (auto it = state.durableRoots.begin(); it != state.durableRoots.end();) {
+       auto current = it++;
+       if (!current->second.resetting && !pressured &&
+-          now - current->second.lastUse < std::chrono::seconds(10))
++          now - current->second.lastUse < server::DurableAdmission::IDLE_DELAY)
+         continue;
+       if (current->second.resetting) current->second.stopFacets();
+       if (current->second.facetsBusy()) continue;
+@@ -2696,7 +2696,10 @@ struct ThreadedServer {
+       const auto tree = current->first;
+       {
+         std::lock_guard lock(durableRoutingMutex);
+-        if (!durableAdmission->stopIdleTree(tree, homeId)) continue;
++        const bool stopped = current->second.resetting || pressured
++            ? durableAdmission->stopIdleTree(tree, homeId)
++            : durableAdmission->stopIdleTree(tree, homeId, current->second.lastUse, now);
++        if (!stopped) continue;
+       }
+       if (!current->second.resetting) {
+         if (pressured) {
