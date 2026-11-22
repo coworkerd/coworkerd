@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
 
 namespace coworkerd {
 
@@ -71,15 +72,34 @@ bool crashCulpritDispatch(const Calls& live, const Recent& recent, const std::st
   });
 }
 
+struct FatalExitEvidence {
+  bool observed = false;
+  std::string culpritRow;
+
+  void record(std::string_view event, const std::string& row) {
+    if (event != "v8-fatal" && event != "v8-fatal-undetermined") return;
+    if (!observed && event == "v8-fatal") culpritRow = row;
+    else culpritRow.clear();  // Competing records cannot prove which thread ended the process.
+    observed = true;
+  }
+};
+
+template <typename Process>
+bool fatalExitMatches(const Process& p, int status) {
+  return p.fatalEvidence.observed && !p.oomSignalled && p.oomCulpritRow.empty() &&
+      WIFEXITED(status) && WEXITSTATUS(status) == 75;
+}
+
 // The inherited event pipe belongs to one process generation. The isolate label
 // is formed by the kernel, including for a cold load before its first lifecycle snapshot.
 template <typename Process, typename Confirmed>
-std::string confirmedFatalCulprit(const Process& p, bool fatalExit, Confirmed confirmed) {
-  if (!fatalExit || p.fatalCulpritRow.empty() || p.fatalCulpritRow.size() >= 4096) return "null";
+std::string confirmedFatalCulprit(const Process& p, int status, Confirmed confirmed) {
+  const auto& row = p.fatalEvidence.culpritRow;
+  if (!fatalExitMatches(p, status) || row.empty() || row.size() >= 4096) return "null";
   try {
     capnp::MallocMessageBuilder message;
     auto value = message.initRoot<v1::rpc::CpuReport>();
-    capnp::JsonCodec().decode(kj::StringPtr(p.fatalCulpritRow.c_str()), value);
+    capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), value);
     if (value.getEvent() != "v8-fatal" || value.getPid() != static_cast<uint32_t>(p.pid)) return "null";
     const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
     const std::string invocation = value.getInvocationId().cStr();
@@ -92,9 +112,9 @@ std::string confirmedFatalCulprit(const Process& p, bool fatalExit, Confirmed co
     if (isolate.size() != 64 || !std::all_of(isolate.begin(), isolate.end(), [](char digit) {
           return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
         })) return "null";
-    auto row = capnp::JsonCodec().encode(value.asReader());
+    auto encoded = capnp::JsonCodec().encode(value.asReader());
     confirmed(worker, invocation);
-    return row.cStr();
+    return encoded.cStr();
   } catch (const kj::Exception&) { return "null"; }
 }
 

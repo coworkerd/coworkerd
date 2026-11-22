@@ -1015,8 +1015,7 @@ struct ProcessGeneration {
   // The evidence rows: the latest CPU culprit (withdrawn by a later terminated row of the same
   // invocation: the termination took effect after all), the OOM row, the OOM identity row.
   std::string culpritRow, culpritInvocation, oomCulpritRow;
-  std::string fatalCulpritRow;
-  bool fatalSignalled = false;
+  FatalExitEvidence fatalEvidence;
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
@@ -1178,7 +1177,7 @@ struct ProcessGeneration {
     // maintains them as bytes arrive; exceptional completions may drain first.
     if (!eventsEnded && !crashEventPending) return;
     pullEvents();
-    if (eventsEnded || fatalSignalled || oomSignalled || !oomCulpritRow.empty()) crashInFlight = inFlightJson();
+    if (eventsEnded || fatalEvidence.observed || oomSignalled || !oomCulpritRow.empty()) crashInFlight = inFlightJson();
   }
   static std::string callKey(uint64_t pid, std::string_view invocation, std::string_view worker, std::string_view version) {
     return std::to_string(pid).append(1, '\n').append(invocation).append(1, '\n').append(worker).append(1, '\n').append(version);
@@ -1289,11 +1288,7 @@ struct ProcessGeneration {
         }
         if (event == "memory-oom-undetermined") oomSignalled = true;
         if (event == "memory-culprit") oomCulpritRow = row;
-        if (event == "v8-fatal" || event == "v8-fatal-undetermined") {
-          if (!fatalSignalled && event == "v8-fatal") fatalCulpritRow = row;
-          else fatalCulpritRow.clear();  // Competing fatal records cannot prove which thread ended the process.
-          fatalSignalled = true;
-        }
+        fatalEvidence.record(event, row);
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
             report.getMemoryLimitMiB(), report.getPeakUsedBytes(), report.getPauseNs(),
             event == "gc-pause" ? row : std::string()});
@@ -1336,7 +1331,7 @@ void ProcessCall::snapshotAfterFailure() noexcept {
 }
 kj::Promise<void> ProcessCall::rejectAfterCrash(kj::Exception&& error) {
   snapshotAfterFailure();
-  if (process->pid == 0 || !process->fatalSignalled || process->durable) return kj::mv(error);
+  if (process->pid == 0 || !process->fatalEvidence.observed || process->durable) return kj::mv(error);
   // A socket can close before the node reaps its child. Apply the suspect mark
   // before returning the failed call, so its next call uses the quarantine route.
   return process->timer->timeoutAfter(1000 * kj::MILLISECONDS, KJ_ASSERT_NONNULL(process->exitSignal).addBranch())
@@ -3051,9 +3046,8 @@ public:
     return true;
   }
   void fatalExit(Slot& slot, ProcessGeneration& p, int status) {
-    const bool v8Fatal = p.fatalSignalled && !p.oomSignalled && p.oomCulpritRow.empty() &&
-        WIFEXITED(status) && WEXITSTATUS(status) == 75;
-    auto offender = confirmedFatalCulprit(p, v8Fatal, [&](const std::string& worker, const std::string& invocation) {
+    const bool v8Fatal = fatalExitMatches(p, status);
+    auto offender = confirmedFatalCulprit(p, status, [&](const std::string& worker, const std::string& invocation) {
       suspects.confirm(worker, p.id, p.generation, invocation);
     });
     if (v8Fatal) {
