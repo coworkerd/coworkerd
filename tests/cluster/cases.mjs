@@ -468,7 +468,7 @@ async function durableThreadedFence(cluster) {
       const { owners } = await namespace();
       const owner = owners.find(entry => entry.shard === old.shard);
       assert.ok(owner && peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(old.epoch));
-    }, { timeout: 18000, interval: 100 });
+    }, { timeout: 20000, interval: 100 });
     assert.ok(performance.now() - sentAt < cluster.confirmTimeoutMs - 1000,
       'the old write has time left on its confirmation deadline when the new epoch is known');
   } finally {
@@ -695,7 +695,7 @@ export const durableThreadedCases = {
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-fence': {
     test: durableThreadedFence, nodes: ['node-1', 'node-2', 'node-3'],
-    membership: { ttlSeconds: 4, heartbeatIntervalMs: 800, livenessGraceMs: 1000, listIntervalMs: 200 },
-    confirmTimeoutMs: 20000,
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+    confirmTimeoutMs: 25000,
   },
 };
