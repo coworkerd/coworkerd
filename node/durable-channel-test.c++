@@ -653,6 +653,7 @@ struct DurableLogChannelTest {
     hooks.openStream = [&](std::string, uint64_t ownerEpoch, uint64_t firstSeq)
         -> kj::Promise<kj::Own<DurableLog::PeerSink>> {
       ++opened;
+      if (name == "unreachable") return kj::NEVER_DONE;
       if (!pair) return kj::Own<DurableLog::PeerSink>(kj::heap<FakeSink>(calls));
       uint64_t stream = 0;
       KJ_REQUIRE(peer.openIncoming("node", ownerEpoch, "instance", "5", firstSeq, stream).empty());
@@ -732,7 +733,12 @@ struct DurableLogChannelTest {
       record.dataEpoch = 1;
       log.takeRecord(channel, std::move(record), request);
     };
-    if (resend) {
+    if (name == "unreachable") {
+      clock.advanceTo(KJ_ASSERT_NONNULL(clock.nextEvent()));
+      answers();
+      KJ_REQUIRE(opened == 1 && calls.empty() && acks.empty() && log.confirmations == 0 &&
+          log.inFlight.size() == hosts.size(), "an unreachable selected peer must not allow local confirmation");
+    } else if (resend) {
       // Records 1, 2, 3 (shards 3, 4, 5) are taken and confirmed; then a write to shard 4 is refused as fenced and
       // the store shows epoch 2 of it -- the shard is given up. When the session reopens, the given-up shard's
       // confirmed record (2) is not sent again; the others are, and a new write to shard 5 is confirmed as usual.
@@ -1119,9 +1125,35 @@ struct DurableLogChannelTest {
     close(11, 2);
     KJ_REQUIRE(channel.openFacets.at(key).id == 21 && object.facets.at(0).open && object.cacheOpen);
     KJ_REQUIRE(object.facets.at(0).databaseBytes == 12288 && log.checkpoints == 1);
+    KJ_REQUIRE(!log.drainChannel("d0-7") && channel.draining,
+        "drain must wait for the current SQLite open");
     close(21, 16384);
     KJ_REQUIRE(!channel.openFacets.contains(key) && !object.facets.at(0).open && !object.cacheOpen);
     KJ_REQUIRE(object.facets.at(0).databaseBytes == 16384);
+    KJ_REQUIRE(log.drainChannel("d0-7"), "the current database close completes the drain");
+
+    channel.draining = false;
+    open(30);
+    object.state = DurableLog::ObjectState::REBUILDING;
+    object.holders[channel.processId].requests = 1;
+    auto closing = log.closeThreadedObject(name);
+    KJ_REQUIRE(!closing.poll(io.waitScope), "recovery must wait for SQLite to close");
+    close(30, 16384);
+    clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
+    KJ_REQUIRE(!closing.poll(io.waitScope), "a dispatched call still holds the old image");
+    object.holders[channel.processId].requests = 0;
+    clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
+    KJ_REQUIRE(closing.poll(io.waitScope) && closing.wait(io.waitScope));
+
+    object.state = DurableLog::ObjectState::LOCAL;
+    open(31);
+    object.state = DurableLog::ObjectState::REBUILDING;
+    auto lost = log.closeThreadedObject(name);
+    KJ_REQUIRE(!lost.poll(io.waitScope));
+    log.channelEnded(channel, "test channel EOF");
+    clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
+    KJ_REQUIRE(lost.poll(io.waitScope) && !lost.wait(io.waitScope),
+        "EOF without process exit is not proof of close");
   }
 
   // The restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The

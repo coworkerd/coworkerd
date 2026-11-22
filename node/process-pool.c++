@@ -3818,7 +3818,7 @@ kj::Promise<uint32_t> ProcessPool::resetDurableAndWait(const std::string& reason
   for (auto& slot : impl->slots) {
     if (!slot.durable) continue;
     Impl::eachGeneration(slot, [&](const auto& generation) {
-      if (generation->pid != 0) exits.add(generation->exitSignal.addBranch());
+      if (generation->pid != 0) exits.add(KJ_ASSERT_NONNULL(generation->exitSignal).addBranch());
     });
   }
   const auto killed = resetDurable(reason);

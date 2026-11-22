@@ -60,3 +60,4 @@
 0080-threaded-wal-channel.patch
 0081-threaded-durable-storage.patch
 0082-threaded-durable-fixture-state.patch
+0083-threaded-wal-open-proof.patch

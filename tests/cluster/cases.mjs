@@ -537,6 +537,9 @@ async function mixedDurableStorage(cluster) {
   assert.equal((await target.read()).fired, false, 'the threaded generation does not deliver a due alarm');
   const startingOwner = await target.owner();
   await cluster.compose(['stop', '--timeout', '45', threaded], { timeout: 70000 });
+  const drained = await cluster.compose(['ps', '-a', '-q', threaded]);
+  assert.equal(await cluster.command('docker', ['inspect', '--format', '{{.State.ExitCode}}', drained]), '0',
+    'the threaded node completed its drain before Compose stopped it');
   const upstreamOwner = await eventually('an upstream owner recovers the threaded write and fires the due alarm', async () => {
     const saved = await target.read();
     assert.equal(saved.value, 'threaded-rpc');

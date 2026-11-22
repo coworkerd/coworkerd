@@ -779,7 +779,8 @@ namespace {
 constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOINT = 4, FROM_RESET = 5,
                   FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10;
 // Messages to one.
-constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6;
+constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6,
+                  TO_OPENED = 7;
 constexpr uint32_t THREADED_WAL_REVISION = 1;
 // An answer's status.
 constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
@@ -2189,6 +2190,13 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
           tellBreak(key, std::string("Durable Object storage is unavailable: ") + reason + " (STORAGE_UNAVAILABLE)");
           markRepair(*object, reason);
         }
+      }
+      if (openId != 0) {
+        std::string opened;
+        putU8(opened, TO_OPENED);
+        putU64(opened, openId);
+        putU8(opened, object->state == ObjectState::LOCAL ? ACK_OK : ACK_UNAVAILABLE);
+        sendToChannel(channel, std::move(opened));
       }
       return;
     }

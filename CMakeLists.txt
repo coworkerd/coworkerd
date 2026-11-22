@@ -251,7 +251,7 @@ foreach(case fenced full full-resend resend-held)
 endforeach()
 foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect cut-short-reconnect limit-reconnect
     corrupt-reconnect chunk pair-full pair-fenced fenced-drop fenced-unshown full-keeps fenced-drop-resend fenced-known
-    reacquired)
+    reacquired unreachable)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
 foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement package module-types cache
