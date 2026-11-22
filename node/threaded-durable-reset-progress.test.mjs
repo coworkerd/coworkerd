@@ -1,4 +1,5 @@
-// An application abort must retire its broken tree promptly even while ordinary HTTP callers retry.
+// Root aborts and facet CPU failures must retire the tree without interrupting request teardown.
+// Ordinary HTTP retries must recover promptly while storage, neighboring roots and the child survive.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -107,10 +108,14 @@ try {
       async fetch(request) {
         isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
+        if (query.has("facet")) {
+          const facet = this.ctx.facets.get("child", () => ({class: this.ctx.exports.Counter}));
+          return await facet.fetch("https://fixture.invalid/?cpu");
+        }
         if (query.has("abort")) this.ctx.abort("fixture application reset");
         if (query.has("cpu")) {
           let checksum = 1;
-          for (let i = 0; i < 200000000; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+          for (let i = 0; i < 2000000000; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
           this.checksum = checksum;
         }
         if (request.method === "POST") await this.ctx.storage.put("value", await request.text());
@@ -148,7 +153,7 @@ try {
   let initial = await successful('/reset', 'retained after abort');
   const neighbor = await successful('/neighbor', 'neighbor retained');
   assert.equal(initial.isolate, neighbor.isolate);
-  for (const cause of ['abort', 'cpu']) {
+  for (const cause of ['abort', 'cpu', 'facet']) {
     const aborted = await request('/reset?' + cause);
     assert.ok([502, 503].includes(aborted.status), JSON.stringify(aborted));
     if (cause === 'abort') assert.match(JSON.stringify(aborted.body), /fixture application reset/);

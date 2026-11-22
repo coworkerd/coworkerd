@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 18:54:07 +0800
+Subject: [PATCH] Defer root abort until the facet CPU turn unwinds
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index bd94eaee8d5529a64110b97f7a397ee23c9cccc1..be34c27c1ccf56cd0758be67d8a6f630c20cf843 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -97,11 +97,11 @@ class DurableAdmission {
+   bool complete(Ticket ticket, uint64_t home);
+   std::vector<Ticket> expire(Time now);
+ 
+-  // A home starts closing only after its mailbox is empty. Reject admission during close,
+-  // and keep the tree's reservation until the home confirms that its handles are gone.
+   // Reset closes admission immediately, releases waiting calls, and retains active credits
+   // until their home completes them. The home still owns every actor handle until releaseTree().
+   bool beginReset(uint64_t tree, uint64_t home);
++  // Idle close requires an empty mailbox and no active calls. It is also the drain check for
++  // a reset already in progress. Keep the tree reservation until the home releases its handles.
+   bool stopIdleTree(uint64_t tree, uint64_t home);
+   // Normal retirement checks the idle deadline as well as mailbox/active ownership.
+   // Pressure retirement uses the unconditional overload above.
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 21988a36be85bb12ceba08eb2266c9a745f459d4..46e2aade766bc91a8a412bd37b94fcac0fb75851 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3410,7 +3410,10 @@ struct ThreadedServer {
+       durableActorResets.fetch_add(1);
+       beginDurableReset(state, at->second);
+       if (root->second.actor.get() != &actor) {
+-        root->second.actor->abort(limitException(LimitCause::CPU));
++        // A root can be awaiting this facet. Unwind the facet turn before aborting its caller.
++        state.tasks.add(kj::evalLater([owner = kj::addRef(*root->second.actor)]() mutable {
++          owner->abort(limitException(LimitCause::CPU));
++        }));
+       }
+     };
+     auto preparation = std::make_shared<ResourcePreparation>(slot->reservation);
