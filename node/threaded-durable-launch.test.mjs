@@ -1,6 +1,11 @@
 /*
 Disposable threaded Durable Object fixture
 
+The `cpu-events` mode calibrates finite work from native home-thread CPU samples. Events on
+one actor interleave across awaits: their combined CPU must exceed a single event budget while
+each stays below it, then one event alone exceeds its budget across repeated awaits. The latter
+must reset only its actor tree, preserving stored state, the neighboring object and the ready child.
+
 The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
 an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
@@ -83,6 +88,7 @@ const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
 const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
+const cpuEvents = scenario === 'cpu-events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
 const httpMemory = scenario === 'http-memory';
@@ -96,7 +102,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
+const exerciseEvents = cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -118,6 +124,8 @@ const env = {
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
+  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1',
+    COWORKERD_DO_TEST_HOME_COUNT: '1' } : {}),
   ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
@@ -244,6 +252,29 @@ try {
       async fetch(request) {
         isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
+        if (query.has("sliceWaiting")) return Response.json(this.slicePart ?? 0);
+        if (query.has("sliceRelease")) {
+          this.sliceLatch.resolve();
+          return Response.json("released");
+        }
+        if (query.has("sliceWork")) {
+          const iterations = Number(query.get("sliceWork"));
+          const parts = Number(query.get("parts"));
+          if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000 ||
+              ![2, 4].includes(parts)) return new Response("invalid slices", {status: 400});
+          this.sliceChecksum = 1;
+          for (let part = 1; part <= parts; ++part) {
+            let checksum = 1;
+            for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+            this.sliceChecksum = checksum;
+            this.slicePart = part;
+            if (part < parts) {
+              this.sliceLatch = Promise.withResolvers();
+              await this.sliceLatch.promise;
+            }
+          }
+          this.slicePart = 0;
+        }
         if (query.has("work")) {
           const iterations = Number(query.get("work"));
           if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000) {
@@ -423,7 +454,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents || cpuEvents ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -552,6 +583,103 @@ try {
     assert.deepEqual(await homeThreads(), originalThreads);
     console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2,
       homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
+  } else if (cpuEvents) {
+    const request = async (path, options, accepted = [200]) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.ok(accepted.includes(response.status), `${path}: ${response.status} ${body}\n${diagnostics}`);
+      return {status: response.status, value: JSON.parse(body)};
+    };
+    const original = (await request('/event-owner', {method: 'POST', body: 'saved owner'})).value;
+    const neighbor = (await request('/event-neighbor', {method: 'POST', body: 'saved neighbor'})).value;
+    assert.equal(original.isolate, neighbor.isolate);
+    const tasks = join('/proc', String(processInfo.pid), 'task');
+    const tids = new Set();
+    for (const tid of await readdir(tasks)) {
+      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-call') tids.add(Number(tid));
+    }
+    assert.equal(tids.size, 1);
+    const samples = [];
+    const cpuTurns = async () => Array.from(
+      (await readFile(join(stack, 'logs', 'workerd.log'), 'utf8')).matchAll(/\[threaded-js\] (\{[^\n]*\})/g),
+      match => JSON.parse(match[1]));
+    const measure = async (iterations) => {
+      await delay(20);
+      const start = (await cpuTurns()).length;
+      await request(`/event-owner?work=${iterations}`);
+      await waitForAdmission(socketPath, 0);
+      await delay(50);
+      const cpuMs = (await cpuTurns()).slice(start).filter(row => tids.has(row.tid))
+        .reduce((total, row) => total + row.cpuNs / 1e6, 0);
+      assert.ok(cpuMs > 0, 'calibration requires native home-thread CPU samples');
+      samples.push({iterations, cpuMs});
+      return cpuMs;
+    };
+    await measure(1000000);
+    let iterations = 10000000, sliceCpuMs;
+    for (let attempt = 0; attempt < 5; ++attempt) {
+      sliceCpuMs = await measure(iterations);
+      if (sliceCpuMs >= 75 && sliceCpuMs <= 100) break;
+      iterations = Math.min(200000000, Math.max(100000, Math.round(iterations * 85 / sliceCpuMs)));
+    }
+    assert.ok(sliceCpuMs >= 75 && sliceCpuMs <= 100, JSON.stringify(samples));
+    const waiting = async (part, ended = () => false) => {
+      for (const until = performance.now() + 2000; performance.now() < until;) {
+        if (ended()) return false;
+        const response = await request('/event-owner?sliceWaiting', undefined, [200, 502, 503]);
+        if (response.status !== 200) return false;
+        if (response.value === part) return true;
+        await delay(10);
+      }
+      assert.fail('the sliced event did not suspend at part ' + part);
+    };
+    // Four calibrated slices in total exceed the actor's 250 ms budget, but no event does.
+    const cpuStart = (await cpuTurns()).length;
+    const within = request(`/event-owner?sliceWork=${iterations}&parts=2`);
+    within.catch(() => {});
+    assert.ok(await waiting(1));
+    await request(`/event-owner?work=${iterations}`);
+    await request(`/event-owner?work=${iterations}`);
+    await request('/event-owner?sliceRelease');
+    assert.deepEqual((await within).value, original);
+    assert.deepEqual((await request('/event-owner')).value, original);
+    assert.equal((await waitForAdmission(socketPath, 0)).actorResets, 0);
+    await delay(50);
+    const interleavedCpuMs = (await cpuTurns()).slice(cpuStart).filter(row => tids.has(row.tid))
+      .reduce((total, row) => total + row.cpuNs / 1e6, 0);
+    assert.ok(interleavedCpuMs > 250, 'the interleaved total must exceed one event budget');
+    // The same event must retain its own CPU charge after repeated yields and other events.
+    let ended = false;
+    const over = request(`/event-owner?sliceWork=${iterations}&parts=4`, undefined, [503])
+      .then(result => { ended = true; return result; });
+    over.catch(() => {});
+    for (let part = 1; part <= 3; ++part) {
+      if (!(await waiting(part, () => ended))) break;
+      await request('/event-owner?work=1');
+      await request('/event-owner?sliceRelease', undefined, [200, 502, 503]);
+    }
+    assert.equal((await over).value.code, 'CPU_LIMIT_EXCEEDED');
+    await waitForAdmission(socketPath, 0);
+    await delay(300);
+    const rebuilt = (await request('/event-owner')).value;
+    assert.notEqual(rebuilt.instance, original.instance);
+    assert.equal(rebuilt.counter, original.counter);
+    assert.equal(rebuilt.isolate, original.isolate);
+    assert.deepEqual((await request('/event-neighbor')).value, neighbor);
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.actorResets, 1);
+    assert.equal(after.isolateResets, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const sameChild = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    console.log(JSON.stringify({scenario, samples, interleavedCpuMs, isolatedEventCpu: true,
+      cumulativeCpuAcrossAwaits: true, neighborPreserved: true, admission: after}));
   } else if (warmCopies) {
     const request = async (path, options) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
