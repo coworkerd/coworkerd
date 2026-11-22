@@ -791,6 +791,37 @@ try {
     await request('/first?release');
     assert.deepEqual(await waiting, initial);
 
+    if (httpIsolation) {
+      for (let attempt = 0; attempt < 3; ++attempt) {
+        const before = await waitForAdmission(socketPath, 0);
+        assert.equal(before.running, 0);
+        const controller = new AbortController();
+        const aborted = fetch(`http://127.0.0.1:${port}/first?hold`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+        });
+        aborted.catch(() => {});
+        let observed = false;
+        for (const until = performance.now() + 2000; performance.now() < until;) {
+          if (await request('/first?waiting')) {
+            observed = true;
+            break;
+          }
+          await delay(10);
+        }
+        assert.ok(observed, 'the canceled request never reached the actor');
+        assert.ok((await readAdmission(socketPath)).running > 0);
+        controller.abort();
+        await assert.rejects(aborted, {name: 'AbortError'});
+        const drained = await waitForAdmission(socketPath, 0);
+        assert.equal(drained.running, 0);
+        for (const field of ['reservedBytes', 'reservedDescriptors', 'residentRoots',
+          'actorResets', 'isolateResets']) assert.equal(drained[field], before[field], field);
+        assert.deepEqual(await request('/first'), initial);
+        assert.deepEqual(await request('/other'), other);
+      }
+      console.log(JSON.stringify({event: 'http-cancellation-passed', attempts: 3}));
+    }
+
     const gated = request('/first?inputGate');
     gated.catch(() => {});
     let running = false;
@@ -853,6 +884,11 @@ try {
         for (const actor of actors) {
           const turns = records.filter(record => record.actor === actor);
           assert.ok(turns.every(record => record.home === root.home && record.tid === root.tid));
+          if (turns.some(record => record.phase === 'destroyed')) {
+            for (const phase of ['created', 'executed', 'delivered', 'destroyed']) {
+              assert.ok(turns.some(record => record.phase === phase), phase);
+            }
+          }
         }
         const rootEnd = records.findIndex(record => record.actor === root.actor && record.phase === 'destroyed');
         if (rootEnd !== -1) {
@@ -875,7 +911,7 @@ try {
     assert.equal(counters.isolateResets, 0);
     assert.equal(counters.actorResets, 2);
     console.log(JSON.stringify({scenario, inputGate: true, interleavedHttp: httpIsolation,
-      facetStatePreserved: true, sameHomeLifecycle: true, pid: sameChild.pid,
+      httpCancellation: httpIsolation, facetStatePreserved: true, sameHomeLifecycle: true, pid: sameChild.pid,
       generation: sameChild.generation, admission: counters}));
   }
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
