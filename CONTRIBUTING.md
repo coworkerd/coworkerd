@@ -58,22 +58,26 @@ alongside them. Use `-DCOWORKERD_TEST_WORKERD="$KERNEL_DIR/workerd"` to test the
 ### Publishing a changed kernel series
 
 An author who changes the kernel patch series or its upstream builds and tests that kernel locally. A maintainer
-checks out the PR head, builds and packages the release kernels on Linux x86_64 and arm64, and publishes the
-archives and `SHA256SUMS` on [this repository's Releases page](https://github.com/coworkerd/coworkerd/releases). Use the
-`kernel-<upstream tag>-<first 12 hex digits of the patch series SHA-256>` tag printed by the packaging script and
-mark the release as a pre-release. Run the packaging command once per architecture. In the final release directory,
-put the first archive in place before packaging or copying the second, then check that `SHA256SUMS` covers every
-published archive. Generate that file with `sha256sum coworkerd-kernel-linux-*.tar.gz > SHA256SUMS` when combining
-archives packaged on separate machines.
+then dispatches [Build Linux kernel archives](https://github.com/coworkerd/coworkerd/actions/workflows/kernel-build.yml)
+from `main`, entering the pull request number and the full SHA of the reviewed PR head. This works for fork PRs
+too. To build the series already on `main`, leave both inputs empty.
 
-The publisher is responsible for building both binaries from the checked workerd source. The packaging script
-checks the source tree against the patch series and records that tree as `workerdTree` in `kernel.json`.
-`coworkerdCommit` records the commit in this repository where the packaging command ran, which may be the PR head.
-If the allowlist uses profiles from another build of the series, record that in the release notes.
+Both standard Ubuntu runners build and profile the two kernel executables over the cluster workloads and run the
+unit and cluster suites against the unpacked archives. The successful run summary gives both archive SHA-256 values,
+the Coworkerd source commit, the patched workerd tree and the pre-release tag. Both `kernel.json` records carry
+that source identity and the Actions run and attempt. The `kernel-release-<attempt>` artifact contains the two
+archives and `SHA256SUMS`. If a job fails, rerun all jobs so that both archives come from one attempt.
 
-The maintainer posts the public release link and archive SHA-256 values on the PR. The author verifies the public
-downloads and records the upstream, full series SHA-256 and verified archive pins in
-`patches/workerd/artifacts.json` on the same PR.
+The maintainer checks the completed run and separately dispatches
+[Publish Linux kernel archives](https://github.com/coworkerd/coworkerd/actions/workflows/kernel-publish.yml) from
+`main`, entering the run ID, successful attempt number and reviewed source commit. The publisher verifies the
+three files of that attempt and publishes them as a GitHub pre-release. Its tag appends `-run-<id>-<attempt>`
+to the series tag printed by `package-kernel.py`, so earlier pinned downloads remain available.
+
+The maintainer posts the pre-release link and the two archive SHA-256 values on the PR. The author verifies the
+public downloads and records the upstream, full series SHA-256, `releaseTag` from the pre-release, and verified
+archive pins in `patches/workerd/artifacts.json`. The original series tag remains the download location for
+pin files that have no `releaseTag` field.
 
 ## CI and local unit tests
 

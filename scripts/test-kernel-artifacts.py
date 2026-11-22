@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -21,7 +22,7 @@ class KernelArtifactsTest(unittest.TestCase):
         self.root = Path(temporary.name)
         scripts = self.root / "scripts"
         scripts.mkdir()
-        for name in ("kernel_artifacts.py", "package-kernel.py", "fetch-kernel.py",
+        for name in ("kernel_artifacts.py", "package-kernel.py", "fetch-kernel.py", "kernel-release.py",
                      "workerd-patches.py", "syscall-allowlist-check.py"):
             shutil.copyfile(ROOT / "scripts" / name, scripts / name)
         self.checkout = self.root / "workerd"
@@ -54,9 +55,9 @@ class KernelArtifactsTest(unittest.TestCase):
         return subprocess.check_output(["git", "-C", str(directory), "-c", "user.name=Test",
                                         "-c", "user.email=test@example.invalid", *args])
 
-    def run_script(self, name, *args, ok=True):
+    def run_script(self, name, *args, ok=True, env=None):
         result = subprocess.run([sys.executable, str(self.root / "scripts" / name), *args],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, env=env)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
@@ -82,10 +83,10 @@ class KernelArtifactsTest(unittest.TestCase):
             record[kind] = {"file": name, "sha256": sha256(path), "count": 1}
         (self.allowlist / "allowlist.json").write_text(json.dumps(record))
 
-    def write_pins(self, archives):
+    def write_pins(self, archives, **fields):
         (self.patches / "artifacts.json").write_text(json.dumps({
             "upstream": self.tag, "upstreamCommit": self.commit, "patchSeriesSha256": self.series_sha,
-            "archives": archives,
+            "archives": archives, **fields,
         }))
 
     def package(self, arch, *, ok=True):
@@ -149,6 +150,46 @@ class KernelArtifactsTest(unittest.TestCase):
         with (self.patches / "0001-fixture.patch").open("a") as stream:
             stream.write("\n")
         self.assertIn("do not match this upstream and patch series", self.fetch(arch, ok=False).stderr)
+
+    def test_bundle_requires_one_run_and_both_profiled_binaries(self):
+        commit = self.git(self.root, "rev-parse", "HEAD").decode().strip()
+        env = {**os.environ, "GITHUB_REPOSITORY": "example/kernel", "GITHUB_RUN_ID": "42",
+               "GITHUB_RUN_ATTEMPT": "1", "GITHUB_WORKFLOW_SHA": commit}
+        pins = {}
+        for arch in ARCHITECTURES:
+            self.write_build(arch)
+            digests = [sha256(self.checkout / relative) for relative in BINARIES.values()]
+            allowlist = self.allowlist / "allowlist.json"
+            record = json.loads(allowlist.read_text())
+            record["workerd"]["sha256s"] = digests
+            record["profiles"] = [{"run": name, "workerdSha256": digest} for name, digest in zip(BINARIES, digests)]
+            for kind in ("startup", "steady"):
+                path = self.allowlist / record[kind]["file"]
+                path.write_text(f"# workerd-sha256 {digests[0]}\n# workerd-sha256 {digests[1]}\n0\n")
+                record[kind]["sha256"] = sha256(path)
+            allowlist.write_text(json.dumps(record))
+            self.run_script("package-kernel.py", "--github-run", "--arch", arch, "--allowlist", str(self.allowlist),
+                            "--out", str(self.out), env=env)
+            pins[arch] = sha256(self.out / archive_name(arch))
+        self.run_script("kernel-release.py", "assemble", str(self.out), "--commit", commit, env=env)
+        self.run_script("kernel-release.py", "verify", str(self.out), "--commit", commit, env=env)
+        wrong_attempt = self.run_script("kernel-release.py", "verify", str(self.out), "--commit", commit,
+                                        "--attempt", "2", env=env, ok=False)
+        self.assertIn("kernel build record does not match", wrong_attempt.stderr)
+
+        tag = f"kernel-{self.tag}-{self.series_sha[:12]}-run-42-1"
+        self.write_pins(pins, releaseTag=tag)
+        arch = "linux-arm64"
+        installed = Path(self.fetch(arch, "--local-dir", str(self.out)).stdout.strip())
+        self.assertEqual(installed.parent.parent.name, tag)
+
+        record["profiles"].pop()
+        allowlist.write_text(json.dumps(record))
+        self.run_script("package-kernel.py", "--github-run", "--arch", arch, "--allowlist", str(self.allowlist),
+                        "--out", str(self.out), env=env)
+        wrong_profile = self.run_script("kernel-release.py", "assemble", str(self.out), "--commit", commit,
+                                        env=env, ok=False)
+        self.assertIn("syscall profiles must cover these exact two binaries", wrong_profile.stderr)
 
 
 if __name__ == "__main__":
