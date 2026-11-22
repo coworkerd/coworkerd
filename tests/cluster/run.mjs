@@ -18,7 +18,9 @@ async function main(args) {
     process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
   }
   const start = performance.now();
-  const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), resolve(args[0]), controller.signal);
+  const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), resolve(args[0]), controller.signal, {
+    holdPeerAcks: selected.some(([name]) => name === 'durable-peer-ack'),
+  });
   let failed = 0;
   try {
     await cluster.start();

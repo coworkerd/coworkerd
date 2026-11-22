@@ -37,6 +37,7 @@ node tests/cluster/run.mjs --help
 
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
 setup or teardown exits nonzero. Linux pull-request CI uses the same entry point.
+Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
 ## Measured time and resources
 
@@ -59,6 +60,7 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
+| `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
 
 Tests deploy code with `cowctl` and observe the product through ingress HTTP, `/v1` and documented management

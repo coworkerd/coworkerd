@@ -927,6 +927,7 @@ DurableLog::DurableLog(Settings settingsParam, const ObjectStoreConfig& storeCon
   settings.config.validate();
   if (const auto* v = std::getenv("COWORKERD_ALARM_THREAD_CPU_FOR_TEST")) measureAlarmCpu = std::string_view(v) == "1";
   if (const auto* v = std::getenv("COWORKERD_SLOW_FLUSH_FOR_TEST"); v != nullptr && *v != '\0') slowFlushForTest = v;
+  if (const auto* v = std::getenv("COWORKERD_HOLD_PEER_ACK_FOR_TEST"); v != nullptr) peerAckGateForTest = v;
   if (settings.objectStore && !storeConfig.endpoint.empty()) {
     store.emplace(storeConfig, network, timer);
     workerStoreConfig = storeConfig;
@@ -2958,6 +2959,16 @@ void DurableLog::slowFlushOnceForTest() {
   const auto ms = std::strtoull(text.c_str(), nullptr, 10);
   log("slow-flush-for-test", "\"ms\":" + std::to_string(ms));
   ::usleep(useconds_t(std::min<uint64_t>(ms, 60000) * 1000));
+}
+
+kj::Promise<void> DurableLog::waitForPeerAckGateForTest() {
+  std::error_code error;
+  if (!std::filesystem::exists(peerAckGateForTest, error)) co_return;
+  ++heldPeerAcksForTest;
+  KJ_DEFER(--heldPeerAcksForTest);
+  do {
+    co_await timer.afterDelay(10 * kj::MILLISECONDS);
+  } while (std::filesystem::exists(peerAckGateForTest, error));
 }
 
 // Records this node will never confirm and never put in a segment: the write was answered with a failure, so a
@@ -7666,7 +7677,9 @@ std::string DurableLog::json() const {
         << peer.queuedBytes << "\",\"lastAckAgoMs\":" << (peer.lastAckMs ? uint64_t(now - peer.lastAckMs) : 0)
         << ",\"refusal\":" << quote(peer.lastRefusal) << "}";
   }
-  out << "],\"switches\":" << peerSwitches << "},\"confirm\":{\"confirmations\":" << confirmations
+  out << "],\"switches\":" << peerSwitches;
+  if (peerAckGateEnabledForTest()) out << ",\"heldAcksForTest\":" << heldPeerAcksForTest;
+  out << "},\"confirm\":{\"confirmations\":" << confirmations
       << ",\"failures\":" << confirmFailures << ",\"refusals\":" << refusals << ",\"isolations\":" << isolations
       << ",\"unconfirmed\":" << unconfirmed << ",\"unconfirmedBytes\":\"" << unconfirmedBytes
       << "\",\"meanMs\":" << (confirmations ? confirmMsTotal / double(confirmations) : 0) << ",\"p50Ms\":"
