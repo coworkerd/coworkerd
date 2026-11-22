@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 23:38:47 +0800
+Subject: [PATCH] =?UTF-8?q?Use=20the=20facet=20home=E2=80=99s=20mutable=20?=
+ =?UTF-8?q?view=20when=20checking=20reset?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 4c0767ce0456c37f8bff66e3529b437ebd8fdbec..aac4f5f1c10fb441dbc13770e74cacae11dee568 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4969,7 +4969,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+   }
+ 
+   void resetStorage(SqliteDatabase& database, server::DurableLogShipper& shipper) {
+-    for (const auto& [name, child]: children) {
++    for (auto& [name, child]: children) {
+       KJ_REQUIRE(!child->busy(), "cannot reset storage with a live descendant facet");
+     }
+     stop();

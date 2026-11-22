@@ -1,0 +1,1211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 20:29:52 +0800
+Subject: [PATCH] Multiplex a generation WAL connection across durable homes
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 0809f7241e9e8eb425587604e23008fc8634a570..4360d0ab3459409ae87ddd931ffec76583ecfd5e 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -77,6 +77,46 @@ wd_cc_library(
+     ],
+ )
+ 
++wd_cc_library(
++    name = "coworkerd-wal",
++    srcs = ["coworkerd-wal-shipper.c++"],
++    hdrs = ["coworkerd-wal-shipper.h", "coworkerd-wal-wire.h"],
++    deps = [
++        "//src/workerd/util:sqlite",
++        "@capnp-cpp//src/kj",
++        "@capnp-cpp//src/kj:kj-async-io",
++        "@sqlite3",
++    ],
++)
++
++wd_cc_library(
++    name = "coworkerd-threaded-wal",
++    srcs = ["coworkerd-threaded-wal.c++"],
++    hdrs = ["coworkerd-threaded-wal.h"],
++    visibility = ["//src/workerd/threaded:__pkg__"],
++    deps = [
++        ":coworkerd-wal",
++        "@capnp-cpp//src/kj",
++        "@capnp-cpp//src/kj:kj-async-io",
++    ],
++)
++
++wd_cc_library(
++    name = "coworkerd-threaded-wal-source",
++    testonly = True,
++    textual_hdrs = ["coworkerd-threaded-wal.c++", "coworkerd-threaded-wal.h"],
++    deps = [
++        ":coworkerd-wal",
++        "@capnp-cpp//src/kj",
++        "@capnp-cpp//src/kj:kj-async-io",
++    ],
++)
++
++kj_test(
++    src = "coworkerd-threaded-wal-test.c++",
++    deps = [":coworkerd-threaded-wal-source"],
++)
++
+ # The C++ side of the Rust server: compiles workers, starts requests, builds actors and their
+ # storage, serves the capnp RPC protocols, encodes channel tokens, runs the inspector.
+ wd_cc_library(
+@@ -93,16 +133,16 @@ wd_cc_library(
+         "coworkerd-gc.h",
+         "coworkerd-idle-eviction.c++",
+         "coworkerd-idle-eviction.h",
+-        "coworkerd-wal-shipper.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+         "worker-factory-listen.c++",
+         "worker-factory-rpc.c++",
+     ],
+-    hdrs = ["coworkerd-channels.h", "coworkerd-wal-shipper.h"],
++    hdrs = ["coworkerd-channels.h"],
+     linkstatic = CC_LIBRARY_LINKSTATIC,
+     deps = [
+         ":coworkerd-sandbox",
++        ":coworkerd-wal",
+         ":worker-factory-hdrs",
+         "@sqlite3",
+         "//src/rust/worker:bridge",
+@@ -155,6 +195,7 @@ wd_cc_library(
+     deps = [
+         ":bootstrap-hdrs",
+         ":coworkerd-sandbox",
++        ":coworkerd-wal",
+         ":worker-factory",
+         "//src/pyodide:pyodide_extra_capnp",
+         "//src/rust/cxx/kj-rs",
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0c58f0c6f51ad066304108fd29f4a4e0cdabf30
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+@@ -0,0 +1,162 @@
++#include "coworkerd-threaded-wal.c++"
++
++#include <kj/test.h>
++
++#include <fcntl.h>
++#include <sys/socket.h>
++
++namespace workerd::server {
++namespace {
++
++// This half is the private node protocol, driven one reply at a time by the test.
++struct WirePair {
++  kj::AsyncIoContext io = kj::setupAsyncIo();
++  kj::Own<kj::AsyncIoStream> node;
++  kj::Own<WalWire> child;
++
++  WirePair() {
++    int fds[2];
++    KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
++    KJ_SYSCALL(fcntl(fds[0], F_SETFD, FD_CLOEXEC));
++    child = kj::heap<WalWire>(*io.lowLevelProvider, fds[0]);
++    node = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
++  }
++
++  kj::Array<kj::byte> receive() {
++    kj::byte header[4];
++    auto& timer = io.provider->getTimer();
++    timer.timeoutAfter(kj::SECONDS, node->read(kj::arrayPtr(header, sizeof(header)))).wait(io.waitScope);
++    auto body = kj::heapArray<kj::byte>(getLe32(header));
++    timer.timeoutAfter(kj::SECONDS, node->read(body.asPtr())).wait(io.waitScope);
++    return body;
++  }
++
++  void reply(kj::Array<kj::byte> bytes) {
++    node->write(bytes.asPtr()).wait(io.waitScope);
++  }
++
++  template <typename T>
++  T wait(kj::Promise<T> promise) {
++    return io.provider->getTimer().timeoutAfter(kj::SECONDS, kj::mv(promise)).wait(io.waitScope);
++  }
++
++  void ready(uint64_t generation) {
++    auto hello = receive();
++    KJ_ASSERT(hello.size() == 25 && hello[0] == MSG_HELLO);
++    KJ_ASSERT(getLe32(hello.begin() + 13) == THREADED_WAL_REVISION);
++    KJ_ASSERT(getLe64(hello.begin() + 17) == generation);
++    Writer response;
++    response.u8(MSG_READY);
++    response.u32(THREADED_WAL_REVISION);
++    response.u64(generation);
++    reply(response.finish());
++  }
++
++  void ack(uint64_t request) {
++    Writer response;
++    response.u8(MSG_ACK);
++    response.u64(request);
++    response.u8(ACK_OK);
++    reply(response.finish());
++  }
++};
++
++KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and reply") {
++  WirePair link;
++  Shared shared(kj::SECONDS);
++  auto session = kj::heap<Session>(shared, *link.child, 7);
++  auto running = session->run().eagerlyEvaluate(nullptr);
++  KJ_ASSERT(!shared.negotiated());
++  link.ready(7);
++  link.io.waitScope.poll();
++  KJ_ASSERT(shared.negotiated());
++
++  auto first = std::make_shared<Inbox>();
++  auto second = std::make_shared<Inbox>();
++  auto post = [&](uint8_t type, uint64_t openId, const std::shared_ptr<Inbox>& inbox) {
++    Writer frame;
++    frame.u8(type);
++    KJ_REQUIRE(shared.post({.bytes = frame.finish(openId), .openId = openId, .inbox = inbox}, true));
++    auto observed = link.receive();
++    KJ_ASSERT(observed[0] == type && getLe64(observed.begin() + 1) == openId);
++  };
++  auto append = [&](uint64_t openId, uint64_t request) {
++    auto paf = kj::newPromiseAndCrossThreadFulfiller<uint8_t>();
++    Writer frame;
++    frame.u8(MSG_FRAMES);
++    frame.u64(request);
++    KJ_REQUIRE(shared.post({.bytes = frame.finish(openId), .openId = openId,
++                            .request = request, .ack = kj::mv(paf.fulfiller)}, false));
++    auto observed = link.receive();
++    KJ_ASSERT(observed[0] == MSG_FRAMES && getLe64(observed.begin() + 1) == openId &&
++        getLe64(observed.begin() + 9) == request);
++    return kj::mv(paf.promise);
++  };
++  auto checkpoint = [&](uint64_t openId) {
++    Writer reply;
++    reply.u8(MSG_CHECKPOINT_ASKED);
++    link.reply(reply.finish(openId));
++  };
++
++  post(MSG_OPEN, 1, first);
++  post(MSG_OPEN, 2, second);
++  auto held = append(1, 3);
++  auto independent = append(2, 4);
++  link.ack(4);
++  KJ_EXPECT(link.wait(kj::mv(independent)) == ACK_OK);
++  KJ_EXPECT(!held.poll(link.io.waitScope));
++  link.ack(3);
++  KJ_EXPECT(link.wait(kj::mv(held)) == ACK_OK);
++
++  post(MSG_CLOSED, 1, first);
++  post(MSG_OPEN, 5, first);
++  auto reopened = append(5, 6);
++  link.ack(3);
++  checkpoint(1);
++  checkpoint(5);
++  auto notice = link.wait(first->next());
++  KJ_EXPECT(KJ_ASSERT_NONNULL(notice).openId == 5);
++  KJ_EXPECT(!reopened.poll(link.io.waitScope));
++
++  // EOF rejects the remaining write and invalidates readiness.
++  link.node = nullptr;
++  KJ_EXPECT_THROW_MESSAGE("replicator closed", link.wait(kj::mv(running)));
++  session = nullptr;
++  KJ_EXPECT(link.wait(kj::mv(reopened)) == ACK_DISCONNECTED);
++  KJ_EXPECT(!shared.negotiated());
++}
++
++KJ_TEST("threaded WAL reserves a control allowance and returns byte credit on consumption") {
++  auto io = kj::setupAsyncIo();
++  Mailbox<int> mailbox;
++  KJ_EXPECT(mailbox.push(1, QUEUED_RECORD_BYTES, QUEUED_RECORD_BYTES));
++  KJ_EXPECT(!mailbox.push(2, 1, QUEUED_RECORD_BYTES));
++  KJ_EXPECT(mailbox.push(3, 1, QUEUED_RECORD_BYTES + QUEUED_CONTROL_BYTES));
++  KJ_EXPECT(KJ_ASSERT_NONNULL(mailbox.next().wait(io.waitScope)) == 1);
++  KJ_EXPECT(mailbox.push(2, QUEUED_RECORD_BYTES - 1, QUEUED_RECORD_BYTES));
++  KJ_EXPECT(KJ_ASSERT_NONNULL(mailbox.next().wait(io.waitScope)) == 3);
++  KJ_EXPECT(KJ_ASSERT_NONNULL(mailbox.next().wait(io.waitScope)) == 2);
++  auto waiting = mailbox.next();
++  KJ_EXPECT(!waiting.poll(io.waitScope));
++  mailbox.close();
++  KJ_EXPECT(waiting.wait(io.waitScope) == kj::none);
++  KJ_EXPECT(!mailbox.push(1, 1, QUEUED_RECORD_BYTES));
++}
++
++KJ_TEST("threaded WAL rejects readiness for another generation") {
++  WirePair link;
++  Shared shared(kj::SECONDS);
++  Session session(shared, *link.child, 7);
++  auto running = session.run().eagerlyEvaluate(nullptr);
++  (void)link.receive();
++  Writer reply;
++  reply.u8(MSG_READY);
++  reply.u32(THREADED_WAL_REVISION);
++  reply.u64(8);
++  link.reply(reply.finish());
++  KJ_EXPECT_THROW_MESSAGE("threaded WAL readiness mismatch", link.wait(kj::mv(running)));
++  KJ_EXPECT(!shared.negotiated());
++}
++
++}  // namespace
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..34726753124e106475cca507e74b85042935dc68
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -0,0 +1,380 @@
++#include "coworkerd-threaded-wal.h"
++#include "coworkerd-wal-wire.h"
++
++#include <kj/thread.h>
++
++#include <unistd.h>
++
++#include <atomic>
++#include <chrono>
++#include <deque>
++#include <map>
++#include <memory>
++#include <mutex>
++
++namespace workerd::server {
++namespace {
++
++using namespace wal;
++
++// The node caps a record at its 64 MiB RPC traversal bound, including when the
++// WAL has one large transaction. Leave room for its private wire header.
++constexpr size_t QUEUED_RECORD_BYTES = 72u << 20;
++// Reserve room for open/close and give-up commands when the data queue is full.
++constexpr size_t QUEUED_CONTROL_BYTES = 1u << 20;
++constexpr size_t QUEUED_NOTIFICATIONS = 4096;
++constexpr uint8_t ACK_TIMEOUT = 255;
++constexpr uint8_t ACK_DISCONNECTED = 254;
++constexpr auto STORAGE_UNAVAILABLE =
++    "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
++    "(STORAGE_UNAVAILABLE)"_kj;
++
++// The producer transfers owned data and wakes the consumer without entering its
++// loop. A queue has one consumer. Its mutex is released before any I/O or await.
++template <typename T>
++class Mailbox {
++ public:
++  bool push(T item, size_t cost, size_t capacity) {
++    kj::Own<kj::CrossThreadPromiseFulfiller<void>> wake;
++    {
++      std::lock_guard lock(mutex);
++      if (closed || cost > capacity || used > capacity - cost) return false;
++      items.push_back({kj::mv(item), cost});
++      used += cost;
++      wake = kj::mv(waiting);
++    }
++    if (wake.get() != nullptr) wake->fulfill();
++    return true;
++  }
++
++  kj::Promise<kj::Maybe<T>> next() {
++    for (;;) {
++      kj::Promise<void> signal = nullptr;
++      {
++        std::lock_guard lock(mutex);
++        if (closed) co_return kj::none;
++        if (!items.empty()) {
++          auto entry = kj::mv(items.front());
++          items.pop_front();
++          used -= entry.cost;
++          co_return kj::mv(entry.item);
++        }
++        auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
++        signal = kj::mv(paf.promise);
++        waiting = kj::mv(paf.fulfiller);
++      }
++      co_await signal;
++    }
++  }
++
++  void close() {
++    kj::Own<kj::CrossThreadPromiseFulfiller<void>> wake;
++    std::deque<Entry> discarded;
++    {
++      std::lock_guard lock(mutex);
++      closed = true;
++      used = 0;
++      items.swap(discarded);
++      wake = kj::mv(waiting);
++    }
++    if (wake.get() != nullptr) wake->fulfill();
++  }
++
++ private:
++  struct Entry {
++    T item;
++    size_t cost;
++  };
++  std::mutex mutex;
++  std::deque<Entry> items;
++  size_t used = 0;
++  bool closed = false;
++  kj::Own<kj::CrossThreadPromiseFulfiller<void>> waiting;
++};
++
++struct Notification {
++  uint8_t type = 0;
++  uint64_t openId = 0;
++  uint32_t salt1 = 0, salt2 = 0, upToFrame = 0;
++  kj::String reason;
++};
++
++using Inbox = Mailbox<Notification>;
++
++struct Command {
++  kj::Array<kj::byte> bytes;
++  uint64_t openId;
++  uint64_t request = 0;
++  bool unconditional = false;
++  kj::Own<kj::CrossThreadPromiseFulfiller<uint8_t>> ack;
++  std::shared_ptr<Inbox> inbox;
++};
++
++struct Shared {
++  explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
++
++  void stop() {
++    if (stopped.exchange(true, std::memory_order_acq_rel)) return;
++    ready.store(false, std::memory_order_release);
++    commands.close();
++    stopSignal.close();
++  }
++
++  bool post(Command command, bool control) {
++    const auto size = command.bytes.size();
++    const auto capacity = QUEUED_RECORD_BYTES + (control ? QUEUED_CONTROL_BYTES : 0);
++    return commands.push(kj::mv(command), size, capacity);
++  }
++
++  bool negotiated() const {
++    return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
++  }
++
++  const kj::Duration confirmationTimeout;
++  Mailbox<Command> commands;
++  Mailbox<bool> stopSignal;
++  std::atomic<uint64_t> nextId{0};
++  std::atomic<bool> ready{false};
++  std::atomic<bool> stopped{false};
++};
++
++class Session {
++ public:
++  Session(Shared& shared, WalWire& wire, uint64_t generation)
++      : shared(shared), wire(wire), generation(generation) {}
++
++  ~Session() noexcept(false) {
++    shared.stop();
++    for (auto& [request, fulfiller]: pending) fulfiller->fulfill(uint8_t(ACK_DISCONNECTED));
++    for (auto& [openId, inbox]: routes) inbox->close();
++  }
++
++  kj::Promise<void> run() {
++    return wire.read([this](auto bytes) { receive(bytes); })
++        .exclusiveJoin(write())
++        .exclusiveJoin(shared.stopSignal.next().ignoreResult());
++  }
++
++ private:
++  Shared& shared;
++  WalWire& wire;
++  uint64_t generation;
++  std::map<uint64_t, std::shared_ptr<Inbox>> routes;
++  std::map<uint64_t, kj::Own<kj::CrossThreadPromiseFulfiller<uint8_t>>> pending;
++
++  kj::Promise<void> write() {
++    Writer hello;
++    hello.u8(MSG_HELLO);
++    hello.u32(getpid());
++    hello.u64(std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1));
++    hello.u32(THREADED_WAL_REVISION);
++    hello.u64(generation);
++    co_await wire.write(hello.finish());
++    for (;;) {
++      auto next = co_await shared.commands.next();
++      if (next == kj::none) co_return;
++      auto command = kj::mv(KJ_ASSERT_NONNULL(next));
++      const auto type = command.bytes[4];
++      if (type == MSG_GAVE_UP) {
++        const auto waiting = pending.erase(command.request);
++        if (!waiting && !command.unconditional) continue;
++      }
++      if (type == MSG_OPEN) routes.emplace(command.openId, kj::mv(command.inbox));
++      if (command.ack.get() != nullptr) pending.emplace(command.request, kj::mv(command.ack));
++      co_await wire.write(kj::mv(command.bytes));
++      if (type == MSG_CLOSED) routes.erase(command.openId);
++    }
++  }
++
++  void receive(kj::ArrayPtr<const kj::byte> reply) {
++    KJ_REQUIRE(reply.size() >= 1, "empty threaded WAL reply");
++    const auto type = reply[0];
++    if (!shared.negotiated()) {
++      KJ_REQUIRE(type == MSG_READY && reply.size() == 13 &&
++              getLe32(reply.begin() + 1) == THREADED_WAL_REVISION &&
++              getLe64(reply.begin() + 5) == generation,
++          "threaded WAL readiness mismatch");
++      shared.ready.store(true, std::memory_order_release);
++      return;
++    }
++    if (type == MSG_ACK) {
++      KJ_REQUIRE(reply.size() == 10, "invalid threaded WAL acknowledgement");
++      const auto request = getLe64(reply.begin() + 1);
++      auto entry = pending.find(request);
++      if (entry == pending.end()) return;
++      entry->second->fulfill(uint8_t(reply[9]));
++      pending.erase(entry);
++      return;
++    }
++    KJ_REQUIRE(reply.size() >= 9, "missing threaded WAL open ID");
++    const auto openId = getLe64(reply.begin() + 1);
++    const auto entry = routes.find(openId);
++    if (entry == routes.end()) return;
++    const auto payload = reply.slice(9);
++    Notification notice{.type = type, .openId = openId};
++    switch (type) {
++      case MSG_SEALED:
++        KJ_REQUIRE(payload.size() == 12, "invalid threaded WAL seal");
++        notice.salt1 = getLe32(payload.begin());
++        notice.salt2 = getLe32(payload.begin() + 4);
++        notice.upToFrame = getLe32(payload.begin() + 8);
++        break;
++      case MSG_BREAK: {
++        KJ_REQUIRE(payload.size() >= 2, "invalid threaded WAL break");
++        const size_t length = size_t(payload[0]) | (size_t(payload[1]) << 8);
++        KJ_REQUIRE(payload.size() == length + 2, "invalid threaded WAL break length");
++        notice.reason = kj::str(kj::arrayPtr(
++            reinterpret_cast<const char*>(payload.begin() + 2), length));
++        break;
++      }
++      case MSG_CHECKPOINT_ASKED:
++        KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL checkpoint");
++        break;
++      default:
++        KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
++    }
++    KJ_REQUIRE(entry->second->push(kj::mv(notice), 1, QUEUED_NOTIFICATIONS),
++        "threaded WAL home cannot receive notification");
++  }
++};
++
++class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
++ public:
++  explicit Home(std::shared_ptr<Shared> shared)
++      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()), tasks(*this) {
++    tasks.add(read());
++  }
++
++  bool enabled() const override { return true; }
++  uint64_t nextRequest() override { return ++shared->nextId; }
++
++  uint64_t registerShipper(DurableLogShipper& shipper) override {
++    KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
++    const auto openId = nextRequest();
++    shippers.emplace(openId, &shipper);
++    return openId;
++  }
++
++  void unregisterShipper(DurableLogShipper& shipper) override {
++    shippers.erase(shipper.getOpenId());
++  }
++
++  void send(DurableLogShipper& shipper, kj::Array<kj::byte> message) override {
++    const auto type = message[4];
++    if (!shared->post({.bytes = kj::mv(message), .openId = shipper.getOpenId(), .inbox = inbox}, true)) {
++      // Losing a control record could leave a dirty image registered. Fail the whole
++      // channel so the node uses generation recovery.
++      shared->stop();
++      if (type == MSG_OPEN) kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    }
++  }
++
++  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
++      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) override {
++    const auto openId = shipper.getOpenId();
++    auto paf = kj::newPromiseAndCrossThreadFulfiller<uint8_t>();
++    if (!shared->post({.bytes = kj::mv(message), .openId = openId,
++          .request = request, .ack = kj::mv(paf.fulfiller)}, false)) {
++      gaveUp(openId, request, shipper.getKey(), true);
++      return kj::Promise<void>(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    }
++    auto ack = waitForAck(openId, request, kj::str(shipper.getKey()), timer, kj::mv(paf.promise)).fork();
++    // A canceled caller releases its branch. The committed transaction still needs
++    // a definite acknowledgement or the give-up record, independent of that caller.
++    tasks.add(ack.addBranch().catch_([](kj::Exception&&) {}));
++    return ack.addBranch();
++  }
++
++ private:
++  std::shared_ptr<Shared> shared;
++  std::shared_ptr<Inbox> inbox;
++  std::map<uint64_t, DurableLogShipper*> shippers;
++  kj::TaskSet tasks;
++
++  void taskFailed(kj::Exception&&) override { shared->stop(); }
++
++  void gaveUp(uint64_t openId, uint64_t request, kj::StringPtr key, bool unsent) {
++    Writer writer;
++    writer.u8(MSG_GAVE_UP);
++    writer.u64(request);
++    writer.str(key);
++    writer.u64(std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1));
++    if (!shared->post({.bytes = writer.finish(openId), .openId = openId,
++            .request = request, .unconditional = unsent}, true)) {
++      shared->stop();
++    }
++  }
++
++  kj::Promise<void> waitForAck(uint64_t openId, uint64_t request, kj::String key,
++      kj::Timer& timer, kj::Promise<uint8_t> answer) {
++    const auto status = co_await answer.catch_([](kj::Exception&&) {
++      return uint8_t(ACK_DISCONNECTED);
++    }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
++    if (status == ACK_TIMEOUT) {
++      gaveUp(openId, request, key, false);
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(
++          "jsg.Error: Durable Object storage is unavailable: the node did not confirm the write "
++          "(STORAGE_UNAVAILABLE)")));
++    }
++    if (status == ACK_DISCONNECTED) {
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    }
++    if (status != ACK_OK) {
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
++    }
++    const auto found = shippers.find(openId);
++    if (found != shippers.end()) found->second->onAcked(request);
++  }
++
++  kj::Promise<void> read() {
++    for (;;) {
++      auto next = co_await inbox->next();
++      if (next == kj::none) co_return;
++      auto& notice = KJ_ASSERT_NONNULL(next);
++      const auto found = shippers.find(notice.openId);
++      if (found == shippers.end()) continue;
++      auto& shipper = *found->second;
++      switch (notice.type) {
++        case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
++        case MSG_BREAK: shipper.onBreak(notice.reason); break;
++        case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
++        default: KJ_UNREACHABLE;
++      }
++    }
++  }
++};
++
++}  // namespace
++
++struct ThreadedWalLog::Impl {
++  Impl(int fd, uint64_t generation, kj::Duration confirmationTimeout)
++      : shared(std::make_shared<Shared>(confirmationTimeout)),
++        owner([state = shared, descriptor = kj::AutoCloseFd(fd), generation]() mutable {
++    KJ_DEFER(state->stop());
++    try {
++      auto io = kj::setupAsyncIo();
++      WalWire wire(*io.lowLevelProvider, descriptor.release());
++      Session session(*state, wire, generation);
++      session.run().wait(io.waitScope);
++    } catch (const kj::Exception& error) {
++      KJ_LOG(ERROR, "threaded WAL channel closed", error);
++    }
++  }) {}
++
++  ~Impl() noexcept(false) { shared->stop(); }
++
++  std::shared_ptr<Shared> shared;
++  kj::Thread owner;
++};
++
++ThreadedWalLog::ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout)
++    : impl(kj::heap<Impl>(fd, generation, confirmationTimeout)) {}
++ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
++
++bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
++
++kj::Own<DurableWalChannel> ThreadedWalLog::attachHome() {
++  return kj::heap<Home>(impl->shared);
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..02f7f7dd889a8edf5ecef6ee531416137201118f
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "coworkerd-wal-shipper.h"
++
++namespace workerd::server {
++
++// Owns the inherited node connection and its I/O thread for one child generation.
++// Each home creates and destroys its own channel handle on its event loop.
++class ThreadedWalLog {
++ public:
++  ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout);
++  ~ThreadedWalLog() noexcept(false);
++  KJ_DISALLOW_COPY_AND_MOVE(ThreadedWalLog);
++
++  bool ready() const;
++  kj::Own<DurableWalChannel> attachHome();
++
++ private:
++  struct Impl;
++  kj::Own<Impl> impl;
++};
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+index 5f832c98a3d7bda5fdec1822e05f047b9ae6c87f..abf1127d8954d2d9301ba3bf5814e9445cf5b2ed 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -1,7 +1,6 @@
+ // Coworkerd: see coworkerd-wal-shipper.h.
+ #include "coworkerd-wal-shipper.h"
+-
+-#include <workerd/jsg/exception.h>
++#include "coworkerd-wal-wire.h"
+ 
+ #include <fcntl.h>
+ #include <sqlite3.h>
+@@ -16,6 +15,8 @@
+ namespace workerd::server {
+ namespace {
+ 
++using namespace wal;
++
+ struct Settings {
+   int fd = -1;
+   uint32_t confirmTimeoutMs = 5000;
+@@ -93,13 +94,6 @@ kj::String jsonString(kj::StringPtr text) {
+ uint32_t getBe32(const kj::byte* p) {
+   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+ }
+-uint32_t getLe32(const kj::byte* p) {
+-  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+-}
+-uint64_t getLe64(const kj::byte* p) {
+-  return uint64_t(getLe32(p)) | (uint64_t(getLe32(p + 4)) << 32);
+-}
+-
+ // SQLite's walChecksumBytes(): pairs of 32-bit words, native byte order unless the WAL magic's low bit asks for
+ // big-endian words.
+ void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_t& s1, uint32_t& s2) {
+@@ -122,66 +116,11 @@ void walChecksum(bool bigEndianWords, const kj::byte* data, size_t size, uint32_
+   s2 = b;
+ }
+ 
+-// Little-endian message building: u32 length, then the body, whose first byte is the type.
+-struct Writer {
+-  kj::Vector<kj::byte> out;
+-  void u8(uint8_t v) {
+-    out.add(v);
+-  }
+-  void u32(uint32_t v) {
+-    for (int i = 0; i < 4; i++) out.add(kj::byte(v >> (8 * i)));
+-  }
+-  void u64(uint64_t v) {
+-    for (int i = 0; i < 8; i++) out.add(kj::byte(v >> (8 * i)));
+-  }
+-  void str(kj::StringPtr s) {
+-    KJ_REQUIRE(s.size() <= 0xffff);
+-    out.add(kj::byte(s.size()));
+-    out.add(kj::byte(s.size() >> 8));
+-    out.addAll(s.asBytes());
+-  }
+-  void bytes(kj::ArrayPtr<const kj::byte> b) {
+-    out.addAll(b);
+-  }
+-  kj::Array<kj::byte> finish() {
+-    auto body = out.releaseAsArray();
+-    auto result = kj::heapArray<kj::byte>(body.size() + 4);
+-    uint32_t n = body.size();
+-    for (int i = 0; i < 4; i++) result[i] = kj::byte(n >> (8 * i));
+-    memcpy(result.begin() + 4, body.begin(), body.size());
+-    return result;
+-  }
+-};
+-
+-// To the replicator.
+-constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 4, MSG_RESET = 5,
+-                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
+-// From the replicator.
+-constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
+-// An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
+-// object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
+-// refused for any of them -- only the write is.
+-constexpr uint8_t ACK_OK = 0, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
+-
+-kj::StringPtr ackRefusal(uint8_t status) {
+-  switch (status) {
+-    case ACK_TOO_LARGE:
+-      return "jsg.Error: Durable Object is too large: the write would take it past "
+-             "durableObjects.objectBytes (DO_OBJECT_TOO_LARGE)"_kj;
+-    case ACK_QUOTA:
+-      return "jsg.Error: the tenant's Durable Object storage quota is exhausted: the write was refused "
+-             "(QUOTA_EXCEEDED)"_kj;
+-    default:
+-      return "jsg.Error: Durable Object storage is unavailable: the node refused the write "
+-             "(STORAGE_UNAVAILABLE)"_kj;
+-  }
+-}
+-
+ kj::LowLevelAsyncIoProvider* logProvider = nullptr;
+ 
+ // The one channel to the node's replicator: the descriptor the process inherited. Every database's shipper writes
+ // its messages to it and takes its confirmations from it.
+-class Replicator final: private kj::TaskSet::ErrorHandler {
++class Replicator final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+  public:
+   static Replicator& get() {
+     auto& instance = holder();
+@@ -195,21 +134,25 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+     // Cancel I/O while the stream, buffers and provider are all still alive.
+     tasks.clear();
+     writeChain = nullptr;
+-    stream = kj::none;
++    wire = kj::none;
+   }
+ 
+   static void shutdown() {
+     holder() = nullptr;
+   }
+ 
+-  bool enabled() {
++  bool enabled() const override {
+     return settings().fd >= 0;
+   }
+ 
+-  uint64_t nextRequest() {
++  uint64_t nextRequest() override {
+     return ++requestCounter;
+   }
+ 
++  void send(DurableLogShipper&, kj::Array<kj::byte> message) override {
++    send(kj::mv(message));
++  }
++
+   void send(kj::Array<kj::byte> message) {
+     if (!enabled()) return;
+     ensureConnected();
+@@ -217,20 +160,19 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+     auto bytes = kj::mv(message);
+     writeChain = writeChain
+                      .then([this, bytes = kj::mv(bytes)]() mutable -> kj::Promise<void> {
+-      auto& s = *KJ_ASSERT_NONNULL(stream);
+-      auto promise = s.write(bytes.asPtr());
+-      return promise.attach(kj::mv(bytes));
++      return KJ_ASSERT_NONNULL(wire)->write(kj::mv(bytes));
+     }).eagerlyEvaluate([this](kj::Exception&& e) { fail(kj::mv(e)); });
+   }
+ 
+   // Sends a FRAMES message and resolves when the replicator confirms `request`; rejects when it refuses them or
+   // does not answer within the confirmation timeout.
+-  kj::Promise<void> sendFrames(
+-      kj::Array<kj::byte> message, uint64_t request, kj::StringPtr key, kj::Timer& timer) {
++  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
++      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) override {
+     if (!enabled()) return kj::READY_NOW;
+     KJ_IF_SOME(e, failure) {
+       return kj::Promise<void>(e.clone());
+     }
++    const auto key = shipper.getKey();
+     auto paf = kj::newPromiseAndFulfiller<void>();
+     pending.insert(request, Pending{kj::mv(paf.fulfiller), kj::str(key)});
+     send(kj::mv(message));
+@@ -242,11 +184,12 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+     return kj::mv(paf.promise);
+   }
+ 
+-  void registerShipper(DurableLogShipper& shipper) {
++  uint64_t registerShipper(DurableLogShipper& shipper) override {
+     shippers.upsert(kj::str(shipper.getKey()), &shipper,
+         [](auto& existing, auto&& replacement) { existing = replacement; });
++    return 0;
+   }
+-  void unregisterShipper(DurableLogShipper& shipper) {
++  void unregisterShipper(DurableLogShipper& shipper) override {
+     KJ_IF_SOME(s, shippers.find(shipper.getKey())) {
+       if (s == &shipper) shippers.erase(shipper.getKey());
+     }
+@@ -260,14 +203,12 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+ 
+   kj::TaskSet tasks;
+   bool started = false;
+-  kj::Maybe<kj::Own<kj::AsyncIoStream>> stream;
++  kj::Maybe<kj::Own<WalWire>> wire;
+   kj::Promise<void> writeChain = nullptr;
+   kj::Maybe<kj::Exception> failure;
+   uint64_t requestCounter = 0;
+   kj::HashMap<uint64_t, Pending> pending;
+   kj::HashMap<kj::String, DurableLogShipper*> shippers;
+-  kj::Vector<kj::byte> inbox;
+-  kj::byte readBuffer[65536];
+ 
+   static kj::Own<Replicator>& holder() {
+     // Bootstrap empties this owner before destroying the provider. Static teardown is inert.
+@@ -318,42 +259,14 @@ class Replicator final: private kj::TaskSet::ErrorHandler {
+     if (started) return;
+     started = true;
+     KJ_REQUIRE(logProvider != nullptr, "the Durable Object log channel has no I/O provider");
+-    stream = logProvider->wrapSocketFd(
+-        static_cast<kj::LowLevelAsyncIoProvider::Fd>(settings().fd),
+-        kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP |
+-            kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);
++    wire = kj::heap<WalWire>(*logProvider, settings().fd);
+     Writer w;
+     w.u8(MSG_HELLO);
+     w.u32(getpid());
+     w.u64(monoNs());
+-    auto hello = w.finish();
+-    auto& st = *KJ_ASSERT_NONNULL(stream);
+-    tasks.add(readLoop());
+-    writeChain = st.write(hello.asPtr()).attach(kj::mv(hello));
+-  }
+-
+-  kj::Promise<void> readLoop() {
+-    auto& s = *KJ_ASSERT_NONNULL(stream);
+-    return s.tryRead(readBuffer, 1, sizeof(readBuffer)).then([this](size_t n) -> kj::Promise<void> {
+-      if (n == 0) {
+-        fail(KJ_EXCEPTION(DISCONNECTED, "the node's replicator closed the Durable Object log channel"));
+-        return kj::READY_NOW;
+-      }
+-      inbox.addAll(kj::arrayPtr(readBuffer, n));
+-      size_t at = 0;
+-      while (inbox.size() - at >= 4) {
+-        uint32_t length = getLe32(inbox.begin() + at);
+-        if (inbox.size() - at - 4 < length) break;
+-        dispatch(kj::arrayPtr(inbox.begin() + at + 4, length));
+-        at += 4 + length;
+-      }
+-      if (at > 0) {
+-        kj::Vector<kj::byte> rest;
+-        rest.addAll(kj::arrayPtr(inbox.begin() + at, inbox.size() - at));
+-        inbox = kj::mv(rest);
+-      }
+-      return readLoop();
+-    });
++    auto& connection = *KJ_ASSERT_NONNULL(wire);
++    tasks.add(connection.read([this](auto message) { dispatch(message); }));
++    writeChain = connection.write(w.finish());
+   }
+ 
+   // A message's object key: u16 length, the bytes.
+@@ -491,16 +404,25 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+     DurableObjectName name,
+     SqliteDatabase& db,
+     kj::Timer& timer)
++    : DurableLogShipper(directory, kj::mv(walPath), kj::mv(databasePath), kj::mv(name), db, timer,
++          Replicator::get()) {}
++
++DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
++    kj::Path walPath,
++    kj::Path databasePath,
++    DurableObjectName name,
++    SqliteDatabase& db,
++    kj::Timer& timer,
++    DurableWalChannel& channel)
+     : directory(directory),
+       walPath(kj::mv(walPath)),
+       databasePath(kj::mv(databasePath)),
+       name(kj::mv(name)),
+       key(this->name.key()),
+       db(&db),
+-      timer(timer) {
++      timer(timer),
++      channel(channel) {
+   configure(db);
+-  Replicator::get().registerShipper(*this);
+-
+   // The files of an earlier instance of this object may still hold a WAL: its frames went to the replicator then,
+   // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
+   // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
+@@ -513,13 +435,19 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+     pendingReadNs = 0;
+     ackedFrames = readFrames;
+   }
+-  sendOpen();
++  openId = channel.registerShipper(*this);
++  try {
++    sendOpen();
++  } catch (...) {
++    channel.unregisterShipper(*this);
++    throw;
++  }
+ }
+ 
+ DurableLogShipper::~DurableLogShipper() noexcept(false) {
+-  Replicator::get().unregisterShipper(*this);
++  KJ_DEFER(channel.unregisterShipper(*this));
+   sqlite3_wal_hook(*db, nullptr, nullptr);
+-  if (!durableLogEnabled()) return;
++  if (!channel.enabled()) return;
+   Writer w;
+   w.u8(MSG_CLOSED);
+   w.str(key);
+@@ -527,7 +455,7 @@ DurableLogShipper::~DurableLogShipper() noexcept(false) {
+   // The database's size as this instance leaves it: a small object may never checkpoint, and the node needs its
+   // size for the tenant's storage and for the object's own limit.
+   w.u64(databaseBytes());
+-  Replicator::get().send(w.finish());
++  channel.send(*this, w.finish(openId));
+ }
+ 
+ void DurableLogShipper::configure(SqliteDatabase& database) {
+@@ -571,7 +499,7 @@ void DurableLogShipper::afterReset(SqliteDatabase& database) {
+   w.u32(name.parentFacetId);
+   w.str(name.facetName);
+   w.u64(monoNs());
+-  Replicator::get().send(w.finish());
++  channel.send(*this, w.finish(openId));
+ }
+ 
+ int DurableLogShipper::walHook(void* arg, sqlite3*, const char*, int frames) {
+@@ -666,8 +594,7 @@ kj::Promise<void> DurableLogShipper::sendPending() {
+     }
+     return kj::READY_NOW;
+   }
+-  auto& replicator = Replicator::get();
+-  uint64_t request = replicator.nextRequest();
++  uint64_t request = channel.nextRequest();
+   Writer w;
+   w.u8(MSG_FRAMES);
+   w.u64(request);
+@@ -702,7 +629,7 @@ kj::Promise<void> DurableLogShipper::sendPending() {
+   pendingCommits = 0;
+   pendingReadNs = 0;
+   inFlight.insert(request, InFlight{generation, endsAt});
+-  auto promise = replicator.sendFrames(w.finish(), request, key, timer).fork();
++  auto promise = channel.sendFrames(*this, w.finish(openId), request, timer).fork();
+   lastAck = promise.addBranch().fork();
+   return promise.addBranch();
+ }
+@@ -771,7 +698,7 @@ uint64_t DurableLogShipper::databaseBytes() {
+ }
+ 
+ void DurableLogShipper::sendOpen() {
+-  if (!durableLogEnabled()) return;
++  if (!channel.enabled()) return;
+   Writer w;
+   w.u8(MSG_OPEN);
+   w.str(key);
+@@ -786,7 +713,7 @@ void DurableLogShipper::sendOpen() {
+   w.u64(walBytes());
+   w.u64(databaseBytes());
+   w.u64(monoNs());
+-  Replicator::get().send(w.finish());
++  channel.send(*this, w.finish(openId));
+ }
+ 
+ // A checkpoint moves the WAL's pages into the database file and truncates it. It runs on this process's event loop
+@@ -824,7 +751,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
+   w.u64(start);
+   w.u64(took);
+   w.str(reason);
+-  Replicator::get().send(w.finish());
++  channel.send(*this, w.finish(openId));
+   // The next commit opens a new generation: a new header at the head of the truncated file, new salts, frames from
+   // one again.
+   haveHeader = false;
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.h b/src/workerd/server/factory/coworkerd-wal-shipper.h
+index 51307d71925763619bbd990da483eb720b4f27b9..5c381b3dd66e3a59669c77741195fa620f85c089 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.h
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.h
+@@ -67,6 +67,23 @@ struct DurableObjectName {
+   }
+ };
+ 
++class DurableLogShipper;
++
++// A WAL shipper and its notifications stay on the SQLite connection's event loop.
++// The channel is responsible for the wire, request IDs and confirmation deadlines.
++class DurableWalChannel {
++ public:
++  virtual bool enabled() const = 0;
++  virtual uint64_t nextRequest() = 0;
++  virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
++  virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
++  virtual void send(DurableLogShipper& shipper, kj::Array<kj::byte> message) = 0;
++  virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
++      kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
++
++  virtual ~DurableWalChannel() noexcept(false) = default;
++};
++
+ class DurableLogShipper {
+  public:
+   DurableLogShipper(const kj::Directory& directory,
+@@ -75,6 +92,13 @@ class DurableLogShipper {
+       DurableObjectName name,
+       SqliteDatabase& db,
+       kj::Timer& timer);
++  DurableLogShipper(const kj::Directory& directory,
++      kj::Path walPath,
++      kj::Path databasePath,
++      DurableObjectName name,
++      SqliteDatabase& db,
++      kj::Timer& timer,
++      DurableWalChannel& channel);
+   ~DurableLogShipper() noexcept(false);
+   KJ_DISALLOW_COPY_AND_MOVE(DurableLogShipper);
+ 
+@@ -92,6 +116,9 @@ class DurableLogShipper {
+   kj::StringPtr getKey() {
+     return key;
+   }
++  uint64_t getOpenId() const {
++    return openId;
++  }
+ 
+   // From the replicator.
+   void onAcked(uint64_t request);
+@@ -107,6 +134,8 @@ class DurableLogShipper {
+   kj::String key;
+   SqliteDatabase* db;
+   kj::Timer& timer;
++  DurableWalChannel& channel;
++  uint64_t openId = 0;
+ 
+   // The WAL generation being read: its header, how far it has been read (always a commit frame) and the running
+   // checksum there.
+diff --git a/src/workerd/server/factory/coworkerd-wal-wire.h b/src/workerd/server/factory/coworkerd-wal-wire.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3079c800f41cd797397604e559d3170e37cd547
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-wal-wire.h
+@@ -0,0 +1,125 @@
++// The private child-to-node WAL wire. The peer and persisted encodings are independent of this channel.
++#pragma once
++
++#include <kj/async-io.h>
++#include <kj/debug.h>
++#include <kj/function.h>
++#include <kj/vector.h>
++
++namespace workerd::server::wal {
++
++inline uint32_t getLe32(const kj::byte* p) {
++  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
++}
++inline uint64_t getLe64(const kj::byte* p) {
++  return uint64_t(getLe32(p)) | (uint64_t(getLe32(p + 4)) << 32);
++}
++
++// Little-endian message building: u32 length, then the body, whose first byte is the type.
++struct Writer {
++  kj::Vector<kj::byte> out;
++  void u8(uint8_t v) {
++    out.add(v);
++  }
++  void u32(uint32_t v) {
++    for (int i = 0; i < 4; i++) out.add(kj::byte(v >> (8 * i)));
++  }
++  void u64(uint64_t v) {
++    for (int i = 0; i < 8; i++) out.add(kj::byte(v >> (8 * i)));
++  }
++  void str(kj::StringPtr s) {
++    KJ_REQUIRE(s.size() <= 0xffff);
++    out.add(kj::byte(s.size()));
++    out.add(kj::byte(s.size() >> 8));
++    out.addAll(s.asBytes());
++  }
++  void bytes(kj::ArrayPtr<const kj::byte> b) {
++    out.addAll(b);
++  }
++  // The threaded revision prefixes per-database payloads with the open ID.
++  // A zero ID emits the original private wire format.
++  kj::Array<kj::byte> finish(uint64_t openId = 0) {
++    auto body = out.releaseAsArray();
++    const size_t prefix = openId ? 8 : 0;
++    uint32_t n = body.size() + prefix;
++    auto result = kj::heapArray<kj::byte>(n + 4);
++    for (int i = 0; i < 4; i++) result[i] = kj::byte(n >> (8 * i));
++    result[4] = body[0];
++    if (openId) {
++      for (int i = 0; i < 8; ++i) result[5 + i] = kj::byte(openId >> (8 * i));
++    }
++    memcpy(result.begin() + 5 + prefix, body.begin() + 1, body.size() - 1);
++    return result;
++  }
++};
++
++// To the replicator.
++constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT = 4, MSG_RESET = 5,
++                  MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
++// From the replicator.
++constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
++constexpr uint8_t MSG_READY = 5;
++constexpr uint32_t THREADED_WAL_REVISION = 1;
++// An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
++// object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
++// refused for any of them -- only the write is.
++constexpr uint8_t ACK_OK = 0, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
++
++inline kj::StringPtr ackRefusal(uint8_t status) {
++  switch (status) {
++    case ACK_TOO_LARGE:
++      return "jsg.Error: Durable Object is too large: the write would take it past "
++             "durableObjects.objectBytes (DO_OBJECT_TOO_LARGE)"_kj;
++    case ACK_QUOTA:
++      return "jsg.Error: the tenant's Durable Object storage quota is exhausted: the write was refused "
++             "(QUOTA_EXCEEDED)"_kj;
++    default:
++      return "jsg.Error: Durable Object storage is unavailable: the node refused the write "
++             "(STORAGE_UNAVAILABLE)"_kj;
++  }
++}
++
++class WalWire {
++ public:
++  WalWire(kj::LowLevelAsyncIoProvider& provider, int fd)
++      : stream(provider.wrapSocketFd(static_cast<kj::LowLevelAsyncIoProvider::Fd>(fd),
++            kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP |
++                kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC)) {}
++
++  kj::Promise<void> write(kj::Array<kj::byte> bytes) {
++    return stream->write(bytes.asPtr()).attach(kj::mv(bytes));
++  }
++
++  kj::Promise<void> read(kj::Function<void(kj::ArrayPtr<const kj::byte>)> dispatch) {
++    for (;;) {
++      const size_t n = co_await stream->tryRead(readBuffer, 1, sizeof(readBuffer));
++      if (n == 0) {
++        kj::throwRecoverableException(
++            KJ_EXCEPTION(DISCONNECTED, "the node's replicator closed the Durable Object log channel"));
++      }
++      inbox.addAll(kj::arrayPtr(readBuffer, n));
++      size_t at = 0;
++      while (inbox.size() - at >= 4) {
++        const uint32_t length = getLe32(inbox.begin() + at);
++        // The node sends only private control messages. At most two u16-length strings
++        // and a fixed-size header can occur in any one reply.
++        KJ_REQUIRE(length <= 2 * UINT16_MAX + 64, "invalid Durable Object log reply size");
++        if (inbox.size() - at - 4 < length) break;
++        dispatch(kj::arrayPtr(inbox.begin() + at + 4, length));
++        at += 4 + length;
++      }
++      if (at > 0) {
++        kj::Vector<kj::byte> rest;
++        rest.addAll(kj::arrayPtr(inbox.begin() + at, inbox.size() - at));
++        inbox = kj::mv(rest);
++      }
++    }
++  }
++
++ private:
++  kj::Own<kj::AsyncIoStream> stream;
++  kj::Vector<kj::byte> inbox;
++  kj::byte readBuffer[65536];
++};
++
++}  // namespace workerd::server::wal

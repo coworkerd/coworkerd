@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 21:01:54 +0800
+Subject: [PATCH] =?UTF-8?q?Await=20the=20node=E2=80=99s=20position=20check?=
+ =?UTF-8?q?=20before=20entering=20a=20durable=20object?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+index c45e515dd2845504258525f34cc7584364518da1..4353a9ed2dd85e729f8f333cefc6bbbd86f3d6a5 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -94,6 +94,7 @@ class Mailbox {
+ 
+ struct Notification {
+   uint8_t type = 0;
++  uint8_t status = 0;
+   uint64_t openId = 0;
+   uint32_t salt1 = 0, salt2 = 0, upToFrame = 0;
+   kj::String reason;
+@@ -233,6 +234,10 @@ class Session {
+       case MSG_CLOSE_ASKED:
+         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
+         break;
++      case MSG_OPENED:
++        KJ_REQUIRE(payload.size() == 1, "invalid threaded WAL open result");
++        notice.status = payload[0];
++        break;
+       default:
+         KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
+     }
+@@ -255,7 +260,8 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+   uint64_t registerShipper(DurableLogShipper& shipper) override {
+     KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
+     const auto openId = nextRequest();
+-    shippers.emplace(openId, &shipper);
++    auto result = kj::newPromiseAndFulfiller<void>();
++    shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
+     return openId;
+   }
+ 
+@@ -263,6 +269,15 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+     shippers.erase(shipper.getOpenId());
+   }
+ 
++  kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
++    const auto found = shippers.find(openId);
++    KJ_REQUIRE(shared->negotiated() && found != shippers.end(), STORAGE_UNAVAILABLE);
++    auto timeout = timer.afterDelay(shared->confirmationTimeout).then([] {
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    });
++    return found->second.ready.addBranch().exclusiveJoin(kj::mv(timeout));
++  }
++
+   void send(uint64_t openId, kj::Array<kj::byte> message) override {
+     const auto type = message[4];
+     if (!shared->post({.bytes = kj::mv(message), .openId = openId, .inbox = inbox}, true)) {
+@@ -291,9 +306,14 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+   }
+ 
+  private:
++  struct Registration {
++    DurableLogShipper* shipper;
++    kj::Own<kj::PromiseFulfiller<void>> opening;
++    kj::ForkedPromise<void> ready;
++  };
+   std::shared_ptr<Shared> shared;
+   std::shared_ptr<Inbox> inbox;
+-  std::map<uint64_t, DurableLogShipper*> shippers;
++  std::map<uint64_t, Registration> shippers;
+   kj::Function<void(uint64_t)> requestClose;
+   kj::TaskSet tasks;
+ 
+@@ -317,7 +337,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+       return uint8_t(ACK_DISCONNECTED);
+     }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
+     const auto found = shippers.find(openId);
+-    if (status != ACK_OK && found != shippers.end()) found->second->onRefused(request);
++    if (status != ACK_OK && found != shippers.end()) found->second.shipper->onRefused(request);
+     if (status == ACK_TIMEOUT) {
+       gaveUp(openId, request, key, false);
+       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(
+@@ -330,22 +350,35 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+     if (status != ACK_OK) {
+       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(status))));
+     }
+-    if (found != shippers.end()) found->second->onAcked(request);
++    if (found != shippers.end()) found->second.shipper->onAcked(request);
+   }
+ 
+   kj::Promise<void> read() {
+     for (;;) {
+       auto next = co_await inbox->next();
+-      if (next == kj::none) co_return;
++      if (next == kj::none) {
++        for (auto& [id, registration]: shippers) {
++          if (registration.opening->isWaiting()) {
++            registration.opening->reject(KJ_EXCEPTION(DISCONNECTED, kj::str(STORAGE_UNAVAILABLE)));
++          }
++        }
++        co_return;
++      }
+       auto& notice = KJ_ASSERT_NONNULL(next);
+       const auto found = shippers.find(notice.openId);
+       if (found == shippers.end()) continue;
+-      auto& shipper = *found->second;
++      auto& registration = found->second;
++      auto& shipper = *registration.shipper;
+       switch (notice.type) {
+         case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
+         case MSG_BREAK: shipper.onBreak(notice.reason); break;
+         case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
+         case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
++        case MSG_OPENED:
++          if (!registration.opening->isWaiting()) break;
++          if (notice.status == ACK_OK) registration.opening->fulfill();
++          else registration.opening->reject(KJ_EXCEPTION(FAILED, kj::str(ackRefusal(notice.status))));
++          break;
+         default: KJ_UNREACHABLE;
+       }
+     }
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.h b/src/workerd/server/factory/coworkerd-wal-shipper.h
+index 774e1c351c8d641185a8d0b6d36156856dd8d38f..389c14ab9dce2ad180986fd84e5f441ca7b42b9d 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.h
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.h
+@@ -78,6 +78,7 @@ class DurableWalChannel {
+   virtual uint64_t nextRequest() = 0;
+   virtual uint64_t registerShipper(DurableLogShipper& shipper) = 0;
+   virtual void unregisterShipper(DurableLogShipper& shipper) = 0;
++  virtual kj::Promise<void> waitForOpen(uint64_t, kj::Timer&) { return kj::READY_NOW; }
+   virtual void send(uint64_t openId, kj::Array<kj::byte> message) = 0;
+   virtual kj::Promise<void> sendFrames(DurableLogShipper& shipper,
+       kj::Array<kj::byte> message, uint64_t request, kj::Timer& timer) = 0;
+diff --git a/src/workerd/server/factory/coworkerd-wal-wire.h b/src/workerd/server/factory/coworkerd-wal-wire.h
+index 622ebd4c76c410232b6ca7c977cd2d0e25df1df7..3a5c53e6a35fa5d7861b718b1c57526ccad5a3e5 100644
+--- a/src/workerd/server/factory/coworkerd-wal-wire.h
++++ b/src/workerd/server/factory/coworkerd-wal-wire.h
+@@ -58,7 +58,7 @@ constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT =
+                   MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
+ // From the replicator.
+ constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
+-constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6;
++constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6, MSG_OPENED = 7;
+ constexpr uint32_t THREADED_WAL_REVISION = 1;
+ // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
+ // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index f4862ad2b84d719e0b8ee967ab4056d1ba66136a..011ef2fb0904c062113d12ee52361c07bd3f5c9c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -5015,13 +5015,15 @@ kj::Promise<void> LocalFacet::initialize() {
+   className = kj::str(binding->name);
+   actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(info.id), className,
+       binding->props.clone(), facet, depth, reservation, parentFacet, name);
++  if (tree->state.wal) co_await tree->state.wal->waitForOpen(
++      tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
+ }
+ 
+ kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
+     kj::String descriptor, kj::Own<Invocation> invocation) {
+-  if (actor == kj::none) {
+-    if (starting == kj::none) starting = initialize().fork();
+-    co_await KJ_ASSERT_NONNULL(starting).addBranch();
++  if (actor == kj::none && starting == kj::none) starting = initialize().fork();
++  KJ_IF_SOME(load, starting) {
++    co_await load.addBranch();
+   }
+   KJ_REQUIRE(!stopped, "durable test facet is closed");
+   auto slot = tree->slot.lock();
+@@ -5151,7 +5153,11 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       tree->server.beginDurableReset(tree->state, tree->tree);
+     }).eagerlyEvaluate(nullptr);
+   }
+-  if (found->second.resetting || found->second.closeRequested) {
++  if (state.wal) {
++    co_await state.wal->waitForOpen(found->second.rootOpenId(), state.io.provider->getTimer());
++    found = state.durableRoots.find(ticket.tree);
++  }
++  if (found == state.durableRoots.end() || found->second.resetting || found->second.closeRequested) {
+     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+         KJ_EXCEPTION(OVERLOADED, "durable object reset is still draining"), "DO_UNAVAILABLE"));
+   }

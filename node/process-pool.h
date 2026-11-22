@@ -39,6 +39,7 @@ public:
   kj::Promise<void> onExit();
   bool threadedServer() const;
   bool threadedDurableTestRole() const;
+  bool threadedDurableRole() const;
   bool cpuLimitExceeded() const;
   bool memoryLimitExceeded() const;
   bool processMemoryPressure() const;
@@ -139,6 +140,7 @@ public:
   // is killed -- what it runs ends with it, the facets of every object among it -- and a new one starts at once, empty.
   // Not a failure of the process: no backoff, no culprit. Returns how many generations were killed.
   uint32_t resetDurable(const std::string& reason);
+  kj::Promise<uint32_t> resetDurableAndWait(const std::string& reason, kj::Duration timeout);
   // The drain's close of the durable processes alone (as closeAll() closes every process), before the node lets its
   // shards go: no durable generation starts from then on. Resolves with the record once they exited.
   kj::Promise<std::string> closeDurable(double deadlineMonotonicMs);
@@ -146,7 +148,9 @@ public:
   // descriptor 9 and ships its objects' WAL frames over it. `open` gives the descriptor the child is to inherit
   // (-1: this node ships nothing), `close` is called when a generation is gone, and the settings the processes read
   // come from the same block.
-  void setDurableChannel(std::function<int(const std::string&)> open, std::function<void(const std::string&)> close,
+  void setDurableChannel(std::function<int(const std::string&, uint64_t)> open,
+      std::function<void(const std::string&)> close,
+      std::function<bool(const std::string&)> drain,
       const DurableLogConfig& settings);
   // Usage: the CPU nanoseconds of each tenant's executions since the last call (from the `completed` rows),
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).

@@ -6,10 +6,10 @@ Subject: [PATCH] Report a fatal V8 error from the current ordinary Worker
 
 
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 019b6299a951a6682023542d692199bcb828715c..38c954eb45e54ea0c2d466f1df2681fca7af4980 100644
+index 339f03ed092c134624fd395bd30351a53d30e21d..9895fca5e4c88f0497c8c29affe024e3af51738b 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
-@@ -40,6 +40,19 @@ wd_cc_binary(
+@@ -42,6 +42,19 @@ wd_cc_binary(
      deps = THREADED_DEPS,
  )
  
@@ -76,10 +76,10 @@ index 720fadf3d930014291f9f3562b72064375f630b2..058a61eb4a36493f7649ba1d8cb770b3
    DescriptorQueue queue(2);
    KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918da300959 100644
+index fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b..135949663d19d60201f5d9568226f2ee7da77c17 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -38,6 +38,7 @@
+@@ -39,6 +39,7 @@
  #include <arpa/inet.h>
  #include <fcntl.h>
  #include <netinet/tcp.h>
@@ -87,7 +87,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
  #include <openssl/evp.h>
  #include <openssl/sha.h>
  #include <poll.h>
-@@ -245,6 +246,21 @@ constexpr uint64_t fragmentationReserve(uint64_t maximum) {
+@@ -246,6 +247,21 @@ constexpr uint64_t fragmentationReserve(uint64_t maximum) {
  }
  
  int limitEventFd();
@@ -109,7 +109,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
  thread_local const char *currentOomReport = nullptr;
  // The executing isolate's heap at its last collection. V8 collects before a
  // fatal OOM, so this is the heap of the isolate whose allocation failed.
-@@ -674,44 +690,93 @@ bool writeLimitRow(kj::StringPtr event,
+@@ -675,44 +691,93 @@ bool writeLimitRow(kj::StringPtr event,
    return true;
  }
  
@@ -228,7 +228,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
  // V8's allocator for `group`: with the sandbox and one pointer cage per group, backing stores
  // must lie in the isolate's own sandbox (V8 aborts the process on the first one otherwise).
  v8::ArrayBuffer::Allocator *newGroupAllocator(const v8::IsolateGroup &group) {
-@@ -1048,6 +1113,7 @@ struct CpuExecution {
+@@ -1049,6 +1114,7 @@ struct CpuExecution {
    std::shared_ptr<MemoryBudget> memory;
    std::atomic<LimitCause> *previousCause;
    OomReportScope oom;
@@ -236,7 +236,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
    CpuWatchdog::Entry entry;
    bool registered;
    bool finished = false;
-@@ -1059,12 +1125,14 @@ struct CpuExecution {
+@@ -1060,12 +1126,14 @@ struct CpuExecution {
        uint32_t cpuMs,
        uint32_t memoryMiB,
        kj::StringPtr identity,
@@ -252,7 +252,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
          entry{.isolate = isolate,
            .cause = cause,
            .memory = std::move(memoryState),
-@@ -1158,6 +1226,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1159,6 +1227,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
    void customizeIsolate(v8::Isolate *value) override {
      server::requireSecureIsolateSandbox(value, sandboxName.c_str());
      if (memory) memory->install(value);
@@ -260,7 +260,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
      if (durableEvents) {
        // V8 restores continuation-preserved data before kBefore and retains it
        // through kAfter. The full amount belongs to the reaction's event.
-@@ -1199,7 +1268,9 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1200,7 +1269,9 @@ struct IsolateLimits final: IsolateLimitEnforcer {
                totalCpu,
                owner.cpuMs,
                owner.memoryMiB,
@@ -271,7 +271,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
      ~Startup() noexcept(false) {
        execution.finish();
        totalCpu += nowNs(CLOCK_THREAD_CPUTIME_ID) - start;
-@@ -1364,7 +1435,8 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1365,7 +1436,8 @@ struct RequestLimits final: LimitEnforcer {
                slot.limits->cpuMs,
                slot.limits->memoryMiB,
                owner.identity,
@@ -281,7 +281,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
        uint expected = 0;
        KJ_REQUIRE(slot.active.compare_exchange_strong(expected, 1), "overlapping JS entries");
        slot.maxActive.store(1);
-@@ -1465,7 +1537,11 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1466,7 +1538,11 @@ struct RequestLimits final: LimitEnforcer {
      // runImpl synchronizes before waiting for the isolate; sample again after
      // that wait, while its lock is held and before this turn enters JavaScript.
      timer.syncTime();
@@ -294,7 +294,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
    }
    void topUpActor() override {}
    kj::Own<void> enterActorEvent(jsg::Lock &js, IoContext::IncomingRequest &request) override {
-@@ -1821,7 +1897,7 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
+@@ -1830,7 +1906,7 @@ kj::Maybe<kj::String> sourceJsonFailure(kj::StringPtr input, IsolateLimits &limi
    v8::Context::Scope inContext(context);
    std::atomic<LimitCause> cause{LimitCause::NONE};
    CpuExecution execution(isolate, cause, limits.memoryState, limits.memory, 0, limits.cpuMs,
@@ -303,19 +303,19 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
    v8::TryCatch caught(isolate);
    v8::Local<v8::String> text;
    v8::Local<v8::Value> value;
-@@ -2328,6 +2404,11 @@ struct ThreadedServer {
-             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
-         subrequestBudget(limit, tenantBudget->limit) {
-     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
-+    if (!this->durableTestStorage) {
+@@ -2373,6 +2449,11 @@ struct ThreadedServer {
+           },
+           durableNumber(std::string_view(this->identity).substr(colon + 1)));
+     }
++    if (!durableAdmission) {
 +      v8::V8::SetFatalErrorHandler([](const char* file, int, const char* message) {
 +        nativeFatal(file, message);
 +      });
 +    }
-     if (this->durableTestStorage) {
-       KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
-       const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
-@@ -3375,6 +3456,7 @@ struct ThreadedServer {
+     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
+     server::requireSecureSandbox();
+     resources->reclaimWake = managerWake;
+@@ -3398,6 +3479,7 @@ struct ThreadedServer {
          if (values.isArray()) base += values.getArray().size();
        }
        JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
@@ -323,7 +323,7 @@ index 13e9e75235a83db02b49284b62e57113c2abd864..632c8ff99a553943d1d9b9fbcaddd918
          capnp::MallocMessageBuilder arena;
          auto globals = arena.initRoot<capnp::List<server::Global>>(
              slot.loopbacks.size() + slot.loopbackActors.size());
-@@ -4523,6 +4605,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
+@@ -4546,6 +4628,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
          slot->limits->memory ? &slot->limits->memory->heap : nullptr);
      worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
        JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {

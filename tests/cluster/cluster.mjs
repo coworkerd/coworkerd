@@ -43,7 +43,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 }
 
 export class Cluster {
-  constructor(directory, kernel, signal, { holdPeerAcks = false, fatalTestBinary } = {}) {
+  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, fatalTestBinary } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
@@ -62,6 +62,9 @@ export class Cluster {
     this.peerAckGate = holdPeerAcks ? join(directory, 'peer-acks') : null;
     this.fatalTestBinary = fatalTestBinary;
     this.fatalControl = fatalTestBinary ? join(directory, 'fatal-control') : null;
+    this.threadedNodes = new Set(threadedNodes);
+    this.membership = membership;
+    this.confirmTimeoutMs = confirmTimeoutMs;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -114,6 +117,11 @@ export class Cluster {
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1 },
         ...(this.fatalControl ? { quarantineProcesses: 1 } : {}),
+        membership: this.membership,
+        ...(this.threadedNodes.has(node) ? {
+          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs },
+          rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
+        } : {}),
       }));
       overrides[node] = {
         // Keep a killed owner down so that only a different node can recover the object.
@@ -121,9 +129,13 @@ export class Cluster {
         environment: { COWORKERD_CONFIG: target },
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
+      if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
       if (this.peerAckGate) {
         const gate = '/tmp/cluster-test-peer-acks';
         overrides[node].environment.COWORKERD_HOLD_PEER_ACK_FOR_TEST = `${gate}/hold`;
+        if (this.threadedNodes.has(node)) {
+          overrides[node].environment.COWORKERD_CUT_DURABLE_CHANNEL_FOR_TEST = `${gate}/loss-${node}`;
+        }
         overrides[node].volumes.push({ type: 'bind', source: this.peerAckGate, target: gate, read_only: true });
       }
       if (this.fatalControl && node === nodes[0]) {
@@ -138,17 +150,19 @@ export class Cluster {
     console.log(`Starting Compose project ${this.project}`);
     this.started = true;
     await this.compose(['up', '-d', '--wait', '--wait-timeout', '120'], { timeout: 180000 });
-    await Promise.all(services.map(async service => {
-      const address = await this.compose(['port', service, service === 'apiserver' ? '8940' : '8930']);
-      assert.match(address, /^127\.0\.0\.1:\d+$/);
-      this.urls[service] = `http://${address}`;
-    }));
+    await Promise.all(services.map(service => this.refreshUrl(service)));
     this.admin = await this.compose(['exec', '-T', 'apiserver', 'coworkerd-entrypoint', 'tool', 'admin-credential']);
     this.management = await this.compose(['exec', '-T', 'apiserver', 'coworkerd-entrypoint', 'tool', 'token']);
     await eventually('three registered nodes', async () => {
       const status = await this.api('/v1/status');
       assert.deepEqual(status.nodes.map(node => node.nodeId).sort(), nodes);
     });
+  }
+
+  async refreshUrl(service) {
+    const address = await this.compose(['port', service, service === 'apiserver' ? '8940' : '8930']);
+    assert.match(address, /^127\.0\.0\.1:\d+$/);
+    this.urls[service] = `http://${address}`;
   }
 
   async api(path, options = {}) {

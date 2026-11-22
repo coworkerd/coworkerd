@@ -227,6 +227,8 @@ add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
+add_test(NAME durable-upstream-channel-eof COMMAND coworkerd-durable-channel-test upstream-channel-eof)
+add_test(NAME durable-threaded-channel COMMAND coworkerd-durable-channel-test threaded-channel)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
@@ -251,7 +253,7 @@ foreach(case fenced full full-resend resend-held)
 endforeach()
 foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect cut-short-reconnect limit-reconnect
     corrupt-reconnect chunk pair-full pair-fenced fenced-drop fenced-unshown full-keeps fenced-drop-resend fenced-known
-    reacquired)
+    reacquired unreachable)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
 foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement package module-types cache

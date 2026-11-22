@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 00:12:35 +0800
+Subject: [PATCH] Use home-based memory reclaim for both durable roles
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index aac4f5f1c10fb441dbc13770e74cacae11dee568..fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2335,8 +2335,8 @@ struct ThreadedServer {
+                         : 0),
+             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
+             limit,
+-            this->durableTestStorage ? ResourceBudget::ReclaimMode::NONE
+-                                     : ResourceBudget::ReclaimMode::BACKGROUND)),
++            this->durableStorage ? ResourceBudget::ReclaimMode::NONE
++                                 : ResourceBudget::ReclaimMode::BACKGROUND)),
+         tenantBudget(std::make_shared<TenantBudget>(
+             configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
+         subrequestBudget(limit, tenantBudget->limit) {
