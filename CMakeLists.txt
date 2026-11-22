@@ -330,6 +330,10 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" warm-copies)
     set_tests_properties(node-threaded-durable-warm-copies PROPERTIES TIMEOUT 30)
+    add_test(NAME node-threaded-durable-load-cancel COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" load-cancel)
+    set_tests_properties(node-threaded-durable-load-cancel PROPERTIES TIMEOUT 30)
     # The positive RPC/events fixture is retained for the next PR of issue #36.
     # This HTTP-only step refuses durable JavaScript RPC before entering that path.
     add_test(NAME node-threaded-durable-http-isolation COMMAND "${COWORKERD_TEST_NODE}"

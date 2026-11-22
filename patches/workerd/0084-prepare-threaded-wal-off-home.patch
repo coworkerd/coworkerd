@@ -360,12 +360,12 @@ index 389c14ab9dce2ad180986fd84e5f441ca7b42b9d..e81b7c14a13e5e9faaa020d48906d282
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45423ba977 100644
+index 56c0022c78de5d053aef7db66004a7b9cdb49337..9dc2a38ebd0aff42f1986c9a66c66135b41b1de5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1652,6 +1652,11 @@ struct ThreadState {
-   std::shared_ptr<Slot> durableSlot;
-   std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
+@@ -1660,6 +1660,11 @@ struct ThreadState {
+   };
+   std::optional<DurableLoad> durableLoad;
    kj::Own<server::DurableWalChannel> wal;
 +  struct WalPreparation {
 +    explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
@@ -375,7 +375,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
    struct DurableRoot {
      kj::Own<Worker::Actor> actor;
      server::DurableAdmission::Time lastUse;
-@@ -4717,7 +4722,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -4760,7 +4765,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      uint depth,
      std::shared_ptr<DurableFacetReservation> reservation = nullptr,
      uint parentFacet = 0,
@@ -385,7 +385,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
  
  class LocalFacet final: public IoChannelFactory::ActorChannel {
   public:
-@@ -4913,8 +4919,14 @@ kj::Promise<void> LocalFacet::initialize() {
+@@ -4956,8 +4962,14 @@ kj::Promise<void> LocalFacet::initialize() {
    KJ_REQUIRE(!stopped && binding != nullptr && slot && slot == binding->slot.lock(),
        "durable test facets require a class in the original isolate copy");
    className = kj::str(binding->name);
@@ -401,7 +401,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
    if (tree->state.wal) co_await tree->state.wal->waitForOpen(
        tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
  }
-@@ -4944,21 +4956,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -4987,21 +4999,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      uint depth,
      std::shared_ptr<DurableFacetReservation> reservation,
      uint parentFacet,
@@ -428,7 +428,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
        auto* current = shipper.get();
        KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
        shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
-@@ -4996,6 +5010,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -5039,6 +5053,20 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    return {kj::mv(actor), borrowedHooks};
  }
  
@@ -449,7 +449,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
  kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
      kj::String descriptor, Frankenvalue props) {
    KJ_REQUIRE(!used, "one event per durable connection");
-@@ -5019,6 +5047,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5062,6 +5090,11 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
        "durable class missing from pinned Worker");
    auto found = state.durableRoots.find(ticket.tree);
@@ -461,7 +461,7 @@ index b3bf58af55ba74d8c62c4dac2a8aa51793c269f0..675e1ef5837d3b4396574e6e250b5c45
    if (found == state.durableRoots.end()) {
      auto actorId = ObjectIdFactory(kj::StringPtr(route.key.namespaceId.c_str()))
                         .idFromString(kj::str(route.key.objectId.c_str()));
-@@ -5033,7 +5066,8 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+@@ -5076,7 +5109,8 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
        {},
      });
      auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
