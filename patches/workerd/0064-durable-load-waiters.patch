@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 19:02:58 +0800
+Subject: [PATCH] End a durable cold load with its last waiter
+
+A home kept the cold load it had in flight in its thread state. When the
+only caller of that load was canceled, the load stayed there, and the next
+tree placed on the home, of whatever definition, waited for it and received
+its isolate.
+
+The load now records its definition and counts its waiters. The last waiter
+to return, fail or be canceled drops it, which cancels a load nobody waits
+for and counts it in canceledLoads. A waiter of another definition is
+refused instead of joining it.
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index e3cd6ba59bd0e289783ab909c9c2d0f4ece78571..4f06fd15bf7fc60cc0585756d14c51b5c34c25c9 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1649,7 +1649,15 @@ struct ThreadState {
+   bool rejectOnly = false;
+   uint64_t durableHome = 0;
+   std::shared_ptr<Slot> durableSlot;
+-  std::optional<kj::ForkedPromise<std::shared_ptr<Slot>>> durableLoad;
++  // The cold load in flight on this home. Its waiters all want its definition, and it
++  // ends with the last of them, so a canceled load is never left for a later tree.
++  struct DurableLoad {
++    std::string definition;
++    kj::ForkedPromise<std::shared_ptr<Slot>> promise;
++    uint waiters = 0;
++    bool settled = false;
++  };
++  std::optional<DurableLoad> durableLoad;
+   struct DurableRoot {
+     kj::Own<Worker::Actor> actor;
+     server::DurableAdmission::Time lastUse;
+@@ -3424,26 +3432,43 @@ struct ThreadedServer {
+       co_return state.durableSlot;
+     }
+     KJ_REQUIRE(state.durableRoots.empty(), "durable home still owns a different isolate");
++    KJ_REQUIRE(!state.durableLoad || state.durableLoad->definition == definition,
++        "durable home is loading a different definition");
+     state.durableSlot.reset();
+     {
+       std::lock_guard lock(durableRoutingMutex);
+       threads[state.durableHome - 1]->home->warmDefinition.clear();
+     }
+     if (!state.durableLoad) {
+-      state.durableLoad.emplace(loadDurableWorker(state, kj::str(descriptor), definition).fork());
++      state.durableLoad.emplace(ThreadState::DurableLoad{
++        .definition = definition,
++        .promise = loadDurableWorker(state, kj::str(descriptor), definition).fork(),
++      });
+     }
+-    try {
+-      state.durableSlot = co_await state.durableLoad->addBranch();
+-      {
+-        std::lock_guard lock(durableRoutingMutex);
+-        threads[state.durableHome - 1]->home->warmDefinition = state.durableSlot->planRevision;
++    ++state.durableLoad->waiters;
++    // Runs when this waiter returns, fails or is canceled. Dropping the load with its
++    // last waiter cancels a load nobody waits for, before another definition can find it.
++    KJ_DEFER({
++      auto &load = *state.durableLoad;
++      if (--load.waiters == 0) {
++        if (!load.settled) canceledLoads.fetch_add(1);
++        state.durableLoad.reset();
+       }
+-      state.durableLoad.reset();
+-      co_return state.durableSlot;
++    });
++    std::shared_ptr<Slot> loaded;
++    try {
++      loaded = co_await state.durableLoad->promise.addBranch();
+     } catch (...) {
+-      state.durableLoad.reset();
++      state.durableLoad->settled = true;
+       throw;
+     }
++    state.durableLoad->settled = true;
++    state.durableSlot = loaded;
++    {
++      std::lock_guard lock(durableRoutingMutex);
++      threads[state.durableHome - 1]->home->warmDefinition = loaded->planRevision;
++    }
++    co_return loaded;
+   }
+ 
+   kj::Promise<std::shared_ptr<Slot>> getWorker(

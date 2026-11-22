@@ -209,7 +209,8 @@ def allowed_path(name, path):
                           name == '0060-durable-http-only-boundary.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name in {'0061-durable-home-before-ack.patch',
-                                   '0062-durable-warm-copies.patch'} and
+                                   '0062-durable-warm-copies.patch',
+                                   '0064-durable-load-waiters.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
