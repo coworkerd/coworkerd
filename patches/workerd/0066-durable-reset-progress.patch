@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 18:54:07 +0800
+Subject: [PATCH] Close durable admission before draining aborted trees
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+index 62938e216edec901d3664b58d24e3e3d1d16934c..8845261533c194c3eada322fe3599a896327f556 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -146,6 +146,37 @@ KJ_TEST("home refusal returns waiting credit once without canceling an active ev
+   KJ_EXPECT(table.state().overloads == 2);
+ }
+ 
++KJ_TEST("durable reset closes admission while active events drain") {
++  Admission table(limits, 1);
++  const auto active = queued(table.queue(first, open, 30, deadline, now), true);
++  KJ_ASSERT(table.publishHome(active.tree, 1));
++  KJ_ASSERT(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
++  const auto activeResources = table.state().reserved;
++  const auto waiting = queued(table.queue(first, open, 40, deadline, now), false);
++  KJ_EXPECT(!table.beginReset(active.tree, 2));
++  KJ_EXPECT(table.state().waiting == 1);
++  KJ_ASSERT(table.beginReset(active.tree, 1));
++  KJ_EXPECT(table.state().waiting == 0);
++  KJ_EXPECT(table.state().active == 1);
++  KJ_EXPECT((table.state().reserved == activeResources));
++  KJ_EXPECT(!table.releaseTree(active.tree, 1));
++  KJ_EXPECT(!table.stopIdleTree(active.tree, 1));
++  KJ_EXPECT(table.begin(waiting, 1, first, open, now) == Delivery::STALE);
++  KJ_EXPECT(!table.next(active.tree).has_value());
++  for (uint i = 0; i < 100; ++i) {
++    KJ_EXPECT(table.queue(first, open, 30, deadline, now).status == Status::STALE);
++  }
++  KJ_EXPECT(table.cancel(active) == Cancellation::SIGNAL_HOME);
++  KJ_EXPECT(table.beginReset(active.tree, 1));
++  KJ_EXPECT(table.state().active == 1);
++  KJ_EXPECT(table.complete(active, 1));
++  KJ_EXPECT(table.stopIdleTree(active.tree, 1));
++  KJ_EXPECT(table.releaseTree(active.tree, 1));
++  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++  const auto replacement = queued(table.queue(first, open, 30, deadline, now), true);
++  KJ_EXPECT(replacement.tree != active.tree);
++}
++
+ KJ_TEST("durable admission retains a closing tree until its home acknowledges release") {
+   Admission table(limits, 1);
+   const auto old = queued(table.queue(first, open, 30, deadline, now), true);
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index e19c838ba336cd43bfcca5c0fdcba184faf86ea5..8fb5bc9bcae77b5d96a9ad485798db8b662cda6b 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -212,9 +212,21 @@ std::vector<DurableAdmission::Ticket> DurableAdmission::expire(Time now) {
+   return expired;
+ }
+ 
++bool DurableAdmission::beginReset(uint64_t tree, uint64_t home) {
++  auto entry = trees.find(tree);
++  if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
++  auto& pending = entry->second;
++  pending.closing = true;
++  for (auto it = pending.events.begin(); it != pending.events.end();) {
++    auto event = it++;
++    if (event->second.phase == Phase::WAITING) releaseEvent(pending, event);
++  }
++  return true;
++}
++
+ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home) {
+   auto entry = trees.find(tree);
+-  if (entry == trees.end() || home == 0 || entry->second.home != home || entry->second.closing ||
++  if (entry == trees.end() || home == 0 || entry->second.home != home ||
+       !entry->second.events.empty()) {
+     return false;
+   }
+@@ -228,7 +240,8 @@ bool DurableAdmission::stopIdleTree(uint64_t tree, uint64_t home, Time lastUse,
+ 
+ bool DurableAdmission::releaseTree(uint64_t tree, uint64_t home) {
+   auto entry = trees.find(tree);
+-  if (entry == trees.end() || !entry->second.closing || entry->second.home != home) {
++  if (entry == trees.end() || !entry->second.closing || entry->second.home != home ||
++      !entry->second.events.empty()) {
+     return false;
+   }
+   eraseTree(entry);
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index a8234f55d3ccffc92ea3b47140a3ebcbcabf7973..bd94eaee8d5529a64110b97f7a397ee23c9cccc1 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -99,6 +99,9 @@ class DurableAdmission {
+ 
+   // A home starts closing only after its mailbox is empty. Reject admission during close,
+   // and keep the tree's reservation until the home confirms that its handles are gone.
++  // Reset closes admission immediately, releases waiting calls, and retains active credits
++  // until their home completes them. The home still owns every actor handle until releaseTree().
++  bool beginReset(uint64_t tree, uint64_t home);
+   bool stopIdleTree(uint64_t tree, uint64_t home);
+   // Normal retirement checks the idle deadline as well as mailbox/active ownership.
+   // Pressure retirement uses the unconditional overload above.
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 8fcf4919b3a80ce41e1debf82afba5257bc23714..cbba8f26f9874fb4c9804971a0b296634096085c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1664,6 +1664,7 @@ struct ThreadState {
+     std::function<bool()> facetsBusy;
+     std::function<void()> stopFacets;
+     bool resetting = false;
++    kj::Maybe<kj::Promise<void>> broken;
+   };
+   std::map<Worker::Actor *, uint64_t> durableActorTrees;
+   std::map<uint64_t, DurableRoot> durableRoots;
+@@ -2666,8 +2667,10 @@ struct ThreadedServer {
+       {
+         std::lock_guard lock(durableRoutingMutex);
+         auto first = durableAdmission->next(ticket.tree);
+-        KJ_REQUIRE(first.has_value() && durableAdmission->homeFor(ticket.tree) == state.durableHome,
+-            "durable routing credit is no longer live");
++        if (!first.has_value() || durableAdmission->homeFor(ticket.tree) != state.durableHome) {
++          kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++              KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
++        }
+         if (first == ticket) {
+           const auto delivery = durableAdmission->begin(
+               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
+@@ -2696,7 +2699,7 @@ struct ThreadedServer {
+   kj::Promise<void> startDurableSession(ThreadState &state, DurableIncoming call) {
+     KJ_DEFER({
+       auto root = state.durableRoots.find(call.ticket.tree);
+-      if (root != state.durableRoots.end()) {
++      if (root != state.durableRoots.end() && !root->second.resetting) {
+         root->second.lastUse = server::DurableAdmission::Clock::now();
+       }
+       finishDurable(call.ticket);
+@@ -2730,6 +2733,15 @@ struct ThreadedServer {
+     }
+   }
+ 
++  void beginDurableReset(ThreadState &state, uint64_t tree) {
++    auto root = state.durableRoots.find(tree);
++    if (root == state.durableRoots.end()) return;
++    root->second.resetting = true;
++    std::lock_guard lock(durableRoutingMutex);
++    KJ_ASSERT(durableAdmission->beginReset(tree, state.durableHome));
++    wakeDurableTree(tree);
++  }
++
+   void retireIdleDurableRoots(ThreadState &state) {
+     if (!state.durableSlot) return;
+     const auto now = server::DurableAdmission::Clock::now();
+@@ -2802,7 +2814,7 @@ struct ThreadedServer {
+     }
+     if (pressureAction == server::DurablePressure::Action::RESET) {
+       for (auto &[tree, root]: state.durableRoots) {
+-        root.resetting = true;
++        beginDurableReset(state, tree);
+         root.actor->abort(limitException(LimitCause::MEMORY));
+       }
+     }
+@@ -3422,7 +3434,7 @@ struct ThreadedServer {
+       auto root = state.durableRoots.find(at->second);
+       if (root == state.durableRoots.end() || root->second.resetting) return;
+       durableActorResets.fetch_add(1);
+-      root->second.resetting = true;
++      beginDurableReset(state, at->second);
+       if (root->second.actor.get() != &actor) {
+         root->second.actor->abort(limitException(LimitCause::CPU));
+       }
+@@ -5013,6 +5025,10 @@ kj::Promise<kj::Own<WorkerInterface>> DurableBootstrap::prepare(
+                     })
+                 .first;
+     server.publishDurableRoot(state.durableHome, ticket.tree);
++    found->second.broken = found->second.actor->onBroken()
++                               .then([]() {}, [tree](kj::Exception &&) {
++      tree->server.beginDurableReset(tree->state, tree->tree);
++    }).eagerlyEvaluate(nullptr);
+   }
+   if (found->second.resetting) {
+     kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
