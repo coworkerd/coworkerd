@@ -13,12 +13,14 @@ const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', bu
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const events = scenario === 'events';
+const httpIsolation = scenario === 'http-isolation';
+const boundedEvents = events || httpIsolation;
 const queueLimit = scenario === 'queue-limit';
 const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = events || measure || placement || httpLifecycle;
+const exerciseEvents = boundedEvents || measure || placement || httpLifecycle;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -35,7 +37,7 @@ const env = {
   TMPDIR: scratch,
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
-  ...(events ? {
+  ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
@@ -291,7 +293,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, events ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -609,7 +611,7 @@ try {
     };
     const initial = await request('/first', { method: 'POST', body: 'confirmed in fixture SQLite' });
     assert.deepEqual(await request('/first'), initial);
-    assert.equal(await request('/first?rpc'), initial.counter);
+    if (!httpIsolation) assert.equal(await request('/first?rpc'), initial.counter);
     const other = await request('/other', { method: 'POST', body: 'other tree' });
     assert.notEqual(other.instance, initial.instance);
     assert.equal(other.isolate, initial.isolate);
@@ -630,8 +632,13 @@ try {
       await delay(10);
     }
     assert.ok(held);
-    assert.equal(await request('/first?rpc'), initial.counter);
-    assert.equal(await request('/first?nested'), other.counter);
+    if (httpIsolation) {
+      assert.deepEqual(await request('/first'), initial);
+      assert.deepEqual(await request('/other'), other);
+    } else {
+      assert.equal(await request('/first?rpc'), initial.counter);
+      assert.equal(await request('/first?nested'), other.counter);
+    }
     await request('/first?release');
     assert.deepEqual(await waiting, initial);
 
@@ -646,9 +653,9 @@ try {
       await delay(10);
     }
     assert.ok(running);
-    const [write, gatedRead] = await Promise.all([gated, request('/first?rpc')]);
+    const [write, gatedRead] = await Promise.all([gated, request(httpIsolation ? '/first' : '/first?rpc')]);
     assert.equal(write.counter, 'after input gate');
-    assert.equal(gatedRead, write.counter);
+    assert.equal(httpIsolation ? gatedRead.counter : gatedRead, write.counter);
 
     let previous = write;
     let resets = (await readAdmission(socketPath)).actorResets;
@@ -706,6 +713,19 @@ try {
       await delay(25);
     }
     assert.ok(completeTrace, 'missing same-home facet and root destruction evidence');
+    const finalState = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1000),
+    }).then(reply => reply.json());
+    const sameChild = finalState.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    const counters = await waitForAdmission(socketPath, 0);
+    assert.equal(counters.isolateResets, 0);
+    assert.equal(counters.actorResets, 2);
+    console.log(JSON.stringify({scenario, inputGate: true, interleavedHttp: httpIsolation,
+      facetStatePreserved: true, sameHomeLifecycle: true, pid: sameChild.pid,
+      generation: sameChild.generation, admission: counters}));
   }
   assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
   child.kill('SIGTERM');
