@@ -4,7 +4,7 @@
 // unprivileged user (uid 10001, as in the image and the systemd unit), the harness as root reads every process's /proc.
 // The binary directory needs a `coworkerd-server` that executes the node daemon `coworkerd` with its arguments: this
 // environment starts the node by that name (a two-line shell script will do).
-//   V45_BIN    the node, the launcher, workerd and the two system call tables (Linux, this machine's architecture)
+//   V45_BIN    the node, the launcher, workerd, coworkerd-threaded and the two system call tables (Linux, this machine's architecture)
 //   V45_STACK  the stack directory (default /tmp/coworkerd-lab-stack, inside the container)
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";

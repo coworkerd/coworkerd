@@ -38,7 +38,11 @@ Generate the allowlist on the target architecture using profiles from `scripts/s
 `scripts/syscall-allowlist.py` as described in the system call allowlist section of the
 [installation guide](docs/guide/install.md). Run the generator from a directory where you can pass relative
 paths for every `--workerd` and `--profile` input, because it writes those paths into `allowlist.json`.
-The generated allowlist must name the exact `workerd` being packaged.
+The profiling binary directory must contain both `workerd` and its sibling `coworkerd-threaded`.
+The profiler records their separate hashes and selects the traced program by process role. A legacy GC
+counter absent from the threaded lifecycle is recorded as unobserved, not as a successful collection.
+The generated allowlist must name the exact `workerd` being packaged; keep the paired threaded hash
+in the profile provenance with the archive record.
 If `ALLOWLIST` is the generated directory, package and unpack your build into the same layout as the fetch command:
 
 ```bash
