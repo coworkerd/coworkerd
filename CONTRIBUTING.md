@@ -120,7 +120,6 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `workerd-configuration` | Patched `workerd`, for the single-process configuration contract |
 | `node-child-memory` (Linux only) | Patched `workerd` and its sibling `coworkerd-threaded`, for actual child processes |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
-| `node-threaded-durable-events` (Linux only) | Both kernel binaries, for HTTP, RPC, actor and facet lifecycle, and event CPU limits |
 | `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
 | `node-threaded-durable-http-isolation` (Linux only) | Both kernel binaries, for HTTP input gates, interleaving during an await, caller cancellation with home lifecycle tracing, facet storage/lifecycle, and JavaScript/SQLite event CPU resets with a surviving neighboring actor |
 | `node-threaded-durable-http-output-gate` (Linux only) | Both kernel binaries, for an HTTP response held behind delayed test-storage confirmation and the saved value after release |
@@ -136,6 +135,10 @@ The positional single-node fixture opts in with `durableObjects.threadedTestStor
 The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
 an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
 fixture deployments. Each threaded durable child starts without a persistent log channel.
+This PR supports HTTP events. Durable JavaScript RPC is explicitly `NOT_SUPPORTED`; RPC input/output
+gates and nested RPC remain for the next PR of issue #36. The positive `events` fixture stays in source
+as that follow-up's acceptance test, but is not registered in the current CTest/CI suite. The HTTP
+isolation test verifies RPC refusal and subsequent HTTP availability in the same child.
 The fixture derives local namespaces from the active declarations and routes them only within the node.
 Each child generation opens a fresh SQLite volume inside the fixture stack.
 The `http-output-gate` mode delays the test-storage completion callback by 300 ms and observes its pending

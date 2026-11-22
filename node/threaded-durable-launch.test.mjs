@@ -901,6 +901,11 @@ try {
     const initial = await request('/first', { method: 'POST', body: 'confirmed in fixture SQLite' });
     assert.deepEqual(await request('/first'), initial);
     if (!httpIsolation) assert.equal(await request('/first?rpc'), initial.counter);
+    else {
+      const unsupported = await request('/first?rpc', undefined, 502);
+      assert.match(unsupported.error, /NOT_SUPPORTED.*JavaScript RPC in the durable test role/);
+      assert.deepEqual(await request('/first'), initial);
+    }
     const other = await request('/other', { method: 'POST', body: 'other tree' });
     assert.notEqual(other.instance, initial.instance);
     assert.equal(other.isolate, initial.isolate);
@@ -988,6 +993,17 @@ try {
     let previous = write;
     let resets = (await readAdmission(socketPath)).actorResets;
     for (const cause of ['cpu', 'sqlCpu']) {
+      const sibling = request('/other?hold');
+      sibling.catch(() => {});
+      let siblingHeld = false;
+      for (const until = performance.now() + 2000; performance.now() < until;) {
+        if (await request('/other?waiting')) {
+          siblingHeld = true;
+          break;
+        }
+        await delay(10);
+      }
+      assert.ok(siblingHeld, 'the neighboring event must be suspended before the CPU reset');
       const refused = await request('/first?' + cause, undefined, 503);
       assert.equal(refused.code, 'CPU_LIMIT_EXCEEDED');
       let resetObserved = false;
@@ -1006,7 +1022,10 @@ try {
       assert.equal(rebuilt.isolate, previous.isolate);
       assert.equal(rebuilt.counter, previous.counter);
       previous = rebuilt;
-      console.log(JSON.stringify({event: 'http-actor-cpu-reset-passed', cause, resets}));
+      await request('/other?release');
+      assert.deepEqual(await sibling, other);
+      console.log(JSON.stringify({event: 'http-actor-cpu-reset-passed', cause, resets,
+        suspendedNeighborSurvived: true}));
     }
     await delay(11500);
     const reopened = await request('/first');
