@@ -2961,14 +2961,19 @@ void DurableLog::slowFlushOnceForTest() {
   ::usleep(useconds_t(std::min<uint64_t>(ms, 60000) * 1000));
 }
 
-kj::Promise<void> DurableLog::waitForPeerAckGateForTest() {
+bool DurableLog::peerAckGateClosedForTest() const {
+  if (peerAckGateForTest.empty()) return false;
   std::error_code error;
-  if (!std::filesystem::exists(peerAckGateForTest, error)) co_return;
+  return std::filesystem::exists(peerAckGateForTest, error);
+}
+
+kj::Promise<void> DurableLog::waitForPeerAckGateForTest() {
+  if (!peerAckGateClosedForTest()) co_return;
   ++heldPeerAcksForTest;
   KJ_DEFER(--heldPeerAcksForTest);
   do {
     co_await timer.afterDelay(10 * kj::MILLISECONDS);
-  } while (std::filesystem::exists(peerAckGateForTest, error));
+  } while (peerAckGateClosedForTest());
 }
 
 // Records this node will never confirm and never put in a segment: the write was answered with a failure, so a
@@ -7678,7 +7683,7 @@ std::string DurableLog::json() const {
         << ",\"refusal\":" << quote(peer.lastRefusal) << "}";
   }
   out << "],\"switches\":" << peerSwitches;
-  if (peerAckGateEnabledForTest()) out << ",\"heldAcksForTest\":" << heldPeerAcksForTest;
+  if (!peerAckGateForTest.empty()) out << ",\"heldAcksForTest\":" << heldPeerAcksForTest;
   out << "},\"confirm\":{\"confirmations\":" << confirmations
       << ",\"failures\":" << confirmFailures << ",\"refusals\":" << refusals << ",\"isolations\":" << isolations
       << ",\"unconfirmed\":" << unconfirmed << ",\"unconfirmedBytes\":\"" << unconfirmedBytes

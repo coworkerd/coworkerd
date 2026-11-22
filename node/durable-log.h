@@ -440,7 +440,7 @@ public:
     std::string refusal;
   };
   AppendResult appendIncoming(uint64_t streamId, std::string_view records, bool partial = false);
-  bool peerAckGateEnabledForTest() const { return !peerAckGateForTest.empty(); }
+  bool peerAckGateClosedForTest() const;
   kj::Promise<void> waitForPeerAckGateForTest();
   void trimIncoming(uint64_t streamId, uint64_t upTo);
   void dropIncoming(uint64_t streamId, const std::vector<uint64_t>& sequences);
