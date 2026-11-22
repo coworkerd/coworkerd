@@ -1,9 +1,9 @@
 {
   "upstream": "v1.20261114.1",
   "upstreamCommit": "3d3093c8f01b9b53f4d36d20a8e4ea0a39787992",
-  "patchSeriesSha256": "38fdef56c3f450a12caff814d16a4977a9bcb863e2940c30632281a9748bbae5",
+  "patchSeriesSha256": "cc7f408fa9164379e5111da13549f6ee5318f0331d572deeab2bec6526929a98",
   "archives": {
-    "linux-x86_64": "7e48a7675cafe570e2f8a8f02dc046cd8095febbcf164c552de93530f3a71d47",
+    "linux-x86_64": "b0c0fe7c778666ac3683bcbaa1af67413f4d1a4a1bc2a9ccdf96f80274af2028",
     "linux-arm64": null
   }
 }
