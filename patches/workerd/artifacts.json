@@ -4,6 +4,6 @@
   "patchSeriesSha256": "aebfc411b6500aff7579e7bcfcfd9d3af88f3cb469ff6e4ebe2528daefcd5e44",
   "archives": {
     "linux-x86_64": "d4c39e0ea39c379df6062fcb66d286119a2fdc887a378bce9cb698a35e7a6fce",
-    "linux-arm64": null
+    "linux-arm64": "668eae156c2c613142b40f56195b6dff1c4acc38a5a4f4a9e607e0972d81ffae"
   }
 }
