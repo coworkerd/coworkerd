@@ -34,6 +34,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   For the threaded durable test role, `0047-durable-test-events.patch` lets the embedder pass an
   absolute thread CPU deadline to SQLite through `src/workerd/util/sqlite.{h,c++}`. The existing
   constructor continues to use the shipped SQL accounting.
+  `0048-durable-event-cpu.patch` adds opt-in api/io/jsg hooks that carry delivered-event CPU
+  accounting and lease authority through actor entry and asynchronous callbacks.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

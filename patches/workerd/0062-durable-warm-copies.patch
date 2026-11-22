@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 17:01:54 +0800
+Subject: [PATCH] Prefer matching warm durable copies after root retirement
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index f7fa17d49626668d038c26da99d96ae2967062d6..e3cd6ba59bd0e289783ab909c9c2d0f4ece78571 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2227,6 +2227,7 @@ struct ThreadedServer {
+     std::thread thread;
+     struct DurableHome {
+       std::string definition;
++      std::string warmDefinition;
+       uint32_t reservedTrees = 0;
+       uint64_t memory = 0;
+       server::DurableHomeLoad load{std::chrono::seconds(4)};
+@@ -2550,10 +2551,14 @@ struct ThreadedServer {
+       for (size_t i = 0; i < threads.size(); ++i) {
+         if (!threads[i]->home) continue;
+         auto &home = *threads[i]->home;
+-        if (home.definition.empty()) {
+-          if (spare == 0 && !home.pressure.resetting()) spare = i + 1;
+-          continue;
++        // An empty copy keeps its definition until its isolate is released.
++        // Prefer a matching warm copy, then an unused home, then a different empty copy.
++        if (home.reservedTrees == 0 && !home.pressure.resetting() &&
++            (spare == 0 ||
++                (home.definition.empty() && !threads[spare - 1]->home->definition.empty()))) {
++          spare = i + 1;
+         }
++        if (home.definition.empty()) continue;
+         candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
+           home.load.busyFor(now), home.pressure.accepting()});
+       }
+@@ -2620,7 +2625,7 @@ struct ThreadedServer {
+     if (home.resident.contains(ticket.tree)) return;
+     if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
+     KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
+-    if (--home.reservedTrees == 0) home.definition.clear();
++    if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
+   }
+ 
+   // durableRoutingMutex is held while checking the FIFO and installing or
+@@ -2743,7 +2748,7 @@ struct ThreadedServer {
+         KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
+         auto &home = *threads[homeId - 1]->home;
+         home.resident.erase(tree);
+-        if (--home.reservedTrees == 0) home.definition.clear();
++        if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
+       }
+     }
+     if (reclaimed) {
+@@ -2780,6 +2785,8 @@ struct ThreadedServer {
+       std::lock_guard lock(durableRoutingMutex);
+       auto &home = *threads[homeId - 1]->home;
+       home.memory = 0;
++      home.warmDefinition.clear();
++      if (home.reservedTrees == 0) home.definition.clear();
+       if (home.pressure.resetting()) {
+         home.pressure.closed();
+         durableIsolateResets.fetch_add(1);
+@@ -3418,11 +3425,19 @@ struct ThreadedServer {
+     }
+     KJ_REQUIRE(state.durableRoots.empty(), "durable home still owns a different isolate");
+     state.durableSlot.reset();
++    {
++      std::lock_guard lock(durableRoutingMutex);
++      threads[state.durableHome - 1]->home->warmDefinition.clear();
++    }
+     if (!state.durableLoad) {
+       state.durableLoad.emplace(loadDurableWorker(state, kj::str(descriptor), definition).fork());
+     }
+     try {
+       state.durableSlot = co_await state.durableLoad->addBranch();
++      {
++        std::lock_guard lock(durableRoutingMutex);
++        threads[state.durableHome - 1]->home->warmDefinition = state.durableSlot->planRevision;
++      }
+       state.durableLoad.reset();
+       co_return state.durableSlot;
+     } catch (...) {

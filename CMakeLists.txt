@@ -309,10 +309,26 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/node-child-memory.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
     set_tests_properties(node-child-memory PROPERTIES TIMEOUT 15)
+    add_test(NAME node-threaded-durable-storage-lifecycle COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-storage-lifecycle.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
+    set_tests_properties(node-threaded-durable-storage-lifecycle PROPERTIES TIMEOUT 35)
+    add_test(NAME node-threaded-durable-cpu-events COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" cpu-events)
+    set_tests_properties(node-threaded-durable-cpu-events PROPERTIES TIMEOUT 30)
     add_test(NAME node-threaded-durable-launch COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js")
     set_tests_properties(node-threaded-durable-launch PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-home-reservation COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" home-reservation)
+    set_tests_properties(node-threaded-durable-home-reservation PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-warm-copies COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" warm-copies)
+    set_tests_properties(node-threaded-durable-warm-copies PROPERTIES TIMEOUT 30)
     # The positive RPC/events fixture is retained for the next PR of issue #36.
     # This HTTP-only step refuses durable JavaScript RPC before entering that path.
     add_test(NAME node-threaded-durable-http-isolation COMMAND "${COWORKERD_TEST_NODE}"

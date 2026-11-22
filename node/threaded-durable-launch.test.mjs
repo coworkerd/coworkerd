@@ -1,3 +1,76 @@
+/*
+Disposable threaded Durable Object fixture
+
+The `cpu-events` mode calibrates finite work from native home-thread CPU samples. Events on
+one actor interleave across awaits: their combined CPU must exceed a single event budget while
+each stays below it, then one event alone exceeds its budget across repeated awaits. The latter
+must reset only its actor tree, preserving stored state, the neighboring object and the ready child.
+
+The positional single-node fixture opts in with `durableObjects.threadedTestStorage: true`.
+The node creates a fresh temporary stack for the run and refuses object-store configuration, peers, and
+an existing Durable Object storage directory in the fixture stack. Use this setting only with disposable
+fixture deployments. Each threaded durable child starts without a persistent log channel.
+The initial host supports HTTP events. Durable JavaScript RPC is explicitly `NOT_SUPPORTED`; RPC input/output
+gates and nested RPC remain for the next PR of issue #36. The positive `events` fixture stays in source
+as that follow-up's acceptance test, but is not registered in the current CTest/CI suite. The HTTP
+isolation test verifies RPC refusal and subsequent HTTP availability in the same child.
+The fixture derives local namespaces from the active declarations and routes them only within the node.
+Each child generation opens a fresh SQLite volume inside the fixture stack.
+The `http-output-gate` mode delays the test-storage completion callback by 300 ms and observes its pending
+counter before accepting a response to an unawaited write. This default-zero hook is limited to the test
+role and at most 1000 ms; it does not simulate peer acknowledgments, a durable log or crash recovery.
+The `http 4 64` fixture mode writes and reads two objects, checks unchanged instances after a brief
+idle interval, then observes three real idle retirements and wakes. Each first wake request alternates
+between a read and a write that verifies the previous stored value before replacing it. Repeated reads
+check the new instance and stored value, while the child must retain its ready PID and generation.
+It does not send JavaScript RPC calls.
+The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
+copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
+waiting mailbox defaults to four events/64 KiB. Reservations keep 256 descriptors plus five per home
+outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
+declared waiting bytes. Facets reserve their own metadata and descriptors. These test-role defaults are
+supported by the source-tagged capacity, queue, pressure and overlap measurements in PR #43; actual
+body execution remains subject to the copy/process memory limits.
+The `http-overlap` mode observes 16 fully read and written 16 KiB bodies held across four facets while
+same-object and neighboring-object requests continue. It records RSS, threads and descriptors, verifies
+facet state and exact event-credit return, and checks the original child remains ready. The ordinary
+ingress fixture uses 32 call slots so its concurrency limit does not hide durable overlap.
+The `group-refusal` mode injects one empty V8-group factory result only in the disposable role, then
+requires returned reservations, successful retry and the original ready child. This does not simulate
+physical address-space exhaustion; `COWORKERD_DO_TEST_REFUSE_GROUP` is zero by default.
+The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
+`COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
+`COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
+`COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
+descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
+
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 4 64`
+to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
+and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
+
+The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
+It checks quiet-copy reuse, a distinct copy after the home becomes busy, pinned existing actors,
+returned event credits, and an unchanged ready child without actor resets or idle retirement.
+For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js placement 4 64 3000`
+uses four homes, 64 roots per copy, and a 3000 ms busy threshold in the four-second window.
+The last argument can vary the threshold for measurements; output includes every work and cold-request
+duration plus the child's thread count, RSS, descriptors, and admission counters. These request durations
+include transport and scheduling, so they are not direct samples of the kernel's synchronous busy clock.
+With `placement-control 4 64 4000`, the same workload runs 32 rounds and must keep one copy;
+the four-second threshold excludes busy-triggered splitting while leaving capacity and memory limits unchanged.
+
+The `queues 4 64` mode measures admission for 64 objects with four events each, declaring 16 KiB per
+event. It checks the four-event count limit separately using one-byte declarations, with another object
+still admitted. This is a measurement before request bodies are read, not an actor execution or payload
+allocation workload. It records reservations, RSS, threads and descriptors, cancels the queued calls,
+and checks that reservations and descriptors return to baseline. The final argument varies the object count.
+The `queue-limit 4 64` mode must run with a descriptor limit of 512; the CTest wrapper sets that limit
+only for its own process tree. It asserts refusal at the reservation ceiling, continued control access,
+256 descriptors of headroom and full credit return. `queue-memory 4 256` sets a 128 MiB process budget
+and checks refusal at its 16 MiB admission memory ceiling. These queue modes verify the original ready
+PID and generation after release. They do not execute Worker events or exercise V8 allocation failure.
+*/
+
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -12,7 +85,10 @@ import { promisify } from 'node:util';
 const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
+const homeReservation = scenario === 'home-reservation';
+const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
+const cpuEvents = scenario === 'cpu-events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
 const httpMemory = scenario === 'http-memory';
@@ -26,7 +102,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
+const exerciseEvents = cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -44,9 +120,12 @@ const env = {
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
+  ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
+  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1',
+    COWORKERD_DO_TEST_HOME_COUNT: '1' } : {}),
   ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
@@ -137,9 +216,9 @@ async function readProcessResources(pid) {
   };
 }
 
-function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n) {
+function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hrtime.bigint() + 5_000_000_000n, definition = 'fixture') {
   return 'D' + JSON.stringify({
-    namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition: 'fixture',
+    namespaceId: 'a'.repeat(64), objectId, invocationId, className: 'Counter', definition,
     uniqueKey: 'coworkerd-do-root-v1-' + 'a'.repeat(64), storageId: objectId,
     generation: '1', dataEpoch: '1', shardEpoch: '1', openId: '1',
     queuedBytes: String(queuedBytes), expiresMonotonicNs: String(expiry),
@@ -173,6 +252,29 @@ try {
       async fetch(request) {
         isolate ??= crypto.randomUUID();
         const query = new URL(request.url).searchParams;
+        if (query.has("sliceWaiting")) return Response.json(this.slicePart ?? 0);
+        if (query.has("sliceRelease")) {
+          this.sliceLatch.resolve();
+          return Response.json("released");
+        }
+        if (query.has("sliceWork")) {
+          const iterations = Number(query.get("sliceWork"));
+          const parts = Number(query.get("parts"));
+          if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000 ||
+              ![2, 4].includes(parts)) return new Response("invalid slices", {status: 400});
+          this.sliceChecksum = 1;
+          for (let part = 1; part <= parts; ++part) {
+            let checksum = 1;
+            for (let i = 0; i < iterations; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
+            this.sliceChecksum = checksum;
+            this.slicePart = part;
+            if (part < parts) {
+              this.sliceLatch = Promise.withResolvers();
+              await this.sliceLatch.promise;
+            }
+          }
+          this.slicePart = 0;
+        }
         if (query.has("work")) {
           const iterations = Number(query.get("work"));
           if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200000000) {
@@ -280,11 +382,23 @@ try {
       durableObjects: [{ binding: 'COUNTERS', className: 'Counter' }], classes: { declared: ['Counter'] },
     });
   }
-  await writeFile(manifestPath, JSON.stringify({
-    compatibilityDate: '2026-08-27',
-    routes: [{ host: '*', pathPrefix: '/', workerId }],
-    workers: [{ workerId, activeVersion: 'v1', versions: [version] }],
-  }));
+  const routes = [{ host: '*', pathPrefix: '/', workerId }];
+  const workers = [{ workerId, activeVersion: 'v1', versions: [version] }];
+  if (warmCopies) {
+    const secondId = 'second-counter';
+    const secondModules = join(fixture, 'workers', secondId, 'v1');
+    await mkdir(secondModules, {recursive: true});
+    const secondSource = source + '\n// A distinct fixture definition.\n';
+    const secondPackage = JSON.stringify({modules: [
+      {bytes: Buffer.byteLength(secondSource), name: 'index.js', sha256: hash(secondSource), type: 'esm'},
+    ]});
+    await writeFile(join(secondModules, 'index.js'), secondSource);
+    await writeFile(join(secondModules, 'package.json'), secondPackage);
+    routes.unshift({host: '*', pathPrefix: '/warm-second', workerId: secondId});
+    workers.push({workerId: secondId, activeVersion: 'v1',
+      versions: [{...version, contentHash: hash(secondPackage)}]});
+  }
+  await writeFile(manifestPath, JSON.stringify({compatibilityDate: '2026-08-27', routes, workers}));
 
   await writeConfig({ ...config, storage: { endpoint: 'http://127.0.0.1:1' } });
   await refuseStart(/requires the positional single-node fixture and disposable local storage/);
@@ -340,7 +454,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents || cpuEvents ? 250 : 30000);
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));
@@ -409,7 +523,208 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (httpLifecycle) {
+  if (homeReservation) {
+    const homeThreads = async () => {
+      const tasks = join('/proc', String(processInfo.pid), 'task');
+      const rows = await Promise.all((await readdir(tasks)).map(async tid =>
+        [(await readFile(join(tasks, tid, 'comm'), 'utf8')).trim(), Number(tid)]));
+      return rows.filter(([name]) => name === 'cwkd-call').map(([, tid]) => tid).sort((a, b) => a - b);
+    };
+    // Observe actual Linux home loops, not just the reservation table's thread dimension.
+    const originalThreads = await homeThreads();
+    assert.equal(originalThreads.length, 2);
+    const keep = [];
+    const claim = async (id, definition) => {
+      const connection = await sendPreface(socketPath,
+        durablePreface(id.repeat(64), `home-${id}`, 0, undefined, definition));
+      keep.push(connection.socket);
+      return connection;
+    };
+    try {
+      for (const [id, definition] of [['1', 'definition-one'], ['2', 'definition-two']]) {
+        const connection = await claim(id, definition);
+        assert.equal(connection.receipt, 'A');
+        connection.socket.write(Buffer.alloc(1));
+      }
+      const occupied = await waitForAdmission(socketPath, 2, 2);
+      assert.equal(occupied.homes, 2);
+      assert.deepEqual(await homeThreads(), originalThreads);
+      const refused = await claim('3', 'definition-three');
+      assert.equal(refused.receipt, 'R',
+        'a definition without a reservable home must be refused before acknowledgement');
+      const bounded = await readAdmission(socketPath);
+      assert.equal(bounded.trees, 2);
+      assert.equal(bounded.waiting, 2);
+      assert.equal(bounded.homes, 2);
+      assert.equal(bounded.reservedBytes, occupied.reservedBytes);
+      assert.equal(bounded.reservedDescriptors, occupied.reservedDescriptors);
+      assert.deepEqual(await homeThreads(), originalThreads, 'refusal must not create another home thread');
+    } finally {
+      for (const socket of keep) socket.destroy();
+    }
+    const drained = await waitForAdmission(socketPath, 0);
+    assert.equal(drained.trees, 0);
+    assert.equal(drained.reservedBytes, 0);
+    assert.equal(drained.reservedDescriptors, 0);
+    const retry = await claim('3', 'definition-three');
+    try {
+      assert.equal(retry.receipt, 'A');
+      const reserved = await readAdmission(socketPath);
+      assert.equal(reserved.homes, 1, 'the home must already be reserved when acknowledgement arrives');
+    } finally { retry.socket.destroy(); }
+    await waitForAdmission(socketPath, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const live = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(live.pid, processInfo.pid);
+    assert.equal(live.generation, processInfo.generation);
+    assert.equal(live.state, 'ready');
+    assert.deepEqual(await homeThreads(), originalThreads);
+    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2,
+      homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
+  } else if (cpuEvents) {
+    const request = async (path, options, accepted = [200]) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.ok(accepted.includes(response.status), `${path}: ${response.status} ${body}\n${diagnostics}`);
+      return {status: response.status, value: JSON.parse(body)};
+    };
+    const original = (await request('/event-owner', {method: 'POST', body: 'saved owner'})).value;
+    const neighbor = (await request('/event-neighbor', {method: 'POST', body: 'saved neighbor'})).value;
+    assert.equal(original.isolate, neighbor.isolate);
+    const tasks = join('/proc', String(processInfo.pid), 'task');
+    const tids = new Set();
+    for (const tid of await readdir(tasks)) {
+      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-call') tids.add(Number(tid));
+    }
+    assert.equal(tids.size, 1);
+    const samples = [];
+    const cpuTurns = async () => Array.from(
+      (await readFile(join(stack, 'logs', 'workerd.log'), 'utf8')).matchAll(/\[threaded-js\] (\{[^\n]*\})/g),
+      match => JSON.parse(match[1]));
+    const measure = async (iterations) => {
+      await delay(20);
+      const start = (await cpuTurns()).length;
+      await request(`/event-owner?work=${iterations}`);
+      await waitForAdmission(socketPath, 0);
+      await delay(50);
+      const cpuMs = (await cpuTurns()).slice(start).filter(row => tids.has(row.tid))
+        .reduce((total, row) => total + row.cpuNs / 1e6, 0);
+      assert.ok(cpuMs > 0, 'calibration requires native home-thread CPU samples');
+      samples.push({iterations, cpuMs});
+      return cpuMs;
+    };
+    await measure(1000000);
+    let iterations = 10000000, sliceCpuMs;
+    for (let attempt = 0; attempt < 5; ++attempt) {
+      sliceCpuMs = await measure(iterations);
+      if (sliceCpuMs >= 75 && sliceCpuMs <= 100) break;
+      iterations = Math.min(200000000, Math.max(100000, Math.round(iterations * 85 / sliceCpuMs)));
+    }
+    assert.ok(sliceCpuMs >= 75 && sliceCpuMs <= 100, JSON.stringify(samples));
+    const waiting = async (part, ended = () => false) => {
+      for (const until = performance.now() + 2000; performance.now() < until;) {
+        if (ended()) return false;
+        const response = await request('/event-owner?sliceWaiting', undefined, [200, 502, 503]);
+        if (response.status !== 200) return false;
+        if (response.value === part) return true;
+        await delay(10);
+      }
+      assert.fail('the sliced event did not suspend at part ' + part);
+    };
+    // Four calibrated slices in total exceed the actor's 250 ms budget, but no event does.
+    const cpuStart = (await cpuTurns()).length;
+    const within = request(`/event-owner?sliceWork=${iterations}&parts=2`);
+    within.catch(() => {});
+    assert.ok(await waiting(1));
+    await request(`/event-owner?work=${iterations}`);
+    await request(`/event-owner?work=${iterations}`);
+    await request('/event-owner?sliceRelease');
+    assert.deepEqual((await within).value, original);
+    assert.deepEqual((await request('/event-owner')).value, original);
+    assert.equal((await waitForAdmission(socketPath, 0)).actorResets, 0);
+    await delay(50);
+    const interleavedCpuMs = (await cpuTurns()).slice(cpuStart).filter(row => tids.has(row.tid))
+      .reduce((total, row) => total + row.cpuNs / 1e6, 0);
+    assert.ok(interleavedCpuMs > 250, 'the interleaved total must exceed one event budget');
+    // The same event must retain its own CPU charge after repeated yields and other events.
+    let ended = false;
+    const over = request(`/event-owner?sliceWork=${iterations}&parts=4`, undefined, [503])
+      .then(result => { ended = true; return result; });
+    over.catch(() => {});
+    for (let part = 1; part <= 3; ++part) {
+      if (!(await waiting(part, () => ended))) break;
+      await request('/event-owner?work=1');
+      await request('/event-owner?sliceRelease', undefined, [200, 502, 503]);
+    }
+    assert.equal((await over).value.code, 'CPU_LIMIT_EXCEEDED');
+    await waitForAdmission(socketPath, 0);
+    await delay(300);
+    const rebuilt = (await request('/event-owner')).value;
+    assert.notEqual(rebuilt.instance, original.instance);
+    assert.equal(rebuilt.counter, original.counter);
+    assert.equal(rebuilt.isolate, original.isolate);
+    assert.deepEqual((await request('/event-neighbor')).value, neighbor);
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.actorResets, 1);
+    assert.equal(after.isolateResets, 0);
+    const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const sameChild = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    console.log(JSON.stringify({scenario, samples, interleavedCpuMs, isolatedEventCpu: true,
+      cumulativeCpuAcrossAwaits: true, neighborPreserved: true, admission: after}));
+  } else if (warmCopies) {
+    const request = async (path, options) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, `${path}: ${body}\n${diagnostics}`);
+      return JSON.parse(body);
+    };
+    const paths = ['/warm-first', '/warm-second'];
+    const initial = [];
+    for (const path of paths) initial.push(await request(path, {method: 'POST', body: path}));
+    assert.notEqual(initial[0].isolate, initial[1].isolate);
+    assert.equal((await waitForAdmission(socketPath, 0)).homes, 2);
+    let idle;
+    for (const until = performance.now() + 15000; performance.now() < until;) {
+      idle = await readAdmission(socketPath);
+      if (idle.residentRoots === 0 && idle.idleRetirements >= 2) break;
+      await delay(50);
+    }
+    assert.equal(idle.residentRoots, 0, JSON.stringify(idle));
+    assert.equal(idle.trees, 0);
+    assert.equal(idle.reservedBytes, 0);
+    // Reverse creation order: choosing the lowest empty home would destroy both warm copies.
+    for (const index of [1, 0]) {
+      const woken = await request(paths[index]);
+      assert.equal(woken.counter, paths[index]);
+      assert.notEqual(woken.instance, initial[index].instance);
+      assert.equal(woken.isolate, initial[index].isolate,
+        'an empty matching warm copy must be preferred over another definition’s empty home');
+      assert.deepEqual(await request(paths[index]), woken);
+    }
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.actorResets, 0);
+    assert.equal(after.isolateResets, 0);
+    console.log(JSON.stringify({scenario, definitions: 2, warmCopiesPreserved: true,
+      statePreserved: true, admission: after}));
+  } else if (httpLifecycle) {
     const request = async (path, options) => {
       const started = performance.now();
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {

@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sun, 22 Nov 2026 16:53:12 +0800
+Subject: [PATCH] Reserve a durable home before acknowledging its connection
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+index 20138ab88b9057d51e7da448fd720ac3ff361488..62938e216edec901d3664b58d24e3e3d1d16934c 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -120,6 +120,32 @@ KJ_TEST("durable admission expires queued events and releases each reservation o
+   KJ_EXPECT((table.state().reserved == limits.tree));
+ }
+ 
++KJ_TEST("home refusal returns waiting credit once without canceling an active event") {
++  Admission table(limits, 1);
++  const auto active = queued(table.queue(first, open, 10, deadline, now), true);
++  KJ_REQUIRE(table.publishHome(active.tree, 1));
++  KJ_REQUIRE(table.begin(active, 1, first, open, now) == Delivery::ACCEPTED);
++  const auto reserved = table.state().reserved;
++  const auto waiting = queued(table.queue(first, open, 20, deadline, now), false);
++  KJ_EXPECT(!table.refuseWaiting(active));
++  KJ_EXPECT(table.state().active == 1);
++  KJ_EXPECT(table.state().overloads == 0);
++  KJ_EXPECT(table.refuseWaiting(waiting));
++  KJ_EXPECT(!table.refuseWaiting(waiting));
++  KJ_EXPECT(table.state().overloads == 1);
++  KJ_EXPECT(table.state().waiting == 0);
++  KJ_EXPECT((table.state().reserved == reserved));
++  KJ_EXPECT(table.complete(active, 1));
++  KJ_EXPECT(table.stopIdleTree(active.tree, 1));
++  KJ_EXPECT(table.releaseTree(active.tree, 1));
++
++  const auto unassigned = queued(table.queue(second, open, 20, deadline, now), true);
++  KJ_EXPECT(table.refuseWaiting(unassigned));
++  KJ_EXPECT(table.releaseUnassigned(unassigned.tree));
++  KJ_EXPECT((table.state().reserved == Admission::Resources{}));
++  KJ_EXPECT(table.state().overloads == 2);
++}
++
+ KJ_TEST("durable admission retains a closing tree until its home acknowledges release") {
+   Admission table(limits, 1);
+   const auto old = queued(table.queue(first, open, 30, deadline, now), true);
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index a14d3456c50c8bcd4b57fada58daaf6b9b87e8db..e19c838ba336cd43bfcca5c0fdcba184faf86ea5 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -177,6 +177,17 @@ DurableAdmission::Cancellation DurableAdmission::cancel(Ticket ticket) {
+   return Cancellation::RELEASED;
+ }
+ 
++bool DurableAdmission::refuseWaiting(Ticket ticket) {
++  auto entry = trees.find(ticket.tree);
++  if (entry == trees.end()) return false;
++  auto& tree = entry->second;
++  auto event = tree.events.find(ticket.event);
++  if (event == tree.events.end() || event->second.phase != Phase::WAITING) return false;
++  releaseEvent(tree, event);
++  ++counters.overloads;
++  return true;
++}
++
+ bool DurableAdmission::complete(Ticket ticket, uint64_t home) {
+   auto entry = trees.find(ticket.tree);
+   if (entry == trees.end() || home == 0 || entry->second.home != home) return false;
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index 02a537fb70304cd83f5b0b26082431974b9155c4..a8234f55d3ccffc92ea3b47140a3ebcbcabf7973 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -92,6 +92,8 @@ class DurableAdmission {
+   std::optional<Ticket> next(uint64_t tree) const;
+   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
+   Cancellation cancel(Ticket ticket);
++  // Refuse a waiting call before acknowledging it, returning its event reservation.
++  bool refuseWaiting(Ticket ticket);
+   bool complete(Ticket ticket, uint64_t home);
+   std::vector<Ticket> expire(Time now);
+ 
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 39610fc917c3df3dbbc7b412f9bd0b3c557b6353..f7fa17d49626668d038c26da99d96ae2967062d6 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2539,15 +2539,9 @@ struct ThreadedServer {
+     return true;
+   }
+ 
+-  // The accept loop has consumed the bounded preface. Transfer the socket
+-  // once it has a home assignment. Only the home reads any RPC bytes.
+-  bool handoffDurable(int fd,
+-      DurableRoute &route,
+-      server::DurableAdmission::Ticket ticket,
+-      server::DurableAdmission::Time deadline) {
+-    if (!ready.load(std::memory_order_acquire)) return false;
+-    std::lock_guard lock(durableRoutingMutex);
+-    if (deadline <= server::DurableAdmission::Clock::now()) return false;
++  // durableRoutingMutex holds placement and event admission together, before
++  // the accept loop acknowledges a connection or reads its dispatch bytes.
++  bool reserveDurableHome(const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
+     auto assigned = durableAdmission->homeFor(ticket.tree);
+     if (!assigned) {
+       std::vector<server::DurableCopyCandidate> candidates;
+@@ -2571,6 +2565,34 @@ struct ThreadedServer {
+       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
+       ++home.reservedTrees;
+     }
++    return !threads[*assigned - 1]->home->pressure.resetting();
++  }
++
++  server::DurableAdmission::Result queueDurable(
++      const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline) {
++    using Admission = server::DurableAdmission;
++    if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
++    std::lock_guard lock(durableRoutingMutex);
++    auto result =
++        durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
++    if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
++      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
++      durableAdmission->releaseUnassigned(result.ticket->tree);
++      return {Admission::Status::OVERLOADED};
++    }
++    return result;
++  }
++
++  // The connection already owns a home reservation. Only that home reads RPC bytes.
++  bool handoffDurable(int fd,
++      DurableRoute &route,
++      server::DurableAdmission::Ticket ticket,
++      server::DurableAdmission::Time deadline) {
++    if (!ready.load(std::memory_order_acquire)) return false;
++    std::lock_guard lock(durableRoutingMutex);
++    if (deadline <= server::DurableAdmission::Clock::now()) return false;
++    auto assigned = durableAdmission->homeFor(ticket.tree);
++    if (!assigned) return false;
+     auto &thread = *threads[*assigned - 1];
+     if (thread.home->pressure.resetting()) return false;
+     thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
+@@ -5332,11 +5354,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+                 "invalid durable routing deadline");
+             auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
+                 std::chrono::nanoseconds(deadlineNs)));
+-            auto result = [&] {
+-              std::lock_guard lock(server.durableRoutingMutex);
+-              return server.durableAdmission->queue(route.key, route.open,
+-                  durableNumber(input, "queuedBytes"), deadline, Admission::Clock::now());
+-            }();
++            auto result = server.queueDurable(route, durableNumber(input, "queuedBytes"), deadline);
+             if (result.ticket) {
+               receipt = 'A';
+               connection.durableCredit = *result.ticket;
