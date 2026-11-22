@@ -81,6 +81,7 @@ const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', bu
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
+const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
 const httpIsolation = scenario === 'http-isolation';
 const httpOutputGate = scenario === 'http-output-gate';
@@ -95,7 +96,7 @@ const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
-const exerciseEvents = boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
+const exerciseEvents = warmCopies || boundedEvents || measure || placement || httpLifecycle || httpOutputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
 if (measure || placement) {
@@ -113,7 +114,7 @@ const env = {
   ...(httpOutputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
-  ...(homeReservation ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
+  ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
   ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
@@ -350,11 +351,23 @@ try {
       durableObjects: [{ binding: 'COUNTERS', className: 'Counter' }], classes: { declared: ['Counter'] },
     });
   }
-  await writeFile(manifestPath, JSON.stringify({
-    compatibilityDate: '2026-08-27',
-    routes: [{ host: '*', pathPrefix: '/', workerId }],
-    workers: [{ workerId, activeVersion: 'v1', versions: [version] }],
-  }));
+  const routes = [{ host: '*', pathPrefix: '/', workerId }];
+  const workers = [{ workerId, activeVersion: 'v1', versions: [version] }];
+  if (warmCopies) {
+    const secondId = 'second-counter';
+    const secondModules = join(fixture, 'workers', secondId, 'v1');
+    await mkdir(secondModules, {recursive: true});
+    const secondSource = source + '\n// A distinct fixture definition.\n';
+    const secondPackage = JSON.stringify({modules: [
+      {bytes: Buffer.byteLength(secondSource), name: 'index.js', sha256: hash(secondSource), type: 'esm'},
+    ]});
+    await writeFile(join(secondModules, 'index.js'), secondSource);
+    await writeFile(join(secondModules, 'package.json'), secondPackage);
+    routes.unshift({host: '*', pathPrefix: '/warm-second', workerId: secondId});
+    workers.push({workerId: secondId, activeVersion: 'v1',
+      versions: [{...version, contentHash: hash(secondPackage)}]});
+  }
+  await writeFile(manifestPath, JSON.stringify({compatibilityDate: '2026-08-27', routes, workers}));
 
   await writeConfig({ ...config, storage: { endpoint: 'http://127.0.0.1:1' } });
   await refuseStart(/requires the positional single-node fixture and disposable local storage/);
@@ -526,6 +539,50 @@ try {
     assert.equal(live.generation, processInfo.generation);
     assert.equal(live.state, 'ready');
     console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2, refusedDefinitions: 1}));
+  } else if (warmCopies) {
+    const request = async (path, options) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        ...options, signal: AbortSignal.timeout(5000),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 200, `${path}: ${body}\n${diagnostics}`);
+      return JSON.parse(body);
+    };
+    const paths = ['/warm-first', '/warm-second'];
+    const initial = [];
+    for (const path of paths) initial.push(await request(path, {method: 'POST', body: path}));
+    assert.notEqual(initial[0].isolate, initial[1].isolate);
+    assert.equal((await waitForAdmission(socketPath, 0)).homes, 2);
+    let idle;
+    for (const until = performance.now() + 15000; performance.now() < until;) {
+      idle = await readAdmission(socketPath);
+      if (idle.residentRoots === 0 && idle.idleRetirements >= 2) break;
+      await delay(50);
+    }
+    assert.equal(idle.residentRoots, 0, JSON.stringify(idle));
+    assert.equal(idle.trees, 0);
+    assert.equal(idle.reservedBytes, 0);
+    // Reverse creation order: choosing the lowest empty home would destroy both warm copies.
+    for (const index of [1, 0]) {
+      const woken = await request(paths[index]);
+      assert.equal(woken.counter, paths[index]);
+      assert.notEqual(woken.instance, initial[index].instance);
+      assert.equal(woken.isolate, initial[index].isolate,
+        'an empty matching warm copy must be preferred over another definition’s empty home');
+      assert.deepEqual(await request(paths[index]), woken);
+    }
+    const current = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
+      headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
+    }).then(response => response.json());
+    const sameChild = current.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(sameChild.pid, processInfo.pid);
+    assert.equal(sameChild.generation, processInfo.generation);
+    assert.equal(sameChild.state, 'ready');
+    const after = await waitForAdmission(socketPath, 0);
+    assert.equal(after.actorResets, 0);
+    assert.equal(after.isolateResets, 0);
+    console.log(JSON.stringify({scenario, definitions: 2, warmCopiesPreserved: true,
+      statePreserved: true, admission: after}));
   } else if (httpLifecycle) {
     const request = async (path, options) => {
       const started = performance.now();

@@ -97,6 +97,7 @@ jobs:
           skipped = [c for c in cases if c.find('skipped') is not None]
           required = ({'node-log-redaction', 'workerd-configuration', 'node-child-memory',
                        'node-threaded-durable-launch', 'node-threaded-durable-home-reservation',
+                       'node-threaded-durable-warm-copies',
                        'node-threaded-durable-http',
                        'node-threaded-durable-http-isolation',
                        'node-threaded-durable-http-output-gate',
