@@ -999,7 +999,7 @@ async function threadedClassMigration(cluster) {
     assert.match(pending.value.text, /DO_CODE_UPDATED/);
     assert.match(pending.value.text, /Durable Object reset because its code was updated/);
   } finally {
-    await reader.cancel();
+    await reader.cancel().catch(() => {});
   }
 
   await eventually('renamed class uses the existing threaded storage', async () => {
