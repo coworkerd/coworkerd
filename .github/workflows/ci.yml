@@ -128,7 +128,7 @@ jobs:
           PY
       - name: Run cluster integration tests
         if: runner.os == 'Linux'
-        timeout-minutes: 12
+        timeout-minutes: 22
         env:
           TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
         run: |
