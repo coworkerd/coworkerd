@@ -290,6 +290,7 @@ export async function longSqlIsolation(cluster) {
   for (let round = 0; round < 2; ++round) {
     await Promise.all(probes.map(probe => probe.check()));
     if (round === 0) await quietWindow();
+    const logSince = new Date().toISOString();
     const pending = blocker.raw([put(round), { sql: slow }])
       .then(response => ({ response }), error => ({ error }));
     await delay(warmStartMs);
@@ -308,7 +309,11 @@ export async function longSqlIsolation(cluster) {
       assert.ok(row);
       return row;
     }, { timeout: 5000, interval: 100 });
-    const log = await cluster.compose(['logs', '--no-color', '--tail', '3500', placement.nodeId]);
+    // A line limit drops early probes when the node logs several events per
+    // dispatch. Fetch from the beginning of the window and use the child's
+    // monotonic timestamps to select the completed overlapping deliveries.
+    const log = await cluster.compose(
+      ['logs', '--no-color', '--since', logSince, placement.nodeId], { maxBuffer: 32 * 1024 * 1024 });
     const start = block.startedMonotonicNs / 1e6;
     const end = block.finishedMonotonicNs / 1e6;
     assert.ok(end - start >= 29900 && end - start <= 31000, JSON.stringify(block));
@@ -335,12 +340,6 @@ export async function longSqlIsolation(cluster) {
     })),
   };
   console.log('Long SQL isolation', JSON.stringify(report));
-  for (const sample of report.probes) {
-    assert.ok(sample.quiet.samples >= 1000 && sample.busy.samples >= 1000, JSON.stringify(sample));
-    assert.ok(sample.observedInBlocker >= 1000, JSON.stringify(sample));
-    assert.ok(sample.busy.errors.length <= sample.quiet.errors.length, JSON.stringify(sample));
-    assert.ok(sample.busy.p99 - sample.quiet.p99 <= 5, JSON.stringify(sample));
-  }
 
   // Each medium-length statement fits by itself; the batch shares one deadline.
   const medium = { sql: slow.replace('1000000000', '2000000') };
@@ -356,4 +355,11 @@ export async function longSqlIsolation(cluster) {
   const timedOut = json(await call('/timeout'), 503, 'D1 SQL deadline');
   assert.match(timedOut.message, /^D1_ERROR: SQL_LIMIT_EXCEEDED:/);
   assert.equal(json(await call(), 200, 'D1 after deadline').success, true);
+
+  for (const sample of report.probes) {
+    assert.ok(sample.quiet.samples >= 1000 && sample.busy.samples >= 1000, JSON.stringify(sample));
+    assert.ok(sample.observedInBlocker >= 1000, JSON.stringify(sample));
+    assert.ok(sample.busy.errors.length <= sample.quiet.errors.length, JSON.stringify(sample));
+    assert.ok(sample.busy.p99 - sample.quiet.p99 <= 5, JSON.stringify(sample));
+  }
 }

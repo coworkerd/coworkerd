@@ -65,11 +65,13 @@ export class Cluster {
     this.confirmTimeoutMs = confirmTimeoutMs;
   }
 
-  async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
+  async command(program, args, {
+    cwd = this.directory, token, cleanup = false, timeout = 60000, maxBuffer = 4 * 1024 * 1024,
+  } = {}) {
     try {
       return (await exec(program, args, {
         cwd, env: token ? { ...this.env, COWCTL_TOKEN: token } : this.env,
-        timeout, signal: cleanup ? undefined : this.signal, maxBuffer: 4 * 1024 * 1024,
+        timeout, signal: cleanup ? undefined : this.signal, maxBuffer,
       })).stdout.trim();
     } catch (error) {
       throw new Error(`${program} ${args.join(' ')} failed (${error.signal ?? error.code})\n${error.stderr ?? ''}${error.stdout ?? ''}`);
