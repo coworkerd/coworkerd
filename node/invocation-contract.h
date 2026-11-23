@@ -76,4 +76,9 @@ inline const char* durableNotSentCode(bool secretDictionary) {
   return secretDictionary ? "SECRET_UNAVAILABLE" : "DO_UNAVAILABLE";
 }
 
+// The persistent threaded owner must reserve and validate its own alarm token.
+inline bool acceptsForwardedAlarm(bool threadedDurableStorage, uint64_t alarmAtUnixMs) {
+  return !threadedDurableStorage || alarmAtUnixMs == 0;
+}
+
 }  // namespace coworkerd

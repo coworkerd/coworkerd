@@ -39,9 +39,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `0081-threaded-durable-storage.patch` connects the threaded server and its Bazel target to the
   inherited WAL channel. Its two SQLite utility changes report a synchronous connection close to the
   embedder only after SQLite confirms that no dependent handles remain.
-  Patches 0100 and 0101 dispatch node-authorized alarm events on threaded homes. Their
+  Patches 0100, 0101 and 0104 dispatch node-authorized alarm events on threaded homes. Their
   `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
-  after WAL confirmation for this host.
+  after WAL confirmation for this host. The storage fixture holds confirmation to test these guarantees.
   Patch 0102 tracks pending I/O and wait-until work on the threaded home and separates local
   WebSocket transport lifetime from other background work. Its embedder hooks live in
   `io/io-context.{h,c++}`, `io/worker.{h,c++}` and `api/web-socket.c++`.

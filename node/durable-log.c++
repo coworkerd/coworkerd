@@ -6489,6 +6489,7 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
     state.retries = 0;
     state.countedRetries = 0;
     state.backoff = 0;
+    state.clearing = false;
     state.notBeforeMs = 0;
     log("alarm-set", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
             ",\"atUnixMs\":" + std::to_string(atUnixMs));
@@ -6813,7 +6814,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
       found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
       found->second.retries, token,
-      settings.threadedAlarmEvents && found->second.retries > ALARM_RETRY_MAX_TRIES};
+      settings.threadedAlarmEvents && found->second.clearing};
   const auto started = alarmMonotonicMs();
   AlarmResult result;
   try {
@@ -6837,6 +6838,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     case AlarmOutcome::NAMESPACE_WAIT: break;
     case AlarmOutcome::REBUILDING: break;
     case AlarmOutcome::CLEARED: break;
+    case AlarmOutcome::STOP: break;
   }
   auto again = alarms.find(key);
   const auto gone = again == alarms.end();
@@ -6868,6 +6870,10 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
       // object's database is still the truth and reports again at its next open.
       if (settings.threadedAlarmEvents) {
         // The WAL channel reports the committed schedule independently of the reply.
+        state.retries = 0;
+        state.countedRetries = 0;
+        state.backoff = 0;
+        state.clearing = false;
         state.notBeforeMs = alarmMonotonicMs() + 1000;
       } else if (state.atUnixMs == ask.atUnixMs) {
         eraseAlarm(key);
@@ -6877,6 +6883,12 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     }
     case AlarmOutcome::NOT_DUE: {
       log("alarm-not-due", fields + ",\"holds\":" + std::to_string(result.atUnixMs));
+      if (settings.threadedAlarmEvents) {
+        if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
+          alarmReported(object->objectName, ask.facetId, result.atUnixMs);
+          co_return;
+        }
+      }
       state.fromHint = false;
       if (result.atUnixMs == 0) {
         eraseAlarm(key);
@@ -6887,6 +6899,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
         state.retries = 0;
         state.countedRetries = 0;
         state.backoff = 0;
+        state.clearing = false;
         state.notBeforeMs = 0;
         writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, result.atUnixMs, ask.facetId, ask.shardEpoch, ask.tenant);
       }
@@ -6895,6 +6908,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     case AlarmOutcome::FAILED: {
       ++state.retries;
       if (settings.threadedAlarmEvents && state.retries > ALARM_RETRY_MAX_TRIES) {
+        state.clearing = true;
         log("alarm-retry-exhausted", fields);
         co_return;  // The next validated dispatch conditionally clears the stored time.
       }
@@ -6917,7 +6931,17 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
       co_return;
     }
     case AlarmOutcome::CLEARED:
-      state.notBeforeMs = alarmMonotonicMs() + 1000;
+      if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
+        alarmReported(object->objectName, ask.facetId, 0);
+      } else {
+        eraseAlarm(key);
+        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
+      }
+      co_return;
+    case AlarmOutcome::STOP:
+      state.clearing = true;
+      state.notBeforeMs = 0;
+      log("alarm-no-retry", fields);
       co_return;
     case AlarmOutcome::DEFERRED:
       // The destination gate holds the whole bucket; only one alarm probes it after 200ms.

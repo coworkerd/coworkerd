@@ -85,7 +85,7 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(io.waitScope.poll(1000) < 1000, "alarm scheduler did not become idle");
     };
     auto opened = [&](std::string objectId) {
-      const auto name = "namespace/" + objectId;
+      const auto name = durableHostName("namespace", objectId, 3);
       auto& object = log.objects[name];
       object.objectName = name;
       object.namespaceId = "namespace";
@@ -96,13 +96,13 @@ struct DurableLogChannelTest {
       object.state = DurableLog::ObjectState::LOCAL;
       return name;
     };
-    auto complete = [&](AlarmOutcome outcome) {
-      attempts.back().result->fulfill(AlarmResult{outcome});
+    auto complete = [&](AlarmOutcome outcome, uint64_t atUnixMs = 0) {
+      attempts.back().result->fulfill(AlarmResult{outcome, atUnixMs});
       flush();
     };
 
     const auto name = opened("retry");
-    const auto key = name + "/0";
+    const auto key = "namespace/retry/0";
     log.alarmReported(name, 0, wall + 1);
     flush();
     KJ_REQUIRE(attempts.empty());
@@ -127,13 +127,19 @@ struct DurableLogChannelTest {
       flush();
       KJ_REQUIRE(attempts.size() == count + 1 && attempts.back().alarm.retryCount == retry &&
           !attempts.back().alarm.clear);
+      if (retry == 1) {
+        complete(AlarmOutcome::DEFERRED);
+        KJ_REQUIRE(log.alarms.at(key).retries == 1 && attempts.size() == count + 1);
+        log.alarmCapacityAvailable("node");
+        flush();
+        KJ_REQUIRE(attempts.size() == count + 2 && attempts.back().alarm.retryCount == 1);
+      }
     }
     const auto count = attempts.size();
     complete(AlarmOutcome::FAILED);
     KJ_REQUIRE(attempts.size() == count + 1 && attempts.back().alarm.clear && log.alarmRetries == 6);
     const auto exhausted = attempts.back().alarm;
-    log.alarmReported(name, 0, 0);
-    log.alarmReported(name, 0, wall);
+    log.alarmReported(name, 0, ++wall);
     flush();
     KJ_REQUIRE(attempts.size() == count + 1 && !log.alarmFireIsCurrent(exhausted),
         "a replacement schedule must wait for the old dispatch, whose token was invalidated");
@@ -141,9 +147,42 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(attempts.size() == count + 2 && attempts.back().alarm.retryCount == 0 &&
         !attempts.back().alarm.clear && log.alarmFireIsCurrent(attempts.back().alarm));
 
+    complete(AlarmOutcome::FAILED);
+    now = log.alarms.at(key).notBeforeMs;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 1);
+    complete(AlarmOutcome::FIRED);
+    now = log.alarms.at(key).notBeforeMs;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).countedRetries == 0);
+
+    complete(AlarmOutcome::NOT_DUE, wall + 50);
+    KJ_REQUIRE(log.alarms.at(key).atUnixMs == wall + 50);
+    KJ_REQUIRE(log.objects.at(name).alarms.at(0) == wall + 50);
+    wall += 50;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.atUnixMs == wall);
+    complete(AlarmOutcome::NOT_DUE);
+    KJ_REQUIRE(!log.alarms.contains(key) && log.objects.at(name).alarms.at(0) == 0);
+    log.alarmReported(name, 0, wall);
+    flush();
+    const auto beforeStop = attempts.size();
+    complete(AlarmOutcome::STOP);
+    KJ_REQUIRE(attempts.size() == beforeStop + 1 && attempts.back().alarm.clear &&
+        attempts.back().alarm.retryCount == 0);
+    complete(AlarmOutcome::UNAVAILABLE);
+    now += 1000;
+    flush();
+    KJ_REQUIRE(attempts.size() == beforeStop + 2 && attempts.back().alarm.clear);
+    complete(AlarmOutcome::CLEARED);
+    KJ_REQUIRE(!log.alarms.contains(key));
+    log.alarmReported(name, 0, wall);
+    flush();
+    const auto beforeParallel = attempts.size();
+
     for (const auto* objectId : {"first", "second", "third"}) log.alarmReported(opened(objectId), 0, wall);
     flush();
-    KJ_REQUIRE(log.activeAlarmFires == 4 && attempts.size() == count + 5);
+    KJ_REQUIRE(log.activeAlarmFires == 4 && attempts.size() == beforeParallel + 3);
     log.shardGone("namespace", 0, "test ownership change");
     KJ_REQUIRE(log.alarms.empty() && !log.alarmFireIsCurrent(attempts.back().alarm));
     for (auto& attempt : attempts) {
