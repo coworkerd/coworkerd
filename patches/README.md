@@ -42,7 +42,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patches 0100, 0101 and 0104 dispatch node-authorized alarm events on threaded homes. Their
   `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
   after WAL confirmation for this host. The storage fixture holds confirmation to test these guarantees.
-  Patches 0110 and 0111 execute D1-style SQL in the factory's native SQLite helper. Patch 0111
+  Patches 0110–0112 execute D1-style SQL in the factory's native SQLite helper. Patch 0111
   also changes the threaded server and its Bazel target to admit and retire dedicated database homes.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.

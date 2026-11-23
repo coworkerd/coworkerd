@@ -32,6 +32,9 @@ async function bindingProbe(cluster, tenant, name) {
           return Response.json(await DB.exec(
             'INSERT INTO ledger VALUES(3);\\nINSERT INTO ledger VALUES(1);\\nINSERT INTO ledger VALUES(4);'));
         }
+        if (url.pathname.endsWith('/unconfirmed')) {
+          return Response.json(await DB.prepare('INSERT INTO ledger VALUES(97)').run());
+        }
         if (url.pathname.endsWith('/timeout')) return Response.json(await DB.prepare(${JSON.stringify(slow)}).raw());
         return Response.json(await DB.prepare('SELECT id FROM ledger ORDER BY id').all());
       } catch (error) {
@@ -157,6 +160,21 @@ export async function sqlConfirmationAndTakeover(cluster) {
     await unlink(hold);
   }
   owner = await eventually('the database reopens without the unconfirmed write', async () => {
+    assert.deepEqual((await db.query({ sql: 'SELECT id FROM ledger ORDER BY id' })).results, kept);
+    return (await acceptedOn(cluster, db.namespaceId)).nodeId;
+  });
+  const call = await bindingProbe(cluster, tenant, db.name);
+  await eventually('the D1 binding reads the confirmed SQL prefix', async () => {
+    assert.deepEqual(json(await call(), 200, 'D1 binding').results, kept);
+  });
+  await writeFile(hold, '');
+  try {
+    const refused = json(await call('/unconfirmed'), 503, 'D1 WAL confirmation timeout');
+    assert.match(refused.message, /^D1_ERROR: STORAGE_UNAVAILABLE:/);
+  } finally {
+    await unlink(hold);
+  }
+  owner = await eventually('the D1 write is excluded before the next owner test', async () => {
     assert.deepEqual((await db.query({ sql: 'SELECT id FROM ledger ORDER BY id' })).results, kept);
     return (await acceptedOn(cluster, db.namespaceId)).nodeId;
   });
@@ -354,6 +372,7 @@ export async function longSqlIsolation(cluster) {
   await eventually('the D1 binding is warm', async () => assert.equal(json(await call(), 200, 'warm binding').success, true));
   const timedOut = json(await call('/timeout'), 503, 'D1 SQL deadline');
   assert.match(timedOut.message, /^D1_ERROR: SQL_LIMIT_EXCEEDED:/);
+  assert.match(timedOut.cause, /^SQL_LIMIT_EXCEEDED:/);
   assert.equal(json(await call(), 200, 'D1 after deadline').success, true);
 
   for (const sample of report.probes) {
