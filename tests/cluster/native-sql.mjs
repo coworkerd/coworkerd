@@ -8,6 +8,8 @@ import { eventually, json, request } from './cluster.mjs';
 
 const cli = fileURLToPath(new URL('../../cli/bin/cowctl.mjs', import.meta.url));
 const slow = 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000) SELECT sum(n) AS total FROM r';
+const missingTable = 'SELECT * FROM missing_table';
+const oversizedResult = 'SELECT zeroblob(4000000)';
 
 async function database(cluster, tenant, name, { create = true } = {}) {
   const path = `${tenant.path}/databases/${name}`;
@@ -34,6 +36,16 @@ async function bindingProbe(cluster, tenant, name) {
         }
         if (url.pathname.endsWith('/unconfirmed')) {
           return Response.json(await DB.prepare('INSERT INTO ledger VALUES(97)').run());
+        }
+        if (url.pathname.endsWith('/read-error')) {
+          return Response.json(await DB.prepare(${JSON.stringify(missingTable)}).all());
+        }
+        if (url.pathname.endsWith('/batch-error')) {
+          const insert = DB.prepare('INSERT INTO ledger VALUES(?)');
+          return Response.json(await DB.batch([insert.bind(9), insert.bind(1)]));
+        }
+        if (url.pathname.endsWith('/size-error')) {
+          return Response.json(await DB.prepare(${JSON.stringify(oversizedResult)}).all());
         }
         if (url.pathname.endsWith('/timeout')) return Response.json(await DB.prepare(${JSON.stringify(slow)}).raw());
         return Response.json(await DB.prepare('SELECT id FROM ledger ORDER BY id').all());
@@ -64,7 +76,7 @@ export async function sqlProtocol(cluster) {
   assert.match((await db.query({ sql: 'SELECT ?' })).error, /parameter bindings/);
   assert.match((await db.query({ sql: 'BEGIN' })).error, /state.storage.transaction/);
   assert.match((await db.query({ sql: 'CREATE TABLE _cf_test(x)' })).error, /prohibited|authorized|SQLITE_AUTH/);
-  assert.match((await db.query([put(9), { sql: 'SELECT zeroblob(4000000)' }]))[0].error, /D1_RESULT_TOO_LARGE/);
+  assert.match((await db.query([put(9), { sql: oversizedResult }]))[0].error, /D1_RESULT_TOO_LARGE/);
   assert.match((await db.query({ ingest: 'INSERT INTO ledger VALUES(9); INSERT INTO ledger VALUES(1);' })).error,
     /UNIQUE constraint failed/);
   const probe = await bindingProbe(cluster, tenant, db.name);
@@ -74,6 +86,22 @@ export async function sqlProtocol(cluster) {
     return answer;
   });
   assert.equal(before.success, true);
+  const readError = await db.query({ sql: missingTable });
+  const [batchError] = await db.query([put(9), put(1)]);
+  const sizeError = await db.query({ sql: oversizedResult });
+  for (const [route, result, expected] of [
+    ['/read-error', readError, /no such table.*missing_table/],
+    ['/batch-error', batchError, /UNIQUE constraint failed/],
+    ['/size-error', sizeError, /D1_RESULT_TOO_LARGE/],
+  ]) {
+    assert.equal(result.success, false);
+    assert.match(result.error, expected);
+    assert.deepEqual(json(await probe(route), 503, route), {
+      message: `D1_ERROR: ${result.error}`,
+      cause: result.error,
+    });
+  }
+  assert.deepEqual(json(await probe(), 200, 'D1 retry after statement failures').results, [{ id: 1 }, { id: 2 }]);
   const rejected = json(await probe('/exec'), 503, 'D1 execute error');
   assert.match(rejected.message, /^D1_EXEC_ERROR: Error in line 2:/);
   assert.match(rejected.cause, /UNIQUE constraint failed/);
