@@ -883,6 +883,7 @@ async function mixedDurableStorage(cluster) {
 }
 
 async function threadedClassMigration(cluster) {
+  const { WebSocket: TestSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
   const [ingress] = cluster.nodes;
   const tenant = await cluster.tenant('threaded-migration');
   const name = 'records';
@@ -952,12 +953,17 @@ async function threadedClassMigration(cluster) {
   const identity = (await namespace('Record')).namespaceId;
   const socketUrl = new URL(url + '/socket', cluster.urls[ingress]);
   socketUrl.protocol = 'ws:';
-  const socket = new WebSocket(socketUrl);
-  await once(socket, 'open', { signal: AbortSignal.timeout(5000) });
-  const echoed = once(socket, 'message', { signal: AbortSignal.timeout(5000) });
+  const socket = new TestSocket(socketUrl);
+  const socketEvent = (event, timeoutMs) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`waiting for WebSocket ${event}`)), timeoutMs);
+    return once(socket, event, { signal: controller.signal }).finally(() => clearTimeout(timer));
+  };
+  await socketEvent('open', 5000);
+  const echoed = socketEvent('message', 5000);
   socket.send('probe');
-  assert.equal((await echoed)[0].data, 'v1:probe');
-  const socketClosed = once(socket, 'close', { signal: AbortSignal.timeout(25000) });
+  assert.equal((await echoed)[0].toString(), 'v1:probe');
+  const socketClosed = socketEvent('close', 25000);
   void socketClosed.catch(() => {});
   const due = Date.now() + 8000;
   assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
@@ -1001,7 +1007,7 @@ async function threadedClassMigration(cluster) {
     const entry = json(await call(''), 200, 'read v2');
     assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2', alarmVersion: 'v2' });
   });
-  assert.equal((await socketClosed)[0].code, 1001, 'version drain closes the old connection');
+  assert.equal((await socketClosed)[0], 1001, 'version drain closes the old connection');
   await cluster.deploy(tenant, name, respondWith('v3'), {
     version: 'v3', wrangler: { migrations: [initial, renamed, deleted] },
   });

@@ -45,7 +45,7 @@ A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that 
 
 An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
 
-After a declared secret or binding changes, the object reopens on its next request, as it does after a version change; that object's in-flight requests and connections end at that point. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
+After a declared secret or binding changes, the object's next request selects the updated definition. On the experimental threaded host, this uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
 ## 2. Declare the namespace
 
