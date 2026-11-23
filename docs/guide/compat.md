@@ -68,6 +68,8 @@ The [Durable Object guide](durable-objects.md) shows migrations, IDs, fetch, met
 
 On the experimental threaded host, in-flight work keeps its pinned definition. A new definition opens after the old tree and its facets close. Class rename keeps the namespace and its data, and class deletion fences subsequent opens.
 
+The experimental threaded Durable Object host serializes alarm handlers for each object. Each shard owner gives a failed schedule up to six retries and confirms its conditional deletion after the last failure. A takeover starts the retry count again.
+
 D1 bindings work without a declared DO class. Migration requests may be at most 1 MiB (1,048,576 bytes) after JSON encoding; larger HTTP SQL bodies return 413 REQUEST_TOO_LARGE. SQL imports read 32 KiB at a time with a 960 KiB JSON request cap; chunks commit independently, and foreign-key deferral does not span chunks. A timeout or uncertain reply is reconciled through the migration ledger without resending the file. The CPU budget actually enforced for the internal SQL event is not verified by the migration-tool change. HTTP SQL preserves node errors and does not replay an uncertain request. See [Durable Objects](durable-objects.md) for recovery boundaries and [databases](databases.md) for the supported SQL API.
 
 D1 numbers follow JavaScript precision: integers outside the safe range may lose precision, and REAL `1.0` reads as

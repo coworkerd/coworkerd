@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 05:24:38 +0800
+Subject: [PATCH] Deliver confirmed Durable Object alarms on threaded homes
+
+
+diff --git a/src/workerd/io/actor-sqlite.c++ b/src/workerd/io/actor-sqlite.c++
+index 4f2ea850cf5d9d7683ddb0f0a980d4f190306216..2af088eb6cae99d6e74b54358d9916472f22a5f5 100644
+--- a/src/workerd/io/actor-sqlite.c++
++++ b/src/workerd/io/actor-sqlite.c++
+@@ -483,6 +483,7 @@ void ActorSqlite::scheduleLaterAlarm(kj::Maybe<kj::Date> newAlarmTime, SpanParen
+ 
+ ActorSqlite::PrecommitAlarmState ActorSqlite::startPrecommitAlarmScheduling() {
+   PrecommitAlarmState state;
++  if (hooks.hasConfirmedAlarmScheduler()) return state;
+   if (pendingCommit == kj::none &&
+       willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
+     // We must wait on the `alarmLaterInFlight` promise here, otherwise, if there is an in-flight
+@@ -561,7 +562,8 @@ kj::Promise<void> ActorSqlite::commitImpl(
+   // the successfully persisted db.
+   int syncIterations = 0;
+   auto startAlarmState = metadata.getAlarm();
+-  while (willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
++  while (!hooks.hasConfirmedAlarmScheduler() &&
++      willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
+     auto alarmSpan = commitSpan.newChild("actor_sqlite_alarm_sync"_kjc);
+     if (debugAlarmSync) {
+       haveAlarmForDebug = true;
+@@ -609,7 +611,11 @@ kj::Promise<void> ActorSqlite::commitImpl(
+ 
+   // Wait for the db to persist.
+   co_await commitCallbackPromise;
++  const bool alarmChanged = lastConfirmedAlarmDbState != alarmStateForCommit;
+   lastConfirmedAlarmDbState = alarmStateForCommit;
++  if (hooks.hasConfirmedAlarmScheduler() && alarmChanged) {
++    hooks.alarmConfirmed(alarmStateForCommit);
++  }
+ 
+   if (debugAlarmSync && haveAlarmForDebug) {
+     KJ_LOG(WARNING, "NOSENTRY DEBUG_ALARM: Persisted in SQLite", "sqlite_has",
+@@ -632,7 +638,7 @@ kj::Promise<void> ActorSqlite::commitImpl(
+   //  3. This coalesces redundant alarm updates for better performance
+   //  4. This avoids race conditions where a later commit moved the alarm earlier, requiring a
+   //     pre-commit alarm update, and this update may have already been made before we get here.
+-  if (alarmVersion == alarmVersionBeforeAsync) {
++  if (!hooks.hasConfirmedAlarmScheduler() && alarmVersion == alarmVersionBeforeAsync) {
+     // No intervening alarm changes, it is safe to schedule a move-later alarm update if needed.
+     if (willFireEarlier(alarmScheduledNoLaterThan, alarmStateForCommit)) {
+       if (debugAlarmSync) {
+@@ -875,6 +881,10 @@ ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(
+   // kv.deleteAll() clears the database, so we need to save and possibly restore alarm state in
+   // the metadata table to maintain behavior from before the deleteAllDeletesAlarm compat flag.
+   auto localAlarmState = metadata.getAlarm();
++  if (hooks.hasConfirmedAlarmScheduler() &&
++      (localAlarmState != scheduledTime || lastConfirmedAlarmDbState != scheduledTime)) {
++    return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
++  }
+ 
+   // deleteAll() cannot be part of a transaction because it deletes the database altogether. So,
+   // we have to close our transactions or fail.
+@@ -1131,6 +1141,9 @@ kj::Promise<kj::Maybe<kj::Date>> ActorSqlite::abandonAlarm(kj::Date scheduledTim
+     LOG_WARNING_ONCE("abandonAlarm called while alarm handler is still running");
+     return kj::Maybe<kj::Date>(kj::none);
+   }
++  if (hooks.hasConfirmedAlarmScheduler() && lastConfirmedAlarmDbState != scheduledTime) {
++    return lastConfirmedAlarmDbState;
++  }
+   KJ_IF_SOME(storedTime, metadata.getAlarm()) {
+     if (storedTime == scheduledTime) {
+       setAlarm(kj::none, {}, nullptr);
+diff --git a/src/workerd/io/actor-sqlite.h b/src/workerd/io/actor-sqlite.h
+index 527353fe2ae5875fb9a62b425bbdacb70d03b33f..994481dbbc8bed5a33ced41e6bbf2ba198936305 100644
+--- a/src/workerd/io/actor-sqlite.h
++++ b/src/workerd/io/actor-sqlite.h
+@@ -41,6 +41,11 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
+     virtual kj::Promise<void> scheduleRun(
+         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask);
+ 
++    // A node-owned scheduler learns the time from confirmed storage and
++    // supplies that exact time when it opens an alarm event.
++    virtual bool hasConfirmedAlarmScheduler() const { return false; }
++    virtual void alarmConfirmed(kj::Maybe<kj::Date>) {}
++
+     static const Hooks DEFAULT;
+ 
+     static constexpr inline Hooks& getDefaultHooks() {
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b..7db0275a1f06f14f4e6c447defb44688e24ce08e 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3716,20 +3716,80 @@ class DurableTestHttp final: public kj::HttpService {
+   kj::Own<WorkerInterface> worker;
+ };
+ 
++struct DurableAlarmEvent {
++  kj::Own<Worker::Actor> actor;
++  kj::Date scheduledTime;
++  uint32_t retryCount;
++  bool clear;
++};
++
++// This service is selected by the trusted event descriptor. A Worker fetch
++// to the same URL uses its regular entrypoint.
++class DurableAlarmHttp final: public kj::HttpService {
++ public:
++  DurableAlarmHttp(kj::Own<WorkerInterface> worker, DurableAlarmEvent event,
++      const kj::HttpHeaderTable& headers)
++      : worker(kj::mv(worker)), event(kj::mv(event)), headers(headers) {}
++
++  kj::Promise<void> request(kj::HttpMethod method,
++      kj::StringPtr url,
++      const kj::HttpHeaders&,
++      kj::AsyncInputStream&,
++      Response& response) override {
++    KJ_REQUIRE(method == kj::HttpMethod::POST &&
++        url == "http://coworkerd-node/__coworkerd/durable-alarm", "invalid alarm event");
++    KJ_REQUIRE(worker.get() != nullptr, "one call per alarm event");
++    auto entry = kj::mv(worker);
++    auto& actor = *event.actor;
++    auto& gate = actor.getOutputGate();
++    co_await gate.wait(nullptr);
++
++    kj::StringPtr outcome;
++    if (event.clear) {
++      co_await entry->abandonAlarm(event.scheduledTime);
++      co_await gate.wait(nullptr);
++      outcome = "cleared";
++    } else {
++      auto result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
++      if (result.outcome == EventOutcome::OK || result.outcome == EventOutcome::SCRIPT_NOT_FOUND) {
++        co_await gate.wait(nullptr);
++        outcome = "fired";
++      } else if (result.retry && result.retryCountsAgainstLimit) {
++        outcome = "failed";
++      } else {
++        outcome = "unavailable";
++      }
++    }
++    auto json = kj::str("{\"outcome\":\"", outcome, "\"}");
++    auto body = response.send(200, "OK", kj::HttpHeaders(headers), json.size());
++    co_await body->write(json.asBytes());
++  }
++
++ private:
++  kj::Own<WorkerInterface> worker;
++  DurableAlarmEvent event;
++  const kj::HttpHeaderTable& headers;
++};
++
+ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
+  public:
+   ChannelDispatcher(ThreadState &state,
+       kj::Own<WorkerInterface> worker,
+       std::shared_ptr<Slot> bindingSlot = {},
+-      kj::String bindingIdentity = nullptr)
++      kj::String bindingIdentity = nullptr,
++      kj::Maybe<DurableAlarmEvent> alarm = kj::none)
+       : state(state),
+         worker(kj::mv(worker)),
+         bindingSlot(std::move(bindingSlot)),
+-        bindingIdentity(kj::mv(bindingIdentity)) {}
++        bindingIdentity(kj::mv(bindingIdentity)),
++        alarm(kj::mv(alarm)) {}
+   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+     KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
+     auto &http = state.http;
+-    if (state.durableHome) {
++    KJ_IF_SOME(event, alarm) {
++      context.getResults().setHttp(
++          http.kjToCapnp(kj::heap<DurableAlarmHttp>(kj::mv(worker), kj::mv(event), *state.headers)));
++    } else if (state.durableHome) {
+       context.getResults().setHttp(http.kjToCapnp(kj::heap<DurableTestHttp>(kj::mv(worker))));
+     } else {
+       context.getResults().setHttp(http.kjToCapnp(kj::mv(worker)));
+@@ -3744,6 +3804,7 @@ class ChannelDispatcher final: public rpc::EventDispatcher::Server {
+   // Only a node-dispatched invocation receives the platform binding handshake.
+   std::shared_ptr<Slot> bindingSlot;
+   kj::String bindingIdentity;
++  kj::Maybe<DurableAlarmEvent> alarm;
+ };
+ 
+ class ChannelBootstrap final: public rpc::WorkerdBootstrap::Server {
+@@ -4583,6 +4644,7 @@ void startBoundRpcSession(rpc::EventDispatcher::JsRpcSessionResults::Builder res
+ 
+ kj::Promise<void> ChannelDispatcher::jsRpcSession(JsRpcSessionContext context) {
+   KJ_REQUIRE(worker.get() != nullptr, "one event per channel invocation");
++  KJ_REQUIRE(alarm == kj::none, "alarm event requires the alarm dispatcher");
+   if (bindingSlot) {
+     startBoundRpcSession(
+         context.getResults(), kj::mv(worker), std::move(bindingSlot), kj::mv(bindingIdentity));
+@@ -4802,10 +4864,14 @@ class DurableAlarmReporter final: public ActorSqlite::Hooks {
+   explicit DurableAlarmReporter(server::DurableLogShipper& shipper, uint facet)
+       : shipper(shipper), facet(facet) {}
+ 
+-  kj::Promise<void> scheduleRun(kj::Maybe<kj::Date> time, kj::Promise<void> priorTask) override {
+-    JSG_REQUIRE(facet == 0, Error, "Facets currently cannot set alarms.");
++  kj::Promise<void> scheduleRun(kj::Maybe<kj::Date>, kj::Promise<void>) override {
++    JSG_FAIL_REQUIRE(Error, "Facets currently cannot set alarms.");
++  }
++  bool hasConfirmedAlarmScheduler() const override {
++    return facet == 0;
++  }
++  void alarmConfirmed(kj::Maybe<kj::Date> time) override {
+     shipper.reportAlarm(time);
+-    return kj::READY_NOW;
+   }
+ 
+  private:
+@@ -5216,9 +5282,21 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+   }
+   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+       nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*found->second.actor));
++  kj::Maybe<DurableAlarmEvent> alarm;
++  auto alarmDescriptor = field(input, "durableAlarm");
++  if (alarmDescriptor.isObject()) {
++    KJ_REQUIRE(state.wal.get() != nullptr, "persistent storage is required for an alarm");
++    const auto time = durableNumber(alarmDescriptor, "scheduledTime");
++    const auto retries = durableNumber(alarmDescriptor, "retryCount");
++    KJ_REQUIRE(time > 0 && time <= INT64_MAX / 1000000 && retries <= 6,
++        "invalid durable alarm descriptor");
++    alarm = DurableAlarmEvent{kj::addRef(*found->second.actor),
++      kj::UNIX_EPOCH + static_cast<int64_t>(time) * kj::MILLISECONDS,
++      static_cast<uint32_t>(retries), flag(alarmDescriptor, "clear")};
++  }
+   auto identity = invocationIdentity(*slot, input);
+   co_return rpc::EventDispatcher::Client(kj::heap<ChannelDispatcher>(
+-      state, kj::mv(prepared.entry), std::move(slot), kj::mv(identity)));
++      state, kj::mv(prepared.entry), std::move(slot), kj::mv(identity), kj::mv(alarm)));
+ }
+ 
+ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {

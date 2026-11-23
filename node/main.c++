@@ -397,6 +397,7 @@ struct DurableTarget {
   uint64_t alarmAtUnixMs = 0;
   uint32_t alarmRetryCount = 0;
   uint32_t alarmFacetId = 1;
+  bool clearAlarm = false;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
@@ -2413,7 +2414,8 @@ public:
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
-    if (process->threadedDurableRole() && (target.isDatabase() || target.alarmAtUnixMs)) {
+    if (process->threadedDurableRole() &&
+        (target.isDatabase() || (process->threadedDurableTestRole() && target.alarmAtUnixMs))) {
       throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", process->threadedDurableTestRole()
           ? "the durable test role supports object requests" : "the threaded durable role supports Worker object requests"}};
     }
@@ -3518,6 +3520,11 @@ private:
                 << "\",\"queuedBytes\":\"" << encoded.size() << "\",\"expiresMonotonicNs\":\""
                 << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
           encoded.pop_back();
+          if (durable->alarmAtUnixMs) {
+            encoded += ",\"durableAlarm\":{\"scheduledTime\":\"" + std::to_string(durable->alarmAtUnixMs) +
+                "\",\"retryCount\":\"" + std::to_string(durable->clearAlarm ? 0 : durable->alarmRetryCount) +
+                "\",\"clear\":" + (durable->clearAlarm ? "true" : "false") + "}";
+          }
           encoded += route.str();
         }
         return kj::str(encoded.c_str());
@@ -6601,6 +6608,22 @@ public:
     }
   }
 
+  kj::Promise<BindingDispatch::Dispatched> dispatchLocalAlarm(Request request, const coworkerd::DurableAlarm& alarm) {
+    Line line{request.workerId, {}, "node", "local", {}};
+    const auto deadline = server.rootDeadline();
+    std::string code, reason;
+    auto version = checked(request, line, code, reason);
+    if (!version || request.target.shard != alarm.shard) {
+      const auto refusal = version ? server.refusal("DO_SHARD_EPOCH_MISMATCH", "the alarm shard changed", 409)
+                                   : server.refusal(code, reason, 409);
+      co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, refusal, deadline)};
+    }
+    auto ran = co_await runHere(std::move(request), std::move(version), line, monotonicTimeMs(), deadline, &alarm);
+    if (ran.refusal)
+      co_return BindingDispatch::Dispatched{rejectedDispatcher(factory, headerTable, *ran.refusal, deadline)};
+    co_return kj::mv(ran.dispatched);
+  }
+
   // A request another node sent here (PeerServer.openObjectInvocation), expecting this node to hold the object's shard at
   // `expectedEpoch` (0: asking it to take the shard): checked, then run as dispatch() runs one of this node's own. It is
   // never sent on. A refusal comes back as one (nothing ran), the dispatcher otherwise.
@@ -6621,6 +6644,10 @@ public:
       log(line, request.target, nullptr, refusal.status, refusal.code, started);
       return Received{refusal};
     };
+    if (!coworkerd::acceptsForwardedAlarm(server.placementConfig().processPool.threadedDurableStorage,
+            request.target.alarmAtUnixMs)) {
+      co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
+    }
     std::string code, reason;
     auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
@@ -6709,7 +6736,7 @@ private:
 
   // The request on this node's durable process for the object (the shard is this node's).
   kj::Promise<Ran> runHere(Request request, std::shared_ptr<const VersionDefinition> version, Line line, double started,
-      double deadline) {
+      double deadline, const coworkerd::DurableAlarm* alarm = nullptr) {
     const auto target = request.target;
     const bool disposable = server.usesDisposableDurableStorage();
     auto refused = [&](const InvocationRejection& refusal) {
@@ -6717,6 +6744,10 @@ private:
       log(line, target, nullptr, refusal.status, refusal.code, started);
       return Ran{refusal};
     };
+    if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(
+            server.placementConfig().processPool.threadedDurableStorage, target.alarmAtUnixMs)) {
+      co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
+    }
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
@@ -6765,6 +6796,16 @@ private:
     auto current = co_await server.admit(version->workerId, version->definitionHash, false,
         deadline, false, false, &target, target.alarmAtUnixMs == 0, slot);
     if (current.refused) co_return refused(*current.refused);
+    if (alarm) {
+      std::string code, reason;
+      const auto active = server.durableVersion(version->workerId, target, code, reason);
+      if (!active) co_return refused(server.refusal(code, reason, 409));
+      if (coworkerd::versionPin(*active) != coworkerd::versionPin(*version) ||
+          shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch ||
+          !durableLog.alarmFireIsCurrent(*alarm)) {
+        co_return refused(server.refusal("DO_ALARM_STALE", "the alarm lost its dispatch authority", 409));
+      }
+    }
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
@@ -6838,9 +6879,8 @@ private:
 
 // One request the node makes of an object itself, through the ordinary dispatch: the shard's owner runs it, which
 // may be another node. There is no caller's call tree, so it opens one of its own, as an object's call does.
-kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOverCapnpFactory& factory,
-    const kj::HttpHeaderTable& headerTable, DurableDispatch::Request request, kj::StringPtr path, std::string body) {
-  auto dispatched = co_await durable.dispatch(std::move(request));
+kj::Promise<CollectedResponse> collectObjectResponse(BindingDispatch::Dispatched dispatched,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, kj::StringPtr path, std::string body) {
   auto ready = kj::mv(dispatched.ready).eagerlyEvaluate([](kj::Exception&&) {});
   auto getHttp = dispatched.dispatcher.getHttpServiceRequest().send();
   auto service = factory.capnpToKj(getHttp.getHttp());
@@ -6861,6 +6901,12 @@ kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOv
         CollectedResponse::OVERFLOW_REASON + "\"}";
   }
   co_return kj::mv(collected);
+}
+
+kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOverCapnpFactory& factory,
+    const kj::HttpHeaderTable& headerTable, DurableDispatch::Request request, kj::StringPtr path, std::string body) {
+  co_return co_await collectObjectResponse(co_await durable.dispatch(std::move(request)), factory, headerTable,
+      path, std::move(body));
 }
 
 // The path the runtime answers for an alarm, and for one SQL statement on a database's object.
@@ -6898,9 +6944,10 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
         ? coworkerd::AlarmOutcome::DELETED : coworkerd::AlarmOutcome::NAMESPACE_WAIT, 0, "alarm namespace is not active yet"};
   auto owner = server.namespaceOwner(alarm.namespaceId);
   KJ_REQUIRE(owner.has_value());
-  if (server.placementConfig().processPool.threadedDurableStorage) {
+  const auto threaded = server.placementConfig().processPool.threadedDurableStorage;
+  if (threaded && owner->isDatabase()) {
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
-        "NOT_SUPPORTED: the experimental threaded durable role does not deliver alarms"};
+        "NOT_SUPPORTED: database objects do not run on the threaded durable host"};
   }
   DurableDispatch::Request request;
   request.workerId = owner->isDatabase()
@@ -6914,6 +6961,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   request.target.alarmAtUnixMs = alarm.atUnixMs;
   request.target.alarmRetryCount = alarm.retryCount;
   request.target.alarmFacetId = alarm.facetId;
+  request.target.clearAlarm = alarm.clear;
   const auto destination = server.durableProcessFor(request.target.key());
   auto capacityResult = [&destination](std::string code, std::string reason) {
     coworkerd::AlarmResult result{coworkerd::AlarmOutcome::DEFERRED, 0, std::move(reason)};
@@ -6932,7 +6980,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   durableLog.alarmCapacityAvailable(destination);
   auto route = co_await shards.route(alarm.namespaceId, alarm.shard);
-  if (route.kind != coworkerd::ShardRoute::Kind::LOCAL)
+  if (route.kind != coworkerd::ShardRoute::Kind::LOCAL || (threaded &&
+      (route.epoch != alarm.shardEpoch || (alarm.dataEpoch && route.dataEpoch != alarm.dataEpoch))))
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, "the alarm is no longer held locally"};
   coworkerd::DurableLog::ObjectIdentity identity{alarm.namespaceId, alarm.objectId, owner->tenant,
       route.dataEpoch, route.epoch, alarm.shard};
@@ -6946,7 +6995,14 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   CollectedResponse answer;
   try {
-    answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
+    if (threaded) {
+      request.target.shardEpoch = route.epoch;
+      request.target.dataEpoch = route.dataEpoch;
+      auto dispatched = co_await durable.dispatchLocalAlarm(std::move(request), alarm);
+      answer = co_await collectObjectResponse(kj::mv(dispatched), factory, headerTable, DURABLE_ALARM_PATH, "{}");
+    } else {
+      answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
+    }
   } catch (const kj::Exception& error) {
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
         std::string(error.getDescription().cStr())};
@@ -6970,6 +7026,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     outcome.clear();
   }
   if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
+  if (threaded && outcome == "cleared") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::CLEARED, 0, {}};
+  if (threaded && outcome == "stop") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::STOP, 0, {}};
   if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
   if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   if (code == "DO_ALARM_REBUILDING") {
@@ -9549,7 +9607,8 @@ int run(Launch launch) {
       server.placementConfig().durableLog,
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
-          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
+      server.placementConfig().processPool.threadedDurableStorage},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {

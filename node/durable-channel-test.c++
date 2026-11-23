@@ -18,6 +18,138 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
+  static void threadedAlarms() {
+    auto io = kj::setupAsyncIo();
+    MembershipView membership;
+    DurableLog log({.config = {}, .objectStore = false, .threadedAlarmEvents = true},
+        {}, io.provider->getNetwork(), io.provider->getTimer(), *io.lowLevelProvider, membership, {});
+    double now = 1000;
+    uint64_t wall = 500000;
+    log.alarmMonotonicForTest = [&] { return now; };
+    log.alarmWallForTest = [&] { return wall; };
+    struct Attempt {
+      DurableAlarm alarm;
+      kj::Own<kj::PromiseFulfiller<AlarmResult>> result;
+    };
+    std::vector<Attempt> attempts;
+    log.setAlarmHook([&](DurableAlarm alarm) {
+      KJ_REQUIRE(log.alarmFireIsCurrent(alarm));
+      auto pending = kj::newPromiseAndFulfiller<AlarmResult>();
+      attempts.push_back({std::move(alarm), kj::mv(pending.fulfiller)});
+      return kj::mv(pending.promise);
+    });
+    auto flush = [&] {
+      log.pumpAlarmFires();
+      KJ_REQUIRE(io.waitScope.poll(1000) < 1000, "alarm scheduler did not become idle");
+    };
+    auto opened = [&](std::string objectId) {
+      const auto name = durableHostName("namespace", objectId, 3);
+      auto& object = log.objects[name];
+      object.objectName = name;
+      object.namespaceId = "namespace";
+      object.objectId = objectId;
+      object.tenant = "tenant";
+      object.dataEpoch = 3;
+      object.shardEpoch = 7;
+      object.state = DurableLog::ObjectState::LOCAL;
+      return name;
+    };
+    auto complete = [&](AlarmOutcome outcome, uint64_t atUnixMs = 0) {
+      attempts.back().result->fulfill(AlarmResult{outcome, atUnixMs});
+      flush();
+    };
+
+    const auto name = opened("retry");
+    const auto key = "namespace/retry/0";
+    log.alarmReported(name, 0, wall + 1);
+    flush();
+    KJ_REQUIRE(attempts.empty());
+    ++wall;
+    flush();
+    KJ_REQUIRE(attempts.size() == 1 && attempts.back().alarm.retryCount == 0);
+    complete(AlarmOutcome::UNAVAILABLE);
+    KJ_REQUIRE(log.alarms.at(key).retries == 0);
+    now += 1000;
+    flush();
+    KJ_REQUIRE(attempts.size() == 2 && attempts.back().alarm.retryCount == 0);
+    for (uint32_t retry = 1; retry <= 6; ++retry) {
+      const auto count = attempts.size();
+      complete(AlarmOutcome::FAILED);
+      const auto due = log.alarms.at(key).notBeforeMs;
+      const double nominal = 2000u << (retry - 1);
+      KJ_REQUIRE(due - now >= nominal * 0.875 && due - now < nominal * 1.125);
+      now = due - 1;
+      flush();
+      KJ_REQUIRE(attempts.size() == count);
+      now = due;
+      flush();
+      KJ_REQUIRE(attempts.size() == count + 1 && attempts.back().alarm.retryCount == retry &&
+          !attempts.back().alarm.clear);
+      if (retry == 1) {
+        complete(AlarmOutcome::DEFERRED);
+        KJ_REQUIRE(log.alarms.at(key).retries == 1 && attempts.size() == count + 1);
+        log.alarmCapacityAvailable("node");
+        flush();
+        KJ_REQUIRE(attempts.size() == count + 2 && attempts.back().alarm.retryCount == 1);
+      }
+    }
+    const auto count = attempts.size();
+    complete(AlarmOutcome::FAILED);
+    KJ_REQUIRE(attempts.size() == count + 1 && attempts.back().alarm.clear && log.alarmRetries == 6);
+    const auto exhausted = attempts.back().alarm;
+    log.alarmReported(name, 0, ++wall);
+    flush();
+    KJ_REQUIRE(attempts.size() == count + 1 && !log.alarmFireIsCurrent(exhausted),
+        "a replacement schedule must wait for the old dispatch, whose token was invalidated");
+    complete(AlarmOutcome::CLEARED);
+    KJ_REQUIRE(attempts.size() == count + 2 && attempts.back().alarm.retryCount == 0 &&
+        !attempts.back().alarm.clear && log.alarmFireIsCurrent(attempts.back().alarm));
+
+    complete(AlarmOutcome::FAILED);
+    now = log.alarms.at(key).notBeforeMs;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 1);
+    complete(AlarmOutcome::FIRED);
+    now = log.alarms.at(key).notBeforeMs;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).countedRetries == 0);
+
+    complete(AlarmOutcome::NOT_DUE, wall + 50);
+    KJ_REQUIRE(log.alarms.at(key).atUnixMs == wall + 50);
+    KJ_REQUIRE(log.objects.at(name).alarms.at(0) == wall + 50);
+    wall += 50;
+    flush();
+    KJ_REQUIRE(attempts.back().alarm.atUnixMs == wall);
+    complete(AlarmOutcome::NOT_DUE);
+    KJ_REQUIRE(!log.alarms.contains(key) && log.objects.at(name).alarms.at(0) == 0);
+    log.alarmReported(name, 0, wall);
+    flush();
+    const auto beforeStop = attempts.size();
+    complete(AlarmOutcome::STOP);
+    KJ_REQUIRE(attempts.size() == beforeStop + 1 && attempts.back().alarm.clear &&
+        attempts.back().alarm.retryCount == 0);
+    complete(AlarmOutcome::UNAVAILABLE);
+    now += 1000;
+    flush();
+    KJ_REQUIRE(attempts.size() == beforeStop + 2 && attempts.back().alarm.clear);
+    complete(AlarmOutcome::CLEARED);
+    KJ_REQUIRE(!log.alarms.contains(key));
+    log.alarmReported(name, 0, wall);
+    flush();
+    const auto beforeParallel = attempts.size();
+
+    for (const auto* objectId : {"first", "second", "third"}) log.alarmReported(opened(objectId), 0, wall);
+    flush();
+    KJ_REQUIRE(log.activeAlarmFires == 4 && attempts.size() == beforeParallel + 3);
+    log.shardGone("namespace", 0, "test ownership change");
+    KJ_REQUIRE(log.alarms.empty() && !log.alarmFireIsCurrent(attempts.back().alarm));
+    for (auto& attempt : attempts) {
+      if (attempt.result->isWaiting()) attempt.result->fulfill(AlarmResult{AlarmOutcome::UNAVAILABLE});
+    }
+    flush();
+    KJ_REQUIRE(log.activeAlarmFires == 0 && log.alarms.empty());
+  }
+
   // The lease of a membership epoch, by the tracker alone. TTL 5 s, interval 1 s.
   static void leaseTracker() {
     using V = LeaseTracker::Verdict;
@@ -1788,6 +1920,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
   else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
+  else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "restored-tail" || mode == "restored-tail-negative")
     coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
