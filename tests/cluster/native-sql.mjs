@@ -269,21 +269,28 @@ export async function longSqlIsolation(cluster) {
   for (let round = 0; round < 2; ++round) {
     await Promise.all(probes.map(probe => probe.check()));
     if (round === 0) await quietWindow();
-    const pending = blocker.raw([put(round), { sql: slow }]);
+    const pending = blocker.raw([put(round), { sql: slow }])
+      .then(response => ({ response }), error => ({ error }));
     await delay(warmStartMs);
     await sampleWindow(probes, busy);
-    const result = json(await pending, 503, '30-second SQL deadline');
+    const answer = await pending;
+    if (answer.error) throw answer.error;
+    const result = json(answer.response, 503, '30-second SQL deadline');
     assert.equal(result.code, 'SQL_LIMIT_EXCEEDED');
 
+    const block = await eventually('the durable child wrote its SQL execution and confirmation times', async () => {
+      const log = await cluster.compose(['exec', '-T', placement.nodeId, 'grep', '-F', '[native-sql] ',
+        '/var/lib/coworkerd/logs/workerd.log']);
+      const row = rows(log, '[native-sql] ').findLast(row => row.pid === original.pid &&
+        row.generation === original.generation && row.namespaceId === blocker.namespaceId.slice(0, 12) &&
+        row.status === 503 && row.startedMonotonicNs > (blockers.at(-1)?.startedMonotonicNs ?? 0));
+      assert.ok(row);
+      return row;
+    }, { timeout: 5000, interval: 100 });
     const log = await cluster.compose(['logs', '--no-color', '--tail', '3500', placement.nodeId]);
-    const block = rows(log, '[native-sql] ').filter(row => row.pid === original.pid &&
-      row.generation === original.generation && row.namespaceId === blocker.namespaceId.slice(0, 12) &&
-      row.status === 503).at(-1);
-    assert.ok(block, 'the threaded child must record the exact execution and confirmation interval');
     const start = block.startedMonotonicNs / 1e6;
     const end = block.finishedMonotonicNs / 1e6;
     assert.ok(end - start >= 29900 && end - start <= 31000, JSON.stringify(block));
-    if (blockers.length !== 0) assert.ok(block.startedMonotonicNs > blockers.at(-1).startedMonotonicNs);
     const deliveries = rows(log, '[do] ').filter(row => sameProcess(row, placement) && row.status === 200 &&
       row.startedMonotonicMs >= start && row.finishedMonotonicMs <= end);
     const overlap = probes.map(probe => deliveries.filter(row =>
