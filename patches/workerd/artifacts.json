@@ -5,6 +5,6 @@
   "releaseTag": "kernel-v1.20261114.1-cb0ada1d298b",
   "archives": {
     "linux-x86_64": "fcf8b426c12815eee402a6ffc6a8797c48299dcf629e6f0d14abde80a7616812",
-    "linux-arm64": null
+    "linux-arm64": "20bfc43d41c39d5f68a512403ca4f1eb8977df8d8780d2cfb297b6f91f173010"
   }
 }
