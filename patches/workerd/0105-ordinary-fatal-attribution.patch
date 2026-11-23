@@ -76,7 +76,7 @@ index 720fadf3d930014291f9f3562b72064375f630b2..058a61eb4a36493f7649ba1d8cb770b3
    DescriptorQueue queue(2);
    KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b..135949663d19d60201f5d9568226f2ee7da77c17 100644
+index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5948cda9790e362710c177928d1456caf32dd5dd 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -39,6 +39,7 @@
@@ -323,7 +323,7 @@ index fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b..135949663d19d60201f5d9568226f2ee
          capnp::MallocMessageBuilder arena;
          auto globals = arena.initRoot<capnp::List<server::Global>>(
              slot.loopbacks.size() + slot.loopbackActors.size());
-@@ -4546,6 +4628,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
+@@ -4643,6 +4725,7 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
          slot->limits->memory ? &slot->limits->memory->heap : nullptr);
      worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
        JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {

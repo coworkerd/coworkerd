@@ -216,8 +216,7 @@ def allowed_path(name, path):
                                    '0067-durable-facet-reset-lifetime.patch',
                                    '0068-durable-process-memory-progress.patch',
                                    '0069-durable-process-memory-recovery.patch',
-                                   '0070-durable-rpc-binding.patch',
-                                   '0091-fatal-attribution-requires-invocation.patch'} and
+                                   '0070-durable-rpc-binding.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0081-threaded-durable-storage.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
@@ -236,15 +235,36 @@ def allowed_path(name, path):
                                    '0088-check-live-facets-on-reset.patch',
                                    '0089-use-durable-home-memory-reclaim.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
-                          name == '0090-ordinary-fatal-attribution.patch' and path in {
+                          name == '0100-threaded-durable-alarms.patch' and path in {
+                              'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/io/actor-sqlite.h',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0101-validate-threaded-alarm-entry.patch' and
+                              path == 'src/workerd/io/actor-sqlite.c++' or
+                          name == '0104-settle-threaded-alarm-outcomes.patch' and path in {
+                              'src/workerd/io/actor-sqlite.h',
+                              'src/workerd/io/actor-sqlite-test.c++',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0105-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0092-fatal-record-test-constant.patch' and
+                          name == '0106-fatal-attribution-requires-invocation.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0107-fatal-record-test-constant.patch' and
                               path == 'src/workerd/threaded/threaded-server-test.c++' or
-                          name == '0093-scope-fatal-attribution.patch' and path in {
+                          name == '0108-scope-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0109-keep-fatal-diagnostics-and-load-scopes.patch' and path in {
+                              'src/workerd/io/limit-enforcer.h',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/tests/test-fixture.c++',
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/fatal-attribution.h',
+                              'src/workerd/threaded/fatal-attribution-test.c++',
+                              'src/workerd/threaded/fatal-attribution-scope-test.c++',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

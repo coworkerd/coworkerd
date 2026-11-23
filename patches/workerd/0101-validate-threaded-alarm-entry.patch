@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 05:40:55 +0800
+Subject: [PATCH] Check the confirmed alarm at the handler entrypoint
+
+
+diff --git a/src/workerd/io/actor-sqlite.c++ b/src/workerd/io/actor-sqlite.c++
+index 2af088eb6cae99d6e74b54358d9916472f22a5f5..eb1afcf0087f3013226e09f9c8ffb8308cf6af6d 100644
+--- a/src/workerd/io/actor-sqlite.c++
++++ b/src/workerd/io/actor-sqlite.c++
+@@ -881,10 +881,6 @@ ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(
+   // kv.deleteAll() clears the database, so we need to save and possibly restore alarm state in
+   // the metadata table to maintain behavior from before the deleteAllDeletesAlarm compat flag.
+   auto localAlarmState = metadata.getAlarm();
+-  if (hooks.hasConfirmedAlarmScheduler() &&
+-      (localAlarmState != scheduledTime || lastConfirmedAlarmDbState != scheduledTime)) {
+-    return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
+-  }
+ 
+   // deleteAll() cannot be part of a transaction because it deletes the database altogether. So,
+   // we have to close our transactions or fail.
+@@ -1032,6 +1028,10 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
+   }
+ 
+   auto localAlarmState = metadata.getAlarm();
++  if (hooks.hasConfirmedAlarmScheduler() &&
++      (localAlarmState != scheduledTime || lastConfirmedAlarmDbState != scheduledTime)) {
++    return CancelAlarmHandler{.waitBeforeCancel = kj::READY_NOW};
++  }
+   if (localAlarmState != scheduledTime) {
+     if (localAlarmState == lastConfirmedAlarmDbState) {
+       // If the local alarm time is already in the past, just run the handler now. This avoids

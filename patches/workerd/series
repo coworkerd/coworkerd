@@ -74,7 +74,11 @@
 0087-allow-threaded-wal-registration.patch
 0088-check-live-facets-on-reset.patch
 0089-use-durable-home-memory-reclaim.patch
-0090-ordinary-fatal-attribution.patch
-0091-fatal-attribution-requires-invocation.patch
-0092-fatal-record-test-constant.patch
-0093-scope-fatal-attribution.patch
+0100-threaded-durable-alarms.patch
+0101-validate-threaded-alarm-entry.patch
+0104-settle-threaded-alarm-outcomes.patch
+0105-ordinary-fatal-attribution.patch
+0106-fatal-attribution-requires-invocation.patch
+0107-fatal-record-test-constant.patch
+0108-scope-fatal-attribution.patch
+0109-keep-fatal-diagnostics-and-load-scopes.patch

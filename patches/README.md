@@ -39,8 +39,13 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `0081-threaded-durable-storage.patch` connects the threaded server and its Bazel target to the
   inherited WAL channel. Its two SQLite utility changes report a synchronous connection close to the
   embedder only after SQLite confirms that no dependent handles remain.
-  `0090-ordinary-fatal-attribution.patch` adds fatal records to the ordinary and quarantine threaded
-  server. Its additional paths are the threaded server, its component test and its Bazel file.
+  Patches 0100, 0101 and 0104 dispatch node-authorized alarm events on threaded homes. Their
+  `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
+  after WAL confirmation for this host. The storage fixture holds confirmation to test these guarantees.
+  Patches 0105 through 0109 add fatal attribution and bounded diagnostics to the ordinary and
+  quarantine threaded roles. Patch 0109 allows the three exact paths in `io/worker.c++`,
+  `io/limit-enforcer.h` and `tests/test-fixture.c++` for the legacy import limit hook.
+  This passes a weak reference to the originating context without changing the ambient context.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 08:07:40 +0800
+Subject: [PATCH] Settle native Durable Object alarm outcomes
+
+
+diff --git a/src/workerd/io/actor-sqlite-test.c++ b/src/workerd/io/actor-sqlite-test.c++
+index 808909d138b8922f18ee4a3c84902b6e2a7f01b2..896410871dbe83de95f995db16f5a7f07cfe109f 100644
+--- a/src/workerd/io/actor-sqlite-test.c++
++++ b/src/workerd/io/actor-sqlite-test.c++
+@@ -94,11 +94,21 @@ struct ActorSqliteTest final: public kj::PtrTarget {
+       return kj::mv(promise);
+     }
+ 
++    bool hasConfirmedAlarmScheduler() const override {
++      return parent.confirmedAlarms;
++    }
++
++    void alarmConfirmed(kj::Maybe<kj::Date> time) override {
++      parent.alarmReports.add(time);
++    }
++
+     ActorSqliteTest& parent;
+   };
+   kj::Maybe<kj::Function<kj::Promise<void>(kj::Maybe<kj::Date>)>> scheduleRunHandler;
+   kj::Maybe<kj::Function<kj::Promise<void>(kj::Maybe<kj::Date>, kj::Promise<void>)>>
+       scheduleRunWithPriorHandler;
++  bool confirmedAlarms = false;
++  kj::Vector<kj::Maybe<kj::Date>> alarmReports;
+   ActorSqliteTestHooks hooks = ActorSqliteTestHooks(*this);
+ 
+   ActorSqlite actor;
+@@ -1203,6 +1213,45 @@ KJ_TEST("rapid move-later alarm changes coalesce into bounded scheduleRun calls"
+   KJ_ASSERT(expectSync(test.getAlarm()) == fiveMs);
+ }
+ 
++KJ_TEST("node-owned alarms are reported, run and abandoned only at the confirmed time") {
++  ActorSqliteTest test;
++  test.confirmedAlarms = true;
++  test.setAlarm(oneMs);
++  auto first = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
++  KJ_EXPECT(test.alarmReports.empty());
++  KJ_EXPECT(test.actor.confirmedAlarmTime() == kj::none);
++  auto unconfirmed = test.actor.armAlarmHandler(oneMs, nullptr, twoMs);
++  KJ_REQUIRE(unconfirmed.is<ActorSqlite::CancelAlarmHandler>());
++  unconfirmed.get<ActorSqlite::CancelAlarmHandler>().waitBeforeCancel.wait(test.ws);
++  KJ_EXPECT(test.actor.abandonAlarm(oneMs).wait(test.ws) == kj::none);
++  KJ_EXPECT(expectSync(test.getAlarm()) == oneMs);
++  first->fulfill();
++  test.pollAndExpectCalls({});
++  KJ_REQUIRE(test.alarmReports.size() == 1 && test.alarmReports[0] == oneMs);
++
++  test.setAlarm(twoMs);
++  auto replacement = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
++  KJ_EXPECT(test.alarmReports.size() == 1 && test.actor.confirmedAlarmTime() == oneMs);
++  KJ_EXPECT(
++      test.actor.armAlarmHandler(oneMs, nullptr, threeMs).is<ActorSqlite::CancelAlarmHandler>());
++  KJ_EXPECT(test.actor.abandonAlarm(twoMs).wait(test.ws) == oneMs);
++  KJ_EXPECT(expectSync(test.getAlarm()) == twoMs);
++  replacement->fulfill();
++  test.pollAndExpectCalls({});
++  KJ_REQUIRE(test.alarmReports.size() == 2 && test.alarmReports[1] == twoMs);
++  KJ_EXPECT(
++      test.actor.armAlarmHandler(oneMs, nullptr, threeMs).is<ActorSqlite::CancelAlarmHandler>());
++  KJ_EXPECT(test.actor.abandonAlarm(oneMs).wait(test.ws) == twoMs);
++  KJ_EXPECT(expectSync(test.getAlarm()) == twoMs);
++
++  KJ_EXPECT(test.actor.abandonAlarm(twoMs).wait(test.ws) == kj::none);
++  auto clear = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
++  KJ_EXPECT(test.alarmReports.size() == 2 && test.actor.confirmedAlarmTime() == twoMs);
++  clear->fulfill();
++  test.pollAndExpectCalls({});
++  KJ_REQUIRE(test.alarmReports.size() == 3 && test.alarmReports[2] == kj::none);
++}
++
+ KJ_TEST("armAlarmHandler with coalesced pending alarms schedules reschedule exactly once") {
+   // Verifies two properties:
+   // 1. No duplicate scheduleRun(6ms): armAlarmHandler clears pendingLaterAlarmTime so the
+diff --git a/src/workerd/io/actor-sqlite.h b/src/workerd/io/actor-sqlite.h
+index 994481dbbc8bed5a33ced41e6bbf2ba198936305..0ded7f7d5cd041abcb349fdfa44f62c35a9b7fac 100644
+--- a/src/workerd/io/actor-sqlite.h
++++ b/src/workerd/io/actor-sqlite.h
+@@ -43,7 +43,9 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
+ 
+     // A node-owned scheduler learns the time from confirmed storage and
+     // supplies that exact time when it opens an alarm event.
+-    virtual bool hasConfirmedAlarmScheduler() const { return false; }
++    virtual bool hasConfirmedAlarmScheduler() const {
++      return false;
++    }
+     virtual void alarmConfirmed(kj::Maybe<kj::Date>) {}
+ 
+     static const Hooks DEFAULT;
+@@ -136,6 +138,10 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
+       kj::StringPtr actorId = "") override;
+   void cancelDeferredAlarmDeletion() override;
+   kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date scheduledTime) override;
++  // Callers check the output gate before using this as the authoritative schedule.
++  kj::Maybe<kj::Date> confirmedAlarmTime() const {
++    return lastConfirmedAlarmDbState;
++  }
+   kj::Maybe<kj::Promise<void>> onNoPendingFlush(SpanParent parentSpan) override;
+   kj::Promise<kj::String> getCurrentBookmark(SpanParent parentSpan) override;
+   kj::Promise<void> waitForBookmark(kj::StringPtr bookmark, SpanParent parentSpan) override;
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 7db0275a1f06f14f4e6c447defb44688e24ce08e..154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3727,40 +3727,76 @@ struct DurableAlarmEvent {
+ // to the same URL uses its regular entrypoint.
+ class DurableAlarmHttp final: public kj::HttpService {
+  public:
+-  DurableAlarmHttp(kj::Own<WorkerInterface> worker, DurableAlarmEvent event,
+-      const kj::HttpHeaderTable& headers)
+-      : worker(kj::mv(worker)), event(kj::mv(event)), headers(headers) {}
++  DurableAlarmHttp(
++      kj::Own<WorkerInterface> worker, DurableAlarmEvent event, const kj::HttpHeaderTable &headers)
++      : worker(kj::mv(worker)),
++        event(kj::mv(event)),
++        headers(headers) {}
+ 
+   kj::Promise<void> request(kj::HttpMethod method,
+       kj::StringPtr url,
+       const kj::HttpHeaders&,
+       kj::AsyncInputStream&,
+       Response& response) override {
+-    KJ_REQUIRE(method == kj::HttpMethod::POST &&
+-        url == "http://coworkerd-node/__coworkerd/durable-alarm", "invalid alarm event");
++    KJ_REQUIRE(
++        method == kj::HttpMethod::POST && url == "http://coworkerd-node/__coworkerd/durable-alarm",
++        "invalid alarm event");
+     KJ_REQUIRE(worker.get() != nullptr, "one call per alarm event");
+     auto entry = kj::mv(worker);
+     auto& actor = *event.actor;
+     auto& gate = actor.getOutputGate();
++    auto &storage = KJ_REQUIRE_NONNULL(kj::tryDowncast<ActorSqlite>(
++        KJ_REQUIRE_NONNULL(actor.getPersistent(), "an alarm requires persistent storage")));
+     co_await gate.wait(nullptr);
+ 
+     kj::StringPtr outcome;
++    auto confirmedTime = storage.confirmedAlarmTime();
+     if (event.clear) {
+       co_await entry->abandonAlarm(event.scheduledTime);
+       co_await gate.wait(nullptr);
+-      outcome = "cleared";
++      confirmedTime = storage.confirmedAlarmTime();
++      if (confirmedTime == kj::none) {
++        outcome = "cleared";
++      } else {
++        outcome = confirmedTime != event.scheduledTime ? "notDue" : "unavailable";
++      }
++    } else if (confirmedTime != event.scheduledTime) {
++      outcome = "notDue";
+     } else {
+-      auto result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
+-      if (result.outcome == EventOutcome::OK || result.outcome == EventOutcome::SCRIPT_NOT_FOUND) {
++      WorkerInterface::AlarmResult result;
++      try {
++        result = co_await entry->runAlarm(event.scheduledTime, event.retryCount);
++      } catch (const kj::Exception &error) {
++        const auto description = error.getDescription();
++        const auto tunneled = jsg::tunneledErrorType(description);
++        const bool tenantFailure = error.getDetail(jsg::EXCEPTION_IS_USER_ERROR) != kj::none ||
++            jsg::isExceptionFromInputGateBroken(description) ||
++            (tunneled.isJsgError && !tunneled.isInternal &&
++                (!tunneled.isDurableObjectReset ||
++                    description.startsWith("broken.constructorFailed;"_kj)));
++        if (!tenantFailure) throw;
++        result.outcome = EventOutcome::EXCEPTION;
++        result.retry = error.getDetail(jsg::EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY) == kj::none;
++      }
++      if (result.outcome == EventOutcome::OK) {
+         co_await gate.wait(nullptr);
+         outcome = "fired";
+-      } else if (result.retry && result.retryCountsAgainstLimit) {
++      } else if (!result.retry && result.outcome == EventOutcome::CANCELED) {
++        co_await gate.wait(nullptr);
++        confirmedTime = storage.confirmedAlarmTime();
++        outcome = confirmedTime != event.scheduledTime ? "notDue" : "unavailable";
++      } else if (!result.retry) {
++        outcome = "stop";
++      } else if (result.retryCountsAgainstLimit) {
+         outcome = "failed";
+       } else {
+         outcome = "unavailable";
+       }
+     }
+-    auto json = kj::str("{\"outcome\":\"", outcome, "\"}");
++    auto atUnixMs = (confirmedTime.orDefault(kj::UNIX_EPOCH) - kj::UNIX_EPOCH) / kj::MILLISECONDS;
++    auto json = outcome == "notDue"
++        ? kj::str("{\"outcome\":\"notDue\",\"atUnixMs\":", atUnixMs, "}")
++        : kj::str("{\"outcome\":\"", outcome, "\"}");
+     auto body = response.send(200, "OK", kj::HttpHeaders(headers), json.size());
+     co_await body->write(json.asBytes());
+   }

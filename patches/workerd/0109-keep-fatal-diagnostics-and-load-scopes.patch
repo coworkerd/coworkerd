@@ -1,0 +1,683 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 12:34:17 +0800
+Subject: [PATCH] Keep fatal diagnostics and scope attribution to live calls
+
+
+diff --git a/src/workerd/io/limit-enforcer.h b/src/workerd/io/limit-enforcer.h
+index 4905aa9d4ed5a65b8638b07379688709a2ad672c..db673190af7973dd015a75b62acee66bb61768b8 100644
+--- a/src/workerd/io/limit-enforcer.h
++++ b/src/workerd/io/limit-enforcer.h
+@@ -56,9 +56,11 @@ class IsolateLimitEnforcer: public kj::Refcounted {
+   virtual kj::Own<void> enterStartupPython(
+       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const = 0;
+ 
+-  // Like enterStartupJs(), but used when compiling a dynamically-imported module.
+-  virtual kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const = 0;
++  // Like enterStartupJs(), but used when compiling a dynamically-imported module. Its legacy
++  // continuation runs outside IoContext::current(); the originating context may still be alive.
++  virtual kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
++      kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
++      kj::Maybe<IoContext&> origin) const = 0;
+ 
+   // Like enterStartupJs(), but used to enforce tight limits in cases where we just intend
+   // to log an error to the inspector or the like.
+diff --git a/src/workerd/io/worker.c++ b/src/workerd/io/worker.c++
+index 87e5de6cd8701fec95bb03b61c3868c855a1deba..aadc30bd0b192da4107ea0dfd3742dfc00024a82 100644
+--- a/src/workerd/io/worker.c++
++++ b/src/workerd/io/worker.c++
+@@ -958,8 +958,8 @@ struct Worker::Script::Impl {
+         "legacy dynamic imports must not be used with the new module registry");
+     static auto constexpr handleDynamicImport =
+         [](kj::Own<const Worker> worker, DynamicImportHandler handler,
+-            kj::Maybe<jsg::Ref<jsg::AsyncContextFrame>> asyncContext)
+-        -> kj::Promise<DynamicImportResult> {
++            kj::Maybe<jsg::Ref<jsg::AsyncContextFrame>> asyncContext,
++            kj::Own<IoContext::WeakRef> origin) -> kj::Promise<DynamicImportResult> {
+       co_await kj::yield();
+       auto asyncLock = co_await worker->takeAsyncLockWithoutRequest(nullptr);
+ 
+@@ -976,8 +976,10 @@ struct Worker::Script::Impl {
+           try {
+             kj::Maybe<jsg::Value> result;
+             {
++              kj::Maybe<IoContext&> originatingContext;
++              origin->runIfAlive([&](IoContext& context) { originatingContext = context; });
+               auto limitScope = worker->getIsolate().getLimitEnforcer().enterDynamicImportJs(
+-                  lock, limitErrorOrTime);
++                  lock, limitErrorOrTime, originatingContext);
+               result = handler();
+             }
+             // The limit may have been hit in a microtask, which throws nothing.
+@@ -1017,7 +1019,7 @@ struct Worker::Script::Impl {
+ 
+         return context.awaitIo(js,
+             handleDynamicImport(kj::atomicAddRef(context.getWorker()), kj::mv(handler),
+-                jsg::AsyncContextFrame::currentRef(js)),
++                jsg::AsyncContextFrame::currentRef(js), context.getWeakRef()),
+             [](jsg::Lock& js, DynamicImportResult result) {
+           if (result.isException) {
+             return js.rejectedPromise<jsg::Value>(kj::mv(result.value));
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
+index 6684c1ce0df5ae7ded16cebd3b2533f3ae71d4d4..8d886124507f92b901841e21a0e6d38cca431643 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.h
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
+@@ -199,9 +199,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     if (memory) return enterAuxiliaryJs(lock, result);
+     return fallback->enterStartupPython(lock, result);
+   }
+-  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
++      kj::OneOf<kj::Exception, kj::Duration>& result,
++      kj::Maybe<IoContext&> origin) const override {
+     if (memory) return enterAuxiliaryJs(lock, result);
+-    return fallback->enterDynamicImportJs(lock, result);
++    return fallback->enterDynamicImportJs(lock, result, origin);
+   }
+   kj::Own<void> enterLoggingJs(jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
+     if (memory) return enterAuxiliaryJs(lock, result);
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index ac0280962beb544fd6682b80f3b45481fa7da405..07dd43fedacea64eeb8e2f461bf350b43ccfe284 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -304,7 +304,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     return {};
+   }
+   kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&, kj::Maybe<IoContext&>) const override {
+     return {};
+   }
+   kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+diff --git a/src/workerd/tests/test-fixture.c++ b/src/workerd/tests/test-fixture.c++
+index 27fc5ddcc6def99b7582d588dbfdcd04fc09a395..c3894eb59bb4717f889e93b6379dabcaed6844b0 100644
+--- a/src/workerd/tests/test-fixture.c++
++++ b/src/workerd/tests/test-fixture.c++
+@@ -218,8 +218,9 @@ struct MockIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+     return enterStartupLimitScope();
+   }
+-  kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++  kj::Own<void> enterDynamicImportJs(jsg::Lock& lock,
++      kj::OneOf<kj::Exception, kj::Duration>&,
++      kj::Maybe<IoContext&>) const override {
+     return {};
+   }
+   kj::Own<void> enterLoggingJs(
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 9895fca5e4c88f0497c8c29affe024e3af51738b..e05a3275d2077123fecb09891f9578d2708c66b4 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -4,6 +4,7 @@ load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
+ load("//:build/wd_cc_library.bzl", "wd_cc_library")
+ 
+ THREADED_DEPS = [
++    ":fatal-attribution",
+     ":protocol_capnp",
+     "//src/workerd/api:memory-cache",
+     "//src/workerd/io",
+@@ -31,6 +32,27 @@ THREADED_DEPS = [
+     "@ssl",
+ ]
+ 
++wd_cc_library(
++    name = "fatal-attribution",
++    hdrs = ["fatal-attribution.h"],
++    deps = ["@capnp-cpp//src/kj"],
++)
++
++kj_test(
++    size = "small",
++    src = "fatal-attribution-test.c++",
++    deps = [":fatal-attribution"],
++)
++
++kj_test(
++    size = "small",
++    src = "fatal-attribution-scope-test.c++",
++    deps = [
++        ":fatal-attribution",
++        "//src/workerd/jsg",
++    ],
++)
++
+ wd_cc_binary(
+     name = "coworkerd-threaded",
+     srcs = [
+@@ -44,6 +66,7 @@ wd_cc_binary(
+ 
+ wd_cc_binary(
+     name = "coworkerd-threaded-fatal-test",
++    testonly = True,
+     srcs = [
+         "protocol.h",
+         "threaded-server.c++",
+@@ -51,7 +74,6 @@ wd_cc_binary(
+     local_defines = ["COWORKERD_FATAL_TEST_BUILD"],
+     malloc = "//src/workerd/server:malloc",
+     target_compatible_with = ["@platforms//os:linux"],
+-    testonly = True,
+     deps = THREADED_DEPS,
+ )
+ 
+@@ -68,7 +90,10 @@ wd_capnp_library(
+ wd_cc_library(
+     name = "server-source",
+     testonly = True,
+-    textual_hdrs = ["threaded-server.c++", "protocol.h"],
++    textual_hdrs = [
++        "threaded-server.c++",
++        "protocol.h",
++    ],
+     deps = THREADED_DEPS,
+ )
+ 
+diff --git a/src/workerd/threaded/fatal-attribution-scope-test.c++ b/src/workerd/threaded/fatal-attribution-scope-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..6756c41754a4f106aa845fd74aad98dbd3ea4455
+--- /dev/null
++++ b/src/workerd/threaded/fatal-attribution-scope-test.c++
+@@ -0,0 +1,66 @@
++#include "fatal-attribution.h"
++
++#include <workerd/jsg/setup.h>
++
++#include <kj/test.h>
++
++namespace workerd::threaded {
++namespace {
++
++KJ_TEST("successful V8 calls restore their invocation identity across isolate entry") {
++  jsg::V8System v8;
++  v8::Isolate::CreateParams params;
++  params.array_buffer_allocator_shared.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
++  auto* first = v8::Isolate::New(params);
++  KJ_DEFER(first->Dispose());
++  auto* second = v8::Isolate::New(params);
++  KJ_DEFER(second->Dispose());
++
++  auto current = [] { return FatalInvocation::forIsolate(v8::Isolate::TryGetCurrent()); };
++  auto compute = [](v8::Isolate* isolate, const char* text) {
++    const auto context = isolate->GetCurrentContext();
++    v8::Local<v8::String> source;
++    KJ_REQUIRE(v8::String::NewFromUtf8(isolate, text).ToLocal(&source));
++    v8::Local<v8::Script> script;
++    KJ_REQUIRE(v8::Script::Compile(context, source).ToLocal(&script));
++    v8::Local<v8::Value> value;
++    KJ_REQUIRE(script->Run(context).ToLocal(&value));
++    int32_t result;
++    KJ_REQUIRE(value->Int32Value(context).To(&result));
++    return result;
++  };
++
++  KJ_EXPECT(current() == nullptr);
++  {
++    v8::Locker locker(first);
++    v8::Isolate::Scope entered(first);
++    v8::HandleScope handles(first);
++    v8::Context::Scope context(v8::Context::New(first));
++    FatalInvocation outer(first, "outer");
++    KJ_EXPECT(current() == &outer);
++    KJ_EXPECT(compute(first, "6 * 7") == 42);
++    {
++      FatalInvocation nested(first, "nested");
++      KJ_EXPECT(current() == &nested);
++      KJ_EXPECT(compute(first, "19 + 23") == 42);
++    }
++    KJ_EXPECT(current() == &outer);
++    {
++      v8::Locker otherLocker(second);
++      v8::Isolate::Scope otherEntered(second);
++      KJ_REQUIRE(v8::Isolate::TryGetCurrent() == second);
++      KJ_EXPECT(current() == nullptr);
++      v8::HandleScope otherHandles(second);
++      v8::Context::Scope otherContext(v8::Context::New(second));
++      FatalInvocation other(second, "other");
++      KJ_EXPECT(current() == &other);
++      KJ_EXPECT(compute(second, "84 / 2") == 42);
++    }
++    KJ_EXPECT(current() == &outer);
++    KJ_EXPECT(compute(first, "43 - 1") == 42);
++  }
++  KJ_EXPECT(current() == nullptr);
++}
++
++}  // namespace
++}  // namespace workerd::threaded
+diff --git a/src/workerd/threaded/fatal-attribution-test.c++ b/src/workerd/threaded/fatal-attribution-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..147f6d0352f78897ae5d5c07784f86ed42ce4bab
+--- /dev/null
++++ b/src/workerd/threaded/fatal-attribution-test.c++
+@@ -0,0 +1,90 @@
++#include "fatal-attribution.h"
++
++#include <kj/test.h>
++
++namespace workerd::threaded {
++namespace {
++
++KJ_TEST("fatal diagnostics preserve short text and cap both byte prefixes") {
++  char row[FATAL_DIAGNOSTIC_ROW_BYTES];
++  KJ_EXPECT(formatFatalDiagnostic(row, 1, nullptr, 0, nullptr) == 0);
++  KJ_EXPECT(formatFatalDiagnostic(row, 1, "x", 42, "a\"\n") > 0);
++  KJ_EXPECT(kj::StringPtr(row) ==
++      "{\"event\":\"v8-fatal-diagnostic\",\"pid\":1,\"fatalLocationHex\":\"78\","
++      "\"fatalLine\":42,\"fatalMessageHex\":\"61220a\"}\n");
++
++  auto location = kj::str(kj::repeat('f', 600), '!');
++  auto message = kj::str(kj::repeat('w', 1600), '!');
++  const auto size = formatFatalDiagnostic(row, 123, location.cStr(), -2147483647, message.cStr());
++  const auto expected =
++      kj::str("{\"event\":\"v8-fatal-diagnostic\",\"pid\":123,\"fatalLocationHex\":\"",
++          kj::repeat('6', 2 * FATAL_LOCATION_MAX_BYTES),
++          "\",\"fatalLine\":-2147483647,\"fatalMessageHex\":\"",
++          kj::repeat('7', 2 * FATAL_MESSAGE_MAX_BYTES), "\"}\n");
++  KJ_EXPECT(size == expected.size());
++  KJ_EXPECT(size < FATAL_DIAGNOSTIC_ROW_BYTES);
++  KJ_EXPECT(kj::StringPtr(row) == expected);
++}
++
++KJ_TEST("successful calls enter and restore nested invocation identities") {
++  struct IsolateToken {};
++  const IsolateToken first, second;
++  auto identity = [](const IsolateToken* current) -> kj::StringPtr {
++    if (const auto* scope = FatalInvocation::forIsolate(current)) return scope->getIdentity();
++    return "";
++  };
++  auto call = [&](const IsolateToken& entered, kj::StringPtr invocation, auto run) {
++    const FatalInvocation scope(&entered, invocation);
++    return run();
++  };
++
++  KJ_EXPECT(identity(&first) == "");
++  auto result = call(first, "outer", [&] {
++    KJ_EXPECT(identity(&first) == "outer");
++    KJ_EXPECT(identity(&second) == "");
++    KJ_EXPECT(identity(nullptr) == "");
++    const auto sameIsolate = call(first, "inner", [&] {
++      KJ_EXPECT(identity(&first) == "inner");
++      return 40;
++    });
++    KJ_EXPECT(identity(&first) == "outer");
++    const auto differentIsolate = call(second, "other", [&] {
++      KJ_EXPECT(identity(&second) == "other");
++      KJ_EXPECT(identity(&first) == "");
++      return 2;
++    });
++    KJ_EXPECT(identity(&first) == "outer");
++    KJ_EXPECT(identity(&second) == "");
++    return sameIsolate + differentIsolate;
++  });
++  KJ_EXPECT(result == 42);
++  KJ_EXPECT(identity(&first) == "");
++  KJ_EXPECT(identity(&second) == "");
++}
++
++KJ_TEST("the process registration seam forwards the handler only for ordinary and quarantine") {
++  struct MockRegistrar {
++    FatalHandler callback = nullptr;
++    unsigned registrations = 0;
++
++    void accept(FatalHandler value) {
++      ++registrations;
++      callback = value;
++    }
++  } mock;
++  auto registerHandler = [&](FatalHandler callback) { mock.accept(callback); };
++  auto record = +[](const char* location, int line, const char* message) {
++    char row[FATAL_DIAGNOSTIC_ROW_BYTES];
++    KJ_EXPECT(formatFatalDiagnostic(row, 2, location, line, message) > 0);
++    KJ_EXPECT(kj::StringPtr(row).contains("647269766572"_kj));
++  };
++
++  registerProcessFatalHandler(FatalHandlerRole::DURABLE, registerHandler, record);
++  KJ_EXPECT(mock.registrations == 0 && mock.callback == nullptr);
++  registerProcessFatalHandler(FatalHandlerRole::ORDINARY_OR_QUARANTINE, registerHandler, record);
++  KJ_REQUIRE(mock.registrations == 1 && mock.callback == record);
++  mock.callback("driver", 10, "ordinary message");
++}
++
++}  // namespace
++}  // namespace workerd::threaded
+diff --git a/src/workerd/threaded/fatal-attribution.h b/src/workerd/threaded/fatal-attribution.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c3136e91cb1e507bb8d0de142046e60a2280bf3
+--- /dev/null
++++ b/src/workerd/threaded/fatal-attribution.h
+@@ -0,0 +1,85 @@
++#pragma once
++
++#include <kj/string.h>
++
++#include <cstdio>
++
++namespace workerd::threaded {
++
++// Only the top scope can identify the isolate executing on this thread.
++class FatalInvocation {
++ public:
++  FatalInvocation(const void* isolate, kj::StringPtr identity)
++      : isolate(isolate),
++        identity(identity),
++        previous(current) {
++    current = this;
++  }
++  ~FatalInvocation() {
++    current = previous;
++  }
++  KJ_DISALLOW_COPY_AND_MOVE(FatalInvocation);
++
++  static const FatalInvocation* forIsolate(const void* isolate) {
++    return current != nullptr && isolate != nullptr && current->isolate == isolate ? current
++                                                                                   : nullptr;
++  }
++
++  kj::StringPtr getIdentity() const {
++    return identity;
++  }
++
++ private:
++  const void* isolate;
++  kj::StringPtr identity;
++  const FatalInvocation* previous;
++  inline static thread_local const FatalInvocation* current = nullptr;
++};
++
++enum class FatalHandlerRole { ORDINARY_OR_QUARANTINE, DURABLE };
++using FatalHandler = void (*)(const char* location, int line, const char* message);
++
++template <typename Registrar>
++void registerProcessFatalHandler(
++    FatalHandlerRole role, Registrar registerHandler, FatalHandler handler) {
++  if (role == FatalHandlerRole::ORDINARY_OR_QUARANTINE) registerHandler(handler);
++}
++
++inline constexpr size_t FATAL_LOCATION_MAX_BYTES = 256;
++inline constexpr size_t FATAL_MESSAGE_MAX_BYTES = 768;
++inline constexpr size_t FATAL_DIAGNOSTIC_ROW_BYTES = 2304;
++
++// Encode fixed-size byte prefixes for the JSON wire format. The node decodes
++// and redacts them before logging. The crash callback allocates no heap memory.
++template <size_t capacity>
++void encodeDiagnosticPrefix(char (&out)[capacity], const char* text) {
++  static constexpr char hex[] = "0123456789abcdef";
++  size_t written = 0;
++  if (text != nullptr) {
++    for (size_t i = 0; i < (capacity - 1) / 2 && text[i] != '\0'; ++i) {
++      const auto byte = static_cast<unsigned char>(text[i]);
++      out[written++] = hex[byte >> 4];
++      out[written++] = hex[byte & 15];
++    }
++  }
++  out[written] = '\0';
++}
++
++inline size_t formatFatalDiagnostic(char (&row)[FATAL_DIAGNOSTIC_ROW_BYTES],
++    int pid,
++    const char* location,
++    int line,
++    const char* message) {
++  if (location == nullptr && message == nullptr) return 0;
++  char where[2 * FATAL_LOCATION_MAX_BYTES + 1];
++  char what[2 * FATAL_MESSAGE_MAX_BYTES + 1];
++  encodeDiagnosticPrefix(where, location);
++  encodeDiagnosticPrefix(what, message);
++  const auto size = snprintf(row, sizeof(row),
++      "{\"event\":\"v8-fatal-diagnostic\",\"pid\":%d,\"fatalLocationHex\":\"%s\","
++      "\"fatalLine\":%d,\"fatalMessageHex\":\"%s\"}\n",
++      pid, where, line, what);
++  return size > 0 && size_t(size) < sizeof(row) ? size_t(size) : 0;
++}
++
++}  // namespace workerd::threaded
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 6e29114cde876b77b6b530da79df2d0f7d8222ea..47e6a413825854e3514ac2e41f189cbb5108fa4a 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache 2.0 license found in the LICENSE file or at:
+ //     https://opensource.org/licenses/Apache-2.0
+ 
++#include "fatal-attribution.h"
+ #include "protocol.h"
+ 
+ #include <workerd/api/actor-state.h>
+@@ -26,9 +27,9 @@
+ #include <workerd/server/factory/coworkerd-durable-cpu.h>
+ #include <workerd/server/factory/coworkerd-durable-placement.h>
+ #include <workerd/server/factory/coworkerd-durable-test-storage.h>
+-#include <workerd/server/factory/coworkerd-threaded-wal.h>
+ #include <workerd/server/factory/coworkerd-sandbox.h>
+ #include <workerd/server/factory/coworkerd-steady.h>
++#include <workerd/server/factory/coworkerd-threaded-wal.h>
+ #include <workerd/server/v8-platform-impl.h>
+ #include <workerd/server/workerd-api.h>
+ #include <workerd/threaded/protocol.capnp.h>
+@@ -247,24 +248,7 @@ constexpr uint64_t fragmentationReserve(uint64_t maximum) {
+ }
+ 
+ int limitEventFd();
+-struct FatalInvocation {
+-  FatalInvocation(v8::Isolate *isolate, kj::StringPtr identity)
+-      : isolate(isolate),
+-        identity(identity),
+-        previous(current) {
+-    current = this;
+-  }
+-  ~FatalInvocation() {
+-    current = previous;
+-  }
+-  KJ_DISALLOW_COPY_AND_MOVE(FatalInvocation);
+-
+-  v8::Isolate *isolate;
+-  kj::StringPtr identity;
+-  const FatalInvocation *previous;
+-  static thread_local const FatalInvocation *current;
+-};
+-thread_local const FatalInvocation *FatalInvocation::current = nullptr;
++using threaded::FatalInvocation;
+ 
+ thread_local const char *currentOomReport = nullptr;
+ // The executing isolate's heap at its last collection. V8 collects before a
+@@ -650,6 +634,9 @@ uint64_t configuredCount(const char *name, uint64_t fallback) {
+ }
+ 
+ kj::StringPtr executionIdentity(kj::StringPtr fallback);
++struct IsolateLimits;
++kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
++    const IsolateLimits &owner, v8::Isolate *isolate, kj::Maybe<IoContext &> origin);
+ 
+ kj::Exception limitException(LimitCause cause) {
+   if (cause == LimitCause::PROCESS_MEMORY)
+@@ -712,13 +699,12 @@ void writeCrashRow(int fd, const char *data, size_t size) {
+ 
+ void writeFatalRecord(int fd) {
+   char row[PIPE_BUF];
+-  const auto *invocation = FatalInvocation::current;
+-  if (invocation != nullptr && invocation->isolate != nullptr &&
+-      invocation->isolate == v8::Isolate::TryGetCurrent() && invocation->identity.size() > 1 &&
+-      invocation->identity.size() < sizeof(row)) {
++  const auto *invocation = FatalInvocation::forIsolate(v8::Isolate::TryGetCurrent());
++  const auto identity = invocation == nullptr ? ""_kj : invocation->getIdentity();
++  if (identity.size() > 1 && identity.size() < sizeof(row)) {
+     // Identity fields carry a trailing comma for use in the kernel's event rows.
+     const auto size = snprintf(row, sizeof(row), "{\"event\":\"v8-fatal\",\"pid\":%d,%.*s}\n",
+-        getpid(), int(invocation->identity.size() - 1), invocation->identity.begin());
++        getpid(), int(identity.size() - 1), identity.begin());
+     if (size > 0 && size_t(size) < sizeof(row)) {
+       writeCrashRow(fd, row, size);
+       return;
+@@ -729,12 +715,24 @@ void writeFatalRecord(int fd) {
+   if (size > 0 && size_t(size) < sizeof(row)) writeCrashRow(fd, row, size);
+ }
+ 
+-[[noreturn]] void nativeFatal(const char *, const char *) {
+-  writeFatalRecord(limitEventFd());
++[[noreturn]] void exitFromV8Fatal(const char *location, int line, const char *message) {
++  const int fd = limitEventFd();
++  writeFatalRecord(fd);
++  if (fd >= 0) {
++    static_assert(threaded::FATAL_DIAGNOSTIC_ROW_BYTES <= PIPE_BUF);
++    char diagnostic[threaded::FATAL_DIAGNOSTIC_ROW_BYTES];
++    const auto size =
++        threaded::formatFatalDiagnostic(diagnostic, getpid(), location, line, message);
++    if (size != 0) writeCrashRow(fd, diagnostic, size);
++  }
+   // Leave directly, as for native OOM, without unwinding or entering V8 again.
+   _exit(75);
+ }
+ 
++[[noreturn]] void nativeFatal(const char *location, const char *message) {
++  exitFromV8Fatal(location, 0, message);
++}
++
+ [[noreturn]] void nativeOom(const char *location, const v8::OOMDetails &details) {
+   const int fd = limitEventFd();
+   char unknown[96];
+@@ -747,10 +745,9 @@ void writeFatalRecord(int fd) {
+     const bool heapLimit = location != nullptr &&
+         (strcmp(location, "Reached heap limit") == 0 ||
+             strcmp(location, "Ineffective mark-compacts near heap limit") == 0);
+-    const auto *invocation = FatalInvocation::current;
+     const bool isolateLocal = details.is_heap_oom &&
+-        (heapLimit || v8::IsolateGroup::CanCreateNewGroups()) && invocation != nullptr &&
+-        invocation->isolate != nullptr && invocation->isolate == v8::Isolate::TryGetCurrent();
++        (heapLimit || v8::IsolateGroup::CanCreateNewGroups()) &&
++        FatalInvocation::forIsolate(v8::Isolate::TryGetCurrent()) != nullptr;
+     auto size = strlen(currentOomReport);
+     char row[PIPE_BUF];
+     int written = currentOomHeap && size >= 2 && size < sizeof(row)
+@@ -1221,6 +1218,8 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+   std::shared_ptr<MemoryBudget> memory;
+   mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
+   mutable uint64_t startupCpu = 0;
++  // Set before this isolate compiles tenant source.
++  v8::Isolate *isolate = nullptr;
+   v8::Isolate::CreateParams getCreateParams() override {
+     v8::Isolate::CreateParams params;
+     if (memory) {
+@@ -1234,6 +1233,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+   // Called with the isolate entered (Worker::Isolate, sourceJsonFailure): with the V8 sandbox,
+   // its own sandbox must be secure before it runs any code.
+   void customizeIsolate(v8::Isolate *value) override {
++    isolate = value;
+     server::requireSecureIsolateSandbox(value, sandboxName.c_str());
+     if (memory) memory->install(value);
+     if (!durableEvents) value->SetFatalErrorHandler(&nativeFatal);
+@@ -1259,6 +1259,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+     std::atomic<LimitCause> localCause{LimitCause::NONE};
+     uint64_t &totalCpu;
+     std::atomic<LimitCause> &cause;
++    kj::Maybe<kj::StringPtr> scopedIdentity;
+     kj::String identity;
+     uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
+     FatalInvocation fatal;
+@@ -1266,15 +1267,15 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+     Startup(const IsolateLimits &owner,
+         jsg::Lock &js,
+         kj::OneOf<kj::Exception, kj::Duration> &result,
+-        bool startup)
++        bool startup,
++        kj::Maybe<IoContext &> origin = kj::none)
+         : owner(owner),
+           result(result),
+           totalCpu(startup ? owner.startupCpu : localCpu),
+           cause(startup ? owner.startupCause : localCause),
+-          identity(kj::str(executionIdentity(owner.identity))),
+-          fatal(
+-              !owner.durableEvents && (startup || IoContext::hasCurrent()) ? js.v8Isolate : nullptr,
+-              identity),
++          scopedIdentity(scopedExecutionIdentity(owner, js.v8Isolate, origin)),
++          identity(kj::str(scopedIdentity.orDefault(executionIdentity(owner.identity)))),
++          fatal(scopedIdentity == kj::none ? nullptr : js.v8Isolate, identity),
+           execution(js.v8Isolate,
+               cause,
+               owner.memoryState,
+@@ -1307,9 +1308,10 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+       jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
+     return enterStartupJs(js, r);
+   }
+-  kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
+-    return kj::heap<Startup>(*this, js, r, false);
++  kj::Own<void> enterDynamicImportJs(jsg::Lock &js,
++      kj::OneOf<kj::Exception, kj::Duration> &r,
++      kj::Maybe<IoContext &> origin) const override {
++    return kj::heap<Startup>(*this, js, r, false, origin);
+   }
+   kj::Own<void> enterLoggingJs(
+       jsg::Lock &js, kj::OneOf<kj::Exception, kj::Duration> &r) const override {
+@@ -1704,6 +1706,19 @@ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
+   return fallback;
+ }
+ 
++kj::Maybe<kj::StringPtr> scopedExecutionIdentity(
++    const IsolateLimits &owner, v8::Isolate *isolate, kj::Maybe<IoContext &> origin) {
++  if (owner.durableEvents) return kj::none;
++  if (const auto *scope = FatalInvocation::forIsolate(isolate)) return scope->getIdentity();
++  if (origin == kj::none) origin = IoContext::tryCurrent();
++  KJ_IF_SOME(context, origin) {
++    auto *request = dynamic_cast<RequestLimits *>(&context.getLimitEnforcer());
++    if (request != nullptr && request->slot.limits == &owner)
++      return kj::StringPtr(request->identity);
++  }
++  return kj::none;
++}
++
+ void noteUnsupported(kj::StringPtr feature) {
+   if (IoContext::hasCurrent()) {
+     auto &limits = static_cast<RequestLimits &>(IoContext::current().getLimitEnforcer());
+@@ -2462,10 +2477,10 @@ struct ThreadedServer {
+           },
+           durableNumber(std::string_view(this->identity).substr(colon + 1)));
+     }
+-    if (!durableAdmission) {
+-      v8::V8::SetFatalErrorHandler(
+-          [](const char *file, int, const char *message) { nativeFatal(file, message); });
+-    }
++    const auto fatalRole = durableAdmission ? threaded::FatalHandlerRole::DURABLE
++                                            : threaded::FatalHandlerRole::ORDINARY_OR_QUARANTINE;
++    threaded::registerProcessFatalHandler(
++        fatalRole, &v8::V8::SetFatalErrorHandler, &exitFromV8Fatal);
+     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
+     server::requireSecureSandbox();
+     resources->reclaimWake = managerWake;
+@@ -3284,6 +3299,7 @@ struct ThreadedServer {
+           workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
+           invocationIdentity(slot, descriptor), slot.reservation, kj::mv(group));
+       limits.sandboxName = slot.isolateLabel + "/source-json";
++      limits.durableEvents = bool(slot.resetDurableRoot);
+       isolateCreationAttempts.fetch_add(1);
+       KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
+         kj::throwRecoverableException(
+@@ -3393,6 +3409,8 @@ struct ThreadedServer {
+         kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), kj::atomicRefcounted<IsolateObserver>(),
+             name, kj::mv(limits), Worker::Isolate::InspectorPolicy::DISALLOW,
+             Worker::LoggingOptions(Worker::ConsoleMode::STDOUT));
++    FatalInvocation fatal(
++        slot.limits->durableEvents ? nullptr : slot.limits->isolate, slot.limits->identity);
+     slot.loadStage = threaded::LoadStage::EVALUATION;
+     auto extracted = server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter);
+     reporter.requireValid();
+@@ -3491,8 +3509,6 @@ struct ThreadedServer {
+         if (values.isArray()) base += values.getArray().size();
+       }
+       JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
+-        FatalInvocation fatal(
+-            slot.resetDurableRoot ? nullptr : js.v8Isolate, slot.limits->identity);
+         capnp::MallocMessageBuilder arena;
+         auto globals = arena.initRoot<capnp::List<server::Global>>(
+             slot.loopbacks.size() + slot.loopbackActors.size());
+@@ -4737,8 +4753,8 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
+     OomReportScope oom(identity, slot->limits->memoryMiB,
+         slot->limits->memory ? &slot->limits->memory->heap : nullptr);
+     worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {
++      FatalInvocation fatal(slot->resetDurableRoot ? nullptr : lock.getIsolate(), identity);
+       JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
+-        FatalInvocation fatal(slot->resetDurableRoot ? nullptr : js.v8Isolate, identity);
+         auto placeholder = jsg::check(
+             v8::Function::New(js.v8Context(), [](const v8::FunctionCallbackInfo<v8::Value> &) {}));
+         jsg::Serializer serializer(js,

@@ -235,13 +235,15 @@ struct DurableAlarm {
   uint64_t dataEpoch = 0, shardEpoch = 0, atUnixMs = 0;
   // How many times the handler has already been tried, for alarmInfo.retryCount.
   uint32_t retryCount = 0;
+  uint64_t fireToken = 0;
+  bool clear = false;
 };
 // What firing one came to. FIRED: the handler ran and the object cleared its own alarm. NOT_DUE: the object's own
 // database holds another time (`atUnixMs`), which is the truth. FAILED: the handler threw, so it is tried again with
 // Cloudflare's backoff. UNAVAILABLE: the object could not be reached at all (this node no longer owns the shard, the
 // store is down), so nothing is counted against the retry limit. DEFERRED is ordinary admission capacity,
-// rechecked through a destination gate without changing retry state. Only a known deletion drops an entry.
-enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, DELETED, NAMESPACE_WAIT, REBUILDING };
+// rechecked through a destination gate without changing retry state. STOP requests a conditional clear.
+enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, DELETED, NAMESPACE_WAIT, REBUILDING, CLEARED, STOP };
 struct AlarmResult {
   AlarmOutcome outcome = AlarmOutcome::FIRED;
   uint64_t atUnixMs = 0;
@@ -311,6 +313,7 @@ public:
     DurableLogConfig config;
     bool objectStore = true;
     uint32_t tailWaitMs = 25000, peerTimeoutMs = 2000;
+    bool threadedAlarmEvents = false;
   };
   // `openStream` opens a log stream to one peer; `fetchTail` asks a node for what it holds of a previous owner's log
   // for a shard; `knownShardEpoch` is this node's view of who owns a shard, for the fencing of the records it takes
@@ -427,6 +430,7 @@ public:
   // This node has taken the shard: the alarm hints of its objects are read, so the alarms the node before it had
   // scheduled go on being fired here. Each one is checked against the object's own database when it fires.
   void shardTaken(const std::string& namespaceId, uint32_t shard, uint64_t shardEpoch, const std::string& tenant);
+  bool alarmFireIsCurrent(const DurableAlarm& alarm) const;
 
   // ---- Durable Object storage per tenant (the durableObjectBytes quota) ----
   // What this node's objects of the tenant hold, and what the cluster holds as the nodes last published it.
@@ -561,6 +565,7 @@ private:
     double notBeforeMs = 0;   // monotonic: a retry waits for it
     uint32_t retries = 0, countedRetries = 0, backoff = 0;
     bool firing = false;
+    bool clearing = false;
     // Read from the hint in the store rather than reported by the object: the object's own database decides when it
     // is opened, and a hint that turns out to be stale is dropped.
     bool fromHint = false;
@@ -863,6 +868,8 @@ private:
   bool alarmLocallyReady(const AlarmState&) const;
   kj::Promise<void> alarmRebuilt(std::string key, uint64_t token, kj::Promise<void>);
   void pumpAlarmFires();
+  double alarmMonotonicMs() const;
+  uint64_t alarmWallMs() const;
   void scheduleAlarmPump();
   struct AlarmCpuScope { DurableLog& owner;uint64_t started = 0;explicit AlarmCpuScope(DurableLog&);~AlarmCpuScope(); };
   struct AlarmDispatchLease {
@@ -1017,6 +1024,7 @@ private:
   std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
+  std::set<std::string> activeThreadedAlarms;     // held even if the running handler deletes its schedule
   using AlarmOrder = std::tuple<uint64_t, uint64_t, std::string>; // eligible time, due time, key
   struct AlarmBucket {
     std::set<AlarmOrder> queue, retryReady;AlarmOrder head;bool ready = false, timed = false;
@@ -1065,6 +1073,8 @@ private:
   std::map<std::string, std::pair<uint32_t, uint32_t>> alarmProcessFires; // active, peak by durable process
   uint64_t alarmFireSerial = 0, alarmDeferred = 0, alarmInactive = 0;
   bool alarmPumpScheduled = false;
+  std::function<double()> alarmMonotonicForTest;
+  std::function<uint64_t()> alarmWallForTest;
   uint64_t alarmTickSamples = 0, alarmTickMaxNs = 0, alarmTickCpuNs = 0;
   std::array<uint64_t, 1024> alarmTickUs{};
   double alarmLoopMaxLagMs = 0;

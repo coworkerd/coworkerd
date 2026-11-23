@@ -35,7 +35,7 @@ index 6265dcf47e0eec3c9935a170b9c32c4d2ecf2264..9af1fc6c304cc03fd5542d1dd988ecc6
  }
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 3234177ddcbc6491b31deed56ddddfd51c9ccc24..e98eabd7fbf3c67cf4b86bb0bca13acadfd21a15 100644
+index 73a38cd29f3394f961238c11d777354bfe6f36b2..6e29114cde876b77b6b530da79df2d0f7d8222ea 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -38,8 +38,8 @@
