@@ -9,9 +9,9 @@ import { eventually, json, request } from './cluster.mjs';
 const cli = fileURLToPath(new URL('../../cli/bin/cowctl.mjs', import.meta.url));
 const slow = 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000) SELECT sum(n) AS total FROM r';
 
-async function database(cluster, tenant, name) {
+async function database(cluster, tenant, name, { create = true } = {}) {
   const path = `${tenant.path}/databases/${name}`;
-  const { database: { namespaceId } } = await cluster.api(path, { method: 'POST', token: tenant.token });
+  const { database: { namespaceId } } = await cluster.api(path, { method: create ? 'POST' : 'GET', token: tenant.token });
   const raw = (body, format = 'ARRAY_OF_OBJECTS', timeout = 40000) =>
     request(cluster.urls.apiserver, `${path}/query?resultsFormat=${format}`,
       { method: 'POST', token: tenant.token, body, timeout });
@@ -87,6 +87,7 @@ export async function sqlCli(cluster) {
     "CREATE TABLE books(title TEXT PRIMARY KEY); INSERT INTO books VALUES ('one');");
   const run = (...args) => cluster.command(process.execPath, [cli, 'd1', ...args], { cwd, token: tenant.token });
   const source = await database(cluster, tenant, 'books');
+  const migrationStarted = Date.now();
   await run('migrations', 'apply', source.name, '--yes');
   assert.deepEqual((await source.query({ sql: 'SELECT title FROM books' })).results, [{ title: 'one' }]);
   assert.equal((await source.query({ sql: 'SELECT count(*) AS n FROM d1_migrations' })).results[0].n, 1);
@@ -97,6 +98,26 @@ export async function sqlCli(cluster) {
   for (const sql of ['SELECT title FROM books', 'SELECT name FROM d1_migrations ORDER BY name']) {
     assert.deepEqual((await source.query({ sql })).results, (await restored.query({ sql })).results);
   }
+
+  const point = await eventually('the migration is in published SQL history', async () => {
+    const { point } = JSON.parse(await run('time-travel', 'info', source.name, '--json'));
+    assert.ok(point.bookmark);
+    assert.ok(Number(point.writtenAtUnixMs) >= migrationStarted, JSON.stringify(point));
+    return point;
+  }, { timeout: 90000, interval: 1000 });
+  assert.equal((await source.query({ sql: "INSERT INTO books VALUES ('two')" })).success, true);
+  const rewound = 'rewound';
+  const receipt = JSON.parse(await run('time-travel', 'restore', source.name, '--bookmark', point.bookmark,
+    '--to', rewound, '--yes', '--json', '--timeout-ms', '50000'));
+  assert.equal(receipt.phase, 'completed');
+  assert.equal(receipt.point.bookmark, point.bookmark);
+  const clone = await database(cluster, tenant, rewound, { create: false });
+  const titles = { sql: 'SELECT title FROM books ORDER BY title' };
+  assert.notEqual(clone.namespaceId, source.namespaceId);
+  assert.deepEqual((await clone.query(titles)).results, [{ title: 'one' }]);
+  assert.equal((await clone.query({ sql: "INSERT INTO books VALUES ('three')" })).success, true);
+  assert.deepEqual((await clone.query(titles)).results, [{ title: 'one' }, { title: 'three' }]);
+  assert.deepEqual((await source.query(titles)).results, [{ title: 'one' }, { title: 'two' }]);
 }
 
 function rows(log, prefix) {
