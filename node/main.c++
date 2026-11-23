@@ -6644,6 +6644,10 @@ public:
       log(line, request.target, nullptr, refusal.status, refusal.code, started);
       return Received{refusal};
     };
+    if (!coworkerd::acceptsForwardedAlarm(server.placementConfig().processPool.threadedDurableStorage,
+            request.target.alarmAtUnixMs)) {
+      co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
+    }
     std::string code, reason;
     auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
@@ -6740,6 +6744,10 @@ private:
       log(line, target, nullptr, refusal.status, refusal.code, started);
       return Ran{refusal};
     };
+    if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(
+            server.placementConfig().processPool.threadedDurableStorage, target.alarmAtUnixMs)) {
+      co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
+    }
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
@@ -7019,6 +7027,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
   if (threaded && outcome == "cleared") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::CLEARED, 0, {}};
+  if (threaded && outcome == "stop") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::STOP, 0, {}};
   if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
   if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   if (code == "DO_ALARM_REBUILDING") {

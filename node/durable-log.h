@@ -242,8 +242,8 @@ struct DurableAlarm {
 // database holds another time (`atUnixMs`), which is the truth. FAILED: the handler threw, so it is tried again with
 // Cloudflare's backoff. UNAVAILABLE: the object could not be reached at all (this node no longer owns the shard, the
 // store is down), so nothing is counted against the retry limit. DEFERRED is ordinary admission capacity,
-// rechecked through a destination gate without changing retry state. Only a known deletion drops an entry.
-enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, DELETED, NAMESPACE_WAIT, REBUILDING, CLEARED };
+// rechecked through a destination gate without changing retry state. STOP requests a conditional clear.
+enum class AlarmOutcome : uint8_t { FIRED, NOT_DUE, FAILED, UNAVAILABLE, DEFERRED, DELETED, NAMESPACE_WAIT, REBUILDING, CLEARED, STOP };
 struct AlarmResult {
   AlarmOutcome outcome = AlarmOutcome::FIRED;
   uint64_t atUnixMs = 0;
@@ -565,6 +565,7 @@ private:
     double notBeforeMs = 0;   // monotonic: a retry waits for it
     uint32_t retries = 0, countedRetries = 0, backoff = 0;
     bool firing = false;
+    bool clearing = false;
     // Read from the hint in the store rather than reported by the object: the object's own database decides when it
     // is opened, and a hint that turns out to be stale is dropped.
     bool fromHint = false;

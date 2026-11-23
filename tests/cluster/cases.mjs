@@ -507,12 +507,19 @@ async function threadedAlarmTakeover(cluster) {
   const [entry] = cluster.nodes;
   const namespace = () => cluster.api(`${tenant.path}/workers/alarms/namespaces/Alarm`,
     { token: tenant.token });
-  await cluster.deploy(tenant, 'alarms', `
+  const deploy = (version, brokenConstructor = '') => cluster.deploy(tenant, 'alarms', `
     import { DurableObject } from 'cloudflare:workers';
     export class Alarm extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        if (ctx.id.toString() === ${JSON.stringify(brokenConstructor)}) {
+          throw new Error('alarm actor constructor failed');
+        }
+      }
       async fetch(request) {
         if (request.method === 'POST') {
           const at = await request.json();
+          if (new URL(request.url).searchParams.has('stop')) await this.ctx.storage.put('stop', true);
           await this.ctx.storage.setAlarm(at);
           return Response.json(at);
         }
@@ -526,6 +533,7 @@ async function threadedAlarmTakeover(cluster) {
         });
       }
       async alarm() {
+        if (await this.ctx.storage.get('stop')) this.ctx.abort('stop this alarm', { retryAlarm: false });
         await this.ctx.storage.put('fired', ((await this.ctx.storage.get('fired')) ?? 0) + 1);
       }
     }
@@ -533,11 +541,14 @@ async function threadedAlarmTakeover(cluster) {
       const name = new URL(request.url).searchParams.get('object');
       return env.ALARMS.getByName(name).fetch(request);
     } };
-  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Alarm'] }],
+  `, { version, wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Alarm'] }],
     durable_objects: { bindings: [{ name: 'ALARMS', class_name: 'Alarm' }] } } });
+  await deploy('v1');
   const { namespaceId, shards } = await namespace();
+  const idOf = name => createHash('sha256').update(Buffer.from(namespaceId, 'hex'))
+    .update('name').update(name).digest('hex');
   const shardOf = name => {
-    const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest('hex');
+    const id = idOf(name);
     return Number(BigInt(`0x${id.slice(0, 16)}`) % BigInt(shards));
   };
   const confirmed = 'confirmed';
@@ -553,7 +564,35 @@ async function threadedAlarmTakeover(cluster) {
   const rescheduled = sameShard('rescheduled');
   const ownerOfShard = async () => (await namespace()).owners.find(owner => owner.shard === shard && !owner.released);
   const call = (node, object, options) => workerCall(cluster, node, tenant, `alarms?object=${object}`, options);
-  const at = Date.now() + 45000;
+  const alarmEvents = async (object, ...nodes) => {
+    const logs = await cluster.compose(['logs', '--no-color', ...nodes]);
+    const prefix = '[do-log] ';
+    return logs.split('\n').filter(line => line.includes(prefix)).map(line => JSON.parse(line.split(prefix)[1]))
+      .filter(row => row.namespaceId === namespaceId && row.objectId === idOf(object).slice(0, 12) &&
+        row.event.startsWith('alarm-'));
+  };
+
+  // Both behaviors are exercised while the three nodes can still confirm writes normally.
+  const constructorFailure = 'constructor-failure';
+  const noRetry = 'no-retry';
+  const reviewAt = Date.now() + 12000;
+  await eventually('schedule the two reviewed alarm outcomes', async () => {
+    const set = { method: 'POST', body: reviewAt };
+    assert.equal(json(await call(entry, constructorFailure, set), 200, 'constructor schedule'), reviewAt);
+    assert.equal(json(await call(entry, noRetry + '&stop', set), 200, 'nonretrying schedule'), reviewAt);
+  });
+  await deploy('v2', idOf(constructorFailure));
+  await eventually('abort without retry clears the schedule and constructor failures are counted', async () => {
+    const stopped = await alarmEvents(noRetry);
+    assert.equal(stopped.filter(row => row.event === 'alarm-no-retry').length, 1);
+    assert.deepEqual(json(await call(entry, noRetry), 200, 'nonretrying alarm after clear'), { at: null, fired: 0 });
+    const failed = (await alarmEvents(constructorFailure)).filter(row => row.event === 'alarm-failed');
+    assert.deepEqual(failed.slice(0, 2).map(row => row.retries), [1, 2]);
+    assert.ok(failed[0].afterMs >= 1750 && failed[0].afterMs < 2250);
+    assert.ok(failed[1].afterMs >= 3500 && failed[1].afterMs < 4500);
+  }, { timeout: 45000, interval: 500 });
+
+  const at = Date.now() + 65000;
   await eventually('both original schedules are confirmed under the same shard owner', async () => {
     for (const object of [confirmed, unconfirmed, rescheduled]) {
       assert.equal(json(await call(entry, object, { method: 'POST', body: at }), 200, object), at);
@@ -599,7 +638,14 @@ async function threadedAlarmTakeover(cluster) {
       { at: null, fired: 0 });
     assert.deepEqual(json(await call(survivor, rescheduled), 200, 'superseded alarm hint'),
       { at: newTime, fired: 0 }, 'the previous due time cannot fire the replacement schedule');
-  }, { timeout: 60000, interval: 250 });
+  }, { timeout: 85000, interval: 250 });
+  const previouslyConfirmed = (await alarmEvents(confirmed, ...peers)).length;
+  assert.ok(Date.now() >= at, 'observe across the previous scheduled time');
+  await delay(2500);
+  assert.equal((await alarmEvents(confirmed, ...peers)).length, previouslyConfirmed,
+    'the successor stops dispatching for the confirmed clear');
+  assert.deepEqual(json(await call(survivor, rescheduled), 200, 'replacement after previous due time'),
+    { at: newTime, fired: 0 });
 }
 
 async function durableGeneration(cluster, node) {
@@ -790,7 +836,7 @@ async function mixedDurableStorage(cluster) {
     assert.equal((await target.owner()).nodeId, threaded);
   });
 
-  const at = Date.now() + 15000;
+  const at = Date.now() + 25000;
   assert.equal(await write('/alarm', at), at);
   assert.equal((await target.read()).fired, false, 'the replacement alarm is still pending');
   const startingOwner = await target.owner();
@@ -804,6 +850,10 @@ async function mixedDurableStorage(cluster) {
     assert.equal(saved.fired, true);
     const owner = await target.owner();
     assert.ok(peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(startingOwner.epoch));
+    const logs = await cluster.compose(['logs', '--no-color', owner.nodeId]);
+    assert.ok(logs.split('\n').some(line => line.includes('[do-log]') &&
+      line.includes('"event":"alarm-fired"') && line.includes(`"objectId":"${target.id.slice(0, 12)}"`) &&
+      line.includes(`"atUnixMs":${at},`)), 'the new upstream owner dispatched this exact alarm');
     return owner;
   }, { timeout: 120000, interval: 1000 });
 
