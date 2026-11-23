@@ -10,6 +10,7 @@
 #include "tenancy.h"
 #include "support.h"
 #include "async-log.h"
+#include "log-cleaning.h"
 #include "memory-watermark.h"
 #include "background-value.h"
 #include "r47-trace.h"
@@ -17,6 +18,7 @@
 #include <capnp/membrane.h>
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
+#include <kj/encoding.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -903,6 +905,16 @@ std::string observeSandbox(pid_t pid) {
 using TenantCpu = std::map<std::string, uint64_t>;
 
 namespace {
+std::string quotedFatalDiagnostic(kj::StringPtr encoded) {
+  auto bytes = kj::decodeHex(encoded);
+  if (bytes.hadErrors || bytes.size() == 0) return json::quote("");
+  auto text = bytes.asPtr().asChars();
+  auto unicode = kj::encodeUtf32(text);
+  // The kernel's byte limit can cut off the last UTF-8 character.
+  if (unicode.hadErrors) return json::quote(redactSecrets(kj::decodeUtf32(unicode).cStr()));
+  return json::quote(redactSecrets(std::string(text.begin(), text.size())));
+}
+
 struct PreparedCpuUsage {
   enum Decision { PENDING, EXECUTED, NOT_EXECUTED } decision = PENDING;
   std::shared_ptr<TenantCpu> source;
@@ -1231,6 +1243,14 @@ struct ProcessGeneration {
         capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), report);
         if (report.getPid() != static_cast<uint32_t>(spawnPid)) continue;
         const std::string event = report.getEvent().cStr();
+        if (event == "v8-fatal-diagnostic") {
+          std::cout << "[v8-fatal-diagnostic] {\"pid\":" << spawnPid
+              << ",\"location\":" << quotedFatalDiagnostic(report.getFatalLocationHex())
+              << ",\"line\":" << report.getFatalLine()
+              << ",\"message\":" << quotedFatalDiagnostic(report.getFatalMessageHex())
+              << "}" << std::endl;
+          continue;
+        }
         if (event == "terminated" || event == "memory-terminated" || (threaded && event == "process-memory-pressure")) {
           const auto cause = event == "terminated" ? 0 : event == "memory-terminated" ? 1 : 2;
           auto key = callKey(report.getPid(), report.getInvocationId().cStr(),

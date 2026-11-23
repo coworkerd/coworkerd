@@ -712,6 +712,10 @@ struct CpuReport {
   oomIsolateHeapReported @25 :Bool;
   # V8 reported a JavaScript heap OOM at the isolate's heap limit or in its own cage.
   oomIsolateLocal @26 :Bool;
+  # Bounded byte prefixes from V8's callback, separate from attribution.
+  fatalLocationHex @27 :Text;
+  fatalMessageHex @28 :Text;
+  fatalLine @29 :Int32;
 }
 
 struct PlacementConfig {
