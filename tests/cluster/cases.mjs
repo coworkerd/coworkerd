@@ -606,8 +606,10 @@ async function threadedAlarmTakeover(cluster) {
   assert.equal(json(await call(entry, confirmed, clear), 200, 'confirmed clear'), null);
   const gate = join(cluster.peerAckGate, 'hold');
   await writeFile(gate, '');
+  const sentAt = performance.now();
   const pending = call(survivor, unconfirmed, clear).catch(error => ({ error }));
   let paused = false;
+  let recovery;
   try {
     await eventually('the old owner has started a clear that cannot be confirmed', async () => {
       const states = await Promise.all(peers.map(node => cluster.state(node)));
@@ -616,21 +618,30 @@ async function threadedAlarmTakeover(cluster) {
     }, { timeout: 3000, interval: 25 });
     await cluster.compose(['pause', original.nodeId]);
     paused = true;
-    await eventually('the surviving owner reopens the alarm shard at a higher epoch', async () => {
-      assert.equal((await call(survivor, confirmed, { timeout: 7000 })).status, 200);
+    recovery = eventually('the new owner reopens the confirmed clear', async () =>
+      json(await call(survivor, confirmed, { timeout: 10000 }), 200, 'fenced alarm takeover'),
+    { timeout: 45000, interval: 100 }).catch(error => ({ error }));
+    await eventually('a survivor acquires the alarm shard at a higher epoch while the old owner is frozen', async () => {
       const owner = await ownerOfShard();
       assert.ok(owner && peers.includes(owner.nodeId) && BigInt(owner.epoch) > BigInt(original.epoch));
-    }, { timeout: 30000 });
+    }, { timeout: 20000, interval: 100 });
+    assert.ok(performance.now() - sentAt < cluster.confirmTimeoutMs - 1000,
+      'the old clear still has time on its confirmation deadline when the new epoch is known');
   } finally {
     await unlink(gate);
     if (paused) await cluster.compose(['unpause', original.nodeId]);
   }
-  const newTime = at + 120000;
-  assert.ok(Date.now() < at, 'the successor replaces the alarm before its former due time');
-  assert.equal(json(await call(survivor, rescheduled, { method: 'POST', body: newTime }),
-    200, 'replace the inherited schedule'), newTime);
   const result = await pending;
   assert.ok(result.error || result.status >= 400, 'the fenced clear never returns success');
+  const saved = await recovery;
+  if (saved.error) throw saved.error;
+  assert.deepEqual(saved, { at: null, fired: 0 }, 'the previously confirmed clear survives recovery');
+  const newTime = at + 120000;
+  await eventually('the successor replaces the inherited schedule', async () => {
+    assert.equal(json(await call(survivor, rescheduled, { method: 'POST', body: newTime, timeout: 10000 }),
+      200, 'replace the inherited schedule'), newTime);
+  });
+  assert.ok(Date.now() < at, 'the successor replaces the alarm before its former due time');
   await eventually('the surviving owner delivers the alarm whose clear was unconfirmed', async () => {
     assert.deepEqual(json(await call(survivor, unconfirmed), 200, 'unconfirmed clear recovery'),
       { at: null, fired: 1 });
