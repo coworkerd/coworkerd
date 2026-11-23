@@ -59,6 +59,11 @@ archive, Docker images and temporary volumes. These are observed values from the
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
+| `sql-atomicity-threaded` | The same batch atomicity contract fails with native database homes. |
+| `sql-protocol`, `sql-protocol-threaded` | The HTTP and Worker binding contract differs for binary and text values, result modes, counters, authorization, rollback, or the confirmed prefix of D1 `exec()`. Both backends execute the same assertions. |
+| `sql-cli-threaded` | CLI migration, reapply, export, import or content checks fail on native databases. |
+| `long-sql-isolation` | One SQL query or one batch exceeds its deadline, a failed batch leaves a write, the Worker binding loses the limit code, or the same-child probe workload fails the design's latency gate. Prints the quiet and busy samples and execution/confirmation intervals. |
+| `sql-takeover-threaded` | A SQL write answers before peer confirmation, a lost reply after owner death lacks the uncertainty code, or a confirmed write is missing after takeover. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |

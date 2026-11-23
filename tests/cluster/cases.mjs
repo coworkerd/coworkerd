@@ -4,6 +4,7 @@ import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
+import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlProtocol } from './native-sql.mjs';
 
 function respondWith(value) {
   return `export default { fetch() { return new Response(${JSON.stringify(value)}); } };`;
@@ -979,7 +980,7 @@ async function threadedClassMigration(cluster) {
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
-export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
+export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'sql-protocol': sqlProtocol, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-takeover': durableTakeover };
 
@@ -998,4 +999,12 @@ export const durableGatedCases = {
     confirmTimeoutMs: 25000,
   },
   'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
+};
+
+export const nativeSqlCases = {
+  'sql-atomicity-threaded': sqlAtomicity,
+  'sql-protocol-threaded': sqlProtocol,
+  'sql-cli-threaded': sqlCli,
+  'long-sql-isolation': longSqlIsolation,
+  'sql-takeover-threaded': sqlConfirmationAndTakeover,
 };

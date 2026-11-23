@@ -1,0 +1,521 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 11:50:13 +0800
+Subject: [PATCH] Reserve isolated database homes on the threaded host
+
+
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 339f03ed092c134624fd395bd30351a53d30e21d..08973e45481f68dcf3a104c9a7b4d430bcf77aa3 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -17,6 +17,7 @@ THREADED_DEPS = [
+     "//src/workerd/server/factory:coworkerd-durable-cpu",
+     "//src/workerd/server/factory:coworkerd-durable-placement",
+     "//src/workerd/server/factory:coworkerd-durable-test-storage",
++    "//src/workerd/server/factory:coworkerd-native-sql",
+     "//src/workerd/server/factory:coworkerd-sandbox",
+     "//src/workerd/server/factory:coworkerd-steady",
+     "//src/workerd/server/factory:coworkerd-threaded-wal",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c75797103 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -26,6 +26,7 @@
+ #include <workerd/server/factory/coworkerd-durable-cpu.h>
+ #include <workerd/server/factory/coworkerd-durable-placement.h>
+ #include <workerd/server/factory/coworkerd-durable-test-storage.h>
++#include <workerd/server/factory/coworkerd-native-sql.h>
+ #include <workerd/server/factory/coworkerd-threaded-wal.h>
+ #include <workerd/server/factory/coworkerd-sandbox.h>
+ #include <workerd/server/factory/coworkerd-steady.h>
+@@ -1688,6 +1689,16 @@ struct ThreadState {
+   };
+   std::map<Worker::Actor *, uint64_t> durableActorTrees;
+   std::map<uint64_t, DurableRoot> durableRoots;
++  struct NativeDatabase {
++    uint64_t tree;
++    server::DurableAdmission::Time lastUse;
++    kj::Own<SqliteDatabase> connection;
++    // Destroy the shipper first. It defers the close record until SQLite has closed.
++    kj::Own<server::DurableLogShipper> shipper;
++    bool closing = false;
++    bool confirming = false;
++  };
++  std::optional<NativeDatabase> nativeDatabase;
+ };
+ 
+ Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
+@@ -1731,6 +1742,7 @@ struct DurableRoute {
+   server::DurableAdmission::Open open;
+   std::string invocation;
+   std::string uniqueKey, storageId;
++  bool database;
+ 
+   bool operator==(const DurableRoute &) const = default;
+ };
+@@ -1780,7 +1792,8 @@ DurableRoute readDurableRoute(Json::Reader value) {
+     {durableNumber(value, "generation"), durableNumber(value, "dataEpoch"),
+       durableNumber(value, "shardEpoch"), durableNumber(value, "openId"),
+       checkedText("definition", 256), checkedText("className", 255)},
+-    checkedText("invocationId", 255), checkedText("uniqueKey", 100), identifier("storageId")};
++    checkedText("invocationId", 255), checkedText("uniqueKey", 100), identifier("storageId"),
++    flag(value, "database")};
+ }
+ 
+ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+@@ -2149,12 +2162,14 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+       ThreadState &state,
+       DurableRoute route,
+       server::DurableAdmission::Ticket ticket,
++      int connectionFd,
+       kj::Own<kj::PromiseFulfiller<void>> accepted,
+       std::shared_ptr<DurableSessionScope> scope)
+       : server(server),
+         state(state),
+         route(std::move(route)),
+         ticket(ticket),
++        connectionFd(connectionFd),
+         accepted(kj::mv(accepted)),
+         scope(std::move(scope)) {}
+ 
+@@ -2166,6 +2181,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+   ThreadState &state;
+   DurableRoute route;
+   server::DurableAdmission::Ticket ticket;
++  int connectionFd;
+   kj::Own<kj::PromiseFulfiller<void>> accepted;
+   std::shared_ptr<DurableSessionScope> scope;
+   bool used = false;
+@@ -2231,6 +2247,7 @@ struct ThreadedServer {
+   std::mutex durableRoutingMutex;
+   using DurableWake = kj::Own<kj::CrossThreadPromiseFulfiller<void>>;
+   std::map<uint64_t, std::map<uint64_t, DurableWake>> durableWaiters;
++  std::map<uint64_t, uint64_t> nativeSqlSessions;
+   std::atomic<uint64_t> durableHomeSessions{0};
+   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
+@@ -2270,6 +2287,7 @@ struct ThreadedServer {
+       std::string definition;
+       std::string warmDefinition;
+       uint32_t reservedTrees = 0;
++      bool database = false;
+       uint64_t memory = 0;
+       server::DurableHomeLoad load{std::chrono::seconds(4)};
+       server::DurablePressure pressure;
+@@ -2604,7 +2622,7 @@ struct ThreadedServer {
+                 (home.definition.empty() && !threads[spare - 1]->home->definition.empty()))) {
+           spare = i + 1;
+         }
+-        if (home.definition.empty()) continue;
++        if (home.definition.empty() || home.database || route.database) continue;
+         candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
+           home.load.busyFor(now), home.pressure.accepting()});
+       }
+@@ -2612,11 +2630,15 @@ struct ThreadedServer {
+       if (!choice && spare == 0) return false;
+       assigned = choice.value_or(spare);
+       auto &home = *threads[*assigned - 1]->home;
+-      if (!choice) home.definition = route.open.definition;
++      if (!choice) {
++        home.definition = route.open.definition;
++        home.database = route.database;
++      }
+       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
+       ++home.reservedTrees;
+     }
+-    return !threads[*assigned - 1]->home->pressure.resetting();
++    const auto& home = *threads[*assigned - 1]->home;
++    return home.database == route.database && !home.pressure.resetting();
+   }
+ 
+   server::DurableAdmission::Result queueDurable(
+@@ -2660,6 +2682,10 @@ struct ThreadedServer {
+   void finishDurable(server::DurableAdmission::Ticket ticket) {
+     std::lock_guard lock(durableRoutingMutex);
+     durableAdmission->cancel(ticket);
++    auto session = nativeSqlSessions.find(ticket.tree);
++    if (session != nativeSqlSessions.end() && session->second == ticket.event) {
++      nativeSqlSessions.erase(session);
++    }
+     wakeDurableTree(ticket.tree);
+     auto assigned = durableAdmission->homeFor(ticket.tree);
+     if (!assigned) {
+@@ -2671,7 +2697,10 @@ struct ThreadedServer {
+     if (home.resident.contains(ticket.tree)) return;
+     if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
+     KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
+-    if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
++    if (--home.reservedTrees == 0) {
++      home.definition = home.warmDefinition;
++      home.database = false;
++    }
+   }
+ 
+   // durableRoutingMutex is held while checking the FIFO and installing or
+@@ -2697,7 +2726,9 @@ struct ThreadedServer {
+           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+               KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
+         }
+-        if (first == ticket) {
++        const bool databaseBusy = route.database && (nativeSqlSessions.contains(ticket.tree) ||
++            (state.nativeDatabase && state.nativeDatabase->confirming));
++        if (first == ticket && !databaseBusy) {
+           const auto delivery = durableAdmission->begin(
+               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
+           if (delivery == Admission::Delivery::EXPIRED) {
+@@ -2705,6 +2736,7 @@ struct ThreadedServer {
+                 KJ_EXCEPTION(OVERLOADED, "durable routing lease expired"), "LEASE_EXPIRED"));
+           }
+           KJ_REQUIRE(delivery == Admission::Delivery::ACCEPTED, "durable event identity changed");
++          if (route.database) nativeSqlSessions.emplace(ticket.tree, ticket.event);
+           wakeDurableTree(ticket.tree);
+           co_return;
+         }
+@@ -2728,7 +2760,11 @@ struct ThreadedServer {
+       if (root != state.durableRoots.end() && !root->second.resetting) {
+         root->second.lastUse = server::DurableAdmission::Clock::now();
+       }
++      if (state.nativeDatabase && state.nativeDatabase->tree == call.ticket.tree) {
++        state.nativeDatabase->lastUse = server::DurableAdmission::Clock::now();
++      }
+       finishDurable(call.ticket);
++      retireNativeDatabase(state);
+     });
+     // Runs before the release above: an event this session was still preparing ends here,
+     // and with it the waiter it has on a cold load.
+@@ -2742,10 +2778,11 @@ struct ThreadedServer {
+     if (remaining.count() <= 0) co_return;
+     durableHomeSessions.fetch_add(1);
+     KJ_DEFER(durableHomeSessions.fetch_sub(1));
++    const int connectionFd = call.socket;
+     auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
+     auto accepted = kj::newPromiseAndFulfiller<void>();
+     capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(
+-        *this, state, std::move(call.route), call.ticket, kj::mv(accepted.fulfiller), scope));
++        *this, state, std::move(call.route), call.ticket, connectionFd, kj::mv(accepted.fulfiller), scope));
+     auto disconnected = session.accept(*stream).fork();
+     try {
+       co_await state.io.provider->getTimer()
+@@ -2768,6 +2805,37 @@ struct ThreadedServer {
+     wakeDurableTree(tree);
+   }
+ 
++  void closeNativeDatabase(ThreadState& state) {
++    auto& database = *state.nativeDatabase;
++    if (database.closing) return;
++    database.closing = true;
++    std::lock_guard lock(durableRoutingMutex);
++    KJ_ASSERT(durableAdmission->beginReset(database.tree, state.durableHome));
++    wakeDurableTree(database.tree);
++  }
++
++  void retireNativeDatabase(ThreadState& state) {
++    if (!state.nativeDatabase || state.nativeDatabase->confirming) return;
++    const auto tree = state.nativeDatabase->tree;
++    const auto homeId = state.durableHome;
++    {
++      std::lock_guard lock(durableRoutingMutex);
++      const auto idle = state.nativeDatabase->closing
++          ? durableAdmission->stopIdleTree(tree, homeId)
++          : durableAdmission->stopIdleTree(tree, homeId, state.nativeDatabase->lastUse,
++              server::DurableAdmission::Clock::now());
++      if (!idle) return;
++    }
++    state.nativeDatabase.reset();
++    std::lock_guard lock(durableRoutingMutex);
++    KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
++    auto& home = *threads[homeId - 1]->home;
++    home.resident.erase(tree);
++    KJ_ASSERT(--home.reservedTrees == 0);
++    home.definition.clear();
++    home.database = false;
++  }
++
+   void retireIdleDurableRoots(ThreadState &state) {
+     if (!state.durableSlot) return;
+     const auto now = server::DurableAdmission::Clock::now();
+@@ -2875,12 +2943,13 @@ struct ThreadedServer {
+   void reportDurable(bool publish, std::string *appendTo = nullptr) {
+     std::lock_guard lock(durableRoutingMutex);
+     const auto state = durableAdmission->state();
+-    size_t resident = 0, homes = 0, placementClosedHomes = 0, resettingHomes = 0;
++    size_t resident = 0, homes = 0, databaseHomes = 0, placementClosedHomes = 0, resettingHomes = 0;
+     uint64_t maxHomeMemory = 0;
+     if (ready.load(std::memory_order_acquire)) {
+       for (const auto &thread: threads) {
+         const auto &home = *thread->home;
+         homes += !home.definition.empty();
++        databaseHomes += home.database;
+         placementClosedHomes += !home.pressure.accepting();
+         resettingHomes += home.pressure.resetting();
+         maxHomeMemory = kj::max(maxHomeMemory, home.memory);
+@@ -2889,6 +2958,7 @@ struct ThreadedServer {
+     }
+     auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
+         ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
++        ",\"databaseHomes\":" + std::to_string(databaseHomes) +
+         ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
+         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
+         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
+@@ -3062,7 +3132,12 @@ struct ThreadedServer {
+     state.rejectOnly = thread.control;
+     state.durableHome = thread.homeId;
+     if (thread.home && durableLog) {
+-      state.wal = durableLog->attachHome([&state](uint64_t openId) {
++      state.wal = durableLog->attachHome([this, &state](uint64_t openId) {
++        if (state.nativeDatabase && state.nativeDatabase->shipper &&
++            state.nativeDatabase->shipper->getOpenId() == openId) {
++          closeNativeDatabase(state);
++          return;
++        }
+         for (auto& [id, root]: state.durableRoots) {
+           if (!root.rootOpenId || root.rootOpenId() != openId) continue;
+           root.closeRequested = true;
+@@ -3090,6 +3165,7 @@ struct ThreadedServer {
+         for (auto &call: incoming) {
+           state.tasks.add(startDurableSession(state, std::move(call)));
+         }
++        retireNativeDatabase(state);
+         retireIdleDurableRoots(state);
+       }
+     }
+@@ -5245,6 +5321,203 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+   co_return co_await preparation->ready.addBranch();
+ }
+ 
++class NativeDatabaseHttp final: public kj::HttpService {
++ public:
++  NativeDatabaseHttp(ThreadedServer& server, ThreadState& state, DurableRoute route,
++      uint64_t tree, int connectionFd, kj::Maybe<uint64_t> alarm)
++      : server(server), state(state), route(std::move(route)), tree(tree),
++        connectionFd(connectionFd), alarm(alarm) {}
++
++  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders&,
++      kj::AsyncInputStream& body, Response& response) override {
++    KJ_REQUIRE(!std::exchange(used, true), "one HTTP request per database event");
++    const auto resource = url.slice(url.findFirst('?').orDefault(url.size()));
++    const std::string_view path(url.begin(), url.size() - resource.size());
++    const bool query = path == "/query" || path.ends_with("://d1/query") ||
++        path.ends_with("://coworkerd-node/query");
++    const bool execute = path == "/execute" || path.ends_with("://d1/execute");
++    if (alarm == kj::none && (method != kj::HttpMethod::POST || (!query && !execute))) {
++      co_return co_await send(response, {404, "{\"error\":\"Not found\"}"});
++    }
++    auto input = co_await body.readAllText();
++    server::NativeSqlReply reply{0, {}};
++    try {
++      co_await open();
++    } catch (const kj::Exception& error) {
++      reply = storageFailure(error);
++    }
++    if (reply.status != 0) co_return co_await send(response, std::move(reply));
++    auto& database = *state.nativeDatabase;
++    auto& connection = *database.connection;
++    const auto started = nowNs();
++    bool reportAlarm = false;
++    try {
++      KJ_IF_SOME(time, alarm) {
++        const auto held = server::readDurableAlarm(connection);
++        const auto scheduled = kj::UNIX_EPOCH + static_cast<int64_t>(time) * kj::MILLISECONDS;
++        if (held == scheduled) {
++          connection.run("UPDATE _cf_METADATA SET value = NULL WHERE key = 1");
++          reportAlarm = true;
++          reply = {200, "{\"outcome\":\"cleared\"}"};
++        } else {
++          const auto heldMs = (held.orDefault(kj::UNIX_EPOCH) - kj::UNIX_EPOCH) / kj::MILLISECONDS;
++          reply = {200, "{\"outcome\":\"notDue\",\"atUnixMs\":" + std::to_string(heldMs) + "}"};
++        }
++      } else {
++        const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
++            ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
++        reply = server::runNativeSql(connection, input, query, format,
++            server::DurableAdmission::Clock::now() + server::NATIVE_SQL_LIMIT, connectionFd);
++      }
++    } catch (const kj::Exception& error) {
++      reply = storageFailure(error);
++    }
++    const auto finished = nowNs();
++    // A canceled client must not cancel acknowledgement of already committed WAL.
++    // Keep the admitted connection alive until the outstanding confirmation settles.
++    if (connection.observedCriticalError() || reply.status == 0 || reply.status == 503) {
++      server.closeNativeDatabase(state);
++    }
++    database.confirming = true;
++    auto confirmation = confirm(database, reportAlarm).fork();
++    state.tasks.add(confirmation.addBranch().catch_([](kj::Exception&&) {}));
++    try {
++      co_await confirmation.addBranch();
++    } catch (const kj::Exception& error) {
++      reply = storageFailure(error);
++    }
++    if (finished - started >= 1000000000) {
++      fprintf(stderr, "[native-sql] {\"pid\":%d,\"generation\":%llu,\"home\":%llu,"
++          "\"namespaceId\":\"%.12s\",\"startedMonotonicNs\":%llu,"
++          "\"finishedMonotonicNs\":%llu,\"confirmedMonotonicNs\":%llu,\"status\":%u}\n",
++          getpid(), static_cast<unsigned long long>(route.open.generation),
++          static_cast<unsigned long long>(state.durableHome), route.key.namespaceId.c_str(),
++          static_cast<unsigned long long>(started), static_cast<unsigned long long>(finished),
++          static_cast<unsigned long long>(nowNs()), reply.status);
++    }
++    if (reply.status != 0) co_await send(response, std::move(reply));
++  }
++
++ private:
++  ThreadedServer& server;
++  ThreadState& state;
++  DurableRoute route;
++  uint64_t tree;
++  int connectionFd;
++  kj::Maybe<uint64_t> alarm;
++  bool used = false;
++
++  static server::NativeSqlReply storageFailure(const kj::Exception& error) {
++    auto reason = error.getDescription();
++    if (reason.startsWith("jsg.Error: ")) reason = reason.slice(sizeof("jsg.Error: ") - 1);
++    auto code = "STORAGE_UNAVAILABLE"_kj;
++    uint status = 503;
++    if (reason.endsWith("(DO_OBJECT_TOO_LARGE)")) {
++      code = "DO_OBJECT_TOO_LARGE"_kj;
++      status = 413;
++    } else if (reason.endsWith("(QUOTA_EXCEEDED)")) {
++      code = "QUOTA_EXCEEDED"_kj;
++      status = 422;
++    } else {
++      reason = "Durable Object storage is unavailable"_kj;
++    }
++    return {status, server::nativeSqlFailure(code, reason)};
++  }
++
++  kj::Promise<void> send(Response& response, server::NativeSqlReply reply) {
++    kj::HttpHeaders headers(*state.headers);
++    headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
++    auto reason = reply.status == 200 ? "OK" : reply.status == 400 ? "Bad Request"
++        : reply.status == 404 ? "Not Found" : reply.status == 413 ? "Payload Too Large"
++        : reply.status == 422 ? "Unprocessable Entity" : "Service Unavailable";
++    auto output = response.send(reply.status, reason, headers, reply.body.size());
++    co_await output->write(kj::arrayPtr(reinterpret_cast<const kj::byte*>(reply.body.data()),
++        reply.body.size()));
++  }
++
++  kj::Promise<void> open() {
++    if (!state.nativeDatabase) {
++      server::DurableWalPosition position;
++      if (state.wal) position = co_await prepareRootWal(server, state, route, tree);
++      // A database can claim a spare home that still holds an empty warm copy.
++      // Release the copy on its own loop before opening SQLite.
++      state.durableSlot.reset();
++      {
++        std::lock_guard lock(server.durableRoutingMutex);
++        auto& home = *server.threads[state.durableHome - 1]->home;
++        home.warmDefinition.clear();
++        home.memory = 0;
++      }
++      const auto openStarted = nowNs();
++      auto connection = server.durableStorage->open(route.uniqueKey.c_str(), route.storageId.c_str());
++      kj::Own<server::DurableLogShipper> shipper;
++      if (state.wal) {
++        shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
++            {.objectName = kj::str(route.key.namespaceId.c_str(), "/", route.key.objectId.c_str(),
++                "/", route.open.dataEpoch), .storageId = kj::str(route.storageId.c_str())},
++            *connection, state.io.provider->getTimer(), *state.wal, position, openStarted);
++        shipper->reportAlarm(server::readDurableAlarm(*connection));
++      }
++      state.nativeDatabase.emplace(ThreadState::NativeDatabase{
++        tree, server::DurableAdmission::Clock::now(), kj::mv(connection), kj::mv(shipper)
++      });
++      server.publishDurableRoot(state.durableHome, tree);
++    }
++    auto& database = *state.nativeDatabase;
++    KJ_REQUIRE(database.tree == tree, "mismatched native database home");
++    try {
++      if (state.wal) {
++        co_await state.wal->waitForOpen(database.shipper->getOpenId(), state.io.provider->getTimer());
++      }
++      KJ_REQUIRE(!database.closing, "the database image is closing");
++    } catch (const kj::Exception&) {
++      server.closeNativeDatabase(state);
++      throw;
++    }
++  }
++
++  kj::Promise<void> confirm(ThreadState::NativeDatabase& database, bool reportAlarm) {
++    auto& owner = server;
++    auto& home = state;
++    auto& timer = state.io.provider->getTimer();
++    KJ_DEFER({
++      database.confirming = false;
++      std::lock_guard lock(owner.durableRoutingMutex);
++      owner.wakeDurableTree(database.tree);
++    });
++    if (!database.shipper && owner.durableCommitDelayMs == 0) co_return;
++    owner.durablePendingCommits.fetch_add(1);
++    KJ_DEFER(owner.durablePendingCommits.fetch_sub(1));
++    try {
++      if (database.shipper) {
++        co_await database.shipper->onCommit();
++        if (reportAlarm) database.shipper->reportAlarm(kj::none);
++      } else {
++        co_await timer.afterDelay(owner.durableCommitDelayMs * kj::MILLISECONDS);
++      }
++    } catch (const kj::Exception&) {
++      owner.closeNativeDatabase(home);
++      throw;
++    }
++  }
++};
++
++class NativeDatabaseDispatcher final: public rpc::EventDispatcher::Server {
++ public:
++  NativeDatabaseDispatcher(ThreadState& state, kj::Own<kj::HttpService> service)
++      : state(state), service(kj::mv(service)) {}
++
++  kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
++    KJ_REQUIRE(service.get() != nullptr, "one event per database invocation");
++    context.getResults().setHttp(state.http.kjToCapnp(kj::mv(service)));
++    return kj::READY_NOW;
++  }
++
++ private:
++  ThreadState& state;
++  kj::Own<kj::HttpService> service;
++};
++
+ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+     kj::String descriptor, Frankenvalue props) {
+   KJ_REQUIRE(!used, "one event per durable connection");
+@@ -5259,11 +5532,26 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+           str(selection, "namespaceId") == route.key.namespaceId &&
+           str(selection, "objectId") == route.key.objectId &&
+           durableNumber(selection, "dataEpoch") == route.open.dataEpoch &&
+-          text(plan, "kind") == "tenant" &&
+           str(plan, "versionFingerprint") == route.open.definition &&
++          text(plan, "kind") == (route.database ? "database" : "tenant") &&
+           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
+       "durable routing descriptor mismatch");
+   co_await server.admitDurableEvent(state, route, ticket);
++  if (route.database) {
++    KJ_REQUIRE(route.open.className == "__coworkerdSqlDatabase", "invalid native database class");
++    kj::Maybe<uint64_t> alarm;
++    auto event = field(input, "durableAlarm");
++    if (event.isObject()) {
++      const auto time = durableNumber(event, "scheduledTime");
++      KJ_REQUIRE(state.wal && time > 0 && time <= INT64_MAX / 1000000,
++          "invalid native database alarm");
++      alarm = time;
++    }
++    auto service = kj::heap<NativeDatabaseHttp>(server, state, std::move(route), ticket.tree,
++        connectionFd, alarm);
++    co_return rpc::EventDispatcher::Client(
++        kj::heap<NativeDatabaseDispatcher>(state, kj::mv(service)));
++  }
+   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
+   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
+       "durable class missing from pinned Worker");
+@@ -5784,6 +6072,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+               (server.durableLog
+                       ? "\r\nX-Coworkerd-Threaded-Role: durable\r\nX-Coworkerd-WAL-Protocol: 1"
+                       : server.durableStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +
++              (server.durableStorage ? "\r\nX-Coworkerd-Native-SQL: 1" : "") +
+               "\r\nContent-Length: " + std::to_string(body.size()) +
+               "\r\nConnection: close\r\n\r\n" + body;
+         }

@@ -1,0 +1,331 @@
+import assert from 'node:assert/strict';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { availableParallelism, cpus } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { eventually, json, request } from './cluster.mjs';
+
+const cli = fileURLToPath(new URL('../../cli/bin/cowctl.mjs', import.meta.url));
+const slow = 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000) SELECT sum(n) AS total FROM r';
+
+async function database(cluster, tenant, name) {
+  const path = `${tenant.path}/databases/${name}`;
+  const { database: { namespaceId } } = await cluster.api(path, { method: 'POST', token: tenant.token });
+  const raw = (body, format = 'ARRAY_OF_OBJECTS', timeout = 40000) =>
+    request(cluster.urls.apiserver, `${path}/query?resultsFormat=${format}`,
+      { method: 'POST', token: tenant.token, body, timeout });
+  const query = async (body, format) => json(await raw(body, format), 200, name);
+  const ready = async () => assert.deepEqual((await query({ sql: 'SELECT 1 AS n' })).results, [{ n: 1 }]);
+  await eventually(`${tenant.name}/${name} is ready`, ready);
+  return { name, namespaceId, path, raw, query, ready };
+}
+
+const put = (id) => ({ sql: 'INSERT INTO ledger VALUES(?)', params: [id] });
+
+async function bindingProbe(cluster, tenant, name) {
+  await cluster.deploy(tenant, 'sql-binding', `
+    export default { async fetch(request, { DB }) {
+      const url = new URL(request.url);
+      try {
+        if (url.pathname.endsWith('/exec')) {
+          return Response.json(await DB.exec(
+            'INSERT INTO ledger VALUES(3);\\nINSERT INTO ledger VALUES(1);\\nINSERT INTO ledger VALUES(4);'));
+        }
+        if (url.pathname.endsWith('/timeout')) return Response.json(await DB.prepare(${JSON.stringify(slow)}).raw());
+        return Response.json(await DB.prepare('SELECT id FROM ledger ORDER BY id').all());
+      } catch (error) {
+        return Response.json({ message: error.message, cause: error.cause?.message }, { status: 503 });
+      }
+    } };
+  `, { wrangler: {
+    d1_databases: [{ binding: 'DB', database_name: name, database_id: '00000000-0000-4000-8000-000000000001' }],
+  } });
+  return (suffix = '', timeout = 40000) => request(cluster.urls[cluster.nodes[0]],
+    `/${tenant.name}/sql-binding${suffix}`, { timeout });
+}
+
+// Both backends execute this contract through the same public paths.
+export async function sqlProtocol(cluster) {
+  const tenant = await cluster.tenant('sql-protocol');
+  const db = await database(cluster, tenant, 'protocol');
+  assert.equal((await db.query({ sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' })).success, true);
+  const results = await db.query([put(1), put(2)]);
+  assert.deepEqual(results.map(({ meta }) => [meta.changes, meta.last_row_id, meta.changed_db]), [[1, 1, true], [1, 2, true]]);
+  assert.ok(results.every(({ meta }) => meta.size_after > 0 && meta.rows_written === 1));
+  const typed = { sql: 'SELECT ? AS a, ? AS a, ? AS note, ? AS missing', params: [3, [0, 255], '🐝\u0000\n', null] };
+  assert.deepEqual((await db.query(typed)).results, [{ a: [0, 255], note: '🐝\u0000\n', missing: null }]);
+  assert.deepEqual((await db.query(typed, 'ROWS_AND_COLUMNS')).results,
+    { columns: ['a', 'a', 'note', 'missing'], rows: [[3, [0, 255], '🐝\u0000\n', null]] });
+  assert.match((await db.query({ sql: 'SELECT ?', params: [[256]] })).error, /D1_TYPE_ERROR/);
+  assert.match((await db.query({ sql: 'SELECT ?' })).error, /parameter bindings/);
+  assert.match((await db.query({ sql: 'BEGIN' })).error, /state.storage.transaction/);
+  assert.match((await db.query({ sql: 'CREATE TABLE _cf_test(x)' })).error, /prohibited|authorized|SQLITE_AUTH/);
+  assert.match((await db.query([put(9), { sql: 'SELECT zeroblob(4000000)' }]))[0].error, /D1_RESULT_TOO_LARGE/);
+  assert.match((await db.query({ ingest: 'INSERT INTO ledger VALUES(9); INSERT INTO ledger VALUES(1);' })).error,
+    /UNIQUE constraint failed/);
+  const probe = await bindingProbe(cluster, tenant, db.name);
+  const before = await eventually('D1 binding answers with the HTTP result', async () => {
+    const answer = json(await probe(), 200, 'D1 binding');
+    assert.deepEqual(answer.results, [{ id: 1 }, { id: 2 }]);
+    return answer;
+  });
+  assert.equal(before.success, true);
+  const rejected = json(await probe('/exec'), 503, 'D1 execute error');
+  assert.match(rejected.message, /^D1_EXEC_ERROR: Error in line 2:/);
+  assert.match(rejected.cause, /UNIQUE constraint failed/);
+  assert.deepEqual((await db.query({ sql: 'SELECT * FROM ledger ORDER BY id' })).results,
+    [{ id: 1 }, { id: 2 }, { id: 3 }]);
+}
+
+export async function sqlCli(cluster) {
+  const tenant = await cluster.tenant('sql-cli');
+  const cwd = join(cluster.directory, 'sql-cli');
+  await mkdir(join(cwd, 'migrations'), { recursive: true });
+  await writeFile(join(cwd, 'cowctl.json'), JSON.stringify({ tenant: tenant.name, controlPlane: cluster.urls.apiserver }));
+  await writeFile(join(cwd, 'migrations', '0001_create.sql'),
+    "CREATE TABLE books(title TEXT PRIMARY KEY); INSERT INTO books VALUES ('one');");
+  const run = (...args) => cluster.command(process.execPath, [cli, 'd1', ...args], { cwd, token: tenant.token });
+  const source = await database(cluster, tenant, 'books');
+  await run('migrations', 'apply', source.name, '--yes');
+  assert.deepEqual((await source.query({ sql: 'SELECT title FROM books' })).results, [{ title: 'one' }]);
+  assert.equal((await source.query({ sql: 'SELECT count(*) AS n FROM d1_migrations' })).results[0].n, 1);
+  await run('migrations', 'apply', source.name, '--yes');
+  await run('export', source.name, '--output', 'backup.sql');
+  const restored = await database(cluster, tenant, 'restored');
+  await run('execute', restored.name, '--file', 'backup.sql', '--yes');
+  for (const sql of ['SELECT title FROM books', 'SELECT name FROM d1_migrations ORDER BY name']) {
+    assert.deepEqual((await source.query({ sql })).results, (await restored.query({ sql })).results);
+  }
+}
+
+function rows(log, prefix) {
+  return log.split('\n').flatMap(line => {
+    const index = line.indexOf(prefix);
+    if (index === -1) return [];
+    return [JSON.parse(line.slice(index + prefix.length))];
+  });
+}
+
+async function acceptedOn(cluster, namespaceId, objectId) {
+  const log = await cluster.compose(['logs', '--no-color', '--tail', '150']);
+  const matching = rows(log, '[do] ').filter(row => row.namespaceId === namespaceId.slice(0, 12) &&
+    (!objectId || row.objectId === objectId) && row.status === 200 && row.processId);
+  assert.ok(matching.length, `no owning process recorded for ${namespaceId}`);
+  return matching.at(-1);
+}
+
+export async function sqlConfirmationAndTakeover(cluster) {
+  const tenant = await cluster.tenant('sql-takeover');
+  const db = await database(cluster, tenant, 'books');
+  assert.equal((await db.query({ sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' })).success, true);
+  let owner = (await acceptedOn(cluster, db.namespaceId)).nodeId;
+  const kept = [];
+  for (let i = 0; i < 8; ++i) {
+    assert.equal((await db.query(put(i))).success, true);
+    kept.push({ id: i });
+  }
+
+  // The peers can hold positive acknowledgements independently of the owner.
+  const hold = join(cluster.peerAckGate, 'hold');
+  await writeFile(hold, '');
+  try {
+    const refused = json(await db.raw(put(98)), 503, 'SQL WAL confirmation timeout');
+    assert.equal(refused.code, 'STORAGE_UNAVAILABLE');
+  } finally {
+    await unlink(hold);
+  }
+  owner = await eventually('the database reopens without the unconfirmed write', async () => {
+    assert.deepEqual((await db.query({ sql: 'SELECT id FROM ledger ORDER BY id' })).results, kept);
+    return (await acceptedOn(cluster, db.namespaceId)).nodeId;
+  });
+  const peers = cluster.nodes.filter(node => node !== owner);
+  await eventually('the two survivors released any held acknowledgements', async () => {
+    const observations = await Promise.all(peers.map(node => cluster.state(node)));
+    assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest === 0));
+  });
+  let settled = false;
+  await writeFile(hold, '');
+  const pending = db.raw(put(99)).then(response => ({ response }), error => ({ error }))
+    .finally(() => { settled = true; });
+  try {
+    await eventually('both peers held a database append', async () => {
+      const states = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    }, { interval: 20, timeout: 3000 });
+    assert.equal(settled, false, 'database replied before WAL confirmation');
+    await cluster.compose(['kill', '-s', 'SIGKILL', owner]);
+  } finally {
+    await unlink(hold);
+  }
+  const lost = await pending;
+  if (lost.error) throw lost.error;
+  assert.equal(json(lost.response, 503, 'database response lost on owner death').code, 'RESULT_UNCERTAIN');
+  const recovered = await eventually('the next owner recovered every confirmed SQL write', async () => {
+    const result = await db.query({ sql: 'SELECT id FROM ledger ORDER BY id' });
+    assert.deepEqual(result.results.filter(({ id }) => id !== 99), kept);
+    const placement = await acceptedOn(cluster, db.namespaceId);
+    assert.notEqual(placement.nodeId, owner);
+    return placement;
+  }, { timeout: 90000 });
+  console.log('SQL takeover', JSON.stringify({ previous: owner, next: recovered.nodeId, confirmedRows: kept.length }));
+}
+
+const sameProcess = (a, b) => a.nodeId === b.nodeId && a.processId === b.processId &&
+  a.processGeneration === b.processGeneration;
+
+async function colocatedDatabase(cluster, tenant, placement) {
+  for (let i = 0; i < 30; ++i) {
+    const db = await database(cluster, tenant, `probe-${i}`);
+    if (sameProcess(await acceptedOn(cluster, db.namespaceId), placement)) return db;
+  }
+  assert.fail(`could not place ${tenant.name}'s probe in ${placement.nodeId}/${placement.processId}`);
+}
+
+async function colocatedObject(cluster, tenant, placement) {
+  await cluster.deploy(tenant, 'sql-neighbor', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Probe extends DurableObject {
+      fetch() { return new Response(this.ctx.id.toString()); }
+    }
+    export default { fetch(request, env) {
+      return env.PROBES.getByName(new URL(request.url).searchParams.get('key')).fetch(request);
+    } };
+  `, { wrangler: {
+    durable_objects: { bindings: [{ name: 'PROBES', class_name: 'Probe' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Probe'] }],
+  } });
+  const { namespaceId } = await cluster.api(`${tenant.path}/workers/sql-neighbor/namespaces/Probe`, { token: tenant.token });
+  for (let i = 0; i < 30; ++i) {
+    const run = () => request(cluster.urls[placement.nodeId], `/${tenant.name}/sql-neighbor?key=${i}`);
+    const id = await eventually('Durable Object probe is available', async () => {
+      const answer = await run();
+      assert.equal(answer.status, 200, answer.text);
+      assert.match(answer.text, /^[\da-f]{64}$/);
+      return answer.text;
+    });
+    const objectId = id.slice(0, 12);
+    if (sameProcess(await acceptedOn(cluster, namespaceId, objectId), placement)) {
+      return { namespaceId, objectId, check: async () => assert.deepEqual(await run(), { status: 200, text: id }) };
+    }
+  }
+  assert.fail('could not colocate a Durable Object with the blocking database');
+}
+
+function stats(samples) {
+  const values = samples.filter(sample => !sample.error).map(sample => sample.ms).sort((a, b) => a - b);
+  const percentile = p => values[Math.ceil(values.length * p) - 1];
+  return { attempted: samples.length, samples: values.length, errors: samples.filter(sample => sample.error).map(sample => sample.error),
+    p50: percentile(0.5), p99: percentile(0.99), maxStartDelay: Math.max(...samples.map(sample => sample.lag)) };
+}
+
+const intervalMs = 50;
+const durationMs = 28000;
+const windowMs = 30000;
+const warmStartMs = 750;
+async function sampleWindow(probes, samples) {
+  const start = performance.now();
+  const jobs = [];
+  for (let due = start; due < start + durationMs; due += intervalMs) {
+    await delay(Math.max(0, due - performance.now()));
+    const sent = performance.now();
+    jobs.push(...probes.map(async (probe, i) => {
+      let error;
+      try { await probe.check(); } catch (failure) { error = failure.message; }
+      samples[i].push({ ms: performance.now() - sent, lag: sent - due, error });
+    }));
+  }
+  await Promise.all(jobs);
+}
+
+export async function longSqlIsolation(cluster) {
+  const tenant = await cluster.tenant('sql-isolation');
+  const other = await cluster.tenant('sql-isolation-other');
+  const blocker = await database(cluster, tenant, 'blocker');
+  assert.equal((await blocker.query({ sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' })).success, true);
+  const placement = await acceptedOn(cluster, blocker.namespaceId);
+  const slot = async () => {
+    const { processes } = await cluster.state(placement.nodeId);
+    const slot = processes.entries.find(entry => entry.processId === placement.processId);
+    assert.equal(slot.generation, placement.processGeneration);
+    assert.equal(slot.sandbox.durableServer, 'threaded');
+    return slot;
+  };
+  const original = await slot();
+  const same = await colocatedDatabase(cluster, tenant, placement);
+  const cross = await colocatedDatabase(cluster, other, placement);
+  const object = await colocatedObject(cluster, tenant, placement);
+  const probes = [{ ...same, check: same.ready }, { ...cross, check: cross.ready }, object];
+  const quiet = probes.map(() => []);
+  const busy = probes.map(() => []);
+  const blockers = [];
+  const quietWindow = async () => {
+    const start = performance.now();
+    await delay(warmStartMs);
+    await sampleWindow(probes, quiet);
+    await delay(Math.max(0, windowMs - (performance.now() - start)));
+  };
+
+  for (let round = 0; round < 2; ++round) {
+    await Promise.all(probes.map(probe => probe.check()));
+    if (round === 0) await quietWindow();
+    const pending = blocker.raw([put(round), { sql: slow }]);
+    await delay(warmStartMs);
+    await sampleWindow(probes, busy);
+    const result = json(await pending, 503, '30-second SQL deadline');
+    assert.equal(result.code, 'SQL_LIMIT_EXCEEDED');
+
+    const log = await cluster.compose(['logs', '--no-color', '--tail', '3500', placement.nodeId]);
+    const block = rows(log, '[native-sql] ').filter(row => row.pid === original.pid &&
+      row.generation === original.generation && row.namespaceId === blocker.namespaceId.slice(0, 12) &&
+      row.status === 503).at(-1);
+    assert.ok(block, 'the threaded child must record the exact execution and confirmation interval');
+    const start = block.startedMonotonicNs / 1e6;
+    const end = block.finishedMonotonicNs / 1e6;
+    assert.ok(end - start >= 29900 && end - start <= 31000, JSON.stringify(block));
+    if (blockers.length !== 0) assert.ok(block.startedMonotonicNs > blockers.at(-1).startedMonotonicNs);
+    const deliveries = rows(log, '[do] ').filter(row => sameProcess(row, placement) && row.status === 200 &&
+      row.startedMonotonicMs >= start && row.finishedMonotonicMs <= end);
+    const overlap = probes.map(probe => deliveries.filter(row =>
+      row.namespaceId === probe.namespaceId.slice(0, 12) && (!probe.objectId || row.objectId === probe.objectId)).length);
+    blockers.push({ ...block, overlap });
+    assert.equal((await slot()).pid, original.pid);
+    assert.deepEqual((await blocker.query({ sql: 'SELECT * FROM ledger' })).results, []);
+    if (round === 1) {
+      await Promise.all(probes.map(probe => probe.check()));
+      await quietWindow();
+    }
+  }
+
+  const report = {
+    engine: 'threaded native SQLite', cpu: cpus()[0]?.model, logicalCpus: availableParallelism(),
+    windowsPerCondition: 2, secondsPerWindow: windowMs / 1000, measuredSeconds: durationMs / 1000,
+    offeredRateHz: 1000 / intervalMs,
+    node: placement.nodeId, process: placement.processId, generation: original.generation, pid: original.pid, blockers,
+    probes: ['same-tenant DB', 'cross-tenant DB', 'Durable Object'].map((probe, i) => ({
+      probe, quiet: stats(quiet[i]), busy: stats(busy[i]), observedInBlocker: blockers.reduce((n, b) => n + b.overlap[i], 0),
+    })),
+  };
+  console.log('Long SQL isolation', JSON.stringify(report));
+  for (const sample of report.probes) {
+    assert.ok(sample.quiet.samples >= 1000 && sample.busy.samples >= 1000, JSON.stringify(sample));
+    assert.ok(sample.observedInBlocker >= 1000, JSON.stringify(sample));
+    assert.ok(sample.busy.errors.length <= sample.quiet.errors.length, JSON.stringify(sample));
+    assert.ok(sample.busy.p99 - sample.quiet.p99 <= 5, JSON.stringify(sample));
+  }
+
+  // Each medium-length statement fits by itself; the batch shares one deadline.
+  const medium = { sql: slow.replace('1000000000', '2000000') };
+  const started = performance.now();
+  assert.equal((await blocker.query(medium)).success, true);
+  const repeats = Math.max(150, Math.ceil(80000 / (performance.now() - started)));
+  const result = json(await blocker.raw([put(100), ...Array(repeats).fill(medium)]), 503, 'batch deadline');
+  assert.equal(result.code, 'SQL_LIMIT_EXCEEDED');
+  assert.deepEqual((await blocker.query({ sql: 'SELECT * FROM ledger' })).results, []);
+
+  const call = await bindingProbe(cluster, tenant, blocker.name);
+  await eventually('the D1 binding is warm', async () => assert.equal(json(await call(), 200, 'warm binding').success, true));
+  const timedOut = json(await call('/timeout'), 503, 'D1 SQL deadline');
+  assert.match(timedOut.message, /^D1_ERROR: SQL_LIMIT_EXCEEDED:/);
+  assert.equal(json(await call(), 200, 'D1 after deadline').success, true);
+}

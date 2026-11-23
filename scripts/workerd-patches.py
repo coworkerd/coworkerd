@@ -245,6 +245,9 @@ def allowed_path(name, path):
                               'src/workerd/io/actor-sqlite.h',
                               'src/workerd/io/actor-sqlite-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0111-threaded-database-homes.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

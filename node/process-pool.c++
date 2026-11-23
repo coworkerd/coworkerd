@@ -2701,7 +2701,8 @@ public:
           bool matchesProtocol = false;
           uint32_t roleHeaders = 0;
           uint32_t walHeaders = 0;
-          bool matchesRole = false, matchesWal = false;
+          uint32_t nativeSqlHeaders = 0;
+          bool matchesRole = false, matchesWal = false, matchesNativeSql = false;
           response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
@@ -2712,6 +2713,10 @@ public:
               ++walHeaders;
               matchesWal = value == "1";
             }
+            if (strcasecmp(name.cStr(), "x-coworkerd-native-sql") == 0) {
+              ++nativeSqlHeaders;
+              matchesNativeSql = value == "1";
+            }
           });
           KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
           const bool roleNegotiated = p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0;
@@ -2721,6 +2726,8 @@ public:
               "native process role does not match the slot");
           KJ_REQUIRE(walNegotiated,
               "native process WAL protocol does not match the slot");
+          KJ_REQUIRE(p->durable ? nativeSqlHeaders == 1 && matchesNativeSql : nativeSqlHeaders == 0,
+              "native SQL protocol does not match the slot");
           p->threadedProtocol = 3;
           p->contextsVisible = true;
         }

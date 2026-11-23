@@ -77,3 +77,5 @@
 0100-threaded-durable-alarms.patch
 0101-validate-threaded-alarm-entry.patch
 0104-settle-threaded-alarm-outcomes.patch
+0110-native-database-sql.patch
+0111-threaded-database-homes.patch

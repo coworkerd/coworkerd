@@ -208,7 +208,7 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
     const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
-    bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
+    bool database, bool nativeDatabase, uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
   using json::quote;
   const auto tenant = tenantOf(version.workerId);
   std::ostringstream spaces;
@@ -224,7 +224,7 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
   if (database) {
     if (const auto* databases = catalog.databases(tenant))
       for (const auto& [name, value] : *databases)
-        if (value.id == namespaceId) space(value, "SqlDatabase");
+        if (value.id == namespaceId) space(value, nativeDatabase ? DATABASE_CLASS_NAME : "SqlDatabase");
   } else {
     for (const auto& name : version.declaredClasses)
       if (const auto* value = catalog.durableNamespace(version.workerId, name)) space(*value, "__coworkerd_do_"+name);
@@ -233,7 +233,7 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
   if (!selected) return std::nullopt;
   std::ostringstream plan;
   std::string fingerprint;
-  plan << "{\"kind\":" << quote(database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
+  plan << "{\"kind\":" << quote(nativeDatabase ? "database" : database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
       << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
       << ",\"compatibilityDate\":" << quote(version.compatibilityDate) << ",\"compatibilityFlags\":[],\"modules\":[]"
       << ",\"namespaces\":" << spaces.str();
@@ -241,7 +241,12 @@ std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
   };
   if (database) {
-    plan << ",\"platformClass\":" << target("SqlDatabase", "{}");
+    if (nativeDatabase) {
+      fingerprint = version.definitionHash + ":" + sha256Hex(plan.str());
+      plan << ",\"versionFingerprint\":" << quote(fingerprint);
+    } else {
+      plan << ",\"platformClass\":" << target("SqlDatabase", "{}");
+    }
   } else {
     const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
     plan << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)

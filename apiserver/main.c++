@@ -222,6 +222,7 @@ struct ControlSettings {
   std::string storageCredentials;
   uint64_t maxUploadBytes = 0;
   uint32_t serverTimeoutMs = 2000;
+  uint32_t sqlForwardTimeoutMs = 40000;
   uint64_t startedAtUnixMs = 0;
   std::string instance;
   // The members: the heartbeats under members/ in the bucket.
@@ -1182,7 +1183,7 @@ private:
     std::optional<Fetched> refused;
     for (const auto& member : list) {
       auto answer = co_await ask(member.address, "/__coworkerd/databases/" + tenant + "/" + database +
-          "/query?resultsFormat=" + format, *text, 15000);
+          "/query?resultsFormat=" + format, *text, settings.sqlForwardTimeoutMs);
       if (answer.ok) {
         std::string code;
         try {
@@ -1621,6 +1622,9 @@ int runControlPlane(const std::vector<std::string>& args) {
       : temporary && *temporary ? fs::path(temporary) : fs::path("/tmp");
   settings.maxUploadBytes = config.controlMaxUploadBytes;
   settings.serverTimeoutMs = config.controlServerTimeoutMs;
+  // Allow the whole 30-second SQL window, the configured WAL confirmation
+  // interval, and time to relay and encode the response.
+  settings.sqlForwardTimeoutMs = 30000 + config.durableLog.confirmTimeoutMs + 5000;
   KJ_REQUIRE(fs::is_directory(settings.temporaryDirectory), "the control plane's temporary directory does not exist",
       settings.temporaryDirectory.string().c_str());
   settings.startedAtUnixMs = wallTimeMsForTest();

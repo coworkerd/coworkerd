@@ -2414,10 +2414,9 @@ public:
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
-    if (process->threadedDurableRole() &&
-        (target.isDatabase() || (process->threadedDurableTestRole() && target.alarmAtUnixMs))) {
-      throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", process->threadedDurableTestRole()
-          ? "the durable test role supports object requests" : "the threaded durable role supports Worker object requests"}};
+    if (process->threadedDurableTestRole() && target.alarmAtUnixMs) {
+      throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED",
+          "the durable test role does not support alarms"}};
     }
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
@@ -2434,7 +2433,7 @@ public:
     }
     const auto limits = namedLimits(version->workerId);
     auto root = coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
-        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
+        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.isDatabase() && process->threadedDurableRole(), target.alarmAtUnixMs,
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
@@ -3518,7 +3517,8 @@ private:
                 << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
                 << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
                 << "\",\"queuedBytes\":\"" << encoded.size() << "\",\"expiresMonotonicNs\":\""
-                << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
+                << uint64_t(expiresAtMonotonicMs * 1000000) << "\",\"database\":"
+                << (durable->isDatabase() ? "true" : "false") << "}}";
           encoded.pop_back();
           if (durable->alarmAtUnixMs) {
             encoded += ",\"durableAlarm\":{\"scheduledTime\":\"" + std::to_string(durable->alarmAtUnixMs) +
@@ -6549,8 +6549,8 @@ public:
     auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
     if (server.usesDisposableDurableStorage()) {
-      if (request.target.isDatabase() || request.target.alarmAtUnixMs) {
-        co_return refused(server.refusal("NOT_SUPPORTED", "the durable test role supports object events", 501));
+      if (request.target.alarmAtUnixMs) {
+        co_return refused(server.refusal("NOT_SUPPORTED", "the durable test role does not support alarms", 501));
       }
       request.target.shardEpoch = 1;
       request.target.dataEpoch = 1;
@@ -6798,7 +6798,8 @@ private:
     if (current.refused) co_return refused(*current.refused);
     if (alarm) {
       std::string code, reason;
-      const auto active = server.durableVersion(version->workerId, target, code, reason);
+      const auto active = target.isDatabase() ? server.databaseVersion(target.tenant)
+          : server.durableVersion(version->workerId, target, code, reason);
       if (!active) co_return refused(server.refusal(code, reason, 409));
       if (coworkerd::versionPin(*active) != coworkerd::versionPin(*version) ||
           shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch ||
@@ -6866,7 +6867,8 @@ private:
               << "\",\"processId\":\"" << (process ? process->processId : std::string()) << "\",\"processGeneration\":"
               << (process ? process->generation : 0) << ",\"status\":" << status
               << ",\"code\":" << (code.empty() ? std::string("null") : "\"" + jsonEscape(code) + "\"") << ",\"elapsedMs\":"
-              << monotonicTimeMs() - started << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
+              << monotonicTimeMs() - started << ",\"startedMonotonicMs\":" << started
+              << ",\"finishedMonotonicMs\":" << monotonicTimeMs() << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
   }
   ServerCore& server;
   PeerForwarder& peerForwarder;
@@ -6945,10 +6947,6 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   auto owner = server.namespaceOwner(alarm.namespaceId);
   KJ_REQUIRE(owner.has_value());
   const auto threaded = server.placementConfig().processPool.threadedDurableStorage;
-  if (threaded && owner->isDatabase()) {
-    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
-        "NOT_SUPPORTED: database objects do not run on the threaded durable host"};
-  }
   DurableDispatch::Request request;
   request.workerId = owner->isDatabase()
       ? owner->tenant + "/" + coworkerd::DATABASE_WORKER_NAME
