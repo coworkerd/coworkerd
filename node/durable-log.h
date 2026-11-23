@@ -535,7 +535,7 @@ private:
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
     std::string threadedDefinition;
-    double definitionDrainStartedMs = 0;
+    kj::Maybe<kj::TimePoint> definitionDrainDeadline;
     struct Holders { uint64_t requests = 0, connections = 0; };
     std::map<std::string, Holders> holders;
     bool dispatchPending = false;
@@ -722,6 +722,7 @@ private:
   void sendToOpenChannels(uint8_t type, const std::string& key, const std::string& payload);
   kj::Promise<bool> closeThreadedObject(const std::string& objectName);
   void askClose(Channel& channel, uint64_t openId);
+  kj::Promise<void> endDefinitionDrain(std::string objectName, std::string channelId, kj::TimePoint deadline);
   void answer(Channel& channel, uint64_t request, uint8_t status);
   void tellSealed(const std::string& key, uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void tellBreak(const std::string& key, const std::string& reason);

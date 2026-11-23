@@ -4725,12 +4725,14 @@ private:
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
       const std::string& platformCode = "") {
     auto code = limitCode();
-    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE") code = platformCode;
+    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE" ||
+        platformCode == "DO_CODE_UPDATED") code = platformCode;
     const bool unsupported = code == "NOT_SUPPORTED";
     slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
+    const auto reason = code == "DO_CODE_UPDATED" ? "Durable Object reset because its code was updated" : failure;
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
         unsupported ? "Not Implemented" : "Service Unavailable",
-        rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
+        rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, reason, 0));
     co_await rejection->respond(tracked);
   }
   // The limit that ended the call, if one did ("" otherwise).

@@ -43,7 +43,9 @@ export async function eventually(description, probe, { timeout = 30000, interval
 }
 
 export class Cluster {
-  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs } = {}) {
+  constructor(directory, kernel, signal, {
+    holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
+  } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
@@ -63,6 +65,7 @@ export class Cluster {
     this.threadedNodes = new Set(threadedNodes);
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
+    this.versionDrainTimeoutMs = versionDrainTimeoutMs;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -114,7 +117,10 @@ export class Cluster {
         ingressPlacement: false, processPool: { count: 1 },
         membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
-          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs },
+          durableObjects: {
+            threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
+            versionDrainTimeoutMs: this.versionDrainTimeoutMs,
+          },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
         } : {}),
       }));

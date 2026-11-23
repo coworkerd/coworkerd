@@ -780,7 +780,7 @@ constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOIN
                   FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10;
 // Messages to one.
 constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6,
-                  TO_OPENED = 7;
+                  TO_OPENED = 7, TO_CLOSE_FOR_CODE_UPDATE = 8;
 constexpr uint32_t THREADED_WAL_REVISION = 1;
 // An answer's status.
 constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
@@ -2200,7 +2200,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       }
       if (openId != 0) {
         const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
-            (facetId == 0 && object->definitionDrainStartedMs != 0);
+            (facetId == 0 && object->definitionDrainDeadline != kj::none);
         const bool authorized = object->state == ObjectState::LOCAL && !fenced;
         std::string opened;
         putU8(opened, TO_OPENED);
@@ -4637,22 +4637,25 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
   }
   if (!definition.empty() && !object->threadedDefinition.empty() &&
-      (definition != object->threadedDefinition || object->definitionDrainStartedMs != 0)) {
-    const auto now = monotonicTimeMs();
+      (definition != object->threadedDefinition || object->definitionDrainDeadline != kj::none)) {
     auto old = channels.find(object->dispatchedChannel);
     if (old != channels.end()) {
-      if (object->definitionDrainStartedMs == 0) object->definitionDrainStartedMs = now;
       if (auto open = old->second.openFacets.find(object->objectName + "/0"); open != old->second.openFacets.end())
         askClose(old->second, open->second.id);
       const bool holdsCalls = hasLiveHolders(*object);
       if (!old->second.open || hasLiveOpenFacets(*object) || holdsCalls || object->dispatchPending) {
+        if (object->definitionDrainDeadline == kj::none) {
+          auto deadline = timer.now() + settings.config.versionDrainTimeoutMs * kj::MILLISECONDS;
+          object->definitionDrainDeadline = deadline;
+          tasks.add(endDefinitionDrain(object->objectName, old->first, deadline));
+        }
         ObjectReady result{false, 503, "DO_VERSION_DRAINING", "the previous Durable Object definition is draining"};
-        result.generationMustClose = !holdsCalls &&
-            now - object->definitionDrainStartedMs >= settings.config.confirmTimeoutMs;
+        result.generationMustClose = timer.now() >= KJ_ASSERT_NONNULL(object->definitionDrainDeadline) +
+            settings.config.confirmTimeoutMs * kj::MILLISECONDS;
         return result;
       }
     }
-    object->definitionDrainStartedMs = 0;
+    object->definitionDrainDeadline = kj::none;
   }
   if (auto error = prepareOpen(*object, &target))
     return {false, 503, "STORAGE_UNAVAILABLE", *error};
@@ -4959,7 +4962,7 @@ std::optional<std::string> DurableLog::authorizeSocketOpen(const ObjectIdentity&
   auto found = objects.find(key);
   const auto* object = found == objects.end() ? nullptr : &found->second;
   if (!object || object->state != ObjectState::LOCAL || object->shardEpoch != identity.shardEpoch ||
-      object->definitionDrainStartedMs != 0) return std::nullopt;
+      object->definitionDrainDeadline != kj::none) return std::nullopt;
   auto channel = channels.find(object->dispatchedChannel);
   if (channel == channels.end() || !channel->second.open || channel->second.draining ||
       generation != channel->second.threadedGeneration || openId == 0 ||
@@ -4976,6 +4979,23 @@ void DurableLog::askClose(Channel& channel, uint64_t openId) {
   putU8(message, TO_CLOSE);
   putU64(message, openId);
   sendToChannel(channel, std::move(message));
+}
+
+kj::Promise<void> DurableLog::endDefinitionDrain(std::string objectName, std::string channelId,
+    kj::TimePoint deadline) {
+  co_await timer.atTime(deadline);
+  const auto* object = objectOf(objectName);
+  if (object == nullptr || object->state != ObjectState::LOCAL || object->definitionDrainDeadline != deadline ||
+      object->dispatchedChannel != channelId) co_return;
+  auto channel = channels.find(channelId);
+  if (channel == channels.end() || !channel->second.open) co_return;
+  auto root = channel->second.openFacets.find(objectName + "/0");
+  if (root == channel->second.openFacets.end()) co_return;
+  std::string message;
+  putU8(message, TO_CLOSE_FOR_CODE_UPDATE);
+  putU64(message, root->second.id);
+  sendToChannel(channel->second, std::move(message));
+  log("version-drain-expired", "\"object\":" + quote(objectName));
 }
 
 kj::Promise<bool> DurableLog::closeThreadedObject(const std::string& objectName) {

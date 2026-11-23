@@ -444,6 +444,8 @@ struct ServerConfig {
     threadedTestStorage @23 :Bool = false;
     # Experimental threaded Worker-object backend with the node's durable log.
     threadedStorage @24 :Bool = false;
+    # When a new definition first waits for a busy tree, bound the remaining drain time.
+    versionDrainTimeoutMs @25 :UInt32 = 30000;
   }
 
   struct IngressConfig {

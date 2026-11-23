@@ -847,13 +847,21 @@ async function threadedClassMigration(cluster) {
           socket.addEventListener('message', event => socket.send('${version}:' + event.data));
           return new Response(null, { status: 101, webSocket: client });
         }
+        if (path.endsWith('/waiting')) return Response.json(await this.ctx.storage.get('waiting') ?? false);
+        if (path.endsWith('/wait-for-headers')) {
+          await this.ctx.storage.put('waiting', true);
+          await scheduler.wait(90000);
+          return new Response('old handler completed');
+        }
         if (path.endsWith('/held')) {
           const encoder = new TextEncoder();
           return new Response(new ReadableStream({
             async start(controller) {
               controller.enqueue(encoder.encode('entered:'));
-              await scheduler.wait(18000);
-              controller.enqueue(encoder.encode('${version}'));
+              for (let i = 0; i < 45; i++) {
+                await scheduler.wait(2000);
+                controller.enqueue(encoder.encode('${version}'));
+              }
               controller.close();
             },
           }));
@@ -889,8 +897,14 @@ async function threadedClassMigration(cluster) {
   assert.equal((await echoed)[0].data, 'v1:probe');
   const socketClosed = once(socket, 'close', { signal: AbortSignal.timeout(25000) });
   void socketClosed.catch(() => {});
-  const due = Date.now() + 12000;
+  const due = Date.now() + 8000;
   assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
+  const waiting = call('/wait-for-headers', { timeout: 60000 }).then(
+    value => ({ value }), error => ({ error }),
+  );
+  await eventually('the second v1 request is waiting before response headers', async () => {
+    assert.equal(json(await call('/waiting'), 200, 'v1 handler entered'), true);
+  });
   const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(30000) });
   assert.equal(held.status, 200);
   const reader = held.body.getReader();
@@ -898,13 +912,24 @@ async function threadedClassMigration(cluster) {
     const firstChunk = await reader.read();
     assert.equal(Buffer.from(firstChunk.value).toString(), 'entered:');
     await deploy('v2', 'RenamedRecord', [initial, renamed]);
-    const versions = [];
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      versions.push(Buffer.from(chunk.value));
-    }
-    assert.equal(Buffer.concat(versions).toString(), 'v1', 'an open stream keeps its code pin');
+    await eventually('the first v2 request is refused while v1 still holds the tree', async () => {
+      const response = await call('');
+      assert.equal(response.status, 503);
+      assert.match(response.text, /DO_VERSION_DRAINING/);
+    });
+    const oldChunk = await reader.read();
+    assert.match(Buffer.from(oldChunk.value).toString(), /^(v1)+$/, 'an open stream keeps its code pin');
+    await assert.rejects(async () => {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+      }
+    }, /terminated|closed|reset|aborted/i, 'the new definition cuts the old stream at the drain bound');
+    const pending = await waiting;
+    if (pending.error) throw pending.error;
+    assert.equal(pending.value.status, 503, 'an old call without response headers can be retried');
+    assert.match(pending.value.text, /DO_CODE_UPDATED/);
+    assert.match(pending.value.text, /Durable Object reset because its code was updated/);
   } finally {
     await reader.cancel();
   }
@@ -1126,7 +1151,9 @@ export const durableGatedCases = {
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
     confirmTimeoutMs: 25000,
   },
-  'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
+  'durable-threaded-migration': {
+    test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'], versionDrainTimeoutMs: 10000,
+  },
   'durable-threaded-hibernation': {
     test: threadedSocketHibernation, nodes: ['node-1', 'node-2', 'node-3'],
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },

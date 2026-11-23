@@ -239,6 +239,8 @@ def allowed_path(name, path):
                               'src/workerd/io/actor-sqlite.c++',
                               'src/workerd/io/actor-sqlite.h',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0105-bound-threaded-version-drain.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0101-validate-threaded-alarm-entry.patch' and
                               path == 'src/workerd/io/actor-sqlite.c++' or
                           name == '0103-park-threaded-durable-websockets.patch' and path in {

@@ -566,6 +566,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `alarmDiscoveryIntervalMs` | `60000` | How often a node with durable processes looks for shards of stopped members that have pending alarms (it also looks at each membership change); at least 200 |
 | `alarmTakeoverConcurrency` | `4` | Such shards a node takes over at once; range 1–4 |
 | `alarmFireConcurrency` | `2` | Dispatching or executing background alarms per node; range 1–512; queued cold rebuilds wait separately, and ordinary admission remains in force. Increase only after measuring hot-request latency during alarm drain |
+| `versionDrainTimeoutMs` | `30000` | Maximum time a busy threaded Durable Object may keep its old definition, measured from the first refused request for the new definition |
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 

@@ -1376,6 +1376,25 @@ struct DurableLogChannelTest {
     const auto stored = object.storageId;
     KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "new-definition").ready &&
         object.threadedDefinition == "new-definition" && object.storageId == stored);
+    clock.advanceTo(clock.now() + kj::MILLISECONDS);
+    log.objectDispatched(identity, "d0", 7);
+    open(24);
+    expectReply(7, 24, 0);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").code == "DO_VERSION_DRAINING");
+    expectReply(6, 24);
+    const auto forcedAt = clock.now() + 30 * kj::SECONDS;
+    clock.advanceTo(forcedAt - kj::MILLISECONDS);
+    {
+      kj::byte unexpected;
+      KJ_REQUIRE(!child->tryRead(&unexpected, 1, 1).poll(io.waitScope),
+          "a completed drain must not close the replacement, and its own drain must wait for the deadline");
+    }
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").code == "DO_VERSION_DRAINING");
+    clock.advanceTo(forcedAt);
+    expectReply(8, 24);
+    close(24, 16384);
+    log.objectRequestFinished(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").ready);
     log.objectDispatched(identity, "d0", 7);
     bool namespaceActive = true;
     log.setNamespaceHook([&](const std::string&) { return namespaceActive; });
