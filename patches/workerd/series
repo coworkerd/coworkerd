@@ -82,5 +82,6 @@
 0105-bound-threaded-version-drain.patch
 0106-complete-threaded-lifecycle-transitions.patch
 0107-settle-threaded-socket-handoffs.patch
+0121-threaded-wal-home-tests.patch
 0129-wal-scanner-consistency.patch
 0120-open-at-last-wal-commit.patch
