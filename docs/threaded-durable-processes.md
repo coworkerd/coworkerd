@@ -225,9 +225,9 @@ The reasons that decide it:
 - **A deadline of its own.** A D1 query and a batch have a 30 s wall deadline; a Durable Object event has a
   CPU budget that each request refills. An isolate per database would need a wall deadline the object path
   does not have.
-- **The native code is mostly our own.** Patches 0110 to 0113 add about 1,430 lines, nearly all in files of
-  their own (`coworkerd-native-sql.*` and the threaded server); about 65 changed lines are in upstream's
-  `util/sqlite`. Upstream changed `util/sqlite` about four times a month in the half year before this review,
+- **The native code is mostly our own.** Step 4's patches, 0110 and following, put nearly all of their code
+  in files of their own (`coworkerd-native-sql.*` and the threaded server); a few dozen changed lines are in
+  upstream's `util/sqlite`. Upstream changed `util/sqlite` about four times a month in the half year before this review,
   and those changes reach the JavaScript class too, through `ctx.storage.sql`. The lasting cost is a second
   implementation of the D1 contract while the JavaScript class exists; step 4's comparison tests cover it.
 
