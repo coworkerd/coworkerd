@@ -77,3 +77,4 @@
 0100-threaded-durable-alarms.patch
 0101-validate-threaded-alarm-entry.patch
 0104-settle-threaded-alarm-outcomes.patch
+0129-wal-scanner-consistency.patch
