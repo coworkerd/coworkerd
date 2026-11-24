@@ -77,10 +77,11 @@ function workerResponses() {
   const limits = [...limitSection.matchAll(/process->([a-zA-Z]+)\(\)\) return "([A-Z_]+)";/g)];
   assert.ok(limits.length >= 2, 'CPU and memory limit producers');
   if (dispatch.includes('const bool unsupported =')) {
-    const [, unsupported, specialStatus, normalStatus, reportedUncertain] = evidence(dispatch,
-      /const bool unsupported = code == "([A-Z_]+)";\s*slot->report\(unsupported \? (\d{3}) : (\d{3}), code.empty\(\) \? "([A-Z_]+)" : code\);/);
+    const [, unsupported, leaseExpired, specialStatus, leaseStatus, normalStatus, reportedUncertain] = evidence(dispatch,
+      /const bool unsupported = code == "([A-Z_]+)";\s*const bool expired = code == "([A-Z_]+)";\s*const uint status = unsupported \? (\d{3}) : expired \? (\d{3}) : (\d{3});\s*slot->report\(status, code\.empty\(\) \? "([A-Z_]+)" : code\);/);
     uncertain = reportedUncertain;
     add(specialStatus, unsupported, 'Partly executed');
+    add(leaseStatus, leaseExpired);
     add(normalStatus, uncertain, 'Result uncertain');
     for (const [, method, code] of limits) {
       add(normalStatus, code, method === 'processMemoryPressure' ? 'Result uncertain' : 'Partly executed');
