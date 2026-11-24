@@ -417,11 +417,15 @@ struct DurableSocketEvent {
 };
 struct DurableSocketResult {
   bool delivered = false;
-  std::string limitCode;
+  std::string terminalCode;
 };
 using DurableSocketDispatch = std::function<kj::Promise<DurableSocketResult>(DurableSocketEvent)>;
 bool socketLimitCode(std::string_view code) {
   return code == "CPU_LIMIT_EXCEEDED" || code == "MEMORY_LIMIT_EXCEEDED" || code == "PROCESS_MEMORY_PRESSURE";
+}
+kj::Promise<void> waitForSocketTestGate(kj::Timer& timer, fs::path marker) {
+  std::error_code error;
+  while (fs::exists(marker, error)) co_await timer.afterDelay(20 * kj::MILLISECONDS);
 }
 constexpr const char* MANAGED_SOCKET_HEADER = "x-coworkerd-managed-socket";
 // More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
@@ -4157,7 +4161,9 @@ public:
   }
   kj::Promise<void> managedSend(kj::WebSocket::Message message) {
     ++managedWrites;
-    auto writing = kj::defer([this] { --managedWrites; });
+    auto writing = kj::defer([this] {
+      if (--managedWrites == 0) parkWriteTimeout = kj::none;
+    });
     KJ_IF_SOME(close, message.tryGet<kj::WebSocket::Close>()) {
       return managedCommands.wrap(closeFrom(false, close.code, close.reason.cStr()).attach(kj::mv(writing)));
     }
@@ -4169,15 +4175,26 @@ public:
         object.dataEpoch == durableObject.dataEpoch && object.shardEpoch == durableObject.shardEpoch;
   }
   void actorReset(std::string_view code) {
-    if (closing) return;
+    if (closing || parked()) return;
     managed->fence(managedOwner);
     if (socketLimitCode(code)) nodeClose(1011, std::string(code), "limit");
     else if (code == "DO_CODE_UPDATED") nodeClose(1001, "the Durable Object definition changed", "definition-changed");
     else nodeClose(1011, "Durable Object reset", "actor-reset");
   }
-  bool canPark(const coworkerd::DurableLog::ObjectIdentity& object, uint64_t generation, uint64_t position) const {
-    return managed && !closing && managedWrites == 0 && belongsTo(object) &&
-        managed->canParkOpen(managedOwner, generation, position);
+  bool canPark(const coworkerd::DurableLog::ObjectIdentity& object, uint64_t generation, uint64_t position) {
+    if (!managed || closing || !belongsTo(object) ||
+        !managed->canParkOpen(managedOwner, generation, position)) return false;
+    if (managedWrites == 0) return true;
+    if (parkWriteTimeout == kj::none) {
+      parkWriteTimeout = timer.afterDelay(5 * kj::SECONDS).then([this] {
+        if (closing) return;
+        direction = "node";
+        cause = "park-write-timeout";
+        outer->abort();
+        finish();
+      }).eagerlyEvaluate(nullptr);
+    }
+    return false;
   }
   void park(uint64_t generation, ManagedSocket::Snapshot snapshot) {
     managed->parkOpen(managedOwner, generation, std::move(snapshot));
@@ -4288,14 +4305,15 @@ private:
   };
 
   kj::Promise<void> writeManaged(kj::WebSocket::Message message) {
-    try {
-      co_await timer.timeoutAfter(5 * kj::SECONDS, outerWriter.send(kj::mv(message)));
-    } catch (...) {
-      // The writer also owns the queued branch. Aborting the physical
-      // transport unblocks it and prevents an unread client pinning a home.
-      outer->abort();
-      throw;
+    if (const auto* test = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR")) {
+      const auto gate = fs::path(test) / "hold-socket-write";
+      std::error_code error;
+      if (fs::exists(gate, error)) {
+        std::cout << "[websocket-test] managed write held" << std::endl;
+        co_await waitForSocketTestGate(timer, gate);
+      }
     }
+    co_await outerWriter.send(kj::mv(message));
   }
 
   // One direction: toward the Worker reads `outer` and writes `inner`, toward the client the other way round.
@@ -4320,7 +4338,7 @@ private:
       const auto action = managed->receive(managedOwner, text);
       if (action.action == Action::REFUSE) co_return;
       if (action.action == Action::ANSWER) {
-        co_await writeManaged(kj::str(kj::arrayPtr(action.answer.data(), action.answer.size())));
+        co_await outerWriter.send(kj::str(kj::arrayPtr(action.answer.data(), action.answer.size())));
         managed->answered(managedOwner, action.position, wallTimeMsForTest());
         ++toClient;
         continue;
@@ -4335,7 +4353,8 @@ private:
           kj::mv(message), managed->autoResponseTime(), disconnected, transportError});
       managed->complete(managedOwner, action.position);
       if (!result.delivered) {
-        if (!closing && !result.limitCode.empty()) actorReset(result.limitCode);
+        if (!closing && result.terminalCode == "DO_CODE_UPDATED") goAway("definition-changed");
+        else if (!closing && socketLimitCode(result.terminalCode)) actorReset(result.terminalCode);
         if (!closing) nodeClose(1013, "Durable Object socket wake refused", "wake-refused");
         co_await end.addBranch();
         co_return;
@@ -4412,6 +4431,9 @@ private:
       try { co_await outerWriter.close(1011, code); } catch (const kj::Exception&) {}
       co_return;
     }
+    // A threaded Durable Object can sit behind an ordinary Worker or a
+    // forwarded relay. Preserve the client's transport failure through those
+    // pipes so its node-owned socket gets an error event instead of a close.
     if (!innerSide && !innerBroken && hooks.propagateAbruptClose) inner->abort();
     if (cause.empty()) {
       cause = innerSide ? (identity.forwarded ? "peer-lost" : "worker-lost") : (role == WebSocketRegistry::Role::INGRESS ? "client-lost" : "ingress-lost");
@@ -4508,6 +4530,7 @@ private:
   kj::PromiseFulfillerPair<void> attached = kj::newPromiseAndFulfiller<void>();
   std::string managedDefinition;
   uint64_t managedWrites = 0;
+  kj::Maybe<kj::Promise<void>> parkWriteTimeout;
   kj::Canceler managedCommands;
   struct Errors final: public kj::TaskSet::ErrorHandler { void taskFailed(kj::Exception&&) override {} } errors;
   kj::TaskSet tasks{errors};
@@ -7408,7 +7431,8 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
     auto value = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(result.body.data(), result.body.size()), value);
     auto code = coworkerd::json::field(value.asReader(), "code");
-    if (code.isString() && socketLimitCode(code.getString().cStr()))
+    if (code.isString() &&
+        (socketLimitCode(code.getString().cStr()) || code.getString() == "DO_CODE_UPDATED"))
       co_return DurableSocketResult{false, code.getString().cStr()};
   } catch (const kj::Exception&) {}
   co_return DurableSocketResult{};
@@ -7605,7 +7629,7 @@ public:
     };
     const auto* test = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR");
     if (test != nullptr) {
-      co_await waitForTestGate(fs::path(test) / "hold-socket-park");
+      co_await waitForSocketTestGate(server.clock(), fs::path(test) / "hold-socket-park");
     }
     const auto params = context.getParams();
     const auto open = params.getOpen();
@@ -7619,13 +7643,16 @@ public:
     }
     std::vector<Socket> prepared;
     std::set<WebSocketRelay*> unique;
+    bool eligible = true;
     for (const auto entry : params.getSockets()) {
       auto* relay = find(entry.getAuthority());
       // A closed node transport no longer needs a snapshot. A live relay
       // with an outstanding application frame keeps the whole home active.
       if (!relay) continue;
-      if (!unique.insert(relay).second || !relay->canPark(current->object, open.getGeneration(), entry.getLastFrame()))
-        co_return;
+      if (!unique.insert(relay).second || !relay->canPark(current->object, open.getGeneration(), entry.getLastFrame())) {
+        eligible = false;
+        continue;
+      }
       const auto tags = entry.getTags();
       const auto attachment = entry.getAttachment();
       KJ_REQUIRE(tags.size() <= 10 && attachment.size() <= 16 * 1024);
@@ -7640,9 +7667,10 @@ public:
       snapshot.closedOutgoing = entry.getClosedOutgoing();
       prepared.push_back({relay, std::move(snapshot)});
     }
+    if (!eligible) co_return;
     for (auto& entry : prepared) entry.relay->park(open.getGeneration(), std::move(entry.snapshot));
     park = {attempt, true};
-    if (test != nullptr) co_await waitForTestGate(fs::path(test) / "hold-socket-park-reply");
+    if (test != nullptr) co_await waitForSocketTestGate(server.clock(), fs::path(test) / "hold-socket-park-reply");
     context.getResults().setAccepted(true);
     co_return;
   }
@@ -7662,12 +7690,19 @@ public:
   }
 
   kj::Promise<void> adopt(AdoptContext context) override {
-    if (const auto* test = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR")) {
-      co_await waitForTestGate(fs::path(test) / "hold-socket-adopt");
+    const auto params = context.getParams();
+    const bool resolving = params.getResolveOnly();
+    const auto* test = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR");
+    if (!resolving && test != nullptr) {
+      co_await waitForSocketTestGate(server.clock(), fs::path(test) / "hold-socket-adopt");
     }
-    const auto open = context.getParams().getOpen();
+    const auto open = params.getOpen();
     const auto current = durable.authorizeSocketOpen(open);
-    KJ_REQUIRE(current.has_value(), "a stale Durable Object open cannot adopt sockets");
+    const auto attempt = params.getAttempt();
+    if (!current || attempt == 0) co_return;
+    auto& adoption = current->authority.adopt;
+    if (resolving && adoption.attempt < attempt) adoption = {attempt, false};
+    if (adoption.attempt > attempt || (adoption.attempt == attempt && !adoption.accepted)) co_return;
     const auto invocation = open.getInvocationId();
     KJ_REQUIRE(invocation.size() > 0 && invocation.size() <= 255);
     const WebSocketRelay::ManagedSocket::Home home{invocation.cStr(), open.getGeneration()};
@@ -7710,14 +7745,14 @@ public:
     }
     for (const auto& [relay, _] : selected)
       relay->adopt(home, current->authority.process);
+    adoption = {attempt, true};
+    if (!resolving && test != nullptr)
+      co_await waitForSocketTestGate(server.clock(), fs::path(test) / "hold-socket-adopt-reply");
+    context.getResults().setAccepted(true);
     co_return;
   }
 
 private:
-  kj::Promise<void> waitForTestGate(fs::path path) {
-    std::error_code error;
-    while (fs::exists(path, error)) co_await server.clock().afterDelay(20 * kj::MILLISECONDS);
-  }
   uint64_t epoch() const { return std::strtoull(server.epoch().c_str(), nullptr, 10); }
   WebSocketRelay* find(rpc::ThreadedSocketAuthority::Reader authority) const {
     const auto id = authority.getSocketId();

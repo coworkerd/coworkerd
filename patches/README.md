@@ -53,6 +53,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0106 transfers sockets before canceling expired work, reports actor resets on the same WAL channel,
   and bounds socket-control calls. Its API and I/O hooks keep pairs local until an actual upgrade and account
   for their transport separately from pending application work.
+  Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
+  and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
+  to a code-update reset.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

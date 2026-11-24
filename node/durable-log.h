@@ -422,13 +422,14 @@ public:
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
       uint64_t generation, std::string_view definition = {});
-  struct SocketPark {
+  struct SocketTransition {
     uint64_t attempt = 0;
     bool accepted = false;
   };
   struct SocketOpenAuthority {
     std::string process;
-    SocketPark& park;
+    SocketTransition& park;
+    SocketTransition& adopt;
   };
   // The authority belongs to the WAL registration. Use it without yielding to the event loop.
   std::optional<SocketOpenAuthority> authorizeSocketOpen(const ObjectIdentity&, uint64_t generation,
@@ -612,7 +613,7 @@ private:
       std::pair<uint64_t, uint64_t> position;
       uint64_t id = 0;
       bool codeUpdateAsked = false;
-      SocketPark socketPark;
+      SocketTransition socketPark, socketAdopt;
     };
     std::string processId;
     kj::Own<kj::AsyncIoStream> stream;

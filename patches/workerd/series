@@ -81,4 +81,5 @@
 0104-settle-threaded-alarm-outcomes.patch
 0105-bound-threaded-version-drain.patch
 0106-complete-threaded-lifecycle-transitions.patch
+0107-settle-threaded-socket-handoffs.patch
 0129-wal-scanner-consistency.patch

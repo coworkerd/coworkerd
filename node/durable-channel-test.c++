@@ -1433,8 +1433,12 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").code == "DO_VERSION_DRAINING");
     clock.advanceTo(forcedAt);
     expectReply(8, 24);
-    close(24, 16384);
+    KJ_REQUIRE(!log.checkObjectDispatch(identity, "d0", 7, "third-definition").generationMustClose,
+        "an unacknowledged close can still finish within the confirmation interval");
     clock.advanceTo(forcedAt + 5 * kj::SECONDS);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").generationMustClose,
+        "lack of a close acknowledgement enables the generation fallback");
+    close(24, 16384);
     const auto acknowledged = log.checkObjectDispatch(identity, "d0", 7, "third-definition");
     KJ_REQUIRE(acknowledged.code == "DO_VERSION_DRAINING" && !acknowledged.generationMustClose,
         "an acknowledged close does not replace the process while the last call unwinds");

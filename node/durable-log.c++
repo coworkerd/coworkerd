@@ -4992,7 +4992,7 @@ std::optional<DurableLog::SocketOpenAuthority> DurableLog::authorizeSocketOpen(
   if (registration == channel->second.openFacets.end() || registration->second.id != openId)
     return std::nullopt;
   return SocketOpenAuthority{channel->first.substr(0, channel->first.rfind('-')),
-      registration->second.socketPark};
+      registration->second.socketPark, registration->second.socketAdopt};
 }
 
 void DurableLog::askClose(Channel& channel, uint64_t openId) {

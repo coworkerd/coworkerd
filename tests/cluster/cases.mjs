@@ -1278,34 +1278,47 @@ async function threadedSocketRetirement(cluster) {
             socket.send('welcome');
           } else {
             socket.accept();
+            socket.addEventListener('message', event => {
+              if (event.data === 'reset') this.ctx.abort('reset the old home after transfer');
+              const managed = this.ctx.getWebSockets('managed')[0];
+              const changes = [
+                () => managed.serializeAttachment({ token: 'lost' }),
+                () => this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'lost')),
+                () => managed.send('lost'),
+                () => managed.close(1000, 'lost'),
+              ];
+              socket.send(JSON.stringify(changes.map(change => {
+                try { change(); return 'accepted'; } catch (error) { return error.name; }
+              })));
+            });
           }
           return new Response(null, { status: 101, webSocket: client });
         }
         if (path.endsWith('/local')) {
           const [peer, socket] = Object.values(new WebSocketPair());
           this.ctx.acceptWebSocket(socket, ['local']);
-          peer.accept();
-          const reply = new Promise(resolve => peer.addEventListener('message', event => resolve(event.data), { once: true }));
-          peer.send('local');
-          const message = await reply;
-          peer.close(1000, 'done');
-          return Response.json(message);
+          try { peer.accept(); } catch (error) {
+            return Response.json({ name: error.name, message: error.message });
+          }
+          return Response.json({ name: 'accepted' });
         }
         if (path.endsWith('/hold')) this.ctx.waitUntil(scheduler.wait(120000));
+        if (path.endsWith('/write')) this.ctx.getWebSockets('managed')[0].send('write-finished');
         if (path.endsWith('/reset')) this.ctx.abort('reset the listening socket');
         return Response.json(this.instance);
       }
       webSocketMessage(socket, message) {
-        if (message === 'local') socket.send('local reply');
-        else socket.send(this.instance + ':' + socket.deserializeAttachment().token);
+        socket.send(this.instance + ':' + socket.deserializeAttachment().token);
       }
       webSocketClose(socket, code, reason) { if (code !== 1006) socket.close(code, reason); }
     }
     export default { fetch(request, env) { return env.TREE.getByName('stable').fetch(request); } };
   `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper'] }],
     durable_objects: { bindings: [{ name: 'TREE', class_name: 'Sleeper' }] } } });
-  await eventually('an in-process pair exchanges a frame without returning a 101', async () => {
-    assert.equal(json(await call('/local'), 200, 'local pair'), 'local reply');
+  await eventually('a hibernatable pair cannot be used without an HTTP upgrade', async () => {
+    const local = json(await call('/local'), 200, 'local pair');
+    assert.equal(local.name, 'NotSupportedError');
+    assert.match(local.message, /requires an HTTP upgrade/);
   });
   const { owners: [owner] } = await cluster.api(`${tenant.path}/workers/sleeper/namespaces/Sleeper`, { token: tenant.token });
   const activity = async () => (await durableGeneration(cluster, owner.nodeId)).lifecycle.durableAdmission;
@@ -1352,6 +1365,8 @@ async function threadedSocketRetirement(cluster) {
     await writeFile(control('hold-socket-park'), '');
     await advance(150000);
     assert.equal(ordinary.readyState, Socket.OPEN, 'the ordinary socket remains open until the managed socket is parked');
+    assert.deepEqual(JSON.parse(await send(ordinary, 'mutate')), Array(4).fill('InvalidStateError'),
+      'an ordinary handler cannot change the managed transport after the snapshot');
     let settled = false;
     const racingRequest = call('/status', { timeout: 7000 })
       .then(response => { settled = true; return response; });
@@ -1387,26 +1402,100 @@ async function threadedSocketRetirement(cluster) {
     assert.ok(stalled == null || stalled.status === 503, 'no request starts before adoption succeeds');
     assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
     await unlink(control('hold-socket-adopt'));
-    await eventually('a new open can restore the parked socket after an adoption timeout', async () => {
-      assert.equal(json(await call('/status'), 200, 'adopt after timeout'), before + 1);
+    await writeFile(control('hold-socket-adopt-reply'), '');
+    const cancelled = call('/status', { timeout: 2200 }).catch(() => null);
+    await eventually('the node adopts while the reply is held', async () => {
+      assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 0);
     });
-    assert.equal(await send(managed, 'resumed'), (before + 1) + ':preserved');
+    assert.equal(await cancelled, null, 'the first caller disconnects while waiting for adoption');
+    await delay(5400);
+    await advance(322000);
+    await retired();
+    await unlink(control('hold-socket-adopt-reply'));
+    const restored = await eventually('a new open restores the parked socket after adoption lost its reply', async () => {
+      const instance = json(await call('/status'), 200, 'adopt after timeout');
+      // The interrupted ingress may finish its submitted event when adoption
+      // resolves. Either way a single subsequent open restores the socket.
+      assert.ok(instance === before + 1 || instance === before + 2, String(instance));
+      return instance;
+    });
+    assert.equal(await send(managed, 'resumed'), restored + ':preserved');
 
-    assert.equal(json(await call('/hold'), 200, 'start pending work'), before + 1);
+    const oldHome = open('/ordinary');
+    try {
+      await next(oldHome, 'open');
+      await onlyOrdinarySession();
+      await writeFile(control('hold-socket-park-reply'), '');
+      await advance(482000);
+      await eventually('the node has parked the managed socket before the old home resets', async () => {
+        assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
+      });
+      const oldHomeClosed = next(oldHome, 'close', 3500);
+      oldHome.send('reset');
+      await oldHomeClosed;
+      await retired();
+      await unlink(control('hold-socket-park-reply'));
+      assert.equal(await send(managed, 'tick'), 'tock', 'a reset of the old home leaves the parked socket live');
+      assert.equal(await send(managed, 'after old home reset'), (restored + 1) + ':preserved');
+    } finally {
+      oldHome.terminate();
+    }
+
+    assert.equal(json(await call('/hold'), 200, 'start pending work'), restored + 1);
     await eventually('the pending-work request releases its session', async () => {
       assert.equal((await activity()).homeSessions, 0);
     });
-    await advance(305000 + 14 * 60 * 1000);
+    await advance(482000 + 14 * 60 * 1000);
     assert.equal((await activity()).residentRoots, 1, 'pending work protects the tree before 15 minutes');
-    await advance(305000 + 15 * 60 * 1000 + 1000);
+    const afterPendingExpiry = 482000 + 15 * 60 * 1000 + 1000;
+    await advance(afterPendingExpiry);
     await retired();
-    assert.equal(await send(managed, 'after the deadline'), (before + 2) + ':preserved',
+    assert.equal(await send(managed, 'after the deadline'), (restored + 2) + ':preserved',
       'expiry parks the attachment before aborting pending work');
     const resetClosed = next(managed, 'close');
     await call('/reset', { timeout: 7000 }).catch(() => null);
     const [code, reason] = await resetClosed;
     assert.equal(code, 1011);
     assert.equal(reason.toString(), 'Durable Object reset');
+    await eventually('the forced reset releases its home before the next upgrade', async () => {
+      const current = await activity();
+      assert.equal(current.homeSessions, 0);
+      assert.equal(current.residentRoots, 0);
+    });
+    await eventually('a fresh request opens on the surviving generation', async () => {
+      json(await call('/status'), 200, 'read after reset');
+    });
+
+    const slow = open('/managed');
+    const greeting = next(slow, 'message');
+    void greeting.catch(() => {});
+    const nodeLogs = () => cluster.compose(['logs', '--no-color', '--tail', '100', owner.nodeId]);
+    const waitForHeldWrite = count => eventually('the managed write reaches the node test gate', async () => {
+      assert.equal((await nodeLogs()).match(/\[websocket-test\] managed write held/g)?.length ?? 0, count);
+    });
+    try {
+      await next(slow, 'open');
+      assert.equal((await greeting)[0].toString(), 'welcome');
+      await writeFile(control('hold-socket-write'), '');
+      const delivered = next(slow, 'message', 10000);
+      json(await call('/write'), 200, 'start a slow write');
+      await waitForHeldWrite(1);
+      await delay(5300);
+      assert.equal(slow.readyState, Socket.OPEN, 'a write may take more than five seconds outside parking');
+      await unlink(control('hold-socket-write'));
+      assert.equal((await delivered)[0].toString(), 'write-finished');
+      await writeFile(control('hold-socket-write'), '');
+      json(await call('/write'), 200, 'start a write that will block parking');
+      await waitForHeldWrite(2);
+      const stalledClosed = next(slow, 'close', 12000);
+      await advance(afterPendingExpiry + 15 * 60 * 1000 + 3000);
+      await stalledClosed;
+      const logs = await nodeLogs();
+      assert.ok(logs.includes('"cause":"park-write-timeout"'), 'the node closed the write that prevented parking');
+      await unlink(control('hold-socket-write'));
+    } finally {
+      slow.terminate();
+    }
     assert.equal((await durableGeneration(cluster, owner.nodeId)).generation, generation);
   } finally {
     ordinary.terminate();
