@@ -1,7 +1,7 @@
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { cases, durableGatedCases } from './cases.mjs';
+import { cases, durableGatedCases, fatalAttribution } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
@@ -34,7 +34,7 @@ async function runSuite(selected, kernel, signal, options) {
 }
 
 async function main(args) {
-  const all = { ...cases, ...durableGatedCases };
+  const all = { ...cases, ...durableGatedCases, 'fatal-attribution': fatalAttribution };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
   if (args[0] === '--help' && args.length === 1) return console.log(help);
   if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(all, args[1]))) {
@@ -48,16 +48,26 @@ async function main(args) {
   }
   const start = performance.now();
   const kernel = resolve(args[0]);
-  const regular = Object.entries(cases).filter(([name]) => !args[1] || args[1] === name);
+  const fatalTest = args[1] === 'fatal-attribution';
+  const testBinary = process.env.COWORKERD_CLUSTER_FATAL_TEST_BINARY;
+  if (fatalTest && !testBinary) {
+    throw new Error('fatal-attribution requires COWORKERD_CLUSTER_FATAL_TEST_BINARY');
+  }
+  const regular = fatalTest ? [['fatal-attribution', fatalAttribution]]
+    : Object.entries(cases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
   let failed = 0;
   try {
     if (regular.length) {
-      failed += await runSuite(regular, kernel, controller.signal);
+      failed += await runSuite(regular, kernel, controller.signal, {
+        fatalTestBinary: fatalTest ? resolve(testBinary) : undefined,
+      });
     }
-    for (const [name, { test, nodes, membership, confirmTimeoutMs }] of gated) {
+    for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
+      delayRecoveryPeers }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
-        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs,
+        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
+        controlDurableLifecycle, delayRecoveryPeers,
       });
     }
     console.log(`${regular.length + gated.length} executed, ${failed} failed`);

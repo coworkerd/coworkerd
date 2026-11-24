@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Mon, 23 Nov 2026 08:07:56 +0800
+Subject: [PATCH] Reset a threaded Durable Object when its code drain expires
+
+
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+index 012238142551dbce67ad31071fc072276489ff65..13f59de48085428f098898f33f889f2017158b05 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -238,6 +238,7 @@ class Session {
+         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL checkpoint");
+         break;
+       case MSG_CLOSE_ASKED:
++      case MSG_CLOSE_FOR_CODE_UPDATE:
+         KJ_REQUIRE(payload.size() == 0, "invalid threaded WAL close request");
+         break;
+       case MSG_OPENED:
+@@ -254,9 +255,12 @@ class Session {
+ 
+ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+  public:
+-  Home(std::shared_ptr<Shared> shared, kj::Function<void(uint64_t)> requestClose)
+-      : shared(kj::mv(shared)), inbox(std::make_shared<Inbox>()),
+-        requestClose(kj::mv(requestClose)), tasks(*this) {
++  Home(std::shared_ptr<Shared> shared,
++      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose)
++      : shared(kj::mv(shared)),
++        inbox(std::make_shared<Inbox>()),
++        requestClose(kj::mv(requestClose)),
++        tasks(*this) {
+     tasks.add(read());
+   }
+ 
+@@ -320,7 +324,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+   std::shared_ptr<Shared> shared;
+   std::shared_ptr<Inbox> inbox;
+   std::map<uint64_t, Registration> shippers;
+-  kj::Function<void(uint64_t)> requestClose;
++  kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
+   kj::TaskSet tasks;
+ 
+   void taskFailed(kj::Exception&&) override { shared->stop(); }
+@@ -379,7 +383,12 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+         case MSG_SEALED: shipper.onSealed(notice.salt1, notice.salt2, notice.upToFrame); break;
+         case MSG_BREAK: shipper.onBreak(notice.reason); break;
+         case MSG_CHECKPOINT_ASKED: shipper.onCheckpointAsked(); break;
+-        case MSG_CLOSE_ASKED: requestClose(notice.openId); break;
++        case MSG_CLOSE_ASKED:
++          requestClose(notice.openId, ThreadedWalLog::CloseReason::DRAIN);
++          break;
++        case MSG_CLOSE_FOR_CODE_UPDATE:
++          requestClose(notice.openId, ThreadedWalLog::CloseReason::CODE_UPDATED);
++          break;
+         case MSG_OPENED:
+           if (!registration.opening->isWaiting()) break;
+           if (notice.status == ACK_OK) registration.opening->fulfill();
+@@ -438,7 +447,8 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
+ 
+ bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
+ 
+-kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(kj::Function<void(uint64_t)> requestClose) {
++kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
++    kj::Function<void(uint64_t, CloseReason)> requestClose) {
+   return kj::heap<Home>(impl->shared, kj::mv(requestClose));
+ }
+ 
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
+index 7b42c712aeffd64c07a33dd6a94ce417a007e46e..b73d509f45edd8d70201a8e35d49c92cfd3f0cee 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.h
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
+@@ -13,7 +13,8 @@ class ThreadedWalLog {
+   KJ_DISALLOW_COPY_AND_MOVE(ThreadedWalLog);
+ 
+   bool ready() const;
+-  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t)> requestClose);
++  enum class CloseReason { DRAIN, CODE_UPDATED };
++  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
+   kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
+ 
+  private:
+diff --git a/src/workerd/server/factory/coworkerd-wal-wire.h b/src/workerd/server/factory/coworkerd-wal-wire.h
+index 3a5c53e6a35fa5d7861b718b1c57526ccad5a3e5..cc9bd557f7fae59dd358a304e75404f913f315a8 100644
+--- a/src/workerd/server/factory/coworkerd-wal-wire.h
++++ b/src/workerd/server/factory/coworkerd-wal-wire.h
+@@ -58,7 +58,7 @@ constexpr uint8_t MSG_HELLO = 1, MSG_FRAMES = 2, MSG_OPEN = 3, MSG_CHECKPOINT =
+                   MSG_DELETED = 6, MSG_CLOSED = 7, MSG_GAVE_UP = 8, MSG_ALARM = 9, MSG_RESIDENCY = 10;
+ // From the replicator.
+ constexpr uint8_t MSG_ACK = 1, MSG_SEALED = 2, MSG_BREAK = 3, MSG_CHECKPOINT_ASKED = 4;
+-constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6, MSG_OPENED = 7;
++constexpr uint8_t MSG_READY = 5, MSG_CLOSE_ASKED = 6, MSG_OPENED = 7, MSG_CLOSE_FOR_CODE_UPDATE = 8;
+ constexpr uint32_t THREADED_WAL_REVISION = 1;
+ // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
+ // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 5a5f2008d42ce911dffb5fb07e005034d9445e48..bfe8f8899f7f4f6f921e17380ec73208633ee2b5 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1684,7 +1684,7 @@ struct ThreadState {
+     std::shared_ptr<server::DurableIdleLifecycle> idle;
+     std::function<bool(bool)> facetsBusy;
+     std::function<bool()> facetHasOrdinaryWebSocket;
+-    std::function<void()> stopFacets;
++    std::function<void(const kj::Exception *)> stopFacets;
+     std::function<uint64_t()> rootOpenId;
+     std::map<uint64_t, std::weak_ptr<DurableSessionScope>> sockets;
+     bool resetting = false;
+@@ -2826,7 +2826,7 @@ struct ThreadedServer {
+       if (decision == Decision::WAIT) continue;
+       const bool cancelPending = decision == Decision::CANCEL_PENDING;
+       const bool closeSocketSessions = !root.sockets.empty() && !root.resetting && !root.idleClosing;
+-      if (root.resetting || root.idleClosing) root.stopFacets();
++      if (root.resetting || root.idleClosing) root.stopFacets(nullptr);
+       if (root.facetsBusy(!cancelPending && !closeSocketSessions)) continue;
+       if (!cancelPending && !closeSocketSessions) {
+         KJ_IF_SOME(context, actor.getIoContext()) {
+@@ -2852,7 +2852,7 @@ struct ThreadedServer {
+       }
+       if (cancelPending || closeSocketSessions) {
+         if (!explicitClose) root.idleClosing = true;
+-        root.stopFacets();
++        root.stopFacets(nullptr);
+         actor.abort(KJ_EXCEPTION(DISCONNECTED, "Durable Object retired after its pending work expired."));
+         continue;
+       }
+@@ -2874,7 +2874,7 @@ struct ThreadedServer {
+         }
+       }
+       if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
+-      current->second.stopFacets();
++      current->second.stopFacets(nullptr);
+       actor.shutdown(0);
+       state.durableRoots.erase(current);
+       {
+@@ -3132,10 +3132,20 @@ struct ThreadedServer {
+     state.rejectOnly = thread.control;
+     state.durableHome = thread.homeId;
+     if (thread.home && durableLog) {
+-      state.wal = durableLog->attachHome([&state](uint64_t openId) {
++      state.wal = durableLog->attachHome(
++          [this, &state](uint64_t openId, server::ThreadedWalLog::CloseReason why) {
+         for (auto& [id, root]: state.durableRoots) {
+           if (!root.rootOpenId || root.rootOpenId() != openId) continue;
+           root.closeRequested = true;
++          if (why == server::ThreadedWalLog::CloseReason::CODE_UPDATED) {
++            beginDurableReset(state, id);
++            auto reason = jsg::tagCoworkerdRpcError(
++                KJ_EXCEPTION(DISCONNECTED,
++                    "broken.codeUpdated; jsg.Error: Durable Object reset because its code was updated"),
++                "DO_CODE_UPDATED"_kj);
++            root.stopFacets(&reason);
++            root.actor->abort(kj::mv(reason));
++          }
+           break;
+         }
+       });
+@@ -5504,6 +5514,10 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+ 
+   void stop() {
+     const auto reason = KJ_EXCEPTION(DISCONNECTED, "Durable test tree was closed.");
++    stop(reason);
++  }
++
++  void stop(const kj::Exception &reason) {
+     for (auto at = children.begin(); at != children.end();) {
+       auto current = at++;
+       current->second->stop(reason);
+@@ -5564,7 +5578,7 @@ bool LocalFacet::hasOrdinaryWebSocket() {
+ void LocalFacet::stop(const kj::Exception &reason) {
+   const auto wasStopped = std::exchange(stopped, true);
+   KJ_IF_SOME(opened, actor) {
+-    opened.hooks->stop();
++    opened.hooks->stop(reason);
+     if (!wasStopped) opened.value->abort(reason.clone());
+     if (!busy()) {
+       opened.value->shutdown(0);
+@@ -5748,17 +5762,22 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+                     ThreadState::DurableRoot{
+                       .actor = kj::mv(actor.value),
+                       .idle = std::move(idle),
+-                      .facetsBusy = [hooks = actor.hooks](bool includeBackground) {
+-                        return hooks->busy(includeBackground);
+-                      },
+-                      .facetHasOrdinaryWebSocket = [hooks = actor.hooks] {
+-                        return hooks->hasOrdinaryWebSocket();
+-                      },
+-                      .stopFacets = [hooks = actor.hooks] { hooks->stop(); },
++                      .facetsBusy =
++                          [hooks = actor.hooks](
++                              bool includeBackground) { return hooks->busy(includeBackground); },
++                      .facetHasOrdinaryWebSocket =
++                          [hooks = actor.hooks] { return hooks->hasOrdinaryWebSocket(); },
++                      .stopFacets =
++                          [hooks = actor.hooks](const kj::Exception *reason) {
++      if (reason == nullptr)
++        hooks->stop();
++      else
++        hooks->stop(*reason);
++    },
+                       .rootOpenId = [tree]() -> uint64_t {
+-                        const auto root = tree->shippers.find(0);
+-                        return root == tree->shippers.end() ? 0 : root->second->getOpenId();
+-                      },
++      const auto root = tree->shippers.find(0);
++      return root == tree->shippers.end() ? 0 : root->second->getOpenId();
++    },
+                     })
+                 .first;
+     server.publishDurableRoot(state.durableHome, ticket.tree);

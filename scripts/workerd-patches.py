@@ -239,12 +239,66 @@ def allowed_path(name, path):
                               'src/workerd/io/actor-sqlite.c++',
                               'src/workerd/io/actor-sqlite.h',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0105-bound-threaded-version-drain.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0101-validate-threaded-alarm-entry.patch' and
                               path == 'src/workerd/io/actor-sqlite.c++' or
+                          name == '0103-park-threaded-durable-websockets.patch' and path in {
+                              'src/workerd/api/http.c++',
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/api/web-socket.h',
+                              'src/workerd/io/legacy-hibernation-manager.c++',
+                              'src/workerd/io/legacy-hibernation-manager.h',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0102-threaded-durable-idle-sockets.patch' and path in {
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/io/io-context.c++',
+                              'src/workerd/io/io-context.h',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0104-settle-threaded-alarm-outcomes.patch' and path in {
                               'src/workerd/io/actor-sqlite.h',
                               'src/workerd/io/actor-sqlite-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0106-complete-threaded-lifecycle-transitions.patch' and path in {
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/api/web-socket.h',
+                              'src/workerd/io/io-context.c++',
+                              'src/workerd/io/io-context.h',
+                              'src/workerd/io/legacy-hibernation-manager.c++',
+                              'src/workerd/io/legacy-hibernation-manager.h',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0107-settle-threaded-socket-handoffs.patch' and path in {
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/api/web-socket.h',
+                              'src/workerd/io/legacy-hibernation-manager.c++',
+                              'src/workerd/io/legacy-hibernation-manager.h',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0130-ordinary-fatal-attribution.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0131-fatal-attribution-requires-invocation.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0132-fatal-record-test-constant.patch' and
+                              path == 'src/workerd/threaded/threaded-server-test.c++' or
+                          name == '0133-scope-fatal-attribution.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0134-keep-fatal-diagnostics-and-load-scopes.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/fatal-attribution.h',
+                              'src/workerd/threaded/fatal-attribution-test.c++',
+                              'src/workerd/threaded/fatal-attribution-scope-test.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

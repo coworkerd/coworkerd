@@ -42,8 +42,23 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patches 0100, 0101 and 0104 dispatch node-authorized alarm events on threaded homes. Their
   `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
   after WAL confirmation for this host. The storage fixture holds confirmation to test these guarantees.
-  Keep implementation in our helpers
-  and upstream hooks small so that following upstream stays manageable.
+  Patch 0102 tracks pending I/O and wait-until work on the threaded home and separates local
+  WebSocket transport lifetime from other background work. Its embedder hooks live in
+  `io/io-context.{h,c++}`, `io/worker.{h,c++}` and `api/web-socket.c++`.
+  Patch 0103 keeps the parked WebSocket transport on the node and restores it on a validated
+  threaded open. The hooks in `api/http.c++`, `api/web-socket.{h,c++}` and
+  `io/legacy-hibernation-manager.{h,c++}` connect native upgrades, attachments and handler delivery
+  to the threaded server's private socket control protocol.
+  Patch 0105 sends a targeted code-update reset over the threaded WAL channel when a definition drain expires.
+  Patch 0106 transfers sockets before canceling expired work, reports actor resets on the same WAL channel,
+  and bounds socket-control calls. Its API and I/O hooks keep pairs local until an actual upgrade and account
+  for their transport separately from pending application work.
+  Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
+  and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
+  to a code-update reset.
+  Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
+  quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
+  Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
   into the fork's `patches/v8/`, where upstream keeps its own.

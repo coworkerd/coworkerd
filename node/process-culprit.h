@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
 
 namespace coworkerd {
 
@@ -49,17 +50,19 @@ std::string confirmedCpuCulprit(Process& p, Limits limits, Labelled labelled, Co
   } catch (const kj::Exception&) { return "null"; }
 }
 
-// A native memory-culprit row carries the heap of the isolate whose allocation failed. Below that
-// Worker's own limit the isolate cannot have used up its own V8 headroom (its limit plus one maximum
-// object and a fragmentation reserve): other isolates filled the shared pointer cage, so the row names
-// no culprit. A row that does not report the heap (stock workerd) keeps its attribution.
-inline bool memoryCulpritOwnsOom(bool heapReported, uint64_t oomIsolateHeapBytes, uint32_t memoryLimitMiB) {
-  return !heapReported || oomIsolateHeapBytes >= (uint64_t(memoryLimitMiB) << 20);
+// The last allocator's heap sample cannot prove ownership of a shared-cage OOM,
+// even when the sample reaches the Worker's limit.
+inline bool memoryCulpritOwnsOom(v1::rpc::CpuReport::Reader report, bool durable) {
+  const bool heapReported = report.getOomIsolateHeapReported();
+  const auto limit = report.getMemoryLimitMiB();
+  const bool heapAtLimit = report.getOomIsolateHeapBytes() >= (uint64_t(limit) << 20);
+  if (durable) return !heapReported || heapAtLimit;
+  return report.getOomIsolateLocal() && heapReported && limit > 0 && heapAtLimit;
 }
 
-// An OOM row can match a completed dispatch in the same process generation.
+// A fatal row can match a completed dispatch in the same process generation.
 template<class Calls, class Recent>
-bool memoryCulpritDispatch(const Calls& live, const Recent& recent, const std::string& invocation,
+bool crashCulpritDispatch(const Calls& live, const Recent& recent, const std::string& invocation,
     const std::string& worker, const std::string& version) {
   auto current = live.find(invocation);
   if (current != live.end() && current->second->dispatched &&
@@ -69,5 +72,50 @@ bool memoryCulpritDispatch(const Calls& live, const Recent& recent, const std::s
   });
 }
 
+struct FatalExitEvidence {
+  bool observed = false;
+  std::string culpritRow;
+
+  void record(std::string_view event, const std::string& row) {
+    if (event != "v8-fatal" && event != "v8-fatal-undetermined") return;
+    if (!observed && event == "v8-fatal") culpritRow = row;
+    else culpritRow.clear();  // Competing records cannot prove which thread ended the process.
+    observed = true;
+  }
+};
+
+template <typename Process>
+bool fatalExitMatches(const Process& p, int status) {
+  return p.fatalEvidence.observed && !p.oomSignalled && p.oomCulpritRow.empty() &&
+      WIFEXITED(status) && WEXITSTATUS(status) == 75;
+}
+
+// The inherited event pipe belongs to one process generation. The isolate label
+// is formed by the kernel, including for a cold load before its first lifecycle snapshot.
+template <typename Process, typename Confirmed>
+std::string confirmedFatalCulprit(const Process& p, int status, Confirmed confirmed) {
+  const auto& row = p.fatalEvidence.culpritRow;
+  if (!fatalExitMatches(p, status) || row.empty() || row.size() >= 4096) return "null";
+  try {
+    capnp::MallocMessageBuilder message;
+    auto value = message.initRoot<v1::rpc::CpuReport>();
+    capnp::JsonCodec().decode(kj::StringPtr(row.c_str()), value);
+    if (value.getEvent() != "v8-fatal" || value.getPid() != static_cast<uint32_t>(p.pid)) return "null";
+    const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
+    const std::string invocation = value.getInvocationId().cStr();
+    if (worker.empty() || version.empty() || invocation.empty() ||
+        !crashCulpritDispatch(p.calls, p.recentDispatched, invocation, worker, version)) return "null";
+    const std::string prefix = "coworkerd-v1:" + worker + "@" + version + "#";
+    std::string_view isolate = value.getIsolate().cStr();
+    if (!isolate.starts_with(prefix)) return "null";
+    isolate.remove_prefix(prefix.size());
+    if (isolate.size() != 64 || !std::all_of(isolate.begin(), isolate.end(), [](char digit) {
+          return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
+        })) return "null";
+    auto encoded = capnp::JsonCodec().encode(value.asReader());
+    confirmed(worker, invocation);
+    return encoded.cStr();
+  } catch (const kj::Exception&) { return "null"; }
+}
 
 }  // namespace coworkerd

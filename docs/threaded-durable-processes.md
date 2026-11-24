@@ -201,6 +201,47 @@ Cloudflare. Two things therefore go with this choice: another copy is used when 
 only when the copy is full, and the guide tells authors that objects of one class may share an isolate and
 that synchronous work should be short.
 
+### Databases: native execution, not an isolate per database
+
+A database could instead stay a Durable Object of the JavaScript `SqlDatabase` class with an isolate copy, and
+so a home, of its own. That would reuse steps 1 to 3, and Cloudflare describes D1 as built on SQLite in Durable
+Objects. Native execution is kept. The reasons first given, the resident memory of an isolate and a smaller
+shared lock, are weak: a minimal isolate measured about 2 MiB (about 2.8 MiB with the V8 sandbox), small next to
+the 64 MiB of SQLite memory a database home reserves, and a database runs one statement at a time either way.
+The reasons that decide it:
+
+- **Isolates are what a process runs short of.** In the default build all isolates of a process share one
+  4 GiB pointer cage; with the V8 sandbox each reserves about 136 GiB of address space ([CHANGELOG](../CHANGELOG.md)).
+  Measured on x86_64 Linux, a process held about 1,400 minimal isolates in the default build and about 650
+  with the sandbox. A database with an isolate of its own takes one of them from the objects of its process;
+  a native database takes none. Threads are not the limit: about 97.5 KiB each, one per working database in
+  both arrangements.
+- **No V8 on the data path.** Stopping a statement works the same way in both, through SQLite's progress
+  callback and the execution budget in `util/sqlite` ([patch 0021](../patches/workerd/0021-sql-execution-limit.patch)),
+  because `ctx.storage.sql` runs SQLite synchronously on the isolate's thread. An isolate per database adds
+  V8 work that native execution does not have: `JSON.parse` of the request, rows held as JavaScript values and
+  `JSON.stringify` of the answer, on the isolate's heap and under V8's interrupts and heap limit. Native
+  execution meters a database's memory in one place, SQLite's metered memory, and fails with SQLite's codes.
+- **A deadline of its own.** A D1 query and a batch have a 30 s wall deadline; a Durable Object event has a
+  CPU budget that each request refills. An isolate per database would need a wall deadline the object path
+  does not have.
+- **The native code is mostly our own.** Step 4's patches, 0110 and following, put nearly all of their code
+  in files of their own (`coworkerd-native-sql.*` and the threaded server); a few dozen changed lines are in
+  upstream's `util/sqlite`. Upstream changed `util/sqlite` about four times a month in the half year before this review,
+  and those changes reach the JavaScript class too, through `ctx.storage.sql`. The lasting cost is a second
+  implementation of the D1 contract while the JavaScript class exists; step 4's comparison tests cover it.
+
+Not measured yet: how long a native database takes to open, against a new isolate. The baseline's cold reopen
+(about 70 ms p50 against 15 ms with the isolate warm) restarted the whole durable process, so it is not the
+cost of creating one isolate.
+
+**Fallback.** Once step 4 lands, the JavaScript class runs only on the upstream backend, so until step 5 the
+fallback is the whole old backend. An isolate per database on threaded homes does not exist. It would need `SqlDatabase` moved
+out of the runtime isolate, which is also the process's entry and hosts `Egress`, `TenantLog` and
+`DurableNamespace`, into a platform definition of its own; a placement rule of one database per copy, or a
+pool of copies reused one database at a time; and the 30 s wall deadline on that path. That is about one step
+of work. Step 5 deletes the JavaScript class only under the conditions it lists.
+
 ### Lifecycle and alarms
 
 Use idle time since the last delivered event finished, or since its last hibernation blocker cleared if later.
@@ -451,6 +492,14 @@ shims, real process supervision, the public API, the ordinary threaded path, and
 that remains in use. Audit the workerd patch series and build/publish the matching verified kernels and
 allowlists through the existing maintainer workflow. The guide says that objects of one class may share an
 isolate and that synchronous work should be short.
+
+**Before the JavaScript SQL class is deleted.** All of these hold; otherwise the fallback in "Databases:
+native execution, not an isolate per database" is built instead:
+- step 4's comparison of native and JavaScript answers passes on both Linux architectures, and the database
+  guide names every intended difference;
+- every path the database guide lists without a proven interruption bound has a bound and a test;
+- every update of the upstream base after step 4 carried the native patches with no change to the D1 contract;
+- the open time and the memory of a native database are measured and recorded in the guide.
 
 **Unit and component gate.** Audit every deleted config, metric and dispatch branch. Old documented config
 files need an intentional, tested compatibility behavior for retired fields. Verify routing all event

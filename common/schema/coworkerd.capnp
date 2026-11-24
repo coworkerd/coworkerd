@@ -69,9 +69,65 @@ interface WorkerdBootstrap @0x878048cda334ade3 {
 
 # Native ordinary-process loopback props. The wire type and method are private
 # to this transport; upstream workerd keeps using WorkerdBootstrap unchanged.
+
+# Private node transport for hibernatable sockets. The socket ID names the
+# original upgrade. The authority changes when the object opens on a new home.
+struct ThreadedSocketAuthority @0xab062bc88f9558c5 {
+  socketId @0 :Text;
+  invocationId @1 :Text;
+  dataEpoch @2 :UInt64;
+  shardEpoch @3 :UInt64;
+  generation @4 :UInt64;
+}
+
+struct ThreadedSocketFrame @0xba48661ff14acb08 {
+  union {
+    text @0 :Text;
+    binary @1 :Data;
+    close :group {
+      code @2 :UInt16;
+      reason @3 :Text;
+    }
+  }
+}
+
+struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
+  authority @0 :ThreadedSocketAuthority;
+  lastFrame @1 :UInt64;
+  tags @2 :List(Text);
+  hasAttachment @3 :Bool;
+  attachment @4 :Data;
+  autoResponseUnixMs @5 :UInt64;
+  closedOutgoing @6 :Bool;
+  autoResponseEnabled @7 :Bool;
+  autoRequest @8 :Text;
+  autoResponse @9 :Text;
+}
+
+struct ThreadedSocketOpen @0x807618c69c531b73 {
+  namespaceId @0 :Text;
+  objectId @1 :Text;
+  invocationId @2 :Text;
+  dataEpoch @3 :UInt64;
+  shardEpoch @4 :UInt64;
+  generation @5 :UInt64;
+  walOpenId @6 :UInt64;
+}
+
+interface ThreadedSocketControl @0xdc432f018090bcc4 {
+  send @0 (authority :ThreadedSocketAuthority, frame :ThreadedSocketFrame) -> () $Cxx.allowCancellation;
+  setAutoResponse @1 (authority :ThreadedSocketAuthority, enabled :Bool, request :Text, response :Text) -> (accepted :Bool);
+  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64)
+      -> (accepted :Bool) $Cxx.allowCancellation;
+  adopt @3 (open :ThreadedSocketOpen, attempt :UInt64, resolveOnly :Bool)
+      -> (sockets :List(ThreadedSocketSnapshot), accepted :Bool) $Cxx.allowCancellation;
+  resolvePark @4 (open :ThreadedSocketOpen, attempt :UInt64) -> (accepted :Bool);
+}
+
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer)
       -> (dispatcher :EventDispatcher);
+  socketControl @1 () -> (control :ThreadedSocketControl);
 }
 
 interface PeerServer @0xab4d6df924ec776f {
@@ -391,6 +447,8 @@ struct ServerConfig {
     threadedTestStorage @23 :Bool = false;
     # Experimental threaded Worker-object backend with the node's durable log.
     threadedStorage @24 :Bool = false;
+    # When a new definition first waits for a busy tree, bound the remaining drain time.
+    versionDrainTimeoutMs @25 :UInt32 = 30000;
   }
 
   struct IngressConfig {
@@ -710,6 +768,12 @@ struct CpuReport {
   # of 0 is a reported heap, for example an isolate that died in its first collection).
   oomIsolateHeapBytes @24 :UInt64;
   oomIsolateHeapReported @25 :Bool;
+  # V8 reported a JavaScript heap OOM at the isolate's heap limit or in its own cage.
+  oomIsolateLocal @26 :Bool;
+  # Bounded byte prefixes from V8's callback, separate from attribution.
+  fatalLocationHex @27 :Text;
+  fatalMessageHex @28 :Text;
+  fatalLine @29 :Int32;
 }
 
 struct PlacementConfig {
