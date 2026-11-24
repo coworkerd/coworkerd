@@ -57,10 +57,11 @@ async function main(args) {
       failed += await runSuite(regular, kernel, controller.signal);
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      objectBytes, inFlightLimit }] of gated) {
+      objectBytes, inFlightLimit, durableOwners, nativeSqlDatabaseSpillBytes, nativeSqlProcessSpillBytes }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
         controlDurableLifecycle, objectBytes, inFlightLimit,
+        durableOwners, nativeSqlDatabaseSpillBytes, nativeSqlProcessSpillBytes,
       });
     }
     if (nativeSql.length) {

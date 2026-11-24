@@ -46,6 +46,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, objectBytes, inFlightLimit,
+    durableOwners, nativeSqlDatabaseSpillBytes, nativeSqlProcessSpillBytes,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -70,6 +71,9 @@ export class Cluster {
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
     this.objectBytes = objectBytes;
     this.inFlightLimit = inFlightLimit;
+    this.durableOwners = durableOwners;
+    this.nativeSqlDatabaseSpillBytes = nativeSqlDatabaseSpillBytes;
+    this.nativeSqlProcessSpillBytes = nativeSqlProcessSpillBytes;
   }
 
   async command(program, args, {
@@ -123,11 +127,16 @@ export class Cluster {
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1, inFlightLimit: this.inFlightLimit },
         membership: this.membership,
-        ...(this.threadedNodes.has(node) ? {
-          durableObjects: {
+        durableObjects: {
+          processes: this.durableOwners && (this.durableOwners.includes(node) ? 1 : 0),
+          ...(this.threadedNodes.has(node) && {
             threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
             versionDrainTimeoutMs: this.versionDrainTimeoutMs, objectBytes: this.objectBytes,
-          },
+            nativeSqlDatabaseSpillBytes: this.nativeSqlDatabaseSpillBytes,
+            nativeSqlProcessSpillBytes: this.nativeSqlProcessSpillBytes,
+          }),
+        },
+        ...(this.threadedNodes.has(node) ? {
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
         } : {}),
       }));

@@ -6,7 +6,8 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
-import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlProtocol, sqlResourceBounds } from './native-sql.mjs';
+import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlHomePressure, sqlProcessSpill, sqlProtocol,
+  sqlResourceBounds } from './native-sql.mjs';
 
 function respondWith(value) {
   return `export default { fetch() { return new Response(${JSON.stringify(value)}); } };`;
@@ -1535,6 +1536,14 @@ export const durableGatedCases = {
   },
   'sql-resource-bounds': {
     test: sqlResourceBounds, nodes: ['node-1', 'node-2', 'node-3'], inFlightLimit: 2, objectBytes: 1024 * 1024,
+    nativeSqlDatabaseSpillBytes: 16 * 1024 * 1024,
+  },
+  'sql-process-spill': {
+    test: sqlProcessSpill, nodes: ['node-1'], durableOwners: ['node-1'],
+    nativeSqlDatabaseSpillBytes: 16 * 1024 * 1024, nativeSqlProcessSpillBytes: 12 * 1024 * 1024,
+  },
+  'sql-home-pressure': {
+    test: sqlHomePressure, nodes: ['node-1'], durableOwners: ['node-1'],
   },
 };
 

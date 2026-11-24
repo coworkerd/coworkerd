@@ -2500,7 +2500,8 @@ public:
   // A request to an object, on the object's durable process: from a stateless Worker a child of its call tree
   // (`allocation`, charged to its budget as a Binding call is), from an object the root of a new call tree.
   OpenEvent openDurable(std::shared_ptr<const VersionDefinition> version, const DurableTarget& target,
-      std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
+      std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog,
+      std::optional<double> sqlDeadline) {
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
     if (process->threadedDurableTestRole() && target.alarmAtUnixMs) {
@@ -2574,7 +2575,8 @@ public:
           &*root);
     }
     auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
-    const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
+    const auto rootExpires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
+    const auto expires = std::min(rootExpires, sqlDeadline.value_or(rootExpires));
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
     addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
     return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
@@ -4894,6 +4896,7 @@ struct ObjectInvocationData {
   // A stateless Worker's call: its child allocation in the caller's tree. None: an object's call (callerObjectId).
   std::optional<ChildAllocation> allocation;
   std::string callerNamespaceId, callerObjectId;
+  std::optional<double> sqlDeadline;
 };
 
 class PeerConnection final {
@@ -5375,7 +5378,9 @@ public:
       address = peer->address;
     }
     const auto identity = address + "#" + std::to_string(invocation.destinationEpoch);
-    const auto deadline = invocation.allocation ? invocation.allocation->expiresAtMonotonicMs : server.rootDeadline();
+    const auto rootDeadline = server.rootDeadline();
+    const auto deadline = invocation.allocation ? invocation.allocation->expiresAtMonotonicMs
+        : std::min(rootDeadline, invocation.sqlDeadline.value_or(rootDeadline));
     if (remainingLeaseMs(deadline) == 0) {
       server.rejectExpiredLease("lease expired before forwarding");
       co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before forwarding", 410), true};
@@ -6334,7 +6339,7 @@ private:
 // One SQL statement on a tenant's database, defined with the other requests the node makes of an object (below).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body, std::string resultsFormat);
+    std::string database, std::string body, std::string resultsFormat, double sqlDeadline);
 
 class PeerRpcService final: public kj::HttpService {
 public:
@@ -6430,6 +6435,7 @@ public:
   // the database's object (the control plane has already checked the caller's credential and the tenant).
   kj::Promise<void> sqlQuery(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
     constexpr uint64_t LIMIT = 1u << 20;
+    const auto sqlDeadline = monotonicTimeMs() + 30000;
     std::string path(url.cStr());
     std::string resultsFormat = "ARRAY_OF_OBJECTS";
     if (auto query = path.find('?'); query != std::string::npos) {
@@ -6471,7 +6477,7 @@ public:
     CollectedResponse answer;
     try {
       answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
-          std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat);
+          std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat, sqlDeadline);
     } catch (const kj::Exception& error) {
       auto code = rpcFailureCode(error);
       if (!sqlAdmissionRefusal(code)) code = "RESULT_UNCERTAIN";
@@ -6882,6 +6888,7 @@ public:
     SharedPathTiming timing;
     // An object's call: the calling object. Both empty for a node's SQL or alarm request.
     std::string callerNamespaceId, callerObjectId;
+    std::optional<double> sqlDeadline;
   };
 
   // A request from a caller on this node -- a stateless Worker's Binding call, or an object's call. The object's shard
@@ -6891,7 +6898,9 @@ public:
   // lost answer is RESULT_UNCERTAIN.
   kj::Promise<BindingDispatch::Dispatched> dispatch(Request request) {
     const auto started = monotonicTimeMs();
-    const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
+    const auto rootDeadline = server.rootDeadline();
+    const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs
+        : std::min(rootDeadline, request.sqlDeadline.value_or(rootDeadline));
     const auto workerId = request.workerId;
     Line line{workerId, {}, request.allocation ? "worker" :
         request.callerNamespaceId.empty() && request.callerObjectId.empty() ? "node" : "object", "local", {}};
@@ -6935,7 +6944,7 @@ public:
       line.node = route.nodeId;
       request.target.shardEpoch = route.epoch;
       auto result = co_await peerForwarder.tryOpenObject(route.nodeId, {workerId, request.target, route.epoch, route.nodeEpoch,
-          request.allocation, request.callerNamespaceId, request.callerObjectId}, route.address);
+          request.allocation, request.callerNamespaceId, request.callerObjectId, request.sqlDeadline}, route.address);
       if (!result.failure) {
         if (!designated) shards.confirmed(request.target.namespaceId, request.target.shard, route.epoch);
         shards.forwarded(designated, "accepted");
@@ -7011,7 +7020,9 @@ public:
       co_return Received{server.refusal("NOT_SUPPORTED", "the durable test role only accepts local dispatch", 501)};
     }
     const auto started = monotonicTimeMs();
-    const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
+    const auto rootDeadline = server.rootDeadline();
+    const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs
+        : std::min(rootDeadline, request.sqlDeadline.value_or(rootDeadline));
     Line line{request.workerId, {}, request.allocation ? "worker" :
         request.callerNamespaceId.empty() && request.callerObjectId.empty() ? "node" : "object", "received", from};
     auto refused = [&](const InvocationRejection& refusal) {
@@ -7181,7 +7192,7 @@ private:
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the socket shard changed before dispatch", 409));
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
-      auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
+      auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog, request.sqlDeadline);
       if (!disposable) {
         durableLog.objectDispatched({target.namespaceId, target.objectId, coworkerd::tenantOf(version->workerId),
             target.dataEpoch, target.shardEpoch, target.shard}, slot->process->processId, slot->process->generation);
@@ -7468,7 +7479,7 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
 // plane to any node, which sends it on to the shard's owner).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body, std::string resultsFormat) {
+    std::string database, std::string body, std::string resultsFormat, double sqlDeadline) {
   CollectedResponse refusal;
   const auto* space = server.database(tenant, database);
   if (space == nullptr || space->status != "active") {
@@ -7484,6 +7495,7 @@ kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCor
   request.target.className = coworkerd::DATABASE_CLASS_NAME;
   request.target.tenant = tenant;
   request.target.database = database;
+  request.sqlDeadline = sqlDeadline;
   const auto path = "http://coworkerd-node/query?resultsFormat=" + resultsFormat;
   co_return co_await askObject(durable, factory, headerTable, std::move(request), path.c_str(), std::move(body));
 }
@@ -7540,6 +7552,9 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
       KJ_REQUIRE(request.target.hops == 0 &&
           (!request.target.database.empty() || request.target.alarmAtUnixMs != 0),
           "invalid remote Durable Object call: the calling node");
+      if (request.target.isDatabase() && request.target.alarmAtUnixMs == 0) {
+        request.sqlDeadline = receivedAtMonotonicMs + std::min(remainingMs, 30000.0);
+      }
     } else {
       KJ_REQUIRE(validSha256(request.callerNamespaceId) && validSha256(request.callerObjectId),
           "invalid remote Durable Object call: the calling object");

@@ -244,6 +244,11 @@ struct DurableLogConfig {
   uint32_t alarmDiscoveryIntervalMs = 60000;
   uint32_t alarmTakeoverConcurrency = 4;
   uint32_t versionDrainTimeoutMs = 30000;
+  uint64_t nativeSqlDatabaseSpillBytes = 1ull << 30;
+  uint64_t nativeSqlProcessSpillBytes = 0;
+  uint64_t nativeSqlProcessSpillLimit() const {
+    return nativeSqlProcessSpillBytes == 0 ? 4 * nativeSqlDatabaseSpillBytes : nativeSqlProcessSpillBytes;
+  }
   void validate() const;
 };
 

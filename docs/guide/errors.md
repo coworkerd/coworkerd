@@ -189,6 +189,15 @@ no separate time limit, and the 7 MiB reply cap is not a process-memory limit. S
 array `/query` requests both roll back. `env.DB.exec()` wraps a failure as `D1_EXEC_ERROR: Error in line N: ...` and keeps
 earlier successful lines, as with its other statement errors. See [result size](databases.md#result-size).
 
+The threaded backend can return the following limits through SQL HTTP or as the cause of a D1 binding error. A `/query` batch rolls back as a whole. Earlier successful `exec()` lines remain committed.
+
+| HTTP status | Code | Meaning |
+| --- | --- | --- |
+| 422 | `SQL_MEMORY_LIMIT_EXCEEDED` | The request, SQLite operation or result exceeded the native database memory budget. Reduce the amount processed by one call. |
+| 507 | `SQL_SPILL_LIMIT_EXCEEDED` | SQLite exceeded the per-database or durable-process budget for uncommitted WAL and temporary files. Reduce the work per transaction or adjust the spill limits. |
+
+See [native SQL budgets](databases.md#10-failure-and-consistency).
+
 ## 4b. Method calls on a Binding (errors `env.SVC.method()` and `stub.method()` throw)
 
 A method call on a Service Binding or on a Durable Object stub is a call of the tree like a `fetch` through the same

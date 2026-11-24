@@ -50,6 +50,11 @@ void DurableLogConfig::validate() const {
   KJ_REQUIRE(peerBufferBytes >= (1u << 20), "durableObjects.peerBufferBytes is at least 1048576");
   KJ_REQUIRE(objectBytes >= (1u << 20), "durableObjects.objectBytes is at least 1048576");
   KJ_REQUIRE(checkpointBytes >= (1u << 16), "durableObjects.checkpointBytes is at least 65536");
+  KJ_REQUIRE(nativeSqlDatabaseSpillBytes >= (1ull << 16) && nativeSqlDatabaseSpillBytes <= (1ull << 40),
+      "durableObjects.nativeSqlDatabaseSpillBytes is between 64 KiB and 1 TiB");
+  KJ_REQUIRE(nativeSqlProcessSpillBytes == 0 ||
+      (nativeSqlProcessSpillBytes >= (1ull << 16) && nativeSqlProcessSpillBytes <= (4ull << 40)),
+      "durableObjects.nativeSqlProcessSpillBytes is zero or between 64 KiB and 4 TiB");
   KJ_REQUIRE(recoverParallelism > 0 && recoverParallelism <= 16,
       "durableObjects.recoverParallelism is between 1 and 16");
   KJ_REQUIRE(rebuildConcurrency > 0 && rebuildConcurrency <= 64,
@@ -262,6 +267,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.peerBufferBytes = durable.getPeerBufferBytes();
   result.durableLog.objectBytes = durable.getObjectBytes();
   result.durableLog.checkpointBytes = durable.getCheckpointBytes();
+  result.durableLog.nativeSqlDatabaseSpillBytes = durable.getNativeSqlDatabaseSpillBytes();
+  result.durableLog.nativeSqlProcessSpillBytes = durable.getNativeSqlProcessSpillBytes();
   result.durableLog.idleCheckpointMs = durable.getIdleCheckpointMs();
   result.durableLog.uploadRetryMs = durable.getUploadRetryMs();
   result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();

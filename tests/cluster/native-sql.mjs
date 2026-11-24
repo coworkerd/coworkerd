@@ -151,6 +151,24 @@ export async function sqlProtocol(cluster) {
   assert.match(rejected.cause, /UNIQUE constraint failed/);
   assert.deepEqual((await db.query({ sql: 'SELECT * FROM ledger ORDER BY id' })).results,
     [{ id: 1 }, { id: 2 }, { id: 3 }]);
+
+  // Exercise the same public disconnect against the JavaScript fallback and
+  // the native home. Either way, losing the client leaves no partial batch.
+  const abort = new AbortController();
+  const disconnected = fetch(cluster.urls.apiserver + db.path + '/query', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify([put(101), { sql: slow }]),
+    signal: abort.signal,
+  }).then(response => ({ response }), error => ({ error }));
+  await delay(40);
+  abort.abort();
+  assert.equal((await disconnected).error?.name, 'AbortError');
+  const afterDisconnect = await eventually('the database answers after a disconnected batch', async () => {
+    const answer = await db.raw({ sql: 'SELECT id FROM ledger WHERE id = 101' }, 'ARRAY_OF_OBJECTS', 2500);
+    return json(answer, 200, 'read after a disconnected batch');
+  });
+  assert.deepEqual(afterDisconnect.results, []);
 }
 
 export async function sqlCli(cluster) {
@@ -293,34 +311,40 @@ async function colocatedDatabase(cluster, tenant, placement) {
   assert.fail(`could not place ${tenant.name}'s probe in ${placement.nodeId}/${placement.processId}`);
 }
 
-async function colocatedObject(cluster, tenant, placement) {
-  await cluster.deploy(tenant, 'sql-neighbor', `
+async function prepareColocatedObject(cluster, tenant, placement, name = 'sql-neighbor') {
+  await cluster.deploy(tenant, name, `
     import { DurableObject } from 'cloudflare:workers';
     export class Probe extends DurableObject {
       fetch() { return new Response(this.ctx.id.toString()); }
     }
-    export default { fetch(request, env) {
-      return env.PROBES.getByName(new URL(request.url).searchParams.get('key')).fetch(request);
+    export default { async fetch(request, env) {
+      try {
+        return await env.PROBES.getByName(new URL(request.url).searchParams.get('key')).fetch(request);
+      } catch (error) {
+        return Response.json({ code: error.code, message: error.message }, { status: 503 });
+      }
     } };
   `, { wrangler: {
     durable_objects: { bindings: [{ name: 'PROBES', class_name: 'Probe' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Probe'] }],
   } });
-  const { namespaceId } = await cluster.api(`${tenant.path}/workers/sql-neighbor/namespaces/Probe`, { token: tenant.token });
-  for (let i = 0; i < 30; ++i) {
-    const run = () => request(cluster.urls[placement.nodeId], `/${tenant.name}/sql-neighbor?key=${i}`);
-    const id = await eventually('Durable Object probe is available', async () => {
-      const answer = await run();
-      assert.equal(answer.status, 200, answer.text);
-      assert.match(answer.text, /^[\da-f]{64}$/);
-      return answer.text;
-    });
-    const objectId = id.slice(0, 12);
-    if (sameProcess(await acceptedOn(cluster, namespaceId, objectId), placement)) {
-      return { namespaceId, objectId, check: async () => assert.deepEqual(await run(), { status: 200, text: id }) };
+  const { namespaceId } = await cluster.api(`${tenant.path}/workers/${name}/namespaces/Probe`, { token: tenant.token });
+  return async () => {
+    for (let i = 0; i < 30; ++i) {
+      const run = () => request(cluster.urls[placement.nodeId], `/${tenant.name}/${name}?key=${i}`);
+      const id = await eventually('Durable Object probe is available', async () => {
+        const answer = await run();
+        assert.equal(answer.status, 200, answer.text);
+        assert.match(answer.text, /^[\da-f]{64}$/);
+        return answer.text;
+      }, { timeout: 5000 });
+      const objectId = id.slice(0, 12);
+      if (sameProcess(await acceptedOn(cluster, namespaceId, objectId), placement)) {
+        return { namespaceId, objectId, check: async () => assert.deepEqual(await run(), { status: 200, text: id }) };
+      }
     }
-  }
-  assert.fail('could not colocate a Durable Object with the blocking database');
+    assert.fail('could not colocate a Durable Object with the blocking database');
+  };
 }
 
 export async function sqlResourceBounds(cluster) {
@@ -361,13 +385,12 @@ export async function sqlResourceBounds(cluster) {
     sqliteAllocatedBytes: maxHomeMemoryBytes, sqliteReservedBytes: nativeDatabaseReservedBytes,
     processResidentBytes: child.residentBytes }));
   assert.equal((await holder.query(schema)).success, true);
-  const neighbor = await colocatedObject(cluster, other, placement);
+  const placeNeighbor = await prepareColocatedObject(cluster, other, placement);
   await holder.ready();
   const location = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${holder.namespaceId}`;
   const disk = async () => {
     const listing = await cluster.compose(
-      ['exec', '-T', placement.nodeId, 'find', location, '-maxdepth', '1', '-type', 'f',
-        '-name', '*.sqlite*', '-printf', '%s %b\n']);
+      ['exec', '-T', placement.nodeId, 'find', location, '-maxdepth', '1', '-type', 'f', '-printf', '%s %b\n']);
     return listing.trim().split('\n').filter(Boolean).reduce((sum, line) => {
       const [bytes, blocks] = line.split(' ').map(Number);
       return { logical: sum.logical + bytes, allocated: sum.allocated + blocks * 512 };
@@ -378,8 +401,10 @@ export async function sqlResourceBounds(cluster) {
     const owner = processes.entries.find(entry => entry.processId === placement.processId);
     assert.equal(owner.generation, placement.processGeneration);
     const descriptors = await cluster.compose(['exec', '-T', placement.nodeId, 'ls', '-1', `/proc/${owner.pid}/fd`]);
-    const { databaseHomes, nativeDatabaseReservedBytes, reservedDescriptors, running } = owner.lifecycle.durableAdmission;
-    return { databaseHomes, nativeDatabaseReservedBytes, reservedDescriptors, running,
+    const { databaseHomes, nativeDatabaseReservedBytes, nativeSqlSpillBytes,
+      nativeSqlSpillMaximum, reservedDescriptors, running } = owner.lifecycle.durableAdmission;
+    return { databaseHomes, nativeDatabaseReservedBytes, nativeSqlSpillBytes, nativeSqlSpillMaximum,
+      reservedDescriptors, running,
       residentBytes: owner.residentBytes, openDescriptors: descriptors.trim().split('\n').length };
   };
   const before = await disk();
@@ -404,7 +429,7 @@ export async function sqlResourceBounds(cluster) {
     during = await disk();
     assert.equal(settled, false, 'the staging transaction ended before the disk sample');
     assert.ok(before.logical > 0);
-    assert.ok(during.logical <= before.logical && during.allocated <= before.allocated,
+    assert.ok(during.logical > before.logical && during.logical - before.logical <= cluster.nativeSqlDatabaseSpillBytes,
       JSON.stringify({ before, during }));
     for (const candidate of candidates) {
       const answer = await candidate.raw({ sql: 'SELECT 1' });
@@ -412,10 +437,11 @@ export async function sqlResourceBounds(cluster) {
       assert.match(code, /^(OVERLOADED|DO_UNAVAILABLE)$/);
       attempts.push({ database: candidate.name, status: answer.status, code });
     }
-    await neighbor.check();
+    await (await placeNeighbor()).check();
     saturated = await resources();
     assert.equal(saturated.databaseHomes, 1);
-    assert.equal(saturated.nativeDatabaseReservedBytes, 64 * 1024 * 1024);
+    assert.ok(saturated.nativeDatabaseReservedBytes > 0 && saturated.nativeDatabaseReservedBytes < 32 * 1024 * 1024);
+    assert.ok(saturated.nativeSqlSpillBytes > 0 && saturated.nativeSqlSpillBytes <= cluster.nativeSqlDatabaseSpillBytes);
     assert.equal(settled, false, "another tenant's Durable Object was not served during the database request");
   } finally {
     abort.abort();
@@ -434,10 +460,18 @@ export async function sqlResourceBounds(cluster) {
   const recoveredProcess = await eventually('the child reports the SQL home idle again', async () => {
     const snapshot = await resources();
     assert.equal(snapshot.running, 0);
+    assert.equal(snapshot.nativeSqlSpillBytes, 0);
     return snapshot;
   });
   console.log('Native SQL resource bounds', JSON.stringify({ attempts, retryMs,
     disk: { before, during, after }, process: { idle, saturated, recovered: recoveredProcess } }));
+
+  const declined = await holder.raw(Array.from({ length: 10 }, () => busy[0]));
+  assert.equal(json(declined, 507, 'oversized transaction').code, 'SQL_SPILL_LIMIT_EXCEEDED');
+  assert.deepEqual((await holder.query({ sql: 'SELECT id FROM ledger' })).results, []);
+  const afterRefusal = await disk();
+  assert.ok(afterRefusal.logical <= before.logical && afterRefusal.allocated <= before.allocated,
+    JSON.stringify({ before, afterRefusal }));
 
   const hold = join(cluster.peerAckGate, 'hold');
   const peers = cluster.nodes.filter(node => node !== placement.nodeId);
@@ -506,6 +540,170 @@ export async function sqlResourceBounds(cluster) {
   }
 }
 
+async function soleDatabaseProcess(cluster, database) {
+  const [node] = cluster.durableOwners;
+  const placement = await acceptedOn(cluster, database.namespaceId);
+  assert.equal(placement.nodeId, node);
+  const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+  const state = async () => {
+    const { membership, processes, storage } = await cluster.state(node);
+    assert.ok(BigInt(storage.appliedTenantsRevision) >= BigInt(tenantsRevision));
+    assert.deepEqual(membership.members.filter(member => member.state === 'active' && member.durableProcesses > 0)
+      .map(member => member.nodeId), [node]);
+    const child = processes.entries.find(entry => entry.processId === placement.processId);
+    assert.equal(child.generation, placement.processGeneration);
+    return { ...child.lifecycle.durableAdmission, residentBytes: child.residentBytes };
+  };
+  await eventually('the sole durable owner sees the current tenant index', state);
+  return { node, placement, state };
+}
+
+function abortableQuery(cluster, tenant, database, statements, abort) {
+  return fetch(cluster.urls.apiserver + database.path + '/query', {
+    method: 'POST', headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(statements), signal: abort.signal,
+  }).then(response => ({ response }), error => ({ error }));
+}
+
+export async function sqlProcessSpill(cluster) {
+  const tenant = await cluster.tenant('sql-process-spill');
+  const first = await database(cluster, tenant, 'first');
+  const second = await database(cluster, tenant, 'second');
+  const { state } = await soleDatabaseProcess(cluster, second);
+  const createLedger = { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY, payload BLOB)' };
+  for (const db of [first, second]) assert.equal((await db.query(createLedger)).success, true);
+  const insert = { sql: 'INSERT INTO ledger(payload) VALUES(randomblob(2097152))' };
+  const hold = (db, count, abort) => abortableQuery(cluster, tenant, db,
+    [...Array.from({ length: count }, () => insert), { sql: slow }], abort);
+  const abortFirst = new AbortController();
+  const abortSecond = new AbortController();
+  const runningFirst = hold(first, 3, abortFirst);
+  let concurrent;
+  try {
+    await eventually('the first database is spilling without confirmation', async () => {
+      const sample = await state();
+      assert.equal(sample.running, 1);
+      assert.ok(sample.nativeSqlSpillBytes > 4 * 1024 * 1024);
+    });
+    const runningSecond = hold(second, 2, abortSecond);
+    try {
+      concurrent = await eventually('two databases are simultaneously spilling in one process', async () => {
+        const sample = await state();
+        assert.equal(sample.running, 2);
+        assert.ok(sample.nativeSqlSpillBytes > 8 * 1024 * 1024);
+        assert.ok(sample.nativeSqlSpillBytes <= cluster.nativeSqlProcessSpillBytes);
+        return sample;
+      });
+    } finally {
+      abortSecond.abort();
+      assert.equal((await runningSecond).error?.name, 'AbortError');
+    }
+    const empty = { sql: 'SELECT id FROM ledger' };
+    await eventually('the second database rolls back after cancellation', async () => {
+      const answer = await second.raw(empty, 'ARRAY_OF_OBJECTS', 1000);
+      assert.deepEqual(json(answer, 200, 'second database after disconnect').results, []);
+    }, { timeout: 4000, interval: 30 });
+    const answer = await second.raw(Array.from({ length: 4 }, () => insert));
+    assert.equal(json(answer, 507, 'process spill cap').code, 'SQL_SPILL_LIMIT_EXCEEDED');
+    assert.deepEqual((await second.query(empty)).results, []);
+  } finally {
+    abortFirst.abort();
+    assert.equal((await runningFirst).error?.name, 'AbortError');
+  }
+  await eventually('all spill credit is returned after rollback', async () => {
+    assert.deepEqual((await first.query({ sql: 'SELECT id FROM ledger' })).results, []);
+    assert.equal((await state()).nativeSqlSpillBytes, 0);
+  }, { timeout: 6000 });
+  const recovered = await state();
+  console.log('Native SQL process spill', JSON.stringify({
+    concurrentBytes: concurrent.nativeSqlSpillBytes, limitBytes: concurrent.nativeSqlSpillMaximum,
+    concurrentDatabases: concurrent.running, recoveredBytes: recovered.nativeSqlSpillBytes,
+  }));
+}
+
+export async function sqlHomePressure(cluster) {
+  const tenant = await cluster.tenant('sql-home-pressure', { durableObjectNamespaces: 1000 });
+  const other = await cluster.tenant('sql-home-pressure-neighbor');
+  const createStarted = performance.now();
+  const databases = [];
+  for (let offset = 0; offset < 1000; offset += 8) {
+    databases.push(...await Promise.all(Array.from({ length: 8 }, (_, i) =>
+      database(cluster, tenant, `db-${offset + i}`, { warm: false }))));
+  }
+  const creationMs = performance.now() - createStarted;
+  const cross = await database(cluster, other, 'cross-tenant');
+  const { node, placement, state } = await soleDatabaseProcess(cluster, cross);
+  const placeFirst = await prepareColocatedObject(cluster, other, placement);
+  const placeSecond = await prepareColocatedObject(cluster, other, placement, 'sql-second-class');
+
+  const warm = [databases[0], databases[1], cross];
+  for (const db of warm) await db.ready();
+  const full = await eventually('database homes fill all but the Durable Object home', async () => {
+    const sample = await state();
+    assert.equal(sample.databaseHomes, sample.homes - 1);
+    return sample;
+  });
+  const blockers = warm.map(db => {
+    const abort = new AbortController();
+    return { abort, running: abortableQuery(cluster, db === cross ? other : tenant, db, { sql: slow }, abort) };
+  });
+  try {
+    await eventually('all database homes are executing', async () => {
+      assert.equal((await state()).running, warm.length);
+    }, { timeout: 5000, interval: 30 });
+    const obj = await placeFirst();
+    await obj.check();
+    const answer = await request(cluster.urls[node], `/${other.name}/sql-second-class?key=0`);
+    const refused = json(answer, 503, 'second Durable Object class with all database homes busy');
+    assert.match(`${refused.code} ${refused.message}`, /OVERLOADED|queue is full/);
+  } finally {
+    for (const { abort } of blockers) abort.abort();
+    for (const { running } of blockers) assert.equal((await running).error?.name, 'AbortError');
+  }
+
+  // An interrupted home closes. Refill the database placements, then send
+  // the first successful call to the other class while all three are idle.
+  for (const db of warm) await eventually(`reopen ${db.name}`, db.ready, { timeout: 5000 });
+  const retireStarted = performance.now();
+  const fresh = await placeSecond();
+  const reclaimed = await eventually('a fresh namespace immediately displaces an idle database home', async () => {
+    const sample = await state();
+    assert.equal(sample.databaseHomes, full.databaseHomes - 1);
+    return sample;
+  }, { timeout: 4000, interval: 25 });
+  const reclaimMs = performance.now() - retireStarted;
+  assert.ok(reclaimMs < 10000, `${reclaimMs} ms`);
+  console.log('Native SQL home pressure', JSON.stringify({ reclaimMs, homes: full.homes,
+    fullDatabaseHomes: full.databaseHomes, reclaimedDatabaseHomes: reclaimed.databaseHomes }));
+
+  // Exercise the default home count and memory capacity on the one owner. The
+  // other tenant continues using both interfaces while the databases rotate.
+  const measurements = [[], [], []];
+  const measure = async (check, output) => {
+    const start = performance.now();
+    await check();
+    output.push({ ms: performance.now() - start, lag: 0 });
+  };
+  const sweepStarted = performance.now();
+  let peakHomes = 0;
+  let peakReservedBytes = 0;
+  let peakResidentBytes = 0;
+  for (let i = 0; i < databases.length; ++i) {
+    const jobs = [measure(databases[i].ready, measurements[0])];
+    if (i % 4 === 0) jobs.push(measure(cross.ready, measurements[1]), measure(fresh.check, measurements[2]));
+    await Promise.all(jobs);
+    if (i % 20 !== 0 && i !== databases.length - 1) continue;
+    const sample = await state();
+    assert.ok(sample.databaseHomes <= sample.homes - 1);
+    peakHomes = Math.max(peakHomes, sample.databaseHomes);
+    peakReservedBytes = Math.max(peakReservedBytes, sample.nativeDatabaseReservedBytes);
+    peakResidentBytes = Math.max(peakResidentBytes, sample.residentBytes);
+  }
+  console.log('Native SQL 1000 databases', JSON.stringify({ node, creationMs,
+    sweepMs: performance.now() - sweepStarted, peakHomes, peakReservedBytes, peakResidentBytes,
+    database: stats(measurements[0]), crossTenantDatabase: stats(measurements[1]), durableObject: stats(measurements[2]) }));
+}
+
 function stats(samples) {
   const values = samples.filter(sample => !sample.error).map(sample => sample.ms).sort((a, b) => a - b);
   const percentile = p => values[Math.ceil(values.length * p) - 1];
@@ -548,7 +746,7 @@ export async function longSqlIsolation(cluster) {
   const original = await slot();
   const same = await colocatedDatabase(cluster, tenant, placement);
   const cross = await colocatedDatabase(cluster, other, placement);
-  const object = await colocatedObject(cluster, tenant, placement);
+  const object = await (await prepareColocatedObject(cluster, tenant, placement))();
   const probes = [{ ...same, check: same.ready }, { ...cross, check: cross.ready }, object];
   const quiet = probes.map(() => []);
   const busy = probes.map(() => []);

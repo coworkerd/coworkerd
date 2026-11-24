@@ -2538,6 +2538,10 @@ public:
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
     if (p->durable && p->threaded) {
+      childEnvironment.push_back("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES=" +
+          std::to_string(durableLog.nativeSqlDatabaseSpillBytes));
+      childEnvironment.push_back("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES=" +
+          std::to_string(durableLog.nativeSqlProcessSpillLimit()));
       for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",

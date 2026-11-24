@@ -1,0 +1,1524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 24 Nov 2026 20:03:50 +0800
+Subject: [PATCH] Charge native SQLite spill and reclaim idle database homes on
+ demand
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 54610c94e992b7023da6de6f624b2fea7539c50b..c857bedf1ebd2ef70e3493ec442ce100d821dec9 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -62,7 +62,7 @@ kj_test(
+ wd_cc_library(
+     name = "coworkerd-native-sql",
+     srcs = ["coworkerd-native-sql.c++"],
+-    hdrs = ["coworkerd-native-sql.h"],
++    hdrs = ["coworkerd-native-sql.h", "coworkerd-native-sql-spill.h"],
+     target_compatible_with = ["@platforms//os:linux"],
+     visibility = ["//src/workerd/threaded:__pkg__"],
+     deps = [
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+index b413ebdb4f7f96e9814abb4997af77adf5648be9..ead64d8d61a25091be128ec61688eb22b5c09331 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
+@@ -33,8 +33,7 @@ DurableStorage::DurableStorage()
+ 
+ DurableStorage::DurableStorage(kj::Own<const kj::Directory> directory)
+     : directory(kj::mv(directory)),
+-      vfs(*this->directory),
+-      nativeSqlVfs(*this->directory, {.maxWalBytes = NATIVE_SQL_WAL_BYTES}) {}
++      vfs(*this->directory) {}
+ 
+ void DurableStorage::ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
+   KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
+@@ -52,15 +51,18 @@ kj::Own<SqliteDatabase> DurableStorage::open(
+       vfs, databasePath(uniqueKey, storageId, facet), mode, kj::maxValue, kj::maxValue, observer);
+ }
+ 
++kj::Own<SqliteDatabase::Vfs> DurableStorage::nativeSqlVfs(
++    SqliteDatabase::VfsOptions::SpillTracker& tracker, SqliteMemoryBudget& memory) const {
++  return kj::heap<SqliteDatabase::Vfs>(*directory,
++      SqliteDatabase::Vfs::Options{.spillTracker = &tracker, .memoryBudget = &memory});
++}
++
+ kj::Own<SqliteDatabase> DurableStorage::openNativeSql(
+-    kj::StringPtr uniqueKey, kj::StringPtr storageId) const {
++    kj::StringPtr uniqueKey, kj::StringPtr storageId, SqliteDatabase::Vfs& vfs) const {
+   ensureNamespace(uniqueKey, storageId);
+-  auto database = kj::heap<SqliteDatabase>(nativeSqlVfs, databasePath(uniqueKey, storageId, 0),
++  auto database = kj::heap<SqliteDatabase>(vfs, databasePath(uniqueKey, storageId, 0),
+       kj::WriteMode::CREATE | kj::WriteMode::MODIFY, NATIVE_SQL_MEMORY_BYTES);
+-  // Sorters and temporary tables stay within SQLite's metered heap. Keep
+-  // uncommitted dirty pages in that heap until COMMIT instead of spilling them.
+-  database->run("PRAGMA temp_store=MEMORY");
+-  database->run("PRAGMA cache_spill=OFF");
++  database->run("PRAGMA temp_store=FILE; PRAGMA cache_size=-512; PRAGMA cache_spill=ON;");
+   return database;
+ }
+ 
+diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+index 763665f5f4ca88d076ab43052e395623d2b216e3..959ed6cc212af624a1037dbce8482965f073b384 100644
+--- a/src/workerd/server/factory/coworkerd-durable-test-storage.h
++++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
+@@ -15,8 +15,8 @@ namespace workerd::server {
+ // node-created volume and attaches its home-local WAL channel to each connection.
+ class DurableStorage {
+  public:
+-  static constexpr uint64_t NATIVE_SQL_MEMORY_BYTES = 64ull << 20;
+-  static constexpr uint64_t NATIVE_SQL_WAL_BYTES = 64ull << 20;
++  static constexpr uint64_t NATIVE_SQL_MEMORY_BYTES = 32ull << 20;
++  static constexpr uint64_t NATIVE_SQL_HOME_OVERHEAD = 64ull << 10;
+ 
+   DurableStorage();
+   explicit DurableStorage(kj::Own<const kj::Directory> directory);
+@@ -25,7 +25,10 @@ class DurableStorage {
+       kj::StringPtr storageId,
+       SqliteObserver& observer = SqliteObserver::DEFAULT,
+       uint facet = 0) const;
+-  kj::Own<SqliteDatabase> openNativeSql(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
++  kj::Own<SqliteDatabase::Vfs> nativeSqlVfs(SqliteDatabase::VfsOptions::SpillTracker& tracker,
++      SqliteMemoryBudget& memory) const;
++  kj::Own<SqliteDatabase> openNativeSql(kj::StringPtr uniqueKey, kj::StringPtr storageId,
++      SqliteDatabase::Vfs& vfs) const;
+ 
+   kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
+       DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
+@@ -49,7 +52,6 @@ class DurableStorage {
+   void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
+   kj::Own<const kj::Directory> directory;
+   SqliteDatabase::Vfs vfs;
+-  SqliteDatabase::Vfs nativeSqlVfs;
+ };
+ 
+ }  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-native-sql-spill.h b/src/workerd/server/factory/coworkerd-native-sql-spill.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2daa72fb49093d320042b21bcc4c9ca82907ea6
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-native-sql-spill.h
+@@ -0,0 +1,136 @@
++// Copyright (c) 2026 Coworkerd.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <workerd/util/sqlite.h>
++
++#include <kj/debug.h>
++#include <kj/filesystem.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <limits>
++
++namespace workerd::server {
++
++// One spill budget for all database homes in a durable process.
++class NativeSqlSpillPool {
++ public:
++  explicit NativeSqlSpillPool(uint64_t maximum): maximum(maximum) {}
++
++  bool acquire(uint64_t bytes) noexcept {
++    auto current = used.load();
++    do {
++      if (bytes > maximum - current) return false;
++    } while (!used.compare_exchange_weak(current, current + bytes));
++    return true;
++  }
++
++  void release(uint64_t bytes) noexcept { used.fetch_sub(bytes); }
++  uint64_t size() const noexcept { return used.load(); }
++  const uint64_t maximum;
++
++ private:
++  std::atomic<uint64_t> used{0};
++};
++
++// The WAL has a committed prefix (or can reuse frames from an earlier
++// generation). Only the write extent of the current transaction is charged.
++// Temporary files stay charged for their full lifetime.
++class NativeSqlSpill final: public SqliteDatabase::VfsOptions::SpillTracker {
++ public:
++  NativeSqlSpill(NativeSqlSpillPool& pool, uint64_t maximum, const kj::Directory& directory,
++      kj::Path walPath)
++      : pool(pool), maximum(maximum), directory(directory), walPath(kj::mv(walPath)) {}
++
++  ~NativeSqlSpill() { pool.release(walBytes + temporaryBytes); }
++
++  void begin() {
++    KJ_ASSERT(!active && walBytes == 0);
++    active = true;
++    exceeded = false;
++    walStatFailed = false;
++  }
++
++  bool writeWal(uint64_t offset, uint64_t length) noexcept override {
++    if (!active || length == 0) return true;
++    if (!walSizeKnown) {
++      try {
++        KJ_IF_SOME(file, directory.tryOpenFile(walPath)) { originalWalSize = file->stat().size; }
++        walSizeKnown = true;
++      } catch (const kj::Exception&) {
++        walStatFailed = true;
++        return false;
++      }
++    }
++    constexpr uint64_t HEADER_BYTES = 32;
++    const auto end = offset + length;
++    const auto header = offset < HEADER_BYTES ? std::max(headerBytes, std::min(HEADER_BYTES, end)) : headerBytes;
++    const auto start = end > HEADER_BYTES ? std::min(firstFrame, std::max(offset, HEADER_BYTES)) : firstFrame;
++    const auto finish = end > HEADER_BYTES ? std::max(lastFrame, end) : lastFrame;
++    const auto frames = finish > start ? finish - start : 0;
++    const auto growth = end > originalWalSize ? end - originalWalSize : 0;
++    const auto updated = std::max(walBytes, std::max(header + frames, growth));
++    if (!reserve(updated - walBytes)) return false;
++    walBytes = updated;
++    firstFrame = start;
++    lastFrame = finish;
++    headerBytes = header;
++    return true;
++  }
++
++  bool resizeTemporary(uint64_t before, uint64_t after) noexcept override {
++    if (after > before) {
++      if (!reserve(after - before)) return false;
++      temporaryBytes += after - before;
++      peakTemporaryBytes = std::max(peakTemporaryBytes, temporaryBytes);
++    } else {
++      temporaryBytes -= before - after;
++      pool.release(before - after);
++    }
++    return true;
++  }
++
++  void end(bool committed) {
++    if (!active) return;
++    if (!committed && walBytes != 0) {
++      // SQLite has already released the write transaction, so its WAL index
++      // ignores the abandoned tail. Preserve the entire pre-transaction file.
++      KJ_IF_SOME(file, directory.tryOpenFile(walPath, kj::WriteMode::MODIFY)) {
++        if (file->stat().size > originalWalSize) file->truncate(originalWalSize);
++      }
++    }
++    pool.release(walBytes);
++    active = false;
++    walSizeKnown = false;
++    originalWalSize = 0;
++    firstFrame = std::numeric_limits<uint64_t>::max();
++    lastFrame = headerBytes = walBytes = 0;
++  }
++
++  bool wasRefused() const noexcept { return exceeded; }
++  bool failedToMeasureWal() const noexcept { return walStatFailed; }
++  uint64_t temporaryHighWater() const noexcept { return peakTemporaryBytes; }
++
++ private:
++  NativeSqlSpillPool& pool;
++  const uint64_t maximum;
++  const kj::Directory& directory;
++  kj::Path walPath;
++  uint64_t firstFrame = std::numeric_limits<uint64_t>::max(), lastFrame = 0, headerBytes = 0;
++  uint64_t originalWalSize = 0, walBytes = 0, temporaryBytes = 0;
++  uint64_t peakTemporaryBytes = 0;
++  bool active = false, walSizeKnown = false, exceeded = false, walStatFailed = false;
++
++  bool reserve(uint64_t bytes) noexcept {
++    if (bytes == 0) return true;
++    if (bytes <= maximum - walBytes - temporaryBytes && pool.acquire(bytes)) return true;
++    exceeded = true;
++    return false;
++  }
++};
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/coworkerd-native-sql-test.c++ b/src/workerd/server/factory/coworkerd-native-sql-test.c++
+index 886eb88273e793f98155c906dee543cc2cc61e47..ed3e77defc0dc9973acefd7694482b72d11c41c8 100644
+--- a/src/workerd/server/factory/coworkerd-native-sql-test.c++
++++ b/src/workerd/server/factory/coworkerd-native-sql-test.c++
+@@ -3,21 +3,52 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "coworkerd-native-sql.h"
++#include "coworkerd-native-sql-spill.h"
+ 
+ #include <sqlite3.h>
+ #include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include <kj/io.h>
+ #include <kj/test.h>
+ 
++#include <cstdlib>
+ #include <thread>
+ 
+ namespace workerd::server {
+ namespace {
+ 
++const bool allocatorInstalled KJ_UNUSED = [] {
++  installSqliteCustomAllocator();
++  return true;
++}();
++
+ using Clock = std::chrono::steady_clock;
+ using namespace std::chrono_literals;
+ 
++class SqlTestDirectory {
++ public:
++  ~SqlTestDirectory() noexcept(false) {
++    directory = nullptr;
++    filesystem->getRoot().remove(path);
++  }
++
++  const kj::Directory& get() const { return *directory; }
++
++ private:
++  kj::Own<kj::Filesystem> filesystem = kj::newDiskFilesystem();
++  kj::Path path = createPath();
++  kj::Own<const kj::Directory> directory = filesystem->getRoot().openSubdir(path, kj::WriteMode::MODIFY);
++
++  kj::Path createPath() {
++    const auto* temporaryDirectory = getenv("TEST_TMPDIR");
++    auto scratch = kj::str(temporaryDirectory != nullptr ? temporaryDirectory : "/tmp",
++        "/workerd-native-sql.XXXXXX");
++    KJ_REQUIRE(mkdtemp(scratch.begin()) != nullptr, "could not make a SQLite spill test directory");
++    return filesystem->getCurrentPath().evalNative(scratch);
++  }
++};
++
+ struct Fixture {
+   kj::Own<kj::Directory> directory = kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
+   SqliteDatabase::Vfs vfs{*directory};
+@@ -238,6 +269,83 @@ KJ_TEST("bounded native WAL refuses a large commit without publishing its rows")
+   KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 0);
+ }
+ 
++KJ_TEST("native SQL budgets new WAL frames on disk and removes abandoned bytes") {
++  SqlTestDirectory storage;
++  const auto& directory = storage.get();
++  NativeSqlSpillPool pool(4ull << 20);
++  NativeSqlSpill spill(pool, 2ull << 20, directory, kj::Path({"sql-wal"}));
++  SqliteDatabase::Vfs vfs(directory, {.spillTracker = &spill});
++  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
++  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal");
++  db.run("PRAGMA cache_size=-512; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=OFF");
++  db.run("CREATE TABLE blobs(value BLOB)");
++  auto wal = directory.openFile(kj::Path({"sql-wal"}));
++  auto query = [&](kj::StringPtr body) {
++    return runNativeSql(db, body, true, NativeSqlResults::OBJECTS, Clock::now() + 10s, -1, &spill);
++  };
++  auto insert = R"SQL({"sql":"INSERT INTO blobs VALUES(zeroblob(1048576))"})SQL"_kj;
++  for (unsigned i = 0; i < 65; ++i) KJ_REQUIRE(query(insert).body.starts_with("{\"success\":true"));
++  const auto initial = wal->stat().size;
++  KJ_EXPECT(initial > (64ull << 20));
++  auto refused = query(R"SQL({"sql":"INSERT INTO blobs VALUES(zeroblob(4194304))"})SQL");
++  KJ_EXPECT(refused.status == 507, refused.body.c_str());
++  KJ_EXPECT(refused.body.find("SQL_SPILL_LIMIT_EXCEEDED") != std::string::npos);
++  KJ_EXPECT(wal->stat().size == initial);
++  KJ_EXPECT(pool.size() == 0);
++  KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 65);
++  KJ_EXPECT(query(insert).body.starts_with("{\"success\":true"));
++  KJ_EXPECT(db.run("SELECT count(*) FROM blobs").getInt(0) == 66);
++}
++
++KJ_TEST("native SQL builds a disk-spilling index on a table larger than the SQLite heap cap") {
++  SqlTestDirectory storage;
++  const auto& directory = storage.get();
++  NativeSqlSpillPool pool(256ull << 20);
++  NativeSqlSpill spill(pool, 256ull << 20, directory, kj::Path({"sql-wal"}));
++  SqliteDatabase::Vfs vfs(directory, {.spillTracker = &spill});
++  constexpr auto heapCap = 32ull << 20;
++  SqliteDatabase db(vfs, kj::Path({"sql"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY, heapCap);
++  KJ_REQUIRE(db.run("PRAGMA journal_mode=WAL").getText(0) == "wal");
++  db.run("PRAGMA temp_store=FILE; PRAGMA cache_spill=ON; PRAGMA cache_size=-512; PRAGMA synchronous=OFF");
++  db.run("CREATE TABLE blobs(payload BLOB)");
++  auto loaded = runNativeSql(db, R"SQL({"sql":"WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<12288) INSERT INTO blobs SELECT randomblob(8192) FROM n"})SQL",
++      true, NativeSqlResults::OBJECTS, Clock::now() + 30s, -1, &spill);
++  KJ_REQUIRE(loaded.body.starts_with("{\"success\":true"), loaded.body.c_str());
++  KJ_REQUIRE(db.run("SELECT sum(length(payload)) FROM blobs").getInt64(0) == 3 * heapCap);
++  const auto idle = db.getSqliteMemoryBytes();
++  sqlite3_int64 initial, peak;
++  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &initial, &peak, 1);
++  auto reply = runNativeSql(db, R"SQL({"sql":"CREATE INDEX payload_order ON blobs(payload)"})SQL",
++      true, NativeSqlResults::OBJECTS, Clock::now() + 30s, -1, &spill);
++  sqlite3_int64 end;
++  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &end, &peak, 0);
++  KJ_EXPECT(reply.body.starts_with("{\"success\":true"), reply.body.c_str());
++  KJ_EXPECT(spill.temporaryHighWater() > 0);
++  KJ_EXPECT(pool.size() == 0);
++  KJ_EXPECT(idle > 0 && idle < heapCap);
++  KJ_LOG(INFO, "native SQL index memory and spill", idle, initial, peak, end, spill.temporaryHighWater());
++}
++
++KJ_TEST("native SQL spill accounts for each database and the process together") {
++  auto directory = kj::newInMemoryDirectory(kj::systemPreciseCalendarClock());
++  NativeSqlSpillPool pool(1024);
++  NativeSqlSpill first(pool, 768, *directory, kj::Path({"one-wal"}));
++  NativeSqlSpill second(pool, 768, *directory, kj::Path({"two-wal"}));
++  first.begin();
++  second.begin();
++  KJ_EXPECT(first.writeWal(0, 640));
++  KJ_EXPECT(first.writeWal(32, 256));
++  KJ_EXPECT(!first.resizeTemporary(0, 129));
++  KJ_EXPECT(second.resizeTemporary(0, 384));
++  KJ_EXPECT(!second.writeWal(0, 32));
++  KJ_EXPECT(pool.size() == 1024);
++  first.end(false);
++  KJ_EXPECT(second.writeWal(0, 32));
++  KJ_EXPECT(second.resizeTemporary(384, 0));
++  second.end(true);
++  KJ_EXPECT(pool.size() == 0);
++}
++
+ KJ_TEST(
+     "native SQL cancellation during a query prevents prior batch writes from becoming visible") {
+   Fixture f;
+diff --git a/src/workerd/server/factory/coworkerd-native-sql.c++ b/src/workerd/server/factory/coworkerd-native-sql.c++
+index 7b7bc40c1f3d10c909d37013eb0ddd04bfa5014e..f18f932318246ab80472a07a9ed39db9c4baf015 100644
+--- a/src/workerd/server/factory/coworkerd-native-sql.c++
++++ b/src/workerd/server/factory/coworkerd-native-sql.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "coworkerd-native-sql.h"
++#include "coworkerd-native-sql-spill.h"
+ 
+ #include <poll.h>
+ #include <sqlite3.h>
+@@ -37,6 +38,38 @@ struct SqlError {
+ };
+ struct ResultTooLarge {};
+ struct Interrupted {};
++struct SpillRefused {};
++struct MemoryRefused {};
++
++void reserveMemory(SqliteMemoryBudget* memory, size_t bytes) {
++  if (memory != nullptr && !memory->acquire(bytes)) throw MemoryRefused{};
++}
++
++class SqlJsonMessage final: public capnp::MessageBuilder {
++ public:
++  explicit SqlJsonMessage(SqliteMemoryBudget* memory): memory(memory) {}
++  ~SqlJsonMessage() noexcept(false) {
++    segments.clear();
++    if (memory != nullptr) memory->release(reserved);
++  }
++
++  kj::ArrayPtr<capnp::word> allocateSegment(uint minimumSize) override {
++    const auto size = std::max(minimumSize, 256u);
++    const auto bytes = size * sizeof(capnp::word);
++    reserveMemory(memory, bytes);
++    reserved += bytes;
++    auto segment = kj::heapArray<capnp::word>(size);
++    memset(segment.begin(), 0, bytes);
++    auto view = segment.asPtr();
++    segments.push_back(kj::mv(segment));
++    return view;
++  }
++
++ private:
++  SqliteMemoryBudget* memory;
++  size_t reserved = 0;
++  std::vector<kj::Array<capnp::word>> segments;
++};
+ 
+ class Deadline {
+  public:
+@@ -119,7 +152,8 @@ class Regulator final: public SqliteDatabase::Regulator {
+         "write coalescing.");
+   }
+ 
+-  void onError(kj::Maybe<int>, kj::StringPtr message) const override {
++  void onError(kj::Maybe<int> code, kj::StringPtr message) const override {
++    if ((code.orDefault(SQLITE_OK) & 0xff) == SQLITE_NOMEM) throw MemoryRefused{};
+     throw SqlError{kj::str(message)};
+   }
+ };
+@@ -239,12 +273,22 @@ std::string number(double value) {
+ 
+ class Writer {
+  public:
+-  explicit Writer(size_t limit = RESULT_LIMIT, Deadline* deadline = nullptr)
++  explicit Writer(size_t limit = RESULT_LIMIT, Deadline* deadline = nullptr,
++      SqliteMemoryBudget* memory = nullptr)
+       : limit(limit),
+-        deadline(deadline) {}
++        deadline(deadline),
++        memory(memory) {}
+ 
+   void append(std::string_view value) {
+     if (value.size() > limit - bytes.size()) throw ResultTooLarge{};
++    const auto needed = bytes.size() + value.size();
++    if (memory != nullptr && needed > bytes.capacity()) {
++      const auto capacity = std::max(needed, std::min(limit, bytes.capacity() * 2));
++      // The result is copied through the RPC stream when the writer finishes.
++      reserveMemory(memory, 3 * capacity - this->reserved);
++      this->reserved = 3 * capacity;
++      bytes.reserve(capacity);
++    }
+     bytes += value;
+   }
+ 
+@@ -323,6 +367,8 @@ class Writer {
+  private:
+   size_t limit;
+   Deadline* deadline;
++  SqliteMemoryBudget* memory;
++  size_t reserved = 0;
+ };
+ 
+ void value(Writer& out, Value cell) {
+@@ -588,10 +634,23 @@ NativeSqlReply failed(kj::StringPtr reason, bool batch) {
+ 
+ // SQLite may have rolled back the whole transaction as part of a failed
+ // statement. Disable cancellation so any remaining rollback can finish.
+-void rollback(SqliteDatabase& db, Deadline& deadline) {
++void rollback(SqliteDatabase& db, Deadline& deadline, NativeSqlSpill* spill) {
+   deadline.disable();
+   if (sqlite3_get_autocommit(db) == 0) db.run("ROLLBACK");
+   else db.acknowledgeAutomaticRollback();
++  if (spill) spill->end(false);
++}
++
++bool spillFailed(NativeSqlSpill* spill) {
++  return spill && (spill->wasRefused() || spill->failedToMeasureWal());
++}
++
++NativeSqlReply spillFailure(const NativeSqlSpill& spill) {
++  if (spill.failedToMeasureWal()) {
++    return {503, nativeSqlFailure("STORAGE_UNAVAILABLE"_kj, "the local WAL size could not be read"_kj)};
++  }
++  return {507, nativeSqlFailure("SQL_SPILL_LIMIT_EXCEEDED"_kj,
++      "uncommitted WAL and temporary files exceeded a native SQL spill budget"_kj)};
+ }
+ 
+ }  // namespace
+@@ -619,14 +678,19 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+     bool query,
+     NativeSqlResults format,
+     Clock::time_point end,
+-    int connectionFd) {
++    int connectionFd,
++    NativeSqlSpill* spill,
++    SqliteMemoryBudget* requestMemory) {
++  auto memoryScope = db.enterMemoryScope();
+   Deadline deadline(db, end, connectionFd);
+-  capnp::MallocMessageBuilder parsed;
+-  auto root = parsed.initRoot<Json>();
+   bool batch = false;
+   try {
++    SqlJsonMessage parsed(requestMemory);
++    auto root = parsed.initRoot<Json>();
+     try {
+       capnp::JsonCodec codec;
++      reserveMemory(requestMemory, body.size());
++      KJ_DEFER(if (requestMemory != nullptr) requestMemory->release(body.size()));
+       auto normalized = normalizeJson(body.asArray(), deadline);
+       codec.decodeRaw(normalized.asPtr(), root);
+       batch = root.isArray();
+@@ -635,9 +699,10 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+       return {400, "{\"error\":\"the body of a statement is JSON\"}"};
+     }
+     auto input = root.asReader();
+-    Writer out(RESULT_LIMIT, &deadline);
++    Writer out(RESULT_LIMIT, &deadline, requestMemory);
+     deadline.check();
+     if (query) {
++      if (spill) spill->begin();
+       db.run("BEGIN");
+       if (batch) {
+         out.append("[");
+@@ -656,9 +721,11 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+       }
+       deadline.check();
+       db.run("COMMIT");
++      if (spill) spill->end(true);
+     } else {
+       auto execute = [&](Json::Reader entry, bool separator) {
+         deadline.check();
++        if (spill) spill->begin();
+         db.run("BEGIN");
+         auto before = out.bytes.size();
+         bool success = false;
+@@ -675,19 +742,23 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+           if (deadline.wasInterrupted()) throw;
+           reason = kj::str(error.getDescription());
+         }
++        if (spillFailed(spill)) throw SpillRefused{};
+         // Preserve the prefix on an ordinary SQL or result error, including
+         // earlier SQL statements within this entry. Timeout cancels this entry.
+         deadline.check();
+         try {
+           if (sqlite3_get_autocommit(db) == 0) {
+             db.run("COMMIT");
++            if (spill) spill->end(true);
+           } else {
+             KJ_ASSERT(!success, "a successful SQL entry ended its own transaction");
+             db.acknowledgeAutomaticRollback();
++            if (spill) spill->end(false);
+           }
+         } catch (const kj::Exception& error) {
+           deadline.check();
+-          rollback(db, deadline);
++          if (spillFailed(spill)) throw SpillRefused{};
++          rollback(db, deadline, spill);
+           if (success) reason = kj::str(error.getDescription());
+           success = false;
+         }
+@@ -712,16 +783,31 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+     }
+     return {200, std::move(out.bytes)};
+   } catch (const Interrupted&) {
+-    rollback(db, deadline);
++    rollback(db, deadline, spill);
++  } catch (const SpillRefused&) {
++    rollback(db, deadline, spill);
++    return spillFailure(*spill);
++  } catch (const MemoryRefused&) {
++    rollback(db, deadline, spill);
++    if (!deadline.wasInterrupted()) {
++      return {422, nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
++          "SQLite could not allocate memory within the native database budget"_kj)};
++    }
+   } catch (const ResultTooLarge&) {
+-    rollback(db, deadline);
++    rollback(db, deadline, spill);
+     return failed(RESULT_TOO_LARGE, batch);
+   } catch (const SqlError& error) {
+-    rollback(db, deadline);
+-    if (!deadline.wasInterrupted()) return failed(error.message, batch);
++    rollback(db, deadline, spill);
++    if (!deadline.wasInterrupted()) {
++      if (spillFailed(spill)) return spillFailure(*spill);
++      return failed(error.message, batch);
++    }
+   } catch (const kj::Exception& error) {
+-    rollback(db, deadline);
+-    if (!deadline.wasInterrupted()) return failed(error.getDescription(), batch);
++    rollback(db, deadline, spill);
++    if (!deadline.wasInterrupted()) {
++      if (spillFailed(spill)) return spillFailure(*spill);
++      return failed(error.getDescription(), batch);
++    }
+   }
+   if (deadline.clientGone()) return {0, {}};
+   return nativeSqlTimeout();
+diff --git a/src/workerd/server/factory/coworkerd-native-sql.h b/src/workerd/server/factory/coworkerd-native-sql.h
+index 13e8ab9bec5392a4a9d2c6e04634015924b4cc44..97d2d4dc3ab1887801cfe0b58de3362693099148 100644
+--- a/src/workerd/server/factory/coworkerd-native-sql.h
++++ b/src/workerd/server/factory/coworkerd-native-sql.h
+@@ -11,6 +11,8 @@
+ 
+ namespace workerd::server {
+ 
++class NativeSqlSpill;
++
+ inline constexpr auto NATIVE_SQL_LIMIT = std::chrono::seconds(30);
+ 
+ enum class NativeSqlResults { OBJECTS, COLUMNS };
+@@ -27,7 +29,9 @@ NativeSqlReply runNativeSql(SqliteDatabase& db,
+     bool query,
+     NativeSqlResults format,
+     std::chrono::steady_clock::time_point deadline,
+-    int connectionFd = -1);
++    int connectionFd = -1,
++    NativeSqlSpill* spill = nullptr,
++    SqliteMemoryBudget* requestMemory = nullptr);
+ 
+ std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason);
+ NativeSqlReply nativeSqlTimeout();
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+index 63d7d6c3d3a5177cc57fb19743f375fd653f20c4..056eb1239a42e95e720cac9f4ee20ab4adb1c49d 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -572,6 +572,7 @@ void DurableLogShipper::reportAfterDatabaseClose() {
+ }
+ 
+ void DurableLogShipper::configure(SqliteDatabase& database) {
++  auto memory = database.enterMemoryScope();
+   db = &database;
+   sqlite3* handle = database;
+   // No checkpoint but the ones below: not after a commit, and not when the last connection closes -- the WAL must
+@@ -846,6 +847,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
+   sqlite3* handle = *db;
+   if (sqlite3_get_autocommit(handle) == 0) return;
+   if (hookFrames != readFrames) return;
++  auto memory = db->enterMemoryScope();
+   int64_t start = monoNs();
+   int logFrames = -1, checkpointed = -1;
+   int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 08973e45481f68dcf3a104c9a7b4d430bcf77aa3..3677d28a64cdbd5e1c8af149e6ca854c533071c2 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -24,6 +24,7 @@ THREADED_DEPS = [
+     "//src/workerd/server/factory:coworkerd-wal",
+     "//src/workerd/util:autogate",
+     "//src/workerd/util:entropy",
++    "//src/workerd/util:sqlite-metering",
+     "@capnp-cpp//src/capnp:capnp-rpc",
+     "@capnp-cpp//src/capnp/compat:http-over-capnp",
+     "@capnp-cpp//src/capnp/compat:json",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3287316a9 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -28,6 +28,7 @@
+ #include <workerd/server/factory/coworkerd-durable-placement.h>
+ #include <workerd/server/factory/coworkerd-durable-test-storage.h>
+ #include <workerd/server/factory/coworkerd-native-sql.h>
++#include <workerd/server/factory/coworkerd-native-sql-spill.h>
+ #include <workerd/server/factory/coworkerd-threaded-wal.h>
+ #include <workerd/server/factory/coworkerd-sandbox.h>
+ #include <workerd/server/factory/coworkerd-steady.h>
+@@ -300,6 +301,7 @@ struct ResourceBudget {
+   ResourceBudget(uint64_t maximum,
+       uint32_t residents,
+       uint32_t callThreads,
++      uint64_t sqlSpillMaximum = 4ull << 30,
+       ReclaimMode reclaimMode = ReclaimMode::BACKGROUND)
+       : reclaimMode(reclaimMode),
+         memoryMaximum(maximum),
+@@ -309,6 +311,7 @@ struct ResourceBudget {
+                 ? UINT64_MAX
+                 : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
+         baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
++        sqlSpill(sqlSpillMaximum),
+         configuredResidentMaximum(residents),
+         residentMaximum(residents),
+         memoryReserved(baselineMemory) {
+@@ -322,6 +325,7 @@ struct ResourceBudget {
+   }
+   const ReclaimMode reclaimMode;
+   const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
++  server::NativeSqlSpillPool sqlSpill;
+   // The node's per-process limit, and the one in force: the first time the address space has no
+   // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
+   // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
+@@ -330,6 +334,7 @@ struct ResourceBudget {
+   std::atomic<uint32_t> residentMaximum;
+   std::mutex mutex;
+   std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
++  std::atomic<uint64_t> nativeSqliteBytes{0};
+   // Heap headroom near-heap-limit raises granted above what their isolates
+   // used, until each call's termination takes effect (MemoryBudget::raise()):
+   // two isolates raised at once never both count on the same remainder.
+@@ -409,6 +414,40 @@ struct ResourceBudget {
+   }
+ };
+ 
++class NativeSqlReservation final: public SqliteMemoryBudget {
++ public:
++  explicit NativeSqlReservation(ResourceBudget& resources, bool sqlite = false)
++      : resources(resources), sqlite(sqlite) {}
++
++  ~NativeSqlReservation() { release(used); }
++
++  bool acquire(size_t bytes) noexcept override {
++    if (bytes > resources.admissionMaximum - resources.baselineMemory - used) {
++      impossible = true;
++      return false;
++    }
++    if (!resources.change(used, used + bytes, 0, 0, true)) return false;
++    used += bytes;
++    if (sqlite) resources.nativeSqliteBytes.fetch_add(bytes);
++    return true;
++  }
++
++  void release(size_t bytes) noexcept override {
++    if (bytes == 0) return;
++    KJ_ASSERT(bytes <= used && resources.change(used, used - bytes, 0, 0));
++    used -= bytes;
++    if (sqlite) resources.nativeSqliteBytes.fetch_sub(bytes);
++  }
++
++  bool canNeverFit() const noexcept { return impossible; }
++
++ private:
++  ResourceBudget& resources;
++  const bool sqlite;
++  size_t used = 0;
++  bool impossible = false;
++};
++
+ struct ResourceReservation {
+   static constexpr uint64_t MiB = ResourceBudget::MiB;
+   // The capacity acquisition records heap and RSS deltas to validate this seed
+@@ -1736,6 +1775,9 @@ struct ThreadState {
+   struct NativeDatabase {
+     uint64_t tree;
+     server::DurableAdmission::Time lastUse;
++    kj::Own<server::NativeSqlSpill> spill;
++    kj::Own<NativeSqlReservation> memory;
++    kj::Own<SqliteDatabase::Vfs> vfs;
+     kj::Own<SqliteDatabase> connection;
+     // Destroy the shipper first. It defers the close record until SQLite has closed.
+     kj::Own<server::DurableLogShipper> shipper;
+@@ -2304,6 +2346,7 @@ struct ThreadedServer {
+   std::atomic<uint64_t> durablePendingCommits{0};
+   std::atomic<bool> refuseDurableGroupForTest{false};
+   const uint64_t durableCommitDelayMs;
++  const uint64_t nativeSqlDatabaseSpillBytes = configuredCount("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES", 1ull << 30);
+   const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
+       ? ""
+       : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
+@@ -2337,6 +2380,9 @@ struct ThreadedServer {
+       std::string warmDefinition;
+       uint32_t reservedTrees = 0;
+       bool database = false;
++      bool databaseBusy = false;
++      bool databaseEvicting = false;
++      server::DurableAdmission::Time databaseLastUse{};
+       uint64_t memory = 0;
+       server::DurableHomeLoad load{std::chrono::seconds(4)};
+       server::DurablePressure pressure;
+@@ -2354,6 +2400,7 @@ struct ThreadedServer {
+   };
+   std::vector<std::unique_ptr<Thread>> threads;
+   int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++  int sqlPlacementWake = -1;
+   std::atomic<bool> ready{false};
+   std::atomic<uint32_t> liveThreads{0};
+   std::atomic<uint64_t> growthFailures{0};
+@@ -2402,6 +2449,7 @@ struct ThreadedServer {
+                         : 0),
+             configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
+             limit,
++            configuredCount("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES", 4 * nativeSqlDatabaseSpillBytes),
+             this->durableStorage ? ResourceBudget::ReclaimMode::NONE
+                                  : ResourceBudget::ReclaimMode::BACKGROUND)),
+         tenantBudget(std::make_shared<TenantBudget>(
+@@ -2409,6 +2457,8 @@ struct ThreadedServer {
+         subrequestBudget(limit, tenantBudget->limit) {
+     KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
+     if (this->durableStorage) {
++      sqlPlacementWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++      KJ_REQUIRE(sqlPlacementWake >= 0, "could not initialize native database placement wakeup");
+       KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
+       const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
+       KJ_REQUIRE(refuseGroup <= 1, "invalid durable test group refusal");
+@@ -2684,7 +2734,7 @@ struct ThreadedServer {
+       // WAL, shared-memory and directory descriptors, and the event charge
+       // covers the connection.
+       if (route.database && (databaseHomes >= limit - 1 ||
+-          !resources->change(0, server::DurableStorage::NATIVE_SQL_MEMORY_BYTES, 0, 0, true))) {
++          !resources->change(0, server::DurableStorage::NATIVE_SQL_HOME_OVERHEAD, 0, 0, true))) {
+         return false;
+       }
+       assigned = choice.value_or(spare);
+@@ -2700,17 +2750,63 @@ struct ThreadedServer {
+     return home.database == route.database && !home.pressure.resetting();
+   }
+ 
++  enum class HomePlacement { READY, WAITING, FULL };
++
++  // Caller holds durableRoutingMutex. Retiring an idle database is a
++  // handshake with its own thread, which owns SQLite and its WAL shipper.
++  HomePlacement placeDurableHome(const DurableRoute& route, server::DurableAdmission::Ticket ticket) {
++    if (reserveDurableHome(route, ticket)) return HomePlacement::READY;
++    if (durableAdmission->homeFor(ticket.tree)) return HomePlacement::FULL;
++    return evictIdleDatabase() ? HomePlacement::WAITING : HomePlacement::FULL;
++  }
++
++  bool evictIdleDatabase() {
++    std::vector<Thread*> idle;
++    for (const auto& thread: threads) {
++      if (!thread->home || !thread->home->database) continue;
++      const auto& home = *thread->home;
++      if (home.databaseEvicting) return true;
++      if (!home.databaseBusy && home.resident.size() == 1) idle.push_back(thread.get());
++    }
++    std::sort(idle.begin(), idle.end(), [](auto* a, auto* b) {
++      return a->home->databaseLastUse < b->home->databaseLastUse;
++    });
++    for (auto* thread: idle) {
++      auto& home = *thread->home;
++      if (!durableAdmission->stopIdleTree(*home.resident.begin(), thread->homeId)) continue;
++      home.databaseEvicting = true;
++      wake(thread->wake);
++      return true;
++    }
++    return false;
++  }
++
++  bool reclaimNativeRequestMemory() {
++    std::lock_guard lock(durableRoutingMutex);
++    return evictIdleDatabase();
++  }
++
++  HomePlacement retryDurableHome(const DurableRoute& route, server::DurableAdmission::Ticket ticket) {
++    std::lock_guard lock(durableRoutingMutex);
++    return placeDurableHome(route, ticket);
++  }
++
+   server::DurableAdmission::Result queueDurable(
+-      const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline) {
++      const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline,
++      bool& waitingForHome) {
+     using Admission = server::DurableAdmission;
+     if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
+     std::lock_guard lock(durableRoutingMutex);
+     auto result =
+         durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
+-    if (result.ticket && !reserveDurableHome(route, *result.ticket)) {
+-      KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
+-      durableAdmission->releaseUnassigned(result.ticket->tree);
+-      return {Admission::Status::OVERLOADED};
++    if (result.ticket) {
++      const auto placement = placeDurableHome(route, *result.ticket);
++      if (placement == HomePlacement::FULL) {
++        KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket));
++        durableAdmission->releaseUnassigned(result.ticket->tree);
++        return {Admission::Status::OVERLOADED};
++      }
++      waitingForHome = placement == HomePlacement::WAITING;
+     }
+     return result;
+   }
+@@ -2752,9 +2848,12 @@ struct ThreadedServer {
+   // connection is gone, including reservations that never opened SQLite.
+   void releaseNativeDatabaseHome(Thread::DurableHome& home) {
+     if (!home.database) return;
+-    KJ_ASSERT(resources->change(server::DurableStorage::NATIVE_SQL_MEMORY_BYTES, 0, 0, 0));
++    KJ_ASSERT(resources->change(server::DurableStorage::NATIVE_SQL_HOME_OVERHEAD, 0, 0, 0));
+     home.database = false;
++    home.databaseBusy = false;
++    home.databaseEvicting = false;
+     home.memory = 0;
++    wake(sqlPlacementWake);
+   }
+ 
+   void reportNativeDatabaseMemory(uint64_t homeId, size_t allocated) {
+@@ -2822,7 +2921,10 @@ struct ThreadedServer {
+                 KJ_EXCEPTION(OVERLOADED, "durable routing lease expired"), "LEASE_EXPIRED"));
+           }
+           KJ_REQUIRE(delivery == Admission::Delivery::ACCEPTED, "durable event identity changed");
+-          if (route.database) nativeSqlSessions.emplace(ticket.tree, ticket.event);
++          if (route.database) {
++            nativeSqlSessions.emplace(ticket.tree, ticket.event);
++            threads[state.durableHome - 1]->home->databaseBusy = true;
++          }
+           wakeDurableTree(ticket.tree);
+           co_return;
+         }
+@@ -2936,7 +3038,10 @@ struct ThreadedServer {
+     const auto homeId = state.durableHome;
+     {
+       std::lock_guard lock(durableRoutingMutex);
+-      const auto idle = state.nativeDatabase->closing
++      auto& home = *threads[homeId - 1]->home;
++      home.databaseBusy = nativeSqlSessions.contains(tree);
++      home.databaseLastUse = state.nativeDatabase->lastUse;
++      const auto idle = state.nativeDatabase->closing || home.databaseEvicting
+           ? durableAdmission->stopIdleTree(tree, homeId)
+           : durableAdmission->stopIdleTree(tree, homeId, state.nativeDatabase->lastUse,
+               server::DurableAdmission::Clock::now());
+@@ -3145,7 +3250,10 @@ struct ThreadedServer {
+         ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
+         ",\"databaseHomes\":" + std::to_string(databaseHomes) +
+         ",\"nativeDatabaseReservedBytes\":" +
+-            std::to_string(databaseHomes * server::DurableStorage::NATIVE_SQL_MEMORY_BYTES) +
++            std::to_string(databaseHomes * server::DurableStorage::NATIVE_SQL_HOME_OVERHEAD +
++                resources->nativeSqliteBytes.load()) +
++        ",\"nativeSqlSpillBytes\":" + std::to_string(resources->sqlSpill.size()) +
++        ",\"nativeSqlSpillMaximum\":" + std::to_string(resources->sqlSpill.maximum) +
+         ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
+         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
+         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
+@@ -6099,41 +6207,18 @@ class NativeDatabaseHttp final: public kj::HttpService {
+     if (alarm == kj::none && (method != kj::HttpMethod::POST || (!query && !execute))) {
+       co_return co_await send(response, {404, "{\"error\":\"Not found\"}"});
+     }
++    NativeSqlReservation requestMemory(*server.resources);
+     server::NativeSqlReply reply{0, {}};
+-    kj::String input;
+-    uint64_t requestMemory = 0;
+-    KJ_DEFER({
+-      if (requestMemory != 0) {
+-        KJ_ASSERT(server.resources->change(requestMemory, 0, 0, 0));
+-      }
+-    });
++    kj::Array<char> input;
++    size_t inputSize = 0;
+     try {
+       if (alarm == kj::none) {
+-        // The binding's largest SQLite BLOB can take four bytes per byte in
+-        // the JSON byte array. Leave space for SQL, metadata and framing.
+-        constexpr uint64_t MAX_SQL_REQUEST_BYTES = 40ull << 20;
+-        constexpr uint64_t SQL_RESPONSE_MEMORY_BYTES = 24ull << 20;
+-        const auto length = body.tryGetLength().orDefault(MAX_SQL_REQUEST_BYTES);
+-        if (length > MAX_SQL_REQUEST_BYTES) co_return co_await send(response, requestTooLarge());
+-        // Two copies can coexist during the streaming read. The decoder
+-        // allocates cells as well as the original and normalized text.
+-        const uint64_t readMemory = 2 * length + 8192;
+-        if (!server.resources->change(0, readMemory, 0, 0, true)) {
+-          co_return co_await send(response, requestMemoryUnavailable());
+-        }
+-        requestMemory = readMemory;
+         const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+             sqlDeadline - server::DurableAdmission::Clock::now());
+         if (remaining.count() <= 0) co_return co_await send(response, server::nativeSqlTimeout());
+         auto readAndOpen = [&]() -> kj::Promise<void> {
+-          input = co_await body.readAllText(length + 1);
+-          const auto executeMemory = SQL_RESPONSE_MEMORY_BYTES + 32 * input.size();
+-          if (!server.resources->change(requestMemory, executeMemory, 0, 0, true)) {
+-            reply = requestMemoryUnavailable();
+-            co_return;
+-          }
+-          requestMemory = executeMemory;
+-          co_await open();
++          reply = co_await readRequest(body, requestMemory, input, inputSize);
++          if (reply.status == 0) co_await open();
+         };
+         bool timedOut = false;
+         co_await readAndOpen().exclusiveJoin(state.io.provider->getTimer()
+@@ -6143,8 +6228,7 @@ class NativeDatabaseHttp final: public kj::HttpService {
+         co_await open();
+       }
+     } catch (const kj::Exception& error) {
+-      reply = error.getDescription().endsWith("Reached limit before EOF.")
+-          ? requestTooLarge() : storageFailure(error);
++      reply = storageFailure(error);
+     }
+     if (reply.status != 0) co_return co_await send(response, std::move(reply));
+     auto& database = *state.nativeDatabase;
+@@ -6166,8 +6250,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
+       } else {
+         const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
+             ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
+-        reply = server::runNativeSql(connection, input, query, format,
+-            sqlDeadline, connectionFd);
++        auto sql = inputSize == 0 ? ""_kj : kj::StringPtr(input.begin(), inputSize);
++        reply = server::runNativeSql(connection, sql, query, format,
++            sqlDeadline, connectionFd, database.spill.get(), &requestMemory);
+       }
+     } catch (const kj::Exception& error) {
+       reply = storageFailure(error);
+@@ -6209,6 +6294,50 @@ class NativeDatabaseHttp final: public kj::HttpService {
+   server::DurableAdmission::Time sqlDeadline;
+   bool used = false;
+ 
++  kj::Promise<server::NativeSqlReply> readRequest(kj::AsyncInputStream& body,
++      NativeSqlReservation& memory, kj::Array<char>& input, size_t& size) {
++    // The largest SQLite BLOB can take four bytes per byte in binding JSON.
++    constexpr size_t MAX_BODY = 40ull << 20;
++    if (body.tryGetLength().orDefault(0) > MAX_BODY) co_return requestTooLarge();
++    char chunk[8192];
++    if (!co_await reserveReadMemory(memory, sizeof(chunk))) co_return requestMemoryUnavailable();
++    KJ_DEFER(memory.release(sizeof(chunk)));
++    for (;;) {
++      auto bytes = co_await body.tryRead(chunk, 1, sizeof(chunk));
++      if (bytes == 0) break;
++      if (bytes > MAX_BODY - size) co_return requestTooLarge();
++      if (size + bytes + 1 > input.size()) {
++        auto capacity = std::min(MAX_BODY + 1, std::max(size + bytes + 1, input.size() * 2));
++        if (!co_await reserveReadMemory(memory, capacity)) {
++          if (memory.canNeverFit()) {
++            co_return server::NativeSqlReply{422, server::nativeSqlFailure("SQL_MEMORY_LIMIT_EXCEEDED"_kj,
++                "the native SQL request exceeds the process memory budget"_kj)};
++          }
++          co_return requestMemoryUnavailable();
++        }
++        const auto previous = input.size();
++        auto next = kj::heapArray<char>(capacity);
++        if (size != 0) memcpy(next.begin(), input.begin(), size);
++        input = kj::mv(next);
++        memory.release(previous);
++      }
++      memcpy(input.begin() + size, chunk, bytes);
++      size += bytes;
++    }
++    if (size != 0) input[size] = '\0';
++    co_return server::NativeSqlReply{0, {}};
++  }
++
++  kj::Promise<bool> reserveReadMemory(NativeSqlReservation& memory, size_t bytes) {
++    while (!memory.acquire(bytes)) {
++      if (memory.canNeverFit() || !server.reclaimNativeRequestMemory()) co_return false;
++      // The selected home closes SQLite and returns its reservation on its
++      // own event loop. Only the upload waits, under the request deadline.
++      co_await state.io.provider->getTimer().afterDelay(kj::MILLISECONDS);
++    }
++    co_return true;
++  }
++
+   static server::NativeSqlReply requestTooLarge() {
+     return {413, server::nativeSqlFailure("REQUEST_TOO_LARGE"_kj, "a binding request is at most 40 MiB"_kj)};
+   }
+@@ -6239,7 +6368,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+     headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+     auto reason = reply.status == 200 ? "OK" : reply.status == 400 ? "Bad Request"
+         : reply.status == 404 ? "Not Found" : reply.status == 413 ? "Payload Too Large"
+-        : reply.status == 422 ? "Unprocessable Entity" : "Service Unavailable";
++        : reply.status == 422 ? "Unprocessable Entity"
++        : reply.status == 507 ? "Insufficient Storage" : "Service Unavailable";
+     auto output = response.send(reply.status, reason, headers, reply.body.size());
+     co_await output->write(kj::arrayPtr(reinterpret_cast<const kj::byte*>(reply.body.data()),
+         reply.body.size()));
+@@ -6259,8 +6389,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
+         home.memory = 0;
+       }
+       const auto openStarted = nowNs();
++      auto walImage = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
++      auto spill = kj::heap<server::NativeSqlSpill>(server.resources->sqlSpill,
++          server.nativeSqlDatabaseSpillBytes, walImage.directory, kj::mv(walImage.path));
++      auto memory = kj::heap<NativeSqlReservation>(*server.resources, true);
++      auto vfs = server.durableStorage->nativeSqlVfs(*spill, *memory);
+       auto connection = server.durableStorage->openNativeSql(
+-          route.uniqueKey.c_str(), route.storageId.c_str());
++          route.uniqueKey.c_str(), route.storageId.c_str(), *vfs);
+       kj::Own<server::DurableLogShipper> shipper;
+       if (state.wal) {
+         shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
+@@ -6270,7 +6405,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+         shipper->reportAlarm(server::readDurableAlarm(*connection));
+       }
+       state.nativeDatabase.emplace(ThreadState::NativeDatabase{
+-        tree, server::DurableAdmission::Clock::now(), kj::mv(connection), kj::mv(shipper)
++        tree, server::DurableAdmission::Clock::now(), kj::mv(spill), kj::mv(memory), kj::mv(vfs),
++            kj::mv(connection), kj::mv(shipper)
+       });
+       server.publishDurableRoot(state.durableHome, tree);
+       server.reportNativeDatabaseMemory(
+@@ -6801,6 +6937,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+   if (parent >= 0) {
+     KJ_REQUIRE(add(parent), "could not monitor parent during startup");
+   }
++  if (server.sqlPlacementWake >= 0) {
++    KJ_REQUIRE(add(server.sqlPlacementWake), "could not monitor native database placement");
++  }
+   auto pauseListener = [&]() {
+     server.acceptFailures.fetch_add(1);
+     if (listening) epoll_ctl(epoll, EPOLL_CTL_DEL, listener, nullptr);
+@@ -6814,20 +6953,41 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+     std::optional<DurableRoute> durableRoute;
+     Admission::Time durableDeadline{};
+     Admission::Time sqlDeadline{};
++    bool waitingForHome = false;
+   };
+   std::map<int, Connection> connections;
+   std::map<uint64_t, int> durableWaiting;
++  std::set<uint64_t> waitingForHomes;
+   uint64_t nextDurableReport = 0;
+   auto closeConnection = [&](auto found) {
+     const int fd = found->first;
+     if (auto credit = found->second.durableCredit) {
+       durableWaiting.erase(credit->event);
++      waitingForHomes.erase(credit->event);
+       server.finishDurable(*credit);
+     }
+     epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+     ::close(fd);
+     connections.erase(found);
+   };
++  auto retryWaitingHomes = [&]() {
++    while (!waitingForHomes.empty()) {
++      auto event = waitingForHomes.begin();
++      auto found = connections.find(durableWaiting.at(*event));
++      auto& connection = found->second;
++      char receipt = 'E';
++      if (Admission::Clock::now() < connection.durableDeadline) {
++        const auto placement = server.retryDurableHome(*connection.durableRoute, *connection.durableCredit);
++        if (placement == ThreadedServer::HomePlacement::WAITING) break;
++        receipt = placement == ThreadedServer::HomePlacement::READY ? 'A' : 'R';
++      }
++      waitingForHomes.erase(event);
++      connection.waitingForHome = false;
++      if (send(found->first, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 || receipt != 'A') {
++        closeConnection(found);
++      }
++    }
++  };
+   for (;;) {
+     if (!listening && nowNs() >= retryAt) {
+       listening = add(listener);
+@@ -6844,6 +7004,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+     }
+     for (int i = 0; i < count; ++i) {
+       auto fd = events[i].data.fd;
++      if (fd == server.sqlPlacementWake) {
++        uint64_t notifications;
++        (void)!read(fd, &notifications, sizeof(notifications));
++        retryWaitingHomes();
++        continue;
++      }
+       if (fd == parent) {
+         char bytes[64];
+         if (read(parent, bytes, sizeof(bytes)) == 0) _exit(0);
+@@ -6878,7 +7044,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+         // waiting credit. No request body belongs to the routing preface.
+         char discarded;
+         const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
+-        if (size > 0 &&
++        if (!connection.waitingForHome && size > 0 &&
+             server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
+                 connection.durableDeadline, connection.sqlDeadline)) {
+           epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
+@@ -6930,7 +7096,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+             auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
+                 std::chrono::nanoseconds(deadlineNs)));
+             const auto sqlDeadline = kj::min(deadline, Admission::Clock::now() + server::NATIVE_SQL_LIMIT);
+-            auto result = server.queueDurable(route, durableNumber(input, "queuedBytes"), deadline);
++            auto result = server.queueDurable(route, durableNumber(input, "queuedBytes"), deadline,
++                connection.waitingForHome);
+             if (result.ticket) {
+               receipt = 'A';
+               connection.durableCredit = *result.ticket;
+@@ -6938,6 +7105,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+               connection.durableDeadline = deadline;
+               connection.sqlDeadline = sqlDeadline;
+               durableWaiting.emplace(result.ticket->event, fd);
++              if (connection.waitingForHome) waitingForHomes.insert(result.ticket->event);
+             } else if (result.status == Admission::Status::OVERLOADED) {
+               receipt = 'R';
+             } else if (result.status == Admission::Status::EXPIRED) {
+@@ -6946,8 +7114,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+               receipt = 'I';
+             }
+           });
+-          if (error != kj::none || send(fd, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 ||
+-              receipt != 'A') {
++          if (error != kj::none || (!connection.waitingForHome &&
++              (send(fd, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 || receipt != 'A'))) {
+             closeConnection(found);
+           }
+           continue;
+@@ -7109,6 +7277,7 @@ int main(int argc, char **argv) {
+   const int listener = strtol(argv[1], nullptr, 10);
+   ThreadedServer *server;
+   try {
++    if (persistent || disposable) installSqliteCustomAllocator();
+     kj::Own<const kj::Directory> directory;
+     kj::Own<server::ThreadedWalLog> wal;
+     if (persistent) {
+diff --git a/src/workerd/util/sqlite-metering.c++ b/src/workerd/util/sqlite-metering.c++
+index 1312df13ec60be6ba6a63303bf3e99d4a6875598..59056637b4a42e725bb0b9a20c9f150bc8b4b6ec 100644
+--- a/src/workerd/util/sqlite-metering.c++
++++ b/src/workerd/util/sqlite-metering.c++
+@@ -6,6 +6,7 @@
+ 
+ #include <sqlite3.h>
+ #include <stdlib.h>
++#include <cstring>
+ 
+ #include <kj/debug.h>
+ 
+@@ -57,7 +58,8 @@ void* sqliteMemMalloc(int size) {
+     if (actual > 0) {
+       // We have already checked that allocating the requested size will not exceed maxMemoryBytes,
+       // but we still have to check that the actual size allocated does not exceed maxMemoryBytes.
+-      if (scope->memoryBytes + actual > scope->maxMemoryBytes) {
++      if (scope->memoryBytes + actual > scope->maxMemoryBytes ||
++          (scope->budget != nullptr && !scope->budget->acquire(actual))) {
+         free(ptr);
+         return nullptr;
+       }
+@@ -75,6 +77,7 @@ void sqliteMemFree(void* ptr) {
+     if (actual > 0) {
+       if (scope->memoryBytes >= actual) {
+         scope->memoryBytes -= actual;
++        if (scope->budget != nullptr) scope->budget->release(actual);
+       } else {
+         // This branch is a defensive measure, but it is important since scope->memoryBytes is a size_t
+         // and an underflow would result in all subsequent allocations failing with SQLITE_NOMEM.
+@@ -115,6 +118,16 @@ void* sqliteMemRealloc(void* ptr, int newSize) {
+   }
+ 
+   size_t oldActual = usableSize(ptr);
++  if (scope != nullptr && scope->budget != nullptr) {
++    // Reserve the replacement before changing the original pointer. SQLite
++    // relies on realloc leaving the old allocation intact if it fails.
++    if (static_cast<size_t>(newSize) <= oldActual) return ptr;
++    void* replacement = sqliteMemMalloc(newSize);
++    if (replacement == nullptr) return nullptr;
++    memcpy(replacement, ptr, oldActual);
++    sqliteMemFree(ptr);
++    return replacement;
++  }
+ 
+   // sqliteMemRealloc must leave the original buffer intact per SQLite's contract when returning
+   // a nullptr. Because realloc consumes the original pointer, we must check whether the requested
+@@ -181,9 +194,11 @@ static const sqlite3_mem_methods kSqliteMemMethods = {
+ 
+ }  // namespace
+ 
+-SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes)
++SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes,
++    SqliteMemoryBudget* budget)
+     : memoryBytes(memoryBytes),
+-      maxMemoryBytes(maxMemoryBytes) {
++      maxMemoryBytes(maxMemoryBytes),
++      budget(budget) {
+   if (threadLocalScope == nullptr) {
+     threadLocalScope = this;
+   }
+diff --git a/src/workerd/util/sqlite-metering.h b/src/workerd/util/sqlite-metering.h
+index f6eb7f0ba3f9b016a7f8e214d726ebf950e0d392..b0cb3873ef28603e6bb378f3fdab3112532dc3e8 100644
+--- a/src/workerd/util/sqlite-metering.h
++++ b/src/workerd/util/sqlite-metering.h
+@@ -29,13 +29,20 @@ namespace workerd {
+ // SqliteMemoryScope is idempotent: if a scope is already active on the current thread, additional
+ // scopes are no-ops. This allows safe nesting (e.g., when a column accessor calls into SQLite while
+ // a Query::nextRow() scope is already active).
++class SqliteMemoryBudget {
++ public:
++  virtual bool acquire(size_t bytes) noexcept = 0;
++  virtual void release(size_t bytes) noexcept = 0;
++};
++
+ class SqliteMemoryScope {
+  public:
+   // memoryBytes: the per-database byte counter owned by SqliteDatabase for its lifetime.
+   // maxMemoryBytes: the per-database cap from WorkerLimits::sqliteMaxMemoryMb.
+   //
+   // If a scope is already active on this thread, this constructor is a no-op (idempotent).
+-  explicit SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes);
++  explicit SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes,
++      SqliteMemoryBudget* budget = nullptr);
+ 
+   ~SqliteMemoryScope() noexcept(false);
+   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
+@@ -44,6 +51,7 @@ class SqliteMemoryScope {
+   // These are accessed by the allocator functions via threadLocalScope.
+   size_t& memoryBytes;
+   const size_t maxMemoryBytes;
++  SqliteMemoryBudget* budget;
+ 
+   // Thread-local pointer to the active scope. Set to this on construction (if not already set),
+   // cleared on destruction (if we set it).
+diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
+index 911ce08bc9874dc6d928bd918862cf27dfdb19c3..601e01ee5d3e62c018f80eb65d7b6f7900cec81d 100644
+--- a/src/workerd/util/sqlite.c++
++++ b/src/workerd/util/sqlite.c++
+@@ -900,7 +900,7 @@ SqliteDatabase::operator sqlite3*() {
+ }
+ 
+ SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
+-  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes);
++  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes, vfs.getMemoryBudget());
+ }
+ 
+ bool SqliteDatabase::observedCriticalError() {
+@@ -2187,6 +2187,33 @@ void SqliteDatabase::Query::beforeSqliteClose(CloseReason reason) {
+ // we want to leverage all that code. If we can just make it interpret paths differently, then we
+ // can reuse the rest of the implementation.
+ 
++// SQLite may rewrite a spilled page and may extend a temporary file with a
++// sparse write. Track the temporary file's logical extent until it is closed.
++struct TrackedSqliteFile {
++  SqliteDatabase::VfsOptions::SpillTracker* tracker = nullptr;
++  bool wal = false;
++  bool temporary = false;
++  uint64_t temporaryBytes = 0;
++
++  bool write(uint64_t offset, uint64_t size) noexcept {
++    if (tracker == nullptr) return true;
++    if (wal) return tracker->writeWal(offset, size);
++    if (temporary && offset + size > temporaryBytes) return resizeTemporary(offset + size);
++    return true;
++  }
++
++  bool resizeTemporary(uint64_t size) noexcept {
++    if (tracker == nullptr || !temporary || temporaryBytes == size) return true;
++    if (!tracker->resizeTemporary(temporaryBytes, size)) return false;
++    temporaryBytes = size;
++    return true;
++  }
++};
++
++static bool walWriteFits(uint64_t limit, sqlite3_int64 offset, uint64_t length) {
++  return offset >= 0 && uint64_t(offset) <= limit && length <= limit - uint64_t(offset);
++}
++
+ #if !_WIN32
+ namespace {
+ 
+@@ -2232,7 +2259,7 @@ static int replaced_lstat(const char* path, struct stat* stats) {
+ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
+   const Vfs* vfs;
+   int rootFd;
+-  bool wal;
++  TrackedSqliteFile spill;
+ 
+   // It's expected that the wrapped sqlite_file begins in memory immediately after this object.
+   sqlite3_file* getWrapped() {
+@@ -2242,10 +2269,6 @@ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
+   static const sqlite3_io_methods METHOD_TABLE;
+ };
+ 
+-static bool walWriteFits(uint64_t limit, sqlite3_int64 offset, uint64_t length) {
+-  return offset >= 0 && uint64_t(offset) <= limit && length <= limit - uint64_t(offset);
+-}
+-
+ // This completely nutso template generates wrapper functions for each of the function pointer
+ // members of sqlite3_vfs. The wrapper function temporarily sets `currentVfsRoot` to the FD
+ // of the directory from the SqliteDatabase::Vfs instance in use, then invokes the same function
+@@ -2295,19 +2318,37 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
+   .name =                                                                                          \
+       &MethodWrapperHack<decltype(&sqlite3_io_methods::name), &sqlite3_io_methods::name>::wrapper
+ 
+-  WRAP(xClose),
++  .xClose = [](sqlite3_file* file) noexcept -> int {
++    auto& self = *static_cast<WrappedNativeFileImpl*>(file);
++    const auto rc = MethodWrapperHack<decltype(&sqlite3_io_methods::xClose),
++        &sqlite3_io_methods::xClose>::wrapper(file);
++    self.spill.resizeTemporary(0);
++    return rc;
++  },
+   WRAP(xRead),
+   .xWrite = [](sqlite3_file* file, const void* buffer, int length, sqlite3_int64 offset) noexcept -> int {
+     auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+-    if (self.wal && !walWriteFits(self.vfs->options.maxWalBytes, offset, length)) return SQLITE_FULL;
++    if (offset < 0 || length < 0 ||
++        (self.spill.wal && !walWriteFits(self.vfs->options.maxWalBytes, offset, length)) ||
++        !self.spill.write(offset, length)) return SQLITE_FULL;
+     return MethodWrapperHack<decltype(&sqlite3_io_methods::xWrite),
+         &sqlite3_io_methods::xWrite>::wrapper(file, buffer, length, offset);
+   },
+   .xTruncate = [](sqlite3_file* file, sqlite3_int64 size) noexcept -> int {
+     auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+-    if (self.wal && !walWriteFits(self.vfs->options.maxWalBytes, size, 0)) return SQLITE_FULL;
+-    return MethodWrapperHack<decltype(&sqlite3_io_methods::xTruncate),
++    if (size < 0 || (self.spill.wal && !walWriteFits(self.vfs->options.maxWalBytes, size, 0))) return SQLITE_FULL;
++    if (self.spill.tracker != nullptr && self.spill.wal) {
++      sqlite3_int64 previous;
++      const auto rc = MethodWrapperHack<decltype(&sqlite3_io_methods::xFileSize),
++          &sqlite3_io_methods::xFileSize>::wrapper(file, &previous);
++      if (rc != SQLITE_OK) return rc;
++      if (size > previous && !self.spill.write(previous, size - previous)) return SQLITE_FULL;
++    }
++    if (uint64_t(size) > self.spill.temporaryBytes && !self.spill.resizeTemporary(size)) return SQLITE_FULL;
++    const auto rc = MethodWrapperHack<decltype(&sqlite3_io_methods::xTruncate),
+         &sqlite3_io_methods::xTruncate>::wrapper(file, size);
++    if (rc == SQLITE_OK) self.spill.resizeTemporary(size);
++    return rc;
+   },
+   .xSync = [](sqlite3_file* file, int flags) noexcept -> int {
+     // Also skips the directory sync that the native xSync does after creating a journal or WAL.
+@@ -2323,7 +2364,8 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
+   WRAP(xCheckReservedLock),
+   .xFileControl = [](sqlite3_file* file, int op, void* arg) noexcept -> int {
+     auto& self = *static_cast<WrappedNativeFileImpl*>(file);
+-    if (self.wal && self.vfs->options.maxWalBytes != kj::maxValue) {
++    const auto tracked = self.spill.tracker != nullptr && (self.spill.wal || self.spill.temporary);
++    if (tracked || (self.spill.wal && self.vfs->options.maxWalBytes != kj::maxValue)) {
+       // A native preallocation hint is optional. Do not let it grow the WAL
+       // without passing the checks on write and truncate.
+       if (op == SQLITE_FCNTL_SIZE_HINT) return SQLITE_OK;
+@@ -2420,7 +2462,9 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
+         wrapper->pMethods = &WrappedNativeFileImpl::METHOD_TABLE;
+         wrapper->vfs = &self;
+         wrapper->rootFd = self.rootFd;
+-        wrapper->wal = (flags & SQLITE_OPEN_WAL) != 0;
++        wrapper->spill = {.tracker = self.options.spillTracker,
++          .wal = (flags & SQLITE_OPEN_WAL) != 0,
++          .temporary = (flags & SQLITE_OPEN_DELETEONCLOSE) != 0};
+       }
+ 
+       return result;
+@@ -2477,7 +2521,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
+ // an actual instance.
+ struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
+   const Vfs& vfs;
+-  bool wal = false;
++  TrackedSqliteFile spill;
+   kj::Maybe<const kj::File&> writableFile;
+   kj::Own<const kj::ReadableFile> file;
+ 
+@@ -2488,10 +2532,11 @@ struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
+   //
+   // We leave this null if the file is not the main database file.
+ 
+-  FileImpl(const Vfs& vfs, kj::Own<const kj::File> file, kj::Maybe<kj::Own<Lock>> lock, bool wal)
++  FileImpl(const Vfs& vfs, kj::Own<const kj::File> file, kj::Maybe<kj::Own<Lock>> lock, int flags)
+       : sqlite3_file{.pMethods = &FILE_METHOD_TABLE},
+         vfs(vfs),
+-        wal(wal),
++        spill{.tracker = vfs.options.spillTracker, .wal = (flags & SQLITE_OPEN_WAL) != 0,
++          .temporary = (flags & SQLITE_OPEN_DELETEONCLOSE) != 0},
+         writableFile(*file),
+         file(kj::mv(file)),
+         lock(kj::mv(lock)) {}
+@@ -2518,7 +2563,9 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
+       auto& self = *static_cast<FileImpl*>(file);
+ 
+       // Caller will free the object's memory, but knows nothing of destructors.
++      auto spill = self.spill;
+       kj::dtor(self);
++      spill.resizeTemporary(0);
+ 
+       return SQLITE_OK;  // return value is ignored by SQLite
+     });
+@@ -2541,7 +2588,9 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
+   .xWrite =
+       [](sqlite3_file* file, const void* buffer, int iAmt, sqlite3_int64 iOfst) noexcept -> int {
+     WRAP_METHOD(SQLITE_IOERR_WRITE, {
+-      if (self.wal && !walWriteFits(self.vfs.options.maxWalBytes, iOfst, iAmt)) return SQLITE_FULL;
++      if (iOfst < 0 || iAmt < 0 ||
++          (self.spill.wal && !walWriteFits(self.vfs.options.maxWalBytes, iOfst, iAmt)) ||
++          !self.spill.write(iOfst, iAmt)) return SQLITE_FULL;
+       KJ_IF_SOME(writableFile, self.writableFile) {
+         auto bytes = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), iAmt);
+         writableFile.write(iOfst, bytes);
+@@ -2554,9 +2603,15 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
+ 
+   .xTruncate = [](sqlite3_file* file, sqlite3_int64 size) noexcept -> int {
+     WRAP_METHOD(SQLITE_IOERR_TRUNCATE, {
+-      if (self.wal && !walWriteFits(self.vfs.options.maxWalBytes, size, 0)) return SQLITE_FULL;
++      if (size < 0 || (self.spill.wal && !walWriteFits(self.vfs.options.maxWalBytes, size, 0))) return SQLITE_FULL;
+       KJ_IF_SOME(writableFile, self.writableFile) {
++        if (self.spill.tracker != nullptr && self.spill.wal) {
++          const auto before = writableFile.stat().size;
++          if (uint64_t(size) > before && !self.spill.write(before, size - before)) return SQLITE_FULL;
++        }
++        if (uint64_t(size) > self.spill.temporaryBytes && !self.spill.resizeTemporary(size)) return SQLITE_FULL;
+         writableFile.truncate(size);
++        self.spill.resizeTemporary(size);
+         return SQLITE_OK;
+       } else {
+         return SQLITE_READONLY;
+@@ -2785,7 +2840,7 @@ sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
+             }
+           }
+ 
+-          kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock), (flags & SQLITE_OPEN_WAL) != 0);
++          kj::ctor(target, self, kj::mv(kjFile), kj::mv(lock), flags);
+         }
+ 
+         // In theory if read-write was requested, but failed, we should retry read-only, and then
+diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
+index 7b793321376730fd404a3be83bc0f7d0c55ae21d..ad43fc9c00493419f3991193cc83b1aabefb83cc 100644
+--- a/src/workerd/util/sqlite.h
++++ b/src/workerd/util/sqlite.h
+@@ -948,9 +948,18 @@ struct SqliteDatabase::VfsOptions {
+   // busy disk.
+   bool sync = true;
+ 
+-  // Hard limit on the logical length of WAL files opened through this VFS.
+-  // An existing longer file can still be read and truncated.
++  // Optional per-file bound for callers that do not use a spill tracker.
+   uint64_t maxWalBytes = kj::maxValue;
++
++  // An embedder may associate one tracker with a database's VFS. SQLite
++  // invokes it on the database's own thread, before creating spill bytes.
++  class SpillTracker {
++   public:
++    virtual bool writeWal(uint64_t offset, uint64_t bytes) noexcept = 0;
++    virtual bool resizeTemporary(uint64_t before, uint64_t after) noexcept = 0;
++  };
++  SpillTracker* spillTracker = nullptr;
++  SqliteMemoryBudget* memoryBudget = nullptr;
+ };
+ 
+ // Implements a SQLite VFS based on a KJ directory.
+@@ -1005,6 +1014,8 @@ class SqliteDatabase::Vfs {
+     return name;
+   }
+ 
++  SqliteMemoryBudget* getMemoryBudget() const { return options.memoryBudget; }
++
+   KJ_DISALLOW_COPY_AND_MOVE(Vfs);
+ 
+  private:

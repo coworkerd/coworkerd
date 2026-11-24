@@ -449,6 +449,10 @@ struct ServerConfig {
     threadedStorage @24 :Bool = false;
     # When a new definition first waits for a busy tree, bound the remaining drain time.
     versionDrainTimeoutMs @25 :UInt32 = 30000;
+    # Uncommitted WAL growth and temporary files of one native database.
+    nativeSqlDatabaseSpillBytes @26 :UInt64 = 1073741824;
+    # Total native SQL spill in a durable child. Zero uses four database allowances.
+    nativeSqlProcessSpillBytes @27 :UInt64 = 0;
   }
 
   struct IngressConfig {
