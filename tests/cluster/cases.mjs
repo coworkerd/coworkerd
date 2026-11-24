@@ -971,7 +971,8 @@ async function threadedClassMigration(cluster) {
       return new Response(new ReadableStream({
         async start(controller) {
           controller.enqueue(encoder.encode('retained:' + await retained.ping()));
-          await scheduler.wait(18000);
+          // Allow the catalog poll and version drain to finish within the caller's lease.
+          await scheduler.wait(26000);
           try {
             controller.enqueue(encoder.encode('still:' + await retained.ping()));
           } catch {
@@ -1010,7 +1011,8 @@ async function threadedClassMigration(cluster) {
   assert.equal(heldRpc.status, 200);
   const rpcReader = heldRpc.body.getReader();
   assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'retained:v1');
-  const due = Date.now() + 8000;
+  // The renamed class reaches the owner after trial load and a catalog poll.
+  const due = Date.now() + 20000;
   assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
   const waiting = call('/wait-for-headers', { timeout: 60000 }).then(
     value => ({ value }), error => ({ error }),
