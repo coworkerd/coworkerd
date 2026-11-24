@@ -41,6 +41,21 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+To measure concurrent recovery on a fresh three-node cluster with default membership and rebuild settings:
+
+```sh
+node tests/cluster/recovery.mjs "$kernel" 200 loss
+node tests/cluster/recovery.mjs "$kernel" 1000 loss
+node tests/cluster/recovery.mjs "$kernel" 200 restart
+```
+
+The fixture writes distinct values to objects on 16 shards owned by one node. It kills that node and reads
+back every confirmed value. The restart mode starts the same container on its original volume immediately
+after the kill. Output includes the time from the kill request to detection or restart readiness, first,
+median and last successful reads, and samples of lease and recovery counters. The 200-object loss case
+requires all reads within 55 seconds of detection. To time an earlier build without that assertion, set
+`COWORKERD_RECOVERY_MEASURE_BASELINE=1` and point `COWORKERD_CLUSTER_BIN_DIR` at its Linux binaries.
+
 ## Measured time and resources
 
 A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose

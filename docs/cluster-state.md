@@ -356,13 +356,14 @@ of a 90,672-byte WAL took 0.250 ms.
   `do/<namespace>/objects/<object>/snapshot/<sequence>/`, writes the index last, and then the manifest that names it.
   The first snapshot requires the size threshold; elapsed time alone does not create it.
   The segments the snapshot covers leave the manifest; the stored segments and snapshots themselves are retained.
-- **Rebuilding an object.** Each node runs at most `durableObjects.rebuildConcurrency` rebuilds at once
-  (default 4, range 1–64). Additional objects wait in FIFO order, and requests for the same object join its existing
-  rebuild. `durableLog.objects.activeRebuilds` counts running rebuilds; `queuedRebuilds` counts live waiters.
-  Queue time counts toward `recoverTimeoutMs`: a request can receive `DO_RECOVERING` while its background rebuild
-  remains queued or running. A rebuild keeps its slot through manifest retries and returns it on success, failure
-  or cancellation. Waiting objects retain their current state until their rebuild starts, using the ownership
-  epoch current when they acquire a slot.
+- **Rebuilding an object.** Each node has `durableObjects.rebuildConcurrency` execution slots (default 4, range 1–64).
+  Requests for the same object join one rebuild. Foreground and alarm recoveries queue by class, and a foreground
+  request promotes a background rebuild. Preparation starts the snapshot download and tail collection. When
+  preparation ends, a rebuild returns its slot while tail collection continues. When the evidence is ready, the
+  object queues again for a slot and revalidates its identity and manifest before publication. The object stays
+  rebuilding throughout the wait. `durableLog.objects` reports active, queued and waiting rebuilds.
+  Queue time counts toward `recoverTimeoutMs`, and a request can receive `DO_RECOVERING` while the rebuild continues.
+  The same response applies when a node's 16 MiB rebuild metadata budget is full.
 
   The first request waits while the node reads the latest manifest, verifies and downloads
   its snapshot, and replays its segments. It also collects unsealed records from its own peer buffer, its own log,
@@ -382,8 +383,9 @@ of a 90,672-byte WAL took 0.250 ms.
   object waits until `membership.ttlSeconds * 1000 + membership.livenessGraceMs` (25 s by default), measured from its
   first rebuild attempt at this ownership epoch; request and storage retries do not restart that clock.
   Lease expiry, a missing member and a failed connection do not prove that a tail never existed.
-  At that deadline, before a cut without an owner's proof, the node reads each silent previous owner's heartbeat
-  of that node epoch once (shared by every recovery that asks about the same epoch within a second): when it is
+  At that deadline, before a final tail round and a cut without an owner's proof, the node checks each silent
+  previous owner's heartbeat. Recoveries on the same node share the in-flight check and its result for 200 ms.
+  When the heartbeat is
   still live by the membership's rule -- its `LastModified` within the TTL plus the grace of the answer's `Date`, as
   a heartbeat the store took late would be -- there is no cut, and the recovery keeps asking; a failed read, an
   answer without both times or a record naming another node or epoch does not allow one either. A heartbeat that is
@@ -422,30 +424,33 @@ of a 90,672-byte WAL took 0.250 ms.
   machine is unavailable, the first request after takeover can instead wait the 25 s missing-evidence period, a bounded final
   holder round described below, and snapshot upload; default failure detection adds about another 25 s. A large snapshot takes longer.
   Store read or publication failures return `STORAGE_UNAVAILABLE`; the deadline does not authorize serving an
-  unpublished history. Tail collection runs alongside snapshot download and segment replay. Verified tails
+  unpublished history. Tail collection runs alongside snapshot download. Verified tails
   survive publication failures and subsequent attempts until the object publishes successfully. Recovery
-  manifests use CAS against the last replayed revision: a newly added segment aborts publication and is replayed
+  manifests use CAS against the last replayed revision. A newly added segment aborts publication and is replayed
   by the retry, rather than being removed by an image that never contained it.
 
   The 25 s clock limits retries for absent evidence, not whether to ask a known holder. Every attempt, including
-  one beginning after that clock expires, asks every known holder once. Connections keep `peerTimeoutMs`;
-  connected probes page to `more=false` within a finite drain round. Because the protocol gives no size before
+  one beginning after that clock expires, gives every known holder a turn. A node starts at most 16 waiting-recovery
+  metadata requests per second, with a burst of four and two in flight. Membership heartbeat writes use their own lane.
+  A node admits at most four peer connection attempts concurrently. Each round marks the matching cached connection
+  stale and shares the replacement attempt and its result for that target. A transport failure or page timeout
+  marks the matching connection generation stale for reuse. Replication and forwarding calls already on that connection
+  can finish. Connections keep `peerTimeoutMs` and use their own slots.
+  Connected probes page to `more=false` within a finite drain round. Because the protocol gives no size before
   a reply, each page reserves the largest legal page at 8 MiB/s aggregate divided among `recoverParallelism`
   slots, plus connection time, and never less than `confirmTimeoutMs`. With defaults this is 34,000 ms per
   page, independent of the remaining 25 s. A probe gets a drain window for one configured peer buffer at the
-  same rate (128,000 ms by default), and its final page retains its full budget. For N queued remote probes
-  and P node-wide slots, let Q include transfers already active or queued ahead of this round. A conservative
-  post-deadline bound is ceil((Q+N)/P) × (25,000 + 128,000 + 34,000) ms with default buffers and timeouts,
-  plus local metadata/encoding work. New arrivals cannot overtake this FIFO batch. A probe whose connected
+  same rate (128,000 ms by default), and its final page retains its full budget. A probe whose connected
   source still has more data at the drain limit contributes only the verified pages already received; the
   missing source is named in the bounded-cut log. The owner's zero-peer append backlog has no separate
   byte cap and can exceed the configured peer-buffer drain window. A local probe does not consume a network slot. Requests may
   answer `DO_RECOVERING` while that background collection continues. Registered nodes with zero durable
   processes are excluded per membership epoch, including from missing-holder accounting.
 
-  Candidate and cursor handling uses one FIFO transfer-slot queue for the whole node, not one-millisecond
-  polling per object. Multiple objects share `recoverParallelism`; a known local owner's complete proof does
-  not start an unnecessary peer batch, and retained self registrations share one local query. Incoming records are
+  Tail pages share a node-wide FIFO transfer queue with at most one active page per target. A busy target leaves
+  room for other targets to proceed. Multiple objects share `recoverParallelism`. A known local owner's complete proof
+  takes the fast path, and retained self registrations share one local query. `durableLog.recovery.scheduler`
+  reports the budgets, object phases, holder, probe age and queue delay. Incoming records are
   CRC-validated on admission. Incoming-buffer and current-epoch page selection read retained metadata, skip
   records at or below the cursor, and decode/copy the selected page. For a held earlier epoch, each page first
   re-encodes every matching record above its cursor, including CRC work and copies outside the selected page.

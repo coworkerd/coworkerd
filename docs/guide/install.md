@@ -562,7 +562,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
 | `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
 | `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
-| `rebuildConcurrency` | `4` | Objects being rebuilt at once per node; range 1–64; foreground and alarm queues share capacity, with promotion when a user joins a queued alarm rebuild |
+| `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
 | `alarmDiscoveryIntervalMs` | `60000` | How often a node with durable processes looks for shards of stopped members that have pending alarms (it also looks at each membership change); at least 200 |
 | `alarmTakeoverConcurrency` | `4` | Such shards a node takes over at once; range 1–4 |
 | `alarmFireConcurrency` | `2` | Dispatching or executing background alarms per upstream node; range 1–512. Queued cold rebuilds wait separately, and ordinary admission remains in force |
@@ -577,12 +577,13 @@ limit; it is not a new configuration key. Oversized commits fail with `STORAGE_U
 and are discarded by the existing repair path; split large transactions. CPU and memory limits can reject
 smaller transactions. See the record-size discussion in cluster-state section 12.
 
-A takeover collects tails for at most `membership.ttlSeconds * 1000 + membership.livenessGraceMs` (25 s by default),
-without restarting the deadline on retries. A complete answer from the original owner ends collection early;
-otherwise recovery publishes a full snapshot cut before serving. An unavailable owner can therefore add 25 s plus
-snapshot time after takeover. `recoverTimeoutMs` limits each request's wait, not the background recovery. Watch
-`durableLog.recovery` and `[do-log] owner-silent` / `tail-recovery-bounded`; the latter names unanswered possible
-holders. `confirmed-tail-unaccounted` requires investigation and preserved old segments; it does not prove loss.
+A takeover starts each object's `membership.ttlSeconds * 1000 + membership.livenessGraceMs` deadline (25 s by default)
+when its preparation begins. A complete owner answer ends collection early. Otherwise the node checks the silent
+holder and sends a final tail round at or after the deadline. An object keeps waiting while the holder appears live or
+its heartbeat status is unknown. The takeover publishes a full snapshot cut before serving after a bounded tail
+round. `recoverTimeoutMs` limits the request's wait while recovery continues. See `durableLog.recovery.scheduler`
+for phases, holders, queue delays and budgets. `[do-log] tail-recovery-bounded` names unanswered possible holders.
+Investigate `confirmed-tail-unaccounted` and preserve the old segments.
 See [cluster state, section 12](../cluster-state.md#12-durable-object-durability) for the recovery boundary.
 
 The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Each namespace stores object files by their hashed storage ids under `do/coworkerd-do-root-v1-<namespace>/`; facet zero is the root database. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
@@ -685,7 +686,7 @@ There is no in-place upgrade to 0.5.6 for clusters that use Durable Objects or D
 
 1. **A short or damaged log or sidecar tail**, such as after a short write on a full disk or a power loss, keeps that node's earlier logs on disk indefinitely. The first open of each affected object then waits for the tails its peers hold (up to 25 seconds with defaults) and publishes a full snapshot.
 2. **A continuously written large object** can repeatedly abandon periodic snapshots. Abandoned attempts can leave unreferenced snapshot parts in storage.
-3. **A silently lost machine and many simultaneous recoveries** can make total recovery time grow with object count. A node rebuilds at most `durableObjects.rebuildConcurrency` objects at a time (4 by default); a request that waits longer than `durableObjects.recoverTimeoutMs` answers `503 DO_RECOVERING` and can be retried.
+3. **A silently lost machine and many simultaneous recoveries.** Objects can wait for the takeover deadline concurrently. The amount of snapshot and replay work, the tail transfers, and the time to detect the lost member still affect total recovery time. Each node allows 16 recovery metadata requests per second (burst 4, two in flight) and 16 MiB of rebuild metadata. A node answers `503 DO_RECOVERING` when that metadata budget is full or a request reaches `durableObjects.recoverTimeoutMs`. Retry the request.
 4. **A fenced former owner** that fails five consecutive reads of the new owner's segments can stop completing seals for all its objects until its process restarts. Restart that node.
 5. **Some retained state has no cleanup bound.** Recovery tails adopted from peers remain in memory after the object's ownership is lost, and recovery state in sidecars is not compacted. These consume memory or disk during repeated failures.
 6. **A takeover interrupted between replacing the local files and publishing them** depends on its peers a second time: the local copy is not kept across a daemon restart, and peers hold such tails in memory only. If the daemon restarts in that window and those peers restart as well before the object is opened again, the writes that only they held are lost. One failure alone loses nothing; the next open collects the tails again.
