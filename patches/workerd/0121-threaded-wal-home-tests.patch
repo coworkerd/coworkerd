@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Tue, 24 Nov 2026 21:35:08 +0800
+Subject: [PATCH] Exercise threaded WAL Home deadlines and notification routing
+
+Drive the Home channel and its Session with a local peer, in-memory SQLite roots, and a controlled clock. Cover caller cancellation, conditional and unconditional give-up, frame refusal, and open and close replies.
+
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+index d0c58f0c6f51ad066304108fd29f4a4e0cdabf30..ae50d063ce51bc37cfed97d80a084940b60bf715 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+@@ -14,9 +14,13 @@ struct WirePair {
+   kj::Own<kj::AsyncIoStream> node;
+   kj::Own<WalWire> child;
+ 
+-  WirePair() {
++  explicit WirePair(bool limitSendBuffer = false) {
+     int fds[2];
+     KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
++    if (limitSendBuffer) {
++      int sendBuffer = 4096;
++      KJ_SYSCALL(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sendBuffer, sizeof(sendBuffer)));
++    }
+     KJ_SYSCALL(fcntl(fds[0], F_SETFD, FD_CLOEXEC));
+     child = kj::heap<WalWire>(*io.lowLevelProvider, fds[0]);
+     node = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+@@ -25,12 +29,21 @@ struct WirePair {
+   kj::Array<kj::byte> receive() {
+     kj::byte header[4];
+     auto& timer = io.provider->getTimer();
+-    timer.timeoutAfter(kj::SECONDS, node->read(kj::arrayPtr(header, sizeof(header)))).wait(io.waitScope);
++    timer.timeoutAfter(kj::SECONDS, node->read(kj::arrayPtr(header, sizeof(header))))
++        .wait(io.waitScope);
+     auto body = kj::heapArray<kj::byte>(getLe32(header));
+     timer.timeoutAfter(kj::SECONDS, node->read(body.asPtr())).wait(io.waitScope);
+     return body;
+   }
+ 
++  kj::Array<kj::byte> receive(uint8_t type, uint64_t openId) {
++    auto body = receive();
++    KJ_REQUIRE(body.size() >= 9);
++    KJ_REQUIRE(body[0] == type, body[0], type);
++    KJ_EXPECT(getLe64(body.begin() + 1) == openId);
++    return body;
++  }
++
+   void reply(kj::Array<kj::byte> bytes) {
+     node->write(bytes.asPtr()).wait(io.waitScope);
+   }
+@@ -59,6 +72,31 @@ struct WirePair {
+     response.u8(ACK_OK);
+     reply(response.finish());
+   }
++
++  void opened(uint64_t openId, uint8_t status = ACK_OK) {
++    Writer response;
++    response.u8(MSG_OPENED);
++    response.u8(status);
++    reply(response.finish(openId));
++  }
++
++  void requestClose(uint64_t openId, uint8_t type) {
++    Writer response;
++    response.u8(type);
++    reply(response.finish(openId));
++  }
++
++  void expectGiveUp(uint64_t openId, uint64_t request, kj::StringPtr key) {
++    auto body = receive(MSG_GAVE_UP, openId);
++    Writer expected;
++    expected.u8(MSG_GAVE_UP);
++    expected.u64(request);
++    expected.str(key);
++    auto prefix = expected.finish(openId);
++    // The monotonic timestamp comes after the request and storage key.
++    KJ_REQUIRE(body.size() == prefix.size() - 4 + sizeof(uint64_t));
++    KJ_EXPECT(body.first(prefix.size() - 4) == prefix.slice(4));
++  }
+ };
+ 
+ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and reply") {
+@@ -158,5 +196,201 @@ KJ_TEST("threaded WAL rejects readiness for another generation") {
+   KJ_EXPECT(!shared.negotiated());
+ }
+ 
++using CloseReason = ThreadedWalLog::CloseReason;
++constexpr auto CONFIRMATION_TIMEOUT = kj::SECONDS;
++constexpr auto JUST_BEFORE_TIMEOUT = CONFIRMATION_TIMEOUT - kj::MILLISECONDS;
++
++// Run Session and Home on one loop. Only the watchdog for socket I/O uses real time.
++struct HomeSession {
++  WirePair link;
++  kj::TimerImpl clock{kj::origin<kj::TimePoint>()};
++  std::shared_ptr<Shared> shared = std::make_shared<Shared>(CONFIRMATION_TIMEOUT);
++  Session session{*shared, *link.child, 7};
++  kj::Promise<void> running = session.run().eagerlyEvaluate(nullptr);
++
++  explicit HomeSession(bool limitSendBuffer = false): link(limitSendBuffer) {
++    link.ready(7);
++    link.io.waitScope.poll();
++    KJ_REQUIRE(shared->negotiated());
++  }
++
++  kj::Own<DurableWalChannel> attachHome(
++      kj::Function<void(uint64_t, CloseReason)> onClose = [](uint64_t, CloseReason) {
++        KJ_FAIL_EXPECT("unexpected close request");
++      }) {
++    return kj::heap<Home>(shared, kj::mv(onClose));
++  }
++
++  void advance(kj::Duration duration) {
++    clock.advanceTo(clock.now() + duration);
++    link.io.waitScope.poll();
++  }
++};
++
++struct TestRoot {
++  kj::Own<kj::Directory> directory = kj::newInMemoryDirectory(kj::nullClock());
++  SqliteDatabase::Vfs vfs{*directory};
++  SqliteDatabase db{vfs, kj::Path({"root.db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY};
++  DurableLogShipper shipper;
++
++  TestRoot(HomeSession& test, DurableWalChannel& home, kj::StringPtr name)
++      : shipper(*directory,
++            kj::Path({"root.db-wal"}),
++            kj::Path({"root.db"}),
++            {.objectName = kj::str(name), .storageId = kj::str(name)},
++            db,
++            test.clock,
++            home) {
++    test.link.receive(MSG_OPEN, id());
++  }
++
++  uint64_t id() const {
++    return shipper.getOpenId();
++  }
++};
++
++void acceptOpen(HomeSession& test, DurableWalChannel& home, const TestRoot& root) {
++  auto opening = home.waitForOpen(root.id(), test.clock);
++  test.link.opened(root.id());
++  test.link.wait(kj::mv(opening));
++}
++
++kj::Promise<void> sendFrames(
++    HomeSession& test, DurableWalChannel& home, TestRoot& root, uint64_t request) {
++  // Call Home directly so dropping its return value drops the caller's only branch.
++  // The fake peer needs only the type, open ID and request ID to acknowledge a record.
++  Writer frame;
++  frame.u8(MSG_FRAMES);
++  frame.u64(request);
++  auto answer = home.sendFrames(root.shipper, frame.finish(root.id()), request, test.clock);
++  auto observed = test.link.receive(MSG_FRAMES, root.id());
++  KJ_REQUIRE(observed.size() == 17 && getLe64(observed.begin() + 9) == request);
++  return answer;
++}
++
++KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller cancellation") {
++  HomeSession test;
++  auto home = test.attachHome();
++  TestRoot root(test, *home, "namespace/canceled/epoch"_kj);
++  acceptOpen(test, *home, root);
++
++  const auto request = home->nextRequest();
++  {
++    auto caller = sendFrames(test, *home, root, request);
++    KJ_EXPECT(!caller.poll(test.link.io.waitScope));
++  }
++  test.advance(JUST_BEFORE_TIMEOUT);
++  root.shipper.reportAlarm(kj::none);
++  test.link.receive(MSG_ALARM, root.id());
++
++  test.advance(kj::MILLISECONDS);
++  test.link.expectGiveUp(root.id(), request, root.shipper.getKey());
++  root.shipper.reportAlarm(kj::none);
++  test.link.receive(MSG_ALARM, root.id());
++}
++
++KJ_TEST("threaded WAL home suppresses a timed-out give-up when the session receives a late ACK") {
++  HomeSession test(true);
++  auto close = kj::newPromiseAndFulfiller<void>();
++  auto home = test.attachHome([&](uint64_t, CloseReason) { close.fulfiller->fulfill(); });
++  TestRoot root(test, *home, "namespace/late-ack/epoch"_kj);
++  acceptOpen(test, *home, root);
++
++  const auto request = home->nextRequest();
++  auto caller = sendFrames(test, *home, root, request);
++  test.advance(JUST_BEFORE_TIMEOUT);
++  // Put a larger record ahead of the give-up so the writer cannot reach it while the peer
++  // leaves that record unread. The reader remains free to consume the incoming ACK.
++  KJ_REQUIRE(root.db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
++  root.db.run("CREATE TABLE entries (data BLOB)");
++  root.db.run("INSERT INTO entries VALUES (zeroblob(262144));");
++  auto bulkConfirmation = root.shipper.onCommit();
++  test.advance(kj::MILLISECONDS);
++  KJ_EXPECT_THROW_MESSAGE("the node did not confirm the write", test.link.wait(kj::mv(caller)));
++  test.link.ack(request);
++  // On the same inbound stream, this notification follows the ACK that removed the request.
++  test.link.requestClose(root.id(), MSG_CLOSE_ASKED);
++  test.link.wait(kj::mv(close.promise));
++
++  root.shipper.reportAlarm(kj::none);
++  auto bulk = test.link.receive(MSG_FRAMES, root.id());
++  KJ_REQUIRE(bulk.size() > 262144);
++  test.link.receive(MSG_ALARM, root.id());
++  test.link.ack(getLe64(bulk.begin() + 9));
++  test.link.wait(kj::mv(bulkConfirmation));
++}
++
++KJ_TEST("threaded WAL home refuses frames at capacity and sends an unconditional give-up") {
++  HomeSession test;
++  auto home = test.attachHome();
++  TestRoot root(test, *home, "namespace/full/epoch"_kj);
++  acceptOpen(test, *home, root);
++
++  // The mailbox's byte accounting is covered above. Simulate an occupied data allowance
++  // without allocating and transferring 72 MiB, and keep the real control allowance available.
++  Writer marker;
++  marker.u8(MSG_ALARM);
++  KJ_REQUIRE(test.shared->commands.push({.bytes = marker.finish(root.id()), .openId = root.id()},
++      QUEUED_RECORD_BYTES, QUEUED_RECORD_BYTES));
++  KJ_REQUIRE(root.db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
++  root.db.run("CREATE TABLE entries (data BLOB)");
++  auto refused = root.shipper.onCommit();
++  KJ_EXPECT(!root.shipper.hasPendingWrites());
++  KJ_EXPECT_THROW_MESSAGE("STORAGE_UNAVAILABLE", test.link.wait(kj::mv(refused)));
++
++  test.link.receive(MSG_ALARM, root.id());
++  // OPEN consumed the first ID. The refused commit consumed the next, without sending FRAMES.
++  test.link.expectGiveUp(root.id(), root.id() + 1, root.shipper.getKey());
++  TestRoot fresh(test, *home, "namespace/fresh/epoch"_kj);
++  acceptOpen(test, *home, fresh);
++}
++
++KJ_TEST("threaded WAL home distinguishes open denial from its confirmation deadline") {
++  HomeSession test;
++  auto home = test.attachHome();
++  TestRoot denied(test, *home, "namespace/denied/epoch"_kj);
++  TestRoot unanswered(test, *home, "namespace/unanswered/epoch"_kj);
++  auto denial = home->waitForOpen(denied.id(), test.clock);
++  auto timeout = home->waitForOpen(unanswered.id(), test.clock);
++  KJ_EXPECT(!denial.poll(test.link.io.waitScope));
++
++  test.link.opened(denied.id(), ACK_QUOTA);
++  KJ_EXPECT_THROW_MESSAGE("QUOTA_EXCEEDED", test.link.wait(kj::mv(denial)));
++  test.advance(JUST_BEFORE_TIMEOUT);
++  KJ_EXPECT(!timeout.poll(test.link.io.waitScope));
++  test.advance(kj::MILLISECONDS);
++  KJ_EXPECT(timeout.poll(test.link.io.waitScope));
++  KJ_EXPECT_THROW_MESSAGE("STORAGE_UNAVAILABLE", test.link.wait(kj::mv(timeout)));
++}
++
++KJ_TEST("threaded WAL home delivers both close reasons to the intended root") {
++  HomeSession test;
++  struct Notice {
++    uint64_t id;
++    CloseReason reason;
++  };
++  kj::Vector<Notice> notices;
++  auto delivered = kj::newPromiseAndFulfiller<void>();
++  auto home = test.attachHome([&](uint64_t id, CloseReason reason) {
++    notices.add(Notice{id, reason});
++    if (notices.size() == 2) delivered.fulfiller->fulfill();
++  });
++  auto otherHome = test.attachHome();
++  TestRoot first(test, *home, "namespace/first/epoch"_kj);
++  TestRoot second(test, *home, "namespace/second/epoch"_kj);
++  TestRoot other(test, *otherHome, "namespace/other-home/epoch"_kj);
++  acceptOpen(test, *home, first);
++  acceptOpen(test, *home, second);
++  acceptOpen(test, *otherHome, other);
++
++  test.link.requestClose(second.id(), MSG_CLOSE_ASKED);
++  test.link.requestClose(first.id(), MSG_CLOSE_FOR_CODE_UPDATE);
++  test.link.wait(kj::mv(delivered.promise));
++  test.link.io.waitScope.poll();
++  KJ_REQUIRE(notices.size() == 2);
++  KJ_EXPECT(notices[0].id == second.id() && notices[0].reason == CloseReason::DRAIN);
++  KJ_EXPECT(notices[1].id == first.id() && notices[1].reason == CloseReason::CODE_UPDATED);
++}
++
+ }  // namespace
+ }  // namespace workerd::server
