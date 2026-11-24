@@ -295,7 +295,7 @@ index b1f971e7bb2008020c538415e28ca393253e2f8f..13e8ab9bec5392a4a9d2c6e046340159
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e5f97f0a8 100644
+index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..b04190e6af2f841cf9d617de7914a0cfdb53991d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1752,6 +1752,7 @@ struct DurableIncoming {
@@ -450,7 +450,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
  
    kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders&,
        kj::AsyncInputStream& body, Response& response) override {
-@@ -5339,12 +5374,48 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -5339,12 +5374,52 @@ class NativeDatabaseHttp final: public kj::HttpService {
      if (alarm == kj::none && (method != kj::HttpMethod::POST || (!query && !execute))) {
        co_return co_await send(response, {404, "{\"error\":\"Not found\"}"});
      }
@@ -458,16 +458,20 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
      server::NativeSqlReply reply{0, {}};
 +    kj::String input;
 +    uint64_t requestMemory = 0;
-+    KJ_DEFER(if (requestMemory != 0) KJ_ASSERT(server.resources->change(requestMemory, 0, 0, 0)));
++    KJ_DEFER({
++      if (requestMemory != 0) {
++        KJ_ASSERT(server.resources->change(requestMemory, 0, 0, 0));
++      }
++    });
      try {
 -      co_await open();
 +      if (alarm == kj::none) {
 +        // The binding's largest SQLite BLOB can take four bytes per byte in
 +        // the JSON byte array. Leave space for SQL, metadata and framing.
-+        constexpr uint64_t MAX_INPUT = 40ull << 20;
-+        constexpr uint64_t RESPONSE_MEMORY = 24ull << 20;
-+        const auto length = body.tryGetLength().orDefault(MAX_INPUT);
-+        if (length > MAX_INPUT) co_return co_await send(response, requestTooLarge());
++        constexpr uint64_t MAX_SQL_REQUEST_BYTES = 40ull << 20;
++        constexpr uint64_t SQL_RESPONSE_MEMORY_BYTES = 24ull << 20;
++        const auto length = body.tryGetLength().orDefault(MAX_SQL_REQUEST_BYTES);
++        if (length > MAX_SQL_REQUEST_BYTES) co_return co_await send(response, requestTooLarge());
 +        // Two copies can coexist during the streaming read. The decoder
 +        // allocates cells as well as the original and normalized text.
 +        const uint64_t readMemory = 2 * length + 8192;
@@ -480,7 +484,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
 +        if (remaining.count() <= 0) co_return co_await send(response, server::nativeSqlTimeout());
 +        auto readAndOpen = [&]() -> kj::Promise<void> {
 +          input = co_await body.readAllText(length + 1);
-+          const auto executeMemory = RESPONSE_MEMORY + 32 * input.size();
++          const auto executeMemory = SQL_RESPONSE_MEMORY_BYTES + 32 * input.size();
 +          if (!server.resources->change(requestMemory, executeMemory, 0, 0, true)) {
 +            reply = requestMemoryUnavailable();
 +            co_return;
@@ -502,7 +506,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
      }
      if (reply.status != 0) co_return co_await send(response, std::move(reply));
      auto& database = *state.nativeDatabase;
-@@ -5367,12 +5438,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -5367,12 +5442,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
          const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
              ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
          reply = server::runNativeSql(connection, input, query, format,
@@ -517,7 +521,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
      // A canceled client must not cancel acknowledgement of already committed WAL.
      // Keep the admitted connection alive until the outstanding confirmation settles.
      if (connection.observedCriticalError() || reply.status == 0 || reply.status == 503) {
-@@ -5405,8 +5477,17 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -5405,8 +5481,17 @@ class NativeDatabaseHttp final: public kj::HttpService {
    uint64_t tree;
    int connectionFd;
    kj::Maybe<uint64_t> alarm;
@@ -535,7 +539,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
    static server::NativeSqlReply storageFailure(const kj::Exception& error) {
      auto reason = error.getDescription();
      if (reason.startsWith("jsg.Error: ")) reason = reason.slice(sizeof("jsg.Error: ") - 1);
-@@ -5449,7 +5530,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -5449,7 +5534,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
          home.memory = 0;
        }
        const auto openStarted = nowNs();
@@ -545,7 +549,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
        kj::Own<server::DurableLogShipper> shipper;
        if (state.wal) {
          shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
-@@ -5462,6 +5544,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -5462,6 +5548,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
          tree, server::DurableAdmission::Clock::now(), kj::mv(connection), kj::mv(shipper)
        });
        server.publishDurableRoot(state.durableHome, tree);
@@ -554,7 +558,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
      }
      auto& database = *state.nativeDatabase;
      KJ_REQUIRE(database.tree == tree, "mismatched native database home");
-@@ -5548,7 +5632,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -5548,7 +5636,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        alarm = time;
      }
      auto service = kj::heap<NativeDatabaseHttp>(server, state, std::move(route), ticket.tree,
@@ -563,7 +567,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
      co_return rpc::EventDispatcher::Client(
          kj::heap<NativeDatabaseDispatcher>(state, kj::mv(service)));
    }
-@@ -5895,6 +5979,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5895,6 +5983,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
      std::optional<Admission::Ticket> durableCredit;
      std::optional<DurableRoute> durableRoute;
      Admission::Time durableDeadline{};
@@ -571,7 +575,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
    };
    std::map<int, Connection> connections;
    std::map<uint64_t, int> durableWaiting;
-@@ -5961,7 +6046,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -5961,7 +6050,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
          const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
          if (size > 0 &&
              server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
@@ -580,7 +584,7 @@ index 5c7ed243ae25b65b224ce1b0f8cd091c75797103..d4d423b78fee88cc4eb70ecf3193c20e
            epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
            durableWaiting.erase(connection.durableCredit->event);
            connections.erase(found);
-@@ -6010,12 +6095,14 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -6010,12 +6099,14 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                  "invalid durable routing deadline");
              auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
                  std::chrono::nanoseconds(deadlineNs)));
