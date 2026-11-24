@@ -595,7 +595,7 @@ index 9af1fc6c304cc03fd5542d1dd988ecc6debe9845..7045a3fe12e0a36d6ce0c7cd987f346c
    // Without the fragmentation reserve this child ended with V8's fatal OOM
    // (exit 74) at 1150.5 MiB live in 1154.8 MiB of pages.
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e05ea45169 100644
+index 3b00db1f3dfa43bd162a7e759ca2b7d1a9b8e812..bb9a4c4516f0e1588d9a5273e25dbcc908bdb026 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2,6 +2,7 @@
@@ -606,7 +606,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  #include "protocol.h"
  
  #include <workerd/api/actor-state.h>
-@@ -26,9 +27,9 @@
+@@ -27,9 +28,9 @@
  #include <workerd/server/factory/coworkerd-durable-cpu.h>
  #include <workerd/server/factory/coworkerd-durable-placement.h>
  #include <workerd/server/factory/coworkerd-durable-test-storage.h>
@@ -617,7 +617,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  #include <workerd/server/v8-platform-impl.h>
  #include <workerd/server/workerd-api.h>
  #include <workerd/threaded/protocol.capnp.h>
-@@ -247,24 +248,7 @@ constexpr uint64_t fragmentationReserve(uint64_t maximum) {
+@@ -248,24 +249,7 @@ constexpr uint64_t fragmentationReserve(uint64_t maximum) {
  }
  
  int limitEventFd();
@@ -643,7 +643,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  
  thread_local const char *currentOomReport = nullptr;
  // The executing isolate's heap at its last collection. V8 collects before a
-@@ -650,6 +634,8 @@ uint64_t configuredCount(const char *name, uint64_t fallback) {
+@@ -651,6 +635,8 @@ uint64_t configuredCount(const char *name, uint64_t fallback) {
  }
  
  kj::StringPtr executionIdentity(kj::StringPtr fallback);
@@ -652,7 +652,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  
  kj::Exception limitException(LimitCause cause) {
    if (cause == LimitCause::PROCESS_MEMORY)
-@@ -712,13 +698,12 @@ void writeCrashRow(int fd, const char *data, size_t size) {
+@@ -713,13 +699,12 @@ void writeCrashRow(int fd, const char *data, size_t size) {
  
  void writeFatalRecord(int fd) {
    char row[PIPE_BUF];
@@ -670,7 +670,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      if (size > 0 && size_t(size) < sizeof(row)) {
        writeCrashRow(fd, row, size);
        return;
-@@ -729,12 +714,33 @@ void writeFatalRecord(int fd) {
+@@ -730,12 +715,33 @@ void writeFatalRecord(int fd) {
    if (size > 0 && size_t(size) < sizeof(row)) writeCrashRow(fd, row, size);
  }
  
@@ -706,7 +706,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  [[noreturn]] void nativeOom(const char *location, const v8::OOMDetails &details) {
    const int fd = limitEventFd();
    char unknown[96];
-@@ -747,10 +753,9 @@ void writeFatalRecord(int fd) {
+@@ -748,10 +754,9 @@ void writeFatalRecord(int fd) {
      const bool heapLimit = location != nullptr &&
          (strcmp(location, "Reached heap limit") == 0 ||
              strcmp(location, "Ineffective mark-compacts near heap limit") == 0);
@@ -719,7 +719,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      auto size = strlen(currentOomReport);
      char row[PIPE_BUF];
      int written = currentOomHeap && size >= 2 && size < sizeof(row)
-@@ -768,7 +773,9 @@ void writeFatalRecord(int fd) {
+@@ -769,7 +774,9 @@ void writeFatalRecord(int fd) {
  }
  
  #ifdef COWORKERD_FATAL_TEST_BUILD
@@ -730,7 +730,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
    auto path = kj::str("/tmp/coworkerd-fatal-test/command.", getpid());
    const int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
    if (fd < 0) return;
-@@ -782,7 +789,13 @@ void injectSyntheticCrash(kj::StringPtr worker) {
+@@ -783,7 +790,13 @@ void injectSyntheticCrash(kj::StringPtr worker) {
      if (input.slice(separator + 1) != worker) return;
      command[separator] = '\0';
      auto event = kj::StringPtr(command, separator);
@@ -744,7 +744,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      if (event == "shared-oom" && !v8::IsolateGroup::CanCreateNewGroups()) {
        nativeOom(nullptr, v8::OOMDetails{.is_heap_oom = true, .detail = nullptr});
      }
-@@ -1221,6 +1234,8 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1222,6 +1235,8 @@ struct IsolateLimits final: IsolateLimitEnforcer {
    std::shared_ptr<MemoryBudget> memory;
    mutable std::atomic<LimitCause> startupCause{LimitCause::NONE};
    mutable uint64_t startupCpu = 0;
@@ -753,7 +753,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
    v8::Isolate::CreateParams getCreateParams() override {
      v8::Isolate::CreateParams params;
      if (memory) {
-@@ -1234,6 +1249,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1235,6 +1250,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
    // Called with the isolate entered (Worker::Isolate, sourceJsonFailure): with the V8 sandbox,
    // its own sandbox must be secure before it runs any code.
    void customizeIsolate(v8::Isolate *value) override {
@@ -761,7 +761,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      server::requireSecureIsolateSandbox(value, sandboxName.c_str());
      if (memory) memory->install(value);
      if (!durableEvents) value->SetFatalErrorHandler(&nativeFatal);
-@@ -1259,6 +1275,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1260,6 +1276,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {
      std::atomic<LimitCause> localCause{LimitCause::NONE};
      uint64_t &totalCpu;
      std::atomic<LimitCause> &cause;
@@ -769,7 +769,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      kj::String identity;
      uint64_t start = nowNs(CLOCK_THREAD_CPUTIME_ID);
      FatalInvocation fatal;
-@@ -1267,14 +1284,19 @@ struct IsolateLimits final: IsolateLimitEnforcer {
+@@ -1268,14 +1285,19 @@ struct IsolateLimits final: IsolateLimitEnforcer {
          jsg::Lock &js,
          kj::OneOf<kj::Exception, kj::Duration> &result,
          bool startup)
@@ -793,7 +793,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
            execution(js.v8Isolate,
                cause,
                owner.memoryState,
-@@ -1704,6 +1726,38 @@ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
+@@ -1705,6 +1727,38 @@ kj::StringPtr executionIdentity(kj::StringPtr fallback) {
    return fallback;
  }
  
@@ -832,7 +832,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
  void noteUnsupported(kj::StringPtr feature) {
    if (IoContext::hasCurrent()) {
      auto &limits = static_cast<RequestLimits &>(IoContext::current().getLimitEnforcer());
-@@ -2462,10 +2516,7 @@ struct ThreadedServer {
+@@ -2507,10 +2561,7 @@ struct ThreadedServer {
            },
            durableNumber(std::string_view(this->identity).substr(colon + 1)));
      }
@@ -844,7 +844,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
      server::requireSecureSandbox();
      resources->reclaimWake = managerWake;
-@@ -3284,6 +3335,7 @@ struct ThreadedServer {
+@@ -3447,6 +3498,7 @@ struct ThreadedServer {
            workerLimit(descriptor, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"),
            invocationIdentity(slot, descriptor), slot.reservation, kj::mv(group));
        limits.sandboxName = slot.isolateLabel + "/source-json";
@@ -852,7 +852,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
        isolateCreationAttempts.fetch_add(1);
        KJ_IF_SOME(failure, sourceJsonFailure(content, limits)) {
          kj::throwRecoverableException(
-@@ -3389,10 +3441,13 @@ struct ThreadedServer {
+@@ -3552,10 +3604,13 @@ struct ThreadedServer {
          capnp::List<server::config::Extension>::Reader(), limits->getCreateParams(), group,
          kj::atomicRefcounted<JsgIsolateObserver>(), slot.cache, python);
      auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
@@ -866,7 +866,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
      slot.loadStage = threaded::LoadStage::EVALUATION;
      auto extracted = server::WorkerdApi::extractSource(name, config, flags.asReader(), reporter);
      reporter.requireValid();
-@@ -3469,6 +3524,9 @@ struct ThreadedServer {
+@@ -3632,6 +3687,9 @@ struct ThreadedServer {
      reporter.requireValid();
      uintptr_t isolateAddress = 0;
      worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock &lock) {
@@ -876,7 +876,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
        lock.validateHandlers(reporter);
        slot.loopbacks.assign(reporter.entrypoints.begin(), reporter.entrypoints.end());
        auto namespaces = field(descriptor, "nativeNamespaces");
-@@ -3491,8 +3549,6 @@ struct ThreadedServer {
+@@ -3654,8 +3712,6 @@ struct ThreadedServer {
          if (values.isArray()) base += values.getArray().size();
        }
        JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock &js) {
@@ -885,7 +885,7 @@ index 6e29114cde876b77b6b530da79df2d0f7d8222ea..50d3528218ccdc0a68e84b1fa3ab04e0
          capnp::MallocMessageBuilder arena;
          auto globals = arena.initRoot<capnp::List<server::Global>>(
              slot.loopbacks.size() + slot.loopbackActors.size());
-@@ -4737,8 +4793,8 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
+@@ -5405,8 +5461,8 @@ class BindingTarget final: public rpc::JsRpcTarget::Server {
      OomReportScope oom(identity, slot->limits->memoryMiB,
          slot->limits->memory ? &slot->limits->memory->heap : nullptr);
      worker.runInLockScope(asyncLock, [&](Worker::Lock &lock) {

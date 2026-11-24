@@ -37,6 +37,7 @@ void checkNodeLeaseMargin(const MembershipConfig& m) {
 void DurableLogConfig::validate() const {
   KJ_REQUIRE(alarmDiscoveryIntervalMs >= 200, "durableObjects.alarmDiscoveryIntervalMs is at least 200");
   KJ_REQUIRE(alarmTakeoverConcurrency > 0 && alarmTakeoverConcurrency <= 4, "durableObjects.alarmTakeoverConcurrency is between 1 and 4");
+  KJ_REQUIRE(versionDrainTimeoutMs > 0, "durableObjects.versionDrainTimeoutMs must be positive");
   KJ_REQUIRE(peers <= 8, "durableObjects.peers is at most 8");
   KJ_REQUIRE(confirmTimeoutMs >= 100 && confirmTimeoutMs <= 29000,
       "durableObjects.confirmTimeoutMs is between 100 and 29000 (workerd resets the object at 30 s)");
@@ -249,6 +250,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.durableProcesses = durable.getProcesses();
   result.durableLog.peers = durable.getPeers();
   result.durableLog.confirmTimeoutMs = durable.getConfirmTimeoutMs();
+  result.durableLog.versionDrainTimeoutMs = durable.getVersionDrainTimeoutMs();
   result.durableLog.recoverTimeoutMs = durable.getRecoverTimeoutMs();
   result.durableLog.segmentIntervalMs = durable.getSegmentIntervalMs();
   result.durableLog.segmentBytes = durable.getSegmentBytes();

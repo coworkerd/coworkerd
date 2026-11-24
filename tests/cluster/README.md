@@ -67,6 +67,21 @@ handler replaces the kernel's; the node logs V8's own location and message for i
 while the Worker loads cold in a new quarantine process, after its top level ran, where only the load's own scope
 names the Worker.
 
+To measure concurrent recovery on a fresh three-node cluster with default membership and rebuild settings:
+
+```sh
+node tests/cluster/recovery.mjs "$kernel" 200 loss
+node tests/cluster/recovery.mjs "$kernel" 1000 loss
+node tests/cluster/recovery.mjs "$kernel" 200 restart
+```
+
+The fixture writes distinct values to objects on 16 shards owned by one node. It kills that node and reads
+back every confirmed value. The restart mode starts the same container on its original volume immediately
+after the kill. Output includes the time from the kill request to detection or restart readiness, first,
+median and last successful reads, and samples of lease and recovery counters. The 200-object loss case
+requires all reads within 55 seconds of detection. To time an earlier build without that assertion, set
+`COWORKERD_RECOVERY_MEASURE_BASELINE=1` and point `COWORKERD_CLUSTER_BIN_DIR` at its Linux binaries.
+
 ## Measured time and resources
 
 A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose
@@ -91,11 +106,14 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
 | `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
+| `durable-slow-holder` | A TCP relay delays the previous holder's peer replies past the recovery deadline while the holder keeps its lease. The successor reports the waiting object and holder, then reads the confirmed value after the relay releases the replies. |
 | `durable-threaded-mixed` | HTTP and RPC replies on a threaded owner wait for upstream peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives the threaded node's drain and fires upstream. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
 | `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
 | `durable-threaded-alarm-fence` | A nonretrying abort clears its schedule, and a constructor exception consumes retries with backoff. When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. The successor stops dispatching a previously confirmed clear, and replacing an inherited schedule prevents it from firing at the old time. |
-| `durable-threaded-migration` | An open stream keeps its version pin during a class rename. The renamed class keeps its namespace, object ID and confirmed storage. Class deletion removes the namespace from admission. |
+| `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and both kinds of WebSocket close without replacing the durable process. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |
+| `durable-threaded-hibernation` | Two hibernatable connections stay live when the home releases the tree. Protocol pings and automatic replies work with zero actor sessions. An HTTP open restores both sockets, a message wakes them with tags and attachment intact, and a higher shard epoch closes both old connections. |
+| `durable-threaded-retirement` | A controllable home clock drives the ordinary socket deadline and the pending-work cutoff while a hibernatable transport survives with its attachment. The case exercises the HTTP-upgrade requirement, a send queued before the 101 response, a mutation during parking, and timeouts before and after park and adopt transfers. It also tests a reset while parked, a reset while attached, and a slow write before and during a park refusal. |
 
 Tests deploy code with `cowctl` and observe the product through ingress HTTP, `/v1` and documented management
 endpoints. The fixture disables stateless ingress forwarding so the CPU and process tests exercise the receiving

@@ -63,9 +63,11 @@ async function main(args) {
         fatalTestBinary: fatalTest ? resolve(testBinary) : undefined,
       });
     }
-    for (const [name, { test, nodes, membership, confirmTimeoutMs }] of gated) {
+    for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
+      delayRecoveryPeers }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
-        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs,
+        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
+        controlDurableLifecycle, delayRecoveryPeers,
       });
     }
     console.log(`${regular.length + gated.length} executed, ${failed} failed`);

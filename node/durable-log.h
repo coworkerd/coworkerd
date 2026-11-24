@@ -7,6 +7,7 @@
 #include "coworkerd.capnp.h"
 #include "membership.h"
 #include "object-store.h"
+#include "recovery-gate.h"
 #include "root-objects.h"
 
 #include <kj/async-io.h>
@@ -284,6 +285,39 @@ struct DurableTailTarget {
   uint64_t heartbeatUnixMs = 0, registeredUnixMs = 0, successorRegisteredUnixMs = 0;
   uint32_t durableProcesses = 1;
   bool timeVerified = false;
+  std::string key() const { return nodeId + "/" + destinationEpoch + "@" + address; }
+};
+
+struct DurableTailConnection {
+  DurableTailTarget target;
+  uint64_t generation = 0;
+  std::function<kj::Promise<DurableTailAnswer>(DurableTailAsk)> page;
+  std::function<void()> failed;
+  std::function<bool()> usable;
+};
+
+template <typename Transport, typename Fetch, typename Report>
+std::shared_ptr<DurableTailConnection> bindDurableTailConnection(DurableTailTarget target, kj::Rc<Transport> connection,
+    Fetch fetch, Report reportFailure) {
+  auto transport = std::make_shared<kj::Rc<Transport>>(kj::mv(connection));
+  auto handle = std::make_shared<DurableTailConnection>();
+  const auto epoch = target.destinationEpoch;
+  const auto generation = (*transport)->getGeneration();
+  handle->target = std::move(target);
+  handle->generation = generation;
+  handle->page = [transport, epoch, fetch = std::move(fetch)](DurableTailAsk ask) {
+    return fetch(transport, std::move(ask), epoch);
+  };
+  handle->failed = [transport, generation, report = std::move(reportFailure)]() {
+    if ((*transport)->markTailFailed()) report(generation);
+  };
+  handle->usable = [transport]() { return (*transport)->canFetchTails(); };
+  return handle;
+}
+
+struct DurableTailRound {
+  uint64_t tick;
+  bool final;
 };
 
 // One node's replicator: the channels to its durable processes, its log, its peers, its segments, the manifests of
@@ -332,7 +366,7 @@ public:
     // Whether the namespace is still a tenant's active one: a deleted class's or a deleted database's objects are
     // not served and stop counting against the tenant's storage.
     std::function<bool(const std::string& namespaceId)> namespaceActive;
-    std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget target, DurableTailAsk ask)> fetchTailAt;
+    std::function<kj::Promise<std::shared_ptr<DurableTailConnection>>(DurableTailTarget, DurableTailRound)> connectTail;
   };
   DurableLog(Settings settings, const ObjectStoreConfig& store, kj::Network& network, kj::Timer& timer,
       kj::LowLevelAsyncIoProvider& lowLevel, const MembershipView& membership, Hooks hooks);
@@ -399,6 +433,9 @@ public:
     uint64_t dataEpoch = 0, shardEpoch = 0;
     uint32_t shard = 0;
   };
+  void setActorResetHook(std::function<void(const ObjectIdentity&, std::string_view)> hook) {
+    actorResetHook = std::move(hook);
+  }
   struct ObjectReady {
     bool ready = true;
     uint status = 503;
@@ -419,6 +456,18 @@ public:
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
       uint64_t generation, std::string_view definition = {});
+  struct SocketTransition {
+    uint64_t attempt = 0;
+    bool accepted = false;
+  };
+  struct SocketOpenAuthority {
+    std::string process;
+    SocketTransition& park;
+    SocketTransition& adopt;
+  };
+  // The authority belongs to the WAL registration. Use it without yielding to the event loop.
+  std::optional<SocketOpenAuthority> authorizeSocketOpen(const ObjectIdentity&, uint64_t generation,
+      uint64_t openId);
   std::vector<std::string> drainThreadedNamespaces(const std::vector<std::string>& namespaces);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
@@ -469,8 +518,8 @@ public:
   static constexpr uint32_t FENCE_REREADS = 5;
   bool canAnswerRestoredTail(const DurableTailAsk& ask, const std::string& destinationEpoch,
       std::string* refusal = nullptr);
-  void setTailAtHook(std::function<kj::Promise<DurableTailAnswer>(DurableTailTarget, DurableTailAsk)> hook) {
-    hooks.fetchTailAt = std::move(hook);
+  void setTailConnectHook(decltype(Hooks::connectTail) hook) {
+    hooks.connectTail = std::move(hook);
   }
   void objectFailed(const std::string& namespaceId, const std::string& objectId, uint64_t shardEpoch,
       const std::string& step, const std::string& reason);
@@ -533,7 +582,7 @@ private:
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
     std::string threadedDefinition;
-    double definitionDrainStartedMs = 0;
+    kj::Maybe<kj::TimePoint> definitionDrainDeadline;
     struct Holders { uint64_t requests = 0, connections = 0; };
     std::map<std::string, Holders> holders;
     bool dispatchPending = false;
@@ -545,13 +594,10 @@ private:
     uint64_t recoveryShardEpoch = 0;
     std::set<std::pair<uint64_t, uint64_t>> lateTails;
     // Verified bytes survive failed publication and retries; they are released only after publication.
-    std::map<std::pair<uint64_t, uint64_t>, LogRecord> recoveryTails;
+    struct RetainedTail { LogRecord record; uint64_t ownerProof = 0; };
+    std::map<std::pair<uint64_t, uint64_t>, RetainedTail> recoveryTails;
     std::optional<uint64_t> recoveryManifestRevision;
     bool recoveryRevisionChanged = false;
-    std::map<std::string, DurableTailTarget> recoveryAddresses;
-    std::set<std::string> recoveryUnknownKeys;
-    bool recoveryDiscoveryCompleted = false;
-    std::map<uint64_t, std::pair<std::string, uint64_t>> recoveryEpochReads;
     // What each of its databases holds as its alarm (0: none), as the durable process reports it.
     std::map<uint32_t, uint64_t> alarms;
   };
@@ -597,6 +643,8 @@ private:
     struct Open {
       std::pair<uint64_t, uint64_t> position;
       uint64_t id = 0;
+      bool codeUpdateAsked = false;
+      SocketTransition socketPark, socketAdopt;
     };
     std::string processId;
     kj::Own<kj::AsyncIoStream> stream;
@@ -721,6 +769,8 @@ private:
   void sendToOpenChannels(uint8_t type, const std::string& key, const std::string& payload);
   kj::Promise<bool> closeThreadedObject(const std::string& objectName);
   void askClose(Channel& channel, uint64_t openId);
+  void askCodeUpdateClose(Channel& channel, Channel::Open& root, const Object& object);
+  kj::Promise<void> endDefinitionDrain(std::string objectName, std::string channelId, kj::TimePoint deadline);
   void answer(Channel& channel, uint64_t request, uint8_t status);
   void tellSealed(const std::string& key, uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void tellBreak(const std::string& key, const std::string& reason);
@@ -748,17 +798,18 @@ private:
   // COWORKERD_SLOW_FLUSH_FOR_TEST names a file; a confirmation flush that finds it sleeps the milliseconds it holds,
   // once, and removes it. Without the variable nothing is read.
   void slowFlushOnceForTest();
-  // Before a cut without a complete owner proof (fetchTails), each silent previous owner's heartbeat of that node epoch
-  // is read once: shared by every recovery that asks about the same epoch within OWNER_REREAD_MS.
+  // Before a cut without a complete owner proof, recoveries share observations of each silent holder's heartbeat.
   enum class OwnerHeartbeat : uint8_t { GONE, LIVE, UNKNOWN };
+  struct RebuildRun;
   static constexpr double OWNER_REREAD_MS = 1000;
+  static constexpr auto RECOVERY_WAKE_INTERVAL = 200 * kj::MILLISECONDS;
   struct CutHold {
     bool holding = false;
     double sinceMs = 0;
   };
   kj::Promise<bool> previousOwnersMayBeCut(std::string objectName, std::vector<std::pair<std::string, uint64_t>> owners,
-      CutHold& hold);
-  kj::Promise<OwnerHeartbeat> readOwnerHeartbeat(std::string nodeId, uint64_t epoch);
+      CutHold& hold, RebuildRun& run);
+  kj::Promise<OwnerHeartbeat> readOwnerHeartbeat(std::string nodeId, uint64_t epoch, double& probeAtMs);
   void isolate(const std::string& objectKey, uint64_t fromSeq, const std::string& reason);
   void isolateRecords(const std::vector<uint64_t>& dropped, const std::string& key, const std::string& reason);
   void isolateObjectPending(Object& object, const std::string& reason);
@@ -897,12 +948,33 @@ private:
   kj::Promise<void> readUsage();
 
   // ---- rebuilding an object ----
+  enum class RebuildPhase { QUEUED, PREPARING, TAILS, DEADLINE, OWNER, FINAL_TAILS, RESUMING, REPLAY };
+  struct RebuildRun {
+    bool background = false, reserved = false, reservedBackground = false;
+    RebuildPhase phase = RebuildPhase::QUEUED;
+    double phaseAtMs = 0, parkedAtMs = 0, queuedMs = 0;
+    size_t metadataBytes = 0;
+    std::string owner;
+    uint64_t ownerEpoch = 0;
+    double probeAtMs = 0;
+  };
+  static constexpr size_t REBUILD_METADATA_LIMIT = 16u << 20;
+  static constexpr size_t REBUILD_ENTRY_BYTES = 4096;
+  static constexpr kj::Exception::DetailTypeId REBUILD_METADATA_FULL = 0x636f777265636d65ull;
+  bool rebuildMetadataFits(size_t bytes, bool background) const;
+  void chargeRebuildMetadata(RebuildRun&, size_t);
+  void setRebuildPhase(RebuildRun&, RebuildPhase);
+  static const char* rebuildPhaseName(RebuildPhase);
+  std::string recoverySchedulerJson(double now) const;
+  kj::Promise<void> acquireRebuildSlot(const std::string&, RebuildRun&);
+  void releaseRebuildSlot(RebuildRun&);
   kj::Promise<void> rebuild(std::string objectName, std::string reason, bool background);
   void pumpRebuilds();
   void promoteRebuild(const std::string&);
-  kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason, double queuedMs = 0);
+  kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason, RebuildRun&);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
-  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
+  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest,
+      bool preparingLocally = false);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
       const std::string& staging, std::function<void()> check = {}, std::function<void(double)> observeFsync = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
@@ -910,11 +982,23 @@ private:
   kj::Promise<std::vector<LogRecord>> readSegments(const ObjectManifest& manifest, const std::string& objectName,
       SegmentReadStats* stats = nullptr);
   struct TailRecovery {
-    std::vector<LogRecord> records;
+    struct Source { uint64_t shardEpoch, nodeEpoch; bool ownerComplete; };
+    std::vector<Source> sources;
     bool cut = false, ownerSilent = false, sourceLogUnavailable = false;
     double collectionMs = 0;
   };
-  kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, uint64_t snapshotShardEpoch, double startedMs);
+  struct TailDiscovery {
+    std::map<std::string, DurableTailTarget> addresses;
+    std::set<std::string> unresolved;
+    bool complete = false;
+  };
+  kj::Promise<std::shared_ptr<const TailDiscovery>> discoverTailTargets();
+  kj::Promise<std::shared_ptr<const TailDiscovery>> tailTargets();
+  kj::Promise<std::shared_ptr<const ObjectResponse>> readRecoveryEpoch(std::string key, bool preparingLocally = false);
+  kj::Promise<ObjectResponse> readRecoveryMetadata(std::string key, uint32_t timeoutMs);
+  kj::Promise<void> recoveryWake();
+  kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, const std::optional<ObjectManifest>& manifest,
+      double startedMs, RebuildRun&, kj::Own<kj::PromiseFulfiller<bool>> localPreparation = {});
   void noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch);
   kj::Promise<void> publishRecovery(std::string objectName, const std::vector<LogRecord>& records);
   kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false,
@@ -1022,6 +1106,7 @@ private:
   // process. Keep the boundary even when no object of an epoch is resident.
   std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
   std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
+  std::function<void(const ObjectIdentity&, std::string_view)> actorResetHook;
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
   std::set<std::string> activeThreadedAlarms;     // held even if the running handler deletes its schedule
@@ -1060,11 +1145,26 @@ private:
   uint64_t threadedHomeOpenSamples = 0, threadedHomeOpenMaxNs = 0;
   uint64_t threadedHomeCheckpointSamples = 0, threadedHomeCheckpointMaxNs = 0;
   uint64_t threadedHomeCheckpointMaxWalBytes = 0;
+  RecoveryGate recoveryMetadata{timer, 2, 16, 4};
+  RecoveryGate tailPages{timer, settings.config.recoverParallelism};
   struct OwnerRead {
     kj::ForkedPromise<OwnerHeartbeat> answer;
-    double atMs;
+    std::shared_ptr<double> settledAtMs;
+    double startedMs;
   };
   std::map<std::pair<std::string, uint64_t>, OwnerRead> ownerReads;
+  struct EpochRead {
+    kj::ForkedPromise<std::shared_ptr<const ObjectResponse>> answer;
+    std::shared_ptr<double> freshUntilMs;
+  };
+  std::map<std::string, EpochRead> recoveryEpochReads;
+  std::optional<kj::ForkedPromise<std::shared_ptr<const TailDiscovery>>> recoveryDiscovery;
+  std::shared_ptr<const TailDiscovery> lastTailDiscovery;
+  double recoveryDiscoveryAtMs = 0;
+  bool recoveryDiscovering = false;
+  std::optional<kj::ForkedPromise<void>> recoveryWakeTick;
+  kj::TimePoint recoveryWakeAt = kj::origin<kj::TimePoint>();
+  uint64_t recoveryRound = 0;
   std::function<AlarmNamespace(const std::string&)> alarmNamespace;
   std::function<std::string(const DurableAlarm&)> alarmDestination;
   kj::Promise<void> alarmTimer = nullptr;double alarmTimerAt = 0;
@@ -1090,13 +1190,6 @@ private:
   std::map<uint64_t, InFlight> inFlight;         // nodeSeq -> what waits for its peers
   std::map<uint64_t, PeerBuffer> incoming;       // streamId -> what this node buffers as a peer
   uint64_t nextStreamId = 0, incomingBytes = 0;
-  // All objects share the transfer concurrency used to size a tail page's budget.
-  uint32_t activeTailFetches = 0;
-  struct TailFetchWaiter {
-    kj::Own<kj::PromiseFulfiller<void>> ready;
-    bool* acquired = nullptr;  // Valid while ready has a waiting observer.
-  };
-  std::deque<TailFetchWaiter> tailFetchWaiters;
   // Healing pins this logical object's manifest revision. Existing local
   // background writes finish first; new ones keep their records for resealing.
   struct ManifestGate {
@@ -1109,13 +1202,16 @@ private:
   // Rebuild slots must outlive the coroutine guards in rebuilding.
   uint32_t activeRebuilds = 0;
   uint32_t activeBackgroundRebuilds = 0;
+  size_t rebuildMetadataLimit = REBUILD_METADATA_LIMIT;
+  size_t rebuildMetadataBytes = 0, peakRebuildMetadataBytes = 0, backgroundRebuildMetadataBytes = 0;
+  uint64_t rebuildMetadataRefusals = 0;
+  std::map<std::string, RebuildRun*> rebuildRuns;
   bool nextBackgroundRebuild = true;
   uint64_t foregroundRebuilds = 0, backgroundRebuilds = 0;
   uint64_t rebuildPromotions = 0, rebuildWaitSerial = 0;
   struct RebuildWaiter {
     kj::Own<kj::PromiseFulfiller<void>> ready;
-    bool* acquired = nullptr;  // Valid while ready has a waiting observer.
-    bool* background = nullptr;
+    RebuildRun* run = nullptr;  // Valid while ready has a waiting observer.
     std::string objectName;uint64_t ticket = 0;
   };
   // KJ exposes the observer check isWaiting() through a non-const interface.
