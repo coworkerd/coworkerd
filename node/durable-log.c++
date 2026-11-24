@@ -777,10 +777,11 @@ kj::Promise<bool> DatabaseReplay::finishAsync() {
 namespace {
 // Messages from a durable process (patches/workerd 0013, coworkerd-wal-shipper.h).
 constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOINT = 4, FROM_RESET = 5,
-                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10;
+                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10,
+                  FROM_ACTOR_RESET = 11;
 // Messages to one.
 constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6,
-                  TO_OPENED = 7;
+                  TO_OPENED = 7, TO_CLOSE_FOR_CODE_UPDATE = 8;
 constexpr uint32_t THREADED_WAL_REVISION = 1;
 // An answer's status.
 constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA = 4;
@@ -2200,14 +2201,21 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       }
       if (openId != 0) {
         const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
-            (facetId == 0 && object->definitionDrainStartedMs != 0);
+            (facetId == 0 && object->definitionDrainDeadline != kj::none);
         const bool authorized = object->state == ObjectState::LOCAL && !fenced;
         std::string opened;
         putU8(opened, TO_OPENED);
         putU64(opened, openId);
         putU8(opened, authorized ? ACK_OK : ACK_UNAVAILABLE);
         sendToChannel(channel, std::move(opened));
-        if (fenced && facetId == 0) askClose(channel, openId);
+        if (fenced && facetId == 0) {
+          if (const auto deadline = object->definitionDrainDeadline;
+              deadline != kj::none && timer.now() >= KJ_ASSERT_NONNULL(deadline)) {
+            askCodeUpdateClose(channel, channel.openFacets.at(key), *object);
+          } else {
+            askClose(channel, openId);
+          }
+        }
       }
       return;
     }
@@ -2358,6 +2366,17 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       const auto atUnixMs = in.u64();
       if (!in.ok) return;
       alarmReported(objectName, facetId, set ? atUnixMs : 0);
+      return;
+    }
+    case FROM_ACTOR_RESET: {
+      const auto objectName = in.text();
+      const auto code = in.text();
+      if (!in.ok || in.at != message.size() || openId == 0 ||
+          !isCurrentOpen(objectName + "/0")) return;
+      const auto* object = objectOf(objectName);
+      if (object == nullptr || object->dispatchedChannel != channel.processId || !actorResetHook) return;
+      actorResetHook({object->namespaceId, object->objectId, object->tenant, object->dataEpoch,
+          object->shardEpoch, object->shard}, code);
       return;
     }
     case FROM_RESIDENCY: {
@@ -4637,22 +4656,27 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
   }
   if (!definition.empty() && !object->threadedDefinition.empty() &&
-      (definition != object->threadedDefinition || object->definitionDrainStartedMs != 0)) {
-    const auto now = monotonicTimeMs();
+      (definition != object->threadedDefinition || object->definitionDrainDeadline != kj::none)) {
     auto old = channels.find(object->dispatchedChannel);
     if (old != channels.end()) {
-      if (object->definitionDrainStartedMs == 0) object->definitionDrainStartedMs = now;
       if (auto open = old->second.openFacets.find(object->objectName + "/0"); open != old->second.openFacets.end())
         askClose(old->second, open->second.id);
-      const bool holdsCalls = hasLiveHolders(*object);
-      if (!old->second.open || hasLiveOpenFacets(*object) || holdsCalls || object->dispatchPending) {
+      const bool closeUnacknowledged =
+          !old->second.open || hasLiveOpenFacets(*object) || object->dispatchPending;
+      if (closeUnacknowledged || hasLiveHolders(*object)) {
+        if (object->definitionDrainDeadline == kj::none) {
+          auto deadline = timer.now() + settings.config.versionDrainTimeoutMs * kj::MILLISECONDS;
+          object->definitionDrainDeadline = deadline;
+          tasks.add(endDefinitionDrain(object->objectName, old->first, deadline));
+        }
         ObjectReady result{false, 503, "DO_VERSION_DRAINING", "the previous Durable Object definition is draining"};
-        result.generationMustClose = !holdsCalls &&
-            now - object->definitionDrainStartedMs >= settings.config.confirmTimeoutMs;
+        result.generationMustClose = closeUnacknowledged &&
+            timer.now() >= KJ_ASSERT_NONNULL(object->definitionDrainDeadline) +
+                settings.config.confirmTimeoutMs * kj::MILLISECONDS;
         return result;
       }
     }
-    object->definitionDrainStartedMs = 0;
+    object->definitionDrainDeadline = kj::none;
   }
   if (auto error = prepareOpen(*object, &target))
     return {false, 503, "STORAGE_UNAVAILABLE", *error};
@@ -4739,6 +4763,10 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     rebuildCancelers.erase(objectName);
     settledRebuilds.erase(objectName);
   }
+  if (!objects.contains(objectName) && !rebuildMetadataFits(REBUILD_ENTRY_BYTES, background)) {
+    ++rebuildMetadataRefusals;
+    co_return ObjectReady{false, 503, "DO_RECOVERING", "the node's recovery metadata budget is full"};
+  }
   auto& object = objects[objectName];
   if (object.objectName.empty()) {
     object.objectName = objectName;
@@ -4785,6 +4813,10 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
       ? object.repairReason
       : std::string("this node has not served the object at this data epoch");
   if (rebuilding.find(objectName) == rebuilding.end()) {
+    if (!rebuildMetadataFits(REBUILD_ENTRY_BYTES, background)) {
+      ++rebuildMetadataRefusals;
+      co_return ObjectReady{false, 503, "DO_RECOVERING", "the node's recovery metadata budget is full"};
+    }
     auto canceler = std::make_unique<kj::Canceler>();
     auto operation = rebuild(objectName, reason, background);
     auto counted = kj::mv(operation).catch_([this, identity, objectName](kj::Exception&& error) {
@@ -4812,6 +4844,9 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     if (auto* current = objectOf(objectName); current == nullptr || current->state == ObjectState::GONE ||
         current->shardEpoch != identity.shardEpoch)
       co_return ObjectReady{false, 409, "DO_SHARD_EPOCH_MISMATCH", "ownership changed during recovery",
+          monotonicTimeMs() - start};
+    if (error.getDetail(REBUILD_METADATA_FULL) != kj::none)
+      co_return ObjectReady{false, 503, "DO_RECOVERING", "the node's recovery metadata budget is full",
           monotonicTimeMs() - start};
     co_return ObjectReady{false, 503, "STORAGE_UNAVAILABLE",
         "the object could not be rebuilt from its replicated history", monotonicTimeMs() - start};
@@ -4858,12 +4893,18 @@ kj::Promise<void> DurableLog::waitForAlarmRebuild(const std::string& ns, const s
   return it->second.addBranch();
 }
 void DurableLog::promoteRebuild(const std::string& name) {
+  auto run = rebuildRuns.find(name);
+  if (run == rebuildRuns.end() || !run->second->background) return;
+  backgroundRebuildMetadataBytes -= run->second->metadataBytes;
+  run->second->background = false;
+  ++rebuildPromotions;
   auto it = queuedRebuildIndex.find(name);
   if (it == queuedRebuildIndex.end() || !it->second.background) return;
   auto row = it->second.row;
   if (!row->ready->isWaiting()) { backgroundRebuildWaiters.erase(row);queuedRebuildIndex.erase(it);return; }
-  *row->background = false;rebuildWaiters.splice(rebuildWaiters.end(), backgroundRebuildWaiters, row);
-  it->second.background = false;++rebuildPromotions;pumpRebuilds();
+  rebuildWaiters.splice(rebuildWaiters.end(), backgroundRebuildWaiters, row);
+  it->second.background = false;
+  pumpRebuilds();
 }
 void DurableLog::pumpRebuilds() {
   const auto width = std::max<uint32_t>(1, settings.config.rebuildConcurrency);
@@ -4890,34 +4931,109 @@ void DurableLog::pumpRebuilds() {
     ++activeRebuilds;if (pickBackground) ++activeBackgroundRebuilds;
     nextBackgroundRebuild = !pickBackground;
     // Reserve before waking so cancellation before resumption returns this class's slot too.
-    *next.acquired = true;next.ready->fulfill();
+    next.run->reserved = true;
+    next.run->reservedBackground = pickBackground;
+    next.ready->fulfill();
   }
 }
-kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason, bool background) {
-  const auto done = kj::defer([this, objectName]() { settledRebuilds.insert(objectName); });
-  bool active = false;
-  const auto release = kj::defer([&]() {
-    if (!active) return;
-    --activeRebuilds;
-    if (background) --activeBackgroundRebuilds;
-    pumpRebuilds();
-  });
+void DurableLog::releaseRebuildSlot(RebuildRun& run) {
+  if (!run.reserved) return;
+  run.reserved = false;
+  --activeRebuilds;
+  if (run.reservedBackground) --activeBackgroundRebuilds;
+  if (!stopped) pumpRebuilds();
+}
+
+bool DurableLog::rebuildMetadataFits(size_t bytes, bool background) const {
+  // Keep a quarter of the budget available to requests during alarm takeover.
+  return bytes <= rebuildMetadataLimit - rebuildMetadataBytes &&
+      (!background || bytes <= rebuildMetadataLimit * 3 / 4 - backgroundRebuildMetadataBytes);
+}
+
+void DurableLog::chargeRebuildMetadata(RebuildRun& run, size_t bytes) {
+  if (!rebuildMetadataFits(bytes, run.background)) {
+    ++rebuildMetadataRefusals;
+    auto error = KJ_EXCEPTION(OVERLOADED, "the node's recovery metadata budget is full");
+    error.setDetail(REBUILD_METADATA_FULL, kj::heapArray<kj::byte>(0));
+    throw kj::mv(error);
+  }
+  run.metadataBytes += bytes;
+  rebuildMetadataBytes += bytes;
+  if (run.background) backgroundRebuildMetadataBytes += bytes;
+  peakRebuildMetadataBytes = std::max(peakRebuildMetadataBytes, rebuildMetadataBytes);
+}
+
+void DurableLog::setRebuildPhase(RebuildRun& run, RebuildPhase phase) {
+  if (run.phase == phase) return;
+  run.phase = phase;
+  run.phaseAtMs = monotonicTimeMs();
+}
+
+const char* DurableLog::rebuildPhaseName(RebuildPhase phase) {
+  switch (phase) {
+    case RebuildPhase::QUEUED: return "queued";
+    case RebuildPhase::PREPARING: return "preparing";
+    case RebuildPhase::TAILS: return "tail-collection";
+    case RebuildPhase::DEADLINE: return "deadline";
+    case RebuildPhase::OWNER: return "owner";
+    case RebuildPhase::FINAL_TAILS: return "final-tails";
+    case RebuildPhase::RESUMING: return "resuming";
+    case RebuildPhase::REPLAY: return "replay";
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::Promise<void> DurableLog::acquireRebuildSlot(const std::string& name, RebuildRun& run) {
   auto available = kj::newPromiseAndFulfiller<void>();
-  auto& queue = background ? backgroundRebuildWaiters : rebuildWaiters;
+  auto& queue = run.background ? backgroundRebuildWaiters : rebuildWaiters;
   const auto ticket = ++rebuildWaitSerial;
-  queue.push_back({kj::mv(available.fulfiller), &active, &background, objectName, ticket});
-  queuedRebuildIndex.insert_or_assign(objectName, QueuedRebuild{background, ticket, std::prev(queue.end())});
+  queue.push_back({kj::mv(available.fulfiller), &run, name, ticket});
+  queuedRebuildIndex.emplace(name, QueuedRebuild{run.background, ticket, std::prev(queue.end())});
+  const auto removeWaiter = kj::defer([&]() {
+    auto found = queuedRebuildIndex.find(name);
+    if (found == queuedRebuildIndex.end() || found->second.ticket != ticket) return;
+    auto& pending = found->second.background ? backgroundRebuildWaiters : rebuildWaiters;
+    pending.erase(found->second.row);
+    queuedRebuildIndex.erase(found);
+  });
   const auto queuedAt = monotonicTimeMs();
-  pumpRebuilds();co_await kj::mv(available.promise);
-  const auto queuedMs = monotonicTimeMs() - queuedAt;
-  if (background) ++backgroundRebuilds;else ++foregroundRebuilds;
+  pumpRebuilds();
+  co_await kj::mv(available.promise);
+  run.queuedMs += monotonicTimeMs() - queuedAt;
+}
+
+kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason, bool background) {
+  RebuildRun run;
+  run.background = background;
+  run.phaseAtMs = monotonicTimeMs();
+  const auto done = kj::defer([&]() {
+    releaseRebuildSlot(run);
+    rebuildMetadataBytes -= run.metadataBytes;
+    if (run.background) backgroundRebuildMetadataBytes -= run.metadataBytes;
+    rebuildRuns.erase(objectName);
+    settledRebuilds.insert(objectName);
+  });
+  chargeRebuildMetadata(run, REBUILD_ENTRY_BYTES);
+  rebuildRuns.emplace(objectName, &run);
+  co_await acquireRebuildSlot(objectName, run);
+  if (run.reservedBackground) ++backgroundRebuilds;
+  else ++foregroundRebuilds;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
   const auto targetEpoch = object->shardEpoch, targetDataEpoch = object->dataEpoch;
   for (uint32_t attempt = 1; attempt <= MANIFEST_ATTEMPTS; ++attempt) {
+    if (!run.reserved) {
+      setRebuildPhase(run, RebuildPhase::RESUMING);
+      co_await acquireRebuildSlot(objectName, run);
+      object = objectOf(objectName);
+      KJ_REQUIRE(object && object->state == ObjectState::REBUILDING &&
+          object->shardEpoch == targetEpoch && object->dataEpoch == targetDataEpoch,
+          "ownership changed before retrying recovery");
+      run.parkedAtMs = 0;
+    }
     object->recoveryRevisionChanged = false;
     try {
-      co_await rebuildAttempt(objectName, reason, attempt == 1 ? queuedMs : 0);
+      co_await rebuildAttempt(objectName, reason, run);
       co_return;
     } catch (const kj::Exception& error) {
       object = objectOf(objectName);
@@ -4933,24 +5049,35 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
 }
 
 kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectName,
-    const std::optional<ObjectManifest>& manifest) {
+    const std::optional<ObjectManifest>& manifest, bool preparingLocally) {
   if (!manifest) co_return 0;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared before its lower-bound check");
-  const auto namespaceId = object->namespaceId;const auto shard = object->shard;
-  ObjectResponse response{200, {}};
-  if (auto cached = object->recoveryEpochReads.find(manifest->shardEpoch); cached != object->recoveryEpochReads.end()) {
-    response.bytes = cached->second.first;response.lastModifiedUnixMs = cached->second.second;
-  } else {
-    response = co_await timer.timeoutAfter(std::max(settings.peerTimeoutMs, settings.config.confirmTimeoutMs) * kj::MILLISECONDS,
-        store->get(shardEpochKey(namespaceId, shard, manifest->shardEpoch)));
-  }
-  const auto epoch = response.status == 200 ? parseShardEpoch(response.bytes) : std::nullopt;
+  const auto namespaceId = object->namespaceId;
+  const auto shard = object->shard;
+  const auto response = co_await readRecoveryEpoch(shardEpochKey(namespaceId, shard, manifest->shardEpoch), preparingLocally);
+  const auto epoch = parseShardEpoch(response->bytes);
   requireStorage(epoch && epoch->epoch == manifest->shardEpoch && epoch->namespaceId == namespaceId && epoch->shard == shard,
       "the latest manifest's ownership origin is unavailable");
-  object = objectOf(objectName);KJ_REQUIRE(object != nullptr, "the lower-bound object disappeared");
-  object->recoveryEpochReads.try_emplace(epoch->epoch, response.bytes, response.lastModifiedUnixMs);
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
+}
+
+std::optional<DurableLog::SocketOpenAuthority> DurableLog::authorizeSocketOpen(
+    const ObjectIdentity& identity, uint64_t generation, uint64_t openId) {
+  const auto key = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
+  auto found = objects.find(key);
+  const auto* object = found == objects.end() ? nullptr : &found->second;
+  if (!object || object->state != ObjectState::LOCAL || object->shardEpoch != identity.shardEpoch ||
+      object->definitionDrainDeadline != kj::none) return std::nullopt;
+  auto channel = channels.find(object->dispatchedChannel);
+  if (channel == channels.end() || !channel->second.open || channel->second.draining ||
+      generation != channel->second.threadedGeneration || openId == 0 ||
+      channel->second.closeAsked.contains(openId)) return std::nullopt;
+  auto registration = channel->second.openFacets.find(key + "/0");
+  if (registration == channel->second.openFacets.end() || registration->second.id != openId)
+    return std::nullopt;
+  return SocketOpenAuthority{channel->first.substr(0, channel->first.rfind('-')),
+      registration->second.socketPark, registration->second.socketAdopt};
 }
 
 void DurableLog::askClose(Channel& channel, uint64_t openId) {
@@ -4959,6 +5086,30 @@ void DurableLog::askClose(Channel& channel, uint64_t openId) {
   putU8(message, TO_CLOSE);
   putU64(message, openId);
   sendToChannel(channel, std::move(message));
+}
+
+void DurableLog::askCodeUpdateClose(Channel& channel, Channel::Open& root, const Object& object) {
+  if (root.codeUpdateAsked) return;
+  root.codeUpdateAsked = true;
+  std::string message;
+  putU8(message, TO_CLOSE_FOR_CODE_UPDATE);
+  putU64(message, root.id);
+  sendToChannel(channel, std::move(message));
+  log("version-drain-expired", "\"object\":" + quote(object.objectName));
+}
+
+kj::Promise<void> DurableLog::endDefinitionDrain(std::string objectName, std::string channelId,
+    kj::TimePoint deadline) {
+  co_await timer.atTime(deadline);
+  const auto* object = objectOf(objectName);
+  if (object == nullptr || object->state != ObjectState::LOCAL || object->definitionDrainDeadline != deadline ||
+      object->dispatchedChannel != channelId) co_return;
+  auto channel = channels.find(channelId);
+  if (channel == channels.end() || !channel->second.open) co_return;
+  auto root = channel->second.openFacets.find(objectName + "/0");
+  // An open still preparing its WAL registers separately. The registration
+  // path checks this same deadline before accepting that open.
+  if (root != channel->second.openFacets.end()) askCodeUpdateClose(channel->second, root->second, *object);
 }
 
 kj::Promise<bool> DurableLog::closeThreadedObject(const std::string& objectName) {
@@ -4990,8 +5141,16 @@ kj::Promise<bool> DurableLog::closeThreadedObject(const std::string& objectName)
   }
 }
 
-kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason, double queuedMs) {
+kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string reason, RebuildRun& run) {
+  KJ_REQUIRE(run.reserved);
+  setRebuildPhase(run, RebuildPhase::PREPARING);
   const auto start = monotonicTimeMs();
+  const auto metadataBefore = run.metadataBytes;
+  const auto releaseAttemptMetadata = kj::defer([&]() {
+    rebuildMetadataBytes -= run.metadataBytes - metadataBefore;
+    if (run.background) backgroundRebuildMetadataBytes -= run.metadataBytes - metadataBefore;
+    run.metadataBytes = metadataBefore;
+  });
   // Where this attempt's time goes, consecutive laps of the same clock (logged with `rebuilt`).
   struct Laps { double setup = 0, manifest = 0, snapshot = 0, segments = 0, local = 0, tailWait = 0, latest = 0,
       prepare = 0, replay = 0, files = 0, publish = 0, markers = 0; };
@@ -5013,8 +5172,6 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       object->recoveryStartedMs = start;
       object->recoveryShardEpoch = object->shardEpoch;
       object->lateTails.clear();
-      object->recoveryAddresses.clear();object->recoveryUnknownKeys.clear();object->recoveryEpochReads.clear();
-      object->recoveryDiscoveryCompleted = false;
     }
     tailStart = object->recoveryStartedMs;
     const bool repair = object->state == ObjectState::REPAIR;
@@ -5043,10 +5200,11 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
   const auto targetEpoch = object->shardEpoch;
   const auto targetDataEpoch = object->dataEpoch;
+  const auto generation = object->rebuildGeneration;
   auto check = [&]() {
     object = objectOf(objectName);
     KJ_REQUIRE(object != nullptr && object->state == ObjectState::REBUILDING &&
-        object->shardEpoch == targetEpoch && object->dataEpoch == targetDataEpoch &&
+        object->shardEpoch == targetEpoch && object->dataEpoch == targetDataEpoch && object->rebuildGeneration == generation &&
         !ownerFenced(object->namespaceId, object->shard, targetEpoch) && !recoveryWriteFailed,
         "ownership changed during object recovery");
   };
@@ -5067,15 +5225,29 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lap(laps.setup);
   auto manifest = co_await readManifest(object->namespaceId, object->objectId);
   check();
-  const auto initialLowerBound = co_await recoveryLowerBound(objectName, manifest);
-  check();
+  if (manifest) {
+    size_t bytes = manifest->isolated.capacity() * sizeof(manifest->isolated.front()) +
+        manifest->facets.capacity() * sizeof(ManifestFacet) + manifest->segments.capacity() * sizeof(ManifestSegment);
+    for (const auto& facet : manifest->facets) bytes += facet.name.size() + facet.sha256.size();
+    for (const auto& segment : manifest->segments) bytes += segment.nodeId.size();
+    chargeRebuildMetadata(run, bytes);
+  }
   lap(laps.manifest);
   std::vector<ManifestFacet> facets;
   uint64_t fromSeq = 0;
   object->recoveryManifestRevision = manifest ? manifest->revision : 0;
+  // A trusted restart on the original disk can prove its own source epochs
+  // during preparation. Remote, missing or incomplete sources park as usual.
+  kj::Maybe<kj::Promise<bool>> preparedLocally;
+  kj::Own<kj::PromiseFulfiller<bool>> localPreparation;
+  if (diskTrusted && sameBootCache && targetDataEpoch < targetEpoch) {
+    auto prepared = kj::newPromiseAndFulfiller<bool>();
+    preparedLocally = kj::mv(prepared.promise);
+    localPreparation = kj::mv(prepared.fulfiller);
+  }
   auto collecting = fetchTails(ObjectIdentity{object->namespaceId, object->objectId, object->tenant,
       object->dataEpoch, object->shardEpoch, object->shard},
-      initialLowerBound, tailStart).eagerlyEvaluate(nullptr);
+      manifest, tailStart, run, kj::mv(localPreparation)).eagerlyEvaluate(nullptr);
   if (manifest) {
     if (manifest->shardEpoch > object->shardEpoch) {
       object->state = ObjectState::GONE;
@@ -5099,6 +5271,26 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     }
   }
   lap(laps.snapshot);
+  bool localProof = false;
+  KJ_IF_SOME(prepared, preparedLocally) {
+    localProof = co_await kj::mv(prepared);
+    check();
+  }
+  if (!localProof) {
+    // The staging image stays private while the collector waits for evidence.
+    setRebuildPhase(run, RebuildPhase::TAILS);
+    run.parkedAtMs = monotonicTimeMs();
+    releaseRebuildSlot(run);
+  }
+  auto tails = co_await kj::mv(collecting);
+  if (!localProof) {
+    setRebuildPhase(run, RebuildPhase::RESUMING);
+    co_await acquireRebuildSlot(objectName, run);
+  }
+  check();
+  run.parkedAtMs = 0;
+  lap(laps.tailWait);
+  setRebuildPhase(run, RebuildPhase::REPLAY);
   std::vector<LogRecord> history;
   if (manifest) history = co_await readSegments(*manifest, object->namespaceId + "/" + object->objectId, &segmentStats);
   check();
@@ -5143,9 +5335,6 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     }
   }
   lap(laps.local);
-  auto tails = co_await kj::mv(collecting);
-  check();
-  lap(laps.tailWait);
   auto latest = co_await readManifest(object->namespaceId, object->objectId);
   check();
   if (latest && (!manifest || latest->revision > manifest->revision)) {
@@ -5173,7 +5362,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lap(laps.latest);
   object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
-  const auto lowerBound = co_await recoveryLowerBound(objectName, manifest);
+  const auto lowerBound = co_await recoveryLowerBound(objectName, manifest, true);
   check();
   std::set<std::pair<uint64_t, uint64_t>> drop;
   uint64_t snapshotShardEpoch = 0;
@@ -5200,10 +5389,10 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     if (localUnsealed.contains(position) && !durableRecords.contains(position) && !drop.contains(position) && !coveredBySnapshot(record))
       adopted.push_back(record);
   }
-  for (auto& record : tails.records) {
-    if (record.shardEpoch < lowerBound) { noteLateTail(objectName, record, lowerBound);continue; }
+  auto appendTail = [&](const LogRecord& record) {
+    if (record.shardEpoch < lowerBound) { noteLateTail(objectName, record, lowerBound);return; }
     const auto position = std::make_pair(record.shardEpoch, record.nodeSeq);
-    if (drop.contains(position)) continue;
+    if (drop.contains(position)) return;
     bool covered = record.shardEpoch < snapshotShardEpoch;
     if (!covered && record.shardEpoch == snapshotShardEpoch) {
       auto facet = std::find_if(facets.begin(), facets.end(), [&](const ManifestFacet& f) {
@@ -5215,10 +5404,18 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
       if (record.shardEpoch < snapshotShardEpoch) {
         noteLateTail(objectName, record, snapshotShardEpoch);
       }
-      continue;
+      return;
     }
     if (!durableRecords.contains(position)) adopted.push_back(record);
-    history.push_back(std::move(record));
+    history.push_back(record);
+  };
+  for (const auto& source : tails.sources) {
+    auto entry = object->recoveryTails.lower_bound({source.shardEpoch, 0});
+    for (; entry != object->recoveryTails.end() && entry->first.first == source.shardEpoch; ++entry) {
+      const auto& tail = entry->second;
+      if (tail.record.nodeEpoch != source.nodeEpoch || (source.ownerComplete && tail.ownerProof != generation.second)) continue;
+      appendTail(tail.record);
+    }
   }
   // Finish and synchronize the new image before touching any original file or facet entry.
   for (const auto& record : history) stagingFacets.insert(record.facetId);
@@ -5300,8 +5497,6 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   object->state = ObjectState::LOCAL;
   object->recoveryStartedMs = 0;
   object->recoveryTails.clear();
-  object->recoveryAddresses.clear();object->recoveryUnknownKeys.clear();object->recoveryEpochReads.clear();
-  object->recoveryDiscoveryCompleted = false;
   object->recoveryManifestRevision.reset();
   object->lateTails.clear();
   object->repairReason.clear();
@@ -5314,7 +5509,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lap(laps.markers);
   log("rebuilt", "\"object\":" + quote(objectName) + ",\"ms\":" + std::to_string(lastRebuildMs) + ",\"manifest\":\"" +
           std::to_string(object->manifestRevision) + "\",\"snapshot\":\"" + std::to_string(object->snapshotSequence) +
-          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\",\"queueMs\":" + std::to_string(queuedMs) +
+          "\",\"fromSeq\":\"" + std::to_string(fromSeq) + "\",\"queueMs\":" + std::to_string(run.queuedMs) +
           ",\"loopDelayMs\":" + std::to_string(lastRebuildLoopDelayMs) +
           ",\"laps\":{\"setupMs\":" + std::to_string(laps.setup) + ",\"manifestMs\":" + std::to_string(laps.manifest) +
           ",\"snapshotMs\":" + std::to_string(laps.snapshot) + ",\"segmentsMs\":" + std::to_string(laps.segments) +
@@ -5378,14 +5573,176 @@ void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& re
 
 // Collect each source epoch from its original owner and all known holder addresses.
 // Only the original process can prove completeness; otherwise publish a cut at the deadline.
+kj::Promise<ObjectResponse> DurableLog::readRecoveryMetadata(std::string key, uint32_t timeoutMs) {
+  auto permit = co_await recoveryMetadata.acquire();
+  co_return co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, store->get(std::move(key)));
+}
+
+kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch(std::string key, bool preparingLocally) {
+  constexpr size_t MAX_CACHED_EPOCHS = 1024;
+  const auto now = monotonicTimeMs();
+  if (auto found = recoveryEpochReads.find(key); found != recoveryEpochReads.end()) {
+    if (*found->second.freshUntilMs == 0 || now < *found->second.freshUntilMs)
+      return found->second.answer.addBranch();
+    recoveryEpochReads.erase(found);
+  }
+  if (recoveryEpochReads.size() >= MAX_CACHED_EPOCHS) {
+    auto settled = std::find_if(recoveryEpochReads.begin(), recoveryEpochReads.end(), [](const auto& item) {
+      return *item.second.freshUntilMs != 0;
+    });
+    if (settled != recoveryEpochReads.end()) recoveryEpochReads.erase(settled);
+  }
+  auto read = [](DurableLog& self, std::string key, std::shared_ptr<double> freshUntil, bool preparingLocally)
+      -> kj::Promise<std::shared_ptr<const ObjectResponse>> {
+    const auto markFailure = kj::defer([&]() {
+      if (*freshUntil == 0) *freshUntil = monotonicTimeMs() + RECOVERY_WAKE_INTERVAL / kj::MILLISECONDS;
+    });
+    const auto limit = std::max(self.settings.peerTimeoutMs, self.settings.config.confirmTimeoutMs);
+    ObjectResponse result;
+    if (preparingLocally) {
+      result = co_await self.timer.timeoutAfter(limit * kj::MILLISECONDS, self.store->get(std::move(key)));
+    } else {
+      result = co_await self.readRecoveryMetadata(std::move(key), limit);
+    }
+    requireStorage(result.status == 200 && result.bytes.size() <= 4096, "a source shard epoch is unavailable");
+    *freshUntil = monotonicTimeMs() + 60000;
+    co_return std::make_shared<const ObjectResponse>(std::move(result));
+  };
+  auto freshUntil = std::make_shared<double>(0);
+  if (recoveryEpochReads.size() >= MAX_CACHED_EPOCHS)
+    return read(*this, std::move(key), std::move(freshUntil), preparingLocally);
+  auto fork = read(*this, key, freshUntil, preparingLocally).fork();
+  auto branch = fork.addBranch();
+  recoveryEpochReads.emplace(std::move(key), EpochRead{kj::mv(fork), std::move(freshUntil)});
+  return branch;
+}
+
+kj::Promise<void> DurableLog::recoveryWake() {
+  if (!recoveryWakeTick || timer.now() >= recoveryWakeAt) {
+    recoveryWakeAt = timer.now() + RECOVERY_WAKE_INTERVAL;
+    ++recoveryRound;
+    recoveryWakeTick.emplace(timer.atTime(recoveryWakeAt).fork());
+  }
+  return recoveryWakeTick->addBranch();
+}
+
+kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::tailTargets() {
+  const auto now = monotonicTimeMs();
+  if (!recoveryDiscovery || (!recoveryDiscovering && now - recoveryDiscoveryAtMs >= OWNER_REREAD_MS)) {
+    recoveryDiscovering = true;
+    recoveryDiscovery.emplace(discoverTailTargets().fork());
+  }
+  return recoveryDiscovery->addBranch();
+}
+
+kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::discoverTailTargets() {
+  auto state = lastTailDiscovery ? std::make_shared<TailDiscovery>(*lastTailDiscovery) : std::make_shared<TailDiscovery>();
+  state->complete = false;
+  for (auto& [key, target] : state->addresses) target.timeVerified = false;
+  const auto settled = kj::defer([this]() {
+    recoveryDiscoveryAtMs = monotonicTimeMs();
+    recoveryDiscovering = false;
+  });
+  const auto budget = std::max<uint32_t>(1, settings.peerTimeoutMs);
+  try {
+    ObjectListing listing;
+    std::string token;
+    do {
+      auto permit = co_await recoveryMetadata.acquire();
+      auto page = co_await timer.timeoutAfter(budget * kj::MILLISECONDS, store->listPage(MEMBERS_PREFIX, 1000, token));
+      if (++listing.pages == 1) listing.dateUnixMs = page.dateUnixMs;
+      for (auto& entry : page.objects) listing.objects.push_back(std::move(entry));
+      token = std::move(page.nextToken);
+    } while (!token.empty());
+    const auto listed = readMemberListing(listing);
+    std::map<std::pair<std::string, uint64_t>, MemberRecord> values;
+    std::map<std::pair<std::string, uint64_t>, MemberRecord> registrations;
+    for (const auto& [id, node] : listed) {
+      if (id == settings.nodeId) continue;
+      for (const auto& [number, value] : node.epochs) {
+        if (!value.registered && !value.heartbeat) continue;
+        const auto key = value.heartbeat ? memberHeartbeatKey(id, number) : memberRegistrationKey(id, number);
+        auto response = co_await readRecoveryMetadata(key, budget);
+        auto record = response.status == 200 ? parseMemberRecord(response.bytes) : std::nullopt;
+        if (!record || record->nodeId != id || record->epoch != number) {
+          state->unresolved.insert(key);continue;
+        }
+        if (!value.heartbeat && value.registered) registrations.emplace(std::make_pair(id, number), *record);
+        values.emplace(std::make_pair(id, number), std::move(*record));
+      }
+    }
+    // All addresses found in this bounded round get a turn, even when the
+    // wait deadline passed while reading metadata. Failed rounds retain them.
+    state->complete = true;
+    state->unresolved.erase("member-discovery");
+    for (const auto& [id, node] : listed) {
+      if (id == settings.nodeId) continue;
+      for (const auto& [number, observed] : node.epochs) {
+        auto found = values.find({id, number});
+        if (found == values.end()) continue;
+        const auto& record = found->second;
+        const auto key = observed.heartbeat ? memberHeartbeatKey(id, number) : memberRegistrationKey(id, number);
+        DurableTailTarget target{id, record.address, std::to_string(number), record.instance};
+        target.heartbeatUnixMs = observed.heartbeat ? observed.heartbeatUnixMs : 0;
+        target.registeredUnixMs = observed.registered ? observed.registeredUnixMs : 0;
+        target.timeVerified = true;target.durableProcesses = record.durableProcesses;
+        if (!observed.heartbeat && !record.instance.empty()) {
+          for (auto successor = node.epochs.upper_bound(number); successor != node.epochs.end(); ++successor) {
+            if (!successor->second.registered || !successor->second.registeredUnixMs) continue;
+            const auto identity = std::make_pair(id, successor->first);
+            auto newer = registrations.find(identity);
+            if (newer == registrations.end()) {
+              const auto registrationKey = memberRegistrationKey(id, successor->first);
+              auto response = co_await readRecoveryMetadata(registrationKey, budget);
+              auto value = response.status == 200 ? parseMemberRecord(response.bytes) : std::nullopt;
+              if (!value || value->nodeId != id || value->epoch != successor->first) {
+                state->unresolved.insert(registrationKey);continue;
+              }
+              state->unresolved.erase(registrationKey);
+              newer = registrations.emplace(identity, std::move(*value)).first;
+            }
+            if (!newer->second.instance.empty() &&
+                newer->second.instance != record.instance && successor->second.registeredUnixMs) {
+              target.successorRegisteredUnixMs = successor->second.registeredUnixMs;break;
+            }
+          }
+        }
+        if (record.address.empty()) { state->unresolved.insert(key);continue; }
+        state->addresses[target.key()] = std::move(target);
+        state->unresolved.erase(key);
+      }
+    }
+  } catch (const kj::Exception& error) {
+    state->complete = false;state->unresolved.insert("member-discovery");
+    log("tail-discovery-failed", "\"error\":" + quote(error.getDescription().cStr()));
+  }
+  lastTailDiscovery = state;
+  co_return state;
+}
+
 kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
-    ObjectIdentity identity, uint64_t snapshotShardEpoch, double startedMs) {
-  Object object;
-  object.namespaceId = identity.namespaceId; object.objectId = identity.objectId;
-  object.dataEpoch = identity.dataEpoch; object.shardEpoch = identity.shardEpoch; object.shard = identity.shard;
-  object.objectName = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
+    ObjectIdentity identity, const std::optional<ObjectManifest>& manifest, double startedMs, RebuildRun& run,
+    kj::Own<kj::PromiseFulfiller<bool>> localPreparation) {
+  auto finishLocalPreparation = [&](bool complete) {
+    if (!localPreparation) return;
+    localPreparation->fulfill(kj::mv(complete));
+    localPreparation = nullptr;
+  };
+  const auto preparationDone = kj::defer([&]() { finishLocalPreparation(false); });
+  const auto name = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
+  const auto generation = objectOf(name)->rebuildGeneration;
+  auto checkIdentity = [&]() {
+    auto* current = objectOf(name);
+    KJ_REQUIRE(current != nullptr && current->state == ObjectState::REBUILDING &&
+        current->rebuildGeneration == generation && current->shardEpoch == identity.shardEpoch &&
+        current->dataEpoch == identity.dataEpoch && !ownerFenced(identity.namespaceId, identity.shard, identity.shardEpoch),
+        "the object changed ownership during tail recovery");
+  };
+  if (!run.reserved) setRebuildPhase(run, RebuildPhase::TAILS);
+  const auto snapshotShardEpoch = co_await recoveryLowerBound(name, manifest, localPreparation.get() != nullptr);
+  checkIdentity();
   const auto deadline = startedMs + settings.tailWaitMs;
-  const auto wanted = object.namespaceId + "/" + object.objectId;
+  const auto wanted = identity.namespaceId + "/" + identity.objectId;
   using Position = std::pair<uint64_t, uint64_t>;
   struct Probe {
     DurableTailTarget target;
@@ -5397,66 +5754,35 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     ShardEpoch epoch;
     uint64_t acquiredAtUnixMs = 0;
     std::map<std::string, Probe> probes;
-    std::map<Position, LogRecord> records;
-    std::set<Position> ownerRecords;
     bool ownerComplete = false;
   };
   struct State {
     std::vector<Source> sources;
     std::map<std::string, DurableTailTarget> addresses;
-    std::set<std::string> unresolved;
-    bool discoveryAttempted = false, discoverySucceeded = false;
-  };
-  auto state = std::make_shared<State>();
-  if (auto* live = objectOf(object.objectName); live != nullptr) {
-    state->addresses = live->recoveryAddresses;state->unresolved = live->recoveryUnknownKeys;
-  }
-  const auto preserveDiscovery = kj::defer([this, state, identity, name = object.objectName]() {
-    auto* live = objectOf(name);
-    if (live == nullptr || live->dataEpoch != identity.dataEpoch || live->shardEpoch != identity.shardEpoch) return;
-    live->recoveryAddresses = state->addresses;live->recoveryUnknownKeys = state->unresolved;
-    live->recoveryDiscoveryCompleted |= state->discoverySucceeded;
-  });
+    std::shared_ptr<const TailDiscovery> discovery;
+  } state;
   // Epoch objects are authority, not hints. A failed read is a storage failure,
   // never permission to treat the history as empty and publish a cut.
-  auto epoch = object.shardEpoch;
+  auto epoch = identity.shardEpoch;
   std::set<uint64_t> visited;
   while (epoch && (!snapshotShardEpoch || epoch >= snapshotShardEpoch)) {
     KJ_REQUIRE(visited.insert(epoch).second, "a shard's previous-epoch chain cycles");
-    ObjectResponse response{200, {}};
-    auto* live = objectOf(object.objectName);
-    KJ_REQUIRE(live != nullptr, "the recovery object disappeared while reading its source chain");
-    auto cached = live->recoveryEpochReads.find(epoch);
-    if (cached != live->recoveryEpochReads.end()) {
-      response.bytes = cached->second.first;response.lastModifiedUnixMs = cached->second.second;
-    } else {
-      response = co_await timer.timeoutAfter(std::max(settings.peerTimeoutMs, settings.config.confirmTimeoutMs) *
-          kj::MILLISECONDS, store->get(shardEpochKey(object.namespaceId, object.shard, epoch)))
-          .catch_([](kj::Exception&& error) -> ObjectResponse {
-            failStorage("a source shard epoch could not be read: " + std::string(error.getDescription().cStr()));
-          });
-    }
-    requireStorage(response.status == 200, "a source shard epoch is unavailable during recovery");
-    auto record = parseShardEpoch(response.bytes);
-    requireStorage(record && record->epoch == epoch && record->namespaceId == object.namespaceId &&
-        record->shard == object.shard, "a source shard epoch is invalid during recovery");
+    const auto response = co_await readRecoveryEpoch(shardEpochKey(identity.namespaceId, identity.shard, epoch),
+        localPreparation.get() != nullptr);
+    checkIdentity();
+    auto record = parseShardEpoch(response->bytes);
+    requireStorage(record && record->epoch == epoch && record->namespaceId == identity.namespaceId &&
+        record->shard == identity.shard, "a source shard epoch is invalid during recovery");
+    chargeRebuildMetadata(run, 512 + response->bytes.size());
     Source source;
     source.epoch = *record;
-    source.acquiredAtUnixMs = response.lastModifiedUnixMs;
-    if (auto* live = objectOf(object.objectName); live != nullptr)
-      live->recoveryEpochReads.try_emplace(epoch, response.bytes, response.lastModifiedUnixMs);
-    if (auto* live = objectOf(object.objectName); live != nullptr) {
-      for (const auto& [position, held] : live->recoveryTails) {
-        if (held.shardEpoch == record->epoch && held.nodeEpoch == record->nodeEpoch)
-          source.records.emplace(position, held);
-      }
-    }
+    source.acquiredAtUnixMs = response->lastModifiedUnixMs;
     if (record->nodeId == settings.nodeId && record->nodeEpoch != nodeEpoch &&
         !membership.heldEpochs.contains(std::to_string(record->nodeEpoch))) {
       auto prior = predecessorLogs.find(record->nodeEpoch);
       if (diskTrusted && sameBootCache && prior != predecessorLogs.end() && prior->second.complete) {
         source.ownerComplete = true;
-        source.records.clear();
+        size_t retainedCount = 0;
         const bool has = prior->second.startupUnsealed.contains({wanted, record->epoch});
         // This immutable raw-log observation is scoped to namespace+objectId,
         // independent of dataEpoch. Every unexcluded byte is a possible write.
@@ -5465,100 +5791,92 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
             for (const auto& [sequence, entry] : held->second) {
               if (entry.objectName != wanted || entry.shardEpoch != record->epoch) continue;
               const Position position{entry.shardEpoch, entry.nodeSeq};
-              source.records.emplace(position, entry);source.ownerRecords.insert(position);
+              objectOf(name)->recoveryTails.insert_or_assign(position, Object::RetainedTail{entry, generation.second});
+              ++retainedCount;
             }
         } else ++localLogEmptyClosures;
-        log(has ? "local-owner-log-complete" : "local-owner-log-empty", "\"object\":" + quote(object.objectName) +
+        log(has ? "local-owner-log-complete" : "local-owner-log-empty", "\"object\":" + quote(name) +
             ",\"sourceEpoch\":\"" + std::to_string(record->epoch) + "\",\"sourceNodeEpoch\":\"" +
-            std::to_string(record->nodeEpoch) + "\",\"records\":" + std::to_string(source.records.size()));
+            std::to_string(record->nodeEpoch) + "\",\"records\":" + std::to_string(retainedCount));
       }
     }
-    state->sources.push_back(std::move(source));
+    if (record->nodeId != settings.nodeId || (!source.ownerComplete && record->nodeEpoch != nodeEpoch &&
+        !membership.heldEpochs.contains(std::to_string(record->nodeEpoch)))) finishLocalPreparation(false);
+    state.sources.push_back(std::move(source));
     epoch = record->previousEpoch;
   }
-  auto remember = [&](const Member& member) {
-    if (member.id == settings.nodeId || member.durableProcesses == 0 || member.address.empty() || member.epoch.empty()) return;
-    DurableTailTarget target{member.id, member.address, member.epoch, member.instance};
-    state->addresses.try_emplace(member.id + "/" + member.epoch + "/" + member.address, std::move(target));
+  auto remember = [&](DurableTailTarget target, bool replace = false) {
+    auto key = target.key();
+    auto found = state.addresses.find(key);
+    if (found == state.addresses.end()) {
+      chargeRebuildMetadata(run, 256 + key.size() + target.nodeId.size() + target.address.size() +
+          target.destinationEpoch.size() + target.instance.size());
+      state.addresses.emplace(std::move(key), std::move(target));
+    } else if (replace) {
+      found->second = std::move(target);
+    }
   };
   auto refreshMemory = [&]() {
-    for (const auto& [key, member] : membership.recoveryMembers) remember(member);
-    for (const auto& [id, member] : membership.members) {
-      // The explicit local entry below already covers this process's held epochs.
-      if (id != settings.nodeId) remember(member);
-    }
-    state->addresses[settings.nodeId + "/local"] =
-        {settings.nodeId, "local", std::to_string(nodeEpoch), settings.instance};
+    auto member = [&](const Member& entry) {
+      if (entry.id != settings.nodeId && entry.durableProcesses && !entry.address.empty() && !entry.epoch.empty())
+        remember({entry.id, entry.address, entry.epoch, entry.instance});
+    };
+    for (const auto& [key, entry] : membership.recoveryMembers) member(entry);
+    for (const auto& [id, entry] : membership.members) member(entry);
+    remember({settings.nodeId, "local", std::to_string(nodeEpoch), settings.instance});
   };
-  refreshMemory();
+  auto addDiscovery = [&]() -> kj::Promise<void> {
+    auto found = co_await tailTargets();
+    checkIdentity();
+    if (found == state.discovery) co_return;
+    for (auto& [key, target] : state.addresses) target.timeVerified = false;
+    for (const auto& [key, target] : found->addresses) {
+      for (auto& [priorKey, prior] : state.addresses) {
+        if (prior.nodeId != target.nodeId || prior.destinationEpoch != target.destinationEpoch) continue;
+        prior.heartbeatUnixMs = target.heartbeatUnixMs;
+        prior.registeredUnixMs = target.registeredUnixMs;
+        prior.successorRegisteredUnixMs = target.successorRegisteredUnixMs;
+        prior.durableProcesses = target.durableProcesses;
+        prior.timeVerified = true;
+      }
+      remember(target, true);
+    }
+    state.discovery = std::move(found);
+  };
   auto allOwners = [&]() {
-    return std::all_of(state->sources.begin(), state->sources.end(),
+    return std::all_of(state.sources.begin(), state.sources.end(),
         [](const Source& source) { return source.ownerComplete; });
   };
-  auto checkIdentity = [&]() {
-    auto* current = objectOf(object.objectName);
-    KJ_REQUIRE(current != nullptr && current->state == ObjectState::REBUILDING &&
-        current->shardEpoch == object.shardEpoch && current->dataEpoch == object.dataEpoch,
-        "the object changed ownership during tail recovery");
-  };
   // A page has no size preface in this protocol. Budget the largest legal page
-  // at an aggregate 8 MiB/s shared by all recovery slots, plus connection time.
+  // at an aggregate 8 MiB/s shared by the transfer slots.
   // It is never shortened by the 25-second missing-holder wait.
   const auto slots = std::max<uint32_t>(1, settings.config.recoverParallelism);
   const auto pageBudget = uint32_t(std::max<double>(settings.config.confirmTimeoutMs,
       settings.peerTimeoutMs + std::ceil(double(tailRecordBytes() + TAIL_RPC_HEADROOM_BYTES) * slots * 1000 / (8u << 20))));
   const auto drainMs = std::ceil(double(std::max<uint64_t>(settings.config.peerBufferBytes,
       tailRecordBytes())) * slots * 1000 / (8u << 20));
-  // A source query exhausts all pages while holding one bounded network slot.
-  // Local reads do not need a slot. No task may outlive the forked batch below.
-  auto query = [&](size_t index, std::string key, bool owner) -> kj::Promise<void> {
-    auto& source = state->sources[index];
+  // Connect before taking a transfer slot. Requeue each page so one busy source
+  // cannot delay other healthy targets or monopolize its own target queue.
+  auto query = [&](size_t index, std::string key, bool owner, DurableTailRound round) -> kj::Promise<void> {
+    auto& source = state.sources[index];
     auto& probe = source.probes.at(key);
     if (probe.complete || probe.gone) co_return;
-    bool active = false;
-    const auto release = kj::defer([&]() {
-      if (!active) return;
-      --activeTailFetches;
-      while (!tailFetchWaiters.empty()) {
-        auto next = kj::mv(tailFetchWaiters.front());
-        tailFetchWaiters.pop_front();
-        if (!next.ready->isWaiting()) continue;
-        ++activeTailFetches;
-        // Cancellation may destroy the waiter after fulfillment but before it
-        // resumes. Its defer must already own the reserved slot in that window.
-        *next.acquired = true;
-        next.ready->fulfill();
-        break;
-      }
-    });
     try {
-      if (probe.target.nodeId != settings.nodeId) {
-        if (activeTailFetches >= slots) {
-          auto available = kj::newPromiseAndFulfiller<void>();
-          tailFetchWaiters.push_back({kj::mv(available.fulfiller), &active});
-          co_await kj::mv(available.promise);
-        } else {
-          ++activeTailFetches;
-        }
-        active = true;
-      }
-      // Every known holder gets an attempt, including a retry after the wait
-      // deadline. One probe may drain a full configured peer buffer, with the
-      // last page retaining its whole page budget. No expired-deadline shortcut.
-      const auto drainUntil = std::max(deadline, monotonicTimeMs()) + drainMs;
-      bool firstPage = true;
+      std::shared_ptr<DurableTailConnection> connection;
+      // Queueing and reconnecting use their own budgets. A probe may drain a
+      // full configured peer buffer, and its last page gets a full page budget.
+      double transferringMs = 0;
       for (;;) {
-        if (!firstPage && monotonicTimeMs() >= drainUntil) co_return;
-        firstPage = false;
+        if (transferringMs >= drainMs) co_return;
         checkIdentity();
         DurableTailAsk ask;
-        ask.namespaceId = object.namespaceId;
-        ask.shard = object.shard;
-        ask.shardEpoch = object.shardEpoch;
+        ask.namespaceId = identity.namespaceId;
+        ask.shard = identity.shard;
+        ask.shardEpoch = identity.shardEpoch;
         ask.ownerNodeId = source.epoch.nodeId;
         ask.ownerNodeEpoch = source.epoch.nodeEpoch;
         ask.afterSeq = probe.after;
-        ask.objectId = object.objectId;
+        ask.objectId = identity.objectId;
         DurableTailAnswer answer;
         if (probe.target.nodeId == settings.nodeId) {
           std::string localRefusal;
@@ -5579,17 +5897,42 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
           }
           answer = tailFor(ask, false);
         } else {
-          KJ_REQUIRE(bool(hooks.fetchTailAt) || bool(hooks.fetchTail), "tail transport is not installed");
+          if (!connection && hooks.connectTail) {
+            connection = co_await hooks.connectTail(probe.target, round);
+            KJ_REQUIRE(bool(connection) && connection->target.key() == probe.target.key(), "a tail connection changed identity");
+          }
+          auto permit = co_await tailPages.acquire(probe.target.key());
+          checkIdentity();
+          if (connection && connection->usable && !connection->usable()) {
+            if (!round.final) KJ_FAIL_REQUIRE("the tail connection failed earlier in this round");
+            // A different object's failure says nothing about this object's
+            // history. Return the page slot and join a replacement connection.
+            connection.reset();
+            continue;
+          }
+          KJ_REQUIRE(bool(connection) || bool(hooks.fetchTail), "tail transport is not installed");
+          const auto transferAt = monotonicTimeMs();
+          if (owner && run.owner == probe.target.nodeId) run.probeAtMs = transferAt;
           ++tailFetches;
-          auto request = hooks.fetchTailAt ? hooks.fetchTailAt(probe.target, ask)
-                                          : hooks.fetchTail(probe.target.nodeId, ask);
-          answer = co_await timer.timeoutAfter(pageBudget * kj::MILLISECONDS, kj::mv(request));
+          auto request = connection ? connection->page(ask) : hooks.fetchTail(probe.target.nodeId, ask);
+          auto timeout = timer.afterDelay(pageBudget * kj::MILLISECONDS).then([connection]() -> DurableTailAnswer {
+            if (connection && connection->failed) connection->failed();
+            KJ_FAIL_REQUIRE("a tail page did not arrive within its transfer budget");
+          });
+          try {
+            answer = co_await kj::mv(request).exclusiveJoin(kj::mv(timeout));
+          } catch (const kj::Exception& error) {
+            if (connection && connection->failed && error.getType() == kj::Exception::Type::DISCONNECTED)
+              connection->failed();
+            throw;
+          }
+          transferringMs += monotonicTimeMs() - transferAt;
         }
         checkIdentity();
         if (!answer.refusal.empty()) {
           probe.error = answer.refusal;
           if (answer.refusal.find("does not hold the epoch") != std::string::npos) probe.gone = true;
-          log("tail-refused", "\"object\":" + quote(object.objectName) + ",\"peer\":" +
+          log("tail-refused", "\"object\":" + quote(name) + ",\"peer\":" +
               quote(probe.target.nodeId) + ",\"source\":" + quote(source.epoch.nodeId) +
               ",\"sourceEpoch\":\"" + std::to_string(source.epoch.epoch) +
               "\",\"reason\":" + quote(answer.refusal));
@@ -5602,7 +5945,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         std::map<Position, std::string> pageBytes;
         for (const auto& record : answer.records) {
           KJ_REQUIRE(record.nodeEpoch == ask.ownerNodeEpoch && record.nodeSeq > ask.afterSeq &&
-              record.shard == object.shard && record.objectName.starts_with(object.namespaceId + "/"),
+              record.shard == identity.shard && record.objectName.starts_with(identity.namespaceId + "/"),
               "a tail page contains records outside its source");
           last = std::max(last, record.nodeSeq);
           if (record.objectName != wanted || record.shardEpoch != source.epoch.epoch) continue;
@@ -5611,8 +5954,9 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
           const auto encoded = encodeLogRecord(record);
           auto [page, added] = pageBytes.emplace(position, encoded);
           KJ_REQUIRE(added || page->second == encoded, "one tail page repeats an identity with different bytes");
-          auto held = source.records.find(position);
-          KJ_REQUIRE(held == source.records.end() || encodeLogRecord(held->second) == encoded,
+          const auto& retained = objectOf(name)->recoveryTails;
+          auto held = retained.find(position);
+          KJ_REQUIRE(held == retained.end() || encodeLogRecord(held->second.record) == encoded,
               "different bytes claim one tail record identity");
         }
         KJ_REQUIRE(!answer.more || last > probe.after, "a tail page makes no cursor progress");
@@ -5620,21 +5964,18 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         // Commit the page only after every record and the cursor are validated.
         for (auto& record : answer.records) {
           if (record.objectName == wanted && record.shardEpoch < snapshotShardEpoch) {
-            noteLateTail(object.objectName, record, snapshotShardEpoch);
+            noteLateTail(name, record, snapshotShardEpoch);
             continue;
           }
           if (record.objectName != wanted || record.shardEpoch != source.epoch.epoch) continue;
           const Position position{record.shardEpoch, record.nodeSeq};
-          auto* live = objectOf(object.objectName);
+          auto* live = objectOf(name);
           KJ_REQUIRE(live != nullptr, "recovery lost its retained tail storage");
-          auto [retained, added] = live->recoveryTails.try_emplace(position, record);
-          KJ_REQUIRE(added || encodeLogRecord(retained->second) == encodeLogRecord(record),
-              "a retained recovery tail changed its bytes");
-          source.records.try_emplace(position, std::move(record));
-          if (ownerProof) source.ownerRecords.insert(position);
+          auto [retained, added] = live->recoveryTails.try_emplace(position, Object::RetainedTail{std::move(record)});
+          if (ownerProof) retained->second.ownerProof = generation.second;
         }
         log(probe.target.nodeId == settings.nodeId ? "tail-local" : "tail-taken",
-            "\"object\":" + quote(object.objectName) + ",\"peer\":" + quote(probe.target.nodeId) +
+            "\"object\":" + quote(name) + ",\"peer\":" + quote(probe.target.nodeId) +
             ",\"source\":" + quote(source.epoch.nodeId) + ",\"sourceEpoch\":\"" +
             std::to_string(source.epoch.epoch) + "\",\"records\":" + std::to_string(answer.count) +
             ",\"ours\":" + std::to_string(mine) + ",\"lastSeq\":\"" + std::to_string(last) +
@@ -5649,8 +5990,11 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
       }
     } catch (const kj::Exception& error) {
       checkIdentity();  // Ownership cancellation is not an individual peer failure.
-      probe.error = error.getDescription().cStr();
-      log("tail-failed", "\"object\":" + quote(object.objectName) + ",\"peer\":" +
+      if (error.getDetail(REBUILD_METADATA_FULL) != kj::none) throw;
+      const std::string description = error.getDescription().cStr();
+      if (probe.error == description) co_return;
+      probe.error = description.substr(0, 512);
+      log("tail-failed", "\"object\":" + quote(name) + ",\"peer\":" +
           quote(probe.target.nodeId) + ",\"source\":" + quote(source.epoch.nodeId) +
           ",\"error\":" + quote(probe.error));
     }
@@ -5659,7 +6003,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
       membership.livenessGraceMs + membership.listIntervalMs;
   auto isCandidate = [&](const DurableTailTarget& target, const Source& source) {
     if (target.durableProcesses == 0) return false;
-    if (!state->discoverySucceeded || !target.timeVerified || !source.acquiredAtUnixMs ||
+    if (!state.discovery || !state.discovery->complete || !target.timeVerified || !source.acquiredAtUnixMs ||
         !membership.grantedTtlSeconds) return true;
     auto before = [&](uint64_t at) {
       return at && at < source.acquiredAtUnixMs && source.acquiredAtUnixMs - at > marginMs;
@@ -5669,105 +6013,54 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     // registered before the entire margin preceding this source's acquisition.
     return !(before(target.registeredUnixMs) && before(target.successorRegisteredUnixMs));
   };
-  double nextDiscovery = monotonicTimeMs();
-  auto discover = [&]() -> kj::Promise<void> {
-    state->discoveryAttempted = true;state->discoverySucceeded = false;
-    for (auto& [key, target] : state->addresses) target.timeVerified = false;
-    const auto budget = std::max<uint32_t>(1, settings.peerTimeoutMs);
-    try {
-      auto listing = co_await timer.timeoutAfter(budget * kj::MILLISECONDS, store->list(MEMBERS_PREFIX));
-      const auto listed = readMemberListing(listing);
-      std::map<std::pair<std::string, uint64_t>, MemberRecord> values;
-      std::map<std::pair<std::string, uint64_t>, MemberRecord> registrations;
-      for (const auto& [id, node] : listed) {
-        if (id == settings.nodeId) continue;
-        for (const auto& [number, value] : node.epochs) {
-          if (!value.registered && !value.heartbeat) continue;
-          const auto key = value.heartbeat ? memberHeartbeatKey(id, number) : memberRegistrationKey(id, number);
-          auto response = co_await timer.timeoutAfter(budget * kj::MILLISECONDS, store->get(key));
-          auto record = response.status == 200 ? parseMemberRecord(response.bytes) : std::nullopt;
-          if (!record || record->nodeId != id || record->epoch != number) {
-            state->unresolved.insert(key);continue;
-          }
-          if (!value.heartbeat && value.registered) registrations.emplace(std::make_pair(id, number), *record);
-          values.emplace(std::make_pair(id, number), std::move(*record));
-        }
-      }
-      // All addresses found in this bounded round get a turn, even when the
-      // wait deadline passed while reading metadata. Failed rounds retain them.
-      state->discoverySucceeded = true;
-      state->unresolved.erase("member-discovery");
-      for (const auto& [id, node] : listed) {
-        if (id == settings.nodeId) continue;
-        for (const auto& [number, observed] : node.epochs) {
-          auto found = values.find({id, number});
-          if (found == values.end()) continue;
-          const auto& record = found->second;
-          const auto key = observed.heartbeat ? memberHeartbeatKey(id, number) : memberRegistrationKey(id, number);
-          DurableTailTarget target{id, record.address, std::to_string(number), record.instance};
-          target.heartbeatUnixMs = observed.heartbeat ? observed.heartbeatUnixMs : 0;
-          target.registeredUnixMs = observed.registered ? observed.registeredUnixMs : 0;
-          target.timeVerified = true;target.durableProcesses = record.durableProcesses;
-          if (!observed.heartbeat && !record.instance.empty()) {
-            for (auto successor = node.epochs.upper_bound(number); successor != node.epochs.end(); ++successor) {
-              if (!successor->second.registered || !successor->second.registeredUnixMs) continue;
-              const auto identity = std::make_pair(id, successor->first);
-              auto newer = registrations.find(identity);
-              if (newer == registrations.end()) {
-                const auto registrationKey = memberRegistrationKey(id, successor->first);
-                auto response = co_await timer.timeoutAfter(budget * kj::MILLISECONDS, store->get(registrationKey));
-                auto value = response.status == 200 ? parseMemberRecord(response.bytes) : std::nullopt;
-                if (!value || value->nodeId != id || value->epoch != successor->first) {
-                  state->unresolved.insert(registrationKey);continue;
-                }
-                state->unresolved.erase(registrationKey);
-                newer = registrations.emplace(identity, std::move(*value)).first;
-              }
-              if (!newer->second.instance.empty() &&
-                  newer->second.instance != record.instance && successor->second.registeredUnixMs) {
-                target.successorRegisteredUnixMs = successor->second.registeredUnixMs;break;
-              }
-            }
-          }
-          for (auto& [addressKey, prior] : state->addresses) {
-            if (prior.nodeId != id || prior.destinationEpoch != target.destinationEpoch) continue;
-            prior.heartbeatUnixMs = target.heartbeatUnixMs;prior.registeredUnixMs = target.registeredUnixMs;
-            prior.successorRegisteredUnixMs = target.successorRegisteredUnixMs;
-            prior.durableProcesses = target.durableProcesses;prior.timeVerified = true;
-          }
-          const bool relevant = std::any_of(state->sources.begin(), state->sources.end(),
-              [&](const Source& source) { return isCandidate(target, source); });
-          if (!relevant) { state->unresolved.erase(key);continue; }
-          if (record.address.empty()) { state->unresolved.insert(key);continue; }
-          state->addresses[id + "/" + target.destinationEpoch + "/" + target.address] = std::move(target);
-          state->unresolved.erase(key);
-        }
-      }
-    } catch (const kj::Exception& error) {
-      state->discoverySucceeded = false;state->unresolved.insert("member-discovery");
-      log("tail-discovery-failed", "\"object\":" + quote(object.objectName) +
-          ",\"error\":" + quote(std::string(error.getDescription().cStr())));
-    }
-    nextDiscovery = monotonicTimeMs() + 1000;
-  };
   CutHold cutHold;
   // A held cut that ends without this decision: the old owner answered in full, or the ownership changed.
   const char* cutHoldEnd = "ownership changed";
   const auto cutHoldEnded = kj::defer([&]() {
     if (cutHold.holding)
-      log("cut-hold-ended", "\"object\":" + quote(object.objectName) + ",\"reason\":" + quote(cutHoldEnd) +
+      log("cut-hold-ended", "\"object\":" + quote(name) + ",\"reason\":" + quote(cutHoldEnd) +
           ",\"waitedMs\":" + std::to_string(uint64_t(monotonicTimeMs() - cutHold.sinceMs)));
   });
+  auto mayCut = [&]() -> kj::Promise<bool> {
+    std::vector<std::pair<std::string, uint64_t>> silent;
+    for (const auto& source : state.sources)
+      if (!source.ownerComplete) silent.emplace_back(source.epoch.nodeId, source.epoch.nodeEpoch);
+    const auto cut = co_await previousOwnersMayBeCut(name, std::move(silent), cutHold, run);
+    checkIdentity();
+    co_return cut;
+  };
+  auto addProbe = [&](Source& source, const std::string& key, const DurableTailTarget& target) -> Probe& {
+    auto found = source.probes.find(key);
+    if (found != source.probes.end()) return found->second;
+    chargeRebuildMetadata(run, 512 + key.size() + target.nodeId.size() + target.address.size() +
+        target.destinationEpoch.size() + target.instance.size());
+    return source.probes.emplace(key, Probe{target}).first->second;
+  };
   for (;;) {
-    checkIdentity();refreshMemory();
+    checkIdentity();
+    if (allOwners()) break;
+    refreshMemory();
+    const bool atDeadline = monotonicTimeMs() >= deadline;
+    if (atDeadline && !state.discovery) {
+      finishLocalPreparation(false);
+      co_await addDiscovery();
+    }
+    const bool finalRound = atDeadline && (co_await mayCut());
+    if (!run.reserved) setRebuildPhase(run, finalRound ? RebuildPhase::FINAL_TAILS :
+        atDeadline ? RebuildPhase::OWNER : RebuildPhase::TAILS);
+    const DurableTailRound round{recoveryRound, finalRound};
     kj::Vector<kj::Promise<void>> ownerCalls;
     kj::Vector<kj::Promise<void>> peerCalls;
-    for (size_t i = 0; i < state->sources.size(); ++i) {
-      auto& source = state->sources[i];
+    for (size_t i = 0; i < state.sources.size(); ++i) {
+      auto& source = state.sources[i];
       if (source.ownerComplete) continue;
+      if (run.owner.empty() && (source.epoch.nodeId != settings.nodeId || source.epoch.nodeEpoch != nodeEpoch)) {
+        run.owner = source.epoch.nodeId;
+        run.ownerEpoch = source.epoch.nodeEpoch;
+      }
       std::optional<DurableTailTarget> ownerTarget;
       int best = -1;
-      for (const auto& [key, target] : state->addresses) {
+      for (const auto& [key, target] : state.addresses) {
         if (target.nodeId != source.epoch.nodeId) continue;
         int score = target.instance == source.epoch.instance ? 2 : 0;
         if (target.destinationEpoch == std::to_string(source.epoch.nodeEpoch)) score += 4;
@@ -5777,23 +6070,23 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
       if (ownerTarget) {
         ownerTarget->destinationEpoch = std::to_string(source.epoch.nodeEpoch);
         const auto key = "owner/" + ownerTarget->address;
-        auto [entry, added] = source.probes.try_emplace(key);
-        if (added) entry->second.target = *ownerTarget;
-        ownerCalls.add(query(i, key, true));
+        auto& probe = addProbe(source, key, *ownerTarget);
+        if (finalRound) probe.complete = false;
+        ownerCalls.add(query(i, key, true, round));
       }
-      if (source.ownerComplete || !state->discoveryAttempted) continue;
-      for (const auto& [addressKey, target] : state->addresses) {
+      if (source.ownerComplete || !state.discovery || (atDeadline && !finalRound)) continue;
+      for (const auto& [addressKey, target] : state.addresses) {
         if (target.nodeId == source.epoch.nodeId) continue;
         const auto key = "peer/" + addressKey;
-        auto [entry, added] = source.probes.try_emplace(key);
-        if (added) entry->second.target = target;
+        auto& probe = addProbe(source, key, target);
         const bool irrelevant = !isCandidate(target, source);
-        if (irrelevant && !entry->second.irrelevant) log("tail-candidate-before-window",
-            "\"object\":" + quote(object.objectName) + ",\"peer\":" + quote(target.nodeId) +
+        if (irrelevant && !probe.irrelevant) log("tail-candidate-before-window",
+            "\"object\":" + quote(name) + ",\"peer\":" + quote(target.nodeId) +
             ",\"nodeEpoch\":\"" + target.destinationEpoch + "\",\"sourceEpoch\":\"" +
             std::to_string(source.epoch.epoch) + "\"");
-        entry->second.irrelevant = irrelevant;
-        if (!irrelevant) peerCalls.add(query(i, key, false));
+        probe.irrelevant = irrelevant;
+        if (finalRound) probe.complete = false;
+        if (!irrelevant) peerCalls.add(query(i, key, false, round));
       }
     }
     // An original owner's full proof takes the fast exit without discovery.
@@ -5803,32 +6096,33 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     if (ready || allOwners()) break;
     co_await owners.addBranch();if (allOwners()) break;
     co_await peersDone.addBranch();
-    if (state->discoveryAttempted && monotonicTimeMs() >= deadline) {
-      // No cut while a silent previous owner's heartbeat shows its epoch still live, or cannot be judged.
-      std::vector<std::pair<std::string, uint64_t>> silent;
-      for (const auto& source : state->sources)
-        if (!source.ownerComplete) silent.emplace_back(source.epoch.nodeId, source.epoch.nodeEpoch);
-      if (co_await previousOwnersMayBeCut(object.objectName, std::move(silent), cutHold)) break;
-      co_await timer.afterDelay(200 * kj::MILLISECONDS);
-      checkIdentity();
+    finishLocalPreparation(false);
+    if (finalRound) {
+      if (co_await mayCut()) break;
+      // A heartbeat became live again while reading the final pages. Keep the
+      // verified prefix, but give each peer another turn before a later cut.
+      for (auto& source : state.sources)
+        for (auto& [key, probe] : source.probes)
+          if (key.starts_with("peer/")) probe.complete = false;
     }
-    if (!state->discoveryAttempted || monotonicTimeMs() >= nextDiscovery) {
-      co_await discover();checkIdentity();continue;
-    }
-    co_await timer.afterDelay(uint32_t(std::max(1.0, std::min(200.0, deadline - monotonicTimeMs()))) * kj::MILLISECONDS);
+    co_await addDiscovery();
+    if (!run.reserved) setRebuildPhase(run, atDeadline ? RebuildPhase::OWNER : RebuildPhase::DEADLINE);
+    co_await recoveryWake();
   }
   cutHoldEnd = "the previous owner answered in full";
   checkIdentity();
   TailRecovery out;
+  size_t recordCount = 0;
   out.collectionMs = monotonicTimeMs() - startedMs;
   out.cut = !allOwners();
-  bool othersMissing = membership.recoveryHistoryIncomplete || !state->unresolved.empty();
+  bool othersMissing = membership.recoveryHistoryIncomplete || (state.discovery && !state.discovery->unresolved.empty());
   std::string missing = "[";
   auto nameMissing = [&](const std::string& text) {
     if (missing.size() > 1) missing += ",";
     missing += quote(text);
   };
-  for (auto& source : state->sources) {
+  for (auto& source : state.sources) {
+    out.sources.push_back({source.epoch.epoch, source.epoch.nodeEpoch, source.ownerComplete});
     if (!source.ownerComplete) {
       for (const auto& [key, probe] : source.probes)
         if (key.starts_with("owner/") && probe.error.find("complete predecessor log is unavailable") != std::string::npos)
@@ -5841,12 +6135,16 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         nameMissing(probe.target.nodeId + "/" + probe.target.destinationEpoch + "@" + probe.target.address);
       }
     }
-    for (auto& [position, record] : source.records) {
-      if (source.ownerComplete && !source.ownerRecords.contains(position)) continue;
-      out.records.push_back(std::move(record));
+    const auto& retained = objectOf(name)->recoveryTails;
+    for (auto entry = retained.lower_bound({source.epoch.epoch, 0});
+        entry != retained.end() && entry->first.first == source.epoch.epoch; ++entry) {
+      const auto& tail = entry->second;
+      if (tail.record.nodeEpoch != source.epoch.nodeEpoch ||
+          (source.ownerComplete && tail.ownerProof != generation.second)) continue;
+      ++recordCount;
     }
   }
-  for (const auto& key : state->unresolved) nameMissing(key);
+  if (state.discovery) for (const auto& key : state.discovery->unresolved) nameMissing(key);
   if (membership.recoveryHistoryIncomplete) nameMissing("evicted-member-address-history");
   missing += "]";
   if (out.cut) {
@@ -5855,13 +6153,14 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     if (out.ownerSilent) ++ownerSilentRecoveries;
     else ++tailRecoveryBounded;
     log(out.ownerSilent ? "owner-silent" : "tail-recovery-bounded",
-        "\"object\":" + quote(object.objectName) + ",\"namespaceId\":" + quote(object.namespaceId) +
-        ",\"shard\":" + std::to_string(object.shard) + ",\"shardEpoch\":\"" +
-        std::to_string(object.shardEpoch) + "\",\"missing\":" + missing +
+        "\"object\":" + quote(name) + ",\"namespaceId\":" + quote(identity.namespaceId) +
+        ",\"shard\":" + std::to_string(identity.shard) + ",\"shardEpoch\":\"" +
+        std::to_string(identity.shardEpoch) + "\",\"missing\":" + missing +
         ",\"ownerLogUnavailable\":" + (out.sourceLogUnavailable ? "true" : "false") +
         ",\"waitedMs\":" + std::to_string(out.collectionMs) + ",\"records\":" +
-        std::to_string(out.records.size()));
+        std::to_string(recordCount));
   }
+  finishLocalPreparation(true);
   co_return out;
 }
 
@@ -5874,10 +6173,12 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
 // check is.
 // Counted once per recovery that has to wait (by why it first waited), logged when the wait starts and when it ends.
 kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
-    std::vector<std::pair<std::string, uint64_t>> owners, CutHold& hold) {
+    std::vector<std::pair<std::string, uint64_t>> owners, CutHold& hold, RebuildRun& run) {
   for (const auto& [nodeId, epoch] : owners) {
     if (nodeId == settings.nodeId && membership.heldEpochs.contains(std::to_string(epoch))) continue;
-    const auto answer = co_await readOwnerHeartbeat(nodeId, epoch);
+    run.owner = nodeId;
+    run.ownerEpoch = epoch;
+    const auto answer = co_await readOwnerHeartbeat(nodeId, epoch, run.probeAtMs);
     if (answer == OwnerHeartbeat::GONE) continue;
     if (!hold.holding) {
       hold.holding = true;
@@ -5885,7 +6186,8 @@ kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
       ++(answer == OwnerHeartbeat::LIVE ? cutsHeldOwnerLive : cutsHeldOwnerUnknown);
       log(answer == OwnerHeartbeat::LIVE ? "cut-held-owner-live" : "cut-held-owner-unknown",
           "\"object\":" + quote(objectName) + ",\"owner\":" + quote(nodeId) + ",\"nodeEpoch\":\"" +
-          std::to_string(epoch) + "\"");
+          std::to_string(epoch) + "\",\"phase\":\"owner\",\"queueMs\":" + std::to_string(run.queuedMs) +
+          ",\"probeAgeMs\":" + std::to_string(monotonicTimeMs() - run.probeAtMs));
     }
     co_return false;
   }
@@ -5897,21 +6199,30 @@ kj::Promise<bool> DurableLog::previousOwnersMayBeCut(std::string objectName,
   co_return true;
 }
 
-kj::Promise<DurableLog::OwnerHeartbeat> DurableLog::readOwnerHeartbeat(std::string nodeId, uint64_t epoch) {
+kj::Promise<DurableLog::OwnerHeartbeat> DurableLog::readOwnerHeartbeat(std::string nodeId, uint64_t epoch,
+    double& probeAtMs) {
   const auto key = std::make_pair(nodeId, epoch);
   const auto now = monotonicTimeMs();
-  if (auto found = ownerReads.find(key); found != ownerReads.end() && now - found->second.atMs < OWNER_REREAD_MS)
+  const auto fresh = [now](const OwnerRead& read) {
+    return *read.settledAtMs == 0 || now - *read.settledAtMs < RECOVERY_WAKE_INTERVAL / kj::MILLISECONDS;
+  };
+  if (auto found = ownerReads.find(key); found != ownerReads.end() && fresh(found->second)) {
+    probeAtMs = found->second.startedMs;
     return found->second.answer.addBranch();
+  }
   for (auto it = ownerReads.begin(); it != ownerReads.end();)
-    it = now - it->second.atMs >= OWNER_REREAD_MS ? ownerReads.erase(it) : std::next(it);
+    it = !fresh(it->second) ? ownerReads.erase(it) : std::next(it);
   ++ownerHeartbeatReads;
+  probeAtMs = now;
   const auto limitMs = int64_t(membership.grantedTtlSeconds) * 1000 + membership.livenessGraceMs;
-  auto read = [](DurableLog& self, std::string nodeId, uint64_t epoch, int64_t limitMs) -> kj::Promise<OwnerHeartbeat> {
+  auto read = [](DurableLog& self, std::string nodeId, uint64_t epoch, int64_t limitMs, std::shared_ptr<double> settled)
+      -> kj::Promise<OwnerHeartbeat> {
+    const auto mark = kj::defer([&]() { *settled = monotonicTimeMs(); });
     if (!self.store) co_return OwnerHeartbeat::UNKNOWN;
     ObjectResponse response;
     try {
-      response = co_await self.timer.timeoutAfter(std::max<uint32_t>(1, self.settings.peerTimeoutMs) * kj::MILLISECONDS,
-          self.store->get(memberHeartbeatKey(nodeId, epoch)));
+      response = co_await self.readRecoveryMetadata(memberHeartbeatKey(nodeId, epoch),
+          std::max<uint32_t>(1, self.settings.peerTimeoutMs));
     } catch (const kj::Exception&) {
       co_return OwnerHeartbeat::UNKNOWN;
     }
@@ -5922,9 +6233,10 @@ kj::Promise<DurableLog::OwnerHeartbeat> DurableLog::readOwnerHeartbeat(std::stri
     const auto age = int64_t(response.dateUnixMs) - int64_t(response.lastModifiedUnixMs);
     co_return age > limitMs ? OwnerHeartbeat::GONE : OwnerHeartbeat::LIVE;
   };
-  auto fork = read(*this, nodeId, epoch, limitMs).fork();
+  auto settled = std::make_shared<double>(0);
+  auto fork = read(*this, nodeId, epoch, limitMs, settled).fork();
   auto branch = fork.addBranch();
-  ownerReads.insert_or_assign(key, OwnerRead{kj::mv(fork), now});
+  ownerReads.insert_or_assign(key, OwnerRead{kj::mv(fork), std::move(settled), now});
   return branch;
 }
 
@@ -6631,7 +6943,7 @@ void DurableLog::alarmCapacityAvailable(const std::string& destination) {
   AlarmCpuScope measured(*this);openAlarmCapacity("node");openAlarmCapacity("process:" + destination);scheduleAlarmPump();
 }
 void DurableLog::wakeAlarmPreparations() {
-  if (!alarmPreparationQueue.empty() && alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT) scheduleAlarmPump();
+  if (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT) scheduleAlarmPump();
 }
 kj::Promise<void> DurableLog::alarmRebuilt(std::string key, uint64_t token, kj::Promise<void> promise) {
   bool failed = false;
@@ -6688,7 +7000,7 @@ void DurableLog::pumpAlarmFires() {
     return settings.threadedAlarmEvents || activeAlarmFires < settings.config.alarmFireConcurrency;
   };
   for (unsigned n = 0;n < 8 && fireRoom();++n) {
-    const bool coldRoom = alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT;
+    const bool coldRoom = activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT;
     auto preparation = alarmPreparationQueue.end();
     if (coldRoom && !alarmPreparationQueue.empty()) {
       preparation = alarmPreparationQueue.upper_bound(lastAlarmPreparationTenant);
@@ -6738,7 +7050,7 @@ void DurableLog::pumpAlarmFires() {
     }));
   }
   if (!alarmActiveNamespaces.empty() || (fireRoom() && (!alarmReadyTenants.empty() ||
-      (!alarmPreparationQueue.empty() && alarmRebuildWaiting + activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)))) scheduleAlarmPump();
+      (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)))) scheduleAlarmPump();
   double next = 0;auto deadline = [&next](double at) { if (!next || at < next) next = at; };
   if (!alarmRetryDeadlines.empty()) deadline(alarmRetryDeadlines.begin()->first);
   if (!alarmNamespaceDeadlines.empty()) deadline(std::max(alarmNamespaceDeadlines.begin()->first, alarmNamespaceBatchAt));
@@ -7889,6 +8201,31 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
 
 // ---- The state endpoint ----
 
+std::string DurableLog::recoverySchedulerJson(double now) const {
+  std::ostringstream out;
+  out << "{\"metadataBytes\":" << rebuildMetadataBytes << ",\"peakMetadataBytes\":" << peakRebuildMetadataBytes
+      << ",\"metadataLimitBytes\":" << rebuildMetadataLimit << ",\"backgroundMetadataBytes\":" << backgroundRebuildMetadataBytes
+      << ",\"foregroundReservedBytes\":" << rebuildMetadataLimit / 4 << ",\"metadataRefusals\":" << rebuildMetadataRefusals
+      << ",\"metadataRequests\":" << recoveryMetadata.started() << ",\"activeMetadataRequests\":" << recoveryMetadata.active()
+      << ",\"peakMetadataRequests\":" << recoveryMetadata.peakActive()
+      << ",\"activeTailTransfers\":" << tailPages.active() << ",\"peakTailTransfers\":" << tailPages.peakActive()
+      << ",\"entries\":[";
+  bool first = true;
+  for (const auto& [name, run] : rebuildRuns) {
+    if (!first) out << ",";
+    first = false;
+    const bool queued = run->phase == RebuildPhase::QUEUED || run->phase == RebuildPhase::RESUMING;
+    out << "{\"object\":" << quote(name) << ",\"phase\":" << quote(rebuildPhaseName(run->phase))
+        << ",\"phaseMs\":" << now - run->phaseAtMs << ",\"waitingMs\":" << (run->parkedAtMs ? now - run->parkedAtMs : 0)
+        << ",\"queueMs\":" << run->queuedMs + (queued ? now - run->phaseAtMs : 0)
+        << ",\"class\":" << quote(run->background ? "background" : "foreground")
+        << ",\"owner\":" << quote(run->owner) << ",\"ownerEpoch\":\"" << run->ownerEpoch
+        << "\",\"probeAgeMs\":" << (run->probeAtMs ? now - run->probeAtMs : 0) << "}";
+  }
+  out << "]}";
+  return out.str();
+}
+
 std::string DurableLog::json() const {
   std::ostringstream out;
   uint64_t earlierRecords = 0;
@@ -7904,6 +8241,9 @@ std::string DurableLog::json() const {
   for (auto& waiter : rebuildWaiters) if (waiter.ready->isWaiting()) ++queuedRebuilds;
   uint32_t queuedBackgroundRebuilds = 0;
   for (auto& waiter : backgroundRebuildWaiters) if (waiter.ready->isWaiting()) ++queuedBackgroundRebuilds;
+  const auto waitingRebuilds = std::count_if(rebuildRuns.begin(), rebuildRuns.end(), [](const auto& entry) {
+    return entry.second->parkedAtMs != 0 && entry.second->phase != RebuildPhase::RESUMING;
+  });
   double alarmTickP99Us = 0;uint64_t tickSeen = 0;
   for (size_t i = 0;i < alarmTickUs.size();++i) {
     tickSeen += alarmTickUs[i];
@@ -7983,6 +8323,7 @@ std::string DurableLog::json() const {
       << "},\"objects\":{\"known\":" << objects.size()
       << ",\"local\":" << local << ",\"rebuilding\":" << rebuildingNow << ",\"repairing\":" << repairing
       << ",\"activeRebuilds\":" << activeRebuilds << ",\"queuedRebuilds\":" << queuedRebuilds + queuedBackgroundRebuilds
+      << ",\"waitingRebuilds\":" << waitingRebuilds
       << ",\"activeBackgroundRebuilds\":" << activeBackgroundRebuilds << ",\"queuedBackgroundRebuilds\":" << queuedBackgroundRebuilds
       << ",\"foregroundRebuilds\":" << foregroundRebuilds << ",\"backgroundRebuilds\":" << backgroundRebuilds
       << ",\"rebuildPromotions\":" << rebuildPromotions
@@ -8042,6 +8383,7 @@ std::string DurableLog::json() const {
         << (entry.wakes ? double(entry.wakeUsTotal) / double(entry.wakes) / 1000.0 : 0.0) << "}";
   }
   out << "],\"recovery\":{\"bounded\":" << tailRecoveryBounded << ",\"ownerSilent\":" << ownerSilentRecoveries
+      << ",\"scheduler\":" << recoverySchedulerJson(now)
       << ",\"cutsHeldOwnerLive\":" << cutsHeldOwnerLive << ",\"cutsHeldOwnerUnknown\":" << cutsHeldOwnerUnknown
       << ",\"ownerHeartbeatReads\":" << ownerHeartbeatReads
       << ",\"lateRecords\":" << lateTailRecords << ",\"transferredRecords\":" << transferredTailRecords

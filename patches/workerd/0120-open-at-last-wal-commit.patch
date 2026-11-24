@@ -237,10 +237,10 @@ index c186bdcdedb602366b2cab5bceeef131f2cd27ee..79ab2aed6ada82f785e3c743a35c1429
  }  // namespace
  }  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
-index b8f42b9cd06d92a44538fcd039cfe8565a7015fa..6fd0abcdd043fd37cf3561fd011cc61409e9ae9a 100644
+index 63d7d6c3d3a5177cc57fb19743f375fd653f20c4..d96f3fd4f09458a1ba04c7a3fd8195281615f913 100644
 --- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
 +++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
-@@ -508,25 +508,18 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
+@@ -517,25 +517,18 @@ DurableLogShipper::DurableLogShipper(const kj::Directory& directory,
    // so this instance starts after them -- and reports where it starts, because the earlier instance may have died
    // between a commit and its confirmation. The node compares the position with what it confirmed and breaks this
    // object when they differ: the frames it never confirmed must not be read by anybody.

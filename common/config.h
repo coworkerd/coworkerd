@@ -243,6 +243,7 @@ struct DurableLogConfig {
   uint32_t usagePublishMs = 3600000;
   uint32_t alarmDiscoveryIntervalMs = 60000;
   uint32_t alarmTakeoverConcurrency = 4;
+  uint32_t versionDrainTimeoutMs = 30000;
   void validate() const;
 };
 
