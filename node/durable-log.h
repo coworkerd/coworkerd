@@ -426,6 +426,7 @@ public:
   int openChannel(const std::string& processId, uint64_t threadedGeneration = 0);
   void closeChannel(const std::string& processId);
   bool drainChannel(const std::string& processId);
+  uint64_t nativeSqlWalFrameLimitBytes() const;
 
   // ---- The objects ----
   struct ObjectIdentity {

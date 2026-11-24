@@ -630,6 +630,93 @@ export async function sqlProcessSpill(cluster) {
   }));
 }
 
+export async function sqlWalAndTemporaryFiles(cluster) {
+  const tenant = await cluster.tenant('sql-wal-and-temp');
+  const db = await database(cluster, tenant, 'ledger');
+  assert.equal((await db.query({ sql: 'CREATE TABLE ledger(payload BLOB)' })).success, true);
+  const placement = await acceptedOn(cluster, db.namespaceId);
+  const state = () => cluster.state(placement.nodeId);
+  const ownerProcess = async () => {
+    const { processes } = await state();
+    const owner = processes.entries.find(entry => entry.processId === placement.processId);
+    assert.equal(owner.generation, placement.processGeneration);
+    return owner;
+  };
+  const before = (await state()).durableLog;
+  const cap = BigInt(before.settings.recordLimitBytes);
+  const insert = size => ({ sql: 'INSERT INTO ledger VALUES(zeroblob(?))', params: [size] });
+  const common = Array.from({ length: 31 }, () => insert(2 * 1024 * 1024));
+  const near = await db.query([...common, insert(1024 * 1024)]);
+  assert.equal(near.length, 32);
+  assert.ok(near.every(row => row.success));
+  const confirmed = (await state()).durableLog;
+  const encodedBytes = BigInt(confirmed.log.bytes) - BigInt(before.log.bytes);
+  assert.ok(encodedBytes <= cap && encodedBytes > cap - 1024n * 1024n,
+    `replicated record of ${encodedBytes} bytes should be just below ${cap}`);
+  assert.equal(confirmed.confirm.confirmations, before.confirm.confirmations + 1);
+  const acknowledgedPeers = confirmed.peers.streams.filter(peer =>
+    BigInt(peer.ackedSeq) >= BigInt(confirmed.log.nextSeq));
+  assert.ok(acknowledgedPeers.length > 0, 'a peer confirmed the near-limit record');
+
+  const walPath = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${db.namespaceId}`;
+  const walBytes = async () => {
+    const text = await cluster.compose(['exec', '-T', placement.nodeId, 'find', walPath,
+      '-maxdepth', '1', '-name', '*.sqlite-wal', '-printf', '%s\n']);
+    return text.split('\n').filter(Boolean).reduce((total, size) => total + Number(size), 0);
+  };
+  const beforeRefusal = await walBytes();
+  const over = await db.raw([...common, insert(2 * 1024 * 1024)]);
+  assert.equal(json(over, 422, 'WAL transaction above the replication limit').code, 'SQL_TRANSACTION_TOO_LARGE');
+  assert.deepEqual((await db.query({ sql: 'SELECT count(*) AS rows, sum(length(payload)) AS bytes FROM ledger' })).results,
+    [{ rows: 32, bytes: 63 * 1024 * 1024 }]);
+  const after = (await state()).durableLog;
+  assert.equal(after.log.records, confirmed.log.records);
+  assert.equal(after.recovery.recordLimitRefusals, confirmed.recovery.recordLimitRefusals);
+  assert.equal(after.threadedHomeIo.openSamples, confirmed.threadedHomeIo.openSamples);
+  assert.ok(await walBytes() <= beforeRefusal);
+  assert.equal((await ownerProcess()).lifecycle.durableAdmission.nativeSqlSpillBytes, 0);
+
+  // The LIMIT preserves the sorted subquery as a coroutine. Its temporary
+  // b-tree stays open while the first output row evaluates a correlated sum.
+  const sort = {
+    sql: `WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<12288)
+      SELECT ordered.x, (WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<1000000000)
+        SELECT sum(n) + ordered.x FROM r)
+      FROM (SELECT x FROM seq ORDER BY randomblob(8192) LIMIT 10000) AS ordered LIMIT 1`,
+  };
+  const abort = new AbortController();
+  const pending = abortableQuery(cluster, tenant, db, sort, abort);
+  let held;
+  try {
+    held = await eventually('SQLite has a live temporary sort file on durable storage', async () => {
+      const { pid, lifecycle: { durableAdmission } } = await ownerProcess();
+      assert.equal(durableAdmission.running, 1);
+      assert.ok(durableAdmission.nativeSqlSpillBytes > 1024 * 1024);
+      const listing = await cluster.compose(['exec', '-T', placement.nodeId, 'ls', '-l', `/proc/${pid}/fd`]);
+      // Linux gives unnamed O_TMPFILE inodes a #number, while the portable
+      // implementation creates and immediately unlinks a named etilqs file.
+      const temporary = listing.split('\n').map(line => line.split(' -> ')[1] ?? '')
+        .filter(path => /\/(?:etilqs_[^/ ]+|#\d+) \(deleted\)$/.test(path));
+      assert.ok(temporary.length > 0, listing);
+      assert.ok(temporary.every(path => path.startsWith('/var/lib/coworkerd/do/')), temporary.join('\n'));
+      return { bytes: durableAdmission.nativeSqlSpillBytes, locations: temporary };
+    }, { timeout: 10000, interval: 100 });
+  } finally {
+    abort.abort();
+    assert.equal((await pending).error?.name, 'AbortError');
+  }
+  await eventually('the interrupted sorter releases its spill', async () => {
+    assert.equal((await ownerProcess()).lifecycle.durableAdmission.nativeSqlSpillBytes, 0);
+    await db.ready();
+  }, { timeout: 6000 });
+  console.log('Native SQL WAL and temporary files', JSON.stringify({
+    encodedBytes: String(encodedBytes), recordLimitBytes: String(cap),
+    frameCapacityBytes: before.settings.nativeSqlWalFrameLimitBytes,
+    acknowledgedPeers: acknowledgedPeers.map(peer => peer.nodeId),
+    openSamples: after.threadedHomeIo.openSamples, tempSpill: held, releasedBytes: 0,
+  }));
+}
+
 export async function sqlHomePressure(cluster) {
   const tenant = await cluster.tenant('sql-home-pressure', { durableObjectNamespaces: 1000 });
   const other = await cluster.tenant('sql-home-pressure-neighbor');

@@ -2455,6 +2455,19 @@ uint64_t DurableLog::recordLimitBytes() const {
   return rawLimit > TAIL_RPC_HEADROOM_BYTES ? rawLimit - TAIL_RPC_HEADROOM_BYTES : 0;
 }
 
+uint64_t DurableLog::nativeSqlWalFrameLimitBytes() const {
+  // A native database uses a root record. takeRecord() drops the data epoch from
+  // the host name before encoding it. The namespace, object and storage IDs are
+  // all 32-byte digests in hex. Budget the WAL header even for later records.
+  LogRecord record;
+  record.objectName.resize(64 + 1 + 64);
+  record.storageId.resize(64);
+  record.header.resize(32);
+  const auto overhead = encodedLogRecordSize(record);
+  const auto limit = recordLimitBytes();
+  return limit > overhead ? limit - overhead : 0;
+}
+
 // One record of this node's log: it goes to the peers of its object's shard, and the answer to the request that
 // carried it waits for them. Nothing here touches the disk or the object store (experiment 25, D.2).
 void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t request) {
@@ -8488,6 +8501,7 @@ std::string DurableLog::json() const {
   }
   out << "]},\"settings\":{\"confirmTimeoutMs\":" << settings.config.confirmTimeoutMs << ",\"recoverTimeoutMs\":"
       << settings.config.recoverTimeoutMs << ",\"recordLimitBytes\":\"" << recordLimitBytes()
+      << "\",\"nativeSqlWalFrameLimitBytes\":\"" << nativeSqlWalFrameLimitBytes()
       << "\",\"segmentIntervalMs\":" << settings.config.segmentIntervalMs
       << ",\"segmentBytes\":\"" << settings.config.segmentBytes << "\",\"snapshotBytes\":\""
       << settings.config.snapshotBytes << "\",\"objectBytes\":\"" << settings.config.objectBytes

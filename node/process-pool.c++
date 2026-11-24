@@ -1530,6 +1530,7 @@ public:
   std::function<void(const std::string&)> durableChannelClose;
   std::function<bool(const std::string&)> durableChannelDrain;
   DurableLogConfig durableLog;
+  uint64_t nativeSqlWalFrameLimit = 0;
   std::shared_ptr<TenantCpu> cpuUsage = std::make_shared<TenantCpu>();
   std::vector<Slot> slots;
   std::deque<std::string> kills;
@@ -2569,6 +2570,9 @@ public:
       childEnvironment.push_back("COWORKERD_DO_CONFIRM_TIMEOUT_MS=" + std::to_string(durableLog.confirmTimeoutMs));
       childEnvironment.push_back("COWORKERD_DO_CHECKPOINT_BYTES=" + std::to_string(durableLog.checkpointBytes));
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
+      if (p->threaded) {
+        childEnvironment.push_back("COWORKERD_DO_SQL_WAL_FRAME_BYTES=" + std::to_string(nativeSqlWalFrameLimit));
+      }
     }
     if (p->durableTestStorage) {
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
@@ -3938,11 +3942,12 @@ kj::Promise<uint32_t> ProcessPool::resetDurableAndWait(const std::string& reason
 
 void ProcessPool::setDurableChannel(std::function<int(const std::string&, uint64_t)> open,
     std::function<void(const std::string&)> close, std::function<bool(const std::string&)> drain,
-    const DurableLogConfig& settings) {
+    const DurableLogConfig& settings, uint64_t nativeSqlWalFrameLimit) {
   impl->durableChannelOpen = std::move(open);
   impl->durableChannelClose = std::move(close);
   impl->durableChannelDrain = std::move(drain);
   impl->durableLog = settings;
+  impl->nativeSqlWalFrameLimit = nativeSqlWalFrameLimit;
 }
 void ProcessPool::setRetiring(std::function<uint32_t(const std::string&, uint64_t)> callback) {
   impl->retiring = std::move(callback);

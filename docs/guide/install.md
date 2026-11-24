@@ -549,7 +549,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `durableObjects` key | Default | Meaning |
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
-| `threadedStorage` | `false` | Experimental Linux opt-in for isolated tests with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. D1, alarm delivery, WebSocket upgrades, and persistent facet cloning are refused as `NOT_SUPPORTED`. A due alarm remains scheduled for ownership by an upstream node. Keep the default upstream backend for product deployments. |
+| `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Worker Durable Objects use threaded homes and D1 databases use native SQLite. See [Durable Objects](durable-objects.md) and [databases](databases.md) for the supported modes. Keep the default upstream backend for product deployments. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
@@ -560,6 +560,8 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 | `peerBufferBytes` | `268435456` | 256 MiB total memory for other owners' tails; refusal beyond it |
 | `objectBytes` | `10737418240` | 10 GiB per object including its facet databases, based on reported checkpoint / open / close sizes |
 | `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
+| `nativeSqlDatabaseSpillBytes` | `1073741824` | Combined uncommitted WAL and temporary-file bytes for one native database |
+| `nativeSqlProcessSpillBytes` | Four times the per-database limit (4 GiB by default) | Combined spill bytes for a native durable process |
 | `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
 | `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
 | `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
@@ -574,8 +576,13 @@ A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes,
 (67,104,768 bytes with defaults), so an acknowledged record fits the existing peer recovery RPC. The normal
 32 MiB page budget permits one larger record by itself. `durableLog.settings.recordLimitBytes` reports the
 limit; it is not a new configuration key. Oversized commits fail with `STORAGE_UNAVAILABLE` before replication
-and are discarded by the existing repair path; split large transactions. CPU and memory limits can reject
-smaller transactions. See the record-size discussion in cluster-state section 12.
+and are discarded by the existing repair path. Native SQL gets the record's frame capacity from the node and
+rejects an oversized transaction before commit with `SQL_TRANSACTION_TOO_LARGE`. CPU and memory limits can
+reject smaller transactions. See the record-size discussion in cluster-state section 12.
+
+Native SQL uses the durable storage filesystem for WAL growth and temporary files. Size that filesystem for up to
+`durableObjects.processes × durableObjects.nativeSqlProcessSpillBytes` of spill per node, in addition to the node
+logs, database files and recovery staging. With one durable process and the default spill limits, this adds 4 GiB.
 
 A takeover starts each object's `membership.ttlSeconds * 1000 + membership.livenessGraceMs` deadline (25 s by default)
 when its preparation begins. A complete owner answer ends collection early. Otherwise the node checks the silent

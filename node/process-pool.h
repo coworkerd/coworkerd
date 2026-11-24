@@ -154,7 +154,7 @@ public:
   void setDurableChannel(std::function<int(const std::string&, uint64_t)> open,
       std::function<void(const std::string&)> close,
       std::function<bool(const std::string&)> drain,
-      const DurableLogConfig& settings);
+      const DurableLogConfig& settings, uint64_t nativeSqlWalFrameLimit);
   // Usage: the CPU nanoseconds of each tenant's executions since the last call (from the `completed` rows),
   // and how many isolates of each tenant are resident now (the lifecycle snapshots).
   std::map<std::string, uint64_t> takeCpuUsage();

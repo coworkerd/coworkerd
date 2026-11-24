@@ -10349,7 +10349,7 @@ int run(Launch launch) {
       },
       [&durableLog](const std::string& processId) { durableLog.closeChannel(processId); },
       [&durableLog](const std::string& processId) { return durableLog.drainChannel(processId); },
-      server.placementConfig().durableLog);
+      server.placementConfig().durableLog, durableLog.nativeSqlWalFrameLimitBytes());
   shards.onShardGone([&server, &durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
     if (server.placementConfig().processPool.threadedDurableStorage)
       server.webSockets().goAwayShard(namespaceId, shard);

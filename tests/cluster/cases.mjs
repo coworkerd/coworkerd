@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlHomePressure, sqlProcessSpill, sqlProtocol,
-  sqlResourceBounds } from './native-sql.mjs';
+  sqlResourceBounds, sqlWalAndTemporaryFiles } from './native-sql.mjs';
 
 function respondWith(value) {
   return `export default { fetch() { return new Response(${JSON.stringify(value)}); } };`;
@@ -1741,6 +1741,9 @@ export const durableGatedCases = {
   'sql-process-spill': {
     test: sqlProcessSpill, nodes: ['node-1'], durableOwners: ['node-1'],
     nativeSqlDatabaseSpillBytes: 16 * 1024 * 1024, nativeSqlProcessSpillBytes: 12 * 1024 * 1024,
+  },
+  'sql-wal-and-temporary-files': {
+    test: sqlWalAndTemporaryFiles, nodes: ['node-1', 'node-2', 'node-3'], confirmTimeoutMs: 15000,
   },
   'sql-home-pressure': {
     test: sqlHomePressure, nodes: ['node-1'], durableOwners: ['node-1'],

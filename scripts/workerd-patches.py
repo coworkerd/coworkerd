@@ -295,6 +295,12 @@ def allowed_path(name, path):
                               'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite-metering.h',
                               'src/workerd/util/sqlite-metering.c++'} or
+                          name == '0115-bound-native-sql-commits.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite.c++',
+                              'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite-metering.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
