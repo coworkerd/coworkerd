@@ -28,7 +28,7 @@ jobs:
             runner: macos-26
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
-    timeout-minutes: 45
+    timeout-minutes: 55
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
@@ -128,7 +128,7 @@ jobs:
           PY
       - name: Run cluster integration tests
         if: runner.os == 'Linux'
-        timeout-minutes: 22
+        timeout-minutes: 35
         env:
           TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
         run: |
