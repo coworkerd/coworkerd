@@ -82,3 +82,4 @@
 0107-fatal-record-test-constant.patch
 0108-scope-fatal-attribution.patch
 0109-keep-fatal-diagnostics-and-load-scopes.patch
+0110-cover-remaining-entries-and-test-fatal-callbacks.patch

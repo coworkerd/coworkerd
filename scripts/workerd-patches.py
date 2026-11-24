@@ -265,6 +265,9 @@ def allowed_path(name, path):
                               'src/workerd/threaded/fatal-attribution-test.c++',
                               'src/workerd/threaded/fatal-attribution-scope-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0110-cover-remaining-entries-and-test-fatal-callbacks.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

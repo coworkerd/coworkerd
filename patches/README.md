@@ -42,10 +42,11 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patches 0100, 0101 and 0104 dispatch node-authorized alarm events on threaded homes. Their
   `io/actor-sqlite.{h,c++}` hooks require an exact confirmed alarm time at entry and publish alarm changes
   after WAL confirmation for this host. The storage fixture holds confirmation to test these guarantees.
-  Patches 0105 through 0109 add fatal attribution and bounded diagnostics to the ordinary and
+  Patches 0105 through 0110 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. Patch 0109 allows the three exact paths in `io/worker.c++`,
   `io/limit-enforcer.h` and `tests/test-fixture.c++` for the legacy import limit hook.
   This passes a weak reference to the originating context without changing the ambient context.
+  Patch 0110 stays in the threaded server and its component test.
   Keep implementation in our helpers
   and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform

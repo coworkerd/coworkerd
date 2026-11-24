@@ -173,13 +173,27 @@ export async function fatalAttribution(cluster) {
     assert.equal(current.state, 'ready');
     return current;
   });
-  const syntheticExit = async (process, event) => {
+  const replacedQuarantine = (process) => eventually('a new quarantine process is ready', async () => {
+    const current = (await pool()).entries.find(entry => entry.processId === process.processId);
+    assert.ok(current?.generation > process.generation);
+    assert.equal(current.state, 'ready');
+    assert.ok(current.pid > 1);
+    return current;
+  });
+  // What V8 itself said before the process with `pid` exited, from the node's log.
+  const diagnosticOf = async (pid) => {
+    const prefix = '[v8-fatal-diagnostic] ';
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', node]);
+    return logs.split('\n').filter(line => line.startsWith(prefix))
+      .map(line => JSON.parse(line.slice(prefix.length))).find(entry => entry.pid === pid);
+  };
+  const syntheticExit = async (process, event, check = result => assertUncertain(result, `synthetic ${event} from ${process.processClass}`)) => {
     const command = join(cluster.fatalControl, `command.${process.pid}`);
     const pending = `${command}.pending`;
     await writeFile(pending, `${event}\n${target}`, { flag: 'wx', mode: 0o644 });
     await rename(pending, command);
     try {
-      assertUncertain(await hello(), `synthetic ${event} from ${process.processClass}`);
+      check(await hello());
     } finally {
       await unlink(command);
     }
@@ -222,6 +236,8 @@ export async function fatalAttribution(cluster) {
   assert.equal(first?.culpritStatus, 'confirmed');
   assert.equal(first.culprit.workerId, target);
   assert.ok(first.inFlight.some(call => call.workerId === `${neighbor.name}/hello`));
+  assert.deepEqual(await diagnosticOf(before.pid),
+    { pid: before.pid, location: 'v8::ToLocalChecked', line: 0, message: 'Empty MaybeLocal' });
   const quarantine = firstRoute.entries.find(entry => entry.processClass === 'quarantine');
   assert.equal(quarantine?.state, 'ready');
   await assertQuarantineRoute(node, quarantine);
@@ -243,6 +259,19 @@ export async function fatalAttribution(cluster) {
   assert.equal(second.processClass, 'quarantine');
   assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
   assert.equal((await ordinaryProcess(cluster, node)).pid, replacement.pid);
+
+  // V8's API check while the Worker loads cold in the replaced quarantine process, after its top level
+  // ran (handler validation), where only the load's own scope names the Worker.
+  const reloaded = await replacedQuarantine(quarantine);
+  let loadResult;
+  await syntheticExit(reloaded, 'load-api-check', result => { loadResult = result; });
+  const third = (await pool()).recentFatalExits.find(entry => sameGeneration(entry, reloaded));
+  assert.equal(third?.culpritStatus, 'confirmed', JSON.stringify(third));
+  // The call that started the load is answered as a load failure.
+  assert.equal(json(loadResult, 503, 'the call whose load ended the process').code, 'LOAD_FAILED');
+  assert.equal(third.culprit.workerId, target);
+  assert.equal((await diagnosticOf(reloaded.pid))?.message, 'Empty MaybeLocal');
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
 }
 
 async function logQuota(cluster) {
