@@ -430,6 +430,61 @@ async function durableTakeover(cluster) {
   });
 }
 
+async function durableSlowHolder(cluster) {
+  const tenant = await takeoverWriter(cluster, 'slow-holder-test');
+  const [first] = cluster.nodes;
+  const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
+  await eventually('the original holder confirms the value', async () => {
+    const response = await workerCall(cluster, first, tenant, 'object', { method: 'POST', body: 19 });
+    assert.equal(json(response, 200, 'confirmed value'), 19);
+  });
+  const { namespaceId, owners: [original] } = await namespace();
+  assert.ok(original && !original.released);
+  const originalState = await cluster.state(original.nodeId);
+  const ingress = cluster.nodes.find(node => node !== first && node !== original.nodeId);
+  const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update('takeover').digest('hex');
+  const gate = join(cluster.recoveryRelayGate, original.nodeId);
+  await writeFile(gate, '');
+  try {
+    // Inject the normal handoff marker while keeping the previous node and its
+    // heartbeat alive. The relay withholds Cap'n Proto replies from that node.
+    await cluster.releaseShardForRecoveryTest(namespaceId, { ...original, nodeEpoch: originalState.durableLog.nodeEpoch });
+    let answered = false;
+    const read = workerCall(cluster, ingress, tenant, 'object', { timeout: 34000 })
+      .then(value => { answered = value.status === 200; return { value }; }, error => ({ error }));
+    const takeover = await eventually('a successor has acquired the released shard', async () => {
+      const { owners } = await namespace();
+      const newOwner = owners.find(owner => owner.shard === original.shard);
+      assert.ok(newOwner && !newOwner.released && newOwner.nodeId !== original.nodeId &&
+        BigInt(newOwner.epoch) > BigInt(original.epoch));
+      return newOwner.nodeId;
+    });
+    await eventually('the successor is waiting past the deadline for the live holder', async () => {
+      const state = await cluster.state(takeover);
+      const entry = state.durableLog.recovery.scheduler.entries.find(row => row.object.startsWith(`${namespaceId}/${id}/`));
+      assert.ok(state.durableLog.recovery.cutsHeldOwnerLive > 0 && entry);
+      assert.equal(entry.owner, original.nodeId);
+      assert.equal(entry.ownerEpoch, originalState.durableLog.nodeEpoch);
+      assert.ok(entry.waitingMs >= 8500);
+      assert.equal(state.durableLog.objects.activeRebuilds, 0);
+      assert.ok(state.peerConnections[original.nodeId].tailFailures > 0, 'a real page timeout marked its connection');
+    }, { timeout: 22000, interval: 75 });
+    assert.equal(answered, false, 'the successor cannot serve the object while the holder is slow');
+    const stillAlive = await cluster.state(original.nodeId);
+    assert.equal(stillAlive.membership.selfExpired, false);
+    assert.equal(stillAlive.membership.leaseFences, originalState.membership.leaseFences);
+    await unlink(gate);
+    const { value, error } = await read;
+    if (error) throw error;
+    assert.deepEqual(json(value, 200, 'the successor read after the holder replied'), [19]);
+    const settled = await cluster.state(takeover);
+    assert.equal(settled.durableLog.recovery.ownerSilent, 0);
+    assert.equal(settled.durableLog.recovery.bounded, 0);
+  } finally {
+    await unlink(gate).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  }
+}
+
 async function durableThreadedFence(cluster) {
   const tenant = await takeoverWriter(cluster, 'fenced-durable-test');
   const [first] = cluster.nodes;
@@ -1510,6 +1565,10 @@ export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation
 
 export const durableGatedCases = {
   'durable-peer-ack': { test: durablePeerAck },
+  'durable-slow-holder': {
+    test: durableSlowHolder, delayRecoveryPeers: true,
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-fence': {

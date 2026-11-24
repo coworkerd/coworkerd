@@ -45,7 +45,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
-    controlDurableLifecycle = false,
+    controlDurableLifecycle = false, delayRecoveryPeers = false,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -64,6 +64,7 @@ export class Cluster {
     this.override = join(directory, 'compose.json');
     this.peerAckGate = holdPeerAcks ? join(directory, 'peer-acks') : null;
     this.durableLifecycleGate = controlDurableLifecycle ? join(directory, 'durable-lifecycle') : null;
+    this.recoveryRelayGate = delayRecoveryPeers ? join(directory, 'recovery-relay') : null;
     this.threadedNodes = new Set(threadedNodes);
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
@@ -104,6 +105,18 @@ export class Cluster {
     if (this.peerAckGate) await mkdir(this.peerAckGate, { mode: 0o755 });
     if (this.durableLifecycleGate) await mkdir(this.durableLifecycleGate, { mode: 0o755 });
     const overrides = {};
+    if (this.recoveryRelayGate) {
+      await mkdir(this.recoveryRelayGate, { mode: 0o755 });
+      overrides['recovery-relay'] = {
+        image: 'node:22-trixie', command: ['node', '/relay.mjs'], networks: ['backend'],
+        depends_on: { secrets: { condition: 'service_completed_successfully' } },
+        volumes: [
+          { type: 'bind', source: join(root, 'tests/cluster/recovery-relay.mjs'), target: '/relay.mjs', read_only: true },
+          { type: 'bind', source: this.recoveryRelayGate, target: '/gates', read_only: true },
+          { type: 'volume', source: 'secrets', target: '/store-secrets', read_only: true, volume: { subpath: 'apiserver' } },
+        ],
+      };
+    }
     for (const node of nodes) {
       const peer = `${node}-peer:8934`;
       const secrets = '/var/lib/coworkerd-secrets';
@@ -111,7 +124,8 @@ export class Cluster {
       const target = '/tmp/cluster-test-node.json';
       await writeFile(config, JSON.stringify({
         nodeId: node, stackDirectory: '/var/lib/coworkerd', listenAddress: '0.0.0.0:8930',
-        advertisedAddress: peer, peerListenAddress: peer,
+        advertisedAddress: this.recoveryRelayGate ? `recovery-relay:${18001 + nodes.indexOf(node)}` : peer,
+        peerListenAddress: peer,
         secrets: { keyFile: `${secrets}/secrets-key.json` },
         peerAuth: { keyFile: `${secrets}/cluster-key.json` },
         storage: { endpoint: 'http://storage:8333', credentialsFile: `${secrets}/server.json` },
@@ -125,6 +139,9 @@ export class Cluster {
             versionDrainTimeoutMs: this.versionDrainTimeoutMs,
           },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
+        } : {}),
+        ...(this.recoveryRelayGate ? {
+          durableObjects: { peerBufferBytes: 1048576, confirmTimeoutMs: 1000, recoverParallelism: 1 },
         } : {}),
       }));
       overrides[node] = {
@@ -177,6 +194,13 @@ export class Cluster {
 
   async state(node) {
     return json(await request(this.urls[node], '/__coworkerd/state', { token: this.management }), 200, `${node} state`);
+  }
+
+  async releaseShardForRecoveryTest(namespaceId, { nodeId, nodeEpoch, shard, epoch }) {
+    assert.ok(this.recoveryRelayGate);
+    assert.match(namespaceId, /^[a-f0-9]{64}$/);
+    await this.compose(['exec', '-T', 'recovery-relay', 'node', '/relay.mjs', '--release',
+      namespaceId, nodeId, String(nodeEpoch), String(shard), String(epoch)]);
   }
 
   async tenant(name, quotas) {
