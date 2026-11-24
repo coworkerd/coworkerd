@@ -257,15 +257,10 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0109-keep-fatal-diagnostics-and-load-scopes.patch' and path in {
-                              'src/workerd/io/limit-enforcer.h',
-                              'src/workerd/io/worker.c++',
-                              'src/workerd/tests/test-fixture.c++',
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/fatal-attribution.h',
                               'src/workerd/threaded/fatal-attribution-test.c++',
                               'src/workerd/threaded/fatal-attribution-scope-test.c++',
-                              'src/workerd/threaded/threaded-server.c++'} or
-                          name == '0110-cover-remaining-entries-and-test-fatal-callbacks.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
