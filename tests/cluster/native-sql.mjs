@@ -390,11 +390,15 @@ export async function sqlResourceBounds(cluster) {
   const location = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${holder.namespaceId}`;
   const disk = async () => {
     const listing = await cluster.compose(
-      ['exec', '-T', placement.nodeId, 'find', location, '-maxdepth', '1', '-type', 'f', '-printf', '%s %b\n']);
-    return listing.trim().split('\n').filter(Boolean).reduce((sum, line) => {
-      const [bytes, blocks] = line.split(' ').map(Number);
-      return { logical: sum.logical + bytes, allocated: sum.allocated + blocks * 512 };
-    }, { logical: 0, allocated: 0 });
+      ['exec', '-T', placement.nodeId, 'find', location, '-maxdepth', '1', '-type', 'f', '-printf', '%f\t%s\t%b\n']);
+    const totals = { logical: 0, allocated: 0, walLogical: 0 };
+    for (const line of listing.split('\n').filter(Boolean)) {
+      const [name, bytes, blocks] = line.split('\t');
+      totals.logical += Number(bytes);
+      totals.allocated += Number(blocks) * 512;
+      if (name.endsWith('.sqlite-wal')) totals.walLogical += Number(bytes);
+    }
+    return totals;
   };
   const resources = async () => {
     const { processes } = await cluster.state(placement.nodeId);
@@ -408,6 +412,12 @@ export async function sqlResourceBounds(cluster) {
       residentBytes: owner.residentBytes, openDescriptors: descriptors.trim().split('\n').length };
   };
   const before = await disk();
+  // Keep sampling every named file, while checking the WAL's rollback
+  // independently. Reopening the home can append small bookkeeping records.
+  const assertSpillReclaimed = (sample) => {
+    assert.ok(sample.walLogical <= before.walLogical && sample.allocated <= before.allocated,
+      JSON.stringify({ before, sample }));
+  };
   const idle = await resources();
   const abort = new AbortController();
   let settled = false;
@@ -428,8 +438,8 @@ export async function sqlResourceBounds(cluster) {
     }, { timeout: 5000, interval: 100 });
     during = await disk();
     assert.equal(settled, false, 'the staging transaction ended before the disk sample');
-    assert.ok(before.logical > 0);
-    assert.ok(during.logical > before.logical && during.logical - before.logical <= cluster.nativeSqlDatabaseSpillBytes,
+    const walGrowth = during.walLogical - before.walLogical;
+    assert.ok(walGrowth > 0 && walGrowth <= cluster.nativeSqlDatabaseSpillBytes,
       JSON.stringify({ before, during }));
     for (const candidate of candidates) {
       const answer = await candidate.raw({ sql: 'SELECT 1' });
@@ -455,8 +465,7 @@ export async function sqlResourceBounds(cluster) {
   assert.deepEqual(recovered.results, []);
   const retryMs = performance.now() - disconnectedAt;
   const after = await disk();
-  assert.ok(after.logical <= before.logical && after.allocated <= before.allocated,
-    JSON.stringify({ before, during, after }));
+  assertSpillReclaimed(after);
   const recoveredProcess = await eventually('the child reports the SQL home idle again', async () => {
     const snapshot = await resources();
     assert.equal(snapshot.running, 0);
@@ -470,8 +479,7 @@ export async function sqlResourceBounds(cluster) {
   assert.equal(json(declined, 507, 'oversized transaction').code, 'SQL_SPILL_LIMIT_EXCEEDED');
   assert.deepEqual((await holder.query({ sql: 'SELECT id FROM ledger' })).results, []);
   const afterRefusal = await disk();
-  assert.ok(afterRefusal.logical <= before.logical && afterRefusal.allocated <= before.allocated,
-    JSON.stringify({ before, afterRefusal }));
+  assertSpillReclaimed(afterRefusal);
 
   const hold = join(cluster.peerAckGate, 'hold');
   const peers = cluster.nodes.filter(node => node !== placement.nodeId);
