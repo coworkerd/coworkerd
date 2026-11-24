@@ -657,6 +657,7 @@ export async function sqlWalAndTemporaryFiles(cluster) {
   const acknowledgedPeers = confirmed.peers.streams.filter(peer =>
     BigInt(peer.ackedSeq) >= BigInt(confirmed.log.nextSeq));
   assert.ok(acknowledgedPeers.length > 0, 'a peer confirmed the near-limit record');
+  assert.ok(confirmed.threadedHomeIo.openSamples > 0);
 
   const walPath = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${db.namespaceId}`;
   const walBytes = async () => {
@@ -674,7 +675,9 @@ export async function sqlWalAndTemporaryFiles(cluster) {
   assert.equal(after.recovery.recordLimitRefusals, confirmed.recovery.recordLimitRefusals);
   assert.equal(after.threadedHomeIo.openSamples, confirmed.threadedHomeIo.openSamples);
   assert.ok(await walBytes() <= beforeRefusal);
-  assert.equal((await ownerProcess()).lifecycle.durableAdmission.nativeSqlSpillBytes, 0);
+  await eventually('the child reports that the rejected transaction returned its spill', async () => {
+    assert.equal((await ownerProcess()).lifecycle.durableAdmission.nativeSqlSpillBytes, 0);
+  }, { timeout: 6000 });
 
   // The LIMIT preserves the sorted subquery as a coroutine. Its temporary
   // b-tree stays open while the first output row evaluates a correlated sum.
