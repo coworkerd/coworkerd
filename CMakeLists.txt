@@ -233,7 +233,7 @@ add_test(NAME durable-threaded-alarms COMMAND coworkerd-durable-channel-test thr
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
 add_test(NAME durable-tail-negative-controls COMMAND coworkerd-durable-channel-test tail-negative)
-foreach(case admission requeue final-round live-owner local-restart)
+foreach(case admission requeue final-round final-per-object live-owner local-restart)
   add_test(NAME durable-recovery-${case} COMMAND coworkerd-durable-channel-test recovery-${case})
 endforeach()
 add_test(NAME durable-segment-equivalence COMMAND coworkerd-durable-channel-test segment)

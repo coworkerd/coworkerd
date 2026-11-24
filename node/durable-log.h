@@ -296,6 +296,30 @@ struct DurableTailConnection {
   std::function<bool()> usable;
 };
 
+template <typename Transport, typename Fetch, typename Report>
+std::shared_ptr<DurableTailConnection> bindDurableTailConnection(DurableTailTarget target, kj::Rc<Transport> connection,
+    Fetch fetch, Report reportFailure) {
+  auto transport = std::make_shared<kj::Rc<Transport>>(kj::mv(connection));
+  auto handle = std::make_shared<DurableTailConnection>();
+  const auto epoch = target.destinationEpoch;
+  const auto generation = (*transport)->getGeneration();
+  handle->target = std::move(target);
+  handle->generation = generation;
+  handle->page = [transport, epoch, fetch = std::move(fetch)](DurableTailAsk ask) {
+    return fetch(transport, std::move(ask), epoch);
+  };
+  handle->failed = [transport, generation, report = std::move(reportFailure)]() {
+    if ((*transport)->markTailFailed()) report(generation);
+  };
+  handle->usable = [transport]() { return (*transport)->canFetchTails(); };
+  return handle;
+}
+
+struct DurableTailRound {
+  uint64_t tick;
+  bool final;
+};
+
 // One node's replicator: the channels to its durable processes, its log, its peers, its segments, the manifests of
 // its objects, their snapshots, and the rebuild of an object from all of it.
 class DurableLog final: private kj::TaskSet::ErrorHandler {
@@ -342,7 +366,7 @@ public:
     // Whether the namespace is still a tenant's active one: a deleted class's or a deleted database's objects are
     // not served and stop counting against the tenant's storage.
     std::function<bool(const std::string& namespaceId)> namespaceActive;
-    std::function<kj::Promise<std::shared_ptr<DurableTailConnection>>(DurableTailTarget, uint64_t)> connectTail;
+    std::function<kj::Promise<std::shared_ptr<DurableTailConnection>>(DurableTailTarget, DurableTailRound)> connectTail;
   };
   DurableLog(Settings settings, const ObjectStoreConfig& store, kj::Network& network, kj::Timer& timer,
       kj::LowLevelAsyncIoProvider& lowLevel, const MembershipView& membership, Hooks hooks);
@@ -937,6 +961,7 @@ private:
   static constexpr size_t REBUILD_METADATA_LIMIT = 16u << 20;
   static constexpr size_t REBUILD_ENTRY_BYTES = 4096;
   static constexpr kj::Exception::DetailTypeId REBUILD_METADATA_FULL = 0x636f777265636d65ull;
+  bool rebuildMetadataFits(size_t bytes, bool background) const;
   void chargeRebuildMetadata(RebuildRun&, size_t);
   void setRebuildPhase(RebuildRun&, RebuildPhase);
   static const char* rebuildPhaseName(RebuildPhase);
@@ -1134,6 +1159,7 @@ private:
   };
   std::map<std::string, EpochRead> recoveryEpochReads;
   std::optional<kj::ForkedPromise<std::shared_ptr<const TailDiscovery>>> recoveryDiscovery;
+  std::shared_ptr<const TailDiscovery> lastTailDiscovery;
   double recoveryDiscoveryAtMs = 0;
   bool recoveryDiscovering = false;
   std::optional<kj::ForkedPromise<void>> recoveryWakeTick;
@@ -1176,7 +1202,8 @@ private:
   // Rebuild slots must outlive the coroutine guards in rebuilding.
   uint32_t activeRebuilds = 0;
   uint32_t activeBackgroundRebuilds = 0;
-  size_t rebuildMetadataBytes = 0, peakRebuildMetadataBytes = 0;
+  size_t rebuildMetadataLimit = REBUILD_METADATA_LIMIT;
+  size_t rebuildMetadataBytes = 0, peakRebuildMetadataBytes = 0, backgroundRebuildMetadataBytes = 0;
   uint64_t rebuildMetadataRefusals = 0;
   std::map<std::string, RebuildRun*> rebuildRuns;
   bool nextBackgroundRebuild = true;

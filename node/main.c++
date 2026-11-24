@@ -4919,6 +4919,8 @@ public:
     disconnected = true;
     return true;
   }
+  bool markTailFailed() { return !std::exchange(tailFailed, true); }
+  bool canFetchTails() const { return !disconnected && !tailFailed; }
 
   uint64_t getGeneration() const {
     return generation;
@@ -4932,6 +4934,7 @@ private:
   kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem;
   rpc::PeerServer::Client peer;
   bool disconnected = false;
+  bool tailFailed = false;
   bool ownerTailSupport = false;
   kj::Promise<void> disconnectWatch = kj::READY_NOW;
 };
@@ -5214,47 +5217,59 @@ public:
 
   // What a node holds of a previous owner's log for one shard.
   using TailConnection = std::shared_ptr<coworkerd::DurableTailConnection>;
-  kj::Promise<TailConnection> connectDurableTail(coworkerd::DurableTailTarget target, uint64_t round) {
+  kj::Promise<TailConnection> connectDurableTail(coworkerd::DurableTailTarget target, coworkerd::DurableTailRound round) {
     const auto key = target.key();
     const auto now = monotonicTimeMs();
+    const auto signingGeneration = peerAuth.signingGeneration();
+    std::optional<uint64_t> lastFinalTick;
+    bool refresh = round.final;
     if (auto found = tailConnections.find(key); found != tailConnections.end() &&
-        (*found->second.settledAtMs == 0 || found->second.round >= round)) {
-      found->second.round = std::max(found->second.round, round);
-      return found->second.connection.addBranch();
+        found->second.signingGeneration == signingGeneration) {
+      auto& batch = found->second;
+      batch.lastUseMs = now;
+      lastFinalTick = batch.lastFinalTick;
+      refresh = round.final && (!lastFinalTick || *lastFinalTick < round.tick);
+      if (!batch.result->settled || (!refresh &&
+          (batch.result->handle && batch.result->handle->usable())) ||
+          (!refresh && !batch.result->handle && batch.attemptTick >= round.tick)) {
+        if (refresh) batch.lastFinalTick = round.tick;
+        return batch.connection.addBranch();
+      }
     }
     std::erase_if(tailConnections, [now](const auto& item) {
-      return *item.second.settledAtMs != 0 && now - *item.second.settledAtMs > 2000;
+      return item.second.result->settled && now - item.second.lastUseMs > 2000;
     });
-    auto settled = std::make_shared<double>(0);
-    auto open = openTailConnection(std::move(target), settled).fork();
+    auto result = std::make_shared<TailDialResult>();
+    auto open = openTailConnection(std::move(target), refresh, result).fork();
     auto branch = open.addBranch();
-    tailConnections.insert_or_assign(key, TailBatch{kj::mv(open), std::move(settled), round});
+    tailConnections.insert_or_assign(key, TailBatch{kj::mv(open), std::move(result), round.tick,
+        refresh ? std::optional(round.tick) : lastFinalTick, now, signingGeneration});
     return branch;
   }
 
 private:
-  kj::Promise<TailConnection> openTailConnection(coworkerd::DurableTailTarget target, std::shared_ptr<double> settled) {
-    const auto done = kj::defer([&]() { *settled = monotonicTimeMs(); });
+  struct TailDialResult {
+    bool settled = false;
+    TailConnection handle;
+  };
+
+  kj::Promise<TailConnection> openTailConnection(coworkerd::DurableTailTarget target, bool refresh,
+      std::shared_ptr<TailDialResult> result) {
+    const auto done = kj::defer([&]() { result->settled = true; });
     const auto identity = target.address + "#" + target.destinationEpoch;
-    if (auto found = peerStates.find(target.nodeId); found != peerStates.end() && found->second.connection != kj::none)
-      found->second.markStale(identity, found->second.generation);
+    if (refresh) {
+      if (auto found = peerStates.find(target.nodeId); found != peerStates.end() && found->second.connection != kj::none)
+        found->second.markStale(identity, found->second.generation);
+    }
     const auto timeout = server.placementConfig().peerTimeoutMs;
     auto connection = co_await getConnection(target.nodeId, target.address, identity, timeout);
-    auto transport = std::make_shared<kj::Rc<PeerConnection>>(std::move(connection));
-    auto failed = std::make_shared<bool>(false);
-    auto handle = std::make_shared<coworkerd::DurableTailConnection>();
-    handle->target = target;
-    handle->generation = (*transport)->getGeneration();
-    handle->page = [transport, epoch = target.destinationEpoch](coworkerd::DurableTailAsk ask) {
-      return fetchDurableTail(transport, std::move(ask), epoch);
-    };
-    handle->failed = [this, failed, nodeId = target.nodeId, identity, generation = handle->generation]() {
-      if (std::exchange(*failed, true)) return;
+    const auto nodeId = target.nodeId;
+    result->handle = coworkerd::bindDurableTailConnection(std::move(target), std::move(connection), fetchDurableTail,
+        [this, nodeId, identity](uint64_t generation) {
       auto found = peerStates.find(nodeId);
       if (found != peerStates.end() && found->second.markStale(identity, generation)) ++found->second.tailFailures;
-    };
-    handle->usable = [failed, transport]() { return !*failed && !(*transport)->isDisconnected(); };
-    co_return handle;
+    });
+    co_return result->handle;
   }
 
   static kj::Promise<coworkerd::DurableTailAnswer> fetchDurableTail(
@@ -5740,8 +5755,11 @@ private:
 
   struct TailBatch {
     kj::ForkedPromise<TailConnection> connection;
-    std::shared_ptr<double> settledAtMs;
-    uint64_t round;
+    std::shared_ptr<TailDialResult> result;
+    uint64_t attemptTick;
+    std::optional<uint64_t> lastFinalTick;
+    double lastUseMs;
+    uint64_t signingGeneration;
   };
 
   kj::Promise<kj::Rc<PeerConnection>> getConnection(
@@ -10265,7 +10283,7 @@ int run(Launch launch) {
                    << ",\"reason\":\"" << jsonEscape(reason) << "\"}" << std::endl;
          co_return;
        }});
-  durableLog.setTailConnectHook([&peerForwarder](coworkerd::DurableTailTarget target, uint64_t round) {
+  durableLog.setTailConnectHook([&peerForwarder](coworkerd::DurableTailTarget target, coworkerd::DurableTailRound round) {
     return peerForwarder.connectDurableTail(std::move(target), round);
   });
   durableLog.setOwnerFenceHook([&shards](const std::string& namespaceId, uint32_t shard, uint64_t through) {

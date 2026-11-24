@@ -364,7 +364,8 @@ of a 90,672-byte WAL took 0.250 ms.
   rebuilding throughout the wait. `durableLog.objects` reports active, queued and waiting rebuilds.
   A trusted restart can prove complete local history during preparation and continue directly to replay.
   Queue time counts toward `recoverTimeoutMs`, and a request can receive `DO_RECOVERING` while the rebuild continues.
-  The same response applies when a node's 16 MiB rebuild metadata budget is full.
+  The same response applies when a node's 16 MiB rebuild metadata budget is full. The node reserves one quarter
+  of this budget for foreground requests.
 
   The first request waits while the node reads the latest manifest, verifies and downloads
   its snapshot, and replays its segments. It also collects unsealed records from its own peer buffer, its own log,
@@ -433,10 +434,12 @@ of a 90,672-byte WAL took 0.250 ms.
   The 25 s clock limits retries for absent evidence, not whether to ask a known holder. Every attempt, including
   one beginning after that clock expires, gives every known holder a turn. A node starts at most 16 waiting-recovery
   metadata requests per second, with a burst of four and two in flight. Membership heartbeat writes use their own lane.
-  A node admits at most four peer connection attempts concurrently. Each round marks the matching cached connection
-  stale and shares the replacement attempt and its result for that target. A transport failure or page timeout
-  marks the matching connection generation stale for reuse. Replication and forwarding calls already on that connection
-  can finish. Connections keep `peerTimeoutMs` and use their own slots.
+  A node admits at most four peer connection attempts concurrently. Ordinary rounds reuse healthy connections.
+  A final round refreshes a matching cached connection once per target and shared wake tick. A transport failure
+  or page timeout marks the matching connection generation stale for reuse. Replication and forwarding calls
+  already on that connection can finish. If another object's failure marked the connection while a final page
+  waited, the waiting object reconnects and makes its own attempt with a full page budget. Connections keep
+  `peerTimeoutMs` and use their own slots.
   Connected probes page to `more=false` within a finite drain round. Because the protocol gives no size before
   a reply, each page reserves the largest legal page at 8 MiB/s aggregate divided among `recoverParallelism`
   slots, plus connection time, and never less than `confirmTimeoutMs`. With defaults this is 34,000 ms per
@@ -457,15 +460,12 @@ of a 90,672-byte WAL took 0.250 ms.
   re-encodes every matching record above its cursor, including CRC work and copies outside the selected page.
   Large tails and multiple recovering objects repeat this work; transient bytes can reach the remaining
   matching tail size. The page transfer limit is not a bound on that temporary allocation or CPU work.
-  Metadata uses O(retained record count) memory within the configured byte buffer. Store member
-  discovery remains per recovering object, at most once per second. Unless every source already has a complete
-  owner proof, even an attempt after the 25 s clock performs one bounded full discovery before its final holder
-  round. Previously discovered addresses and unresolved keys survive failed attempts. Each LIST and member
-  metadata GET has its own `peerTimeoutMs` budget, including after the missing-evidence clock expires.
-  For O objects and M registrations, normal discovery work is O(O × M × recovery rounds). A malformed successor
-  registration can be read again for each predecessor, making the conservative full-round bound one LIST plus
-  M + M × (M - 1) / 2 metadata GETs, each with that budget. Successfully decoded registrations are reused within
-  the round. The retained in-process member history is capped at 4,096 entries;
+  Tail records retain their metadata within the configured byte buffer. Recoveries on a node share one
+  member discovery round at a time, with a one-second reuse window after each round. The shared lookup keeps
+  earlier addresses if a later scan cannot verify their member records. A recovery without full owner proof
+  uses discovery before its final holder round. Each LIST page and member GET takes a metadata permit and has
+  its own `peerTimeoutMs` budget. Successfully decoded registrations are reused within the discovery round.
+  The retained in-process membership history is capped at 4,096 entries,
   eviction leaves `recoveryHistoryIncomplete` set until process restart, so early completion cannot assume that
   all evicted addresses were rediscovered. A failed membership listing can also leave older member entries visible.
 
@@ -474,9 +474,10 @@ of a 90,672-byte WAL took 0.250 ms.
   needs a verified newer registration for a different instance before that margin. Missing dates, ambiguous
   instances and registration-only members without such a successor remain candidates; they can force a
   `tail-recovery-bounded` cut. Node-reported start times do not establish these windows.
-  A chain of S source epochs requires at most S serial immutable authority GETs per attempt, each bounded by
-  max(`peerTimeoutMs`, `confirmTimeoutMs`) (5 s by default). Successful reads are cached across attempts in this
-  object's current recovery, giving a first-pass bound of S × 5 s plus local work; failed reads may be retried.
+  An uncached chain of S source epochs needs at most S serial immutable authority GETs. Concurrent recoveries
+  of the same shard share those reads by full object-store key. A read takes a waiting-recovery permit except
+  during preparation with a trusted original disk or replay. Each read has
+  max(`peerTimeoutMs`, `confirmTimeoutMs`) after admission (5 s by default). Failed reads can be retried.
   A request waits at most `durableObjects.recoverTimeoutMs` (30 s) before `503 DO_RECOVERING`,
   while the same rebuild continues. The receiving peer returns its dispatcher before this wait; peer-open retains
   its two-second `peerTimeoutMs` bound, and an open known not to have sent an event may be tried elsewhere.

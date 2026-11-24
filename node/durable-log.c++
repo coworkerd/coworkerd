@@ -4763,7 +4763,7 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     rebuildCancelers.erase(objectName);
     settledRebuilds.erase(objectName);
   }
-  if (!objects.contains(objectName) && REBUILD_ENTRY_BYTES > REBUILD_METADATA_LIMIT - rebuildMetadataBytes) {
+  if (!objects.contains(objectName) && !rebuildMetadataFits(REBUILD_ENTRY_BYTES, background)) {
     ++rebuildMetadataRefusals;
     co_return ObjectReady{false, 503, "DO_RECOVERING", "the node's recovery metadata budget is full"};
   }
@@ -4813,7 +4813,7 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
       ? object.repairReason
       : std::string("this node has not served the object at this data epoch");
   if (rebuilding.find(objectName) == rebuilding.end()) {
-    if (REBUILD_ENTRY_BYTES > REBUILD_METADATA_LIMIT - rebuildMetadataBytes) {
+    if (!rebuildMetadataFits(REBUILD_ENTRY_BYTES, background)) {
       ++rebuildMetadataRefusals;
       co_return ObjectReady{false, 503, "DO_RECOVERING", "the node's recovery metadata budget is full"};
     }
@@ -4895,6 +4895,7 @@ kj::Promise<void> DurableLog::waitForAlarmRebuild(const std::string& ns, const s
 void DurableLog::promoteRebuild(const std::string& name) {
   auto run = rebuildRuns.find(name);
   if (run == rebuildRuns.end() || !run->second->background) return;
+  backgroundRebuildMetadataBytes -= run->second->metadataBytes;
   run->second->background = false;
   ++rebuildPromotions;
   auto it = queuedRebuildIndex.find(name);
@@ -4943,8 +4944,14 @@ void DurableLog::releaseRebuildSlot(RebuildRun& run) {
   if (!stopped) pumpRebuilds();
 }
 
+bool DurableLog::rebuildMetadataFits(size_t bytes, bool background) const {
+  // Keep a quarter of the budget available to requests during alarm takeover.
+  return bytes <= rebuildMetadataLimit - rebuildMetadataBytes &&
+      (!background || bytes <= rebuildMetadataLimit * 3 / 4 - backgroundRebuildMetadataBytes);
+}
+
 void DurableLog::chargeRebuildMetadata(RebuildRun& run, size_t bytes) {
-  if (bytes > REBUILD_METADATA_LIMIT - rebuildMetadataBytes) {
+  if (!rebuildMetadataFits(bytes, run.background)) {
     ++rebuildMetadataRefusals;
     auto error = KJ_EXCEPTION(OVERLOADED, "the node's recovery metadata budget is full");
     error.setDetail(REBUILD_METADATA_FULL, kj::heapArray<kj::byte>(0));
@@ -4952,6 +4959,7 @@ void DurableLog::chargeRebuildMetadata(RebuildRun& run, size_t bytes) {
   }
   run.metadataBytes += bytes;
   rebuildMetadataBytes += bytes;
+  if (run.background) backgroundRebuildMetadataBytes += bytes;
   peakRebuildMetadataBytes = std::max(peakRebuildMetadataBytes, rebuildMetadataBytes);
 }
 
@@ -5001,6 +5009,7 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   const auto done = kj::defer([&]() {
     releaseRebuildSlot(run);
     rebuildMetadataBytes -= run.metadataBytes;
+    if (run.background) backgroundRebuildMetadataBytes -= run.metadataBytes;
     rebuildRuns.erase(objectName);
     settledRebuilds.insert(objectName);
   });
@@ -5013,6 +5022,15 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared");
   const auto targetEpoch = object->shardEpoch, targetDataEpoch = object->dataEpoch;
   for (uint32_t attempt = 1; attempt <= MANIFEST_ATTEMPTS; ++attempt) {
+    if (!run.reserved) {
+      setRebuildPhase(run, RebuildPhase::RESUMING);
+      co_await acquireRebuildSlot(objectName, run);
+      object = objectOf(objectName);
+      KJ_REQUIRE(object && object->state == ObjectState::REBUILDING &&
+          object->shardEpoch == targetEpoch && object->dataEpoch == targetDataEpoch,
+          "ownership changed before retrying recovery");
+      run.parkedAtMs = 0;
+    }
     object->recoveryRevisionChanged = false;
     try {
       co_await rebuildAttempt(objectName, reason, run);
@@ -5130,6 +5148,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   const auto metadataBefore = run.metadataBytes;
   const auto releaseAttemptMetadata = kj::defer([&]() {
     rebuildMetadataBytes -= run.metadataBytes - metadataBefore;
+    if (run.background) backgroundRebuildMetadataBytes -= run.metadataBytes - metadataBefore;
     run.metadataBytes = metadataBefore;
   });
   // Where this attempt's time goes, consecutive laps of the same clock (logged with `rebuilt`).
@@ -5617,7 +5636,9 @@ kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::tailTa
 }
 
 kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::discoverTailTargets() {
-  auto state = std::make_shared<TailDiscovery>();
+  auto state = lastTailDiscovery ? std::make_shared<TailDiscovery>(*lastTailDiscovery) : std::make_shared<TailDiscovery>();
+  state->complete = false;
+  for (auto& [key, target] : state->addresses) target.timeVerified = false;
   const auto settled = kj::defer([this]() {
     recoveryDiscoveryAtMs = monotonicTimeMs();
     recoveryDiscovering = false;
@@ -5695,6 +5716,7 @@ kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::discov
     state->complete = false;state->unresolved.insert("member-discovery");
     log("tail-discovery-failed", "\"error\":" + quote(error.getDescription().cStr()));
   }
+  lastTailDiscovery = state;
   co_return state;
 }
 
@@ -5835,17 +5857,12 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
       tailRecordBytes())) * slots * 1000 / (8u << 20));
   // Connect before taking a transfer slot. Requeue each page so one busy source
   // cannot delay other healthy targets or monopolize its own target queue.
-  auto query = [&](size_t index, std::string key, bool owner, uint64_t round) -> kj::Promise<void> {
+  auto query = [&](size_t index, std::string key, bool owner, DurableTailRound round) -> kj::Promise<void> {
     auto& source = state.sources[index];
     auto& probe = source.probes.at(key);
     if (probe.complete || probe.gone) co_return;
     try {
       std::shared_ptr<DurableTailConnection> connection;
-      if (probe.target.nodeId != settings.nodeId && hooks.connectTail)
-        connection = co_await hooks.connectTail(probe.target, round);
-      if (connection) {
-        KJ_REQUIRE(connection->target.key() == probe.target.key(), "a tail connection changed identity");
-      }
       // Queueing and reconnecting use their own budgets. A probe may drain a
       // full configured peer buffer, and its last page gets a full page budget.
       double transferringMs = 0;
@@ -5880,13 +5897,22 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
           }
           answer = tailFor(ask, false);
         } else {
+          if (!connection && hooks.connectTail) {
+            connection = co_await hooks.connectTail(probe.target, round);
+            KJ_REQUIRE(bool(connection) && connection->target.key() == probe.target.key(), "a tail connection changed identity");
+          }
           auto permit = co_await tailPages.acquire(probe.target.key());
           checkIdentity();
+          if (connection && connection->usable && !connection->usable()) {
+            if (!round.final) KJ_FAIL_REQUIRE("the tail connection failed earlier in this round");
+            // A different object's failure says nothing about this object's
+            // history. Return the page slot and join a replacement connection.
+            connection.reset();
+            continue;
+          }
+          KJ_REQUIRE(bool(connection) || bool(hooks.fetchTail), "tail transport is not installed");
           const auto transferAt = monotonicTimeMs();
           if (owner && run.owner == probe.target.nodeId) run.probeAtMs = transferAt;
-          if (connection && connection->usable && !connection->usable())
-            KJ_FAIL_REQUIRE("the tail connection failed earlier in this round");
-          KJ_REQUIRE(bool(connection) || bool(hooks.fetchTail), "tail transport is not installed");
           ++tailFetches;
           auto request = connection ? connection->page(ask) : hooks.fetchTail(probe.target.nodeId, ask);
           auto timeout = timer.afterDelay(pageBudget * kj::MILLISECONDS).then([connection]() -> DurableTailAnswer {
@@ -6022,7 +6048,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     const bool finalRound = atDeadline && (co_await mayCut());
     if (!run.reserved) setRebuildPhase(run, finalRound ? RebuildPhase::FINAL_TAILS :
         atDeadline ? RebuildPhase::OWNER : RebuildPhase::TAILS);
-    const uint64_t round = recoveryRound * 2 + (finalRound ? 1 : 0);
+    const DurableTailRound round{recoveryRound, finalRound};
     kj::Vector<kj::Promise<void>> ownerCalls;
     kj::Vector<kj::Promise<void>> peerCalls;
     for (size_t i = 0; i < state.sources.size(); ++i) {
@@ -8178,7 +8204,8 @@ DurableTailAnswer DurableLog::tailForPage(const DurableTailAsk& ask, bool remote
 std::string DurableLog::recoverySchedulerJson(double now) const {
   std::ostringstream out;
   out << "{\"metadataBytes\":" << rebuildMetadataBytes << ",\"peakMetadataBytes\":" << peakRebuildMetadataBytes
-      << ",\"metadataLimitBytes\":" << REBUILD_METADATA_LIMIT << ",\"metadataRefusals\":" << rebuildMetadataRefusals
+      << ",\"metadataLimitBytes\":" << rebuildMetadataLimit << ",\"backgroundMetadataBytes\":" << backgroundRebuildMetadataBytes
+      << ",\"foregroundReservedBytes\":" << rebuildMetadataLimit / 4 << ",\"metadataRefusals\":" << rebuildMetadataRefusals
       << ",\"metadataRequests\":" << recoveryMetadata.started() << ",\"activeMetadataRequests\":" << recoveryMetadata.active()
       << ",\"peakMetadataRequests\":" << recoveryMetadata.peakActive()
       << ",\"activeTailTransfers\":" << tailPages.active() << ",\"peakTailTransfers\":" << tailPages.peakActive()
