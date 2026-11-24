@@ -328,6 +328,15 @@ export async function sqlResourceBounds(cluster) {
   const other = await cluster.tenant('sql-capacity-neighbor');
   const databases = await Promise.all(Array.from({ length: 9 }, (_, i) =>
     database(cluster, tenant, 'candidate-' + i, { warm: false })));
+  const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+  await eventually('every node sees the databases and the same durable members', async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    for (const { storage, membership } of states) {
+      assert.ok(BigInt(storage.appliedTenantsRevision) >= BigInt(tenantsRevision));
+      const eligible = membership.members.filter(member => member.state === 'active' && member.durableProcesses > 0);
+      assert.deepEqual(eligible.map(member => member.nodeId).sort(), [...cluster.nodes].sort());
+    }
+  });
   // Cold databases have one shard. Group them by the node that would claim
   // shard zero so the saturation check always hits the blocking process.
   const groups = new Map(cluster.nodes.map(node => [node, []]));
@@ -340,9 +349,18 @@ export async function sqlResourceBounds(cluster) {
   const [targetNode, [holder, ...candidates]] = [...groups].sort((a, b) => b[1].length - a[1].length)[0];
   const schema = { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY, payload BLOB)' };
   await eventually('the blocking database is ready', holder.ready);
-  assert.equal((await holder.query(schema)).success, true);
   const placement = await acceptedOn(cluster, holder.namespaceId);
   assert.equal(placement.nodeId, targetNode);
+  // Before deploying the Durable Object, these node-wide open and process
+  // memory gauges cover only the newly opened database and its first read.
+  const { durableLog, processes } = await cluster.state(placement.nodeId);
+  const { openSamples, maxOpenNs } = durableLog.threadedHomeIo;
+  const child = processes.entries.find(entry => entry.processId === placement.processId);
+  const { homes, databaseHomes, maxHomeMemoryBytes, nativeDatabaseReservedBytes } = child.lifecycle.durableAdmission;
+  console.log('Native SQL cold open', JSON.stringify({ openSamples, maxOpenNs, homes, databaseHomes,
+    sqliteAllocatedBytes: maxHomeMemoryBytes, sqliteReservedBytes: nativeDatabaseReservedBytes,
+    processResidentBytes: child.residentBytes }));
+  assert.equal((await holder.query(schema)).success, true);
   const neighbor = await colocatedObject(cluster, other, placement);
   await holder.ready();
   const location = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${holder.namespaceId}`;
