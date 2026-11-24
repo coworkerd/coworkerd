@@ -9,6 +9,7 @@
 #include "log-sink.h"
 #include "object-store.h"
 #include "object-state.h"
+#include "sql-http-cancellation.h"
 #include "support.h"
 
 #include <capnp/compat/byte-stream.h>
@@ -1665,7 +1666,11 @@ int runControlPlane(const std::vector<std::string>& args) {
     }
   }
   ControlService service(settings, storage, state, timer, io.provider->getNetwork(), *headerTable);
-  kj::HttpServer server(timer, *headerTable, service);
+  kj::HttpServer server(timer, *headerTable,
+      [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
+    return kj::heap<coworkerd::SqlHttpCancellation>(
+        service, connection, timer, coworkerd::SqlHttpCancellation::Route::CONTROL_PLANE);
+  });
   auto address = io.provider->getNetwork().parseAddress(settings.listenAddress.c_str()).wait(io.waitScope);
   auto listener = address->listen();
   std::cout << "[control] {\"event\":\"configuration\",\"version\":" << versionJson() << ",\"configFile\":\""

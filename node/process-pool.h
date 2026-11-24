@@ -50,6 +50,9 @@ public:
   bool dispatched = false;
   bool capacityRejected = false;
   std::function<void()> onCapacityRejected;
+  void sqlClientDisconnected() noexcept;
+  bool sqlClientGone = false;
+  std::function<void()> closeSqlInput;
 private:
   friend class ProcessPool;
   explicit ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string tenant = {});
@@ -163,7 +166,7 @@ public:
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash,
-      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {});
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {}, bool nativeSql = false);
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);

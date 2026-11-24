@@ -31,6 +31,7 @@
 #include "egress.h"
 #include "json.h"
 #include "peer-auth.h"
+#include "sql-http-cancellation.h"
 #include "tenancy.h"
 #include "tenant-manifest.h"
 #include "tenants.h"
@@ -488,6 +489,7 @@ struct AdmissionSlot {
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
   bool durable = false;
+  bool nativeSql = false;
   coworkerd::DurableLog::ObjectIdentity durableObject;
   coworkerd::DurableLog* durableLog = nullptr;
   std::function<void(uint status, const std::string& code)> outcome;
@@ -2824,7 +2826,10 @@ private:
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
-    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
+    const bool nativeSql = durable != nullptr && durable->isDatabase() && durable->alarmAtUnixMs == 0 &&
+        process->threadedDurableRole();
+    if (slot) slot->nativeSql = nativeSql;
+    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps(), nativeSql);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -4388,6 +4393,10 @@ private:
   kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relay
 };
 
+bool sqlAdmissionRefusal(std::string_view code) {
+  return code == "OVERLOADED" || code == "DO_UNAVAILABLE" || code == "LEASE_EXPIRED";
+}
+
 class AdmissionHttpService final: public kj::HttpService {
 public:
   AdmissionHttpService(kj::Own<kj::HttpService> inner, std::shared_ptr<AdmissionSlot> slot,
@@ -4402,6 +4411,10 @@ public:
     auto started = monotonicTimeMs();
     std::string failure;
     std::string platformCode;
+    bool answered = false;
+    auto cancelSql = kj::defer([&] {
+      if (!answered && slot->nativeSql && slot->process) slot->process->sqlClientDisconnected();
+    });
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
@@ -4411,6 +4424,7 @@ public:
         return kj::mv(error);
       });
       co_await kj::mv(request).attach(std::move(finish));
+      answered = true;
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
       if (slot->timing && slot->timing->kind == "binding") slot->timing->emit();
@@ -4419,6 +4433,7 @@ public:
       slot->report(tracked->status(), slot->outcome ? limitCode() : std::string());
       co_return;
     } catch (const kj::Exception& error) {
+      answered = true;
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
@@ -4458,11 +4473,14 @@ private:
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
       const std::string& platformCode = "") {
     auto code = limitCode();
-    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE") code = platformCode;
+    if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE" ||
+        (slot->nativeSql && sqlAdmissionRefusal(platformCode))) code = platformCode;
     const bool unsupported = code == "NOT_SUPPORTED";
-    slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
-    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
-        unsupported ? "Not Implemented" : "Service Unavailable",
+    const bool expired = code == "LEASE_EXPIRED";
+    const uint status = unsupported ? 501 : expired ? 410 : 503;
+    slot->report(status, code.empty() ? "RESULT_UNCERTAIN" : code);
+    auto rejection = kj::heap<LeaseRejectionHttpService>(headers, status,
+        unsupported ? "Not Implemented" : expired ? "Gone" : "Service Unavailable",
         rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, failure, 0));
     co_await rejection->respond(tracked);
   }
@@ -4611,10 +4629,10 @@ public:
       kj::Rc<PeerConnection> connection,
       const kj::HttpHeaderTable& headerTable,
       std::string targetServerId,
-      double expiresAtMonotonicMs)
+      double expiresAtMonotonicMs, bool sql)
       : inner(std::move(inner)), connection(std::move(connection)),
         headerTable(headerTable), targetServerId(std::move(targetServerId)),
-        expiresAtMonotonicMs(expiresAtMonotonicMs) {}
+        expiresAtMonotonicMs(expiresAtMonotonicMs), sql(sql) {}
 
   kj::Promise<void> request(
       kj::HttpMethod method,
@@ -4629,6 +4647,7 @@ public:
     return request.catch_([this, ptr = tracked.get()](kj::Exception&& error)
         -> kj::Promise<void> {
       if (ptr->hasStarted()) return std::move(error);
+      if (sql && sqlAdmissionRefusal(rpcFailureCode(error))) return kj::mv(error);
       // This request has been dispatched. No failure here proves non-execution.
       auto reason = "peer request result uncertain node=" + targetServerId +
           " detail=" + error.getDescription().cStr();
@@ -4646,6 +4665,7 @@ private:
   const kj::HttpHeaderTable& headerTable;
   std::string targetServerId;
   double expiresAtMonotonicMs;
+  bool sql;
 };
 
 // A capability of another node with this node's peer session attached: the session is held for as long as the
@@ -4676,18 +4696,18 @@ public:
       capnp::HttpOverCapnpFactory& factory,
       const kj::HttpHeaderTable& headerTable,
       std::string targetServerId,
-      double expiresAtMonotonicMs)
+      double expiresAtMonotonicMs, bool sql)
       : remote(std::move(remote)),
         connection(std::move(connection)),
         factory(factory), headerTable(headerTable),
-        targetServerId(std::move(targetServerId)), expiresAtMonotonicMs(expiresAtMonotonicMs) {}
+        targetServerId(std::move(targetServerId)), expiresAtMonotonicMs(expiresAtMonotonicMs), sql(sql) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     auto response = remote.getHttpServiceRequest().send();
     auto service = factory.capnpToKj(response.getHttp());
     auto attached = kj::heap<AttachedHttpService>(
         std::move(service), connection.addRef(), headerTable,
-        targetServerId, expiresAtMonotonicMs);
+        targetServerId, expiresAtMonotonicMs, sql);
     context.initResults(capnp::MessageSize{4, 1})
         .setHttp(factory.kjToCapnp(std::move(attached)));
     // The pipelined HTTP capability carries resolution failures into the service
@@ -4712,6 +4732,7 @@ private:
   const kj::HttpHeaderTable& headerTable;
   std::string targetServerId;
   double expiresAtMonotonicMs;
+  bool sql;
 };
 
 // One peer's end of this node's Durable Object log, over the signed peer session: the calls of a stream of their own,
@@ -5003,7 +5024,7 @@ public:
         co_return InvocationAttempt{nullptr, std::move(refused), retry};
       }
       co_return InvocationAttempt{rpc::EventDispatcher::Client(kj::heap<PeerProxyEventDispatcher>(
-          result.getAccepted(), connection.addRef(), factory, headerTable, targetServerId, deadline)), std::nullopt, false};
+          result.getAccepted(), connection.addRef(), factory, headerTable, targetServerId, deadline, false)), std::nullopt, false};
     } catch (const kj::Exception& error) {
       recordSend();
       markConnectionDisconnected(targetServerId, connection);
@@ -5091,7 +5112,8 @@ public:
         co_return InvocationAttempt{nullptr, std::move(refused), retry};
       }
       co_return InvocationAttempt{rpc::EventDispatcher::Client(kj::heap<PeerProxyEventDispatcher>(
-          result.getAccepted(), connection.addRef(), factory, headerTable, targetServerId, deadline)), std::nullopt, false};
+          result.getAccepted(), connection.addRef(), factory, headerTable, targetServerId, deadline,
+          target.isDatabase() && !target.alarmAtUnixMs)), std::nullopt, false};
     } catch (const kj::Exception& error) {
       markConnectionDisconnected(targetServerId, connection);
       auto reason = "peer unavailable before object dispatch node=" + targetServerId + " detail=" + error.getDescription().cStr();
@@ -6121,8 +6143,16 @@ public:
           "{\"code\":\"REQUEST_TOO_LARGE\",\"reason\":\"a statement is at most 1 MiB\"}");
       co_return;
     }
-    auto answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
-        std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat);
+    CollectedResponse answer;
+    try {
+      answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
+          std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat);
+    } catch (const kj::Exception& error) {
+      auto code = rpcFailureCode(error);
+      if (!sqlAdmissionRefusal(code)) code = "RESULT_UNCERTAIN";
+      answer.status = code == "LEASE_EXPIRED" ? 410 : 503;
+      answer.body = rejectionJson(code, cleanReason(error.getDescription().cStr()), 0);
+    }
     co_await sendJson(response, answer.status ? answer.status : 503,
         answer.status == 200 ? "OK" : "Error",
         answer.body.empty() ? std::string("{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the database answered nothing\"}")
@@ -9783,7 +9813,11 @@ int run(Launch launch) {
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
   kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
-  kj::HttpServer peerServer(timer, *headerTable, seedPeer);
+  kj::HttpServer peerServer(timer, *headerTable,
+      [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
+    return kj::heap<coworkerd::SqlHttpCancellation>(
+        seedPeer, connection, timer, coworkerd::SqlHttpCancellation::Route::PEER);
+  });
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
   kj::HttpServer egressServer(timer, *headerTable, egress);
 

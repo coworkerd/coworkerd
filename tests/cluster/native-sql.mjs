@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { availableParallelism, cpus } from 'node:os';
 import { join } from 'node:path';
@@ -325,12 +326,23 @@ async function colocatedObject(cluster, tenant, placement) {
 export async function sqlResourceBounds(cluster) {
   const tenant = await cluster.tenant('sql-capacity');
   const other = await cluster.tenant('sql-capacity-neighbor');
-  const holder = await database(cluster, tenant, 'holder');
-  const candidates = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+  const databases = await Promise.all(Array.from({ length: 9 }, (_, i) =>
     database(cluster, tenant, 'candidate-' + i, { warm: false })));
+  // Cold databases have one shard. Group them by the node that would claim
+  // shard zero so the saturation check always hits the blocking process.
+  const groups = new Map(cluster.nodes.map(node => [node, []]));
+  for (const db of databases) {
+    const scored = cluster.nodes.map(node => ({ node,
+      score: createHash('sha256').update(`${db.namespaceId}/0\0${node}`).digest().readBigUInt64BE() }));
+    scored.sort((a, b) => a.score === b.score ? a.node.localeCompare(b.node) : a.score > b.score ? -1 : 1);
+    groups.get(scored[0].node).push(db);
+  }
+  const [targetNode, [holder, ...candidates]] = [...groups].sort((a, b) => b[1].length - a[1].length)[0];
   const schema = { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY, payload BLOB)' };
+  await eventually('the blocking database is ready', holder.ready);
   assert.equal((await holder.query(schema)).success, true);
   const placement = await acceptedOn(cluster, holder.namespaceId);
+  assert.equal(placement.nodeId, targetNode);
   const neighbor = await colocatedObject(cluster, other, placement);
   await holder.ready();
   const location = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${holder.namespaceId}`;
@@ -343,7 +355,17 @@ export async function sqlResourceBounds(cluster) {
       return { logical: sum.logical + bytes, allocated: sum.allocated + blocks * 512 };
     }, { logical: 0, allocated: 0 });
   };
+  const resources = async () => {
+    const { processes } = await cluster.state(placement.nodeId);
+    const owner = processes.entries.find(entry => entry.processId === placement.processId);
+    assert.equal(owner.generation, placement.processGeneration);
+    const descriptors = await cluster.compose(['exec', '-T', placement.nodeId, 'ls', '-1', `/proc/${owner.pid}/fd`]);
+    const { databaseHomes, nativeDatabaseReservedBytes, reservedDescriptors, running } = owner.lifecycle.durableAdmission;
+    return { databaseHomes, nativeDatabaseReservedBytes, reservedDescriptors, running,
+      residentBytes: owner.residentBytes, openDescriptors: descriptors.trim().split('\n').length };
+  };
   const before = await disk();
+  const idle = await resources();
   const abort = new AbortController();
   let settled = false;
   const busy = Array.from({ length: 4 }, () =>
@@ -354,59 +376,63 @@ export async function sqlResourceBounds(cluster) {
     body: JSON.stringify([...busy, { sql: slow }]),
     signal: abort.signal,
   }).then(response => ({ response }), error => ({ error })).finally(() => { settled = true; });
-  let during;
+  let during, saturated;
+  const attempts = [];
   try {
     await delay(1200);
+    await eventually('the database home is executing the staged transaction', async () => {
+      assert.equal((await resources()).running, 1);
+    }, { timeout: 5000, interval: 100 });
     during = await disk();
     assert.equal(settled, false, 'the staging transaction ended before the disk sample');
     assert.ok(before.logical > 0);
     assert.ok(during.logical <= before.logical && during.allocated <= before.allocated,
       JSON.stringify({ before, during }));
-    let refused;
     for (const candidate of candidates) {
       const answer = await candidate.raw({ sql: 'SELECT 1' });
-      if (answer.status === 503) {
-        const code = JSON.parse(answer.text).code;
-        assert.match(code, /^(OVERLOADED|DO_UNAVAILABLE)$/);
-        refused = candidate;
-        break;
-      }
-      assert.equal(answer.status, 200, answer.text);
+      const { code } = json(answer, 503, `database ${candidate.name} is refused while the home is occupied`);
+      assert.match(code, /^(OVERLOADED|DO_UNAVAILABLE)$/);
+      attempts.push({ database: candidate.name, status: answer.status, code });
     }
-    assert.ok(refused, 'another database should be refused after the available home is occupied');
     await neighbor.check();
+    saturated = await resources();
+    assert.equal(saturated.databaseHomes, 1);
+    assert.equal(saturated.nativeDatabaseReservedBytes, 64 * 1024 * 1024);
     assert.equal(settled, false, "another tenant's Durable Object was not served during the database request");
   } finally {
     abort.abort();
   }
   assert.equal((await pending).error?.name, 'AbortError');
-  const cancelled = await eventually('the database home interrupted the disconnected client', async () => {
-    const log = await cluster.compose(['exec', '-T', placement.nodeId, 'grep', '-F', '[native-sql] ',
-      '/var/lib/coworkerd/logs/workerd.log']);
-    const event = rows(log, '[native-sql] ').findLast(row => row.namespaceId === holder.namespaceId.slice(0, 12)
-      && row.status === 0);
-    assert.ok(event);
-    return event;
-  }, { timeout: 10000, interval: 100 });
-  assert.ok(cancelled.finishedMonotonicNs - cancelled.startedMonotonicNs < 20e9);
+  const disconnectedAt = performance.now();
+  const recovered = await eventually('the database serves its next request before the original deadline', async () => {
+    const retry = await holder.raw({ sql: 'SELECT id FROM ledger' }, 'ARRAY_OF_OBJECTS', 1500);
+    return json(retry, 200, 'read after disconnect');
+  }, { timeout: 6000, interval: 100 });
+  assert.deepEqual(recovered.results, []);
+  const retryMs = performance.now() - disconnectedAt;
   const after = await disk();
   assert.ok(after.logical <= before.logical && after.allocated <= before.allocated,
     JSON.stringify({ before, during, after }));
-  await holder.ready();
-  assert.deepEqual((await holder.query({ sql: 'SELECT id FROM ledger' })).results, []);
-  console.log('Native SQL local disk', JSON.stringify({ before, during, after, cancelled }));
+  const recoveredProcess = await eventually('the child reports the SQL home idle again', async () => {
+    const snapshot = await resources();
+    assert.equal(snapshot.running, 0);
+    return snapshot;
+  });
+  console.log('Native SQL resource bounds', JSON.stringify({ attempts, retryMs,
+    disk: { before, during, after }, process: { idle, saturated, recovered: recoveredProcess } }));
 
   const hold = join(cluster.peerAckGate, 'hold');
   const peers = cluster.nodes.filter(node => node !== placement.nodeId);
+  const insertId = id => ({ sql: 'INSERT INTO ledger(id) VALUES(?)', params: [id] });
   await writeFile(hold, '');
-  const first = holder.raw(put(98)).then(response => ({ response }), error => ({ error }));
+  const first = holder.raw(insertId(98)).then(response => ({ response }), error => ({ error }));
   let queued;
   try {
     await eventually('both peers are holding a database commit', async () => {
       const observations = await Promise.all(peers.map(node => cluster.state(node)));
       assert.ok(observations.every(state => state.durableLog.peers.heldAcksForTest > 0));
     }, { interval: 20, timeout: 2000 });
-    queued = holder.raw([put(99), { sql: slow }])
+    queued = holder.raw([insertId(99), { sql: slow }])
       .then(response => ({ response }), error => ({ error }));
     await delay(2500);
   } finally {
