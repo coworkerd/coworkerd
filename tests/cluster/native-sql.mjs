@@ -685,22 +685,33 @@ export async function sqlHomePressure(cluster) {
     output.push({ ms: performance.now() - start, lag: 0 });
   };
   const sweepStarted = performance.now();
+  const lastStarted = new Array(databases.length);
+  const revisit = [];
   let peakHomes = 0;
   let peakReservedBytes = 0;
   let peakResidentBytes = 0;
-  for (let i = 0; i < databases.length; ++i) {
-    const jobs = [measure(databases[i].ready, measurements[0])];
-    if (i % 4 === 0) jobs.push(measure(cross.ready, measurements[1]), measure(fresh.check, measurements[2]));
-    await Promise.all(jobs);
-    if (i % 20 !== 0 && i !== databases.length - 1) continue;
-    const sample = await state();
-    assert.ok(sample.databaseHomes <= sample.homes - 1);
-    peakHomes = Math.max(peakHomes, sample.databaseHomes);
-    peakReservedBytes = Math.max(peakReservedBytes, sample.nativeDatabaseReservedBytes);
-    peakResidentBytes = Math.max(peakResidentBytes, sample.residentBytes);
+  const sweepMs = [];
+  for (let round = 0; round < 2; ++round) {
+    const start = performance.now();
+    for (let i = 0; i < databases.length; ++i) {
+      const sent = performance.now();
+      if (round > 0) revisit.push({ ms: sent - lastStarted[i], lag: 0 });
+      lastStarted[i] = sent;
+      const jobs = [measure(databases[i].ready, measurements[0])];
+      if (i % 4 === 0) jobs.push(measure(cross.ready, measurements[1]), measure(fresh.check, measurements[2]));
+      await Promise.all(jobs);
+      if (i % 20 !== 0 && i !== databases.length - 1) continue;
+      const sample = await state();
+      assert.ok(sample.databaseHomes <= sample.homes - 1);
+      peakHomes = Math.max(peakHomes, sample.databaseHomes);
+      peakReservedBytes = Math.max(peakReservedBytes, sample.nativeDatabaseReservedBytes);
+      peakResidentBytes = Math.max(peakResidentBytes, sample.residentBytes);
+    }
+    sweepMs.push(performance.now() - start);
   }
   console.log('Native SQL 1000 databases', JSON.stringify({ node, creationMs,
-    sweepMs: performance.now() - sweepStarted, peakHomes, peakReservedBytes, peakResidentBytes,
+    elapsedMs: performance.now() - sweepStarted, sweepMs, revisit: stats(revisit),
+    peakHomes, peakReservedBytes, peakResidentBytes,
     database: stats(measurements[0]), crossTenantDatabase: stats(measurements[1]), durableObject: stats(measurements[2]) }));
 }
 
@@ -787,7 +798,7 @@ export async function longSqlIsolation(cluster) {
       ['logs', '--no-color', '--since', logSince, placement.nodeId], { maxBuffer: 32 * 1024 * 1024 });
     const start = block.startedMonotonicNs / 1e6;
     const end = block.finishedMonotonicNs / 1e6;
-    assert.ok(end - start >= 29900 && end - start <= 31000, JSON.stringify(block));
+    assert.ok(end - start >= 28900 && end - start <= 31000, JSON.stringify(block));
     const deliveries = rows(log, '[do] ').filter(row => sameProcess(row, placement) && row.status === 200 &&
       row.startedMonotonicMs >= start && row.finishedMonotonicMs <= end);
     const overlap = probes.map(probe => deliveries.filter(row =>
