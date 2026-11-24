@@ -552,6 +552,7 @@ async function soleDatabaseProcess(cluster, database) {
       .map(member => member.nodeId), [node]);
     const child = processes.entries.find(entry => entry.processId === placement.processId);
     assert.equal(child.generation, placement.processGeneration);
+    assert.equal(child.sandbox.durableServer, 'threaded');
     return { ...child.lifecycle.durableAdmission, residentBytes: child.residentBytes };
   };
   await eventually('the sole durable owner sees the current tenant index', state);
@@ -640,7 +641,8 @@ export async function sqlHomePressure(cluster) {
   for (const db of warm) await db.ready();
   const full = await eventually('database homes fill all but the Durable Object home', async () => {
     const sample = await state();
-    assert.equal(sample.databaseHomes, sample.homes - 1);
+    assert.equal(sample.databaseHomes, sample.workerThreads - 1);
+    assert.equal(sample.databaseHomes, warm.length);
     return sample;
   });
   const blockers = warm.map(db => {
@@ -653,9 +655,14 @@ export async function sqlHomePressure(cluster) {
     }, { timeout: 5000, interval: 30 });
     const obj = await placeFirst();
     await obj.check();
+    const before = await state();
     const answer = await request(cluster.urls[node], `/${other.name}/sql-second-class?key=0`);
-    const refused = json(answer, 503, 'second Durable Object class with all database homes busy');
-    assert.match(`${refused.code} ${refused.message}`, /OVERLOADED|queue is full/);
+    json(answer, 503, 'second Durable Object class with all database homes busy');
+    await eventually('the child records a pre-execution capacity refusal', async () => {
+      const sample = await state();
+      assert.equal(sample.running, warm.length);
+      assert.ok(sample.overloaded > before.overloaded);
+    }, { timeout: 2000, interval: 30 });
   } finally {
     for (const { abort } of blockers) abort.abort();
     for (const { running } of blockers) assert.equal((await running).error?.name, 'AbortError');
@@ -673,7 +680,7 @@ export async function sqlHomePressure(cluster) {
   }, { timeout: 4000, interval: 25 });
   const reclaimMs = performance.now() - retireStarted;
   assert.ok(reclaimMs < 10000, `${reclaimMs} ms`);
-  console.log('Native SQL home pressure', JSON.stringify({ reclaimMs, homes: full.homes,
+  console.log('Native SQL home pressure', JSON.stringify({ reclaimMs, availableHomes: full.workerThreads,
     fullDatabaseHomes: full.databaseHomes, reclaimedDatabaseHomes: reclaimed.databaseHomes }));
 
   // Exercise the default home count and memory capacity on the one owner. The
@@ -702,7 +709,7 @@ export async function sqlHomePressure(cluster) {
       await Promise.all(jobs);
       if (i % 20 !== 0 && i !== databases.length - 1) continue;
       const sample = await state();
-      assert.ok(sample.databaseHomes <= sample.homes - 1);
+      assert.ok(sample.databaseHomes <= sample.workerThreads - 1);
       peakHomes = Math.max(peakHomes, sample.databaseHomes);
       peakReservedBytes = Math.max(peakReservedBytes, sample.nativeDatabaseReservedBytes);
       peakResidentBytes = Math.max(peakResidentBytes, sample.residentBytes);
