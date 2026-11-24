@@ -2,8 +2,9 @@
   "upstream": "v1.20261114.1",
   "upstreamCommit": "3d3093c8f01b9b53f4d36d20a8e4ea0a39787992",
   "patchSeriesSha256": "d723fc0444d1ee013ea4ff93fb1b394fc47710c2041e8b499ff7d9d002c7266f",
+  "releaseTag": "kernel-v1.20261114.1-d723fc0444d1-run-45451463136-1",
   "archives": {
-    "linux-x86_64": null,
-    "linux-arm64": null
+    "linux-x86_64": "936f4b3763314de4f9cdb44d340e0810dcdae9d0cc47b0516c005ae00f0ab50b",
+    "linux-arm64": "6085ab92bed17291e48bb124f474b1d869023bebbb051f37145b4bed77bc5253"
   }
 }
