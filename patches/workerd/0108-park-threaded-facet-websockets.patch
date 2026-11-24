@@ -6,7 +6,7 @@ Subject: [PATCH] Keep threaded facet WebSockets across idle retirement
 Park root and facet transports in one handoff. Carry the facet's startup options, use its own WebSocket manager on reopen, and forward the native upgrade through local facet fetches.
 
 diff --git a/src/workerd/api/http.c++ b/src/workerd/api/http.c++
-index 28950ad1edd6262c8895f235d890fd1637f3dbb1..edf59c0dfa9699db798935233240d5256f233539 100644
+index 28950ad1edd6262c8895f235d890fd1637f3dbb1..77531281953e64b19954c88e8a0a5909eab97dee 100644
 --- a/src/workerd/api/http.c++
 +++ b/src/workerd/api/http.c++
 @@ -1325,6 +1325,15 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
@@ -25,14 +25,23 @@ index 28950ad1edd6262c8895f235d890fd1637f3dbb1..edf59c0dfa9699db798935233240d525
        KJ_IF_SOME(manager, actor.getHibernationManager()) {
          KJ_IF_SOME(legacy, kj::tryDowncast<LegacyHibernationManagerImpl>(manager)) {
            KJ_IF_SOME(pending, legacy.stageNodeSocket(js, *ws)) {
-@@ -1724,9 +1733,24 @@ jsg::Promise<jsg::Ref<Response>> handleWebSocketFetchResponse(jsg::Lock& js,
-         webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket),
-             kj::mv(cancellation.canceler), kj::mv(cancellation.registration));
-       }
-+      auto socket = js.alloc<WebSocket>(js, kj::mv(webSocket));
+@@ -1715,18 +1724,46 @@ jsg::Promise<jsg::Ref<Response>> handleWebSocketFetchResponse(jsg::Lock& js,
+     }
+     KJ_CASE_ONEOF(webSocket, kj::Own<kj::WebSocket>) {
+       KJ_ASSERT(response.statusCode == 101);
+-      webSocket = webSocket.attach(kj::mv(client));
+       KJ_IF_SOME(s, signal) {
+         if (s->getAborted(js)) {
+           return js.rejectedPromise<jsg::Ref<Response>>(s->getReason(js));
+         }
+-        auto cancellation = s->newCanceler(js);
+-        webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket),
+-            kj::mv(cancellation.canceler), kj::mv(cancellation.registration));
++      }
 +      constexpr auto marker = LegacyHibernationManagerImpl::NODE_SOCKET_HEADER;
 +      auto& context = IoContext::current();
 +      kj::HttpHeaders publicHeaders(context.getHeaderTable());
++      kj::Maybe<kj::StringPtr> stagedUpgrade;
 +      response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
 +        if (strcasecmp(name.cStr(), marker.cStr()) != 0) {
 +          publicHeaders.addPtrPtr(name, value);
@@ -40,10 +49,27 @@ index 28950ad1edd6262c8895f235d890fd1637f3dbb1..edf59c0dfa9699db798935233240d525
 +        }
 +        KJ_IF_SOME(actor, context.getActor()) {
 +          if (LegacyHibernationManagerImpl::canForwardNodeUpgrade(actor, value)) {
-+            socket->setStagedNodeUpgrade(value);
++            stagedUpgrade = value;
 +          }
 +        }
 +      });
++      kj::Maybe<jsg::Ref<WebSocket>> socket;
++      KJ_IF_SOME(token, stagedUpgrade) {
++        // The node will provide the transport at the outer upgrade. Release the local
++        // fetch and its pipe with this response so neither can keep the child facet busy.
++        auto placeholder = kj::newWebSocketPipe();
++        auto forwarded = js.alloc<WebSocket>(js, kj::mv(placeholder.ends[0]));
++        forwarded->setStagedNodeUpgrade(token);
++        socket = kj::mv(forwarded);
++      } else {
++        webSocket = webSocket.attach(kj::mv(client));
++        KJ_IF_SOME(s, signal) {
++          auto cancellation = s->newCanceler(js);
++          webSocket = kj::refcounted<AbortableWebSocket>(kj::mv(webSocket),
++              kj::mv(cancellation.canceler), kj::mv(cancellation.registration));
++        }
++        socket = js.alloc<WebSocket>(js, kj::mv(webSocket));
+       }
        return js.resolvedPromise(makeHttpResponse(js, jsRequest->getMethodEnum(), kj::mv(urlList),
 -          response.statusCode, response.statusText, *response.headers, newNullInputStream(),
 -          js.alloc<WebSocket>(js, kj::mv(webSocket)), jsRequest->getResponseBodyEncoding(),
@@ -195,7 +221,7 @@ index 01a63e71876e698ed3515bab81f9b711703df30d..bcb98b4d58b163ccbebedce73f05f4e7
  
  interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac499fd8644 100644
+index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba229030976a9bd87 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1806,6 +1806,9 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
@@ -684,7 +710,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
      }
      return opened.value->getNonHibernatableWebSocketCount()->count > 0 ||
          opened.hooks->hasOrdinaryWebSocket();
-@@ -6009,33 +6245,98 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
+@@ -6009,33 +6245,100 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
        open(kj::str(channels.document.original), kj::heap<Invocation>(*this)));
  }
  
@@ -698,6 +724,8 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
 -      "durable test facets require a class in the original isolate copy");
 -  className = kj::str(binding->name);
 +  KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
++  // The startup callback is only used once. Its IoContext reentry handle counts as pending I/O.
++  auto startFacet = kj::mv(getStartInfo);
 +  Worker::Actor::Id id;
 +  Frankenvalue props;
 +  PropsMessage saveStart;
@@ -717,7 +745,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
 +    auto channels = kj::rc<Channels>(tree->state, tree->server, slot, descriptor);
 +    props = readFacetProps(start.getProps(), channels);
 +  } else {
-+    auto info = co_await getStartInfo();
++    auto info = co_await startFacet();
 +    co_await info.ensureAllResolved();
 +    auto *binding = dynamic_cast<LocalActorClass *>(info.actorClass.get());
 +    KJ_REQUIRE(!stopped && binding != nullptr && slot == binding->slot.lock(),
@@ -795,7 +823,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
    auto slot = tree->slot.lock();
    KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
    JsonDoc input(descriptor);
-@@ -6175,6 +6476,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6175,6 +6478,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                  .emplace(ticket.tree,
                      ThreadState::DurableRoot{
                        .actor = kj::mv(actor.value),
@@ -804,7 +832,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
                        .idle = std::move(idle),
                        .facetsBusy =
                            [hooks = actor.hooks](
-@@ -6221,35 +6524,37 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6221,35 +6526,37 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      if (!root.nodeSockets) {
        auto sockets = std::make_shared<DurableNodeSockets>(state, kj::str(server.bindingAddress.c_str()),
            route, root.rootOpenId(), root.idle);
@@ -856,7 +884,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
        // A client can drop the first event while the node is adopting. Let the
        // home finish the handoff and settle the admission fence anyway.
        auto adopting = root.adopting;
-@@ -6278,8 +6583,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6278,8 +6585,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        }
      }
    }
@@ -867,7 +895,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..686759e45df0198223c0cd9a495a3ac4
    kj::Maybe<DurableAlarmEvent> alarm;
    auto alarmDescriptor = field(input, "durableAlarm");
    if (alarmDescriptor.isObject()) {
-@@ -6296,25 +6601,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6296,25 +6603,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
    auto socketDescriptor = field(input, "durableSocket");
    if (socketDescriptor.isObject()) {
      KJ_REQUIRE(state.wal.get() != nullptr, "persistent storage is required for a socket event");
