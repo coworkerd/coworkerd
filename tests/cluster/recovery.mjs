@@ -66,6 +66,10 @@ try {
     assert.equal(value, name);
   };
   for (let offset = 0; offset < count; offset += 16) await Promise.all(objects.slice(offset, offset + 16).map(confirm));
+  const current = await namespace();
+  for (const shard of shards)
+    assert.ok(current.owners.some(owner => owner.shard === shard && owner.nodeId === original && !owner.released),
+      `shard ${shard} is still held by the node about to stop`);
   const before = Object.fromEntries(await Promise.all(survivors.map(async node => [node, await cluster.state(node)])));
   const originalState = await cluster.state(original);
   // Disable only this project container's restart policy before delivering SIGKILL.

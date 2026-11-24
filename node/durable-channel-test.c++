@@ -2020,7 +2020,7 @@ struct DurableLogChannelTest {
     kj::HttpHeaderId ifNoneMatch;
   };
 
-  static void recoveryCollection(bool live) {
+  static void recoveryCollection(bool live, bool local = false) {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-recovery-test-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
     KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
@@ -2045,9 +2045,9 @@ struct DurableLogChannelTest {
     membership.livenessGraceMs = 10000;
     const std::string ns(64, 'b'), id(64, '1');
     store.objects[shardEpochKey(ns, 1, 2)] = shardEpochJson(
-        {ns, "new", "timeout", "new-instance", "nonce", "old", 1, 2, 9, 2, 1, 1, 7});
+        {ns, "new", "timeout", "new-instance", "nonce", local ? "new" : "old", 1, 2, 9, local ? 1u : 2u, 1, 1, 7});
     store.objects[shardEpochKey(ns, 1, 1)] = shardEpochJson(
-        {ns, "old", "first", "old-instance", "nonce", "", 1, 1, 7, 1, 1});
+        {ns, local ? "new" : "old", "first", "old-instance", "nonce", "", 1, 1, 7, 1, 1});
     store.objects[memberRegistrationKey("old", 7)] = memberRecordJson({"old", "old:8934", "active", "old-instance", 7});
     store.objects[memberRegistrationKey("peer", 8)] = memberRecordJson({"peer", "peer:8934", "active", "peer-instance", 8});
     if (live)
@@ -2064,12 +2064,17 @@ struct DurableLogChannelTest {
       handle->target = target;
       handle->generation = 1;
       handle->failed = [&] { ++ownerFailures; };
-      handle->page = [&, target, round](DurableTailAsk) -> kj::Promise<DurableTailAnswer> {
+      handle->page = [&, target, round](DurableTailAsk ask) -> kj::Promise<DurableTailAnswer> {
         if (target.nodeId == "old") {
           ++ownerCalls;
           if (live) {
+            if (ask.afterSeq == 0) {
+              auto first = testRecord(ns, 7, 1, 1, 1);
+              first.objectName = ns + "/" + id;
+              co_return DurableTailAnswer{.records = {std::move(first)}, .firstSeq = 1, .lastSeq = 1,
+                  .count = 1, .more = true, .ownerConfirmed = true};
+            }
             if (!ownerReleased) {
-              // Until the last page arrives the owner has supplied no proof.
               co_return DurableTailAnswer{.refusal = "the owner has not finished preparing its answer"};
             }
             co_await ownerReady.addBranch();
@@ -2088,22 +2093,38 @@ struct DurableLogChannelTest {
     DurableLog log({"new", "new-instance", temp, {}, true, WAIT_MS}, config, io.provider->getNetwork(),
         timer, *io.lowLevelProvider, membership, std::move(hooks));
     log.nodeEpoch = 9;
-    const auto name = durableHostName(ns, id, 2);
+    const auto dataEpoch = local ? 1u : 2u;
+    const auto name = durableHostName(ns, id, dataEpoch);
     auto& object = log.objects[name];
     object.namespaceId = ns;
     object.objectId = id;
     object.objectName = name;
     object.shard = 1;
-    object.shardEpoch = object.dataEpoch = 2;
+    object.shardEpoch = 2;
+    object.dataEpoch = dataEpoch;
     object.state = DurableLog::ObjectState::REBUILDING;
     DurableLog::RebuildRun run;
     std::optional<ObjectManifest> manifest;
+    if (local) {
+      log.diskTrusted = log.sameBootCache = true;
+      log.predecessorLogs[7].complete = true;
+      run.reserved = true;
+      auto prepared = kj::newPromiseAndFulfiller<bool>();
+      auto collection = log.fetchTails({ns, id, "", dataEpoch, 2, 1}, manifest, started, run,
+          kj::mv(prepared.fulfiller)).eagerlyEvaluate(nullptr);
+      KJ_REQUIRE(timer.timeoutAfter(5 * kj::SECONDS, kj::mv(prepared.promise)).wait(io.waitScope),
+          "a trusted restart with complete local evidence keeps its preparation slot");
+      KJ_REQUIRE(!collection.wait(io.waitScope).cut && log.recoveryMetadata.started() == 0 &&
+          ownerCalls == 0 && peerCalls == 0, "local evidence needs no waiting-recovery probes");
+      return;
+    }
     auto collection = log.fetchTails({ns, id, "", 2, 2, 1}, manifest, started, run).eagerlyEvaluate(nullptr);
     if (live) {
       const auto limit = timer.now() + 3 * kj::SECONDS;
       while (log.cutsHeldOwnerLive == 0 && timer.now() < limit) timer.afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
       KJ_REQUIRE(!collection.poll(io.waitScope) && log.cutsHeldOwnerLive == 1 && run.owner == "old" && peerCalls == 0);
-      // Replace the incomplete page with a complete proof from the same source.
+      KJ_REQUIRE(object.recoveryTails.size() == 1, "the incomplete proof retains its verified prefix while waiting");
+      // Release the final page of the owner's proof.
       ownerReleased = true;
       ownerReply.fulfiller->fulfill();
     }
@@ -2231,8 +2252,8 @@ int main(int argc, char* argv[]) {
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "recovery-admission") coworkerd::DurableLogChannelTest::recoveryAdmission();
   else if (mode == "recovery-requeue") coworkerd::DurableLogChannelTest::recoveryRequeue();
-  else if (mode == "recovery-final-round" || mode == "recovery-live-owner")
-    coworkerd::DurableLogChannelTest::recoveryCollection(mode == "recovery-live-owner");
+  else if (mode == "recovery-final-round" || mode == "recovery-live-owner" || mode == "recovery-local-restart")
+    coworkerd::DurableLogChannelTest::recoveryCollection(mode == "recovery-live-owner", mode == "recovery-local-restart");
   else if (mode == "restored-tail" || mode == "restored-tail-negative")
     coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
   else coworkerd::DurableLogChannelTest::run(mode == "index");

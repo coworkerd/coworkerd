@@ -5031,13 +5031,13 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
 }
 
 kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectName,
-    const std::optional<ObjectManifest>& manifest) {
+    const std::optional<ObjectManifest>& manifest, bool preparingLocally) {
   if (!manifest) co_return 0;
   auto* object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "the recovery object disappeared before its lower-bound check");
   const auto namespaceId = object->namespaceId;
   const auto shard = object->shard;
-  const auto response = co_await readRecoveryEpoch(shardEpochKey(namespaceId, shard, manifest->shardEpoch));
+  const auto response = co_await readRecoveryEpoch(shardEpochKey(namespaceId, shard, manifest->shardEpoch), preparingLocally);
   const auto epoch = parseShardEpoch(response->bytes);
   requireStorage(epoch && epoch->epoch == manifest->shardEpoch && epoch->namespaceId == namespaceId && epoch->shard == shard,
       "the latest manifest's ownership origin is unavailable");
@@ -5217,9 +5217,18 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   std::vector<ManifestFacet> facets;
   uint64_t fromSeq = 0;
   object->recoveryManifestRevision = manifest ? manifest->revision : 0;
+  // A trusted restart on the original disk can prove its own source epochs
+  // during preparation. Remote, missing or incomplete sources park as usual.
+  kj::Maybe<kj::Promise<bool>> preparedLocally;
+  kj::Own<kj::PromiseFulfiller<bool>> localPreparation;
+  if (diskTrusted && sameBootCache && targetDataEpoch < targetEpoch) {
+    auto prepared = kj::newPromiseAndFulfiller<bool>();
+    preparedLocally = kj::mv(prepared.promise);
+    localPreparation = kj::mv(prepared.fulfiller);
+  }
   auto collecting = fetchTails(ObjectIdentity{object->namespaceId, object->objectId, object->tenant,
       object->dataEpoch, object->shardEpoch, object->shard},
-      manifest, tailStart, run).eagerlyEvaluate(nullptr);
+      manifest, tailStart, run, kj::mv(localPreparation)).eagerlyEvaluate(nullptr);
   if (manifest) {
     if (manifest->shardEpoch > object->shardEpoch) {
       object->state = ObjectState::GONE;
@@ -5243,13 +5252,22 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     }
   }
   lap(laps.snapshot);
-  // The staging image stays private while the collector waits for evidence.
-  setRebuildPhase(run, RebuildPhase::TAILS);
-  run.parkedAtMs = monotonicTimeMs();
-  releaseRebuildSlot(run);
+  bool localProof = false;
+  KJ_IF_SOME(prepared, preparedLocally) {
+    localProof = co_await kj::mv(prepared);
+    check();
+  }
+  if (!localProof) {
+    // The staging image stays private while the collector waits for evidence.
+    setRebuildPhase(run, RebuildPhase::TAILS);
+    run.parkedAtMs = monotonicTimeMs();
+    releaseRebuildSlot(run);
+  }
   auto tails = co_await kj::mv(collecting);
-  setRebuildPhase(run, RebuildPhase::RESUMING);
-  co_await acquireRebuildSlot(objectName, run);
+  if (!localProof) {
+    setRebuildPhase(run, RebuildPhase::RESUMING);
+    co_await acquireRebuildSlot(objectName, run);
+  }
   check();
   run.parkedAtMs = 0;
   lap(laps.tailWait);
@@ -5325,7 +5343,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lap(laps.latest);
   object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
-  const auto lowerBound = co_await recoveryLowerBound(objectName, manifest);
+  const auto lowerBound = co_await recoveryLowerBound(objectName, manifest, true);
   check();
   std::set<std::pair<uint64_t, uint64_t>> drop;
   uint64_t snapshotShardEpoch = 0;
@@ -5541,7 +5559,7 @@ kj::Promise<ObjectResponse> DurableLog::readRecoveryMetadata(std::string key, ui
   co_return co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, store->get(std::move(key)));
 }
 
-kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch(std::string key) {
+kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch(std::string key, bool preparingLocally) {
   constexpr size_t MAX_CACHED_EPOCHS = 1024;
   const auto now = monotonicTimeMs();
   if (auto found = recoveryEpochReads.find(key); found != recoveryEpochReads.end()) {
@@ -5555,20 +5573,26 @@ kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch
     });
     if (settled != recoveryEpochReads.end()) recoveryEpochReads.erase(settled);
   }
-  auto read = [](DurableLog& self, std::string key, std::shared_ptr<double> freshUntil)
+  auto read = [](DurableLog& self, std::string key, std::shared_ptr<double> freshUntil, bool preparingLocally)
       -> kj::Promise<std::shared_ptr<const ObjectResponse>> {
     const auto markFailure = kj::defer([&]() {
       if (*freshUntil == 0) *freshUntil = monotonicTimeMs() + RECOVERY_WAKE_INTERVAL / kj::MILLISECONDS;
     });
-    auto result = co_await self.readRecoveryMetadata(std::move(key),
-        std::max(self.settings.peerTimeoutMs, self.settings.config.confirmTimeoutMs));
+    const auto limit = std::max(self.settings.peerTimeoutMs, self.settings.config.confirmTimeoutMs);
+    ObjectResponse result;
+    if (preparingLocally) {
+      result = co_await self.timer.timeoutAfter(limit * kj::MILLISECONDS, self.store->get(std::move(key)));
+    } else {
+      result = co_await self.readRecoveryMetadata(std::move(key), limit);
+    }
     requireStorage(result.status == 200 && result.bytes.size() <= 4096, "a source shard epoch is unavailable");
     *freshUntil = monotonicTimeMs() + 60000;
     co_return std::make_shared<const ObjectResponse>(std::move(result));
   };
   auto freshUntil = std::make_shared<double>(0);
-  if (recoveryEpochReads.size() >= MAX_CACHED_EPOCHS) return read(*this, std::move(key), std::move(freshUntil));
-  auto fork = read(*this, key, freshUntil).fork();
+  if (recoveryEpochReads.size() >= MAX_CACHED_EPOCHS)
+    return read(*this, std::move(key), std::move(freshUntil), preparingLocally);
+  auto fork = read(*this, key, freshUntil, preparingLocally).fork();
   auto branch = fork.addBranch();
   recoveryEpochReads.emplace(std::move(key), EpochRead{kj::mv(fork), std::move(freshUntil)});
   return branch;
@@ -5675,7 +5699,14 @@ kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::discov
 }
 
 kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
-    ObjectIdentity identity, const std::optional<ObjectManifest>& manifest, double startedMs, RebuildRun& run) {
+    ObjectIdentity identity, const std::optional<ObjectManifest>& manifest, double startedMs, RebuildRun& run,
+    kj::Own<kj::PromiseFulfiller<bool>> localPreparation) {
+  auto finishLocalPreparation = [&](bool complete) {
+    if (!localPreparation) return;
+    localPreparation->fulfill(kj::mv(complete));
+    localPreparation = nullptr;
+  };
+  const auto preparationDone = kj::defer([&]() { finishLocalPreparation(false); });
   const auto name = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
   const auto generation = objectOf(name)->rebuildGeneration;
   auto checkIdentity = [&]() {
@@ -5686,7 +5717,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         "the object changed ownership during tail recovery");
   };
   if (!run.reserved) setRebuildPhase(run, RebuildPhase::TAILS);
-  const auto snapshotShardEpoch = co_await recoveryLowerBound(name, manifest);
+  const auto snapshotShardEpoch = co_await recoveryLowerBound(name, manifest, localPreparation.get() != nullptr);
   checkIdentity();
   const auto deadline = startedMs + settings.tailWaitMs;
   const auto wanted = identity.namespaceId + "/" + identity.objectId;
@@ -5714,7 +5745,8 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
   std::set<uint64_t> visited;
   while (epoch && (!snapshotShardEpoch || epoch >= snapshotShardEpoch)) {
     KJ_REQUIRE(visited.insert(epoch).second, "a shard's previous-epoch chain cycles");
-    const auto response = co_await readRecoveryEpoch(shardEpochKey(identity.namespaceId, identity.shard, epoch));
+    const auto response = co_await readRecoveryEpoch(shardEpochKey(identity.namespaceId, identity.shard, epoch),
+        localPreparation.get() != nullptr);
     checkIdentity();
     auto record = parseShardEpoch(response->bytes);
     requireStorage(record && record->epoch == epoch && record->namespaceId == identity.namespaceId &&
@@ -5746,6 +5778,8 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
             std::to_string(record->nodeEpoch) + "\",\"records\":" + std::to_string(retainedCount));
       }
     }
+    if (record->nodeId != settings.nodeId || (!source.ownerComplete && record->nodeEpoch != nodeEpoch &&
+        !membership.heldEpochs.contains(std::to_string(record->nodeEpoch)))) finishLocalPreparation(false);
     state.sources.push_back(std::move(source));
     epoch = record->previousEpoch;
   }
@@ -5981,7 +6015,10 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     if (allOwners()) break;
     refreshMemory();
     const bool atDeadline = monotonicTimeMs() >= deadline;
-    if (atDeadline && !state.discovery) co_await addDiscovery();
+    if (atDeadline && !state.discovery) {
+      finishLocalPreparation(false);
+      co_await addDiscovery();
+    }
     const bool finalRound = atDeadline && (co_await mayCut());
     if (!run.reserved) setRebuildPhase(run, finalRound ? RebuildPhase::FINAL_TAILS :
         atDeadline ? RebuildPhase::OWNER : RebuildPhase::TAILS);
@@ -6033,6 +6070,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
     if (ready || allOwners()) break;
     co_await owners.addBranch();if (allOwners()) break;
     co_await peersDone.addBranch();
+    finishLocalPreparation(false);
     if (finalRound) {
       if (co_await mayCut()) break;
       // A heartbeat became live again while reading the final pages. Keep the
@@ -6096,6 +6134,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         ",\"waitedMs\":" + std::to_string(out.collectionMs) + ",\"records\":" +
         std::to_string(recordCount));
   }
+  finishLocalPreparation(true);
   co_return out;
 }
 

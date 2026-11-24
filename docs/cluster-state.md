@@ -362,6 +362,7 @@ of a 90,672-byte WAL took 0.250 ms.
   preparation ends, a rebuild returns its slot while tail collection continues. When the evidence is ready, the
   object queues again for a slot and revalidates its identity and manifest before publication. The object stays
   rebuilding throughout the wait. `durableLog.objects` reports active, queued and waiting rebuilds.
+  A trusted restart can prove complete local history during preparation and continue directly to replay.
   Queue time counts toward `recoverTimeoutMs`, and a request can receive `DO_RECOVERING` while the rebuild continues.
   The same response applies when a node's 16 MiB rebuild metadata budget is full.
 

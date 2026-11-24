@@ -948,7 +948,8 @@ private:
   void promoteRebuild(const std::string&);
   kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason, RebuildRun&);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
-  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest);
+  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest,
+      bool preparingLocally = false);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
       const std::string& staging, std::function<void()> check = {}, std::function<void(double)> observeFsync = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
@@ -968,11 +969,11 @@ private:
   };
   kj::Promise<std::shared_ptr<const TailDiscovery>> discoverTailTargets();
   kj::Promise<std::shared_ptr<const TailDiscovery>> tailTargets();
-  kj::Promise<std::shared_ptr<const ObjectResponse>> readRecoveryEpoch(std::string key);
+  kj::Promise<std::shared_ptr<const ObjectResponse>> readRecoveryEpoch(std::string key, bool preparingLocally = false);
   kj::Promise<ObjectResponse> readRecoveryMetadata(std::string key, uint32_t timeoutMs);
   kj::Promise<void> recoveryWake();
   kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, const std::optional<ObjectManifest>& manifest,
-      double startedMs, RebuildRun&);
+      double startedMs, RebuildRun&, kj::Own<kj::PromiseFulfiller<bool>> localPreparation = {});
   void noteLateTail(const std::string& objectName, const LogRecord& record, uint64_t cutEpoch);
   kj::Promise<void> publishRecovery(std::string objectName, const std::vector<LogRecord>& records);
   kj::Promise<void> forceRecoverySnapshot(std::string objectName, bool healing = false, bool local = false,
