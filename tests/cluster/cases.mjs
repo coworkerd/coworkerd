@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { unlink, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { rename, unlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
@@ -892,6 +894,7 @@ async function mixedDurableStorage(cluster) {
 }
 
 async function threadedClassMigration(cluster) {
+  const { WebSocket: TestSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
   const [ingress] = cluster.nodes;
   const tenant = await cluster.tenant('threaded-migration');
   const name = 'records';
@@ -903,17 +906,46 @@ async function threadedClassMigration(cluster) {
   const renamed = { tag: 'v2', renamed_classes: [{ from: 'Record', to: 'RenamedRecord' }] };
   const deleted = { tag: 'v3', deleted_classes: ['RenamedRecord'] };
   const source = (className, version) => `
-    import { DurableObject } from 'cloudflare:workers';
+    import { DurableObject, RpcTarget } from 'cloudflare:workers';
+    class Retained extends RpcTarget {
+      ping() { return '${version}'; }
+    }
     export class ${className} extends DurableObject {
+      retain() { return new Retained(); }
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path.endsWith('/alarm')) {
+          const at = await request.json();
+          await this.ctx.storage.setAlarm(at);
+          return Response.json(at);
+        }
+        if (path.endsWith('/socket') || path.endsWith('/hibernatable')) {
+          const [client, socket] = Object.values(new WebSocketPair());
+          if (path.endsWith('/hibernatable')) {
+            this.ctx.acceptWebSocket(socket, ['old']);
+          } else {
+            socket.accept();
+            socket.addEventListener('message', event => socket.send('${version}:' + event.data));
+          }
+          return new Response(null, { status: 101, webSocket: client });
+        }
+        if (path.endsWith('/waiting')) return Response.json(await this.ctx.storage.get('waiting') ?? false);
+        if (path.endsWith('/wait-starts')) return Response.json(await this.ctx.storage.get('wait-starts') ?? 0);
+        if (path.endsWith('/wait-for-headers')) {
+          await this.ctx.storage.put('wait-starts', (await this.ctx.storage.get('wait-starts') ?? 0) + 1);
+          await this.ctx.storage.put('waiting', true);
+          await scheduler.wait(90000);
+          return new Response('old handler completed');
+        }
         if (path.endsWith('/held')) {
           const encoder = new TextEncoder();
           return new Response(new ReadableStream({
             async start(controller) {
               controller.enqueue(encoder.encode('entered:'));
-              await scheduler.wait(8000);
-              controller.enqueue(encoder.encode('${version}'));
+              for (let i = 0; i < 45; i++) {
+                await scheduler.wait(2000);
+                controller.enqueue(encoder.encode('${version}'));
+              }
               controller.close();
             },
           }));
@@ -922,11 +954,31 @@ async function threadedClassMigration(cluster) {
         return Response.json({
           id: this.ctx.id.toString(),
           value: await this.ctx.storage.get('value'),
+          alarmVersion: (await this.ctx.storage.get('alarm-version')) ?? null,
           version: '${version}',
         });
       }
+      webSocketMessage(socket, message) { socket.send('${version}:' + message); }
+      async alarm() { await this.ctx.storage.put('alarm-version', '${version}'); }
     }
-    export default { fetch(request, env) { return env.OBJECT.getByName('stable').fetch(request); } };
+    export default { async fetch(request, env) {
+      const stub = env.OBJECT.getByName('stable');
+      if (!new URL(request.url).pathname.endsWith('/retain')) return stub.fetch(request);
+      const retained = await stub.retain();
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream({
+        async start(controller) {
+          controller.enqueue(encoder.encode('retained:' + await retained.ping()));
+          await scheduler.wait(18000);
+          try {
+            controller.enqueue(encoder.encode('still:' + await retained.ping()));
+          } catch {
+            controller.enqueue(encoder.encode('released'));
+          }
+          controller.close();
+        },
+      }));
+    } };
   `;
   const deploy = (version, className, migrations) => cluster.deploy(tenant, name, source(className, version), {
     version, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
@@ -937,30 +989,76 @@ async function threadedClassMigration(cluster) {
     assert.equal(value.version, 'v1');
     return value;
   });
-  const identity = (await namespace('Record')).namespaceId;
-  const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(25000) });
+  const { namespaceId: identity, owners: [owner] } = await namespace('Record');
+  const generation = (await durableGeneration(cluster, owner.nodeId)).generation;
+  const openSocket = async mode => {
+    const address = new URL(url + mode, cluster.urls[ingress]);
+    address.protocol = 'ws:';
+    const socket = new TestSocket(address);
+    await once(socket, 'open', { signal: AbortSignal.timeout(5000) });
+    const echoed = once(socket, 'message', { signal: AbortSignal.timeout(5000) });
+    socket.send('probe');
+    assert.equal((await echoed)[0].toString(), 'v1:probe');
+    return socket;
+  };
+  const sockets = await Promise.all(['/socket', '/hibernatable'].map(openSocket));
+  const socketsClosed = sockets.map(socket => once(socket, 'close', { signal: AbortSignal.timeout(35000) }));
+  for (const closing of socketsClosed) void closing.catch(() => {});
+  const heldRpc = await fetch(cluster.urls[ingress] + url + '/retain', { signal: AbortSignal.timeout(45000) });
+  assert.equal(heldRpc.status, 200);
+  const rpcReader = heldRpc.body.getReader();
+  assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'retained:v1');
+  const due = Date.now() + 8000;
+  assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
+  const waiting = call('/wait-for-headers', { timeout: 60000 }).then(
+    value => ({ value }), error => ({ error }),
+  );
+  await eventually('the second v1 request is waiting before response headers', async () => {
+    assert.equal(json(await call('/waiting'), 200, 'v1 handler entered'), true);
+  });
+  const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(30000) });
   assert.equal(held.status, 200);
   const reader = held.body.getReader();
   try {
     const firstChunk = await reader.read();
     assert.equal(Buffer.from(firstChunk.value).toString(), 'entered:');
     await deploy('v2', 'RenamedRecord', [initial, renamed]);
-    const versions = [];
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      versions.push(Buffer.from(chunk.value));
-    }
-    assert.equal(Buffer.concat(versions).toString(), 'v1', 'an open stream keeps its code pin');
+    await eventually('the first v2 request is refused while v1 still holds the tree', async () => {
+      const response = await call('');
+      assert.equal(response.status, 503);
+      assert.match(response.text, /DO_VERSION_DRAINING/);
+    });
+    const oldChunk = await reader.read();
+    assert.match(Buffer.from(oldChunk.value).toString(), /^(v1)+$/, 'an open stream keeps its code pin');
+    await assert.rejects(async () => {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+      }
+    }, /terminated|closed|reset|aborted/i, 'the new definition cuts the old stream at the drain bound');
+    const pending = await waiting;
+    if (pending.error) throw pending.error;
+    assert.equal(pending.value.status, 503, 'an old call without response headers has an uncertain result');
+    assert.match(pending.value.text, /DO_CODE_UPDATED/);
+    assert.match(pending.value.text, /Durable Object reset because its code was updated/);
+    assert.match(pending.value.text, /execution result uncertain/);
   } finally {
-    await reader.cancel();
+    await reader.cancel().catch(() => {});
   }
 
   await eventually('renamed class uses the existing threaded storage', async () => {
     assert.equal((await namespace('RenamedRecord')).namespaceId, identity);
     const entry = json(await call(''), 200, 'read v2');
-    assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2' });
+    assert.deepEqual(entry, { id: first.id, value: 'retained', version: 'v2', alarmVersion: 'v2' });
   });
+  assert.equal((await durableGeneration(cluster, owner.nodeId)).generation, generation,
+    'the target tree releases its sessions without replacing the process');
+  assert.equal(json(await call('/wait-starts'), 200, 'confirmed call count'), 1,
+    'the platform does not replay an old call with an uncertain result');
+  assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'released',
+    'a retained RPC capability from the old tree is revoked');
+  await rpcReader.cancel();
+  for (const closed of socketsClosed) assert.equal((await closed)[0], 1001, 'version drain closes both socket kinds');
   await cluster.deploy(tenant, name, respondWith('v3'), {
     version: 'v3', wrangler: { migrations: [initial, renamed, deleted] },
   });
@@ -976,6 +1074,433 @@ async function threadedClassMigration(cluster) {
       assert.equal(gone.status, 404);
     }
   });
+}
+
+async function threadedSocketHibernation(cluster) {
+  const { WebSocket: PingSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const tenant = await cluster.tenant('threaded-hibernation');
+  const [ingress] = cluster.nodes;
+  const path = `/${tenant.name}/sleeper`;
+  const namespace = () => cluster.api(`${tenant.path}/workers/sleeper/namespaces/Sleeper`,
+    { token: tenant.token });
+  await cluster.deploy(tenant, 'sleeper', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Sleeper extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        this.constructedWith = ctx.getWebSockets('retained').length;
+        ctx.blockConcurrencyWhile(async () => {
+          this.instance = (await ctx.storage.get('constructors') ?? 0) + 1;
+          await ctx.storage.put('constructors', this.instance);
+        });
+      }
+      async fetch(request) {
+        if (new URL(request.url).pathname.endsWith('/terminal')) {
+          return Response.json(await this.ctx.storage.get('terminal') ?? null);
+        }
+        if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+          const [client, socket] = Object.values(new WebSocketPair());
+          this.ctx.acceptWebSocket(socket, ['retained']);
+          socket.serializeAttachment({ field: 42 });
+          this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'tock'));
+          return new Response(null, { status: 101, webSocket: client });
+        }
+        return Response.json({ instance: this.instance, sockets: this.ctx.getWebSockets('retained').length,
+          constructedWith: this.constructedWith });
+      }
+      webSocketMessage(socket, message) {
+        socket.send(JSON.stringify({
+          instance: this.instance, constructedWith: this.constructedWith,
+          message: typeof message === 'string' ? message : [...new Uint8Array(message)],
+          attachment: socket.deserializeAttachment(),
+          retained: this.ctx.getWebSockets('retained').length,
+          automatic: this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime(),
+        }));
+      }
+      async webSocketClose(socket, code, reason, wasClean) {
+        await this.ctx.storage.put('terminal', { code, reason, wasClean });
+        if (wasClean) socket.close(code, reason);
+      }
+      async webSocketError(socket, error) {
+        await this.ctx.storage.put('terminal', { error: String(error) });
+      }
+    }
+    export default {
+      fetch(request, env) { return env.TREE.getByName('parked').fetch(request); }
+    };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper'] }],
+    durable_objects: { bindings: [{ name: 'TREE', class_name: 'Sleeper' }] } } });
+
+  await eventually('the threaded object answers successfully', async () => {
+    assert.deepEqual(json(await request(cluster.urls[ingress], path), 200, 'open sleeper'),
+      { instance: 1, sockets: 0, constructedWith: 0 });
+  });
+  const owner = (await namespace()).owners[0];
+  assert.ok(owner && cluster.nodes.includes(owner.nodeId));
+  const activity = async () => (await durableGeneration(cluster, owner.nodeId)).lifecycle.durableAdmission;
+  const retired = after => eventually('the tree and its live sessions leave the home', async () => {
+    const state = await activity();
+    assert.ok(state.idleRetirements > after, JSON.stringify(state));
+    assert.equal(state.residentRoots, 0, JSON.stringify(state));
+    assert.equal(state.homeSessions, 0, JSON.stringify(state));
+    assert.equal(state.running, 0);
+    return state.idleRetirements;
+  }, { timeout: 25000 });
+
+  const socketUrl = new URL(path, cluster.urls[owner.nodeId]);
+  socketUrl.protocol = 'ws:';
+  const first = new PingSocket(socketUrl);
+  const second = new PingSocket(socketUrl);
+  const sockets = [first, second];
+  const next = async (socket, event, timeout = 7000) => {
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(new Error(`WebSocket ${event} timed out`)), timeout);
+    try {
+      return await once(socket, event, { signal: abort.signal });
+    } catch (error) {
+      if (abort.signal.aborted) throw abort.signal.reason;
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+    }
+  };
+  const ping = async (socket, text) => {
+    const pong = next(socket, 'pong');
+    socket.ping(text);
+    assert.equal((await pong)[0].toString(), text);
+  };
+  const send = async (socket, text) => {
+    const answer = next(socket, 'message');
+    socket.send(text);
+    return (await answer)[0].toString();
+  };
+  let paused = false;
+  try {
+    await Promise.all(sockets.map(socket => next(socket, 'open')));
+    await ping(first, 'before');
+    assert.equal(await send(first, 'tick'), 'tock');
+    const firstEvent = JSON.parse(await send(first, 'warm'));
+    assert.equal(firstEvent.instance, 1);
+    assert.equal(firstEvent.retained, 2);
+    assert.deepEqual(firstEvent.attachment, { field: 42 });
+    assert.ok(Number.isSafeInteger(firstEvent.automatic));
+
+    const firstRetirement = await retired(0);
+    const parked = (await cluster.state(owner.nodeId)).webSockets;
+    assert.equal(parked.parked, 2);
+    await ping(second, 'while parked');
+    assert.equal(await send(second, 'tick'), 'tock');
+    const afterAutomatic = await activity();
+    assert.equal(afterAutomatic.residentRoots, 0);
+    assert.equal(afterAutomatic.homeSessions, 0);
+    assert.equal(afterAutomatic.idleRetirements, firstRetirement);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.socketWakes, parked.socketWakes);
+    assert.deepEqual(json(await request(cluster.urls[owner.nodeId], path), 200, 'normal HTTP wake'),
+      { instance: 2, sockets: 2, constructedWith: 2 }, 'a normal reopen restores both sockets before the constructor runs');
+
+    const secondRetirement = await retired(firstRetirement);
+    assert.equal(await send(first, 'tick'), 'tock');
+    const wake = JSON.parse(await send(first, 'wake'));
+    assert.equal(wake.instance, 3);
+    assert.equal(wake.message, 'wake');
+    assert.equal(wake.retained, 2);
+    assert.equal(wake.constructedWith, 2);
+    assert.deepEqual(wake.attachment, { field: 42 });
+    assert.ok(wake.automatic > firstEvent.automatic);
+    assert.deepEqual(JSON.parse(await send(second, Buffer.from([0, 128, 255]))).message, [0, 128, 255]);
+
+    const readTerminal = async () => json(await request(cluster.urls[owner.nodeId], path + '/terminal'),
+      200, 'socket termination');
+    const clean = new PingSocket(socketUrl);
+    await next(clean, 'open');
+    const cleanClose = next(clean, 'close');
+    clean.close(1000, 'finished');
+    assert.equal((await cleanClose)[0], 1000);
+    await eventually('the actor receives the clean close code and its reason', async () => {
+      assert.deepEqual(await readTerminal(), { code: 1000, reason: 'finished', wasClean: true });
+    }, { timeout: 7000 });
+    const interrupted = new PingSocket(socketUrl);
+    await next(interrupted, 'open');
+    assert.equal(JSON.parse(await send(interrupted, 'armed')).message, 'armed');
+    interrupted.terminate();
+    await eventually('the actor receives one abnormal close', async () => {
+      const terminal = await readTerminal();
+      assert.equal(terminal?.code, 1006);
+      assert.equal(terminal.wasClean, false);
+    }, { timeout: 7000 });
+    await retired(secondRetirement);
+
+    const survivor = cluster.nodes.find(node => node !== owner.nodeId);
+    const closed = sockets.map(socket => next(socket, 'close', 45000));
+    closed.forEach(promise => void promise.catch(() => {}));
+    await cluster.compose(['pause', owner.nodeId]);
+    paused = true;
+    await eventually('a surviving node takes the parked socket shard', async () => {
+      const read = json(await request(cluster.urls[survivor], path, { timeout: 7000 }), 200, 'takeover wake');
+      assert.deepEqual(read, { instance: 4, sockets: 0, constructedWith: 0 });
+      const nextOwner = (await namespace()).owners[0];
+      assert.notEqual(nextOwner.nodeId, owner.nodeId);
+      assert.ok(BigInt(nextOwner.epoch) > BigInt(owner.epoch));
+    }, { timeout: 35000 });
+    await cluster.compose(['unpause', owner.nodeId]);
+    paused = false;
+    for (const close of closed) assert.equal((await close)[0], 1001, 'loss of shard fences the parked socket');
+  } finally {
+    if (paused) await cluster.compose(['unpause', owner.nodeId]);
+    for (const socket of sockets) socket.terminate();
+  }
+}
+
+async function threadedSocketRetirement(cluster) {
+  const { WebSocket: Socket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const tenant = await cluster.tenant('threaded-retirement');
+  const [ingress] = cluster.nodes;
+  const path = `/${tenant.name}/sleeper`;
+  const call = (route, options) => request(cluster.urls[ingress], path + route, options);
+  await cluster.deploy(tenant, 'sleeper', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Sleeper extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        ctx.blockConcurrencyWhile(async () => {
+          this.instance = (await ctx.storage.get('constructors') ?? 0) + 1;
+          await ctx.storage.put('constructors', this.instance);
+        });
+      }
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path.endsWith('/ordinary') || path.endsWith('/managed')) {
+          const [client, socket] = Object.values(new WebSocketPair());
+          if (path.endsWith('/managed')) {
+            this.ctx.acceptWebSocket(socket, ['managed']);
+            socket.serializeAttachment({ token: 'preserved' });
+            this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'tock'));
+            socket.send('welcome');
+          } else {
+            socket.accept();
+            socket.addEventListener('message', event => {
+              if (event.data === 'reset') this.ctx.abort('reset the old home after transfer');
+              const managed = this.ctx.getWebSockets('managed')[0];
+              const changes = [
+                () => managed.serializeAttachment({ token: 'lost' }),
+                () => this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'lost')),
+                () => managed.send('lost'),
+                () => managed.close(1000, 'lost'),
+              ];
+              socket.send(JSON.stringify(changes.map(change => {
+                try { change(); return 'accepted'; } catch (error) { return error.name; }
+              })));
+            });
+          }
+          return new Response(null, { status: 101, webSocket: client });
+        }
+        if (path.endsWith('/local')) {
+          const [peer, socket] = Object.values(new WebSocketPair());
+          this.ctx.acceptWebSocket(socket, ['local']);
+          try { peer.accept(); } catch (error) {
+            return Response.json({ name: error.name, message: error.message });
+          }
+          return Response.json({ name: 'accepted' });
+        }
+        if (path.endsWith('/hold')) this.ctx.waitUntil(scheduler.wait(120000));
+        if (path.endsWith('/write')) this.ctx.getWebSockets('managed')[0].send('write-finished');
+        if (path.endsWith('/reset')) this.ctx.abort('reset the listening socket');
+        return Response.json(this.instance);
+      }
+      webSocketMessage(socket, message) {
+        socket.send(this.instance + ':' + socket.deserializeAttachment().token);
+      }
+      webSocketClose(socket, code, reason) { if (code !== 1006) socket.close(code, reason); }
+    }
+    export default { fetch(request, env) { return env.TREE.getByName('stable').fetch(request); } };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper'] }],
+    durable_objects: { bindings: [{ name: 'TREE', class_name: 'Sleeper' }] } } });
+  await eventually('a hibernatable pair cannot be used without an HTTP upgrade', async () => {
+    const local = json(await call('/local'), 200, 'local pair');
+    assert.equal(local.name, 'NotSupportedError');
+    assert.match(local.message, /requires an HTTP upgrade/);
+  });
+  const { owners: [owner] } = await cluster.api(`${tenant.path}/workers/sleeper/namespaces/Sleeper`, { token: tenant.token });
+  const activity = async () => (await durableGeneration(cluster, owner.nodeId)).lifecycle.durableAdmission;
+  const generation = (await durableGeneration(cluster, owner.nodeId)).generation;
+  const control = name => join(cluster.durableLifecycleGate, name);
+  const advance = async elapsed => {
+    const next = control('idle-offset-next');
+    await writeFile(next, String(elapsed), { mode: 0o644 });
+    await rename(next, control('idle-offset-ms'));
+    await delay(550);
+  };
+  const open = route => {
+    const address = new URL(path + route, cluster.urls[owner.nodeId]);
+    address.protocol = 'ws:';
+    return new Socket(address);
+  };
+  const next = (socket, event, timeout = 7000) => once(socket, event, { signal: AbortSignal.timeout(timeout) })
+    .catch(error => { throw new Error(`WebSocket ${socket.url} did not deliver ${event}`, { cause: error }); });
+  const send = async (socket, message) => {
+    const answer = next(socket, 'message');
+    socket.send(message);
+    return (await answer)[0].toString();
+  };
+  const retired = () => eventually('the ordinary socket or expired work releases the tree with its managed socket parked', async () => {
+    const current = await activity();
+    assert.equal(current.homeSessions, 0);
+    assert.equal(current.residentRoots, 0);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
+  });
+  const ordinary = open('/ordinary'), managed = open('/managed');
+  const welcome = next(managed, 'message');
+  try {
+    await Promise.all([next(ordinary, 'open'), next(managed, 'open')]);
+    assert.equal((await welcome)[0].toString(), 'welcome', 'writes queued before 101 move to the upgraded transport');
+    const before = json(await call('/status'), 200, 'read before retirement');
+    const onlyOrdinarySession = () => eventually('only the ordinary transport still holds an event ticket', async () => {
+      const state = await activity();
+      assert.equal(state.homeSessions, 1);
+      assert.equal(state.running, 1);
+    });
+    await onlyOrdinarySession();
+    await advance(65000);
+    assert.equal(ordinary.readyState, Socket.OPEN);
+    await writeFile(control('hold-socket-park'), '');
+    await advance(150000);
+    assert.equal(ordinary.readyState, Socket.OPEN, 'the ordinary socket remains open until the managed socket is parked');
+    assert.deepEqual(JSON.parse(await send(ordinary, 'mutate')), Array(4).fill('InvalidStateError'),
+      'an ordinary handler cannot change the managed transport after the snapshot');
+    let settled = false;
+    const racingRequest = call('/status', { timeout: 7000 })
+      .then(response => { settled = true; return response; });
+    void racingRequest.catch(() => {});
+    await delay(400);
+    assert.equal(settled, false, 'new requests wait at the retiring tree fence');
+    const raced = await racingRequest;
+    if (raced.status === 200) assert.equal(JSON.parse(raced.text), before);
+    else assert.equal(raced.status, 503, raced.text);
+    await eventually('a timed out park resumes admission to the same tree', async () => {
+      assert.equal(json(await call('/status'), 200, 'park refused'), before);
+    });
+    await onlyOrdinarySession();
+    await unlink(control('hold-socket-park'));
+    await writeFile(control('hold-socket-park-reply'), '');
+    const ordinaryClosed = next(ordinary, 'close', 13000);
+    await advance(305000);
+    await eventually('the node parks the socket while the original reply is held', async () => {
+      assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
+    });
+    await ordinaryClosed.catch(async error => {
+      const state = await cluster.state(owner.nodeId);
+      throw new Error(`Ordinary socket stayed open. ${JSON.stringify({ activity: await activity(), websockets: state.webSockets })}`,
+        { cause: error });
+    });
+    await unlink(control('hold-socket-park-reply'));
+    await retired();
+    assert.equal(await send(managed, 'tick'), 'tock');
+    assert.equal((await activity()).homeSessions, 0);
+
+    await writeFile(control('hold-socket-adopt'), '');
+    const stalled = await call('/status', { timeout: 7500 }).catch(() => null);
+    assert.ok(stalled == null || stalled.status === 503, 'no request starts before adoption succeeds');
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
+    await unlink(control('hold-socket-adopt'));
+    await writeFile(control('hold-socket-adopt-reply'), '');
+    const cancelled = call('/status', { timeout: 2200 }).catch(() => null);
+    await eventually('the node adopts while the reply is held', async () => {
+      assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 0);
+    });
+    assert.equal(await cancelled, null, 'the first caller disconnects while waiting for adoption');
+    await delay(5400);
+    await advance(322000);
+    await retired();
+    await unlink(control('hold-socket-adopt-reply'));
+    const restored = await eventually('a new open restores the parked socket after adoption lost its reply', async () => {
+      const instance = json(await call('/status'), 200, 'adopt after timeout');
+      // The interrupted ingress may finish its submitted event when adoption
+      // resolves. Either way a single subsequent open restores the socket.
+      assert.ok(instance === before + 1 || instance === before + 2, String(instance));
+      return instance;
+    });
+    assert.equal(await send(managed, 'resumed'), restored + ':preserved');
+
+    const oldHome = open('/ordinary');
+    try {
+      await next(oldHome, 'open');
+      await onlyOrdinarySession();
+      await writeFile(control('hold-socket-park-reply'), '');
+      await advance(482000);
+      await eventually('the node has parked the managed socket before the old home resets', async () => {
+        assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
+      });
+      const oldHomeClosed = next(oldHome, 'close', 3500);
+      oldHome.send('reset');
+      await oldHomeClosed;
+      await retired();
+      await unlink(control('hold-socket-park-reply'));
+      assert.equal(await send(managed, 'tick'), 'tock', 'a reset of the old home leaves the parked socket live');
+      assert.equal(await send(managed, 'after old home reset'), (restored + 1) + ':preserved');
+    } finally {
+      oldHome.terminate();
+    }
+
+    assert.equal(json(await call('/hold'), 200, 'start pending work'), restored + 1);
+    await eventually('the pending-work request releases its session', async () => {
+      assert.equal((await activity()).homeSessions, 0);
+    });
+    await advance(482000 + 14 * 60 * 1000);
+    assert.equal((await activity()).residentRoots, 1, 'pending work protects the tree before 15 minutes');
+    const afterPendingExpiry = 482000 + 15 * 60 * 1000 + 1000;
+    await advance(afterPendingExpiry);
+    await retired();
+    assert.equal(await send(managed, 'after the deadline'), (restored + 2) + ':preserved',
+      'expiry parks the attachment before aborting pending work');
+    const resetClosed = next(managed, 'close');
+    await call('/reset', { timeout: 7000 }).catch(() => null);
+    const [code, reason] = await resetClosed;
+    assert.equal(code, 1011);
+    assert.equal(reason.toString(), 'Durable Object reset');
+    await eventually('the forced reset releases its home before the next upgrade', async () => {
+      const current = await activity();
+      assert.equal(current.homeSessions, 0);
+      assert.equal(current.residentRoots, 0);
+    });
+    await eventually('a fresh request opens on the surviving generation', async () => {
+      json(await call('/status'), 200, 'read after reset');
+    });
+
+    const slow = open('/managed');
+    const greeting = next(slow, 'message');
+    void greeting.catch(() => {});
+    const nodeLogs = () => cluster.compose(['logs', '--no-color', '--tail', '100', owner.nodeId]);
+    const waitForHeldWrite = count => eventually('the managed write reaches the node test gate', async () => {
+      assert.equal((await nodeLogs()).match(/\[websocket-test\] managed write held/g)?.length ?? 0, count);
+    });
+    try {
+      await next(slow, 'open');
+      assert.equal((await greeting)[0].toString(), 'welcome');
+      await writeFile(control('hold-socket-write'), '');
+      const delivered = next(slow, 'message', 10000);
+      json(await call('/write'), 200, 'start a slow write');
+      await waitForHeldWrite(1);
+      await delay(5300);
+      assert.equal(slow.readyState, Socket.OPEN, 'a write may take more than five seconds outside parking');
+      await unlink(control('hold-socket-write'));
+      assert.equal((await delivered)[0].toString(), 'write-finished');
+      await writeFile(control('hold-socket-write'), '');
+      json(await call('/write'), 200, 'start a write that will block parking');
+      await waitForHeldWrite(2);
+      const stalledClosed = next(slow, 'close', 12000);
+      await advance(afterPendingExpiry + 15 * 60 * 1000 + 3000);
+      await stalledClosed;
+      const logs = await nodeLogs();
+      assert.ok(logs.includes('"cause":"park-write-timeout"'), 'the node closed the write that prevented parking');
+      await unlink(control('hold-socket-write'));
+    } finally {
+      slow.terminate();
+    }
+    assert.equal((await durableGeneration(cluster, owner.nodeId)).generation, generation);
+  } finally {
+    ordinary.terminate();
+    managed.terminate();
+  }
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
@@ -997,5 +1522,14 @@ export const durableGatedCases = {
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
     confirmTimeoutMs: 25000,
   },
-  'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
+  'durable-threaded-migration': {
+    test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'], versionDrainTimeoutMs: 10000,
+  },
+  'durable-threaded-hibernation': {
+    test: threadedSocketHibernation, nodes: ['node-1', 'node-2', 'node-3'],
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'durable-threaded-retirement': {
+    test: threadedSocketRetirement, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,
+  },
 };

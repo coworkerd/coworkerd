@@ -43,7 +43,10 @@ export async function eventually(description, probe, { timeout = 30000, interval
 }
 
 export class Cluster {
-  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs } = {}) {
+  constructor(directory, kernel, signal, {
+    holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
+    controlDurableLifecycle = false,
+  } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
@@ -60,9 +63,11 @@ export class Cluster {
     this.image = `coworkerd:${this.project}`;
     this.override = join(directory, 'compose.json');
     this.peerAckGate = holdPeerAcks ? join(directory, 'peer-acks') : null;
+    this.durableLifecycleGate = controlDurableLifecycle ? join(directory, 'durable-lifecycle') : null;
     this.threadedNodes = new Set(threadedNodes);
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
+    this.versionDrainTimeoutMs = versionDrainTimeoutMs;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -97,6 +102,7 @@ export class Cluster {
     for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh', 'runtime/runtime.js']) files[file] = join(root, file);
     await Promise.all(Object.entries(files).map(([file, source]) => copyFile(source, join(context, file))));
     if (this.peerAckGate) await mkdir(this.peerAckGate, { mode: 0o755 });
+    if (this.durableLifecycleGate) await mkdir(this.durableLifecycleGate, { mode: 0o755 });
     const overrides = {};
     for (const node of nodes) {
       const peer = `${node}-peer:8934`;
@@ -114,7 +120,10 @@ export class Cluster {
         ingressPlacement: false, processPool: { count: 1 },
         membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
-          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs },
+          durableObjects: {
+            threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
+            versionDrainTimeoutMs: this.versionDrainTimeoutMs,
+          },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
         } : {}),
       }));
@@ -125,6 +134,11 @@ export class Cluster {
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
+      if (this.durableLifecycleGate && this.threadedNodes.has(node)) {
+        const gate = '/tmp/cluster-test-durable-lifecycle';
+        overrides[node].environment.COWORKERD_DO_TEST_LIFECYCLE_DIR = gate;
+        overrides[node].volumes.push({ type: 'bind', source: this.durableLifecycleGate, target: gate, read_only: true });
+      }
       if (this.peerAckGate) {
         const gate = '/tmp/cluster-test-peer-acks';
         overrides[node].environment.COWORKERD_HOLD_PEER_ACK_FOR_TEST = `${gate}/hold`;

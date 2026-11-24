@@ -1,5 +1,6 @@
 #include "durable-log.h"
 #include "durable-shards.h"
+#include "parked-websocket.h"
 
 #include "support.h"
 #include "json.h"
@@ -18,6 +19,49 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
+  static void parkedWebSocket() {
+    using Socket = ParkedWebSocket;
+    using Action = Socket::Frame::Action;
+    const Socket::Owner owner{4, 8}, staleOwner{4, 7};
+    const Socket::Home first{"upgrade", 11}, next{"wake", 12};
+    Socket socket(owner, first);
+    KJ_REQUIRE(socket.configure(owner, first, std::pair{std::string("ping"), std::string("pong")}));
+    const auto current = socket.receive(owner, "message");
+    KJ_REQUIRE(current.action == Action::FORWARD && current.position == 1);
+    KJ_REQUIRE(!socket.canPark(owner, first, current.position));
+    KJ_REQUIRE(socket.complete(owner, current.position));
+    KJ_REQUIRE(!socket.canPark(staleOwner, first, current.position));
+    KJ_REQUIRE(!socket.canPark(owner, first, current.position - 1));
+
+    const Socket::Snapshot saved{.tags = {"room", "member"}, .attachment = std::string("saved")};
+    KJ_REQUIRE(socket.park(owner, first, current.position, saved));
+    KJ_REQUIRE(!socket.authorized(owner, first));
+    const auto automatic = socket.receive(owner, "ping");
+    KJ_REQUIRE(automatic.action == Action::ANSWER && automatic.answer == "pong");
+    KJ_REQUIRE(!socket.complete(owner, automatic.position));
+    KJ_REQUIRE(socket.answered(owner, automatic.position, 1000));
+
+    const auto wake = socket.receive(owner, "ping ");
+    KJ_REQUIRE(wake.action == Action::WAKE && wake.position == automatic.position + 1);
+    KJ_REQUIRE(socket.receive(owner, std::nullopt).action == Action::BACKPRESSURE);
+    const auto* restored = socket.parked(owner);
+    KJ_REQUIRE(restored && restored->tags == saved.tags && restored->attachment == saved.attachment);
+    KJ_REQUIRE(restored->autoResponseTime == 1000);
+    KJ_REQUIRE(!socket.complete(staleOwner, wake.position));
+    socket.adopt(staleOwner, next);
+    KJ_REQUIRE(!socket.authorized(owner, next));
+    socket.adopt(owner, next);
+    KJ_REQUIRE(socket.authorized(owner, next));
+    KJ_REQUIRE(socket.adoptable(owner, next) == restored);
+    KJ_REQUIRE(!socket.adoptable(owner, first));
+    KJ_REQUIRE(socket.complete(owner, wake.position));
+    KJ_REQUIRE(!socket.park(owner, first, wake.position, saved));
+    KJ_REQUIRE(socket.park(owner, next, wake.position, saved));
+    socket.fence(owner);
+    KJ_REQUIRE(socket.receive(owner, "ping").action == Action::REFUSE);
+    KJ_REQUIRE(!socket.parked(owner));
+  }
+
   static void threadedAlarms() {
     auto io = kj::setupAsyncIo();
     MembershipView membership;
@@ -1373,6 +1417,63 @@ struct DurableLogChannelTest {
     const auto stored = object.storageId;
     KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "new-definition").ready &&
         object.threadedDefinition == "new-definition" && object.storageId == stored);
+    clock.advanceTo(clock.now() + kj::MILLISECONDS);
+    log.objectDispatched(identity, "d0", 7);
+    open(24);
+    expectReply(7, 24, 0);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").code == "DO_VERSION_DRAINING");
+    expectReply(6, 24);
+    const auto forcedAt = clock.now() + 30 * kj::SECONDS;
+    clock.advanceTo(forcedAt - kj::MILLISECONDS);
+    {
+      kj::byte unexpected;
+      KJ_REQUIRE(!child->tryRead(&unexpected, 1, 1).poll(io.waitScope),
+          "a completed drain must not close the replacement, and its own drain must wait for the deadline");
+    }
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").code == "DO_VERSION_DRAINING");
+    clock.advanceTo(forcedAt);
+    expectReply(8, 24);
+    KJ_REQUIRE(!log.checkObjectDispatch(identity, "d0", 7, "third-definition").generationMustClose,
+        "an unacknowledged close can still finish within the confirmation interval");
+    clock.advanceTo(forcedAt + 5 * kj::SECONDS);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").generationMustClose,
+        "lack of a close acknowledgement enables the generation fallback");
+    close(24, 16384);
+    const auto acknowledged = log.checkObjectDispatch(identity, "d0", 7, "third-definition");
+    KJ_REQUIRE(acknowledged.code == "DO_VERSION_DRAINING" && !acknowledged.generationMustClose,
+        "an acknowledged close does not replace the process while the last call unwinds");
+    log.objectRequestFinished(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").ready);
+    log.objectDispatched(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "fourth-definition").code == "DO_VERSION_DRAINING");
+    clock.advanceTo(clock.now() + 30 * kj::SECONDS);
+    {
+      kj::byte unexpected;
+      KJ_REQUIRE(!child->tryRead(&unexpected, 1, 1).poll(io.waitScope),
+          "the deadline has no open ID to address until the root registers");
+    }
+    open(28);
+    expectReply(7, 28, 1);
+    expectReply(8, 28);
+    unsigned resetReports = 0;
+    log.setActorResetHook([&](const DurableLog::ObjectIdentity& reset, std::string_view code) {
+      KJ_REQUIRE(reset.namespaceId == ns && reset.objectId == id && reset.dataEpoch == 1);
+      KJ_REQUIRE(code == "CPU_LIMIT_EXCEEDED");
+      ++resetReports;
+    });
+    const auto reportReset = [&](uint64_t openId) {
+      std::string body(1, char(11));
+      integer(body, openId, 8);
+      text(body, name);
+      text(body, "CPU_LIMIT_EXCEEDED");
+      log.onMessage(channel, body);
+    };
+    reportReset(24);
+    reportReset(28);
+    KJ_REQUIRE(resetReports == 1, "only the latest open can report an actor reset");
+    close(28, 16384);
+    log.objectRequestFinished(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "fourth-definition").ready);
     log.objectDispatched(identity, "d0", 7);
     bool namespaceActive = true;
     log.setNamespaceHook([&](const std::string&) { return namespaceActive; });
@@ -1920,6 +2021,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
   else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
+  else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "restored-tail" || mode == "restored-tail-negative")

@@ -45,7 +45,7 @@ A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that 
 
 An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
 
-After a declared secret or binding changes, the object reopens on its next request, as it does after a version change; that object's in-flight requests and connections end at that point. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
+After a declared secret or binding changes, the object's next request selects the updated definition. On the experimental threaded host, this uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
 ## 2. Declare the namespace
 
@@ -62,7 +62,9 @@ Add to the Worker project's Wrangler configuration:
 
 `cowctl deploy` builds the project and the migrations declare the class. Each class gets a random namespace id recorded in the tenant manifest. `new_classes` also declares a SQLite class; `renamed_classes` preserves its namespace id, `deleted_classes` marks it deleting, and migration tags are applied in order. A binding may name only a class of this Worker (`script_name`, if given, must name itself); `transferred_classes` is refused. An active object request uses the Worker's currently active version, so redeployment changes the class code on the same namespace and data. Keep schema changes compatible with that data.
 
-On the experimental threaded host, a running request keeps its code version. When a request selects a new definition, the previous tree drains and its facets close before the new home can open the same storage. Calls during that drain may receive `503 DO_VERSION_DRAINING`. A class rename preserves object IDs and the existing databases. After the node applies a class deletion, it refuses old-generation opens for that namespace.
+On the experimental threaded host, a running request keeps its code version during the drain. The first new-definition request refused with `503 DO_VERSION_DRAINING` starts the `durableObjects.versionDrainTimeoutMs` clock, which defaults to 30 seconds. At the deadline, the home resets the old tree and ends any sessions still holding it, including retained RPC capabilities. The new definition opens on the same confirmed storage. The node can replace the whole durable process if the home fails to acknowledge the close within `durableObjects.confirmTimeoutMs` after the deadline.
+
+A call still waiting for response headers can receive `503 DO_CODE_UPDATED` with an uncertain result. Its writes may already have committed, and the platform never replays that call. A response body already streaming ends early. A class rename preserves object IDs and the existing databases. After the node applies a class deletion, it refuses old-generation opens for that namespace.
 
 ```bash
 cowctl do list
@@ -104,7 +106,13 @@ webSocketError(ws, error) { console.error(String(error)); }
 
 Use `ctx.getWebSockets(tag?)`, `ctx.getTags(ws)` and `ctx.setWebSocketAutoResponse()` to manage accepted connections. An idle object's eviction leaves hibernatable connections open; the next delivered message constructs the object again with those connections and the same storage. Reconstruct in-memory state from storage in the constructor. Calling `ws.accept()` instead uses the ordinary WebSocket API and does not opt into this hibernation path.
 
-A process or node exit closes its connections: hibernation does not preserve a relay on a failed node. Draining and rotation close with `1001`, so clients reconnect. Incoming messages are at most 32 MiB; the ingress default is 1000 open connections per tenant per node (`429 WEBSOCKET_LIMIT` beyond it). There is no idle timeout or compression. A connection counts once in request usage; CPU is added as its messages execute.
+The upstream host keeps connections in its durable process. Process rotation, node drain and node exit end those connections. Incoming messages are at most 32 MiB and the ingress default is 1000 open connections per tenant per node (`429 WEBSOCKET_LIMIT` beyond it). Compression is disabled. CPU is charged as message handlers execute.
+
+On the experimental threaded host, an eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
+
+When a threaded tree retires, the node parks upgraded hibernatable WebSockets, including tags and serialized attachments. The home transfers them before canceling expired work or closing ordinary sockets. While parking is in progress, changes to hibernatable sockets such as `send()`, `close()`, `serializeAttachment()` and `ctx.setWebSocketAutoResponse()` throw `InvalidStateError`. The node answers WebSocket pings and matching auto-responses while the object sleeps. An application message or a close requiring a handler opens the object on its current shard owner. The node restores parked sockets before the constructor runs. Parking and adoption calls each have a five-second response bound. After a lost reply the home gives the node another five seconds to confirm the transfer. A pending write can defer parking for five seconds from the first refusal it causes. If the write still blocks parking, the node closes that connection.
+
+On a threaded Durable Object, return the peer of a `ctx.acceptWebSocket()` socket in an HTTP 101 response. Calling `accept()` on that peer in-process throws `NotSupportedError`. Facet sockets stay with the tree and end when it retires. Parked connections belong to their node and shard epoch. A forced actor reset closes its attached managed sockets with `1011` and the reset reason. Node drain, definition changes and loss of shard ownership close affected connections with `1001` when the transport is still reachable. The client must reconnect after a node exit.
 
 ## 5. Alarms
 
