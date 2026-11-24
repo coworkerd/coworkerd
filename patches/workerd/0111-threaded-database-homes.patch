@@ -17,10 +17,10 @@ index 339f03ed092c134624fd395bd30351a53d30e21d..08973e45481f68dcf3a104c9a7b4d430
      "//src/workerd/server/factory:coworkerd-steady",
      "//src/workerd/server/factory:coworkerd-threaded-wal",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c75797103 100644
+index 8ecd35b80c662a03e9aa2851ec9f6a5103a3910a..50d6e8d8eadc957e4a59424c65a075f8d0decb54 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -26,6 +26,7 @@
+@@ -27,6 +27,7 @@
  #include <workerd/server/factory/coworkerd-durable-cpu.h>
  #include <workerd/server/factory/coworkerd-durable-placement.h>
  #include <workerd/server/factory/coworkerd-durable-test-storage.h>
@@ -28,7 +28,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
  #include <workerd/server/factory/coworkerd-threaded-wal.h>
  #include <workerd/server/factory/coworkerd-sandbox.h>
  #include <workerd/server/factory/coworkerd-steady.h>
-@@ -1688,6 +1689,16 @@ struct ThreadState {
+@@ -1732,6 +1733,16 @@ struct ThreadState {
    };
    std::map<Worker::Actor *, uint64_t> durableActorTrees;
    std::map<uint64_t, DurableRoot> durableRoots;
@@ -45,7 +45,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
  };
  
  Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
-@@ -1731,6 +1742,7 @@ struct DurableRoute {
+@@ -1775,6 +1786,7 @@ struct DurableRoute {
    server::DurableAdmission::Open open;
    std::string invocation;
    std::string uniqueKey, storageId;
@@ -53,7 +53,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
  
    bool operator==(const DurableRoute &) const = default;
  };
-@@ -1780,7 +1792,8 @@ DurableRoute readDurableRoute(Json::Reader value) {
+@@ -1824,7 +1836,8 @@ DurableRoute readDurableRoute(Json::Reader value) {
      {durableNumber(value, "generation"), durableNumber(value, "dataEpoch"),
        durableNumber(value, "shardEpoch"), durableNumber(value, "openId"),
        checkedText("definition", 256), checkedText("className", 255)},
@@ -63,7 +63,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
  }
  
  kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
-@@ -2149,12 +2162,14 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2194,12 +2207,14 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
        ThreadState &state,
        DurableRoute route,
        server::DurableAdmission::Ticket ticket,
@@ -78,7 +78,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          accepted(kj::mv(accepted)),
          scope(std::move(scope)) {}
  
-@@ -2166,6 +2181,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2211,6 +2226,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
    ThreadState &state;
    DurableRoute route;
    server::DurableAdmission::Ticket ticket;
@@ -86,7 +86,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
    kj::Own<kj::PromiseFulfiller<void>> accepted;
    std::shared_ptr<DurableSessionScope> scope;
    bool used = false;
-@@ -2231,6 +2247,7 @@ struct ThreadedServer {
+@@ -2276,6 +2292,7 @@ struct ThreadedServer {
    std::mutex durableRoutingMutex;
    using DurableWake = kj::Own<kj::CrossThreadPromiseFulfiller<void>>;
    std::map<uint64_t, std::map<uint64_t, DurableWake>> durableWaiters;
@@ -94,7 +94,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
    std::atomic<uint64_t> durableHomeSessions{0};
    std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
    std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
-@@ -2270,6 +2287,7 @@ struct ThreadedServer {
+@@ -2315,6 +2332,7 @@ struct ThreadedServer {
        std::string definition;
        std::string warmDefinition;
        uint32_t reservedTrees = 0;
@@ -102,7 +102,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
        uint64_t memory = 0;
        server::DurableHomeLoad load{std::chrono::seconds(4)};
        server::DurablePressure pressure;
-@@ -2604,7 +2622,7 @@ struct ThreadedServer {
+@@ -2649,7 +2667,7 @@ struct ThreadedServer {
                  (home.definition.empty() && !threads[spare - 1]->home->definition.empty()))) {
            spare = i + 1;
          }
@@ -111,7 +111,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          candidates.push_back({i + 1, home.definition, home.reservedTrees, home.memory,
            home.load.busyFor(now), home.pressure.accepting()});
        }
-@@ -2612,11 +2630,15 @@ struct ThreadedServer {
+@@ -2657,11 +2675,15 @@ struct ThreadedServer {
        if (!choice && spare == 0) return false;
        assigned = choice.value_or(spare);
        auto &home = *threads[*assigned - 1]->home;
@@ -129,8 +129,8 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
    }
  
    server::DurableAdmission::Result queueDurable(
-@@ -2660,6 +2682,10 @@ struct ThreadedServer {
-   void finishDurable(server::DurableAdmission::Ticket ticket) {
+@@ -2714,6 +2736,10 @@ struct ThreadedServer {
+   bool finishDurable(server::DurableAdmission::Ticket ticket) {
      std::lock_guard lock(durableRoutingMutex);
      durableAdmission->cancel(ticket);
 +    auto session = nativeSqlSessions.find(ticket.tree);
@@ -140,19 +140,19 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
      wakeDurableTree(ticket.tree);
      auto assigned = durableAdmission->homeFor(ticket.tree);
      if (!assigned) {
-@@ -2671,7 +2697,10 @@ struct ThreadedServer {
-     if (home.resident.contains(ticket.tree)) return;
-     if (!durableAdmission->stopIdleTree(ticket.tree, *assigned)) return;
+@@ -2725,7 +2751,10 @@ struct ThreadedServer {
+     if (home.resident.contains(ticket.tree) || !durableAdmission->stopIdleTree(ticket.tree, *assigned))
+       return finished;
      KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
 -    if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
 +    if (--home.reservedTrees == 0) {
 +      home.definition = home.warmDefinition;
 +      home.database = false;
 +    }
+     return finished;
    }
  
-   // durableRoutingMutex is held while checking the FIFO and installing or
-@@ -2697,7 +2726,9 @@ struct ThreadedServer {
+@@ -2752,7 +2781,9 @@ struct ThreadedServer {
            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
                KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
          }
@@ -163,7 +163,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
            const auto delivery = durableAdmission->begin(
                ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
            if (delivery == Admission::Delivery::EXPIRED) {
-@@ -2705,6 +2736,7 @@ struct ThreadedServer {
+@@ -2760,6 +2791,7 @@ struct ThreadedServer {
                  KJ_EXCEPTION(OVERLOADED, "durable routing lease expired"), "LEASE_EXPIRED"));
            }
            KJ_REQUIRE(delivery == Admission::Delivery::ACCEPTED, "durable event identity changed");
@@ -171,19 +171,18 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
            wakeDurableTree(ticket.tree);
            co_return;
          }
-@@ -2728,7 +2760,11 @@ struct ThreadedServer {
-       if (root != state.durableRoots.end() && !root->second.resetting) {
-         root->second.lastUse = server::DurableAdmission::Clock::now();
+@@ -2786,6 +2818,10 @@ struct ThreadedServer {
+           root->second.idle->eventFinished(durableIdleNow());
+         }
        }
 +      if (state.nativeDatabase && state.nativeDatabase->tree == call.ticket.tree) {
 +        state.nativeDatabase->lastUse = server::DurableAdmission::Clock::now();
 +      }
-       finishDurable(call.ticket);
 +      retireNativeDatabase(state);
      });
      // Runs before the release above: an event this session was still preparing ends here,
      // and with it the waiter it has on a cold load.
-@@ -2742,10 +2778,11 @@ struct ThreadedServer {
+@@ -2803,10 +2839,11 @@ struct ThreadedServer {
      if (remaining.count() <= 0) co_return;
      durableHomeSessions.fetch_add(1);
      KJ_DEFER(durableHomeSessions.fetch_sub(1));
@@ -195,9 +194,9 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
 +        *this, state, std::move(call.route), call.ticket, connectionFd, kj::mv(accepted.fulfiller), scope));
      auto disconnected = session.accept(*stream).fork();
      try {
-       co_await state.io.provider->getTimer()
-@@ -2768,6 +2805,37 @@ struct ThreadedServer {
-     wakeDurableTree(tree);
+       auto serving =
+@@ -2852,6 +2889,37 @@ struct ThreadedServer {
+     }));
    }
  
 +  void closeNativeDatabase(ThreadState& state) {
@@ -233,8 +232,8 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
 +
    void retireIdleDurableRoots(ThreadState &state) {
      if (!state.durableSlot) return;
-     const auto now = server::DurableAdmission::Clock::now();
-@@ -2875,12 +2943,13 @@ struct ThreadedServer {
+     const auto now = durableIdleNow();
+@@ -3028,12 +3096,13 @@ struct ThreadedServer {
    void reportDurable(bool publish, std::string *appendTo = nullptr) {
      std::lock_guard lock(durableRoutingMutex);
      const auto state = durableAdmission->state();
@@ -249,7 +248,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          placementClosedHomes += !home.pressure.accepting();
          resettingHomes += home.pressure.resetting();
          maxHomeMemory = kj::max(maxHomeMemory, home.memory);
-@@ -2889,6 +2958,7 @@ struct ThreadedServer {
+@@ -3042,6 +3111,7 @@ struct ThreadedServer {
      }
      auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
          ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
@@ -257,12 +256,10 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
          ",\"resettingHomes\":" + std::to_string(resettingHomes) +
          ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
-@@ -3062,7 +3132,12 @@ struct ThreadedServer {
-     state.rejectOnly = thread.control;
-     state.durableHome = thread.homeId;
+@@ -3217,6 +3287,11 @@ struct ThreadedServer {
      if (thread.home && durableLog) {
--      state.wal = durableLog->attachHome([&state](uint64_t openId) {
-+      state.wal = durableLog->attachHome([this, &state](uint64_t openId) {
+       state.wal = durableLog->attachHome(
+           [this, &state](uint64_t openId, server::ThreadedWalLog::CloseReason why) {
 +        if (state.nativeDatabase && state.nativeDatabase->shipper &&
 +            state.nativeDatabase->shipper->getOpenId() == openId) {
 +          closeNativeDatabase(state);
@@ -271,7 +268,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          for (auto& [id, root]: state.durableRoots) {
            if (!root.rootOpenId || root.rootOpenId() != openId) continue;
            root.closeRequested = true;
-@@ -3090,6 +3165,7 @@ struct ThreadedServer {
+@@ -3253,6 +3328,7 @@ struct ThreadedServer {
          for (auto &call: incoming) {
            state.tasks.add(startDurableSession(state, std::move(call)));
          }
@@ -279,7 +276,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
          retireIdleDurableRoots(state);
        }
      }
-@@ -5245,6 +5321,203 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+@@ -5970,6 +6046,203 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
    co_return co_await preparation->ready.addBranch();
  }
  
@@ -483,7 +480,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
  kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      kj::String descriptor, Frankenvalue props) {
    KJ_REQUIRE(!used, "one event per durable connection");
-@@ -5259,11 +5532,26 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -5984,11 +6257,26 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
            str(selection, "namespaceId") == route.key.namespaceId &&
            str(selection, "objectId") == route.key.objectId &&
            durableNumber(selection, "dataEpoch") == route.open.dataEpoch &&
@@ -511,7 +508,7 @@ index 154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90..5c7ed243ae25b65b224ce1b0f8cd091c
    auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
        "durable class missing from pinned Worker");
-@@ -5784,6 +6072,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -6616,6 +6904,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                (server.durableLog
                        ? "\r\nX-Coworkerd-Threaded-Role: durable\r\nX-Coworkerd-WAL-Protocol: 1"
                        : server.durableStorage ? "\r\nX-Coworkerd-Threaded-Role: durable-test" : "") +

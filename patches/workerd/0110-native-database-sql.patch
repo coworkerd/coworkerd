@@ -5,7 +5,7 @@ Subject: [PATCH] Execute D1 statements in native SQLite
 
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index 7ffc9eb8f52a9e4866c067f43de1f5768b93616d..6173248ffb11fe17856f426217836e37bd7b22cc 100644
+index 2fc38aa5bf88950ac79e3219e81080855100461c..54610c94e992b7023da6de6f624b2fea7539c50b 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
 @@ -59,6 +59,27 @@ kj_test(

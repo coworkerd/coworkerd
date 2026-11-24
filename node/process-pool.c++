@@ -284,6 +284,7 @@ public:
   bool threadedDurable = false;
   uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
+  kj::Timer* timer = nullptr;
   static constexpr size_t IDLE_CONNECTIONS = 32;
   std::vector<kj::Own<kj::AsyncIoStream>> idle;
   bool filling = false;
@@ -352,9 +353,6 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     tasks->add(kj::mv(next.promise).then([owned = std::unique_ptr<RuntimeConnection>(raw)] {}));
     next.fulfiller->fulfill();
   });
-  if (idle.empty()) connection->stream = co_await address->connect();
-  else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
-  replenish();
   try {
     if (sqlCall) {
       if (sqlCall->sqlClientGone) {
@@ -369,6 +367,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       };
     }
     // No Cap'n Proto bytes may precede this raw routing prefix.
+    auto prefix = kj::str("T");
     if (threadedDurable) {
       capnp::MallocMessageBuilder builder;
       capnp::JsonCodec codec;
@@ -376,14 +375,17 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       codec.decodeRaw(descriptor.asArray(), root);
       const auto route = json::field(root.asReader(), "durableTestRoute");
       KJ_REQUIRE(route.isObject(), "missing durable test routing identity");
-      auto preface = kj::str("D", codec.encodeRaw(route), "\n");
-      KJ_REQUIRE(preface.size() <= 4096, "durable routing preface is too large");
-      co_await connection->stream->write(preface.asBytes());
-    } else {
-      co_await connection->stream->write(kj::StringPtr("T").asBytes());
+      prefix = kj::str("D", codec.encodeRaw(route), "\n");
+      KJ_REQUIRE(prefix.size() <= 4096, "durable routing preface is too large");
     }
     KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
-    {
+    auto retryDelay = 5 * kj::MILLISECONDS;
+    const auto waitUntil = timer->now() + 5 * kj::SECONDS;
+    for (;;) {
+      if (idle.empty()) connection->stream = co_await address->connect();
+      else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
+      replenish();
+      co_await connection->stream->write(prefix.asBytes());
       char decision;
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
@@ -400,7 +402,19 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         kj::throwRecoverableException(tagRpcError(
             KJ_EXCEPTION(OVERLOADED, "durable routing identity is stale"), "DO_UNAVAILABLE"));
       }
+      if (threadedDurable && decision == 'I') {
+        // The previous idle tree is closing before execution begins. Retry
+        // the preface so this invocation can enter after the close settles.
+        connection->stream = nullptr;
+        if (timer->now() + retryDelay >= waitUntil)
+          kj::throwRecoverableException(tagRpcError(
+              KJ_EXCEPTION(OVERLOADED, "durable idle retirement did not settle"), "DO_UNAVAILABLE"));
+        co_await timer->afterDelay(retryDelay);
+        retryDelay = kj::min(retryDelay * 2, 50 * kj::MILLISECONDS);
+        continue;
+      }
       KJ_REQUIRE(decision == 'A', "invalid native admission response");
+      break;
     }
     onDispatched();
     if (!threadedDurable) ready->fulfill();
@@ -2528,7 +2542,7 @@ public:
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
                "COWORKERD_DO_TEST_FD_HEADROOM", "COWORKERD_DO_TEST_COMMIT_DELAY_MS",
-               "COWORKERD_DO_TEST_REFUSE_GROUP"}) {
+               "COWORKERD_DO_TEST_REFUSE_GROUP", "COWORKERD_DO_TEST_LIFECYCLE_DIR"}) {
         if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
       }
     }
@@ -2764,6 +2778,7 @@ public:
 #endif
         }
         auto r = std::make_shared<RuntimeConnection>();
+        r->timer = &provider.getTimer();
         r->address = co_await provider.getNetwork().parseAddress(text.c_str());
         r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
         if (p->threaded) {

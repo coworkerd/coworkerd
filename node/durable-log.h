@@ -399,6 +399,9 @@ public:
     uint64_t dataEpoch = 0, shardEpoch = 0;
     uint32_t shard = 0;
   };
+  void setActorResetHook(std::function<void(const ObjectIdentity&, std::string_view)> hook) {
+    actorResetHook = std::move(hook);
+  }
   struct ObjectReady {
     bool ready = true;
     uint status = 503;
@@ -419,6 +422,18 @@ public:
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
       uint64_t generation, std::string_view definition = {});
+  struct SocketTransition {
+    uint64_t attempt = 0;
+    bool accepted = false;
+  };
+  struct SocketOpenAuthority {
+    std::string process;
+    SocketTransition& park;
+    SocketTransition& adopt;
+  };
+  // The authority belongs to the WAL registration. Use it without yielding to the event loop.
+  std::optional<SocketOpenAuthority> authorizeSocketOpen(const ObjectIdentity&, uint64_t generation,
+      uint64_t openId);
   std::vector<std::string> drainThreadedNamespaces(const std::vector<std::string>& namespaces);
   // Called synchronously after dispatch, before another request can prepare these files again.
   void objectDispatched(const ObjectIdentity& identity, const std::string& processId, uint64_t generation);
@@ -533,7 +548,7 @@ private:
     // Memory only: the last process generation given these files, including before FROM_OPEN arrives.
     std::string dispatchedChannel;
     std::string threadedDefinition;
-    double definitionDrainStartedMs = 0;
+    kj::Maybe<kj::TimePoint> definitionDrainDeadline;
     struct Holders { uint64_t requests = 0, connections = 0; };
     std::map<std::string, Holders> holders;
     bool dispatchPending = false;
@@ -597,6 +612,8 @@ private:
     struct Open {
       std::pair<uint64_t, uint64_t> position;
       uint64_t id = 0;
+      bool codeUpdateAsked = false;
+      SocketTransition socketPark, socketAdopt;
     };
     std::string processId;
     kj::Own<kj::AsyncIoStream> stream;
@@ -721,6 +738,8 @@ private:
   void sendToOpenChannels(uint8_t type, const std::string& key, const std::string& payload);
   kj::Promise<bool> closeThreadedObject(const std::string& objectName);
   void askClose(Channel& channel, uint64_t openId);
+  void askCodeUpdateClose(Channel& channel, Channel::Open& root, const Object& object);
+  kj::Promise<void> endDefinitionDrain(std::string objectName, std::string channelId, kj::TimePoint deadline);
   void answer(Channel& channel, uint64_t request, uint8_t status);
   void tellSealed(const std::string& key, uint32_t salt1, uint32_t salt2, uint32_t upToFrame);
   void tellBreak(const std::string& key, const std::string& reason);
@@ -1022,6 +1041,7 @@ private:
   // process. Keep the boundary even when no object of an epoch is resident.
   std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
   std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
+  std::function<void(const ObjectIdentity&, std::string_view)> actorResetHook;
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
   std::set<std::string> activeThreadedAlarms;     // held even if the running handler deletes its schedule
