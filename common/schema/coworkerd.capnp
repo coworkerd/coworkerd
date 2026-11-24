@@ -102,6 +102,19 @@ struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
   autoResponseEnabled @7 :Bool;
   autoRequest @8 :Text;
   autoResponse @9 :Text;
+  facetId @10 :UInt32;
+}
+
+struct ThreadedSocketFacet @0xdcd0f9f40ff655bf {
+  id @0 :UInt32;
+  parent @1 :UInt32;
+  name @2 :Text;
+  className @3 :Text;
+  actorId @4 :Text;
+  namespaceId @5 :Text;
+  hasActorName @6 :Bool;
+  actorName @7 :Text;
+  props @8 :AnyPointer;
 }
 
 struct ThreadedSocketOpen @0x807618c69c531b73 {
@@ -117,11 +130,14 @@ struct ThreadedSocketOpen @0x807618c69c531b73 {
 interface ThreadedSocketControl @0xdc432f018090bcc4 {
   send @0 (authority :ThreadedSocketAuthority, frame :ThreadedSocketFrame) -> () $Cxx.allowCancellation;
   setAutoResponse @1 (authority :ThreadedSocketAuthority, enabled :Bool, request :Text, response :Text) -> (accepted :Bool);
-  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64)
+  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64,
+      facets :List(ThreadedSocketFacet))
       -> (accepted :Bool) $Cxx.allowCancellation;
   adopt @3 (open :ThreadedSocketOpen, attempt :UInt64, resolveOnly :Bool)
-      -> (sockets :List(ThreadedSocketSnapshot), accepted :Bool) $Cxx.allowCancellation;
+      -> (sockets :List(ThreadedSocketSnapshot), accepted :Bool, facets :List(ThreadedSocketFacet))
+      $Cxx.allowCancellation;
   resolvePark @4 (open :ThreadedSocketOpen, attempt :UInt64) -> (accepted :Bool);
+  closeAborted @5 (open :ThreadedSocketOpen, socketIds :List(Text)) -> () $Cxx.allowCancellation;
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {

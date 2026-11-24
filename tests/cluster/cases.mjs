@@ -1140,10 +1140,22 @@ async function threadedSocketHibernation(cluster) {
     { token: tenant.token });
   await cluster.deploy(tenant, 'sleeper', `
     import { DurableObject } from 'cloudflare:workers';
-    export class Sleeper extends DurableObject {
+    class SocketActor extends DurableObject {
       constructor(ctx, env) {
         super(ctx, env);
-        this.constructedWith = ctx.getWebSockets('retained').length;
+        this.role = ctx.props?.role ?? 'root';
+        this.attachment = { field: 42, role: this.role };
+        this.autoRequest = this.role === 'root' ? 'tick' : 'facet-tick';
+        this.autoReply = this.role === 'root' ? 'tock' : 'facet-tock';
+        const retained = ctx.getWebSockets('retained');
+        const automatic = ctx.getWebSocketAutoResponse();
+        this.constructedWith = retained.length;
+        this.restored = retained.every(socket =>
+          ctx.getTags(socket).join(',') === 'retained,' + this.role &&
+          JSON.stringify(socket.deserializeAttachment()) === JSON.stringify(this.attachment)) &&
+          (retained.length === 0 || (automatic?.request === this.autoRequest &&
+            automatic.response === this.autoReply));
+        this.sequence = 0;
         ctx.blockConcurrencyWhile(async () => {
           this.instance = (await ctx.storage.get('constructors') ?? 0) + 1;
           await ctx.storage.put('constructors', this.instance);
@@ -1155,17 +1167,19 @@ async function threadedSocketHibernation(cluster) {
         }
         if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
           const [client, socket] = Object.values(new WebSocketPair());
-          this.ctx.acceptWebSocket(socket, ['retained']);
-          socket.serializeAttachment({ field: 42 });
-          this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'tock'));
+          this.ctx.acceptWebSocket(socket, ['retained', this.role]);
+          socket.serializeAttachment(this.attachment);
+          this.ctx.setWebSocketAutoResponse(
+            new WebSocketRequestResponsePair(this.autoRequest, this.autoReply));
           return new Response(null, { status: 101, webSocket: client });
         }
         return Response.json({ instance: this.instance, sockets: this.ctx.getWebSockets('retained').length,
-          constructedWith: this.constructedWith });
+          constructedWith: this.constructedWith, restored: this.restored, role: this.role });
       }
       webSocketMessage(socket, message) {
         socket.send(JSON.stringify({
-          instance: this.instance, constructedWith: this.constructedWith,
+          instance: this.instance, constructedWith: this.constructedWith, restored: this.restored,
+          role: this.role, sequence: ++this.sequence, id: this.ctx.id.toString(),
           message: typeof message === 'string' ? message : [...new Uint8Array(message)],
           attachment: socket.deserializeAttachment(),
           retained: this.ctx.getWebSockets('retained').length,
@@ -1180,6 +1194,28 @@ async function threadedSocketHibernation(cluster) {
         await this.ctx.storage.put('terminal', { error: String(error) });
       }
     }
+    export class SocketFacet extends SocketActor {}
+    export class Parent extends DurableObject {
+      fetch(request) {
+        return this.ctx.facets.get('leaf', () => ({
+          class: this.ctx.exports.SocketFacet({ props: { role: 'leaf' } }),
+          id: 'original-facet',
+        })).fetch(request);
+      }
+    }
+    export class Sleeper extends SocketActor {
+      fetch(request) {
+        const route = new URL(request.url).pathname;
+        if (route.endsWith('/delete-facet')) {
+          this.ctx.facets.delete('parent');
+          return new Response(null, { status: 204 });
+        }
+        if (route.includes('/facet/')) {
+          return this.ctx.facets.get('parent', () => ({ class: this.ctx.exports.Parent })).fetch(request);
+        }
+        return super.fetch(request);
+      }
+    }
     export default {
       fetch(request, env) { return env.TREE.getByName('parked').fetch(request); }
     };
@@ -1188,7 +1224,7 @@ async function threadedSocketHibernation(cluster) {
 
   await eventually('the threaded object answers successfully', async () => {
     assert.deepEqual(json(await request(cluster.urls[ingress], path), 200, 'open sleeper'),
-      { instance: 1, sockets: 0, constructedWith: 0 });
+      { instance: 1, sockets: 0, constructedWith: 0, restored: true, role: 'root' });
   });
   const owner = (await namespace()).owners[0];
   assert.ok(owner && cluster.nodes.includes(owner.nodeId));
@@ -1206,7 +1242,8 @@ async function threadedSocketHibernation(cluster) {
   socketUrl.protocol = 'ws:';
   const first = new PingSocket(socketUrl);
   const second = new PingSocket(socketUrl);
-  const sockets = [first, second];
+  const facet = new PingSocket(new URL(socketUrl.pathname + '/facet/socket', socketUrl));
+  const sockets = [first, second, facet];
   const next = async (socket, event, timeout = 7000) => {
     const abort = new AbortController();
     const deadline = setTimeout(() => abort.abort(new Error(`WebSocket ${event} timed out`)), timeout);
@@ -1237,30 +1274,73 @@ async function threadedSocketHibernation(cluster) {
     const firstEvent = JSON.parse(await send(first, 'warm'));
     assert.equal(firstEvent.instance, 1);
     assert.equal(firstEvent.retained, 2);
-    assert.deepEqual(firstEvent.attachment, { field: 42 });
+    assert.deepEqual(firstEvent.attachment, { field: 42, role: 'root' });
     assert.ok(Number.isSafeInteger(firstEvent.automatic));
+    await ping(facet, 'facet before retirement');
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
+    const warmFacet = JSON.parse(await send(facet, 'warm facet'));
+    assert.equal(warmFacet.instance, 1);
+    assert.equal(warmFacet.id, 'original-facet');
+    assert.ok(Number.isSafeInteger(warmFacet.automatic));
 
     const firstRetirement = await retired(0);
     const parked = (await cluster.state(owner.nodeId)).webSockets;
-    assert.equal(parked.parked, 2);
+    assert.equal(parked.parked, 3);
     await ping(second, 'while parked');
     assert.equal(await send(second, 'tick'), 'tock');
+    await ping(facet, 'facet while parked');
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
     const afterAutomatic = await activity();
     assert.equal(afterAutomatic.residentRoots, 0);
     assert.equal(afterAutomatic.homeSessions, 0);
     assert.equal(afterAutomatic.idleRetirements, firstRetirement);
     assert.equal((await cluster.state(owner.nodeId)).webSockets.socketWakes, parked.socketWakes);
     assert.deepEqual(json(await request(cluster.urls[owner.nodeId], path), 200, 'normal HTTP wake'),
-      { instance: 2, sockets: 2, constructedWith: 2 }, 'a normal reopen restores both sockets before the constructor runs');
+      { instance: 2, sockets: 2, constructedWith: 2, restored: true, role: 'root' },
+      'a normal reopen restores the root sockets before the constructor runs');
+    assert.deepEqual(json(await request(cluster.urls[owner.nodeId], path + '/facet/status'), 200, 'facet HTTP wake'),
+      { instance: 2, sockets: 1, constructedWith: 1, restored: true, role: 'leaf' },
+      'a normal reopen restores the facet socket, tags, attachment and automatic reply before its constructor');
 
     const secondRetirement = await retired(firstRetirement);
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
+    const burst = ['facet wake', Buffer.from([0, 128, 255]), 'last'];
+    const replies = [];
+    const onMessage = body => replies.push(JSON.parse(body.toString()));
+    facet.on('message', onMessage);
+    try {
+      const last = eventually('the sleeping facet receives all queued frames', () => {
+        assert.equal(replies.length, burst.length);
+      }, { timeout: 7000 });
+      for (const frame of burst) facet.send(frame);
+      await last;
+      const marker = next(facet, 'message');
+      facet.send('marker');
+      assert.equal(JSON.parse((await marker)[0].toString()).message, 'marker');
+    } finally {
+      facet.off('message', onMessage);
+    }
+    assert.deepEqual(replies.map(reply => [reply.sequence, reply.message]), [
+      [1, 'facet wake'], [2, [0, 128, 255]], [3, 'last'], [4, 'marker'],
+    ]);
+    for (const reply of replies) {
+      assert.equal(reply.id, 'original-facet');
+      assert.equal(reply.role, 'leaf');
+      assert.equal(reply.instance, 3);
+      assert.equal(reply.constructedWith, 1);
+      assert.equal(reply.retained, 1);
+      assert.equal(reply.restored, true);
+      assert.deepEqual(reply.attachment, { field: 42, role: 'leaf' });
+      assert.ok(reply.automatic > warmFacet.automatic);
+    }
+
     assert.equal(await send(first, 'tick'), 'tock');
     const wake = JSON.parse(await send(first, 'wake'));
     assert.equal(wake.instance, 3);
     assert.equal(wake.message, 'wake');
     assert.equal(wake.retained, 2);
     assert.equal(wake.constructedWith, 2);
-    assert.deepEqual(wake.attachment, { field: 42 });
+    assert.deepEqual(wake.attachment, { field: 42, role: 'root' });
     assert.ok(wake.automatic > firstEvent.automatic);
     assert.deepEqual(JSON.parse(await send(second, Buffer.from([0, 128, 255]))).message, [0, 128, 255]);
 
@@ -1283,16 +1363,25 @@ async function threadedSocketHibernation(cluster) {
       assert.equal(terminal?.code, 1006);
       assert.equal(terminal.wasClean, false);
     }, { timeout: 7000 });
-    await retired(secondRetirement);
+    const thirdRetirement = await retired(secondRetirement);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 3);
+    const facetClosed = next(facet, 'close');
+    void facetClosed.catch(() => {});
+    assert.equal((await request(cluster.urls[owner.nodeId], path + '/delete-facet')).status, 204);
+    const [facetCloseCode, facetCloseReason] = await facetClosed;
+    assert.equal(facetCloseCode, 1001);
+    assert.match(facetCloseReason.toString(), /facet was deleted/i);
+    assert.equal(await send(first, 'tick'), 'tock');
+    await retired(thirdRetirement);
 
     const survivor = cluster.nodes.find(node => node !== owner.nodeId);
-    const closed = sockets.map(socket => next(socket, 'close', 45000));
+    const closed = [first, second].map(socket => next(socket, 'close', 45000));
     closed.forEach(promise => void promise.catch(() => {}));
     await cluster.compose(['pause', owner.nodeId]);
     paused = true;
     await eventually('a surviving node takes the parked socket shard', async () => {
       const read = json(await request(cluster.urls[survivor], path, { timeout: 7000 }), 200, 'takeover wake');
-      assert.deepEqual(read, { instance: 4, sockets: 0, constructedWith: 0 });
+      assert.deepEqual(read, { instance: 5, sockets: 0, constructedWith: 0, restored: true, role: 'root' });
       const nextOwner = (await namespace()).owners[0];
       assert.notEqual(nextOwner.nodeId, owner.nodeId);
       assert.ok(BigInt(nextOwner.epoch) > BigInt(owner.epoch));

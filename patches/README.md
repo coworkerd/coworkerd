@@ -56,6 +56,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
   and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
   to a code-update reset.
+  Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
+  WebSocket hooks carry a native upgrade through local facet fetches. The legacy hibernation manager
+  and the threaded host validate the upgrade against the tree that staged it.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

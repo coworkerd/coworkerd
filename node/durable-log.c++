@@ -2587,6 +2587,10 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   }
   facet.lastSeq = record.nodeSeq;
   facet.deleted = record.kind == LogRecordKind::DELETED;
+  if (facet.deleted && facetDeletedHook) {
+    facetDeletedHook({object->namespaceId, object->objectId, object->tenant, object->dataEpoch,
+        object->shardEpoch, object->shard}, record.facetId);
+  }
   ++recordsTaken;
   bytesTaken += encoded.size();
   recordBytes += encoded.size();

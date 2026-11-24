@@ -401,6 +401,7 @@ struct DurableTarget {
   bool clearAlarm = false;
   std::string socketId;
   uint64_t socketFrame = 0;
+  uint32_t socketFacet = 0;
   size_t socketBytes = 0;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
@@ -414,6 +415,7 @@ struct DurableSocketEvent {
   std::optional<uint64_t> autoResponseTime;
   bool disconnected = false;
   bool transportError = false;
+  uint32_t facet = 0;
 };
 struct DurableSocketResult {
   bool delivered = false;
@@ -3623,7 +3625,8 @@ private:
             encoded += ",\"hasNodeSockets\":true";
           if (!durable->socketId.empty()) {
             encoded += ",\"durableSocket\":{\"id\":\"" + jsonEscape(durable->socketId) +
-                "\",\"frame\":\"" + std::to_string(durable->socketFrame) + "\"}";
+                "\",\"frame\":\"" + std::to_string(durable->socketFrame) +
+                "\",\"facet\":\"" + std::to_string(durable->socketFacet) + "\"}";
           }
           encoded += route.str();
         }
@@ -4079,6 +4082,10 @@ InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
 class WebSocketRelay final: public WebSocketRegistry::Relay {
 public:
   using ManagedSocket = coworkerd::ParkedWebSocket;
+  struct FacetStarts {
+    capnp::MallocMessageBuilder message;
+    std::map<uint32_t, rpc::ThreadedSocketFacet::Reader> byId;
+  };
   static constexpr size_t MAX_MESSAGE_BYTES = 32u << 20;
   static constexpr uint32_t CLOSE_GRACE_MS = 2000;
   // The close capnp's HTTP-over-capnp sends on a WebSocket whose request failed with OVERLOADED: workerd ends a request
@@ -4152,12 +4159,13 @@ public:
         target.dataEpoch == durableObject.dataEpoch && target.shardEpoch == durableObject.shardEpoch;
   }
   std::shared_ptr<ManagedInput> useNodeTransport(
-      uint64_t nodeEpoch, DurableSocketDispatch dispatch, std::string definition) {
+      uint64_t nodeEpoch, DurableSocketDispatch dispatch, std::string definition, uint32_t facet) {
     KJ_REQUIRE(durableLog != nullptr && dispatch);
     managedOwner = {nodeEpoch, durableObject.shardEpoch};
     managed.emplace(managedOwner, ManagedSocket::Home{identity.invocationId, generation});
     dispatchManaged = std::move(dispatch);
     managedDefinition = std::move(definition);
+    managedFacet = facet;
     innerBroken = true;
     return managedInput = std::make_shared<ManagedInput>();
   }
@@ -4198,8 +4206,11 @@ public:
     }
     return false;
   }
-  void park(uint64_t generation, ManagedSocket::Snapshot snapshot) {
+  uint32_t facetId() const { return managedFacet; }
+  const FacetStarts* parkedFacetStarts() const { return facetStarts.get(); }
+  void park(uint64_t generation, ManagedSocket::Snapshot snapshot, std::shared_ptr<FacetStarts> starts) {
     managed->parkOpen(managedOwner, generation, std::move(snapshot));
+    facetStarts = std::move(starts);
     if (!durableProcessId.empty()) {
       durableLog->objectConnectionClosed(durableObject, durableProcessId, durableGeneration);
       durableProcessId.clear();
@@ -4256,9 +4267,12 @@ public:
   }
   void goAway(const std::string& why) override {
     if (managed) managed->fence(managedOwner);
+    facetStarts.reset();
     if (closing) return;
     nodeClose(1001, why == "drain" ? "the node is draining" : why == "owner-expired" ? "the node no longer owns this object"
-        : why == "definition-changed" ? "the Durable Object definition changed" : "the process is being replaced", why);
+        : why == "definition-changed" ? "the Durable Object definition changed"
+        : why == "facet-deleted" ? "the Durable Object facet was deleted"
+        : why == "facet-aborted" ? "the Durable Object facet was aborted" : "the process is being replaced", why);
   }
   // The executing node: the request toward workerd ended -- its failure, if it failed.
   void innerSettled(kj::Maybe<kj::Exception> failure) {
@@ -4352,7 +4366,7 @@ private:
       const auto closeReason = closingFrame ? std::string(message.get<kj::WebSocket::Close>().reason.cStr()) : std::string();
       if (!closingFrame) ++toWorker;
       const auto result = co_await dispatchManaged({durableObject, identity.invocationId, action.position,
-          kj::mv(message), managed->autoResponseTime(), disconnected, transportError});
+          kj::mv(message), managed->autoResponseTime(), disconnected, transportError, managedFacet});
       managed->complete(managedOwner, action.position);
       if (!result.delivered) {
         if (!closing && result.terminalCode == "DO_CODE_UPDATED") goAway("definition-changed");
@@ -4526,6 +4540,8 @@ private:
   kj::Own<kj::WebSocket> outer, inner;
   Writer outerWriter, innerWriter;
   std::optional<ManagedSocket> managed;
+  std::shared_ptr<FacetStarts> facetStarts;
+  uint32_t managedFacet = 0;
   ManagedSocket::Owner managedOwner{};
   DurableSocketDispatch dispatchManaged;
   std::shared_ptr<ManagedInput> managedInput;
@@ -4636,8 +4652,16 @@ public:
     auto& server = *slot->server;
     auto process = slot->process;
     KJ_ASSERT(process != nullptr, "a WebSocket answered without a process call");
-    const bool nodeTransport = slot->durableLog && process->threadedDurableRole() && server.socketDispatch() &&
-        headerValue(headers, MANAGED_SOCKET_HEADER) == process->invocationId;
+    const auto marker = headerValue(headers, MANAGED_SOCKET_HEADER);
+    uint32_t facet = 0;
+    bool validMarker = marker == process->invocationId;
+    if (!validMarker && marker.starts_with(process->invocationId + ":")) {
+      const auto digits = std::string_view(marker).substr(process->invocationId.size() + 1);
+      const auto parsed = std::from_chars(digits.begin(), digits.end(), facet);
+      validMarker = parsed.ec == std::errc() && parsed.ptr == digits.end() && facet > 0 && facet <= UINT16_MAX;
+    }
+    const bool nodeTransport = slot->durableLog && process->threadedDurableRole() &&
+        server.socketDispatch() && validMarker;
     kj::HttpHeaders publicHeaders(server.responseHeaders());
     headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
       if (strcasecmp(name.cStr(), MANAGED_SOCKET_HEADER) != 0) publicHeaders.addPtrPtr(name, value);
@@ -4674,7 +4698,7 @@ public:
     if (slot->durable && slot->durableLog != nullptr)
       relay->holdObject(*slot->durableLog, slot->durableObject, process->processId, process->generation);
     if (nodeTransport) managedInput = relay->useNodeTransport(std::strtoull(server.epoch().c_str(), nullptr, 10),
-        server.socketDispatch(), slot->durableDefinition);
+        server.socketDispatch(), slot->durableDefinition, facet);
     if (!nodeTransport) server.holdLease(invocation);
     // Between two messages the connection is not executing: the node's admission count and the process's calls in flight
     // leave it; its request context stays open in workerd until the connection ends.
@@ -7467,6 +7491,7 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
   request.target.shardEpoch = event.object.shardEpoch;
   request.target.socketId = event.socketId;
   request.target.socketFrame = event.frame;
+  request.target.socketFacet = event.facet;
 
   using coworkerd::json::quote;
   std::ostringstream body;
@@ -7710,12 +7735,29 @@ public:
     }
     std::vector<Socket> prepared;
     std::set<WebSocketRelay*> unique;
+    const auto facets = params.getFacets();
+    KJ_REQUIRE(facets.size() <= UINT16_MAX);
+    std::shared_ptr<WebSocketRelay::FacetStarts> starts;
+    if (facets.size() != 0) {
+      starts = std::make_shared<WebSocketRelay::FacetStarts>();
+      starts->message.setRoot(facets);
+      for (auto facet : starts->message.getRoot<capnp::List<rpc::ThreadedSocketFacet>>().asReader()) {
+        const auto id = facet.getId();
+        KJ_REQUIRE(id > 0 && id <= UINT16_MAX && facet.getParent() < id);
+        KJ_REQUIRE(starts->byId.emplace(id, facet).second);
+      }
+      for (const auto& [_, facet] : starts->byId) {
+        KJ_REQUIRE(facet.getParent() == 0 || starts->byId.contains(facet.getParent()));
+      }
+    }
     bool eligible = true;
     for (const auto entry : params.getSockets()) {
       auto* relay = find(entry.getAuthority());
       // A closed node transport no longer needs a snapshot. A live relay
       // with an outstanding application frame keeps the whole home active.
       if (!relay) continue;
+      KJ_REQUIRE(relay->facetId() == entry.getFacetId());
+      KJ_REQUIRE(relay->facetId() == 0 || (starts && starts->byId.contains(relay->facetId())));
       if (!unique.insert(relay).second || !relay->canPark(current->object, open.getGeneration(), entry.getLastFrame())) {
         eligible = false;
         continue;
@@ -7735,7 +7777,10 @@ public:
       prepared.push_back({relay, std::move(snapshot)});
     }
     if (!eligible) co_return;
-    for (auto& entry : prepared) entry.relay->park(open.getGeneration(), std::move(entry.snapshot));
+    for (auto& entry : prepared) {
+      entry.relay->park(open.getGeneration(), std::move(entry.snapshot),
+          entry.relay->facetId() == 0 ? nullptr : starts);
+    }
     park = {attempt, true};
     if (test != nullptr) co_await waitForSocketTestGate(server.clock(), fs::path(test) / "hold-socket-park-reply");
     context.getResults().setAccepted(true);
@@ -7752,6 +7797,19 @@ public:
       auto& park = current->authority.park;
       if (park.attempt < attempt) park = {attempt, false};
       context.getResults().setAccepted(park.attempt == attempt && park.accepted);
+    }
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> closeAborted(CloseAbortedContext context) override {
+    const auto params = context.getParams();
+    if (const auto current = durable.authorizeSocketOpen(params.getOpen())) {
+      for (const auto id : params.getSocketIds()) {
+        auto* relay = find(id);
+        if (relay && relay->facetId() != 0 && relay->belongsTo(current->object)) {
+          relay->goAway("facet-aborted");
+        }
+      }
     }
     return kj::READY_NOW;
   }
@@ -7774,10 +7832,18 @@ public:
     KJ_REQUIRE(invocation.size() > 0 && invocation.size() <= 255);
     const WebSocketRelay::ManagedSocket::Home home{invocation.cStr(), open.getGeneration()};
     std::vector<std::pair<WebSocketRelay*, const WebSocketRelay::ManagedSocket::Snapshot*>> selected;
+    std::map<uint32_t, rpc::ThreadedSocketFacet::Reader> facets;
     for (auto* candidate : server.webSockets().managedObject(current->object.namespaceId, current->object.objectId)) {
       auto* relay = static_cast<WebSocketRelay*>(candidate);
       if (const auto* snapshot = relay->adoptable(current->object, home)) {
         selected.emplace_back(relay, snapshot);
+        const auto* starts = relay->parkedFacetStarts();
+        for (auto facetId = relay->facetId(); facetId != 0;) {
+          KJ_ASSERT(starts != nullptr);
+          const auto facet = starts->byId.at(facetId);
+          if (!facets.emplace(facetId, facet).second) break;
+          facetId = facet.getParent();
+        }
       } else if (relay->belongsTo(current->object)) {
         // This root is a successor. A connection left attached without
         // parking lost its previous actor and cannot be adopted.
@@ -7788,6 +7854,7 @@ public:
     for (size_t i = 0; i < selected.size(); ++i) {
       const auto [relay, snapshot] = selected[i];
       auto out = result[i];
+      out.setFacetId(relay->facetId());
       auto authority = out.initAuthority();
       const auto id = relay->managedId();
       authority.setSocketId(kj::str(kj::arrayPtr(id.begin(), id.size())));
@@ -7810,6 +7877,9 @@ public:
         out.setAutoResponse(kj::str(kj::arrayPtr(pair->second.data(), pair->second.size())));
       }
     }
+    auto facetList = context.getResults().initFacets(facets.size());
+    size_t index = 0;
+    for (const auto& [_, facet] : facets) facetList.setWithCaveats(index++, facet);
     for (const auto& [relay, _] : selected)
       relay->adopt(home, current->authority.process);
     adoption = {attempt, true};
@@ -7822,7 +7892,9 @@ public:
 private:
   uint64_t epoch() const { return std::strtoull(server.epoch().c_str(), nullptr, 10); }
   WebSocketRelay* find(rpc::ThreadedSocketAuthority::Reader authority) const {
-    const auto id = authority.getSocketId();
+    return find(authority.getSocketId());
+  }
+  WebSocketRelay* find(kj::StringPtr id) const {
     return dynamic_cast<WebSocketRelay*>(server.webSockets().managedSocket({id.begin(), id.size()}));
   }
   ServerCore& server;
@@ -10293,6 +10365,12 @@ int run(Launch launch) {
     for (auto* candidate : server.webSockets().managedObject(object.namespaceId, object.objectId)) {
       auto& relay = static_cast<WebSocketRelay&>(*candidate);
       if (relay.belongsTo(object)) relay.actorReset(code);
+    }
+  });
+  durableLog.setFacetDeletedHook([&server](const auto& object, uint32_t facet) {
+    for (auto* candidate : server.webSockets().managedObject(object.namespaceId, object.objectId)) {
+      auto& relay = static_cast<WebSocketRelay&>(*candidate);
+      if (relay.facetId() == facet && relay.belongsTo(object)) relay.goAway("facet-deleted");
     }
   });
   runtime.setDurableChannel([&durableLog](const std::string& processId, uint64_t threadedGeneration) {
