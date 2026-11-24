@@ -2281,6 +2281,9 @@ public:
         result.refusal = processRefusal(ProcessUnavailable{false, probe.notSent}, root);
       } else if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+      } else if (probe.culprit == "fatal") {
+        category = "evaluation"; detail = "V8_FATAL";
+        message = "the workerd process ended with a V8 fatal error attributed to this load";
       } else if (!probe.culprit.empty()) {
         category = "limit"; detail = "LIMIT_EXCEEDED";
         message = probe.culprit == "memory"
@@ -3089,7 +3092,8 @@ public:
     co_return output.str();
   }
 
-  kj::Promise<std::string> stateJson(std::string peerConnectionsJson, std::string avoidanceJson) {
+  kj::Promise<std::string> stateJson(std::string peerConnectionsJson, std::string avoidanceJson,
+      std::string peerConnectBudgetJson) {
     while (buildingState) co_await timer.afterDelay(1 * kj::MILLISECONDS);
     buildingState = true;
     const auto release = kj::defer([this]() { buildingState = false; });
@@ -3171,6 +3175,7 @@ public:
            << ",\"peerUnavailableRejections\":" << peerUnavailableRejections
            << ",\"placement\":" << [&]() { auto value = placementJson(); value.pop_back(); return value + ",\"avoidance\":" + avoidanceJson + "}"; }()
            << ",\"peerConnections\":" << peerConnectionsJson
+           << ",\"peerConnectBudget\":" << peerConnectBudgetJson
            << ",\"versionUnavailableRejections\":" << versionUnavailableRejections
            << ",\"versionUnavailableByReason\":{\"definitionUnknown\":" << versionUnknownRejections
            << ",\"definitionInconsistent\":" << versionInconsistentRejections
@@ -3404,14 +3409,14 @@ public:
     process->invocationId = invocationId; process->treeId = invocationId;
     return runtime.open(process, descriptor, version.definitionHash);
   }
-  // The culprit a workerd exit or kill confirmed for this invocation: "memory"
-  // (fatal OOM), "cpu" (watchdog kill), or empty.
+  // The culprit a workerd exit or kill confirmed for this invocation.
   std::string culpritOf(const std::string& invocationId) {
     auto text = runtime.culpritRecordsJson();
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), json);
-    for (auto [list, kind] : {std::pair{"recentMemoryCrashes", "memory"}, std::pair{"recentKills", "cpu"}}) {
+    for (auto [list, kind] : {std::pair{"recentMemoryCrashes", "memory"}, std::pair{"recentKills", "cpu"},
+        std::pair{"recentFatalExits", "fatal"}}) {
       auto entries = coworkerd::json::field(json, list);
       if (!entries.isArray()) continue;
       for (auto entry : entries.getArray()) {
@@ -4741,8 +4746,7 @@ public:
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
-        process->snapshotAfterFailure();
-        return kj::mv(error);
+        return process->rejectAfterCrash(kj::mv(error));
       });
       co_await kj::mv(request).attach(std::move(finish));
       answered = true;
@@ -4774,7 +4778,10 @@ private:
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
-      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
+      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
+          .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
+        return process->rejectAfterCrash(kj::mv(error));
+      });
       co_await request;
     } catch (const kj::Exception& error) {
       if (slot->process) slot->process->snapshotAfterFailure();
@@ -4921,8 +4928,11 @@ public:
   void setOwnerTailSupport(bool supported) { ownerTailSupport = supported; }
   bool supportsOwnerTail() const { return ownerTailSupport; }
 
-  kj::Promise<void> onDisconnect() {
-    return rpcSystem->onDisconnect();
+  void watchDisconnect(kj::Function<void()> observed) {
+    disconnectWatch = rpcSystem->onDisconnect().catch_([](kj::Exception&&) {}).then(
+        [this, observed = kj::mv(observed)]() mutable {
+      if (markDisconnected()) observed();
+    }).eagerlyEvaluate(nullptr);
   }
 
   bool isDisconnected() const {
@@ -4934,6 +4944,8 @@ public:
     disconnected = true;
     return true;
   }
+  bool markTailFailed() { return !std::exchange(tailFailed, true); }
+  bool canFetchTails() const { return !disconnected && !tailFailed; }
 
   uint64_t getGeneration() const {
     return generation;
@@ -4947,7 +4959,9 @@ private:
   kj::Own<coworkerd::CoarseTwoPartyClient> rpcSystem;
   rpc::PeerServer::Client peer;
   bool disconnected = false;
+  bool tailFailed = false;
   bool ownerTailSupport = false;
+  kj::Promise<void> disconnectWatch = kj::READY_NOW;
 };
 
 class AttachedHttpService final: public kj::HttpService {
@@ -5131,11 +5145,18 @@ public:
              << ",\"connectAttempts\":" << state.connectAttempts
              << ",\"successfulConnections\":" << state.successfulConnections
              << ",\"disconnects\":" << state.disconnects
+             << ",\"tailFailures\":" << state.tailFailures
              << ",\"peerUnavailableResponses\":" << state.peerUnavailableResponses
              << "}";
     }
     output << "}";
     return output.str();
+  }
+
+  std::string connectBudgetJson() const {
+    return "{\"active\":" + std::to_string(peerConnects.active()) +
+        ",\"peak\":" + std::to_string(peerConnects.peakActive()) +
+        ",\"attempts\":" + std::to_string(peerConnects.started()) + "}";
   }
 
   rpc::EventDispatcher::Client open(const std::string& targetServerId, RemoteInvocationData invocation) {
@@ -5223,17 +5244,65 @@ public:
   }
 
   // What a node holds of a previous owner's log for one shard.
-  kj::Promise<coworkerd::DurableTailAnswer> fetchDurableTail(std::string targetServerId,
-      coworkerd::DurableTailAsk ask, std::string address = {}, std::string epoch = {}) {
-    const auto& config = server.placementConfig();
-    if (address.empty()) {
-      auto peer = server.member(targetServerId);
-      KJ_REQUIRE(peer != nullptr, "the peer is not in the member table", targetServerId.c_str());
-      address = peer->address;
-      epoch = peer->epoch;
+  using TailConnection = std::shared_ptr<coworkerd::DurableTailConnection>;
+  kj::Promise<TailConnection> connectDurableTail(coworkerd::DurableTailTarget target, coworkerd::DurableTailRound round) {
+    const auto key = target.key();
+    const auto now = monotonicTimeMs();
+    const auto signingGeneration = peerAuth.signingGeneration();
+    std::optional<uint64_t> lastFinalTick;
+    bool refresh = round.final;
+    if (auto found = tailConnections.find(key); found != tailConnections.end() &&
+        found->second.signingGeneration == signingGeneration) {
+      auto& batch = found->second;
+      batch.lastUseMs = now;
+      lastFinalTick = batch.lastFinalTick;
+      refresh = round.final && (!lastFinalTick || *lastFinalTick < round.tick);
+      if (!batch.result->settled || (!refresh &&
+          (batch.result->handle && batch.result->handle->usable())) ||
+          (!refresh && !batch.result->handle && batch.attemptTick >= round.tick)) {
+        if (refresh) batch.lastFinalTick = round.tick;
+        return batch.connection.addBranch();
+      }
     }
-    const auto identity = address + "#" + epoch;
-    auto connection = co_await getConnection(targetServerId, address, identity, config.peerTimeoutMs);
+    std::erase_if(tailConnections, [now](const auto& item) {
+      return item.second.result->settled && now - item.second.lastUseMs > 2000;
+    });
+    auto result = std::make_shared<TailDialResult>();
+    auto open = openTailConnection(std::move(target), refresh, result).fork();
+    auto branch = open.addBranch();
+    tailConnections.insert_or_assign(key, TailBatch{kj::mv(open), std::move(result), round.tick,
+        refresh ? std::optional(round.tick) : lastFinalTick, now, signingGeneration});
+    return branch;
+  }
+
+private:
+  struct TailDialResult {
+    bool settled = false;
+    TailConnection handle;
+  };
+
+  kj::Promise<TailConnection> openTailConnection(coworkerd::DurableTailTarget target, bool refresh,
+      std::shared_ptr<TailDialResult> result) {
+    const auto done = kj::defer([&]() { result->settled = true; });
+    const auto identity = target.address + "#" + target.destinationEpoch;
+    if (refresh) {
+      if (auto found = peerStates.find(target.nodeId); found != peerStates.end() && found->second.connection != kj::none)
+        found->second.markStale(identity, found->second.generation);
+    }
+    const auto timeout = server.placementConfig().peerTimeoutMs;
+    auto connection = co_await getConnection(target.nodeId, target.address, identity, timeout);
+    const auto nodeId = target.nodeId;
+    result->handle = coworkerd::bindDurableTailConnection(std::move(target), std::move(connection), fetchDurableTail,
+        [this, nodeId, identity](uint64_t generation) {
+      auto found = peerStates.find(nodeId);
+      if (found != peerStates.end() && found->second.markStale(identity, generation)) ++found->second.tailFailures;
+    });
+    co_return result->handle;
+  }
+
+  static kj::Promise<coworkerd::DurableTailAnswer> fetchDurableTail(
+      std::shared_ptr<kj::Rc<PeerConnection>> transport, coworkerd::DurableTailAsk ask, std::string epoch) {
+    auto& connection = *transport;
     auto request = connection->client().fetchDurableTailRequest();
     auto parameters = request.initRequest();
     parameters.setNamespaceId(ask.namespaceId.c_str());
@@ -5269,6 +5338,7 @@ public:
     co_return answer;
   }
 
+public:
   kj::Promise<InvocationAttempt> tryOpen(std::string targetServerId, RemoteInvocationData invocation) {
     const auto& config = server.placementConfig();
     auto peer = server.member(targetServerId);
@@ -5700,20 +5770,27 @@ private:
   struct Avoidance { double until = 0; uint32_t failures = 0; };
   std::map<std::string, Avoidance> avoidance;
 
-  struct PeerState {
-    std::string memberIdentity;
-    kj::Maybe<kj::Rc<PeerConnection>> connection;
+  struct PeerState: coworkerd::PeerConnectionReuse<PeerConnection> {
     kj::Maybe<kj::ForkedPromise<kj::Rc<PeerConnection>>> connecting;
     // The attempt in `connecting` has settled. Its fork is released by the next getConnection(),
     // never from the fork's own continuation: when every caller waiting on it was cancelled, that
     // would destroy the fork while it runs the continuation (a use after free in KJ's ForkHub).
     bool connectingSettled = false;
-    uint64_t generation = 0;
     uint64_t connectAttempts = 0;
     uint64_t successfulConnections = 0;
     uint64_t disconnects = 0;
     uint64_t peerUnavailableResponses = 0;
     uint64_t signingGeneration = 0;
+    uint64_t tailFailures = 0;
+  };
+
+  struct TailBatch {
+    kj::ForkedPromise<TailConnection> connection;
+    std::shared_ptr<TailDialResult> result;
+    uint64_t attemptTick;
+    std::optional<uint64_t> lastFinalTick;
+    double lastUseMs;
+    uint64_t signingGeneration;
   };
 
   kj::Promise<kj::Rc<PeerConnection>> getConnection(
@@ -5728,14 +5805,16 @@ private:
       state.connection = kj::none;
       state.connecting = kj::none;
       state.connectingSettled = false;
+      state.stale = false;
       ++state.generation;
       state.memberIdentity = memberIdentity;
       state.signingGeneration = peerAuth.signingGeneration();
     }
     KJ_IF_SOME(connection, state.connection) {
-      if (!connection->isDisconnected()) return connection.addRef();
+      if (!state.stale && !connection->isDisconnected()) return connection.addRef();
       state.connection = kj::none;
     }
+    state.stale = false;
     if (state.connectingSettled) {
       state.connecting = kj::none;
       state.connectingSettled = false;
@@ -5755,7 +5834,9 @@ private:
         found->second.connectingSettled = true;
         ++found->second.successfulConnections;
       }
-      watchDisconnect(targetServerId, connection.addRef());
+      connection->watchDisconnect([this, targetServerId]() {
+        if (auto found = peerStates.find(targetServerId); found != peerStates.end()) ++found->second.disconnects;
+      });
       return std::move(connection);
     }).catch_([this, targetServerId, generation](kj::Exception&& error)
                   -> kj::Promise<kj::Rc<PeerConnection>> {
@@ -5770,11 +5851,12 @@ private:
   }
 
   kj::Promise<kj::Rc<PeerConnection>> connectPeer(
-      const std::string& targetServerId,
-      const std::string& addressText,
+      std::string targetServerId,
+      std::string addressText,
       uint64_t generation,
       uint32_t timeoutMs) {
-    return timer.timeoutAfter(
+    auto permit = co_await peerConnects.acquire(targetServerId + "@" + addressText);
+    co_return co_await timer.timeoutAfter(
         timeoutMs * kj::MILLISECONDS,
         network.parseAddress(addressText.c_str()).then(
             [this, generation, timeoutMs, targetServerId](kj::Own<kj::NetworkAddress>&& address)
@@ -5813,18 +5895,6 @@ private:
     }));
   }
 
-  void watchDisconnect(
-      const std::string& targetServerId,
-      kj::Rc<PeerConnection> connection) {
-    connection->onDisconnect()
-        .then([this, targetServerId, connection = connection.addRef()]() mutable {
-      markConnectionDisconnected(targetServerId, connection);
-    }).catch_([this, targetServerId, connection = connection.addRef()](
-                  kj::Exception&&) mutable {
-      markConnectionDisconnected(targetServerId, connection);
-    }).detach([](kj::Exception&&) {});
-  }
-
   void markConnectionDisconnected(
       const std::string& targetServerId,
       kj::Rc<PeerConnection>& connection) {
@@ -5850,7 +5920,9 @@ private:
   const kj::HttpHeaderTable& headerTable;
   capnp::HttpOverCapnpFactory& factory;
   coworkerd::PeerAuth& peerAuth;
+  coworkerd::RecoveryGate peerConnects{timer, 4};
   std::map<std::string, PeerState> peerStates;
+  std::map<std::string, TailBatch> tailConnections;
 };
 
 class DurableDispatch;
@@ -8842,6 +8914,9 @@ private:
           verdict = {"UNAVAILABLE", "", notSent};
         } else if (timedOut) {
           verdict = {"TIMEOUT", "", "timed out while loading (" + std::to_string(request.timeoutMs) + " ms); the probe was cancelled"};
+        } else if (culprit == "fatal") {
+          quarantined = server.quarantined(version->workerId);
+          verdict = {"LOAD_FAILED", "fatal", "the workerd process ended with a V8 fatal error attributed to this trial"};
         } else if (!culprit.empty()) {
           quarantined = server.quarantined(version->workerId);
           verdict = {"LIMIT_EXCEEDED", culprit, culprit == "memory"
@@ -9065,7 +9140,7 @@ private:
     if (url == "/__coworkerd/state") {
       co_return co_await sendText(
           response, 200, "OK",
-          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson(), peerForwarder.connectBudgetJson()), "application/json");
     }
     {
       // Process rotation. POST /__coworkerd/rotate?all=1 or ?process=p0&process=p1;
@@ -9123,7 +9198,7 @@ private:
       server.reload();
       co_return co_await sendText(
           response, 200, "OK",
-          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()), "application/json");
+          co_await server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson(), peerForwarder.connectBudgetJson()), "application/json");
     }
 
     if (server.draining()) {
@@ -10246,9 +10321,7 @@ int run(Launch launch) {
          return peerForwarder.openDurableLog(std::move(nodeId),
              ownerEpoch, membership->view().instance, firstSeq);
        },
-       [&peerForwarder](std::string nodeId, coworkerd::DurableTailAsk ask) {
-         return peerForwarder.fetchDurableTail(std::move(nodeId), std::move(ask));
-       },
+       {},
        [&shards](const std::string& namespaceId, uint32_t shard) { return shards.knownShardEpoch(namespaceId, shard); },
        [&runtime, &server](std::string reason) -> kj::Promise<void> {
          // Recovery can replace the image only after the pool has reaped the generations
@@ -10259,9 +10332,8 @@ int run(Launch launch) {
                    << ",\"reason\":\"" << jsonEscape(reason) << "\"}" << std::endl;
          co_return;
        }});
-  durableLog.setTailAtHook([&peerForwarder](coworkerd::DurableTailTarget target, coworkerd::DurableTailAsk ask) {
-    return peerForwarder.fetchDurableTail(std::move(target.nodeId), std::move(ask),
-        std::move(target.address), std::move(target.destinationEpoch));
+  durableLog.setTailConnectHook([&peerForwarder](coworkerd::DurableTailTarget target, coworkerd::DurableTailRound round) {
+    return peerForwarder.connectDurableTail(std::move(target), round);
   });
   durableLog.setOwnerFenceHook([&shards](const std::string& namespaceId, uint32_t shard, uint64_t through) {
     shards.fenceOwner(namespaceId, shard, through);
@@ -10417,7 +10489,7 @@ int run(Launch launch) {
       [&trials](kj::HttpMethod method, kj::AsyncInputStream& body, kj::HttpService::Response& response) {
         return trials.serve(method, body, response);
       },
-      workerLogs, [&server, &peerForwarder]() { return server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson()); },
+      workerLogs, [&server, &peerForwarder]() { return server.stateJson(peerForwarder.stateJson(), peerForwarder.avoidanceJson(), peerForwarder.connectBudgetJson()); },
       peerAuth, controlPlane);
   coworkerd::DatabaseSeed databaseSeed(durableLog, shards,
       [&server](const std::string& ns) { return server.namespaceOwner(ns).has_value(); });

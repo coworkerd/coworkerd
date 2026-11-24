@@ -56,6 +56,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
   and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
   to a code-update reset.
+  Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
+  quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patches 0110–0114 execute D1-style SQL in the factory's native SQLite helper. Patch 0111
   also changes the threaded server and its Bazel target to admit and retire dedicated database homes.
   Patch 0113 reconciles SQLite's automatic rollbacks and bounds native SQL memory, WAL writes and queue time.

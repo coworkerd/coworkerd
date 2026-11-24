@@ -135,8 +135,147 @@ async function processReplacement(cluster) {
     assert.equal(after.state, 'ready');
     assert.equal((await request(cluster.urls[node], '/__coworkerd/ready')).status, 200);
   });
+  const { processes } = await cluster.state(node);
+  const exit = processes.recentFatalExits.find(entry => entry.pid === before.pid && entry.generation === before.generation);
+  assert.equal(exit?.culpritStatus, 'undetermined', 'a process exit without evidence leaves the tenant unmarked');
+  assert.equal(exit.culprit, null);
+  assert.ok(!processes.suspects.entries.some(entry => entry.tenant === tenant.name));
   assert.deepEqual(await workerCall(cluster, node, tenant, 'hello'), { status: 200, text: 'alive' },
     'the first Worker call after the replacement is ready succeeds');
+}
+
+export async function fatalAttribution(cluster) {
+  const [node, peer] = cluster.nodes;
+  const tenant = await cluster.tenant('fatal-test');
+  const neighbor = await cluster.tenant('fatal-neighbor');
+  const target = `${tenant.name}/hello`;
+  await cluster.deploy(tenant, 'hello', respondWith('hello'));
+  await cluster.deploy(neighbor, 'hello', `export default { async fetch(request) {
+    if (new URL(request.url).pathname.endsWith('/held')) {
+      await new Promise(resolve => setTimeout(resolve, 15000));
+    }
+    return new Response('neighbor');
+  } };`);
+  const hello = (at = node) => workerCall(cluster, at, tenant, 'hello');
+  const near = (worker = 'hello') => workerCall(cluster, node, neighbor, worker, { timeout: 18000 });
+  const pool = async (at = node) => (await cluster.state(at)).processes;
+  const sameGeneration = (entry, process) => entry.processId === process.processId && entry.generation === process.generation;
+  const assertUncertain = (result, description) => assert.equal(json(result, 503, description).code, 'RESULT_UNCERTAIN');
+  const assertQuarantineRoute = async (at, process) => {
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', at]);
+    const prefix = '[execution] ';
+    const call = logs.split('\n').filter(line => line.startsWith(prefix))
+      .map(line => JSON.parse(line.slice(prefix.length)))
+      .findLast(entry => entry.kind === 'ingress' && entry.target === `${target}@v1`);
+    assert.equal(call?.processId, process.processId);
+    assert.equal(call.processGeneration, process.generation);
+  };
+  const recovered = (process) => eventually('a new ordinary process is ready', async () => {
+    const current = await ordinaryProcess(cluster, node);
+    assert.equal(current.processId, process.processId);
+    assert.ok(current.generation > process.generation);
+    assert.equal(current.state, 'ready');
+    return current;
+  });
+  const replacedQuarantine = (process) => eventually('a new quarantine process is ready', async () => {
+    const current = (await pool()).entries.find(entry => entry.processId === process.processId);
+    assert.ok(current?.generation > process.generation);
+    assert.equal(current.state, 'ready');
+    assert.ok(current.pid > 1);
+    return current;
+  });
+  // What V8 itself said before the process with `pid` exited, from the node's log.
+  const diagnosticOf = async (pid) => {
+    const prefix = '[v8-fatal-diagnostic] ';
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', node]);
+    return logs.split('\n').filter(line => line.startsWith(prefix))
+      .map(line => JSON.parse(line.slice(prefix.length))).find(entry => entry.pid === pid);
+  };
+  const syntheticExit = async (process, event, check = result => assertUncertain(result, `synthetic ${event} from ${process.processClass}`)) => {
+    const command = join(cluster.fatalControl, `command.${process.pid}`);
+    const pending = `${command}.pending`;
+    await writeFile(pending, `${event}\n${target}`, { flag: 'wx', mode: 0o644 });
+    await rename(pending, command);
+    try {
+      check(await hello());
+    } finally {
+      await unlink(command);
+    }
+  };
+  await eventually('both tenants run before the fault', async () => {
+    assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+    assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+    assert.deepEqual(await hello(peer), { status: 200, text: 'hello' });
+  });
+
+  const initial = await ordinaryProcess(cluster, node);
+  await syntheticExit(initial, 'shared-oom');
+  const before = await recovered(initial);
+  const oom = (await pool()).recentMemoryCrashes.find(entry => sameGeneration(entry, initial));
+  assert.equal(oom?.culpritStatus, 'undetermined');
+  assert.equal(oom.culprit, null);
+  assert.ok(!(await pool()).suspects.entries.some(entry => entry.tenant === tenant.name));
+  assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+
+  const held = near('hello/held').then(response => ({ response }), error => ({ error }));
+  let firstRoute;
+  try {
+    await eventually('the other tenant is in flight in the ordinary process', async () => {
+      const current = await ordinaryProcess(cluster, node);
+      assert.equal(current.pid, before.pid);
+      assert.equal(current.inFlight, 1);
+    }, { timeout: 5000, interval: 30 });
+    // V8 reports this one itself, through the fatal handler the isolate ended up with.
+    await syntheticExit(before, 'api-check');
+    // Send the first call before polling state or waiting for an ordinary replacement.
+    assert.deepEqual(await hello(), { status: 200, text: 'hello' });
+    firstRoute = await pool();
+  } finally {
+    await held;
+  }
+  const { response, error } = await held;
+  if (error) throw error;
+  assertUncertain(response, 'neighbor affected by the ordinary exit');
+  const first = firstRoute.recentFatalExits.find(entry => sameGeneration(entry, before));
+  assert.equal(first?.culpritStatus, 'confirmed');
+  assert.equal(first.culprit.workerId, target);
+  assert.ok(first.inFlight.some(call => call.workerId === `${neighbor.name}/hello`));
+  assert.deepEqual(await diagnosticOf(before.pid),
+    { pid: before.pid, location: 'v8::ToLocalChecked', line: 0, message: 'Empty MaybeLocal' });
+  const quarantine = firstRoute.entries.find(entry => entry.processClass === 'quarantine');
+  assert.equal(quarantine?.state, 'ready');
+  await assertQuarantineRoute(node, quarantine);
+  const replacement = await recovered(before);
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+
+  const adopted = await eventually('another node learns which tenant to quarantine', async () => {
+    const view = await pool(peer);
+    assert.ok(view.suspects.entries.some(entry => entry.tenant === tenant.name && entry.workerId === target));
+    return view;
+  });
+  assert.deepEqual(await hello(peer), { status: 200, text: 'hello' });
+  await assertQuarantineRoute(peer, adopted.entries.find(entry => entry.processClass === 'quarantine'));
+
+  await syntheticExit(quarantine, 'fatal');
+  const second = (await pool()).recentFatalExits.find(entry => sameGeneration(entry, quarantine));
+  assert.equal(second?.culpritStatus, 'confirmed');
+  assert.equal(second.culprit.workerId, target);
+  assert.equal(second.processClass, 'quarantine');
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
+  assert.equal((await ordinaryProcess(cluster, node)).pid, replacement.pid);
+
+  // V8's API check while the Worker loads cold in the replaced quarantine process, after its top level
+  // ran (handler validation), where only the load's own scope names the Worker.
+  const reloaded = await replacedQuarantine(quarantine);
+  let loadResult;
+  await syntheticExit(reloaded, 'load-api-check', result => { loadResult = result; });
+  const third = (await pool()).recentFatalExits.find(entry => sameGeneration(entry, reloaded));
+  assert.equal(third?.culpritStatus, 'confirmed', JSON.stringify(third));
+  // The call that started the load is answered as a load failure.
+  assert.equal(json(loadResult, 503, 'the call whose load ended the process').code, 'LOAD_FAILED');
+  assert.equal(third.culprit.workerId, target);
+  assert.equal((await diagnosticOf(reloaded.pid))?.message, 'Empty MaybeLocal');
+  assert.deepEqual(await near(), { status: 200, text: 'neighbor' });
 }
 
 async function logQuota(cluster) {
@@ -430,6 +569,61 @@ async function durableTakeover(cluster) {
     assert.ok(owner && !owner.released && owner.nodeId !== original.nodeId && cluster.nodes.includes(owner.nodeId));
     assert.ok(BigInt(owner.epoch) > BigInt(original.epoch));
   });
+}
+
+async function durableSlowHolder(cluster) {
+  const tenant = await takeoverWriter(cluster, 'slow-holder-test');
+  const [first] = cluster.nodes;
+  const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
+  await eventually('the original holder confirms the value', async () => {
+    const response = await workerCall(cluster, first, tenant, 'object', { method: 'POST', body: 19 });
+    assert.equal(json(response, 200, 'confirmed value'), 19);
+  });
+  const { namespaceId, owners: [original] } = await namespace();
+  assert.ok(original && !original.released);
+  const originalState = await cluster.state(original.nodeId);
+  const ingress = cluster.nodes.find(node => node !== first && node !== original.nodeId);
+  const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update('takeover').digest('hex');
+  const gate = join(cluster.recoveryRelayGate, original.nodeId);
+  await writeFile(gate, '');
+  try {
+    // Inject the normal handoff marker while keeping the previous node and its
+    // heartbeat alive. The relay withholds Cap'n Proto replies from that node.
+    await cluster.releaseShardForRecoveryTest(namespaceId, { ...original, nodeEpoch: originalState.durableLog.nodeEpoch });
+    let answered = false;
+    const read = workerCall(cluster, ingress, tenant, 'object', { timeout: 34000 })
+      .then(value => { answered = value.status === 200; return { value }; }, error => ({ error }));
+    const takeover = await eventually('a successor has acquired the released shard', async () => {
+      const { owners } = await namespace();
+      const newOwner = owners.find(owner => owner.shard === original.shard);
+      assert.ok(newOwner && !newOwner.released && newOwner.nodeId !== original.nodeId &&
+        BigInt(newOwner.epoch) > BigInt(original.epoch));
+      return newOwner.nodeId;
+    });
+    await eventually('the successor is waiting past the deadline for the live holder', async () => {
+      const state = await cluster.state(takeover);
+      const entry = state.durableLog.recovery.scheduler.entries.find(row => row.object.startsWith(`${namespaceId}/${id}/`));
+      assert.ok(state.durableLog.recovery.cutsHeldOwnerLive > 0 && entry);
+      assert.equal(entry.owner, original.nodeId);
+      assert.equal(entry.ownerEpoch, originalState.durableLog.nodeEpoch);
+      assert.ok(entry.waitingMs >= 8500);
+      assert.equal(state.durableLog.objects.activeRebuilds, 0);
+      assert.ok(state.peerConnections[original.nodeId].tailFailures > 0, 'a real page timeout marked its connection');
+    }, { timeout: 22000, interval: 75 });
+    assert.equal(answered, false, 'the successor cannot serve the object while the holder is slow');
+    const stillAlive = await cluster.state(original.nodeId);
+    assert.equal(stillAlive.membership.selfExpired, false);
+    assert.equal(stillAlive.membership.leaseFences, originalState.membership.leaseFences);
+    await unlink(gate);
+    const { value, error } = await read;
+    if (error) throw error;
+    assert.deepEqual(json(value, 200, 'the successor read after the holder replied'), [19]);
+    const settled = await cluster.state(takeover);
+    assert.equal(settled.durableLog.recovery.ownerSilent, 0);
+    assert.equal(settled.durableLog.recovery.bounded, 0);
+  } finally {
+    await unlink(gate).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  }
 }
 
 async function durableThreadedFence(cluster) {
@@ -1514,6 +1708,10 @@ export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'sql-protocol'
 
 export const durableGatedCases = {
   'durable-peer-ack': { test: durablePeerAck },
+  'durable-slow-holder': {
+    test: durableSlowHolder, delayRecoveryPeers: true,
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-fence': {

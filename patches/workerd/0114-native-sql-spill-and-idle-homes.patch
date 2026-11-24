@@ -630,10 +630,10 @@ index 13e8ab9bec5392a4a9d2c6e04634015924b4cc44..97d2d4dc3ab1887801cfe0b58de33626
  std::string nativeSqlFailure(kj::StringPtr code, kj::StringPtr reason);
  NativeSqlReply nativeSqlTimeout();
 diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
-index 63d7d6c3d3a5177cc57fb19743f375fd653f20c4..056eb1239a42e95e720cac9f4ee20ab4adb1c49d 100644
+index d96f3fd4f09458a1ba04c7a3fd8195281615f913..a99382baccd5b497dc3370feb414b6b006554c88 100644
 --- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
 +++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
-@@ -572,6 +572,7 @@ void DurableLogShipper::reportAfterDatabaseClose() {
+@@ -565,6 +565,7 @@ void DurableLogShipper::reportAfterDatabaseClose() {
  }
  
  void DurableLogShipper::configure(SqliteDatabase& database) {
@@ -641,7 +641,7 @@ index 63d7d6c3d3a5177cc57fb19743f375fd653f20c4..056eb1239a42e95e720cac9f4ee20ab4
    db = &database;
    sqlite3* handle = database;
    // No checkpoint but the ones below: not after a commit, and not when the last connection closes -- the WAL must
-@@ -846,6 +847,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
+@@ -839,6 +840,7 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
    sqlite3* handle = *db;
    if (sqlite3_get_autocommit(handle) == 0) return;
    if (hookFrames != readFrames) return;
@@ -650,10 +650,10 @@ index 63d7d6c3d3a5177cc57fb19743f375fd653f20c4..056eb1239a42e95e720cac9f4ee20ab4
    int logFrames = -1, checkpointed = -1;
    int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 08973e45481f68dcf3a104c9a7b4d430bcf77aa3..3677d28a64cdbd5e1c8af149e6ca854c533071c2 100644
+index 5522532053abb9e90dc8248e371c809557f70891..7512bc06e250fe3978b41ca49747547fd3b55da7 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
-@@ -24,6 +24,7 @@ THREADED_DEPS = [
+@@ -25,6 +25,7 @@ THREADED_DEPS = [
      "//src/workerd/server/factory:coworkerd-wal",
      "//src/workerd/util:autogate",
      "//src/workerd/util:entropy",
@@ -662,18 +662,18 @@ index 08973e45481f68dcf3a104c9a7b4d430bcf77aa3..3677d28a64cdbd5e1c8af149e6ca854c
      "@capnp-cpp//src/capnp/compat:http-over-capnp",
      "@capnp-cpp//src/capnp/compat:json",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3287316a9 100644
+index 5f17d2676a8dc6493092a7f318f6c67a0ee5ac68..abc8ee53b80ce33fe0183f9e820e2a43800cd50d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -28,6 +28,7 @@
+@@ -29,6 +29,7 @@
  #include <workerd/server/factory/coworkerd-durable-placement.h>
  #include <workerd/server/factory/coworkerd-durable-test-storage.h>
  #include <workerd/server/factory/coworkerd-native-sql.h>
 +#include <workerd/server/factory/coworkerd-native-sql-spill.h>
- #include <workerd/server/factory/coworkerd-threaded-wal.h>
  #include <workerd/server/factory/coworkerd-sandbox.h>
  #include <workerd/server/factory/coworkerd-steady.h>
-@@ -300,6 +301,7 @@ struct ResourceBudget {
+ #include <workerd/server/factory/coworkerd-threaded-wal.h>
+@@ -304,6 +305,7 @@ struct ResourceBudget {
    ResourceBudget(uint64_t maximum,
        uint32_t residents,
        uint32_t callThreads,
@@ -681,7 +681,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        ReclaimMode reclaimMode = ReclaimMode::BACKGROUND)
        : reclaimMode(reclaimMode),
          memoryMaximum(maximum),
-@@ -309,6 +311,7 @@ struct ResourceBudget {
+@@ -313,6 +315,7 @@ struct ResourceBudget {
                  ? UINT64_MAX
                  : (4ull << 30) - MAX_SINGLE_HEAP_OBJECT - (256ull << 20)),
          baselineMemory(64 * MiB + uint64_t(callThreads + 16) * (256ull << 10)),
@@ -689,7 +689,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
          configuredResidentMaximum(residents),
          residentMaximum(residents),
          memoryReserved(baselineMemory) {
-@@ -322,6 +325,7 @@ struct ResourceBudget {
+@@ -326,6 +329,7 @@ struct ResourceBudget {
    }
    const ReclaimMode reclaimMode;
    const uint64_t memoryMaximum, admissionMaximum, addressMaximum, baselineMemory;
@@ -697,7 +697,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    // The node's per-process limit, and the one in force: the first time the address space has no
    // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
    // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
-@@ -330,6 +334,7 @@ struct ResourceBudget {
+@@ -334,6 +338,7 @@ struct ResourceBudget {
    std::atomic<uint32_t> residentMaximum;
    std::mutex mutex;
    std::atomic<uint64_t> memoryReserved{0}, addressReserved{0};
@@ -705,7 +705,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    // Heap headroom near-heap-limit raises granted above what their isolates
    // used, until each call's termination takes effect (MemoryBudget::raise()):
    // two isolates raised at once never both count on the same remainder.
-@@ -409,6 +414,40 @@ struct ResourceBudget {
+@@ -413,6 +418,40 @@ struct ResourceBudget {
    }
  };
  
@@ -746,7 +746,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
  struct ResourceReservation {
    static constexpr uint64_t MiB = ResourceBudget::MiB;
    // The capacity acquisition records heap and RSS deltas to validate this seed
-@@ -1736,6 +1775,9 @@ struct ThreadState {
+@@ -1878,6 +1917,9 @@ struct ThreadState {
    struct NativeDatabase {
      uint64_t tree;
      server::DurableAdmission::Time lastUse;
@@ -756,7 +756,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
      kj::Own<SqliteDatabase> connection;
      // Destroy the shipper first. It defers the close record until SQLite has closed.
      kj::Own<server::DurableLogShipper> shipper;
-@@ -2304,6 +2346,7 @@ struct ThreadedServer {
+@@ -2447,6 +2489,7 @@ struct ThreadedServer {
    std::atomic<uint64_t> durablePendingCommits{0};
    std::atomic<bool> refuseDurableGroupForTest{false};
    const uint64_t durableCommitDelayMs;
@@ -764,7 +764,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
        ? ""
        : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
-@@ -2337,6 +2380,9 @@ struct ThreadedServer {
+@@ -2480,6 +2523,9 @@ struct ThreadedServer {
        std::string warmDefinition;
        uint32_t reservedTrees = 0;
        bool database = false;
@@ -774,7 +774,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        uint64_t memory = 0;
        server::DurableHomeLoad load{std::chrono::seconds(4)};
        server::DurablePressure pressure;
-@@ -2354,6 +2400,7 @@ struct ThreadedServer {
+@@ -2497,6 +2543,7 @@ struct ThreadedServer {
    };
    std::vector<std::unique_ptr<Thread>> threads;
    int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -782,7 +782,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    std::atomic<bool> ready{false};
    std::atomic<uint32_t> liveThreads{0};
    std::atomic<uint64_t> growthFailures{0};
-@@ -2402,6 +2449,7 @@ struct ThreadedServer {
+@@ -2545,6 +2592,7 @@ struct ThreadedServer {
                          : 0),
              configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
              limit,
@@ -790,7 +790,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
              this->durableStorage ? ResourceBudget::ReclaimMode::NONE
                                   : ResourceBudget::ReclaimMode::BACKGROUND)),
          tenantBudget(std::make_shared<TenantBudget>(
-@@ -2409,6 +2457,8 @@ struct ThreadedServer {
+@@ -2552,6 +2600,8 @@ struct ThreadedServer {
          subrequestBudget(limit, tenantBudget->limit) {
      KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
      if (this->durableStorage) {
@@ -799,7 +799,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
        const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
        KJ_REQUIRE(refuseGroup <= 1, "invalid durable test group refusal");
-@@ -2684,7 +2734,7 @@ struct ThreadedServer {
+@@ -2828,7 +2878,7 @@ struct ThreadedServer {
        // WAL, shared-memory and directory descriptors, and the event charge
        // covers the connection.
        if (route.database && (databaseHomes >= limit - 1 ||
@@ -808,7 +808,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
          return false;
        }
        assigned = choice.value_or(spare);
-@@ -2700,17 +2750,63 @@ struct ThreadedServer {
+@@ -2844,17 +2894,63 @@ struct ThreadedServer {
      return home.database == route.database && !home.pressure.resetting();
    }
  
@@ -877,7 +877,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
      }
      return result;
    }
-@@ -2752,9 +2848,12 @@ struct ThreadedServer {
+@@ -2896,9 +2992,12 @@ struct ThreadedServer {
    // connection is gone, including reservations that never opened SQLite.
    void releaseNativeDatabaseHome(Thread::DurableHome& home) {
      if (!home.database) return;
@@ -891,7 +891,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    }
  
    void reportNativeDatabaseMemory(uint64_t homeId, size_t allocated) {
-@@ -2822,7 +2921,10 @@ struct ThreadedServer {
+@@ -2966,7 +3065,10 @@ struct ThreadedServer {
                  KJ_EXCEPTION(OVERLOADED, "durable routing lease expired"), "LEASE_EXPIRED"));
            }
            KJ_REQUIRE(delivery == Admission::Delivery::ACCEPTED, "durable event identity changed");
@@ -903,7 +903,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
            wakeDurableTree(ticket.tree);
            co_return;
          }
-@@ -2936,7 +3038,10 @@ struct ThreadedServer {
+@@ -3080,7 +3182,10 @@ struct ThreadedServer {
      const auto homeId = state.durableHome;
      {
        std::lock_guard lock(durableRoutingMutex);
@@ -915,7 +915,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
            ? durableAdmission->stopIdleTree(tree, homeId)
            : durableAdmission->stopIdleTree(tree, homeId, state.nativeDatabase->lastUse,
                server::DurableAdmission::Clock::now());
-@@ -3145,7 +3250,10 @@ struct ThreadedServer {
+@@ -3289,7 +3394,10 @@ struct ThreadedServer {
          ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
          ",\"databaseHomes\":" + std::to_string(databaseHomes) +
          ",\"nativeDatabaseReservedBytes\":" +
@@ -927,7 +927,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
          ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
          ",\"resettingHomes\":" + std::to_string(resettingHomes) +
          ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
-@@ -6099,41 +6207,18 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6251,41 +6359,18 @@ class NativeDatabaseHttp final: public kj::HttpService {
      if (alarm == kj::none && (method != kj::HttpMethod::POST || (!query && !execute))) {
        co_return co_await send(response, {404, "{\"error\":\"Not found\"}"});
      }
@@ -974,7 +974,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
          };
          bool timedOut = false;
          co_await readAndOpen().exclusiveJoin(state.io.provider->getTimer()
-@@ -6143,8 +6228,7 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6295,8 +6380,7 @@ class NativeDatabaseHttp final: public kj::HttpService {
          co_await open();
        }
      } catch (const kj::Exception& error) {
@@ -984,7 +984,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
      }
      if (reply.status != 0) co_return co_await send(response, std::move(reply));
      auto& database = *state.nativeDatabase;
-@@ -6166,8 +6250,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6318,8 +6402,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
        } else {
          const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
              ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
@@ -996,7 +996,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        }
      } catch (const kj::Exception& error) {
        reply = storageFailure(error);
-@@ -6209,6 +6294,50 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6361,6 +6446,50 @@ class NativeDatabaseHttp final: public kj::HttpService {
    server::DurableAdmission::Time sqlDeadline;
    bool used = false;
  
@@ -1047,7 +1047,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    static server::NativeSqlReply requestTooLarge() {
      return {413, server::nativeSqlFailure("REQUEST_TOO_LARGE"_kj, "a binding request is at most 40 MiB"_kj)};
    }
-@@ -6239,7 +6368,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6391,7 +6520,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
      headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
      auto reason = reply.status == 200 ? "OK" : reply.status == 400 ? "Bad Request"
          : reply.status == 404 ? "Not Found" : reply.status == 413 ? "Payload Too Large"
@@ -1057,7 +1057,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
      auto output = response.send(reply.status, reason, headers, reply.body.size());
      co_await output->write(kj::arrayPtr(reinterpret_cast<const kj::byte*>(reply.body.data()),
          reply.body.size()));
-@@ -6259,8 +6389,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6411,8 +6541,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
          home.memory = 0;
        }
        const auto openStarted = nowNs();
@@ -1072,7 +1072,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        kj::Own<server::DurableLogShipper> shipper;
        if (state.wal) {
          shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
-@@ -6270,7 +6405,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6422,7 +6557,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
          shipper->reportAlarm(server::readDurableAlarm(*connection));
        }
        state.nativeDatabase.emplace(ThreadState::NativeDatabase{
@@ -1082,7 +1082,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        });
        server.publishDurableRoot(state.durableHome, tree);
        server.reportNativeDatabaseMemory(
-@@ -6801,6 +6937,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -6953,6 +7089,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
    if (parent >= 0) {
      KJ_REQUIRE(add(parent), "could not monitor parent during startup");
    }
@@ -1092,7 +1092,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    auto pauseListener = [&]() {
      server.acceptFailures.fetch_add(1);
      if (listening) epoll_ctl(epoll, EPOLL_CTL_DEL, listener, nullptr);
-@@ -6814,20 +6953,41 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -6966,20 +7105,41 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
      std::optional<DurableRoute> durableRoute;
      Admission::Time durableDeadline{};
      Admission::Time sqlDeadline{};
@@ -1134,7 +1134,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
    for (;;) {
      if (!listening && nowNs() >= retryAt) {
        listening = add(listener);
-@@ -6844,6 +7004,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -6996,6 +7156,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
      }
      for (int i = 0; i < count; ++i) {
        auto fd = events[i].data.fd;
@@ -1147,7 +1147,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
        if (fd == parent) {
          char bytes[64];
          if (read(parent, bytes, sizeof(bytes)) == 0) _exit(0);
-@@ -6878,7 +7044,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7030,7 +7196,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
          // waiting credit. No request body belongs to the routing preface.
          char discarded;
          const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
@@ -1156,7 +1156,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
              server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
                  connection.durableDeadline, connection.sqlDeadline)) {
            epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
-@@ -6930,7 +7096,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7082,7 +7248,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
              auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
                  std::chrono::nanoseconds(deadlineNs)));
              const auto sqlDeadline = kj::min(deadline, Admission::Clock::now() + server::NATIVE_SQL_LIMIT);
@@ -1166,7 +1166,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
              if (result.ticket) {
                receipt = 'A';
                connection.durableCredit = *result.ticket;
-@@ -6938,6 +7105,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7090,6 +7257,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                connection.durableDeadline = deadline;
                connection.sqlDeadline = sqlDeadline;
                durableWaiting.emplace(result.ticket->event, fd);
@@ -1174,7 +1174,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
              } else if (result.status == Admission::Status::OVERLOADED) {
                receipt = 'R';
              } else if (result.status == Admission::Status::EXPIRED) {
-@@ -6946,8 +7114,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7098,8 +7266,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                receipt = 'I';
              }
            });
@@ -1185,7 +1185,7 @@ index ed4d6ccc8506d559c64251159e8fd4050256065f..421c3562076ce7021f6d0f21a77668b3
              closeConnection(found);
            }
            continue;
-@@ -7109,6 +7277,7 @@ int main(int argc, char **argv) {
+@@ -7261,6 +7429,7 @@ int main(int argc, char **argv) {
    const int listener = strtol(argv[1], nullptr, 10);
    ThreadedServer *server;
    try {

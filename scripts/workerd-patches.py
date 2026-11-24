@@ -295,6 +295,24 @@ def allowed_path(name, path):
                               'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite-metering.h',
                               'src/workerd/util/sqlite-metering.c++'} or
+                          name == '0130-ordinary-fatal-attribution.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0131-fatal-attribution-requires-invocation.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0132-fatal-record-test-constant.patch' and
+                              path == 'src/workerd/threaded/threaded-server-test.c++' or
+                          name == '0133-scope-fatal-attribution.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0134-keep-fatal-diagnostics-and-load-scopes.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/fatal-attribution.h',
+                              'src/workerd/threaded/fatal-attribution-test.c++',
+                              'src/workerd/threaded/fatal-attribution-scope-test.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

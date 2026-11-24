@@ -41,6 +41,47 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+### Fatal attribution with the test kernel
+
+In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
+kernel test. Then pass the test executable to the cluster runner from the product checkout.
+
+```sh
+(cd workerd && bazel build --config=release //src/workerd/threaded:coworkerd-threaded-fatal-test \
+  '//src/workerd/threaded:threaded-server-test@' && \
+  bazel test --config=release //src/workerd/threaded:fatal-attribution-test@ \
+    //src/workerd/threaded:fatal-attribution-scope-test@)
+for title in 'fatal record identifies' "the isolate's registered V8 fatal" \
+    'the ordinary role registers the process-wide'; do
+  line=$(grep -n -F "KJ_TEST(\"$title" workerd/src/workerd/threaded/threaded-server-test.c++ | cut -d: -f1)
+  workerd/bazel-bin/src/workerd/threaded/threaded-server-test@ --filter="threaded-server-test.c++:$line"
+done
+COWORKERD_CLUSTER_FATAL_TEST_BINARY="$PWD/workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded-fatal-test" \
+  node tests/cluster/run.mjs "$kernel" fatal-attribution
+```
+
+The fixture mounts a read-only controller directory into one node. The controller selects the process and
+Worker before issuing a normal HTTP call. The synthetic event hook exists only in the test executable. The first confirmed
+exit is an API check that V8 reports through the isolate's fatal handler, so the case also fails when another
+handler replaces the kernel's; the node logs V8's own location and message for it. The last one fails the same check
+while the Worker loads cold in a new quarantine process, after its top level ran, where only the load's own scope
+names the Worker.
+
+To measure concurrent recovery on a fresh three-node cluster with default membership and rebuild settings:
+
+```sh
+node tests/cluster/recovery.mjs "$kernel" 200 loss
+node tests/cluster/recovery.mjs "$kernel" 1000 loss
+node tests/cluster/recovery.mjs "$kernel" 200 restart
+```
+
+The fixture writes distinct values to objects on 16 shards owned by one node. It kills that node and reads
+back every confirmed value. The restart mode starts the same container on its original volume immediately
+after the kill. Output includes the time from the kill request to detection or restart readiness, first,
+median and last successful reads, and samples of lease and recovery counters. The 200-object loss case
+requires all reads within 55 seconds of detection. To time an earlier build without that assertion, set
+`COWORKERD_RECOVERY_MEASURE_BASELINE=1` and point `COWORKERD_CLUSTER_BIN_DIR` at its Linux binaries.
+
 ## Measured time and resources
 
 A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose
@@ -66,10 +107,12 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `long-sql-isolation` | One SQL query or one batch exceeds its deadline, a failed batch leaves a write, the Worker binding loses the limit code, or same-child probes fail or lack actual overlap. It always prints the quiet and busy samples and execution/confirmation intervals. Set `COWORKERD_ASSERT_LONG_SQL_ISOLATION=1` on a dedicated acceptance run to assert the 5 ms p99 increase. |
 | `sql-takeover-threaded` | A SQL write answers before peer confirmation, a lost reply after owner death lacks the uncertainty code, or a confirmed write is missing after takeover. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
-| `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
+| `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
+| `fatal-attribution` (test kernel) | A confirmed fatal exit fails to route the tenant's next call to quarantine, a peer fails to apply the suspect mark, a repeat exit affects the ordinary process, an unrelated tenant fails to recover, shared-cage exhaustion marks the last allocator, an exit through V8's own API check or one during the load stays unattributed, or V8's diagnostic is missing. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
 | `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
+| `durable-slow-holder` | A TCP relay delays the previous holder's peer replies past the recovery deadline while the holder keeps its lease. The successor reports the waiting object and holder, then reads the confirmed value after the relay releases the replies. |
 | `durable-threaded-mixed` | HTTP and RPC replies on a threaded owner wait for upstream peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives the threaded node's drain and fires upstream. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
 | `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |

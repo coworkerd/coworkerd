@@ -4,6 +4,7 @@
 
 #include "support.h"
 #include "json.h"
+#include "object-state.h"
 
 #include <kj/async-io.h>
 #include <kj/timer.h>
@@ -19,6 +20,87 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
+  static void recoveryAdmission() {
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    RecoveryGate metadata(clock, 2, 16, 4);
+    auto advance = [&](kj::Duration by) { clock.advanceTo(clock.now() + by); io.waitScope.poll(); };
+    auto one = metadata.acquire().wait(io.waitScope);
+    auto two = metadata.acquire().wait(io.waitScope);
+    auto three = metadata.acquire();
+    auto four = metadata.acquire();
+    auto five = metadata.acquire();
+    KJ_REQUIRE(metadata.active() == 2 && !three.poll(io.waitScope));
+    one = nullptr;
+    two = nullptr;
+    KJ_REQUIRE(three.poll(io.waitScope) && four.poll(io.waitScope));
+    three = nullptr;
+    four = nullptr;
+    KJ_REQUIRE(metadata.started() == 4 && metadata.active() == 0 && !five.poll(io.waitScope));
+    advance(62499 * kj::MICROSECONDS);
+    KJ_REQUIRE(!five.poll(io.waitScope), "the fifth request must wait for the first refill");
+    advance(kj::MICROSECONDS);
+    KJ_REQUIRE(five.poll(io.waitScope) && metadata.started() == 5 && metadata.peakActive() == 2);
+    five = nullptr;
+    advance(kj::SECONDS);
+    for (int i = 0; i != 4; ++i) metadata.acquire().wait(io.waitScope) = nullptr;
+    KJ_REQUIRE(!metadata.acquire().poll(io.waitScope), "an idle bucket refills to four tokens");
+
+    RecoveryGate connections(clock, 4);
+    std::vector<kj::Own<RecoveryGate::Permit>> connecting;
+    for (const char* target : {"one", "two", "three", "four"})
+      connecting.push_back(connections.acquire(target).wait(io.waitScope));
+    auto repeat = connections.acquire("one");
+    auto fifth = connections.acquire("five");
+    KJ_REQUIRE(!repeat.poll(io.waitScope) && !fifth.poll(io.waitScope) && connections.active() == 4);
+    connecting.back() = nullptr;
+    KJ_REQUIRE(fifth.poll(io.waitScope) && !repeat.poll(io.waitScope), "a busy target cannot block a healthy target");
+    connecting.front() = nullptr;
+    KJ_REQUIRE(repeat.poll(io.waitScope) && connections.peakActive() == 4);
+    repeat = nullptr;
+    fifth = nullptr;
+    connecting.clear();
+    KJ_REQUIRE(connections.active() == 0, "abandoning a fulfilled promise returns its permit");
+
+    struct Transport {
+      explicit Transport(kj::Own<kj::AsyncIoStream> stream): stream(kj::mv(stream)) {}
+      uint64_t getGeneration() const { return 2; }
+      bool markTailFailed() { return !std::exchange(failed, true); }
+      bool canFetchTails() const { return !failed; }
+      kj::Own<kj::AsyncIoStream> stream;
+      bool failed = false;
+    };
+    auto pipe = io.provider->newTwoWayPipe();
+    PeerConnectionReuse<Transport> cached;
+    cached.memberIdentity = "holder#19";
+    cached.generation = 2;
+    cached.connection = kj::rc<Transport>(kj::mv(pipe.ends[0]));
+    auto replication = KJ_ASSERT_NONNULL(cached.connection).addRef();
+    KJ_REQUIRE(!cached.markStale("holder#18", 2) && !cached.markStale("holder#19", 1) && !cached.stale);
+    unsigned marks = 0;
+    auto tail = bindDurableTailConnection(DurableTailTarget{"holder", "holder", "19", ""},
+        replication.addRef(), [](auto, DurableTailAsk, std::string) -> kj::Promise<DurableTailAnswer> {
+      return KJ_EXCEPTION(DISCONNECTED, "a test tail request failed");
+    }, [&](uint64_t generation) {
+      if (cached.markStale("holder#19", generation)) ++marks;
+    });
+    char byte = 0, sent = 'v';
+    auto reading = replication->stream->tryRead(&byte, 1, 1).eagerlyEvaluate(nullptr);
+    try {
+      tail->page({}).wait(io.waitScope);
+      KJ_FAIL_REQUIRE("the test tail should fail");
+    } catch (const kj::Exception& error) {
+      KJ_REQUIRE(error.getType() == kj::Exception::Type::DISCONNECTED);
+      tail->failed();
+    }
+    tail->failed();
+    KJ_REQUIRE(marks == 1 && cached.stale && cached.connection != kj::none && !tail->usable());
+    cached.connection = kj::none;  // A replacement has removed the stale cache entry.
+    tail.reset();
+    pipe.ends[1]->write(kj::arrayPtr(&sent, 1).asBytes()).wait(io.waitScope);
+    KJ_REQUIRE(reading.wait(io.waitScope) == 1 && byte == sent, "the existing stream survives a tail failure");
+  }
+
   static void parkedWebSocket() {
     using Socket = ParkedWebSocket;
     using Action = Socket::Frame::Action;
@@ -1255,7 +1337,7 @@ struct DurableLogChannelTest {
         "an ended upstream channel cannot block dispatch to the replacement");
     KJ_REQUIRE(closed.dispatchedChannel.empty());
     // The directory fixture has no remote history. Exercise the rebuild's decision before the storage read.
-    auto rebuild = log.rebuildAttempt(damaged.objectName, "upstream fixture recovery", 0);
+    auto rebuild = log.rebuild(damaged.objectName, "upstream fixture recovery", false);
     (void)rebuild.poll(io.waitScope);
     KJ_REQUIRE(damaged.state == DurableLog::ObjectState::REBUILDING && closeCalls == 0,
         "an ended upstream channel cannot make this rebuild reset live generations");
@@ -1845,6 +1927,10 @@ struct DurableLogChannelTest {
       const auto key = path.size() > 3 ? path.substr(3) : std::string();  // "/b/<key>"
       if (method == kj::HttpMethod::GET && query.find("list-type=2") != std::string::npos) {
         const auto prefix = decode(parameter(query, "prefix"));
+        if (auto gate = reads.find(prefix); gate != reads.end()) {
+          heldReads.insert(prefix);
+          co_await gate->second.addBranch();
+        }
         std::string xml = "<ListBucketResult><IsTruncated>false</IsTruncated>";
         for (const auto& [name, bytes] : objects) {
           if (!name.starts_with(prefix)) continue;
@@ -1855,6 +1941,10 @@ struct DurableLogChannelTest {
         co_return;
       }
       if (method == kj::HttpMethod::GET) {
+        if (unreadable.contains(key)) {
+          co_await send(response, 503, "");
+          co_return;
+        }
         auto found = objects.find(key);
         co_await send(response, found == objects.end() ? 404 : 200, found == objects.end() ? std::string() : found->second);
         co_return;
@@ -1880,7 +1970,11 @@ struct DurableLogChannelTest {
       co_await send(response, 200, "");
     }
     std::map<std::string, std::string> objects;
+    std::set<std::string> unreadable;
+    std::map<std::string, kj::ForkedPromise<void>> reads;
+    std::set<std::string> heldReads;
     std::string hold, fail;
+    bool sendStoreTimes = false;
     uint32_t held = 0, failed = 0, written = 0;
     kj::Own<kj::PromiseFulfiller<void>> parked;
     kj::PromiseFulfillerPair<void> gate = kj::newPromiseAndFulfiller<void>();
@@ -1905,12 +1999,388 @@ struct DurableLogChannelTest {
     }
     kj::Promise<void> send(Response& response, uint32_t status, std::string text) {
       kj::HttpHeaders out(table);
+      if (sendStoreTimes) {
+        out.add("Date", "Fri, 20 Nov 2026 00:00:10 GMT");
+        out.add("Last-Modified", "Fri, 20 Nov 2026 00:00:00 GMT");
+      }
       auto stream = response.send(status, status == 200 ? "OK" : "Error", out, uint64_t(text.size()));
       if (!text.empty()) co_await stream->write(kj::arrayPtr(text.data(), text.size()).asBytes());
     }
     const kj::HttpHeaderTable& table;
     kj::HttpHeaderId ifNoneMatch;
   };
+
+  static void recoveryRequeue() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-recovery-queue-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    kj::HttpHeaderTable::Builder builder;
+    auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(timer, *table, store);
+    auto listening = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.bucket = "b";
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    const std::string ns(64, 'a');
+    store.objects[shardEpochKey(ns, 1, 2)] = shardEpochJson(
+        {ns, "new", "timeout", "new-instance", "nonce", "old", 1, 2, 9, 2, 1, 1, 7});
+    store.objects[shardEpochKey(ns, 1, 1)] = shardEpochJson(
+        {ns, "old", "first", "old-instance", "nonce", "", 1, 1, 7, 1, 1});
+    store.objects[memberRegistrationKey("old", 7)] = memberRecordJson({"old", "old:8934", "active", "old-instance", 7});
+    auto owner = kj::newPromiseAndFulfiller<void>();
+    auto ownerReply = owner.promise.fork();
+    unsigned ownerCalls = 0;
+    DurableLog::Hooks hooks;
+    hooks.fetchTail = [&](std::string node, DurableTailAsk) -> kj::Promise<DurableTailAnswer> {
+      KJ_REQUIRE(node == "old");
+      ++ownerCalls;
+      co_await ownerReply.addBranch();
+      co_return DurableTailAnswer{.ownerConfirmed = true};
+    };
+    DurableLog::Settings settings{"new", "new-instance", temp, {}};
+    settings.config.rebuildConcurrency = 1;
+    DurableLog log(settings, config, io.provider->getNetwork(), timer, *io.lowLevelProvider, membership, std::move(hooks));
+    log.nodeEpoch = 9;
+    std::filesystem::create_directories(log.logDirectory());
+    KJ_REQUIRE(log.initializeRecovery());
+
+    auto until = [&](const char* phase, auto predicate) {
+      auto end = timer.now() + 4 * kj::SECONDS;
+      while (!predicate() && timer.now() < end) timer.afterDelay(5 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(predicate(), "rebuild did not reach the expected phase", phase, ownerCalls, log.json().c_str());
+    };
+    auto id = [&](char digit) { return DurableLog::ObjectIdentity{ns, std::string(64, digit), "", 2, 2, 1}; };
+    auto name = [&](char digit) { return durableHostName(ns, id(digit).objectId, 2); };
+    auto open = [&](char digit, bool background) {
+      return log.openObject(id(digit), false, background, false).wait(io.waitScope);
+    };
+    auto holdManifest = [&](char digit) {
+      const auto prefix = objectManifestPrefix(ns, id(digit).objectId) + "/";
+      auto gate = kj::newPromiseAndFulfiller<void>();
+      store.reads.emplace(prefix, gate.promise.fork());
+      return std::pair(prefix, kj::mv(gate.fulfiller));
+    };
+    auto cancel = [&](char digit) { log.rebuildCancelers.at(name(digit))->cancel("fixture cancellation"); };
+    auto check = [&](uint32_t active, uint32_t background) {
+      KJ_REQUIRE(log.activeRebuilds == active && log.activeBackgroundRebuilds == background &&
+          background <= active && active <= settings.config.rebuildConcurrency);
+    };
+
+    auto first = holdManifest('1');
+    KJ_REQUIRE(open('1', true).code == "DO_ALARM_REBUILDING");
+    until("initial manifest read", [&] { return store.heldReads.contains(first.first); });
+    check(1, 1);
+    KJ_REQUIRE(open('2', true).code == "DO_ALARM_REBUILDING");
+    KJ_REQUIRE(log.queuedRebuildIndex.contains(name('2')));
+    cancel('2');
+    check(1, 1);
+    KJ_REQUIRE(!log.queuedRebuildIndex.contains(name('2')));
+    first.second->fulfill();
+    until("tail wait", [&] { return ownerCalls == 1 && log.rebuildRuns.at(name('1'))->parkedAtMs != 0; });
+    check(0, 0);
+    KJ_REQUIRE(log.objectOf(name('1'))->state == DurableLog::ObjectState::REBUILDING);
+    KJ_REQUIRE(open('1', false).code == "DO_ALARM_REBUILDING");
+    KJ_REQUIRE(!log.rebuildRuns.at(name('1'))->background && log.backgroundRebuildMetadataBytes == 0);
+
+    auto blocker = holdManifest('3');
+    KJ_REQUIRE(open('3', false).code == "DO_ALARM_REBUILDING");
+    until("held foreground preparation", [&] { return store.heldReads.contains(blocker.first); });
+    check(1, 0);
+    owner.fulfiller->fulfill();
+    until("replay admission", [&] { return log.queuedRebuildIndex.contains(name('1')); });
+    KJ_REQUIRE(log.rebuildRuns.at(name('1'))->phase == DurableLog::RebuildPhase::RESUMING);
+    cancel('3');
+    check(1, 0);  // The waking rebuild owns the slot before its coroutine resumes.
+    cancel('1');
+    check(0, 0);
+    KJ_REQUIRE(log.rebuildRuns.empty() && log.queuedRebuildIndex.empty() && log.rebuildMetadataBytes == 0);
+
+    owner = kj::newPromiseAndFulfiller<void>();
+    ownerReply = owner.promise.fork();
+    KJ_REQUIRE(open('4', true).code == "DO_ALARM_REBUILDING");
+    until("second tail wait", [&] { return ownerCalls == 2; });
+    check(0, 0);
+    cancel('4');
+    check(0, 0);
+    KJ_REQUIRE(log.rebuildMetadataBytes == 0 && log.backgroundRebuildMetadataBytes == 0);
+
+    // Hold/cancel a real preparation after filling the background share with
+    // queued jobs. A request can still enter the foreground queue.
+    auto budgetBlocker = holdManifest('5');
+    log.rebuildMetadataLimit = 4 * DurableLog::REBUILD_ENTRY_BYTES;
+    for (char digit : {'5', '6', '7'}) KJ_REQUIRE(open(digit, true).code == "DO_ALARM_REBUILDING");
+    KJ_REQUIRE(open('8', true).code == "DO_RECOVERING");
+    KJ_REQUIRE(open('9', false).code == "DO_ALARM_REBUILDING" && log.queuedRebuildIndex.contains(name('9')));
+    for (char digit : {'9', '7', '6', '5'}) cancel(digit);
+    check(0, 0);
+
+    // Let entry admission succeed and exhaust the remaining bytes inside
+    // fetchTails. The real open must surface a retryable recovery refusal.
+    log.rebuildMetadataLimit = DurableLog::REBUILD_ENTRY_BYTES + 32;
+    const auto refused = log.openObject(id('a'), false).wait(io.waitScope);
+    KJ_REQUIRE(!refused.ready && refused.status == 503 && refused.code == "DO_RECOVERING" &&
+        log.rebuildMetadataRefusals == 2 && log.rebuildMetadataBytes == 0);
+
+    const auto memberKey = memberRegistrationKey("old", 7);
+    store.unreadable.insert(memberKey);
+    log.recoveryDiscoveryAtMs = 0;
+    const auto discovery = log.tailTargets().wait(io.waitScope);
+    KJ_REQUIRE(discovery->addresses.contains("old/7@old:8934") && discovery->unresolved.contains(memberKey),
+        "a failed later discovery preserves a previously known holder");
+  }
+
+  static LogRecord recoveryPage(const std::string& name, const std::string& page) {
+    auto record = testRecord(name.substr(0, 64), 7, 1, 1, 1);
+    record.objectName = name;
+    record.kind = LogRecordKind::FRAMES;
+    record.pageSize = page.size();
+    record.frames = record.firstFrame = record.commits = record.generation = 1;
+    auto setWord = [](std::string& bytes, size_t at, uint32_t word) {
+      for (unsigned i = 0; i < 4; ++i) bytes[at + i] = char(word >> (24 - 8 * i));
+    };
+    auto word = [](const std::string& bytes, size_t at) {
+      uint32_t value = 0;
+      for (unsigned i = 0; i < 4; ++i) value = (value << 8) | uint8_t(bytes[at + i]);
+      return value;
+    };
+    uint32_t first = 0, second = 0;
+    auto checksum = [&](const std::string& bytes, size_t at, size_t end) {
+      for (; at < end; at += 8) {
+        first += word(bytes, at) + second;
+        second += word(bytes, at + 4) + first;
+      }
+    };
+    record.header.resize(32);
+    setWord(record.header, 0, 0x377f0683);
+    setWord(record.header, 4, 3007000);
+    setWord(record.header, 8, page.size());
+    checksum(record.header, 0, 24);
+    setWord(record.header, 24, first);
+    setWord(record.header, 28, second);
+    record.frameBytes.resize(24);
+    setWord(record.frameBytes, 0, 1);  // page one
+    setWord(record.frameBytes, 4, 1);  // one page at commit
+    checksum(record.frameBytes, 0, 8);
+    checksum(page, 0, page.size());
+    setWord(record.frameBytes, 16, first);
+    setWord(record.frameBytes, 20, second);
+    record.frameBytes += page;
+    return record;
+  }
+
+  static void recoveryFinalPerObject() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-recovery-page-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    kj::HttpHeaderTable::Builder builder;
+    auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(timer, *table, store);
+    auto listening = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.bucket = "b";
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    const std::string ns(64, 'c'), slow(64, '1'), healthy(64, '2'), page(512, 'v');
+    store.objects[shardEpochKey(ns, 1, 2)] = shardEpochJson(
+        {ns, "new", "timeout", "new-instance", "nonce", "old", 1, 2, 9, 2, 1, 1, 7});
+    store.objects[shardEpochKey(ns, 1, 1)] = shardEpochJson(
+        {ns, "old", "first", "old-instance", "nonce", "", 1, 1, 7, 1, 1});
+    store.objects[memberRegistrationKey("old", 7)] = memberRecordJson({"old", "old:8934", "active", "old-instance", 7});
+    store.objects[memberRegistrationKey("peer", 8)] = memberRecordJson({"peer", "peer:8934", "active", "peer-instance", 8});
+    auto started = kj::newPromiseAndFulfiller<void>();
+    auto bothBorrowed = kj::newPromiseAndFulfiller<void>();
+    bool failed = false;
+    unsigned firstBorrows = 0, replacements = 0, healthyPages = 0;
+    std::shared_ptr<DurableTailConnection> first;
+    DurableLog::Hooks hooks;
+    hooks.connectTail = [&](DurableTailTarget target, DurableTailRound round)
+        -> kj::Promise<std::shared_ptr<DurableTailConnection>> {
+      if (target.nodeId == "old") throw KJ_EXCEPTION(DISCONNECTED, "the source owner is gone");
+      KJ_REQUIRE(round.final);
+      if (!failed) {
+        if (!first) {
+          first = std::make_shared<DurableTailConnection>();
+          first->target = target;
+          first->generation = 1;
+          first->usable = [&] { return !failed; };
+          first->failed = [&] { failed = true; };
+          first->page = [&](DurableTailAsk ask) -> kj::Promise<DurableTailAnswer> {
+            KJ_REQUIRE(ask.objectId == slow && started.fulfiller->isWaiting());
+            started.fulfiller->fulfill();
+            co_await kj::Promise<void>(kj::NEVER_DONE);
+            KJ_UNREACHABLE;
+          };
+        }
+        if (++firstBorrows == 2) bothBorrowed.fulfiller->fulfill();
+        co_return first;
+      }
+      ++replacements;
+      auto replacement = std::make_shared<DurableTailConnection>();
+      replacement->target = target;
+      replacement->generation = 2;
+      replacement->page = [&](DurableTailAsk ask) -> kj::Promise<DurableTailAnswer> {
+        KJ_REQUIRE(ask.objectId == healthy);
+        ++healthyPages;
+        co_return DurableTailAnswer{.records = {recoveryPage(ns + "/" + healthy, page)},
+            .firstSeq = 1, .lastSeq = 1, .count = 1};
+      };
+      co_return replacement;
+    };
+    DurableLog::Settings settings{"new", "new-instance", temp, {}, true, 0, 1000};
+    settings.config.confirmTimeoutMs = 100;
+    settings.config.peerBufferBytes = 1u << 20;
+    settings.config.recoverParallelism = 1;
+    DurableLog log(settings, config, io.provider->getNetwork(), timer, *io.lowLevelProvider, membership, std::move(hooks));
+    log.nodeEpoch = 9;
+    std::filesystem::create_directories(log.logDirectory());
+    KJ_REQUIRE(log.initializeRecovery());
+    auto a = log.openObject({ns, slow, "", 2, 2, 1}, false).eagerlyEvaluate(nullptr);
+    timer.timeoutAfter(5 * kj::SECONDS, kj::mv(started.promise)).wait(io.waitScope);
+    auto b = log.openObject({ns, healthy, "", 2, 2, 1}, false).eagerlyEvaluate(nullptr);
+    timer.timeoutAfter(5 * kj::SECONDS, kj::mv(bothBorrowed.promise)).wait(io.waitScope);
+    KJ_REQUIRE(!failed && log.tailPages.active() == 1, "both objects borrow the same connection before its failure");
+    KJ_REQUIRE(a.wait(io.waitScope).ready && b.wait(io.waitScope).ready);
+    KJ_REQUIRE(failed && replacements == 1 && healthyPages == 1, "the queued object gets its own final page");
+    const auto* image = log.objectOf(durableHostName(ns, healthy, 2));
+    std::ifstream file(log.databasePath(*image, 0), std::ios::binary);
+    KJ_REQUIRE(std::string(std::istreambuf_iterator<char>(file), {}) == page,
+        "the second object's only surviving page is in its rebuilt image");
+  }
+
+  static void recoveryCollection(bool live, bool local = false) {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-recovery-test-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    kj::HttpHeaderTable::Builder builder;
+    const auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    store.sendStoreTimes = true;
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(timer, *table, store);
+    auto listening = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.bucket = "b";
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("9");
+    membership.grantedTtlSeconds = 15;
+    membership.livenessGraceMs = 10000;
+    const std::string ns(64, 'b'), id(64, '1');
+    store.objects[shardEpochKey(ns, 1, 2)] = shardEpochJson(
+        {ns, "new", "timeout", "new-instance", "nonce", local ? "new" : "old", 1, 2, 9, local ? 1u : 2u, 1, 1, 7});
+    store.objects[shardEpochKey(ns, 1, 1)] = shardEpochJson(
+        {ns, local ? "new" : "old", "first", "old-instance", "nonce", "", 1, 1, 7, 1, 1});
+    store.objects[memberRegistrationKey("old", 7)] = memberRecordJson({"old", "old:8934", "active", "old-instance", 7});
+    store.objects[memberRegistrationKey("peer", 8)] = memberRecordJson({"peer", "peer:8934", "active", "peer-instance", 8});
+    if (live)
+      store.objects[memberHeartbeatKey("old", 7)] = store.objects.at(memberRegistrationKey("old", 7));
+    auto ownerReply = kj::newPromiseAndFulfiller<void>();
+    auto ownerReady = ownerReply.promise.fork();
+    unsigned peerCalls = 0, earlyFinalCalls = 0, ownerFailures = 0, ownerCalls = 0;
+    bool ownerReleased = false;
+    const auto started = monotonicTimeMs();
+    constexpr unsigned WAIT_MS = 300;
+    DurableLog::Hooks hooks;
+    hooks.connectTail = [&](DurableTailTarget target, DurableTailRound round) -> kj::Promise<std::shared_ptr<DurableTailConnection>> {
+      auto handle = std::make_shared<DurableTailConnection>();
+      handle->target = target;
+      handle->generation = 1;
+      handle->failed = [&] { ++ownerFailures; };
+      handle->page = [&, target, round](DurableTailAsk ask) -> kj::Promise<DurableTailAnswer> {
+        if (target.nodeId == "old") {
+          ++ownerCalls;
+          if (live) {
+            if (ask.afterSeq == 0) {
+              auto first = testRecord(ns, 7, 1, 1, 1);
+              first.objectName = ns + "/" + id;
+              co_return DurableTailAnswer{.records = {std::move(first)}, .firstSeq = 1, .lastSeq = 1,
+                  .count = 1, .more = true, .ownerConfirmed = true};
+            }
+            if (!ownerReleased) {
+              co_return DurableTailAnswer{.refusal = "the owner has not finished preparing its answer"};
+            }
+            co_await ownerReady.addBranch();
+            co_return DurableTailAnswer{.ownerConfirmed = true};
+          }
+          throw KJ_EXCEPTION(DISCONNECTED, "test owner transport failed");
+        }
+        if (round.final) {
+          ++peerCalls;
+          if (monotonicTimeMs() < started + WAIT_MS) ++earlyFinalCalls;
+        }
+        co_return DurableTailAnswer{};
+      };
+      co_return handle;
+    };
+    DurableLog log({"new", "new-instance", temp, {}, true, WAIT_MS}, config, io.provider->getNetwork(),
+        timer, *io.lowLevelProvider, membership, std::move(hooks));
+    log.nodeEpoch = 9;
+    const auto dataEpoch = local ? 1u : 2u;
+    const auto name = durableHostName(ns, id, dataEpoch);
+    auto& object = log.objects[name];
+    object.namespaceId = ns;
+    object.objectId = id;
+    object.objectName = name;
+    object.shard = 1;
+    object.shardEpoch = 2;
+    object.dataEpoch = dataEpoch;
+    object.state = DurableLog::ObjectState::REBUILDING;
+    DurableLog::RebuildRun run;
+    std::optional<ObjectManifest> manifest;
+    if (local) {
+      log.diskTrusted = log.sameBootCache = true;
+      log.predecessorLogs[7].complete = true;
+      run.reserved = true;
+      auto prepared = kj::newPromiseAndFulfiller<bool>();
+      auto collection = log.fetchTails({ns, id, "", dataEpoch, 2, 1}, manifest, started, run,
+          kj::mv(prepared.fulfiller)).eagerlyEvaluate(nullptr);
+      KJ_REQUIRE(timer.timeoutAfter(5 * kj::SECONDS, kj::mv(prepared.promise)).wait(io.waitScope),
+          "a trusted restart with complete local evidence keeps its preparation slot");
+      KJ_REQUIRE(!collection.wait(io.waitScope).cut && log.recoveryMetadata.started() == 0 &&
+          ownerCalls == 0 && peerCalls == 0, "local evidence needs no waiting-recovery probes");
+      return;
+    }
+    auto collection = log.fetchTails({ns, id, "", 2, 2, 1}, manifest, started, run).eagerlyEvaluate(nullptr);
+    if (live) {
+      const auto limit = timer.now() + 3 * kj::SECONDS;
+      while (log.cutsHeldOwnerLive == 0 && timer.now() < limit) timer.afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(!collection.poll(io.waitScope) && log.cutsHeldOwnerLive == 1 && run.owner == "old" && peerCalls == 0);
+      KJ_REQUIRE(object.recoveryTails.size() == 1, "the incomplete proof retains its verified prefix while waiting");
+      // Release the final page of the owner's proof.
+      ownerReleased = true;
+      ownerReply.fulfiller->fulfill();
+    }
+    const auto result = timer.timeoutAfter(5 * kj::SECONDS, kj::mv(collection)).wait(io.waitScope);
+    KJ_REQUIRE(ownerCalls > 0 && result.cut != live && earlyFinalCalls == 0);
+    if (!live) KJ_REQUIRE(peerCalls > 0 && ownerFailures > 0, "a real tail failure marks the transfer handle");
+    else KJ_REQUIRE(peerCalls == 0 && ownerFailures == 0);
+    log.rebuildMetadataBytes -= run.metadataBytes;
+    log.rebuildMetadataBytes = DurableLog::REBUILD_METADATA_LIMIT;
+    const auto ready = log.openObject({ns, std::string(64, '2'), "", 2, 2, 1}, false).wait(io.waitScope);
+    KJ_REQUIRE(!ready.ready && ready.status == 503 && ready.code == "DO_RECOVERING" && log.rebuildMetadataRefusals == 1);
+  }
 
   static void publishGate() {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-publish-gate-test-XXXXXX").string();
@@ -2024,6 +2494,11 @@ int main(int argc, char* argv[]) {
   else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
+  else if (mode == "recovery-admission") coworkerd::DurableLogChannelTest::recoveryAdmission();
+  else if (mode == "recovery-requeue") coworkerd::DurableLogChannelTest::recoveryRequeue();
+  else if (mode == "recovery-final-per-object") coworkerd::DurableLogChannelTest::recoveryFinalPerObject();
+  else if (mode == "recovery-final-round" || mode == "recovery-live-owner" || mode == "recovery-local-restart")
+    coworkerd::DurableLogChannelTest::recoveryCollection(mode == "recovery-live-owner", mode == "recovery-local-restart");
   else if (mode == "restored-tail" || mode == "restored-tail-negative")
     coworkerd::DurableLogChannelTest::restoredTail(mode == "restored-tail-negative");
   else coworkerd::DurableLogChannelTest::run(mode == "index");
