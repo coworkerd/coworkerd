@@ -777,7 +777,8 @@ kj::Promise<bool> DatabaseReplay::finishAsync() {
 namespace {
 // Messages from a durable process (patches/workerd 0013, coworkerd-wal-shipper.h).
 constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOINT = 4, FROM_RESET = 5,
-                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10;
+                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10,
+                  FROM_ACTOR_RESET = 11;
 // Messages to one.
 constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6,
                   TO_OPENED = 7, TO_CLOSE_FOR_CODE_UPDATE = 8;
@@ -2207,7 +2208,14 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
         putU64(opened, openId);
         putU8(opened, authorized ? ACK_OK : ACK_UNAVAILABLE);
         sendToChannel(channel, std::move(opened));
-        if (fenced && facetId == 0) askClose(channel, openId);
+        if (fenced && facetId == 0) {
+          if (const auto deadline = object->definitionDrainDeadline;
+              deadline != kj::none && timer.now() >= KJ_ASSERT_NONNULL(deadline)) {
+            askCodeUpdateClose(channel, channel.openFacets.at(key), *object);
+          } else {
+            askClose(channel, openId);
+          }
+        }
       }
       return;
     }
@@ -2358,6 +2366,17 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       const auto atUnixMs = in.u64();
       if (!in.ok) return;
       alarmReported(objectName, facetId, set ? atUnixMs : 0);
+      return;
+    }
+    case FROM_ACTOR_RESET: {
+      const auto objectName = in.text();
+      const auto code = in.text();
+      if (!in.ok || in.at != message.size() || openId == 0 ||
+          !isCurrentOpen(objectName + "/0")) return;
+      const auto* object = objectOf(objectName);
+      if (object == nullptr || object->dispatchedChannel != channel.processId || !actorResetHook) return;
+      actorResetHook({object->namespaceId, object->objectId, object->tenant, object->dataEpoch,
+          object->shardEpoch, object->shard}, code);
       return;
     }
     case FROM_RESIDENCY: {
@@ -4642,16 +4661,18 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
     if (old != channels.end()) {
       if (auto open = old->second.openFacets.find(object->objectName + "/0"); open != old->second.openFacets.end())
         askClose(old->second, open->second.id);
-      const bool holdsCalls = hasLiveHolders(*object);
-      if (!old->second.open || hasLiveOpenFacets(*object) || holdsCalls || object->dispatchPending) {
+      const bool closeUnacknowledged =
+          !old->second.open || hasLiveOpenFacets(*object) || object->dispatchPending;
+      if (closeUnacknowledged || hasLiveHolders(*object)) {
         if (object->definitionDrainDeadline == kj::none) {
           auto deadline = timer.now() + settings.config.versionDrainTimeoutMs * kj::MILLISECONDS;
           object->definitionDrainDeadline = deadline;
           tasks.add(endDefinitionDrain(object->objectName, old->first, deadline));
         }
         ObjectReady result{false, 503, "DO_VERSION_DRAINING", "the previous Durable Object definition is draining"};
-        result.generationMustClose = timer.now() >= KJ_ASSERT_NONNULL(object->definitionDrainDeadline) +
-            settings.config.confirmTimeoutMs * kj::MILLISECONDS;
+        result.generationMustClose = closeUnacknowledged &&
+            timer.now() >= KJ_ASSERT_NONNULL(object->definitionDrainDeadline) +
+                settings.config.confirmTimeoutMs * kj::MILLISECONDS;
         return result;
       }
     }
@@ -4956,8 +4977,8 @@ kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectNa
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
 }
 
-std::optional<std::string> DurableLog::authorizeSocketOpen(const ObjectIdentity& identity,
-    uint64_t generation, uint64_t openId) const {
+std::optional<DurableLog::SocketOpenAuthority> DurableLog::authorizeSocketOpen(
+    const ObjectIdentity& identity, uint64_t generation, uint64_t openId) {
   const auto key = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
   auto found = objects.find(key);
   const auto* object = found == objects.end() ? nullptr : &found->second;
@@ -4970,7 +4991,8 @@ std::optional<std::string> DurableLog::authorizeSocketOpen(const ObjectIdentity&
   auto registration = channel->second.openFacets.find(key + "/0");
   if (registration == channel->second.openFacets.end() || registration->second.id != openId)
     return std::nullopt;
-  return channel->first.substr(0, channel->first.rfind('-'));
+  return SocketOpenAuthority{channel->first.substr(0, channel->first.rfind('-')),
+      registration->second.socketPark};
 }
 
 void DurableLog::askClose(Channel& channel, uint64_t openId) {
@@ -4979,6 +5001,16 @@ void DurableLog::askClose(Channel& channel, uint64_t openId) {
   putU8(message, TO_CLOSE);
   putU64(message, openId);
   sendToChannel(channel, std::move(message));
+}
+
+void DurableLog::askCodeUpdateClose(Channel& channel, Channel::Open& root, const Object& object) {
+  if (root.codeUpdateAsked) return;
+  root.codeUpdateAsked = true;
+  std::string message;
+  putU8(message, TO_CLOSE_FOR_CODE_UPDATE);
+  putU64(message, root.id);
+  sendToChannel(channel, std::move(message));
+  log("version-drain-expired", "\"object\":" + quote(object.objectName));
 }
 
 kj::Promise<void> DurableLog::endDefinitionDrain(std::string objectName, std::string channelId,
@@ -4990,12 +5022,9 @@ kj::Promise<void> DurableLog::endDefinitionDrain(std::string objectName, std::st
   auto channel = channels.find(channelId);
   if (channel == channels.end() || !channel->second.open) co_return;
   auto root = channel->second.openFacets.find(objectName + "/0");
-  if (root == channel->second.openFacets.end()) co_return;
-  std::string message;
-  putU8(message, TO_CLOSE_FOR_CODE_UPDATE);
-  putU64(message, root->second.id);
-  sendToChannel(channel->second, std::move(message));
-  log("version-drain-expired", "\"object\":" + quote(objectName));
+  // An open still preparing its WAL registers separately. The registration
+  // path checks this same deadline before accepting that open.
+  if (root != channel->second.openFacets.end()) askCodeUpdateClose(channel->second, root->second, *object);
 }
 
 kj::Promise<bool> DurableLog::closeThreadedObject(const std::string& objectName) {

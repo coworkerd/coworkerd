@@ -52,6 +52,8 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(!socket.authorized(owner, next));
     socket.adopt(owner, next);
     KJ_REQUIRE(socket.authorized(owner, next));
+    KJ_REQUIRE(socket.adoptable(owner, next) == restored);
+    KJ_REQUIRE(!socket.adoptable(owner, first));
     KJ_REQUIRE(socket.complete(owner, wake.position));
     KJ_REQUIRE(!socket.park(owner, first, wake.position, saved));
     KJ_REQUIRE(socket.park(owner, next, wake.position, saved));
@@ -1432,8 +1434,42 @@ struct DurableLogChannelTest {
     clock.advanceTo(forcedAt);
     expectReply(8, 24);
     close(24, 16384);
+    clock.advanceTo(forcedAt + 5 * kj::SECONDS);
+    const auto acknowledged = log.checkObjectDispatch(identity, "d0", 7, "third-definition");
+    KJ_REQUIRE(acknowledged.code == "DO_VERSION_DRAINING" && !acknowledged.generationMustClose,
+        "an acknowledged close does not replace the process while the last call unwinds");
     log.objectRequestFinished(identity, "d0", 7);
     KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "third-definition").ready);
+    log.objectDispatched(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "fourth-definition").code == "DO_VERSION_DRAINING");
+    clock.advanceTo(clock.now() + 30 * kj::SECONDS);
+    {
+      kj::byte unexpected;
+      KJ_REQUIRE(!child->tryRead(&unexpected, 1, 1).poll(io.waitScope),
+          "the deadline has no open ID to address until the root registers");
+    }
+    open(28);
+    expectReply(7, 28, 1);
+    expectReply(8, 28);
+    unsigned resetReports = 0;
+    log.setActorResetHook([&](const DurableLog::ObjectIdentity& reset, std::string_view code) {
+      KJ_REQUIRE(reset.namespaceId == ns && reset.objectId == id && reset.dataEpoch == 1);
+      KJ_REQUIRE(code == "CPU_LIMIT_EXCEEDED");
+      ++resetReports;
+    });
+    const auto reportReset = [&](uint64_t openId) {
+      std::string body(1, char(11));
+      integer(body, openId, 8);
+      text(body, name);
+      text(body, "CPU_LIMIT_EXCEEDED");
+      log.onMessage(channel, body);
+    };
+    reportReset(24);
+    reportReset(28);
+    KJ_REQUIRE(resetReports == 1, "only the latest open can report an actor reset");
+    close(28, 16384);
+    log.objectRequestFinished(identity, "d0", 7);
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 7, "fourth-definition").ready);
     log.objectDispatched(identity, "d0", 7);
     bool namespaceActive = true;
     log.setNamespaceHook([&](const std::string&) { return namespaceActive; });

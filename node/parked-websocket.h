@@ -59,6 +59,7 @@ public:
       snapshot.autoResponseTime = this->snapshot.autoResponseTime;
     this->snapshot = std::move(snapshot);
     home.reset();
+    adopted = false;
     return true;
   }
 
@@ -74,8 +75,15 @@ public:
     return expected == owner && !home && !closed ? &snapshot : nullptr;
   }
 
+  const Snapshot* adoptable(Owner expected, const Home& replacement) const {
+    return alive(expected) && (!home || (adopted && home == replacement)) ? &snapshot : nullptr;
+  }
+
   void adopt(Owner expected, Home replacement) {
-    if (parked(expected)) home = std::move(replacement);
+    if (parked(expected)) {
+      home = std::move(replacement);
+      adopted = true;
+    }
   }
 
   const auto& automatic() const { return automaticResponse; }
@@ -132,6 +140,7 @@ private:
   uint64_t lastFrame = 0, lastApplicationFrame = 0;
   std::optional<uint64_t> pendingApplication, pendingAnswer;
   bool closed = false;
+  bool adopted = false;
 };
 
 }  // namespace coworkerd

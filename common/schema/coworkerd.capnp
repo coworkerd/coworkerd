@@ -117,8 +117,10 @@ struct ThreadedSocketOpen @0x807618c69c531b73 {
 interface ThreadedSocketControl @0xdc432f018090bcc4 {
   send @0 (authority :ThreadedSocketAuthority, frame :ThreadedSocketFrame) -> () $Cxx.allowCancellation;
   setAutoResponse @1 (authority :ThreadedSocketAuthority, enabled :Bool, request :Text, response :Text) -> (accepted :Bool);
-  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot)) -> (accepted :Bool);
-  adopt @3 (open :ThreadedSocketOpen) -> (sockets :List(ThreadedSocketSnapshot));
+  park @2 (open :ThreadedSocketOpen, sockets :List(ThreadedSocketSnapshot), attempt :UInt64)
+      -> (accepted :Bool) $Cxx.allowCancellation;
+  adopt @3 (open :ThreadedSocketOpen) -> (sockets :List(ThreadedSocketSnapshot)) $Cxx.allowCancellation;
+  resolvePark @4 (open :ThreadedSocketOpen, attempt :UInt64) -> (accepted :Bool);
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {

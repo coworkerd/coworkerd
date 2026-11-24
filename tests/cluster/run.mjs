@@ -55,9 +55,10 @@ async function main(args) {
     if (regular.length) {
       failed += await runSuite(regular, kernel, controller.signal);
     }
-    for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs }] of gated) {
+    for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
+        controlDurableLifecycle,
       });
     }
     console.log(`${regular.length + gated.length} executed, ${failed} failed`);

@@ -262,6 +262,17 @@ def allowed_path(name, path):
                               'src/workerd/io/actor-sqlite.h',
                               'src/workerd/io/actor-sqlite-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0106-complete-threaded-lifecycle-transitions.patch' and path in {
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/api/web-socket.h',
+                              'src/workerd/io/io-context.c++',
+                              'src/workerd/io/io-context.h',
+                              'src/workerd/io/legacy-hibernation-manager.c++',
+                              'src/workerd/io/legacy-hibernation-manager.h',
+                              'src/workerd/io/worker.c++',
+                              'src/workerd/io/worker.h',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

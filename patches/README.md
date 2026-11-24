@@ -50,6 +50,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `io/legacy-hibernation-manager.{h,c++}` connect native upgrades, attachments and handler delivery
   to the threaded server's private socket control protocol.
   Patch 0105 sends a targeted code-update reset over the threaded WAL channel when a definition drain expires.
+  Patch 0106 transfers sockets before canceling expired work, reports actor resets on the same WAL channel,
+  and bounds socket-control calls. Its API and I/O hooks keep pairs local until an actual upgrade and account
+  for their transport separately from pending application work.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
