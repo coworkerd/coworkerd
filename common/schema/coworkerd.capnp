@@ -105,6 +105,9 @@ struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
   facetId @10 :UInt32;
 }
 
+const threadedSocketFacetMaxWords :UInt32 = 8192;  # 64 KiB
+const threadedSocketTreeMaxWords :UInt32 = 131072;  # 1 MiB
+
 struct ThreadedSocketFacet @0xdcd0f9f40ff655bf {
   id @0 :UInt32;
   parent @1 :UInt32;

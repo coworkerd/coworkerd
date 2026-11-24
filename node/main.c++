@@ -7742,6 +7742,14 @@ public:
     std::set<WebSocketRelay*> unique;
     const auto facets = params.getFacets();
     KJ_REQUIRE(facets.size() <= UINT16_MAX);
+    uint64_t startWords = 0;
+    for (const auto facet : facets) {
+      const auto size = facet.totalSize();
+      KJ_REQUIRE(size.capCount == 0 && size.wordCount <= rpc::THREADED_SOCKET_FACET_MAX_WORDS &&
+          size.wordCount <= rpc::THREADED_SOCKET_TREE_MAX_WORDS - startWords,
+          "WebSocket facet startup options exceed the park limit");
+      startWords += size.wordCount;
+    }
     std::shared_ptr<WebSocketRelay::FacetStarts> starts;
     if (facets.size() != 0) {
       starts = std::make_shared<WebSocketRelay::FacetStarts>();

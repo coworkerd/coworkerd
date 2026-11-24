@@ -5,6 +5,20 @@ Subject: [PATCH] Keep threaded facet WebSockets across idle retirement
 
 Park root and facet transports in one handoff. Carry the facet's startup options, use its own WebSocket manager on reopen, and forward the native upgrade through local facet fetches.
 
+diff --git a/src/workerd/api/hibernatable-web-socket.c++ b/src/workerd/api/hibernatable-web-socket.c++
+index 135fbc3aeaa47a1794367fd8e3ffc68f6ede9016..ace2a031c8a9a3cb8eea44fe2c4945bc61ab792d 100644
+--- a/src/workerd/api/hibernatable-web-socket.c++
++++ b/src/workerd/api/hibernatable-web-socket.c++
+@@ -67,7 +67,8 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
+     co_await context.run(
+         [entrypointName = entrypointName, eventParameters = kj::mv(eventParameters),
+             versionInfo = kj::mv(versionInfo), props = kj::mv(props),
+-            isDynamicDispatch](Worker::Lock& lock, IoContext& context) mutable {
++            isDynamicDispatch, &request = *incomingRequest](Worker::Lock& lock, IoContext& context) mutable {
++      auto limitScope = request.enterActorEvent(lock);
+       KJ_SWITCH_ONEOF(eventParameters.eventType) {
+         KJ_CASE_ONEOF(text, HibernatableSocketParams::Text) {
+           markHibernatableWebSocketReceive(context);
 diff --git a/src/workerd/api/http.c++ b/src/workerd/api/http.c++
 index 28950ad1edd6262c8895f235d890fd1637f3dbb1..77531281953e64b19954c88e8a0a5909eab97dee 100644
 --- a/src/workerd/api/http.c++
@@ -79,7 +93,7 @@ index 28950ad1edd6262c8895f235d890fd1637f3dbb1..77531281953e64b19954c88e8a0a5909
      }
    }
 diff --git a/src/workerd/api/web-socket.c++ b/src/workerd/api/web-socket.c++
-index 03f035d44f4a7aa208f263efacc59e80cd82ee21..fed8066491e64bd2a053216baa39f6e5afbc07e1 100644
+index 03f035d44f4a7aa208f263efacc59e80cd82ee21..a73588fd0a5dd202f436c45be9d9c5bac464588c 100644
 --- a/src/workerd/api/web-socket.c++
 +++ b/src/workerd/api/web-socket.c++
 @@ -125,6 +125,8 @@ WebSocket::WebSocket(jsg::Lock& js, kj::String url)
@@ -91,11 +105,43 @@ index 03f035d44f4a7aa208f263efacc59e80cd82ee21..fed8066491e64bd2a053216baa39f6e5
    impl->accept(js, kj::mv(options));
  }
  
+@@ -210,6 +212,10 @@ bool WebSocket::isPeerOf(jsg::Lock& js, const WebSocket& candidate) {
+   return kj::downcast<LegacyWebSocketAdapter>(*impl).isPeerOf(js, candidate);
+ }
+ 
++void WebSocket::abandonHibernatableUpgrade() {
++  kj::downcast<LegacyWebSocketAdapter>(*impl).abandonHibernatableUpgrade();
++}
++
+ kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
+   return kj::downcast<const LegacyWebSocketAdapter>(*impl).getSerializedAttachment();
+ }
+@@ -1160,6 +1166,13 @@ int LegacyWebSocketAdapter::getReadyState() {
+   return WebSocket::READY_STATE_OPEN;
+ }
+ 
++void LegacyWebSocketAdapter::abandonHibernatableUpgrade() {
++  KJ_ASSERT(isHibernatable());
++  farNative->closedIncoming = true;
++  farNative->closedOutgoing = true;
++  farNative->outgoingAborted = true;
++}
++
+ bool LegacyWebSocketAdapter::isAccepted() {
+   return farNative->state.is<Accepted>();
+ }
 diff --git a/src/workerd/api/web-socket.h b/src/workerd/api/web-socket.h
-index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..9040e271e0e17e4cce9d8b4803528adcdc3e4840 100644
+index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..5172222f9b6ce45c9afd2e5015cbc6751447beef 100644
 --- a/src/workerd/api/web-socket.h
 +++ b/src/workerd/api/web-socket.h
-@@ -205,6 +205,12 @@ class WebSocket: public EventTarget {
+@@ -199,12 +199,19 @@ class WebSocket: public EventTarget {
+   kj::Rc<kj::WebSocket> acceptAsHibernatable(
+       kj::Array<kj::String> tags, kj::Maybe<WrapTransport> wrapTransport = kj::none);
+   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
++  void abandonHibernatableUpgrade();
+   void requirePeerUpgrade() {
+     peerMustUpgrade = true;
+   }
    bool peerRequiresUpgrade() const {
      return peerMustUpgrade;
    }
@@ -108,7 +154,7 @@ index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..9040e271e0e17e4cce9d8b4803528adc
    kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
    bool isOutputClosed() const;
  
-@@ -382,6 +388,7 @@ class WebSocket: public EventTarget {
+@@ -382,6 +389,7 @@ class WebSocket: public EventTarget {
    // cppgc to handle this correctly, or (c) re-trigger tracing post-swap.
    kj::Own<WebSocketAdapter> impl;
    bool peerMustUpgrade = false;
@@ -116,19 +162,68 @@ index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..9040e271e0e17e4cce9d8b4803528adc
  };
  
  #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
+@@ -585,6 +593,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
+   kj::Rc<kj::WebSocket> acceptWithTransport(
+       kj::Array<kj::String> tags, kj::Maybe<WebSocket::WrapTransport> wrapTransport);
+   bool isPeerOf(jsg::Lock& js, const WebSocket& candidate);
++  void abandonHibernatableUpgrade();
+   kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
+   bool isOutputClosed() const;
+   void initiateHibernatableRelease(jsg::Lock& js,
 diff --git a/src/workerd/io/legacy-hibernation-manager.c++ b/src/workerd/io/legacy-hibernation-manager.c++
-index ae4d1c31a523402edc4f88940322299309aeac1c..e8eacaac24478aa6a8cae5f8f8021f70f1e13870 100644
+index ae4d1c31a523402edc4f88940322299309aeac1c..cb920654e5981ea5ad4f53c341ea8de55a47e97b 100644
 --- a/src/workerd/io/legacy-hibernation-manager.c++
 +++ b/src/workerd/io/legacy-hibernation-manager.c++
-@@ -254,6 +254,25 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
+@@ -245,6 +245,12 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
+     KJ_IF_SOME(active, socket->activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+       if (active->isPeerOf(js, peer)) {
+         KJ_REQUIRE(socket->pendingNodeSocket.size() == 0, "WebSocket was already upgraded");
++        try {
++          socket->pendingNodeInvocation = kj::str(KJ_REQUIRE_NONNULL(nodeUpgradeOwner)());
++        } catch (...) {
++          discardNodeUpgrade(*socket);
++          throw;
++        }
+         socket->pendingNodeSocket = randomUUID(kj::none);
+         socket->nodeSocket->startUpgrade();
+         return socket->pendingNodeSocket.asPtr();
+@@ -254,12 +260,60 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
    return kj::none;
  }
  
-+bool LegacyHibernationManagerImpl::hasStagedNodeSocket(kj::StringPtr pending) const {
++bool LegacyHibernationManagerImpl::hasStagedNodeSocket(
++    kj::StringPtr pending, kj::StringPtr invocation) const {
 +  for (const auto& socket: allWs) {
-+    if (socket->pendingNodeSocket.size() != 0 && socket->pendingNodeSocket == pending) return true;
++    if (socket->pendingNodeSocket.size() != 0 && socket->pendingNodeSocket == pending &&
++        socket->pendingNodeInvocation == invocation) return true;
 +  }
 +  return false;
++}
++
++bool LegacyHibernationManagerImpl::hasNodeUpgrades() const {
++  for (const auto& socket: allWs) {
++    if (socket->nodeSocket != nullptr &&
++        (socket->nodeSocket->id().size() != 0 || socket->pendingNodeSocket.size() != 0)) return true;
++  }
++  return false;
++}
++
++void LegacyHibernationManagerImpl::discardStagedNodeSockets(kj::Maybe<kj::StringPtr> invocation) {
++  for (auto it = allWs.begin(); it != allWs.end();) {
++    auto& socket = **it++;
++    if (socket.pendingNodeSocket.size() != 0 &&
++        invocation.orDefault(socket.pendingNodeInvocation.asPtr()) == socket.pendingNodeInvocation) {
++      discardNodeUpgrade(socket);
++    }
++  }
++}
++
++void LegacyHibernationManagerImpl::discardNodeUpgrade(HibernatableWebSocket& socket) {
++  socket.nodeSocket->abandonUpgrade();
++  KJ_IF_SOME(active, socket.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
++    active->abandonHibernatableUpgrade();
++  }
++  dropHibernatableWebSocket(socket);
 +}
 +
 +bool LegacyHibernationManagerImpl::canForwardNodeUpgrade(
@@ -146,40 +241,74 @@ index ae4d1c31a523402edc4f88940322299309aeac1c..e8eacaac24478aa6a8cae5f8f8021f70
  kj::Promise<void> LegacyHibernationManagerImpl::activateNodeSocket(
      kj::StringPtr pending, kj::StringPtr invocation) {
    for (auto& socket: allWs) {
+-    if (socket->pendingNodeSocket != pending) continue;
++    if (socket->pendingNodeSocket != pending || socket->pendingNodeInvocation != invocation) continue;
+     KJ_REQUIRE(socket->nodeSocket != nullptr);
+     socket->pendingNodeSocket = nullptr;
++    socket->pendingNodeInvocation = nullptr;
+     auto keepAlive = KJ_ASSERT_NONNULL(socket->ws).addRef();
+     auto& transport = *socket->nodeSocket;
+     transport.attach(invocation, invocation);
 diff --git a/src/workerd/io/legacy-hibernation-manager.h b/src/workerd/io/legacy-hibernation-manager.h
-index d850491d048794d3fe49acce1b95f653d7fd4a1a..b06a336b901a0e8b1aa2360655f7c1537a833bb5 100644
+index d850491d048794d3fe49acce1b95f653d7fd4a1a..fa3bc120fb8b271e8cf9697f99447a706e40283e 100644
 --- a/src/workerd/io/legacy-hibernation-manager.h
 +++ b/src/workerd/io/legacy-hibernation-manager.h
-@@ -50,6 +50,11 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
+@@ -27,6 +27,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
+    public:
+     virtual void useLocalTransport(kj::Own<kj::WebSocket> transport) = 0;
+     virtual void startUpgrade() = 0;
++    virtual void abandonUpgrade() = 0;
+     virtual kj::Promise<void> whenUpgrading() = 0;
+     virtual void attach(kj::StringPtr socketId, kj::StringPtr invocationId) = 0;
+     virtual void activate() = 0;
+@@ -50,6 +51,15 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
  
    static constexpr auto NODE_SOCKET_HEADER = "x-coworkerd-managed-socket"_kj;
    kj::Maybe<kj::StringPtr> stageNodeSocket(jsg::Lock& js, api::WebSocket& peer);
-+  bool hasStagedNodeSocket(kj::StringPtr pending) const;
-+  void setNodeUpgradeLookup(kj::Function<bool(kj::StringPtr)> lookup) {
++  bool hasStagedNodeSocket(kj::StringPtr pending, kj::StringPtr invocation) const;
++  bool hasNodeUpgrades() const;
++  void discardStagedNodeSockets(kj::Maybe<kj::StringPtr> invocation = kj::none);
++  void setNodeUpgradeHooks(kj::Function<kj::StringPtr()> owner,
++      kj::Function<bool(kj::StringPtr)> lookup) {
++    nodeUpgradeOwner = kj::mv(owner);
 +    nodeUpgradeLookup = kj::mv(lookup);
 +  }
 +  static bool canForwardNodeUpgrade(Worker::Actor& actor, kj::StringPtr pending);
    kj::Promise<void> activateNodeSocket(kj::StringPtr pending, kj::StringPtr invocation);
    kj::Promise<void> configureNodeSocket(NodeSocket& socket);
    kj::Array<SocketSnapshot> snapshotNodeSockets();
-@@ -115,6 +120,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
+@@ -115,7 +125,10 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
  
   private:
    bool socketParking = false;
++  kj::Maybe<kj::Function<kj::StringPtr()>> nodeUpgradeOwner;
 +  kj::Maybe<kj::Function<bool(kj::StringPtr)>> nodeUpgradeLookup;
    class HibernatableWebSocket;
++  void discardNodeUpgrade(HibernatableWebSocket& socket);
  
    // Ends the handoff identified by `generation`, putting the parked loopback back if no replacement
+   // supplied one. Does nothing if that handoff already ended, so a handle dropped afterwards cannot
+@@ -177,6 +190,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
+     State activeOrPackage;
+     NodeSocket* nodeSocket = nullptr;
+     kj::String pendingNodeSocket;
++    kj::String pendingNodeInvocation;
+     uint64_t lastFrame = 0;
+ 
+     // This is the manager's strong reference to the websocket shared with api::WebSocket after
 diff --git a/src/workerd/threaded/protocol.capnp b/src/workerd/threaded/protocol.capnp
-index 01a63e71876e698ed3515bab81f9b711703df30d..bcb98b4d58b163ccbebedce73f05f4e7f3bf955d 100644
+index 01a63e71876e698ed3515bab81f9b711703df30d..be4772b1936089b2d8326fae2ecf5c859a5f2430 100644
 --- a/src/workerd/threaded/protocol.capnp
 +++ b/src/workerd/threaded/protocol.capnp
-@@ -46,6 +46,28 @@ struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
+@@ -46,6 +46,31 @@ struct ThreadedSocketSnapshot @0x9e4cd226c6cf0c04 {
    autoResponseEnabled @7 :Bool;
    autoRequest @8 :Text;
    autoResponse @9 :Text;
 +  facetId @10 :UInt32;
 +}
++
++const threadedSocketFacetMaxWords :UInt32 = 8192;  # 64 KiB
++const threadedSocketTreeMaxWords :UInt32 = 131072;  # 1 MiB
 +
 +struct ThreadedSocketFacet @0xdcd0f9f40ff655bf {
 +  id @0 :UInt32;
@@ -203,7 +332,7 @@ index 01a63e71876e698ed3515bab81f9b711703df30d..bcb98b4d58b163ccbebedce73f05f4e7
  }
  
  struct ThreadedSocketOpen @0x807618c69c531b73 {
-@@ -61,11 +83,14 @@ struct ThreadedSocketOpen @0x807618c69c531b73 {
+@@ -61,11 +86,14 @@ struct ThreadedSocketOpen @0x807618c69c531b73 {
  interface ThreadedSocketControl @0xdc432f018090bcc4 {
    send @0 (authority :ThreadedSocketAuthority, frame :ThreadedSocketFrame) -> () $Cxx.allowCancellation;
    setAutoResponse @1 (authority :ThreadedSocketAuthority, enabled :Bool, request :Text, response :Text) -> (accepted :Bool);
@@ -220,8 +349,72 @@ index 01a63e71876e698ed3515bab81f9b711703df30d..bcb98b4d58b163ccbebedce73f05f4e7
  }
  
  interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 7045a3fe12e0a36d6ce0c7cd987f346cf7b6f5a4..67eb486f1d73adba9a141bd82f17d3cdf8faffd1 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -1371,6 +1371,59 @@ KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neig
+   }
+ }
+ 
++KJ_TEST("facet WebSocket startup props round-trip nested binding channels and object identity") {
++  struct Binding final: Frankenvalue::CapTableEntry, kj::Refcounted {
++    Binding(uint channel, kj::Maybe<kj::String> object, kj::Maybe<Frankenvalue> props)
++        : channel(channel), object(kj::mv(object)), props(kj::mv(props)) {}
++    kj::Own<CapTableEntry> clone() override {
++      return kj::addRef(*this);
++    }
++    uint channel;
++    kj::Maybe<kj::String> object;
++    kj::Maybe<Frankenvalue> props;
++  };
++  auto bind = [](uint channel, kj::Maybe<kj::String> object,
++                  kj::Maybe<Frankenvalue> props) -> kj::Own<Frankenvalue::CapTableEntry> {
++    return kj::refcounted<Binding>(channel, kj::mv(object), kj::mv(props));
++  };
++  auto describe = [](Frankenvalue::CapTableEntry& entry) -> kj::Maybe<FacetPropChannel> {
++    auto& binding = kj::downcast<Binding>(entry);
++    return FacetPropChannel{binding.channel,
++      binding.object.map([](auto& id) { return id.asPtr(); }),
++      binding.props.map([](auto& props) -> Frankenvalue& { return props; })};
++  };
++  Frankenvalue serviceProps;
++  serviceProps.setProperty(kj::str("nested"), Frankenvalue::fromCapability(42,
++      bind(15, kj::str("original-object"), kj::none)));
++  Frankenvalue input;
++  input.setProperty(kj::str("service"), Frankenvalue::fromCapability(42,
++      bind(12, kj::none, kj::mv(serviceProps))));
++
++  capnp::MallocMessageBuilder message;
++  auto outbound = message.initRoot<rpc::Frankenvalue>();
++  size_t remaining = 64 * 1024;
++  KJ_REQUIRE(writeFacetProps(input, outbound, remaining, describe));
++  auto restored = readFacetProps(outbound.asReader(), bind);
++  auto bindings = restored.getCapTable();
++  KJ_ASSERT(bindings.size() == 1);
++  auto& service = kj::downcast<Binding>(*bindings[0]);
++  KJ_EXPECT(service.channel == 12 && service.object == kj::none);
++  auto nested = KJ_REQUIRE_NONNULL(service.props).getCapTable();
++  KJ_ASSERT(nested.size() == 1);
++  auto& object = kj::downcast<Binding>(*nested[0]);
++  KJ_EXPECT(object.channel == 15 && KJ_REQUIRE_NONNULL(object.object) == "original-object");
++  KJ_EXPECT(object.props == kj::none);
++
++  remaining = 32;
++  KJ_EXPECT(!writeFacetProps(input, outbound, remaining, describe));
++  remaining = 64 * 1024;
++  KJ_EXPECT(!writeFacetProps(input, outbound, remaining,
++      [&](Frankenvalue::CapTableEntry& entry) -> kj::Maybe<FacetPropChannel> {
++    if (kj::downcast<Binding>(entry).channel == 15) return kj::none;
++    return describe(entry);
++  }));
++}
++
+ KJ_TEST("deadline decimal spelling and native refusal mappings") {
+   for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
+          "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba229030976a9bd87 100644
+index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..e38655d8d5bfc0ca796ecc4e87c620871457ea9f 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1806,6 +1806,9 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
@@ -243,30 +436,43 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      std::shared_ptr<server::DurableIdleLifecycle> idle;
      std::function<bool(bool)> facetsBusy;
      std::function<bool()> facetHasOrdinaryWebSocket;
-@@ -4011,8 +4016,14 @@ struct DurableSocketStart {
+@@ -4011,9 +4016,18 @@ struct DurableSocketStart {
    std::shared_ptr<server::DurableIdleLifecycle> idle;
    kj::String invocation;
    const kj::HttpHeaderTable& headers;
 -  kj::Own<Worker::Actor> actor;
 +  std::shared_ptr<DurableTreeContext> tree;
-+};
-+
+ };
+ 
 +struct StagedDurableUpgrade {
 +  uint facet;
 +  kj::Own<LegacyHibernationManagerImpl> manager;
- };
-+kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(DurableTreeContext &tree, kj::StringPtr token);
- 
++};
++void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation);
++void finishDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation);
++kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(
++    DurableTreeContext &tree, kj::StringPtr token, kj::StringPtr invocation);
++
  class DurableSocketStream final: public kj::WebSocket {
   public:
-@@ -4082,13 +4093,17 @@ class DurableHttp final: public kj::HttpService {
+   DurableSocketStream(kj::Own<kj::WebSocket> inner, std::shared_ptr<server::DurableIdleLifecycle> idle)
+@@ -4064,6 +4078,8 @@ class DurableHttp final: public kj::HttpService {
+     try {
+       if (headers.get(kj::HttpHeaderId::UPGRADE) != kj::none) {
+         KJ_IF_SOME(start, socket) {
++          beginDurableUpgrade(*start.tree, start.invocation);
++          KJ_DEFER(finishDurableUpgrade(*start.tree, start.invocation));
+           struct UpgradingResponse final: Response {
+             UpgradingResponse(Response& inner, DurableSocketStart& start): inner(inner), start(start) {}
+             kj::Own<kj::AsyncOutputStream> send(uint status, kj::StringPtr text,
+@@ -4082,13 +4098,17 @@ class DurableHttp final: public kj::HttpService {
                  }
                });
                KJ_IF_SOME(id, pending) {
 -                auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
 -                    KJ_REQUIRE_NONNULL(start.actor->getHibernationManager()));
 -                outgoing.addPtrPtr(marker, start.invocation);
-+                auto upgrade = KJ_REQUIRE_NONNULL(findDurableUpgrade(*start.tree, id),
++                auto upgrade = KJ_REQUIRE_NONNULL(findDurableUpgrade(*start.tree, id, start.invocation),
 +                    "node-owned WebSocket is missing from the admitted tree");
 +                auto trusted = upgrade.facet == 0 ? kj::str(start.invocation)
 +                                                  : kj::str(start.invocation, ":", upgrade.facet);
@@ -281,7 +487,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
                  return accepted;
                }
                auto opened = inner.acceptWebSocket(outgoing);
-@@ -4452,6 +4467,14 @@ kj::Promise<kj::Own<WorkerInterface>> openBinding(
+@@ -4452,6 +4472,14 @@ kj::Promise<kj::Own<WorkerInterface>> openBinding(
    co_return result.attach(kj::mv(connection));
  }
  
@@ -296,7 +502,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
  class DurableNodeSockets final {
   public:
    DurableNodeSockets(ThreadState& state, kj::String address, DurableRoute route, uint64_t walOpen,
-@@ -4498,27 +4521,21 @@ class DurableNodeSockets final {
+@@ -4498,27 +4526,21 @@ class DurableNodeSockets final {
      out.setGeneration(route.open.generation);
    }
  
@@ -329,7 +535,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
        entry.initAuthority().setSocketId(socket.id);
        entry.setLastFrame(socket.lastFrame);
        auto tags = entry.initTags(socket.tags.size());
-@@ -4548,11 +4565,11 @@ class DurableNodeSockets final {
+@@ -4548,11 +4570,11 @@ class DurableNodeSockets final {
      }
    }
  
@@ -343,7 +549,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      try {
        answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, false));
      } catch (const kj::Exception &error) {
-@@ -4564,34 +4581,22 @@ class DurableNodeSockets final {
+@@ -4564,34 +4586,22 @@ class DurableNodeSockets final {
          answer = co_await clock().timeoutAfter(CONTROL_TIMEOUT, requestAdopt(adoption, true));
        } catch (const kj::Exception &error) {
          reportDurableFailureForTest("WebSocket adoption resolution", error);
@@ -390,12 +596,60 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
    }
  
    kj::Timer& clock() { return state.io.provider->getTimer(); }
-@@ -5623,6 +5628,17 @@ struct DurableTreeContext {
+@@ -4685,6 +4695,11 @@ class DurableNodeWebSocket final: public LegacyHibernationManagerImpl::NodeSocke
+     pendingUpgrade = true;
+     upgrading.fulfiller->fulfill();
+   }
++  void abandonUpgrade() override {
++    if (!pendingUpgrade) startUpgrade();
++    if (local) local->abort();
++    attaching.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket upgrade was abandoned"));
++  }
+   kj::Promise<void> whenUpgrading() override {
+     return upgraded.addBranch();
+   }
+@@ -5204,11 +5219,20 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+           object(kj::mv(object)),
+           props(kj::mv(props)) {}
+     kj::Own<WorkerInterface> startRequest(SubrequestMetadata metadata) override {
++      auto current = owner.addRef();
++      // Serialized facet props retain their binding selections. Calls from the same
++      // durable Worker use the event's new lease, even if the facet stayed resident.
++      KJ_IF_SOME(context, IoContext::tryCurrent()) {
++        auto* active = dynamic_cast<Channels*>(&context.getIoChannelFactory());
++        if (active != nullptr && active->state.durableHome != 0 && active->slot == owner->slot) {
++          current = kj::addRef(*active);
++        }
++      }
+       KJ_IF_SOME(id, object) {
+         return newPromisedWorkerInterface(
+-            owner->queuedRequest(false, owner->objectEnvelope(channel, id)).attach(owner.addRef()));
++            current->queuedRequest(false, current->objectEnvelope(channel, id)).attach(current.addRef()));
+       }
+-      return owner->startRequest(
++      return current->startRequest(
+           channel, kj::mv(metadata), props.map([](Frankenvalue &value) { return value.clone(); }));
+     }
+     void requireAllowsTransfer() override {}
+@@ -5614,6 +5638,11 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+ }
+ 
+ struct DurableTreeContext {
++  struct SocketManager {
++    Worker::Actor* actor;
++    LegacyHibernationManagerImpl* manager;
++  };
++
+   ThreadState &state;
+   ThreadedServer &server;
+   std::weak_ptr<Slot> slot;
+@@ -5623,6 +5652,19 @@ struct DurableTreeContext {
    std::shared_ptr<server::DurableIdleLifecycle> idle;
    std::map<uint, server::DurableLogShipper*> shippers;
    uint liveFacets = 0;
 +  std::shared_ptr<DurableNodeSockets> nodeSockets;
-+  std::map<uint, LegacyHibernationManagerImpl *> socketManagers;
++  std::map<uint, SocketManager> socketManagers;
++  std::set<std::string, std::less<>> socketUpgradeInvocations;
 +  std::map<uint, PropsMessage> facetStarts;
 +  kj::Maybe<DurableSocketAdoption> adoption;
 +  std::map<uint, std::vector<threaded::rpc::ThreadedSocketSnapshot::Reader>> dormantSockets;
@@ -405,25 +659,40 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +  kj::Promise<SocketParkResult> parkSockets();
 +  void forgetFacetSockets(uint facet);
 +  void abortFacetSockets(uint facet, kj::Vector<kj::String> &ids);
++  void requireRestorableUpgrade(uint facet);
  
    const server::DurableStorage &storage() {
      return *server.durableStorage;
-@@ -5634,6 +5650,168 @@ struct DurableTreeContext {
+@@ -5634,6 +5676,230 @@ struct DurableTreeContext {
    }
  };
  
-+kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(DurableTreeContext &tree, kj::StringPtr token) {
-+  for (const auto &[facet, manager]: tree.socketManagers) {
-+    if (!manager->hasStagedNodeSocket(token)) continue;
-+    for (auto id = facet; id != 0;) {
-+      auto start = tree.facetStarts.find(id);
-+      JSG_REQUIRE(start != tree.facetStarts.end(), DOMNotSupportedError,
-+          "The facet's startup options cannot be restored after WebSocket hibernation.");
-+      id = start->second->getRoot<threaded::rpc::ThreadedSocketFacet>().getParent();
++void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
++  KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);
++}
++
++void finishDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
++  auto at = tree.socketUpgradeInvocations.find(std::string_view(invocation.begin(), invocation.size()));
++  KJ_ASSERT(at != tree.socketUpgradeInvocations.end());
++  tree.socketUpgradeInvocations.erase(at);
++  for (const auto &[_, socket]: tree.socketManagers) {
++    socket.manager->discardStagedNodeSockets(invocation);
++  }
++}
++
++kj::Maybe<StagedDurableUpgrade> findDurableUpgrade(
++    DurableTreeContext &tree, kj::StringPtr token, kj::StringPtr invocation) {
++  for (const auto &[facet, socket]: tree.socketManagers) {
++    if (socket.manager->hasStagedNodeSocket(token, invocation)) {
++      return StagedDurableUpgrade{facet, kj::addRef(*socket.manager)};
 +    }
-+    return StagedDurableUpgrade{facet, kj::addRef(*manager)};
 +  }
 +  return kj::none;
++}
++
++kj::StringPtr currentUpgradeInvocation() {
++  auto& channels = kj::downcast<Channels>(IoContext::current().getIoChannelFactory());
++  return field(channels.input(), "invocationId").getString();
 +}
 +
 +LegacyHibernationManagerImpl::SocketSnapshot readSocketSnapshot(
@@ -452,11 +721,14 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +      LegacyHibernationManagerImpl::SocketFactory(
 +          [sockets = nodeSockets] { return kj::heap<DurableNodeWebSocket>(sockets); }));
 +  // The manager's loopback owns this tree even when a request releases its actor.
-+  manager->setNodeUpgradeLookup([this](kj::StringPtr pending) {
-+    for (auto &[_, candidate]: socketManagers) {
-+      if (candidate->hasStagedNodeSocket(pending)) return true;
-+    }
-+    return false;
++  manager->setNodeUpgradeHooks([this, facet] {
++    const auto invocation = currentUpgradeInvocation();
++    JSG_REQUIRE(socketUpgradeInvocations.contains(std::string_view(invocation.begin(), invocation.size())),
++        DOMInvalidStateError, "The Durable Object WebSocket must be returned from its upgrade request.");
++    requireRestorableUpgrade(facet);
++    return invocation;
++  }, [this](kj::StringPtr pending) {
++    return findDurableUpgrade(*this, pending, currentUpgradeInvocation()) != kj::none;
 +  });
 +  if (auto dormant = dormantSockets.find(facet); dormant != dormantSockets.end()) {
 +    const auto first = dormant->second.front();
@@ -469,8 +741,32 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +    dormantSockets.erase(dormant);
 +    if (dormantSockets.empty()) adoption = kj::none;
 +  }
-+  KJ_ASSERT(socketManagers.emplace(facet, manager.get()).second);
++  KJ_ASSERT(socketManagers.emplace(facet, SocketManager{&actor, manager.get()}).second);
 +  actor.setHibernationManager(kj::mv(manager));
++}
++
++void DurableTreeContext::requireRestorableUpgrade(uint facet) {
++  if (facet == 0) return;
++  std::set<uint> counted;
++  uint64_t total = 0;
++  auto count = [&](uint id) {
++    for (; id != 0 && counted.insert(id).second;) {
++      auto at = facetStarts.find(id);
++      JSG_REQUIRE(at != facetStarts.end(), DOMNotSupportedError,
++          "The facet's startup options cannot be restored after WebSocket hibernation. "
++          "A facet's options must be serializable and use at most 64 KiB.");
++      auto start = at->second->getRoot<threaded::rpc::ThreadedSocketFacet>().asReader();
++      total += start.totalSize().wordCount;
++      JSG_REQUIRE(total <= threaded::rpc::THREADED_SOCKET_TREE_MAX_WORDS, DOMNotSupportedError,
++          "The Durable Object tree's WebSocket facet startup options exceed 1 MiB.");
++      id = start.getParent();
++    }
++  };
++  count(facet);
++  for (const auto &[id, socket]: socketManagers) {
++    if (id != 0 && socket.manager->hasNodeUpgrades()) count(id);
++  }
++  for (const auto &[id, _]: dormantSockets) count(id);
 +}
 +
 +void DurableTreeContext::restoreSockets(DurableSocketAdoption response) {
@@ -489,12 +785,12 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +  kj::Vector<DurableSocketSnapshot> sockets;
 +  bool release = true;
 +  KJ_DEFER(if (release) {
-+    for (const auto &[_, manager]: socketManagers) manager->setSocketParking(false);
++    for (const auto &[_, socket]: socketManagers) socket.manager->setSocketParking(false);
 +  });
-+  for (const auto &[facet, manager]: socketManagers) {
-+    manager->setSocketParking(true);
-+    for (auto &socket: manager->snapshotNodeSockets()) {
-+      sockets.add(DurableSocketSnapshot{facet, kj::mv(socket)});
++  for (const auto &[facet, socket]: socketManagers) {
++    socket.manager->setSocketParking(true);
++    for (auto &snapshot: socket.manager->snapshotNodeSockets()) {
++      sockets.add(DurableSocketSnapshot{facet, kj::mv(snapshot)});
 +    }
 +  }
 +  for (const auto &[facet, entries]: dormantSockets) {
@@ -520,6 +816,10 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +}
 +
 +void DurableTreeContext::forgetFacetSockets(uint facet) {
++  if (auto at = socketManagers.find(facet); at != socketManagers.end()) {
++    at->second.manager->discardStagedNodeSockets();
++    socketManagers.erase(at);
++  }
 +  facetStarts.erase(facet);
 +  dormantSockets.erase(facet);
 +  if (dormantSockets.empty()) adoption = kj::none;
@@ -529,7 +829,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +  facetIndex().forEachChild(
 +      facet, [&](uint child, kj::StringPtr) { abortFacetSockets(child, ids); });
 +  if (auto manager = socketManagers.find(facet); manager != socketManagers.end()) {
-+    for (auto &socket: manager->second->snapshotNodeSockets()) ids.add(kj::mv(socket.id));
++    for (auto &socket: manager->second.manager->snapshotNodeSockets()) ids.add(kj::mv(socket.id));
 +  }
 +  if (auto dormant = dormantSockets.find(facet); dormant != dormantSockets.end()) {
 +    for (const auto socket: dormant->second) ids.add(kj::str(socket.getAuthority().getSocketId()));
@@ -537,39 +837,56 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +  forgetFacetSockets(facet);
 +}
 +
-+bool writeFacetProps(Frankenvalue &value, rpc::Frankenvalue::Builder out, const Slot &slot) {
-+  value.toCapnp(out);
++struct FacetPropChannel {
++  uint channel;
++  kj::Maybe<kj::StringPtr> object;
++  kj::Maybe<Frankenvalue&> props;
++};
++
++bool writeFacetProps(Frankenvalue &value, rpc::Frankenvalue::Builder out, size_t &remaining,
++    kj::FunctionParam<kj::Maybe<FacetPropChannel>(Frankenvalue::CapTableEntry&)> describe) {
 +  auto caps = value.getCapTable();
++  const auto bytes = value.estimateSize();
++  if (bytes > remaining) return false;
++  remaining -= bytes;
++  // Every channel adds data and pointer words even if it has no ID or own props.
++  constexpr size_t CHANNEL_BYTES = 3 * sizeof(capnp::word);
++  if (caps.size() > remaining / CHANNEL_BYTES) return false;
++  remaining -= caps.size() * CHANNEL_BYTES;
++  value.toCapnp(out);
 +  if (caps.size() == 0) return true;
 +  auto table =
 +      out.getCapTable().initAs<capnp::List<threaded::rpc::ThreadedSocketPropChannel>>(caps.size());
 +  for (auto i: kj::indices(caps)) {
-+    auto *bound = dynamic_cast<Channels::Bound *>(caps[i].get());
-+    if (bound == nullptr || bound->owner->slot.get() != &slot) return false;
++    auto saved = describe(*caps[i]);
++    if (saved == kj::none) return false;
++    const auto& bound = KJ_ASSERT_NONNULL(saved);
 +    auto channel = table[i];
-+    channel.setChannel(bound->channel);
-+    KJ_IF_SOME(object, bound->object) {
++    channel.setChannel(bound.channel);
++    KJ_IF_SOME(object, bound.object) {
++      if (object.size() > remaining) return false;
++      remaining -= object.size();
 +      channel.setHasObject(true);
 +      channel.setObjectId(object);
 +    }
-+    KJ_IF_SOME(props, bound->props) {
-+      if (!writeFacetProps(props, channel.initProps(), slot)) return false;
++    KJ_IF_SOME(props, bound.props) {
++      if (!writeFacetProps(props, channel.initProps(), remaining, describe)) return false;
 +    }
 +  }
 +  return true;
 +}
 +
-+Frankenvalue readFacetProps(rpc::Frankenvalue::Reader value, kj::Rc<Channels> &channels) {
++Frankenvalue readFacetProps(rpc::Frankenvalue::Reader value,
++    kj::FunctionParam<kj::Own<Frankenvalue::CapTableEntry>(uint, kj::Maybe<kj::String>,
++        kj::Maybe<Frankenvalue>)> bind) {
 +  kj::Vector<kj::Own<Frankenvalue::CapTableEntry>> caps;
 +  for (auto channel:
 +      value.getCapTable().getAs<capnp::List<threaded::rpc::ThreadedSocketPropChannel>>()) {
 +    kj::Maybe<kj::String> object;
 +    if (channel.getHasObject()) object = kj::str(channel.getObjectId());
 +    kj::Maybe<Frankenvalue> props;
-+    if (channel.hasProps()) props = readFacetProps(channel.getProps(), channels);
-+    caps.add(kj::rc<Channels::Bound>(
-+        channels.addRef(), channel.getChannel(), kj::mv(object), kj::mv(props))
-+                 .toOwn());
++    if (channel.hasProps()) props = readFacetProps(channel.getProps(), bind);
++    caps.add(bind(channel.getChannel(), kj::mv(object), kj::mv(props)));
 +  }
 +  return Frankenvalue::fromCapnp(value, kj::mv(caps));
 +}
@@ -577,15 +894,18 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
  class DurablePendingOperations final: public Worker::Actor::WaitUntilTaskTracker {
   public:
    explicit DurablePendingOperations(std::shared_ptr<server::DurableIdleLifecycle> idle)
-@@ -5706,6 +5884,7 @@ class DurableActorObserver final: public ActorObserver {
+@@ -5706,6 +5972,10 @@ class DurableActorObserver final: public ActorObserver {
      if (actor != nullptr) {
        record("destroyed");
        tree->state.durableActorTrees.erase(actor);
-+      tree->socketManagers.erase(facet);
++      auto at = tree->socketManagers.find(facet);
++      if (at != tree->socketManagers.end() && at->second.actor == actor) {
++        tree->socketManagers.erase(at);
++      }
      }
    }
  
-@@ -5741,8 +5920,6 @@ class DurableActorObserver final: public ActorObserver {
+@@ -5741,8 +6011,6 @@ class DurableActorObserver final: public ActorObserver {
    Worker::Actor *actor = nullptr;
  };
  
@@ -594,7 +914,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
  struct DurableActorHandle {
    kj::Own<Worker::Actor> value;
    DurableActorHooks *hooks;
-@@ -5813,7 +5990,13 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -5813,7 +6081,13 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    bool isStopped() const {
      return stopped;
    }
@@ -608,7 +928,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
  
   private:
    struct Invocation {
-@@ -5826,7 +6009,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -5826,7 +6100,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
      kj::Own<LocalFacet> owner;
    };
  
@@ -618,7 +938,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
    kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation);
  
    std::shared_ptr<DurableTreeContext> tree;
-@@ -5864,6 +6048,11 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -5864,6 +6139,11 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
  
    kj::Rc<IoChannelFactory::ActorChannel> getFacet(
        kj::StringPtr name, kj::Function<kj::Promise<StartInfo>()> getStartInfo) override {
@@ -630,7 +950,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      const std::string key(name.begin(), name.size());
      auto at = children.find(key);
      if (at != children.end()) {
-@@ -5879,7 +6068,49 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -5879,7 +6159,49 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
      return child;
    }
  
@@ -680,7 +1000,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      auto at = children.find(std::string(name.begin(), name.size()));
      if (at == children.end()) return;
      at->second->stop(reason);
-@@ -5888,7 +6119,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -5888,7 +6210,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
  
    void deleteFacet(kj::StringPtr name) override {
      requireIdle(name);
@@ -689,7 +1009,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      auto &index = tree->facetIndex();
      deleteStoredFacet(index, index.getId(facet, name));
    }
-@@ -5949,6 +6180,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -5949,6 +6271,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
   private:
    void deleteStoredFacet(server::FacetTreeIndex& index, uint target) {
      kj::Function<void(uint)> report = [&](uint deleted) {
@@ -697,8 +1017,11 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
        auto shipper = tree->shippers.find(facet);
        if (shipper != tree->shippers.end()) shipper->second->reportFacetDeleted(deleted);
      };
-@@ -5980,7 +6212,11 @@ bool LocalFacet::busy(bool includeBackground) {
+@@ -5978,9 +6301,14 @@ bool LocalFacet::busy(bool includeBackground) {
+ }
+ 
  bool LocalFacet::hasOrdinaryWebSocket() {
++  if (stopped) return false;
    KJ_IF_SOME(opened, actor) {
      KJ_IF_SOME(manager, opened.value->getHibernationManager()) {
 -      if (manager.getWebSocketCount() != 0) return true;
@@ -710,7 +1033,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
      }
      return opened.value->getNonHibernatableWebSocketCount()->count > 0 ||
          opened.hooks->hasOrdinaryWebSocket();
-@@ -6009,33 +6245,100 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
+@@ -6009,33 +6337,125 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
        open(kj::str(channels.document.original), kj::heap<Invocation>(*this)));
  }
  
@@ -743,7 +1066,10 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +          kj::str(start.getNamespaceId()), kj::str(start.getActorId()), kj::mv(actorName)));
 +    }
 +    auto channels = kj::rc<Channels>(tree->state, tree->server, slot, descriptor);
-+    props = readFacetProps(start.getProps(), channels);
++    props = readFacetProps(start.getProps(), [&](uint channel, kj::Maybe<kj::String> object,
++                              kj::Maybe<Frankenvalue> props) {
++      return kj::rc<Channels::Bound>(channels.addRef(), channel, kj::mv(object), kj::mv(props)).toOwn();
++    });
 +  } else {
 +    auto info = co_await startFacet();
 +    co_await info.ensureAllResolved();
@@ -753,7 +1079,19 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +    className = kj::str(binding->name);
 +    id = kj::mv(info.id);
 +    props = binding->props.clone();
-+    if (tree->nodeSockets) {
++    constexpr size_t MAX_BYTES = threaded::rpc::THREADED_SOCKET_FACET_MAX_WORDS * sizeof(capnp::word);
++    size_t identityBytes = name.size() + className.size();
++    KJ_SWITCH_ONEOF(id) {
++      KJ_CASE_ONEOF(string, kj::String) {
++        identityBytes += string.size();
++      }
++      KJ_CASE_ONEOF(global, kj::Own<ActorIdFactory::ActorId>) {
++        auto &object = kj::downcast<ObjectIdFactory::Id>(*global);
++        identityBytes += object.space.size() + object.id.size();
++        KJ_IF_SOME(value, object.name) { identityBytes += value.size(); }
++      }
++    }
++    if (tree->nodeSockets && identityBytes <= MAX_BYTES) {
 +      saveStart = kj::heap<capnp::MallocMessageBuilder>();
 +      auto start = saveStart->initRoot<threaded::rpc::ThreadedSocketFacet>();
 +      start.setId(facet);
@@ -774,7 +1112,17 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +          }
 +        }
 +      }
-+      if (!writeFacetProps(props, start.initProps(), *slot)) saveStart = nullptr;
++      auto remaining = MAX_BYTES - identityBytes;
++      auto describe = [&](Frankenvalue::CapTableEntry& cap) -> kj::Maybe<FacetPropChannel> {
++        auto* bound = dynamic_cast<Channels::Bound*>(&cap);
++        if (bound == nullptr || bound->owner->slot != slot) return kj::none;
++        return FacetPropChannel{bound->channel, bound->object.map([](auto& id) { return id.asPtr(); }),
++          bound->props.map([](auto& props) -> Frankenvalue& { return props; })};
++      };
++      if (!writeFacetProps(props, start.initProps(), remaining, describe) ||
++          start.asReader().totalSize().wordCount > threaded::rpc::THREADED_SOCKET_FACET_MAX_WORDS) {
++        saveStart = nullptr;
++      }
 +    }
 +  }
    server::DurableWalPosition position;
@@ -823,7 +1171,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
    auto slot = tree->slot.lock();
    KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
    JsonDoc input(descriptor);
-@@ -6175,6 +6478,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6175,6 +6595,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                  .emplace(ticket.tree,
                      ThreadState::DurableRoot{
                        .actor = kj::mv(actor.value),
@@ -832,7 +1180,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
                        .idle = std::move(idle),
                        .facetsBusy =
                            [hooks = actor.hooks](
-@@ -6221,35 +6526,37 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6221,35 +6643,37 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      if (!root.nodeSockets) {
        auto sockets = std::make_shared<DurableNodeSockets>(state, kj::str(server.bindingAddress.c_str()),
            route, root.rootOpenId(), root.idle);
@@ -847,7 +1195,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
 +      root.parkSockets = [tree = root.tree] { return tree->parkSockets(); };
 +      root.hasLocalSockets = [tree = root.tree] {
 +        auto manager = tree->socketManagers.find(0);
-+        return manager != tree->socketManagers.end() && manager->second->hasLocalSockets();
++        return manager != tree->socketManagers.end() && manager->second.manager->hasLocalSockets();
 +      };
        root.nodeSockets = std::move(sockets);
        root.socketsRestored = !flag(input, "hasNodeSockets");
@@ -884,7 +1232,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
        // A client can drop the first event while the node is adopting. Let the
        // home finish the handoff and settle the admission fence anyway.
        auto adopting = root.adopting;
-@@ -6278,8 +6585,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6278,8 +6702,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        }
      }
    }
@@ -895,7 +1243,7 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..6c4f0f337fecf44a5ee8b60ba2290309
    kj::Maybe<DurableAlarmEvent> alarm;
    auto alarmDescriptor = field(input, "durableAlarm");
    if (alarmDescriptor.isObject()) {
-@@ -6296,25 +6603,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6296,25 +6720,38 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
    auto socketDescriptor = field(input, "durableSocket");
    if (socketDescriptor.isObject()) {
      KJ_REQUIRE(state.wal.get() != nullptr, "persistent storage is required for a socket event");

@@ -114,7 +114,11 @@ When a threaded tree retires, the node parks the upgraded hibernatable WebSocket
 
 Parking and adoption calls each have a five-second response bound. After a lost reply the home gives the node another five seconds to confirm the transfer. A pending write can defer parking for five seconds from the first refusal it causes. If the write still blocks parking, the node closes that connection.
 
-On a threaded Durable Object, return the peer of a `ctx.acceptWebSocket()` socket in an HTTP 101 response. Calling `accept()` on that peer in-process throws `NotSupportedError`. Deleting a facet closes the sockets that it and its descendants accepted. Parked connections belong to their node and shard epoch. A forced actor reset closes its attached managed sockets with `1011` and the reset reason. Node drain, definition changes and loss of shard ownership close affected connections with `1001` when the transport is still reachable. The client must reconnect after a node exit.
+On a threaded Durable Object, return the peer of a `ctx.acceptWebSocket()` socket in an HTTP 101 response. A parent can forward the response from its facet. Calling `accept()` on the peer throws `NotSupportedError`, including when the parent receives it from a facet fetch. If the request ends before the parent forwards the response, the unupgraded socket closes and leaves the facet's socket list.
+
+A facet with a retained socket opens with the class, ID and props from its last start. The callback passed to `ctx.facets.get()` is skipped for that start. The upgrade throws `NotSupportedError` if the facet's options or an ancestor's options contain a capability that cannot be recreated from a binding in the same Worker definition. The serialized options can use up to 64 KiB per facet and 1 MiB across the tree, counting each ancestor once. Exceeding either limit also throws `NotSupportedError` at upgrade.
+
+Deleting or aborting a facet closes the connections it and its descendants accepted. Parked connections belong to their node and shard epoch. A forced root reset closes its attached managed sockets with `1011` and the reset reason. Node drain, definition changes and loss of shard ownership close affected connections with `1001` when the transport is still reachable. The client must reconnect after a node exit.
 
 ## 5. Alarms
 
