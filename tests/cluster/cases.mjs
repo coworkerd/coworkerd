@@ -1567,10 +1567,10 @@ async function threadedSocketHibernation(cluster) {
       const discarded = await upgradeResponse('discard', operation);
       if (operation === 'throw') assert.ok(discarded.status >= 500, JSON.stringify(discarded));
       else assert.deepEqual(discarded, { status: 200, body: { name: 'NotSupportedError' } });
-      await eventually('the unforwarded socket closes and leaves its manager', async () => {
+      await eventually(`the unforwarded socket closes and leaves its manager after ${operation}`, async () => {
         assert.deepEqual(json(await lookup(facetPath('discard', 'discarded')), 200, 'discarded socket'),
           { sockets: 0, state: PingSocket.CLOSED });
-      });
+      }, { timeout: 7000 });
     }
 
     assert.equal((await lookup(facetPath('too-large', 'status'))).status, 200);

@@ -93,7 +93,7 @@ index 28950ad1edd6262c8895f235d890fd1637f3dbb1..77531281953e64b19954c88e8a0a5909
      }
    }
 diff --git a/src/workerd/api/web-socket.c++ b/src/workerd/api/web-socket.c++
-index 03f035d44f4a7aa208f263efacc59e80cd82ee21..a73588fd0a5dd202f436c45be9d9c5bac464588c 100644
+index 03f035d44f4a7aa208f263efacc59e80cd82ee21..8d57ff25a2f180f41441e03555b49aa79009e993 100644
 --- a/src/workerd/api/web-socket.c++
 +++ b/src/workerd/api/web-socket.c++
 @@ -125,6 +125,8 @@ WebSocket::WebSocket(jsg::Lock& js, kj::String url)
@@ -116,22 +116,43 @@ index 03f035d44f4a7aa208f263efacc59e80cd82ee21..a73588fd0a5dd202f436c45be9d9c5ba
  kj::Maybe<kj::ArrayPtr<const byte>> WebSocket::getSerializedAttachment() const {
    return kj::downcast<const LegacyWebSocketAdapter>(*impl).getSerializedAttachment();
  }
-@@ -1160,6 +1166,13 @@ int LegacyWebSocketAdapter::getReadyState() {
+@@ -1009,6 +1015,7 @@ void LegacyWebSocketAdapter::requireHibernatableMutationAllowed() {
+ }
+ 
+ void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> message) {
++  if (abandonedUpgrade) return;
+   requireHibernatableMutationAllowed();
+   auto& native = *farNative;
+   JSG_REQUIRE(!native.closedOutgoing, TypeError, "Can't call WebSocket send() after close().");
+@@ -1103,6 +1110,7 @@ void LegacyWebSocketAdapter::close(
+   // then there must be a code, too.
+   JSG_REQUIRE(reason == kj::none || code != kj::none, DOMInvalidAccessError,
+       "If you specify a WebSocket close reason, you must also specify a code.");
++  if (abandonedUpgrade) return;
+ 
+   // Handle close before connection is established for websockets obtained through `new WebSocket()`.
+   KJ_IF_SOME(pending, native.state.tryGet<AwaitingConnection>()) {
+@@ -1147,6 +1155,7 @@ void LegacyWebSocketAdapter::close(
+ }
+ 
+ int LegacyWebSocketAdapter::getReadyState() {
++  if (abandonedUpgrade) return WebSocket::READY_STATE_CLOSED;
+   auto& native = *farNative;
+   if ((native.closedIncoming && native.closedOutgoing) || error != kj::none) {
+     return WebSocket::READY_STATE_CLOSED;
+@@ -1160,6 +1169,10 @@ int LegacyWebSocketAdapter::getReadyState() {
    return WebSocket::READY_STATE_OPEN;
  }
  
 +void LegacyWebSocketAdapter::abandonHibernatableUpgrade() {
-+  KJ_ASSERT(isHibernatable());
-+  farNative->closedIncoming = true;
-+  farNative->closedOutgoing = true;
-+  farNative->outgoingAborted = true;
++  abandonedUpgrade = true;
 +}
 +
  bool LegacyWebSocketAdapter::isAccepted() {
    return farNative->state.is<Accepted>();
  }
 diff --git a/src/workerd/api/web-socket.h b/src/workerd/api/web-socket.h
-index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..5172222f9b6ce45c9afd2e5015cbc6751447beef 100644
+index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..0eb5d241d09b2b05ea7a88e91fd1d62e134280e3 100644
 --- a/src/workerd/api/web-socket.h
 +++ b/src/workerd/api/web-socket.h
 @@ -199,12 +199,19 @@ class WebSocket: public EventTarget {
@@ -170,8 +191,17 @@ index 9ff06d1ec58583fccd7d2e90bfa0224a2a80b28e..5172222f9b6ce45c9afd2e5015cbc675
    kj::Maybe<kj::ArrayPtr<const byte>> getSerializedAttachment() const;
    bool isOutputClosed() const;
    void initiateHibernatableRelease(jsg::Lock& js,
+@@ -873,6 +882,8 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
+   // so it cannot be `IoOwn`ed as `farNative` is. Informs the HibernatableWebSocket if we
+   // called `close()`, preventing send() after revival.
+   bool closedOutgoingForHib = false;
++  // An unfinished node upgrade can end outside the accepting actor's IoContext.
++  bool abandonedUpgrade = false;
+ 
+   // When YES, a server-initiated close does NOT automatically send a reciprocal close
+   // frame, leaving readyState as CLOSING (2) when the close event fires. When NO (the
 diff --git a/src/workerd/io/legacy-hibernation-manager.c++ b/src/workerd/io/legacy-hibernation-manager.c++
-index ae4d1c31a523402edc4f88940322299309aeac1c..cb920654e5981ea5ad4f53c341ea8de55a47e97b 100644
+index ae4d1c31a523402edc4f88940322299309aeac1c..26ca61ae63f5d32d847f26dcab9cf64d5e10bdd0 100644
 --- a/src/workerd/io/legacy-hibernation-manager.c++
 +++ b/src/workerd/io/legacy-hibernation-manager.c++
 @@ -245,6 +245,12 @@ kj::Maybe<kj::StringPtr> LegacyHibernationManagerImpl::stageNodeSocket(
@@ -219,11 +249,11 @@ index ae4d1c31a523402edc4f88940322299309aeac1c..cb920654e5981ea5ad4f53c341ea8de5
 +}
 +
 +void LegacyHibernationManagerImpl::discardNodeUpgrade(HibernatableWebSocket& socket) {
-+  socket.nodeSocket->abandonUpgrade();
++  KJ_DEFER(dropHibernatableWebSocket(socket));
 +  KJ_IF_SOME(active, socket.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
 +    active->abandonHibernatableUpgrade();
 +  }
-+  dropHibernatableWebSocket(socket);
++  socket.nodeSocket->abandonUpgrade();
 +}
 +
 +bool LegacyHibernationManagerImpl::canForwardNodeUpgrade(
@@ -414,7 +444,7 @@ index 7045a3fe12e0a36d6ce0c7cd987f346cf7b6f5a4..67eb486f1d73adba9a141bd82f17d3cd
    for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
           "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..e38655d8d5bfc0ca796ecc4e87c620871457ea9f 100644
+index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..7f355641445dd2329a222cf84eedeaf028c1b154 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1806,6 +1806,9 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
@@ -602,8 +632,8 @@ index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..e38655d8d5bfc0ca796ecc4e87c62087
    }
 +  void abandonUpgrade() override {
 +    if (!pendingUpgrade) startUpgrade();
-+    if (local) local->abort();
 +    attaching.fulfiller->reject(KJ_EXCEPTION(DISCONNECTED, "WebSocket upgrade was abandoned"));
++    if (local) local->abort();
 +  }
    kj::Promise<void> whenUpgrading() override {
      return upgraded.addBranch();
