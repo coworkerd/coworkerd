@@ -2279,6 +2279,9 @@ public:
         result.refusal = processRefusal(ProcessUnavailable{false, probe.notSent}, root);
       } else if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+      } else if (probe.culprit == "fatal") {
+        category = "evaluation"; detail = "V8_FATAL";
+        message = "the workerd process ended with a V8 fatal error attributed to this load";
       } else if (!probe.culprit.empty()) {
         category = "limit"; detail = "LIMIT_EXCEEDED";
         message = probe.culprit == "memory"
@@ -3400,14 +3403,14 @@ public:
     process->invocationId = invocationId; process->treeId = invocationId;
     return runtime.open(process, descriptor, version.definitionHash);
   }
-  // The culprit a workerd exit or kill confirmed for this invocation: "memory"
-  // (fatal OOM), "cpu" (watchdog kill), or empty.
+  // The culprit a workerd exit or kill confirmed for this invocation.
   std::string culpritOf(const std::string& invocationId) {
     auto text = runtime.culpritRecordsJson();
     capnp::MallocMessageBuilder message;
     auto json = message.initRoot<capnp::JsonValue>();
     capnp::JsonCodec().decodeRaw(kj::arrayPtr(text.data(), text.size()), json);
-    for (auto [list, kind] : {std::pair{"recentMemoryCrashes", "memory"}, std::pair{"recentKills", "cpu"}}) {
+    for (auto [list, kind] : {std::pair{"recentMemoryCrashes", "memory"}, std::pair{"recentKills", "cpu"},
+        std::pair{"recentFatalExits", "fatal"}}) {
       auto entries = coworkerd::json::field(json, list);
       if (!entries.isArray()) continue;
       for (auto entry : entries.getArray()) {
@@ -4728,8 +4731,7 @@ public:
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
-        process->snapshotAfterFailure();
-        return kj::mv(error);
+        return process->rejectAfterCrash(kj::mv(error));
       });
       co_await kj::mv(request).attach(std::move(finish));
       phaseTiming("request-through-body", started, slot->process);
@@ -4759,7 +4761,10 @@ private:
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
-      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit());
+      if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
+          .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
+        return process->rejectAfterCrash(kj::mv(error));
+      });
       co_await request;
     } catch (const kj::Exception& error) {
       if (slot->process) slot->process->snapshotAfterFailure();
@@ -8868,6 +8873,9 @@ private:
           verdict = {"UNAVAILABLE", "", notSent};
         } else if (timedOut) {
           verdict = {"TIMEOUT", "", "timed out while loading (" + std::to_string(request.timeoutMs) + " ms); the probe was cancelled"};
+        } else if (culprit == "fatal") {
+          quarantined = server.quarantined(version->workerId);
+          verdict = {"LOAD_FAILED", "fatal", "the workerd process ended with a V8 fatal error attributed to this trial"};
         } else if (!culprit.empty()) {
           quarantined = server.quarantined(version->workerId);
           verdict = {"LIMIT_EXCEEDED", culprit, culprit == "memory"

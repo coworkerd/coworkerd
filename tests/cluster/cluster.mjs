@@ -45,7 +45,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
-    controlDurableLifecycle = false, delayRecoveryPeers = false,
+    controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -63,6 +63,8 @@ export class Cluster {
     this.image = `coworkerd:${this.project}`;
     this.override = join(directory, 'compose.json');
     this.peerAckGate = holdPeerAcks ? join(directory, 'peer-acks') : null;
+    this.fatalTestBinary = fatalTestBinary;
+    this.fatalControl = fatalTestBinary ? join(directory, 'fatal-control') : null;
     this.durableLifecycleGate = controlDurableLifecycle ? join(directory, 'durable-lifecycle') : null;
     this.recoveryRelayGate = delayRecoveryPeers ? join(directory, 'recovery-relay') : null;
     this.threadedNodes = new Set(threadedNodes);
@@ -96,6 +98,7 @@ export class Cluster {
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
     for (const file of ['workerd', 'coworkerd-threaded']) files[`bin/${file}`] = join(this.kernel, file);
+    if (this.fatalTestBinary) files['bin/coworkerd-threaded'] = this.fatalTestBinary;
     for (const phase of ['startup', 'steady']) {
       const file = `coworkerd-syscalls-${phase}.txt`;
       files[`bin/${file}`] = join(this.kernel, 'allowlist', file);
@@ -103,6 +106,7 @@ export class Cluster {
     for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh', 'runtime/runtime.js']) files[file] = join(root, file);
     await Promise.all(Object.entries(files).map(([file, source]) => copyFile(source, join(context, file))));
     if (this.peerAckGate) await mkdir(this.peerAckGate, { mode: 0o755 });
+    if (this.fatalControl) await mkdir(this.fatalControl, { mode: 0o755 });
     if (this.durableLifecycleGate) await mkdir(this.durableLifecycleGate, { mode: 0o755 });
     const overrides = {};
     if (this.recoveryRelayGate) {
@@ -132,6 +136,7 @@ export class Cluster {
         egress: { clusterAddresses: ['apiserver:8940'] },
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1 },
+        ...(this.fatalControl ? { quarantineProcesses: 1 } : {}),
         membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
           durableObjects: {
@@ -163,6 +168,10 @@ export class Cluster {
           overrides[node].environment.COWORKERD_CUT_DURABLE_CHANNEL_FOR_TEST = `${gate}/loss-${node}`;
         }
         overrides[node].volumes.push({ type: 'bind', source: this.peerAckGate, target: gate, read_only: true });
+      }
+      if (this.fatalControl && node === nodes[0]) {
+        overrides[node].volumes.push({ type: 'bind', source: this.fatalControl,
+          target: '/tmp/coworkerd-fatal-test', read_only: true });
       }
     }
     await writeFile(this.override, JSON.stringify({ services: overrides }));

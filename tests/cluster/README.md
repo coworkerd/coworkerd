@@ -41,6 +41,32 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+### Fatal attribution with the test kernel
+
+In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
+kernel test. Then pass the test executable to the cluster runner from the product checkout.
+
+```sh
+(cd workerd && bazel build --config=release //src/workerd/threaded:coworkerd-threaded-fatal-test \
+  '//src/workerd/threaded:threaded-server-test@' && \
+  bazel test --config=release //src/workerd/threaded:fatal-attribution-test@ \
+    //src/workerd/threaded:fatal-attribution-scope-test@)
+for title in 'fatal record identifies' "the isolate's registered V8 fatal" \
+    'the ordinary role registers the process-wide'; do
+  line=$(grep -n -F "KJ_TEST(\"$title" workerd/src/workerd/threaded/threaded-server-test.c++ | cut -d: -f1)
+  workerd/bazel-bin/src/workerd/threaded/threaded-server-test@ --filter="threaded-server-test.c++:$line"
+done
+COWORKERD_CLUSTER_FATAL_TEST_BINARY="$PWD/workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded-fatal-test" \
+  node tests/cluster/run.mjs "$kernel" fatal-attribution
+```
+
+The fixture mounts a read-only controller directory into one node. The controller selects the process and
+Worker before issuing a normal HTTP call. The synthetic event hook exists only in the test executable. The first confirmed
+exit is an API check that V8 reports through the isolate's fatal handler, so the case also fails when another
+handler replaces the kernel's; the node logs V8's own location and message for it. The last one fails the same check
+while the Worker loads cold in a new quarantine process, after its top level ran, where only the load's own scope
+names the Worker.
+
 To measure concurrent recovery on a fresh three-node cluster with default membership and rebuild settings:
 
 ```sh
@@ -75,7 +101,8 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
-| `process-replacement` | Killing an ordinary workerd process leaves its slot unavailable, or its replacement cannot serve the next Worker request after readiness returns. |
+| `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
+| `fatal-attribution` (test kernel) | A confirmed fatal exit fails to route the tenant's next call to quarantine, a peer fails to apply the suspect mark, a repeat exit affects the ordinary process, an unrelated tenant fails to recover, shared-cage exhaustion marks the last allocator, an exit through V8's own API check or one during the load stays unattributed, or V8's diagnostic is missing. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
 | `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |

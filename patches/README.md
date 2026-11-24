@@ -56,6 +56,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
   and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
   to a code-update reset.
+  Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
+  quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
