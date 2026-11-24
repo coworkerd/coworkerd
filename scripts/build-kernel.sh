@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build both kernel executables from this checkout on an Ubuntu runner.
+# Build and test the kernel from this checkout on an Ubuntu runner.
 set -euo pipefail
 
 sudo apt-get update
@@ -21,3 +21,18 @@ cd workerd
 export PATH="$tools:$PATH"
 time bazel --output_user_root="$RUNNER_TEMP/kernel-bazel" build --config=release --jobs=3 \
   //src/workerd/server:workerd //src/workerd/threaded:coworkerd-threaded
+
+# Reuse the release build's outputs. Run one test at a time because the
+# threaded-server tests start children that allocate several GiB of heap.
+# Each explicit upstream label corresponds to a test source modified by the series.
+test_started=$SECONDS
+test_status=0
+bazel --output_user_root="$RUNNER_TEMP/kernel-bazel" test --config=release --jobs=3 \
+  --build_tests_only --local_test_jobs=1 --cache_test_results=no --test_output=errors \
+  //src/workerd/server/factory/... //src/workerd/threaded/... \
+  //src/workerd/io:actor-sqlite-test@ //src/workerd/io:actor-sqlite-test@all-autogates \
+  //src/workerd/server:channel-token-test@ //src/workerd/server:channel-token-test@all-autogates \
+  || test_status=$?
+printf '### Bazel kernel tests\n\nElapsed after the executable build: %d s. Bazel exit: %d.\n\n' \
+  "$((SECONDS - test_started))" "$test_status" | tee -a "$GITHUB_STEP_SUMMARY"
+exit "$test_status"

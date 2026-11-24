@@ -74,6 +74,10 @@ checking a successful run, dispatch
 [Publish Linux kernel archives](https://github.com/coworkerd/coworkerd/actions/workflows/kernel-publish.yml)
 from `main` with the run ID, attempt number, and source SHA in the build summary.
 
+On both Linux architectures the hosted build runs the factory and threaded Bazel tests and the upstream test files
+extended by our patches. The tests reuse the release build's outputs. A test failure stops that architecture job
+before packaging. The build summary records the elapsed time of the Bazel test invocation.
+
 Use the series tag printed by `package-kernel.py` for a local publication. When adding an architecture to a
 local release, update `SHA256SUMS` to include every published archive. For hosted builds, record the published
 `releaseTag` in the pin file. The hosted tag adds `-run-<id>-<attempt>` to the series tag, so earlier pins keep
