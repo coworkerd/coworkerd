@@ -56,9 +56,9 @@ async function main(args) {
     if (regular.length) {
       failed += await runSuite(regular, kernel, controller.signal);
     }
-    for (const [name, { test, nodes, membership, confirmTimeoutMs }] of gated) {
+    for (const [name, { test, nodes, membership, confirmTimeoutMs, objectBytes, inFlightLimit }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
-        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs,
+        threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, objectBytes, inFlightLimit,
       });
     }
     if (nativeSql.length) {

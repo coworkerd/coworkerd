@@ -43,7 +43,8 @@ export async function eventually(description, probe, { timeout = 30000, interval
 }
 
 export class Cluster {
-  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs } = {}) {
+  constructor(directory, kernel, signal, { holdPeerAcks = false, threadedNodes = [], membership,
+    confirmTimeoutMs, objectBytes, inFlightLimit } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
@@ -63,6 +64,8 @@ export class Cluster {
     this.threadedNodes = new Set(threadedNodes);
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
+    this.objectBytes = objectBytes;
+    this.inFlightLimit = inFlightLimit;
   }
 
   async command(program, args, {
@@ -113,10 +116,11 @@ export class Cluster {
         storage: { endpoint: 'http://storage:8333', credentialsFile: `${secrets}/server.json` },
         egress: { clusterAddresses: ['apiserver:8940'] },
         // Pin stateless ingress to the receiving node and its sole ordinary process.
-        ingressPlacement: false, processPool: { count: 1 },
+        ingressPlacement: false, processPool: { count: 1, inFlightLimit: this.inFlightLimit },
         membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
-          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs },
+          durableObjects: { threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
+            objectBytes: this.objectBytes },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
         } : {}),
       }));

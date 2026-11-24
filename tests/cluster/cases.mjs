@@ -4,7 +4,7 @@ import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
-import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlProtocol } from './native-sql.mjs';
+import { longSqlIsolation, sqlCli, sqlConfirmationAndTakeover, sqlProtocol, sqlResourceBounds } from './native-sql.mjs';
 
 function respondWith(value) {
   return `export default { fetch() { return new Response(${JSON.stringify(value)}); } };`;
@@ -999,6 +999,9 @@ export const durableGatedCases = {
     confirmTimeoutMs: 25000,
   },
   'durable-threaded-migration': { test: threadedClassMigration, nodes: ['node-1', 'node-2', 'node-3'] },
+  'sql-resource-bounds': {
+    test: sqlResourceBounds, nodes: ['node-1', 'node-2', 'node-3'], inFlightLimit: 2, objectBytes: 1024 * 1024,
+  },
 };
 
 export const nativeSqlCases = {

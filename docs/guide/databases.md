@@ -322,13 +322,22 @@ be used again in this release.
 
 ## 10. Failure and consistency
 
-With `durableObjects.threadedStorage` enabled, each database executes SQLite on its own home thread. Other databases and Durable Objects in the same process can serve requests while it runs. A single query or an entire batch has a 30-second wall-clock deadline covering statement preparation, execution, result encoding and transaction completion. The control plane's forwarding deadline allows time for routing and the configured WAL confirmation interval. The owner confirms completed writes before replying.
+With `durableObjects.threadedStorage` enabled, each database executes SQLite on its own home thread. Other databases and Durable Objects in the same process can serve requests while it runs. A single query or an entire batch has a 30-second wall-clock deadline. The budget starts at native admission and includes waiting behind another request, opening the image, reading the request, and preparing, stepping, encoding and committing its SQL. A shorter dispatch lease also bounds the wait. The control plane's forwarding deadline allows time for routing and the configured WAL confirmation interval. The owner confirms completed writes before replying.
+
+A durable process reserves one home for Durable Objects. A process with one home therefore serves Durable Objects only. When the other homes or the process memory budget are full, a new database request can receive a pre-execution `503 OVERLOADED` or `DO_UNAVAILABLE`. Each database home reserves 64 MiB of metered SQLite memory in the process budget. Native requests also reserve memory for their input, decoded JSON and response. One native binding request may use up to 40 MiB of serialized input, subject to that memory budget. The public HTTP limit remains 1 MiB.
+
+Sorters and temporary tables use SQLite's metered memory. Dirty pages stay there before commit. The native connection can write a WAL up to 64 MiB, including headers, before SQLite returns a full-storage error and rolls back the current transaction. The main database grows from committed pages during checkpointing. The existing node and tenant storage limits still apply to committed data. A larger WAL inherited on open can be read and truncated during recovery or checkpointing.
 
 On the upstream backend, each database event uses the native SQL CPU budget and active wall-time fallback. The defaults are 200 ms of cumulative SQL CPU and 800 ms of active SQL wall time, configured with `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs`. CPU accounting samples short segments and measures segments that reach a SQLite progress callback. A statement occupies the durable process's execution loop until it returns. Keep both limits below `processPool.stuckTimeoutMs` (3000 ms by default).
 
 A SQL deadline returns `503 SQL_LIMIT_EXCEEDED`. A D1 binding receives `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A `/query` batch, one ingest segment or one migration file including its ledger row rolls back as a whole, even when the interrupted statement is a read. Earlier confirmed `exec()` statements, ingest segments and migration files remain. `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain priority when confirmation fails or the reply is lost.
 
-SQLite checks the deadline during preparation and execution. A callback-free SQLite operation or blocked filesystem call can delay interruption until control reaches a check. Break up costly work into bounded transactions, for example by changing rows by key range.
+SQLite checks the deadline during preparation, stepping, result encoding and at its commit hook. The following execution paths still lack a proven interruption bound and block enabling native SQL by default:
+
+- A parser or optimizer operation between SQLite progress callbacks, including schema loading and a single expensive planning step.
+- A VM opcode or internal SQLite routine that does substantial work before returning, including scalar functions over large text or BLOB values, sorting or index maintenance, and virtual-table work.
+- Decoding the bounded request JSON inside the decoder.
+- A stalled local filesystem operation during open, recovery, commit, checkpointing, finalization or rollback. Once the commit hook has allowed a commit, a deadline that arrives during its physical writes cannot undo it.
 
 Tenant code using a Durable Object's `ctx.storage.sql` follows the Durable Object's event limits. An interrupted write rolls back its transaction even when caught. A read failure that escapes `transactionSync()` rolls back. See [Durable Objects](durable-objects.md).
 
