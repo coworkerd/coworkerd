@@ -98,10 +98,10 @@ index eb1afcf0087f3013226e09f9c8ffb8308cf6af6d..6d3ed006d4b839a2800768c69154eaff
      committed = true;
    }
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb81aef8e25 100644
+index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..c93757d6d6b1b2db5c1825f957cff9a3c8958870 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1074,13 +1074,14 @@ class CpuWatchdog {
+@@ -1075,13 +1075,14 @@ class CpuWatchdog {
      KJ_REQUIRE(found != entries.end());
      entries.erase(found);
    }
@@ -118,7 +118,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
      entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
      entry.identity = identity;
      changed.notify_one();
-@@ -1434,6 +1435,7 @@ struct DurableEventCpu {
+@@ -1435,6 +1436,7 @@ struct DurableEventCpu {
    kj::String identity, oomReport;
    kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
    server::DurableCpuAccount account;
@@ -126,7 +126,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
  };
  
  class DurableEventObserver final: public RequestObserver {
-@@ -1518,7 +1520,7 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1519,7 +1521,7 @@ struct RequestLimits final: LimitEnforcer {
        auto &charged = account();
        charged.charge(segmentStart, now);
        const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
@@ -135,7 +135,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
            (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
          auto expected = LimitCause::NONE;
          measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
-@@ -1550,7 +1552,8 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1551,7 +1553,8 @@ struct RequestLimits final: LimitEnforcer {
        const auto used = (next ? next->account : turnOverhead).consumed();
        if (execution.registered &&
            !CpuWatchdog::instance().switchAccount(
@@ -145,7 +145,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
          return;
        }
        currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
-@@ -1616,7 +1619,9 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1617,7 +1620,9 @@ struct RequestLimits final: LimitEnforcer {
      return nullptr;
    }
    std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
@@ -156,7 +156,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
      if (!sqlBudget) {
        const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
        const auto left = scope->account().remaining(maximum);
-@@ -2382,6 +2387,17 @@ struct DurableSessionScope {
+@@ -2400,6 +2405,17 @@ struct DurableSessionScope {
    kj::Canceler preparing;
    kj::Canceler transport;
    bool ended = false;
@@ -174,7 +174,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
  };
  
  class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
-@@ -2987,6 +3003,7 @@ struct ThreadedServer {
+@@ -3067,6 +3083,7 @@ struct ThreadedServer {
      // Runs before the release above: an event this session was still preparing ends here,
      // and with it the waiter it has on a cold load.
      auto scope = std::make_shared<DurableSessionScope>();
@@ -182,7 +182,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
      auto &sessions = state.durableSessions[call.ticket.tree];
      KJ_ASSERT(sessions.emplace(call.ticket.event, scope).second);
      KJ_DEFER({
-@@ -5638,7 +5655,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5730,7 +5747,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      std::shared_ptr<TenantPermit> tenant,
      kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>(),
      kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
@@ -192,7 +192,7 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
    if (!preparation) preparation = server.prepareSlot(slot);
    auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
    invocation->measurement.preparation = std::move(preparation);
-@@ -5667,8 +5685,9 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5760,8 +5778,9 @@ PreparedInvocation prepareInvocation(ThreadState &state,
        ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
        slot->isolateLabel.c_str(), "\",");
    if (slot->resetDurableRoot) {
@@ -202,9 +202,9 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
 +    event->sqlDeadline = std::move(sqlDeadline);
 +    observer = kj::refcounted<DurableEventObserver>(std::move(event));
    }
+   observer = kj::mv(observer).attachToThisReference(std::move(budgetLifetime));
    auto limits =
-       kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
-@@ -6612,7 +6631,34 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6708,7 +6727,34 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
            str(plan, "versionFingerprint") == route.open.definition &&
            route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
        "durable routing descriptor mismatch");
@@ -239,12 +239,12 @@ index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb8
    auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
        "durable class missing from pinned Worker");
-@@ -6785,8 +6831,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6881,8 +6927,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
    }
    if (entry.get() == nullptr) {
 +    checkSqlDeadline();
-     entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+     entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
 -        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
 +        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor), kj::none, std::move(sqlDeadline))
                  .entry;

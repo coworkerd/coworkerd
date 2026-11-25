@@ -30,15 +30,16 @@ The experimental native tenant execution share is disabled by default and is not
 | 503 | `SECRET_UNAVAILABLE` | The node running it has no usable value of a secret the version declares: it has not read the value yet (it was just set; nodes read the desired state every 5 seconds), or the value does not open with that node's secrets key; or that node cannot add the values to its log cleaning now: its dictionary is full, the tenant's secret values would take more than its share of it (a quarter; the reason says by how much: fewer or smaller secrets), or it still holds more than 1 MiB of the tenant's earlier secret values for isolates that may still use them (the reason says roughly when that ends); for a Durable Object call also when the tenant's earlier values grow too fast on the node's durable process (a rotation for them less than an hour ago; refused until the hour has passed), and when the values changed after the call was admitted and the dictionary cannot take the new ones (the same code as at admission) | Not executed | Retry a little later (placement tries another node); when it persists on one node, that node's `secrets-key.json` is not the cluster's |
 | 409 | `VERSION_UNAVAILABLE`, `VERSION_PIN_MISMATCH` | The deployment changed during the call, and the node it runs on does not know the version this call is locked to yet; or the node could not fetch or verify the version's code bundle before execution: the next candidate node is tried, and when none can, the call answers `503 PLACEMENT_EXHAUSTED` with `VERSION_UNAVAILABLE` in each attempt (409 itself only for a Worker with a static placement or with ingress placement off). A static asset whose bytes cannot be fetched or verified answers `503 ASSET_UNAVAILABLE` at the node that received the call, without another node being tried | Not executed | Retry |
 | 410 | `LEASE_EXPIRED` | The deadline of this call (or of its parent call) has passed | Not executed | Retry |
-| 429 | `SUBREQUEST_BUDGET_EXHAUSTED` | The subrequest budget of one call tree is used up -- on a WebSocket connection, of one message: each message starts it again | Not executed | Make fewer Binding calls |
+| 429 | `SUBREQUEST_BUDGET_EXHAUSTED` | The calling invocation spent its subrequest balance. WebSocket delivery refills the balance | Not executed | Make fewer subrequests in this invocation |
 | 503 | `WEBSOCKET_NODE_CAPACITY` | The ingress node's shared WebSocket ceiling is full. `inFlight` counts both pending handshakes and open connections across all tenants. `limit` is the effective ceiling. The response includes `dispatched: false` and `retryable: true` | Not executed | Retry after a connection closes, or connect through another node |
 | 503 | `SERVER_DRAINING`, `PROCESS_UNAVAILABLE`, `QUARANTINE_UNAVAILABLE`, `PLACEMENT_EXHAUSTED`, `PEER_UNAVAILABLE`, `OVERLOADED`, `LOAD_BAND_REJECTED` | This node or all candidate nodes cannot take it for now (exiting, a process not ready, a concurrency limit, memory pressure) | Not executed | Retry, or use another ingress |
 | 508 | `PLACEMENT_HOPS_EXHAUSTED` | A Binding call relayed along static placements ran out of placement hops | Not executed | Check the nodes' `placements` entries |
+| 508 | `BINDING_HOP_LIMIT` | A call to a Worker would exceed eight levels of nested calls | Not executed | Shorten the chain |
 | 503 | `ASSET_UNAVAILABLE` | A static asset's bytes cannot be fetched or do not verify; while a Worker's asset index cannot be read, every request to that Worker answers it, also for paths its code would serve | Not executed | Recovers by itself once object storage is back |
 
 Once the Worker accepted a WebSocket (`101`), the connection ends with a close code instead of an answer: the Worker's own codes pass as they are; `1001` (going away) when the node holding or running the connection drains, or the process it runs in is replaced -- reconnect, and another node or process takes it --; `1011` with the reason `CPU_LIMIT_EXCEEDED` or `MEMORY_LIMIT_EXCEEDED` when a message went over a limit, `RESULT_UNCERTAIN` when its process ended otherwise; no close frame, which a client reports as `1006`, when the node holding the client's connection lost the node running it.
 
-**Durable Object calls**: what a stub's `fetch()` answers when the object's request fails -- the Worker decides what its own client gets. The refusals of the table above apply as well (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `VERSION_UNAVAILABLE`, `SECRET_UNAVAILABLE`, `OVERLOADED`, and for a stateless Worker's call `SUBREQUEST_BUDGET_EXHAUSTED` and `LEASE_EXPIRED`). A call to an object goes to the node that owns the object's shard ([cluster state](../cluster-state.md), section 11); when that node refuses it, or cannot be reached, the node of the caller looks for the owner once more and sends it once more, and answers the second refusal: `PEER_UNAVAILABLE` (`503`) when the owner could not be reached, the owner's own code otherwise; once sent, a call whose answer did not come back is `RESULT_UNCERTAIN`. While a shard has no owner a node can reach, its objects' calls fail this way until another node takes the shard over.
+**Durable Object calls**: what a stub's `fetch()` answers when the object's request fails -- the Worker decides what its own client gets. The refusals of the table above apply as well (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `VERSION_UNAVAILABLE`, `SECRET_UNAVAILABLE`, `OVERLOADED`, `SUBREQUEST_BUDGET_EXHAUSTED`, and `LEASE_EXPIRED`). A call to an object goes to the node that owns the object's shard ([cluster state](../cluster-state.md), section 11); when that node refuses it, or cannot be reached, the node of the caller looks for the owner once more and sends it once more, and answers the second refusal: `PEER_UNAVAILABLE` (`503`) when the owner could not be reached, the owner's own code otherwise; once sent, a call whose answer did not come back is `RESULT_UNCERTAIN`. While a shard has no owner a node can reach, its objects' calls fail this way until another node takes the shard over.
 
 | HTTP | `code` | Meaning | Executed? | What to do |
 | --- | --- | --- | --- | --- |
@@ -161,11 +162,15 @@ A node needs a management token (compose sets one; without one a node starts onl
 
 ## 4. A database's statements (errors `env.DB` throws)
 
+Budget refusals use HTTP 429 on the internal binding request. The calling Worker receives a D1 error and decides what to return to its own client. Direct HTTP SQL through the control plane does not consume a Worker invocation's budget.
+
 A `d1_databases` Binding speaks D1's protocol, so its errors are D1's: statement failures throw an `Error` whose `message` starts with the D1 prefix, and `error.cause` carries the message alone. `batch()` rejects on any statement failure and rolls the whole batch back. `exec()` stops at its first failing line and keeps earlier successful lines.
 
 | `message` | Meaning | What to do |
 | --- | --- | --- |
 | `D1_ERROR: <SQLite's message>` | The statement itself failed: a table that does not exist, a constraint, a type | Fix the statement |
+| `D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED: ...` | The invocation used its D1 allowance across its bindings. A batch counts once. The refused request does not reach the database | Make fewer database requests in this invocation |
+| `D1_ERROR: SUBREQUEST_BUDGET_EXHAUSTED: ...` | The invocation has no subrequests left. The refused request does not reach the database | Make fewer subrequests in this invocation |
 | `D1_ERROR: D1_RESULT_TOO_LARGE: query response exceeds 7340032 bytes; use LIMIT to fetch results in smaller batches` | The complete UTF-8 JSON reply exceeds 7 MiB, including columns, `meta`, all array entries and framing, and expanded BLOB number arrays | Fetch smaller batches with `LIMIT`; a single `/query` object, an array `/query` and `batch()` all roll back their writes |
 | `D1_ERROR: DO_OBJECT_TOO_LARGE: ...` | The write would take the database past 10 GiB (section 1); the statement is not durable, and reads go on | Delete rows, or ask the administrator to raise the object limit; transactions that do not grow the database remain permitted |
 | `D1_ERROR: QUOTA_EXCEEDED: ...` | The tenant's Durable Objects already hold more than `durableObjectBytes` (section 1) | Delete data, or ask for a larger quota; transactions that do not grow the database remain permitted |
@@ -201,7 +206,8 @@ not cause the runtime to add `.code`.
 | `message` | `code` | Meaning | What to do |
 | --- | --- | --- | --- |
 | whatever the method threw | absent unless the application supplied it | The target's code threw: the instance remains available; an uppercase message prefix alone does not add `.code` | The caller's own business |
-| `SUBREQUEST_BUDGET_EXHAUSTED: ...` | `SUBREQUEST_BUDGET_EXHAUSTED` | The call tree's budget is used up: a method call draws on it exactly as a `fetch` through the Binding does (section 1) | Make fewer Binding calls |
+| `SUBREQUEST_BUDGET_EXHAUSTED: ...` | `SUBREQUEST_BUDGET_EXHAUSTED` | The caller has no subrequests left. A method call draws from the same balance as a `fetch` through the Binding | Make fewer subrequests in this invocation |
+| `BINDING_HOP_LIMIT: ...` | `BINDING_HOP_LIMIT` | The call would exceed the nested Worker call limit | Shorten the chain |
 | `LEASE_EXPIRED: ...` | `LEASE_EXPIRED` | The call tree's deadline has passed -- for a capability the target returned, this is also what a call on it answers once the tree that made it is over | Make the call within the tree that opened it |
 | `CPU_LIMIT_EXCEEDED: ...`, `MEMORY_LIMIT_EXCEEDED: ...` | the same | A limit ended the method, as it would a request (section 1) | Do less per call |
 | `VERSION_UNAVAILABLE: ...`, `VERSION_PIN_MISMATCH: ...` | the same | The deployment changed during the call (section 1) | Retry |
@@ -222,6 +228,8 @@ try { await fetch("http://10.0.0.5/"); }
 catch (error) { error.message; }     // "EGRESS_DENIED: private-network"
 ```
 
+An attempted fetch that reaches the node's egress service and gets `EGRESS_DENIED` costs one subrequest.
+
 | `message` | Meaning | What to do |
 | --- | --- | --- |
 | `EGRESS_DENIED: cluster` | The destination is one of the cluster's own addresses: a node, a peer, object storage, the control plane (it announces its addresses to the nodes; others in `egress.clusterAddresses`), on any port | Cannot be allowed |
@@ -235,6 +243,8 @@ catch (error) { error.message; }     // "EGRESS_DENIED: private-network"
 | `EGRESS_DENIED: scheme`, `url` | A destination the policy point cannot take: not `http`/`https`, or an invalid URL, such as one without a host. A scheme other than `http`/`https` usually never reaches the node -- `fetch` throws `TypeError: Fetch API cannot load` itself --, and a user name and password in the URL are dropped by `fetch`, so the request goes out without them | -- |
 | `EGRESS_FAILED: dns` | The node cannot resolve this name | Check the name |
 | `EGRESS_FAILED: connect`, `tls`, `timeout`, `protocol` | Cannot connect, the TLS handshake or the certificate check failed, a timeout (30 seconds by default), the other side's answer is not valid HTTP | Check the destination; certificates are verified by the node against the system's root certificates |
+| `SUBREQUEST_BUDGET_EXHAUSTED: ...` | The caller has no subrequests left | Make fewer subrequests in this invocation |
+| `LEASE_EXPIRED: ...` | The outgoing fetch has no live calling invocation | Make the call while the invocation is live |
 
 Redirects are followed by `fetch` itself, and each hop is checked again: a public address redirecting to an internal one is refused just the same. Every request the node's egress service handles (allowed, refused, failed) has a line in the node log -- with `egress.mode` `off` the runtime refuses without the node and no line is written --
 `[egress] {"tenant","workerId","host","port","address","result","rule","status","requestBytes","responseBytes","durationMs",...}`,

@@ -58,7 +58,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
+    budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
     databaseFixtureNode, previousProduct,
   } = {}) {
     this.directory = directory;
@@ -86,6 +86,7 @@ export class Cluster {
     this.confirmTimeoutMs = confirmTimeoutMs;
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
     this.webSocketsPerNode = webSocketsPerNode;
+    this.budgetLifetime = budgetLifetime;
     this.configureNode = configureNode;
     this.nodeEnvironment = nodeEnvironment;
     this.productRoot = productRoot;
@@ -138,6 +139,12 @@ export class Cluster {
     if (this.fatalControl) await mkdir(this.fatalControl, { mode: 0o755 });
     if (this.durableLifecycleGate) await mkdir(this.durableLifecycleGate, { mode: 0o755 });
     const overrides = {};
+    if (this.budgetLifetime) {
+      overrides['budget-origin'] = {
+        image: 'node:22-trixie', networks: ['backend'],
+        command: ['node', '-e', 'require("node:http").createServer((_, res) => res.end("origin")).listen(8080, "0.0.0.0")'],
+      };
+    }
     const platformSource = this.platformFixture && await readFile(join(this.productRoot, 'tests/cluster/platform.js'), 'utf8');
     if (this.recoveryRelayGate) {
       await mkdir(this.recoveryRelayGate, { mode: 0o755 });
@@ -163,7 +170,9 @@ export class Cluster {
         secrets: { keyFile: `${secrets}/secrets-key.json` },
         peerAuth: { keyFile: `${secrets}/cluster-key.json` },
         storage: { endpoint: 'http://storage:8333', credentialsFile: `${secrets}/server.json` },
-        egress: { clusterAddresses: ['apiserver:8940'] },
+        egress: { clusterAddresses: ['apiserver:8940'], ...(this.budgetLifetime ? {
+          tenants: [{ tenant: this.budgetLifetime.tenant, allowInternal: ['budget-origin:8080'] }],
+        } : {}) },
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1 },
         ...(node === nodes[0] && this.webSocketsPerNode ? { ingress: { webSocketsPerNode: this.webSocketsPerNode } } : {}),
@@ -189,6 +198,7 @@ export class Cluster {
         environment: { ...this.nodeEnvironment?.(node), COWORKERD_CONFIG: target },
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
+      if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
       if (node === this.databaseFixtureNode) {
         overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';

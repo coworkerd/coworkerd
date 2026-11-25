@@ -82,6 +82,7 @@ struct VersionDefinition {
   std::vector<DurableObjectBindingDefinition> durableObjects;
   std::vector<std::string> declaredClasses, deletedClasses;
   std::vector<DurableObjectRename> renamedClasses;
+  std::optional<uint32_t> subrequestLimit;
   // Input location only; excluded from immutable identity and authority state.
   std::filesystem::path packagePath;
   std::string key() const { return workerId + "@" + versionId; }

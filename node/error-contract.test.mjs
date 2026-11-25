@@ -98,11 +98,13 @@ function workerResponses() {
   const [, budgetStatus, expiredStatus] = evidence(node,
     /const uint status = budget \? (\d{3}) : expired \? (\d{3}) : (\d{3});/);
   add(budgetStatus, budget);
+  const [, hopCode, hopStatus] = evidence(node, /server\.refusal\("(BINDING_HOP_LIMIT)", detail, (\d{3})\)/);
+  add(hopStatus, hopCode);
   add(expiredStatus, expired);
   // The ordering refusal is only reachable in the intentionally incorrect
   // lease counterexample. Check that guard before excluding it from the table.
   assert.equal(outOfOrder, 'BINDING_ARRIVAL_OUT_OF_ORDER');
-  const orderCheck = section(node, '    if (leaseConfig.naive()) {\n      auto orderKey', '      ++expected;');
+  const orderCheck = section(node, '    if (leaseConfig.naive()) {\n      auto orderKey', '    debitBinding(budget');
   evidence(orderCheck, /if \(orderSequence != expected\)[\s\S]*lastRejection = "Binding arrival out of order:/);
   for (const [, status, code] of node.matchAll(/sendText\(response, (\d{3}), "[^"]+",\s*rejectionJson\("([A-Z_]+)"/g)) {
     add(status, code, code === uncertain ? 'Result uncertain' : 'Not executed');

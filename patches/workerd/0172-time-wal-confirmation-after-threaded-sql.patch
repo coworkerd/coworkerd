@@ -179,10 +179,10 @@ index b73d509f45edd8d70201a8e35d49c92cfd3f0cee..b92c0b7377793841495b7122b078c0f8
    kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
    kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b896652c0c9c5c 100644
+index c93757d6d6b1b2db5c1825f957cff9a3c8958870..e3b59b78493fc01094ae8b36be636fb0094af102 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1923,6 +1923,8 @@ struct JsonDoc {
+@@ -1924,6 +1924,8 @@ struct JsonDoc {
    }
  };
  
@@ -191,7 +191,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
  struct DurableRoute {
    server::DurableAdmission::Key key;
    server::DurableAdmission::Open open;
-@@ -2953,8 +2955,8 @@ struct ThreadedServer {
+@@ -3033,8 +3035,8 @@ struct ThreadedServer {
      durableWaiters.erase(at);
    }
  
@@ -202,7 +202,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
      using Admission = server::DurableAdmission;
      for (;;) {
        auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
-@@ -2965,7 +2967,9 @@ struct ThreadedServer {
+@@ -3045,7 +3047,9 @@ struct ThreadedServer {
            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
                KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
          }
@@ -213,7 +213,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
            const auto delivery = durableAdmission->begin(
                ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
            if (delivery == Admission::Delivery::EXPIRED) {
-@@ -6115,7 +6119,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -6209,7 +6213,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      std::shared_ptr<DurableFacetReservation> reservation = nullptr,
      uint parentFacet = 0,
      kj::StringPtr facetName = ""_kj,
@@ -223,7 +223,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
  
  class LocalFacet final: public IoChannelFactory::ActorChannel {
   public:
-@@ -6544,7 +6549,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -6640,7 +6645,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      std::shared_ptr<DurableFacetReservation> reservation,
      uint parentFacet,
      kj::StringPtr facetName,
@@ -233,7 +233,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
    auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
    auto *borrowedHooks = hooks.get();
    auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
-@@ -6593,6 +6599,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -6689,6 +6695,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
        className, kj::mv(props), kj::mv(makeStorage), kj::mv(hooks), tree->state.timer,
        kj::mv(observer), kj::none, kj::none, kj::none, jsg::Dict<kj::String>{}, *borrowedHooks,
        kj::none, kj::none, kj::heap<DurablePendingOperations>(tree->idle));
@@ -246,7 +246,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
    borrowedObserver->bind(*actor);
    return {kj::mv(actor), borrowedHooks};
  }
-@@ -6631,14 +6643,18 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6727,14 +6739,18 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
            str(plan, "versionFingerprint") == route.open.definition &&
            route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
        "durable routing descriptor mismatch");
@@ -269,7 +269,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
      sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
          [expires, weak = std::weak_ptr(scope)]() noexcept {
        const auto now = nowNs();
-@@ -6657,7 +6673,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6753,7 +6769,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      }
    };
    checkSqlDeadline();
@@ -285,7 +285,7 @@ index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b89665
    checkSqlDeadline();
    auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
-@@ -6688,7 +6711,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6784,7 +6807,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      });
      auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
          Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,

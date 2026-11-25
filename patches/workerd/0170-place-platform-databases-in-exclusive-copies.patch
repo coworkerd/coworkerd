@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Wed, 25 Nov 2026 18:17:29 +0800
+Date: Wed, 25 Nov 2026 22:47:36 +0800
 Subject: [PATCH] Place platform databases in exclusive isolate copies
 
 
@@ -35,10 +35,10 @@ index 7451f2ee2c20206d35cb59ff1954bd39467f97fe..d706e00f8c866295dbd39e4363610f49
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index c5ac43c87884319b81013709250a6a4c8c65efb6..2ef3792bd94d149aa868cb7344d8e60a3d93c7a1 100644
+index b9f6cab54ffdd9e8528b666bc96e685ce3c871e7..593c2a0fdecf25d0d14d24b09a6f57417cb15ab2 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1983,7 +1983,7 @@ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+@@ -1984,7 +1984,7 @@ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
  }
  
  CompatibilityFlags::Builder compileTenantFlags(
@@ -47,7 +47,7 @@ index c5ac43c87884319b81013709250a6a4c8c65efb6..2ef3792bd94d149aa868cb7344d8e60a
    // Compatibility flags are tenant validation, before package decoding.
    slot.loadStage = threaded::LoadStage::EVALUATION;
    auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
-@@ -2000,8 +2000,11 @@ CompatibilityFlags::Builder compileTenantFlags(
+@@ -2001,8 +2001,11 @@ CompatibilityFlags::Builder compileTenantFlags(
        list.set(i++, item.getString());
      }
    }
@@ -60,7 +60,7 @@ index c5ac43c87884319b81013709250a6a4c8c65efb6..2ef3792bd94d149aa868cb7344d8e60a
    reporter.requireValid();
    if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
    return flags;
-@@ -2103,7 +2106,15 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
+@@ -2104,7 +2107,15 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
    return kj::encodeHex(result).cStr();
  }
  
@@ -77,7 +77,7 @@ index c5ac43c87884319b81013709250a6a4c8c65efb6..2ef3792bd94d149aa868cb7344d8e60a
    auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
      auto value = field(descriptor, name);
      if (value.isNull()) return 0;
-@@ -2115,15 +2126,22 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
+@@ -2116,15 +2127,22 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
        text(descriptor, "versionId"), "\n", text(descriptor, "definitionHash"), "\n",
        text(descriptor, "contentHash"), "\n", namedLimit("cpuLimitMs"), "\n",
        namedLimit("memoryLimitMiB"));
@@ -101,7 +101,7 @@ index c5ac43c87884319b81013709250a6a4c8c65efb6..2ef3792bd94d149aa868cb7344d8e60a
    auto empty = [](Json::Reader value) {
      return value.isNull() || (value.isArray() && value.getArray().size() == 0);
    };
-@@ -3552,7 +3570,9 @@ struct ThreadedServer {
+@@ -3632,7 +3650,9 @@ struct ThreadedServer {
    kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
      slot.loadStage = threaded::LoadStage::PACKAGE;
      Reporter reporter;

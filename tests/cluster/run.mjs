@@ -68,11 +68,11 @@ async function main(args) {
       failed += await runSuite(webSockets, kernel, controller.signal, { webSocketsPerNode: 2 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      delayRecoveryPeers, platformFixture, databaseFixtureNode, publishPeerPorts }] of gated) {
+      delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts }] of gated) {
       const previousProduct = name === 'durable-threaded-database-placement' && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
-        controlDurableLifecycle, delayRecoveryPeers, platformFixture, databaseFixtureNode, publishPeerPorts,
+        controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts,
         previousProduct: previousProduct ? resolve(previousProduct) : undefined,
       });
     }
