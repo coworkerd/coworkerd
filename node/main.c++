@@ -2929,7 +2929,7 @@ private:
         depth,
         expiresAtMonotonicMs,
         pins, *process, ingressServerId, slot ? slot->entrypoint : "", false, false, {}, coldLoaded, durable, root,
-        slot ? slot->dispatchReceipt : std::string());
+        slot ? slot->dispatchReceipt : std::string(), slot ? slot->durableLog : nullptr);
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
@@ -3549,7 +3549,7 @@ private:
       const std::string& ingressServerId, const std::string& entrypoint, bool trial = false,
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
       const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
-      const std::string& dispatchReceipt = {}) const {
+      const std::string& dispatchReceipt = {}, const coworkerd::DurableLog* durableLog = nullptr) const {
     auto encodeNative = [&](kj::String encoded) {
       if (!process.threadedServer()) return encoded;
       std::string value(encoded.cStr()); value.pop_back();
@@ -3722,6 +3722,10 @@ private:
                 << "\",\"queuedBytes\":\"" << encoded.size() + durable->socketBytes << "\",\"expiresMonotonicNs\":\""
                 << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
           encoded.pop_back();
+          if (durableLog && durable->isDatabase() && durable->platformClass) {
+            encoded += ",\"sqlWalFrameLimitBytes\":\"" +
+                std::to_string(durableLog->sqlWalFrameLimitBytes(storage)) + "\"";
+          }
           if (durable->sqlDeadline && durable->platformClass) {
             encoded += ",\"sqlDeadlineMonotonicNs\":\"" +
                 std::to_string(uint64_t(*durable->sqlDeadline * 1000000)) + "\"";

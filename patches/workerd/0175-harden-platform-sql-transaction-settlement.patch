@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Thu, 26 Nov 2026 03:30:35 +0800
+Subject: [PATCH] Harden SQL transaction settlement and test WAL record
+ grouping
+
+
+diff --git a/src/workerd/api/actor-state.c++ b/src/workerd/api/actor-state.c++
+index 8ed78bac33fa05b258d14937371544855873866e..8263b382a8cd2ff4d7fe157b7e40ba3bd12f23d9 100644
+--- a/src/workerd/api/actor-state.c++
++++ b/src/workerd/api/actor-state.c++
+@@ -750,7 +750,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+       // refusal and a refusal during the final commit can reach this caller.
+       // The actor still owns WAL confirmation and locks its output gate.
+       limit->begin();
+-      KJ_DEFER(limit->end(sqlite));
++      KJ_DEFER(limit->abandon(sqlite));
+       auto started = cache->startTransaction();
+       auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
+       StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
+@@ -766,6 +766,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+         }
+         KJ_REQUIRE(txn->commit() == kj::none, "synchronous SQL commit unexpectedly deferred");
+         syncExternalTxn.commit();
++        limit->end(sqlite);
+         return kj::mv(result);
+       }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
+         txn = nullptr;  // Roll back before translating the error.
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper-test.c++ b/src/workerd/server/factory/coworkerd-wal-shipper-test.c++
+index 6ff1cee13daf2f061b830bd5b27d42eabffa7b47..f888f7f9894106675573d1a9dc88ca3b1c012d3d 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper-test.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper-test.c++
+@@ -218,6 +218,41 @@ KJ_TEST("a SQL WAL transaction at the record limit commits and an extra frame ro
+   KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 3);
+ }
+ 
++KJ_TEST("the SQL WAL shipper splits a group of commits that exceeds the record limit") {
++  auto io = kj::setupAsyncIo();
++  auto dir = kj::newInMemoryDirectory(kj::nullClock());
++  const auto dbPath = kj::Path({"test.db"});
++  const auto walPath = kj::Path({"test.db-wal"});
++  SqliteDatabase::WalTransactionLimit limit(FRAME_SIZE);
++  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
++  SqliteDatabase db(vfs, dbPath.clone(), CREATE_OR_MODIFY);
++  db.run("PRAGMA page_size = 4096; CREATE TABLE entries (value INTEGER); INSERT INTO entries VALUES (0)");
++  db.run("PRAGMA journal_mode = WAL");
++  RecordingChannel channel;
++  DurableLogShipper shipper(*dir, walPath.clone(), dbPath.clone(),
++      {.objectName = kj::str(OBJECT_NAME), .storageId = kj::str(STORAGE_ID)}, db,
++      io.provider->getTimer(), channel);
++
++  // Leave both commits for a single shipper callback. Each changes the same
++  // leaf page and fits on its own.
++  for (int value: {1, 2}) {
++    limit.begin();
++    db.run("SAVEPOINT ledger");
++    db.run("UPDATE entries SET value = ?", value);
++    db.run("RELEASE ledger");
++    KJ_EXPECT(!limit.wasRefused());
++    limit.end(db);
++  }
++  const auto wal = dir->openFile(walPath)->readAllBytes();
++  KJ_ASSERT(wal.size() == WAL_HEADER_SIZE + 2 * FRAME_SIZE);
++  const auto header = wal.first(WAL_HEADER_SIZE);
++  const auto frames = wal.slice(WAL_HEADER_SIZE);
++  shipper.onCommit().wait(io.waitScope);
++  KJ_ASSERT(channel.frames.size() == 2);
++  expectFrames(channel.frames[0], header, 1, frames.first(FRAME_SIZE), 1, true);
++  expectFrames(channel.frames[1], header, 2, frames.slice(FRAME_SIZE), 2, false);
++}
++
+ KJ_TEST("cold WAL scan and shipper agree on the last complete SQLite commit") {
+   auto io = kj::setupAsyncIo();
+   auto dir = kj::newInMemoryDirectory(kj::nullClock());
+diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
+index 282d3d21231619d370bad3e68d2976fe26e2f7b6..ef7e275c4dffcda5f94b4a5dce07b88bdccd4ec6 100644
+--- a/src/workerd/util/sqlite.c++
++++ b/src/workerd/util/sqlite.c++
+@@ -986,6 +986,18 @@ void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
+   }
+ }
+ 
++void SqliteDatabase::WalTransactionLimit::abandon(SqliteDatabase& db) noexcept {
++  const bool unfinishedRefusal = wasRefused();
++  active = false;
++  if (unfinishedRefusal) {
++    // Rollback can fail while another exception is unwinding. Record the
++    // SQLite state while preserving the original exception.
++    kj::runCatchingExceptions([&] {
++      KJ_LOG(ERROR, "SQL WAL refusal cleanup did not finish", sqlite3_get_autocommit(db));
++    });
++  }
++}
++
+ void SqliteDatabase::notifyWrite(bool allowUnconfirmed) {
+   KJ_IF_SOME(cb, onWriteCallback) {
+     cb(allowUnconfirmed);
+diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
+index 21670f6b91a999b8b1dcf7677fc8d124e227a5b3..1ce805b0021f9e30e63cdeb80a44c4c4c682027c 100644
+--- a/src/workerd/util/sqlite.h
++++ b/src/workerd/util/sqlite.h
+@@ -947,6 +947,7 @@ class SqliteDatabase::WalTransactionLimit {
+   void setPageSize(uint32_t pageSize);
+   void begin();
+   void end(SqliteDatabase& db);
++  void abandon(SqliteDatabase& db) noexcept;
+   int checkWrite(sqlite3_file* file, int64_t offset, int length) noexcept;
+ 
+  private:

@@ -73,6 +73,11 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the platform database's output-gate watchdog cover both windows. The `io/worker.{h,c++}` hook sets
   that watchdog when the database home is created. The home finishes delivering a database reply
   before it starts the next queued SQL event.
+  Patch 0173 bounds the platform database's WAL frame writes using the capacity supplied by the node.
+  The SQLite VFS checks the frame span, and the SQL transaction returns a limit refusal after rollback.
+  The storage actor still owns confirmation of successful commits.
+  Patch 0175 keeps WAL cleanup out of exception unwinding and tests a group of individually
+  valid SQL transactions whose frames require more than one record.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
