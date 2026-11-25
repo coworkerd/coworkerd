@@ -644,9 +644,13 @@ export async function sqlWalAndTemporaryFiles(cluster) {
   };
   const before = (await state()).durableLog;
   const cap = BigInt(before.settings.recordLimitBytes);
+  const { confirmTimeoutMs } = before.settings;
+  assert.equal(confirmTimeoutMs, 5000);
   const insert = size => ({ sql: 'INSERT INTO ledger VALUES(zeroblob(?))', params: [size] });
   const common = Array.from({ length: 31 }, () => insert(2 * 1024 * 1024));
+  const started = performance.now();
   const near = await db.query([...common, insert(1024 * 1024)]);
+  const responseMs = performance.now() - started;
   assert.equal(near.length, 32);
   assert.ok(near.every(row => row.success));
   const confirmed = (await state()).durableLog;
@@ -654,10 +658,20 @@ export async function sqlWalAndTemporaryFiles(cluster) {
   assert.ok(encodedBytes <= cap && encodedBytes > cap - 1024n * 1024n,
     `replicated record of ${encodedBytes} bytes should be just below ${cap}`);
   assert.equal(confirmed.confirm.confirmations, before.confirm.confirmations + 1);
+  // This case has one active database and just added one log confirmation.
+  // Subtract the cumulative times represented by the two node snapshots.
+  const confirmMs = confirmed.confirm.meanMs * confirmed.confirm.confirmations -
+    before.confirm.meanMs * before.confirm.confirmations;
+  assert.ok(confirmMs >= 0 && confirmMs < confirmTimeoutMs, `node confirmed in ${confirmMs} ms`);
   const acknowledgedPeers = confirmed.peers.streams.filter(peer =>
     BigInt(peer.ackedSeq) >= BigInt(confirmed.log.nextSeq));
   assert.ok(acknowledgedPeers.length > 0, 'a peer confirmed the near-limit record');
   assert.ok(confirmed.threadedHomeIo.openSamples > 0);
+  console.log('Native SQL near-limit confirmation', JSON.stringify({
+    encodedBytes: String(encodedBytes), recordLimitBytes: String(cap),
+    confirmTimeoutMs, confirmMs: Number(confirmMs.toFixed(3)), responseMs: Number(responseMs.toFixed(3)),
+    acknowledgedPeers: acknowledgedPeers.map(peer => peer.nodeId),
+  }));
 
   const walPath = `/var/lib/coworkerd/do/coworkerd-do-root-v1-${db.namespaceId}`;
   const walBytes = async () => {
@@ -713,9 +727,7 @@ export async function sqlWalAndTemporaryFiles(cluster) {
     await db.ready();
   }, { timeout: 6000 });
   console.log('Native SQL WAL and temporary files', JSON.stringify({
-    encodedBytes: String(encodedBytes), recordLimitBytes: String(cap),
     frameCapacityBytes: before.settings.nativeSqlWalFrameLimitBytes,
-    acknowledgedPeers: acknowledgedPeers.map(peer => peer.nodeId),
     openSamples: after.threadedHomeIo.openSamples, tempSpill: held, releasedBytes: 0,
   }));
 }

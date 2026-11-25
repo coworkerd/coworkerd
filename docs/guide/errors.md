@@ -194,7 +194,7 @@ The threaded backend can return the following limits through SQL HTTP or as the 
 | HTTP status | Code | Meaning |
 | --- | --- | --- |
 | 422 | `SQL_MEMORY_LIMIT_EXCEEDED` | The call exceeded the 32 MiB SQLite heap limit or could never fit its process memory budget. The current transaction rolls back. Reduce the work per call. |
-| 503 | `DO_UNAVAILABLE` | The native durable process temporarily lacked memory and attempted to retire an idle database. The current transaction rolls back. Retry the rolled-back work. Earlier entries of `exec()` may already have committed. |
+| 503 | `DO_UNAVAILABLE` | The native durable process lacked an available home or temporarily lacked memory. On memory pressure it rolls back the current transaction and attempts to retire an idle database. Retry once capacity returns. |
 | 422 | `SQL_TRANSACTION_TOO_LARGE` | This native transaction exceeded the WAL frame capacity of a single replicated record, about 64 MiB with defaults. It rolls back before commit and the connection stays open. Split the change into several transactions. |
 | 507 | `SQL_SPILL_LIMIT_EXCEEDED` | SQLite exceeded the per-database or durable-process budget for uncommitted WAL and temporary files. Reduce the work per transaction or adjust the spill limits. |
 

@@ -2021,7 +2021,7 @@ export const durableGatedCases = {
     nativeSqlDatabaseSpillBytes: 16 * 1024 * 1024, nativeSqlProcessSpillBytes: 12 * 1024 * 1024,
   },
   'sql-wal-and-temporary-files': {
-    test: sqlWalAndTemporaryFiles, nodes: ['node-1', 'node-2', 'node-3'], confirmTimeoutMs: 15000,
+    test: sqlWalAndTemporaryFiles, nodes: ['node-1', 'node-2', 'node-3'],
   },
   'sql-home-pressure': {
     test: sqlHomePressure, nodes: ['node-1'], durableOwners: ['node-1'],

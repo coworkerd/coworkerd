@@ -583,6 +583,8 @@ reject smaller transactions. See the record-size discussion in cluster-state sec
 Native SQL uses the durable storage filesystem for WAL growth and temporary files. Size that filesystem for up to
 `durableObjects.processes × durableObjects.nativeSqlProcessSpillBytes` of spill per node, in addition to the node
 logs, database files and recovery staging. With one durable process and the default spill limits, this adds 4 GiB.
+On the threaded backend, Durable Objects with SQLite storage also write temporary files here, bounded by the
+available filesystem space.
 
 A takeover starts each object's `membership.ttlSeconds * 1000 + membership.livenessGraceMs` deadline (25 s by default)
 when its preparation begins. A complete owner answer ends collection early. Otherwise the node checks the silent
