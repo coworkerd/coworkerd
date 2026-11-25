@@ -4900,10 +4900,7 @@ public:
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
       if (slot->requestLease && !slot->closeLeaseOnFinish) {
-        // Once ingress starts its drain, the root has no response to produce.
-        // Child calls can still serve registered work until the cutoff.
-        auto ends = slot->root ? slot->requestLease->whenClosing() : slot->requestLease->whenClosed();
-        request = kj::mv(request).exclusiveJoin(ends.then([]() -> kj::Promise<void> {
+        request = kj::mv(request).exclusiveJoin(slot->requestLease->whenClosed().then([]() -> kj::Promise<void> {
           return KJ_EXCEPTION(DISCONNECTED, "caller lease ended during execution");
         }));
       }
