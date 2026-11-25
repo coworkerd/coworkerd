@@ -69,8 +69,10 @@ usage: cowctl <command> [options]              (in the project's directory)
 
   administrator (the administrator's credential):
   tenant create <name> [--hostname HOST]... [--quota NAME=N]... [--default-cpu-ms N] [--default-memory-mib N]
+                       [--default-subrequests N] [--default-d1-queries N]
   tenant list | get <name> | delete <name> [--yes]
   tenant update <name> [--hostname HOST]... [--no-hostnames] [--quota NAME=N]... [--default-cpu-ms N] [--default-memory-mib N]
+                       [--default-subrequests N] [--default-d1-queries N]
   credential create [--description TEXT] [--expires-in 30d]
                               a credential of the tenant (printed once; give it to the tenant)
   credential list | revoke <keyId>   (a tenant revokes its own credentials too)
@@ -929,13 +931,11 @@ function tenantBody(options, creating) {
   if (options.hostname) body.hostnames = options.hostname;
   const quotas = quotaFields(options.quota);
   if (Object.keys(quotas).length) body.quotas = quotas;
-  if (options["default-cpu-ms"] !== undefined || options["default-memory-mib"] !== undefined) {
-    body.defaultLimits = {};
-    for (const [flag, name] of [["default-cpu-ms", "cpuMs"], ["default-memory-mib", "memoryMiB"]]) {
-      if (options[flag] === undefined) continue;
-      if (!/^[0-9]+$/.test(options[flag])) throw usage(`--${flag} takes a number`);
-      body.defaultLimits[name] = Number(options[flag]);
-    }
+  for (const [flag, name] of [["default-cpu-ms", "cpuMs"], ["default-memory-mib", "memoryMiB"],
+    ["default-subrequests", "subrequests"], ["default-d1-queries", "d1Queries"]]) {
+    if (options[flag] === undefined) continue;
+    if (!/^[0-9]+$/.test(options[flag])) throw usage(`--${flag} takes a number`);
+    (body.defaultLimits ??= {})[name] = Number(options[flag]);
   }
   if (!creating && !Object.keys(body).length) throw usage("tenant update takes --hostname, --no-hostnames, --quota or --default-*");
   return body;
@@ -953,7 +953,8 @@ function printTenant(tenant, extra = {}) {
 }
 async function tenant(args) {
   const [operation, ...rest] = args;
-  const spec = { hostname: "list", quota: "list", "default-cpu-ms": "value", "default-memory-mib": "value", "no-hostnames": "flag", json: "flag", yes: "flag" };
+  const spec = { hostname: "list", quota: "list", "default-cpu-ms": "value", "default-memory-mib": "value",
+    "default-subrequests": "value", "default-d1-queries": "value", "no-hostnames": "flag", json: "flag", yes: "flag" };
   if (!["create", "list", "get", "update", "delete"].includes(operation)) throw usage("tenant create|list|get|update|delete");
   const { options, positional } = parse(rest, spec);
   const config = loadConfig();

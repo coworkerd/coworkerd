@@ -34,17 +34,30 @@ inline std::string invocationName(const std::string& node, const std::string& ep
   return node + "." + epoch + kind + std::to_string(sequence);
 }
 
-struct ChildBudget {
-  uint16_t grant, charged, remaining;
+enum class BudgetDebit { charged, subrequestsExhausted, d1Exhausted };
+
+struct InvocationBudget {
+  uint32_t subrequestLimit, remaining;
+  uint32_t d1Limit, d1Remaining;
+
+  InvocationBudget(uint32_t subrequestLimit, uint32_t d1Limit)
+      : subrequestLimit(subrequestLimit), remaining(subrequestLimit), d1Limit(d1Limit), d1Remaining(d1Limit) {}
+
+  BudgetDebit debit(bool database, bool countSubrequest = true) {
+    if (database && d1Remaining == 0) return BudgetDebit::d1Exhausted;
+    if (countSubrequest) {
+      if (remaining == 0) return BudgetDebit::subrequestsExhausted;
+      --remaining;
+    }
+    if (database) --d1Remaining;
+    return BudgetDebit::charged;
+  }
+
+  void refill() {
+    remaining = subrequestLimit;
+    d1Remaining = d1Limit;
+  }
 };
-// The caller has already rejected an empty budget in the correct mode. An
-// allocation carries the resulting grant and charge through placement attempts.
-inline ChildBudget childBudget(uint16_t before, uint16_t cap, bool naive) {
-  if (naive) return {before, 0, before};
-  const auto grant = std::min<uint16_t>(cap, static_cast<uint16_t>(before - 1));
-  const auto charged = static_cast<uint16_t>(1 + grant);
-  return {grant, charged, static_cast<uint16_t>(before - charged)};
-}
 
 struct TenantAdmissionCounts {
   uint32_t roots = 0, nested = 0;

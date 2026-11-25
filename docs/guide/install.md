@@ -530,7 +530,7 @@ All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. 
 `COWORKERD_GC_BUDGET_MS`, `COWORKERD_GC_REFILL_MS_PER_S`, `COWORKERD_GC_LONG_PAUSE_MS`, `COWORKERD_IDLE_GC_MS`, `COWORKERD_IDLE_GC_MIN_MIB`, `COWORKERD_GC_INITIAL_OLD_SPACE_MIB`, `COWORKERD_STATIC_HEAP_MIB` (the `gc` fields, in that order),
 `COWORKERD_SANDBOX_MODE`, `COWORKERD_SANDBOX_SYSCALLS`, `COWORKERD_SANDBOX_ALLOWLIST`, `COWORKERD_SANDBOX_SYSCALLS_STEADY`, `COWORKERD_SANDBOX_STEADY_ALLOWLIST`, `COWORKERD_EGRESS_MODE`, `COWORKERD_EGRESS_DEFAULT_POLICY`,
 and for the Workers' logs `COWORKERD_TENANT_LOG_BUFFER_BYTES`, `COWORKERD_WORKER_LOG_TOTAL_BYTES`, `COWORKERD_WORKER_LOG_LINES_PER_SECOND`, `COWORKERD_WORKER_LOG_MAX_LINE_BYTES`, `COWORKERD_WORKERD_LOG_MAX_BYTES`, `COWORKERD_WORKERD_LOG_FILES`.
-Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`), `COWORKERD_SUBREQUEST_BUDGET` (`8`) and `COWORKERD_SUBREQUEST_GRANT` (`1`);
+Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`) and the legacy overrides described under [invocation budgets](#invocation-budgets);
 the limits on a package's assets, `COWORKERD_ASSET_MAX_COUNT` (`20000`), `COWORKERD_ASSET_MAX_FILE_BYTES` (25 MiB) and `COWORKERD_ASSET_MAX_TOTAL_BYTES` (100 MiB); and the log buffers `COWORKERD_LOG_BUFFER_BYTES` and `COWORKERD_WORKERD_LOG_BUFFER_BYTES` (4 MiB each).
 Names ending in `_FOR_TEST` are for tests only.
 
@@ -540,6 +540,23 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PEER_KEY_FILE` (by default `cluster-key.json` there, used when present), `COWORKERD_PEER_ADDRESS`, `COWORKERD_LISTEN_ADDRESS`, `COWORKERD_PEER_LISTEN_ADDRESS`,
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
+
+### Invocation budgets
+
+Each invocation starts with 10,000 subrequests by default, including invocations through Service Bindings and Durable Object calls. Set `limits.subrequests` in a Worker's Wrangler configuration to give that version a limit from 1 through 10,000,000. An administrator can set a lower tenant default for versions that omit the field.
+
+```toml
+[limits]
+subrequests = 20000
+```
+
+```sh
+cowctl tenant update T --default-subrequests 50 --default-d1-queries 50
+```
+
+`defaultLimits.subrequests` accepts 1 through 10,000. `defaultLimits.d1Queries` accepts 1 through 1,000 and applies across the tenant's database bindings. Each invocation gets its own D1 allowance. A query, a `batch()`, or an `exec()` spends a single D1 request and one subrequest. The administrator sets the full `defaultLimits` object in one update. Include any CPU and memory defaults you want to keep.
+
+Existing Worker versions inherit the tenant or node default. `COWORKERD_SUBREQUEST_BUDGET` still supplies the node's fallback in lieu of 10,000. An existing `COWORKERD_SUBREQUEST_GRANT` setting is accepted with a startup warning. Each callee resolves its own limit. Upgrade the nodes, control plane and kernel together before deploying versions with `limits.subrequests`. See [the call lease](../architecture.md#3-the-path-of-one-call) for counted operations and [error codes](errors.md) for quota refusals.
 
 ### Inbound WebSocket capacity
 

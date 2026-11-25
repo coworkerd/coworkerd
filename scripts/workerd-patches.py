@@ -57,6 +57,10 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0140-invocation-budget-identity.patch": frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/root_loader.rs",
+    }),
     "0041-ordinary-lease-deadline.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0038-preparation-queue-and-failure-cache.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0035-preparation-failure-recovery.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
@@ -143,14 +147,14 @@ def allowed_path(name, path):
     rust_path = (path.startswith(("src/workerd/server/server/", "src/workerd/server/cli/")) and
                  path in RUST_PATHS.get(name, frozenset()))
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
-                          name == '0140-alarm-wall-limit.patch' and path in {
+                          name == '0143-alarm-wall-limit.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++'} or
-                          name == '0141-threaded-request-lease-drain.patch' and path in {
+                          name == '0144-threaded-request-lease-drain.patch' and path in {
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0142-alarm-limit-visibility.patch' and
+                          name == '0145-alarm-limit-visibility.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
@@ -299,6 +303,14 @@ def allowed_path(name, path):
                               'src/workerd/io/legacy-hibernation-manager.h',
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name in {'0140-invocation-budget-identity.patch', '0141-ordinary-binding-caller.patch'} and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0142-hold-invocation-budget-through-drain.patch' and path in {
+                              'src/workerd/io/io-channels.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker-interface.capnp',
+                              'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',

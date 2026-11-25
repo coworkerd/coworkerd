@@ -166,6 +166,7 @@ public:
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {},
+      kj::Maybe<capnp::Capability::Client> budgetLifetime = kj::none,
       std::shared_ptr<RequestLease> requestLease = {});
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;

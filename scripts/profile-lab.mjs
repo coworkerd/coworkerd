@@ -110,7 +110,7 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
   await writeFile(`${STACK}/server-config.json`, JSON.stringify(configuration));
   execFileSync("chown", ["-R", `${USER}:${USER}`, STACK]);
   if (bin !== BIN) execFileSync("chown", ["-R", "root:root", `${STACK}/bin`]);
-  const environment = { COWORKERD_LEASE_MODE: "correct", COWORKERD_SUBREQUEST_GRANT: "2", COWORKERD_LEASE_TTL_MS: "10000",
+  const environment = { COWORKERD_LEASE_MODE: "correct", COWORKERD_LEASE_TTL_MS: "10000",
     COWORKERD_LOG_BUFFER_BYTES: "4194304", ...env };
   const child = spawn("setpriv", ["--reuid", USER, "--regid", USER, "--clear-groups",
     ...(trace ? ["--inh-caps", "+sys_ptrace", "--ambient-caps", "+sys_ptrace"] : []), "--", `${bin}/coworkerd-server`,

@@ -62,7 +62,7 @@ index 0000000000000000000000000000000000000000..b73bb25da064dfbe9d4bfb934cc40ef3
 +
 +}  // namespace workerd
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index ac0280962beb544fd6682b80f3b45481fa7da405..10d81ceb4105b0afde37485ec9d2456d492c3b6e 100644
+index 35de0cf5fa454c85146d31388eec241fa7495d24..0628a1f333e53c5ef56baf35314c60992ed19c7e 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -4,6 +4,7 @@
@@ -95,7 +95,7 @@ index e05a3275d2077123fecb09891f9578d2708c66b4..faed397abb8133b5dd652fc6cbcb6bd4
      "//src/workerd/server/factory:coworkerd-durable-cpu",
      "//src/workerd/server/factory:coworkerd-durable-placement",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7f355641445dd2329a222cf84eedeaf028c1b154..d4e25ce3a279612b199fe70dded87b1eb1576cc3 100644
+index 39de789e08ca274a53e810cecc72267da806eaa7..1c96ec1b3cf3d2fab4af2d7a37f11a68e4fef990 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -24,6 +24,7 @@

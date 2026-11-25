@@ -106,10 +106,10 @@ async function main(args) {
         { threadedNodes, alarmWallTimeMs: 1000 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      delayRecoveryPeers }] of gated) {
+      delayRecoveryPeers, budgetLifetime }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
-        controlDurableLifecycle, delayRecoveryPeers,
+        controlDurableLifecycle, delayRecoveryPeers, budgetLifetime,
       });
     }
     const executed = regular.length + webSockets.length + requestLeases.length + gated.length + alarms.length + Number(capacity);

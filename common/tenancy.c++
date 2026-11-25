@@ -79,15 +79,26 @@ std::string workerFullId(const std::string& tenant, const std::string& worker) {
 
 std::string workerLimitsJson(const WorkerLimits& limits) {
   std::string out = "{";
-  if (limits.cpuMs) out += "\"cpuMs\":" + std::to_string(limits.cpuMs);
-  if (limits.memoryMiB) out += std::string(out.size() > 1 ? "," : "") + "\"memoryMiB\":" + std::to_string(limits.memoryMiB);
+  for (const auto& [name, value] : {std::pair{"cpuMs", limits.cpuMs}, std::pair{"memoryMiB", limits.memoryMiB},
+      std::pair{"subrequests", limits.subrequests}, std::pair{"d1Queries", limits.d1Queries}}) {
+    if (value) out += std::string(out.size() > 1 ? ",\"" : "\"") + name + "\":" + std::to_string(value);
+  }
   return out + '}';
 }
-WorkerLimits readWorkerLimits(Json::Reader object) {
-  KJ_REQUIRE(object.isObject(), "limits is an object {\"cpuMs\",\"memoryMiB\"}");
+WorkerLimits readWorkerLimits(Json::Reader object, bool tenantDefaults) {
+  KJ_REQUIRE(object.isObject(), "limits must be an object");
   WorkerLimits limits;
   for (auto entry : object.getObject()) {
     const std::string name = entry.getName().cStr();
+    if (tenantDefaults && (name == "subrequests" || name == "d1Queries")) {
+      if (entry.getValue().isNull()) continue;
+      const bool queries = name == "d1Queries";
+      const auto max = queries ? DEFAULT_D1_QUERY_LIMIT : DEFAULT_SUBREQUEST_LIMIT;
+      const auto value = number(object, name.c_str());
+      KJ_REQUIRE(value > 0 && value <= max, "tenant default must be a whole number between 1 and", max, name.c_str());
+      (queries ? limits.d1Queries : limits.subrequests) = static_cast<uint32_t>(value);
+      continue;
+    }
     KJ_REQUIRE(name == "cpuMs" || name == "memoryMiB", "unknown limit", name.c_str());
     if (entry.getValue().isNull()) continue;
     const auto value = number(object, name.c_str());
@@ -188,6 +199,8 @@ TenantRecord decodeTenantRecord(const std::string& bytes) {
     if (limits.isObject()) {
       tenant.defaultLimits.cpuMs = static_cast<uint32_t>(std::min<uint64_t>(number(limits, "cpuMs"), 4294967295ull));
       tenant.defaultLimits.memoryMiB = static_cast<uint32_t>(std::min<uint64_t>(number(limits, "memoryMiB"), 4294967295ull));
+      tenant.defaultLimits.subrequests = static_cast<uint32_t>(std::min<uint64_t>(number(limits, "subrequests"), DEFAULT_SUBREQUEST_LIMIT));
+      tenant.defaultLimits.d1Queries = static_cast<uint32_t>(std::min<uint64_t>(number(limits, "d1Queries"), DEFAULT_D1_QUERY_LIMIT));
     }
     auto deletion = field(json, "deletion");
     if (deletion.isObject()) tenant.deletion = capnp::JsonCodec().encodeRaw(deletion).cStr();

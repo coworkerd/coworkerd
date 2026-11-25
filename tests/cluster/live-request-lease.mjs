@@ -269,12 +269,24 @@ export async function silentRequestLease(cluster) {
 export async function actorRequestLease(cluster) {
   const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers');
   const call = (event, actor, timeout = 5000) => request(base, `${path}/${event}?actor=${actor}`, { timeout });
+  const executions = async () => (await Promise.all(cluster.nodes.map(node => cluster.state(node))))
+    .flatMap(state => state.executions).filter(event => event.target === 'live-request-timers/lease-stream@v1');
   for (const actor of ['idle', 'taken-over']) {
     assert.deepEqual(await call('timer', actor), { status: 200, text: 'scheduled' });
   }
   await delay(16_000, undefined, { signal: cluster.signal });
+  const previous = new Set((await executions()).map(event => event.invocationId));
   const takeover = call('take-over', 'taken-over', 30_000);
   assert.deepEqual(await takeover, { status: 200, text: 'object' }, 'the newer event can hold the timer work');
+  const next = (await executions()).filter(event => !previous.has(event.invocationId));
+  const root = next.find(event => event.kind === 'ingress');
+  assert.ok(root, 'the newer request has an ingress invocation');
+  const actor = next.find(event => event.kind === 'durable' && event.parentInvocationId === root.invocationId);
+  assert.ok(actor, 'the newer request invokes the object');
+  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === actor.invocationId &&
+    event.treeId === root.treeId), 'the timer inherits the newer event’s live lease');
+  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === '' &&
+    event.treeId !== root.treeId), 'the idle timer opens a fresh tree');
   assert.deepEqual(await call('timer-result', 'idle'), { status: 200, text: 'object' },
     'an actor timer can make a bounded call with no live ingress event');
 }

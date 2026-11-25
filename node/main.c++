@@ -223,8 +223,7 @@ enum class LeaseMode {
 
 struct LeaseConfig {
   LeaseMode mode;
-  uint16_t rootBudget;
-  uint16_t grantCap;
+  uint32_t defaultSubrequests;
   uint64_t ttlMs;
   uint64_t alarmWallMs;
 
@@ -244,12 +243,13 @@ struct LeaseConfig {
     constexpr uint64_t ALARM_WALL_MS = 15 * 60 * 1000;
     auto alarmWallMs = environmentUnsigned("COWORKERD_TEST_ALARM_WALL_MS", ALARM_WALL_MS, ALARM_WALL_MS);
     KJ_REQUIRE(alarmWallMs > 0, "COWORKERD_TEST_ALARM_WALL_MS must be positive");
+    if (std::getenv("COWORKERD_SUBREQUEST_GRANT") != nullptr) {
+      std::cerr << "[server] COWORKERD_SUBREQUEST_GRANT is ignored: calls use the callee's own subrequest limit\n";
+    }
     return {
       experimentalNaive ? LeaseMode::NAIVE : LeaseMode::CORRECT,
-      static_cast<uint16_t>(environmentUnsigned(
-          "COWORKERD_SUBREQUEST_BUDGET", 8, 65'535)),
-      static_cast<uint16_t>(environmentUnsigned(
-          "COWORKERD_SUBREQUEST_GRANT", 1, 65'535)),
+      static_cast<uint32_t>(environmentUnsigned(
+          "COWORKERD_SUBREQUEST_BUDGET", coworkerd::DEFAULT_SUBREQUEST_LIMIT, coworkerd::MAX_SUBREQUEST_LIMIT)),
       ttlMs,
       alarmWallMs,
     };
@@ -332,8 +332,7 @@ struct ExecutionRecord {
   std::string parentInvocationId;
   uint64_t callSequence;
   uint64_t orderSequence;
-  uint16_t grant;
-  uint16_t remainingAfter;
+  uint32_t subrequestLimit;
   uint16_t depth;
   double expiresAtMonotonicMs;
   std::string ingressServerId;
@@ -347,17 +346,15 @@ struct DebitRecord {
   std::string parentInvocationId;
   std::string target;
   std::string targetServerId;
-  uint16_t grant;
-  uint16_t charged;
-  uint16_t remainingAfter;
+  uint32_t charged;
+  uint32_t remainingAfter;
   uint16_t depth;
   double expiresAtMonotonicMs;
 };
 
 struct InvocationLeaseState {
   std::string treeId;
-  uint16_t remainingSubrequests;
-  uint16_t grant;
+  coworkerd::InvocationBudget budget;
   uint16_t depth;
   double expiresAtMonotonicMs;
   SharedVersionPins pins;
@@ -367,6 +364,7 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
+  bool budgetHeld = false;
   std::shared_ptr<coworkerd::RequestLease> requestLease;
   bool presents(double value) const {
     return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
@@ -377,6 +375,17 @@ struct InvocationLeaseState {
   double childDeadline(double now, double preparationLimitMs) const {
     return requestLease ? now + std::min(preparationLimitMs, requestLease->remainingMs()) : expiresAtMonotonicMs;
   }
+  bool hasActiveBudget(double now) const {
+    return budgetHeld || held || live(now);
+  }
+};
+
+class InvocationBudgetLifetime final: public rpc::InvocationBudgetLifetime::Server {
+public:
+  explicit InvocationBudgetLifetime(std::function<void()> release): release(std::move(release)) {}
+  ~InvocationBudgetLifetime() noexcept { release(); }
+private:
+  std::function<void()> release;
 };
 
 using NativeProps = std::shared_ptr<capnp::MallocMessageBuilder>;
@@ -392,9 +401,8 @@ struct ChildAllocation {
   std::string parentInvocationId;
   uint64_t callSequence;
   uint64_t orderSequence;
-  uint16_t grant;
-  uint16_t charged;
-  uint16_t remainingAfter;
+  uint32_t charged;
+  uint32_t remainingAfter;
   uint16_t depth;
   double expiresAtMonotonicMs;
   SharedVersionPins pins;
@@ -457,6 +465,8 @@ kj::Promise<void> waitForSocketTestGate(kj::Timer& timer, fs::path marker) {
 constexpr const char* MANAGED_SOCKET_HEADER = "x-coworkerd-managed-socket";
 // More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
 constexpr uint16_t MAX_DURABLE_HOPS = 8;
+constexpr uint16_t MAX_BINDING_DEPTH = 8;
+enum class SubrequestKind { worker, object, d1 };
 
 struct LeaseExpiry {
   double expiresAtMonotonicMs;
@@ -1026,12 +1036,11 @@ public:
     redactions.earlierRevision = [this]() { syncSecretDictionary(); return secretDictionary.earlierRevision(); };
     redactions.earlierValues = [this]() { return secretDictionary.earlierValues(); };
     if (leaseConfig.naive()) {
-      std::cout << "[server] {\"event\":\"experimental-naive-lease\",\"warning\":\"the naive lease is a test-only counterexample: "
-                   "it does not conserve the subrequest budget across Servers\"}" << std::endl;
+      std::cout << "[server] {\"event\":\"experimental-naive-lease\",\"warning\":\"the test-only naive lease "
+                   "requires Binding calls in sequence and skips their subrequest debits\"}" << std::endl;
     }
     std::cout << "[server] lease mode=" << (leaseConfig.naive() ? "naive" : "correct")
-              << " root-budget=" << leaseConfig.rootBudget
-              << " grant-cap=" << leaseConfig.grantCap
+              << " default-subrequests=" << leaseConfig.defaultSubrequests
               << " ttl-ms=" << leaseConfig.ttlMs
               << " node-id=" << this->serverConfig.serverId
               << " placements=" << this->serverConfig.placements.size()
@@ -1053,6 +1062,26 @@ public:
   bool tenantDeleting(const std::string& tenant) const { return tenants && tenants->deleting(tenant); }
   // Why a tenant's Workers start nothing here ("" when they may): its record says deleting, or there is none.
   std::string tenantUnavailable(const std::string& tenant) const { return tenants ? tenants->unavailable(tenant) : std::string(); }
+  coworkerd::InvocationBudget invocationBudget(const VersionDefinition& version) const {
+    const auto* tenant = tenants ? tenants->tenant(coworkerd::tenantOf(version.workerId)) : nullptr;
+    return {
+      version.subrequestLimit.value_or(tenant && tenant->defaultLimits.subrequests
+          ? tenant->defaultLimits.subrequests : leaseConfig.defaultSubrequests),
+      tenant && tenant->defaultLimits.d1Queries ? tenant->defaultLimits.d1Queries : coworkerd::DEFAULT_D1_QUERY_LIMIT,
+    };
+  }
+  coworkerd::EgressDebit chargeEgress(const std::string& invocationId) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end() || !lease->second.hasActiveBudget(monotonicTimeMs())) {
+      ++expiredLeaseRejections;
+      return coworkerd::EgressDebit::expired;
+    }
+    if (lease->second.budget.debit(false) == coworkerd::BudgetDebit::subrequestsExhausted) {
+      ++budgetRejections;
+      return coworkerd::EgressDebit::exhausted;
+    }
+    return coworkerd::EgressDebit::charged;
+  }
   // Each tenant this node knows of: its record's status and log quota, its Workers here (valid of all), whether it
   // is a suspect and which quarantine process is its shard, and the limits its Workers name (their own, else the
   // tenant's default, else this node's).
@@ -1349,7 +1378,7 @@ public:
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     auto parent = leases.find(parentInvocationId);
-    if (parent == leases.end() || !parent->second.live(nowMonotonicMs) ||
+    if (parent == leases.end() || parent->second.treeId != treeId || !parent->second.live(nowMonotonicMs) ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
       ++expiredLeaseRejections;
       lastRejection = "lease expired before execution for parent=" + parentInvocationId + " tree=" + treeId +
@@ -1490,13 +1519,9 @@ public:
     return out.str();
   }
   void observeRpcProxied(uint64_t capabilities) { rpcProxied += capabilities; }
-  // A connection's lease, on the node that executes it: held while the connection is open, and renewed at each message
-  // toward the Worker -- an event of the call tree, as workerd tops up the request's CPU for it -- as a new root's would
-  // be: the deadline becomes now plus the lease time, and the budget of subrequests starts again from the root's own
-  // (its grant), so that the message's Binding calls are neither refused as expired however long the connection has
-  // lasted nor limited by the calls of earlier messages. The budget is conserved per message: its Binding calls and
-  // their own share it, a child never getting more than its parent has left. Its Binding calls present the deadline the
-  // runtime was given at the start (presents()).
+  // The executing node holds the lease while the connection is open. Each message renews the deadline and refills
+  // both balances to the invocation's own limits. Binding calls charge the current balance when callbacks for
+  // different messages overlap. They present the deadline the runtime was given at the start (presents()).
   void holdLease(const std::string& invocationId) {
     auto lease = leases.find(invocationId);
     if (lease != leases.end()) lease->second.held = true;
@@ -1505,7 +1530,7 @@ public:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     auto& state = lease->second;
-    state.remainingSubrequests = state.grant;
+    state.budget.refill();
     const auto renewed = monotonicTimeMs() + static_cast<double>(leaseConfig.ttlMs);
     if (renewed <= state.expiresAtMonotonicMs) return;
     if (state.presentedExpiresAtMonotonicMs == 0) state.presentedExpiresAtMonotonicMs = state.expiresAtMonotonicMs;
@@ -2029,10 +2054,10 @@ public:
   ChildAllocation allocateRoot(SharedVersionPins pins, double deadline) {
     auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     std::cout << "[root] {\"nodeId\":\"" << serverConfig.serverId << "\",\"treeId\":\"" << tree
-              << "\",\"grant\":" << leaseConfig.rootBudget << ",\"remainingMs\":" << remainingLeaseMs(deadline)
+              << "\",\"remainingMs\":" << remainingLeaseMs(deadline)
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << deadline
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
-    return {tree, {}, 0, 0, leaseConfig.rootBudget, 0, leaseConfig.rootBudget, 0, deadline,
+    return {tree, {}, 0, 0, 0, 0, 0, deadline,
         std::move(pins), true, serverConfig.serverId};
   }
   void reroute(const std::string& code) { ++placementReroutes[code]; }
@@ -2198,7 +2223,7 @@ public:
     probe.generation = process->generation;
     kj::String descriptor;
     try {
-      descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
+      descriptor = encodeDescriptor(version, probe.checkId, probe.checkId, 0, 0, 0, deadline, std::make_shared<const VersionPins>(),
           *process, serverConfig.serverId, entrypoint, true, true, forInvocation);
     } catch (const ProcessUnavailable& error) {
       // The secret dictionary could not take the values: nothing is sent, the call may go elsewhere.
@@ -2439,11 +2464,12 @@ public:
     auto id = invocationId(sequence);
     auto expires = deadline > 0 ? deadline : nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     KJ_REQUIRE(std::isfinite(expires), "lease deadline overflow");
-    InvocationLeaseState lease{id, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId};
+    const auto budget = invocationBudget(*version);
+    InvocationLeaseState lease{id, budget, 0, expires, pins, serverConfig.serverId};
     lease.requestLease = std::move(requestLease);
     addLease(id, std::move(lease));
     return execute(std::move(version), sequence, id, id, std::move(kind), {}, 0, 0,
-        leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId,
+        budget.subrequestLimit, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId,
         check.coldLoaded);
   }
 
@@ -2541,8 +2567,7 @@ public:
     return version;
   }
 
-  // A request to an object, on the object's durable process: from a stateless Worker a child of its call tree
-  // (`allocation`, charged to its budget as a Binding call is), from an object the root of a new call tree.
+  // An object event inherits the caller's tree when there is a caller lease. Events without a caller start a tree.
   OpenEvent openDurable(std::shared_ptr<const VersionDefinition> version, const DurableTarget& target,
       std::optional<ChildAllocation> allocation, std::shared_ptr<AdmissionSlot> slot, coworkerd::DurableLog& durableLog) {
     auto process = runtime.selectDurable(target.key());
@@ -2609,14 +2634,15 @@ public:
     auto id = invocationId(sequence);
     // The request is the object's next event for its log lines.
     startObjectLogEvent(id, target.key());
+    const auto budget = invocationBudget(*version);
     if (allocation) {
       if (slot) slot->timing = allocation->timing;
-      InvocationLeaseState lease{allocation->treeId, allocation->grant, allocation->grant, allocation->depth,
+      InvocationLeaseState lease{allocation->treeId, budget, allocation->depth,
           allocation->expiresAtMonotonicMs, allocation->pins, allocation->ingressServerId};
       lease.requestLease = allocation->requestLease;
       addLease(id, std::move(lease));
       return execute(std::move(version), sequence, std::move(id), allocation->treeId, "durable", allocation->parentInvocationId,
-          allocation->callSequence, allocation->orderSequence, allocation->grant, allocation->remainingAfter, allocation->depth,
+          allocation->callSequence, allocation->orderSequence, budget.subrequestLimit, allocation->depth,
           allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
           &*root);
     }
@@ -2624,15 +2650,15 @@ public:
     const auto expires = nowMonotonicMs + static_cast<double>(
         target.alarmAtUnixMs ? leaseConfig.alarmWallMs : leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
-    InvocationLeaseState lease{tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId};
+    InvocationLeaseState lease{tree, budget, 0, expires, pins, serverConfig.serverId};
     if (target.alarmAtUnixMs) {
       lease.requestLease = std::make_shared<coworkerd::RequestLease>(timer);
       lease.requestLease->startFixed(leaseConfig.alarmWallMs * kj::MILLISECONDS);
       if (slot) slot->closeLeaseOnFinish = true;
     }
     addLease(id, std::move(lease));
-    return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
-        leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
+    return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, budget.subrequestLimit,
+        0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
         &*root);
   }
 
@@ -2641,17 +2667,18 @@ public:
       std::string parentInvocationId,
       uint64_t callSequence,
       uint64_t orderSequence,
-      double presentedExpiresAtMonotonicMs) {
+      double presentedExpiresAtMonotonicMs, SubrequestKind kind = SubrequestKind::worker) {
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     // Coworkerd Servers are assumed to share one trust domain. The trusted runtime
     // descriptor and RemoteInvocation fields are accepted directly. Crossing a
     // trust-domain boundary requires a new authentication and authorization design.
     auto parent = leases.find(parentInvocationId);
-    if (parent == leases.end() ||
+    if (parent == leases.end() || parent->second.treeId != treeId ||
         !parent->second.live(nowMonotonicMs) ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
-      if (parent != leases.end() && !parent->second.live(nowMonotonicMs) && !parent->second.held) {
+      if (parent != leases.end() && !parent->second.live(nowMonotonicMs) &&
+          !parent->second.held && !parent->second.budgetHeld) {
         leases.erase(parent);
       }
       ++expiredLeaseRejections;
@@ -2665,19 +2692,12 @@ public:
     auto inherited = coworkerd::inheritLease(parent->second);
     auto depth = static_cast<uint16_t>(parent->second.depth + 1);
     KJ_REQUIRE(depth > parent->second.depth, "invocation depth overflow");
-    const auto parentRemainingBefore = parent->second.remainingSubrequests;
-    if (!leaseConfig.naive() && parentRemainingBefore < 1) {
-      ++budgetRejections;
-      lastRejection = "subrequest budget exhausted before execution for parent=" +
-          parentInvocationId + " tree=" + treeId;
-      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
-      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    if (kind == SubrequestKind::worker && depth > MAX_BINDING_DEPTH) {
+      KJ_FAIL_REQUIRE("Binding call depth exceeds the hop limit");
     }
-    // The naive counterexample copies the budget without debiting the parent.
-    const auto [grant, charged, remainingAfter] = coworkerd::childBudget(
-        parentRemainingBefore, leaseConfig.grantCap, leaseConfig.naive());
-    if (!leaseConfig.naive()) parent->second.remainingSubrequests = remainingAfter;
-
+    auto& budget = parent->second.budget;
+    const auto parentRemainingBefore = budget.remaining;
+    uint64_t* nextOrder = nullptr;
     if (leaseConfig.naive()) {
       auto orderKey = treeId + "#" + std::to_string(depth);
       auto& expected = nextArrivalOrder[orderKey];
@@ -2691,17 +2711,18 @@ public:
         std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
         KJ_FAIL_REQUIRE(lastRejection.c_str());
       }
-      ++expected;
+      nextOrder = &expected;
     }
+    debitBinding(budget, kind == SubrequestKind::d1, treeId, parentInvocationId);
+    if (nextOrder) ++*nextOrder;
 
     ChildAllocation allocation{
       std::move(treeId),
       std::move(parentInvocationId),
       callSequence,
       orderSequence,
-      grant,
-      charged,
-      remainingAfter,
+      parentRemainingBefore - budget.remaining,
+      budget.remaining,
       depth,
       parent->second.childDeadline(nowMonotonicMs, leaseConfig.ttlMs),
       parent->second.pins,
@@ -2719,11 +2740,23 @@ public:
     const auto& parent = found->second;
     // Actor-originated calls keep their own admission and quota accounting.
     // When the runtime has a live event identity, its deadline still bounds the work.
-    ChildAllocation allocation{parent.treeId, invocationId, 0, 0, leaseConfig.rootBudget, 0, leaseConfig.rootBudget,
+    ChildAllocation allocation{parent.treeId, invocationId, 0, 0, 0, parent.budget.remaining,
         static_cast<uint16_t>(parent.depth + 1), parent.childDeadline(now, leaseConfig.ttlMs), nullptr, false,
         parent.ingressServerId};
     allocation.requestLease = parent.requestLease;
     return allocation;
+  }
+
+  void debitObjectCall(const std::string& treeId, const std::string& invocationId,
+      double presentedDeadline, bool database) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end() || lease->second.treeId != treeId || !lease->second.presents(presentedDeadline) ||
+        !lease->second.hasActiveBudget(monotonicTimeMs())) {
+      ++expiredLeaseRejections;
+      lastRejection = "lease expired before execution for parent=" + invocationId + " tree=" + treeId;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+    debitBinding(lease->second.budget, database, treeId, invocationId);
   }
 
   OpenEvent executeAllocated(
@@ -2735,10 +2768,10 @@ public:
     auto process = selectProcess(version->workerId);
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
+    const auto budget = invocationBudget(*version);
     InvocationLeaseState lease{
       allocation.treeId,
-      allocation.grant,
-      allocation.grant,
+      budget,
       allocation.depth,
       allocation.expiresAtMonotonicMs,
       allocation.pins,
@@ -2755,18 +2788,16 @@ public:
         std::move(allocation.parentInvocationId),
         allocation.callSequence,
         allocation.orderSequence,
-        allocation.grant,
-        allocation.remainingAfter,
+        budget.subrequestLimit,
         allocation.depth,
         allocation.expiresAtMonotonicMs,
         allocation.pins, std::move(slot), std::move(process), allocation.ingressServerId, check.coldLoaded);
   }
 
-  OpenEvent openGranted(
+  OpenEvent openForwarded(
       std::shared_ptr<const VersionDefinition> version,
       std::string treeId,
       std::string parentInvocationId,
-      uint16_t grant,
       uint16_t depth,
       double expiresAtMonotonicMs,
       uint64_t callSequence,
@@ -2785,7 +2816,8 @@ public:
     }
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
-    InvocationLeaseState lease{treeId, grant, grant, depth, expiresAtMonotonicMs, pins, ingressServerId};
+    const auto budget = invocationBudget(*version);
+    InvocationLeaseState lease{treeId, budget, depth, expiresAtMonotonicMs, pins, ingressServerId};
     lease.requestLease = std::move(requestLease);
     addLease(invocationId, std::move(lease));
     return execute(
@@ -2797,8 +2829,7 @@ public:
         std::move(parentInvocationId),
         callSequence,
         orderSequence,
-        grant,
-        grant,
+        budget.subrequestLimit,
         depth,
         expiresAtMonotonicMs,
         pins, std::move(slot), std::move(process), std::move(ingressServerId), check.coldLoaded);
@@ -2817,7 +2848,6 @@ public:
       allocation.parentInvocationId,
       version.key(),
       targetServerId,
-      allocation.grant,
       allocation.charged,
       allocation.remainingAfter,
       allocation.depth,
@@ -2830,7 +2860,6 @@ public:
       const std::string& parentInvocationId,
       const std::string& target,
       const std::string& targetServerId,
-      uint16_t grant,
       uint16_t depth,
       double expiresAtMonotonicMs) {
     ++forwardedInvocations;
@@ -2838,7 +2867,7 @@ public:
     if (debits.size() == MAX_EXECUTION_RECORDS) debits.pop_front();
     debits.push_back(std::make_shared<DebitRecord>(DebitRecord{
       sequence, treeId, parentInvocationId, target, targetServerId,
-      grant, 0, grant, depth, expiresAtMonotonicMs,
+      0, 0, depth, expiresAtMonotonicMs,
     }));
   }
 
@@ -2885,8 +2914,7 @@ private:
       std::string parentInvocationId,
       uint64_t callSequence,
       uint64_t orderSequence,
-      uint16_t grant,
-      uint16_t remainingAfter,
+      uint32_t subrequestLimit,
       uint16_t depth,
       double expiresAtMonotonicMs,
       SharedVersionPins pins, std::shared_ptr<AdmissionSlot> slot, std::shared_ptr<coworkerd::ProcessCall> process,
@@ -2908,8 +2936,7 @@ private:
         *version,
         invocationId,
         treeId,
-        grant,
-        grant,
+        subrequestLimit,
         orderSequence,
         depth,
         expiresAtMonotonicMs,
@@ -2932,8 +2959,7 @@ private:
       std::move(parentInvocationId),
       callSequence,
       orderSequence,
-      grant,
-      remainingAfter,
+      subrequestLimit,
       depth,
       expiresAtMonotonicMs,
       ingressServerId,
@@ -2984,7 +3010,7 @@ private:
               << "\",\"invocationId\":\"" << invocationId << "\",\"target\":\"" << version->key()
               << "\",\"definitionHash\":\"" << version->definitionHash << "\",\"kind\":\"" << executions.back()->kind
               << "\",\"parentInvocationId\":\"" << executions.back()->parentInvocationId
-              << "\",\"grant\":" << grant << ",\"remainingAfter\":" << remainingAfter << ",\"depth\":" << depth
+              << "\",\"subrequestLimit\":" << subrequestLimit << ",\"depth\":" << depth
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
               << ",\"ingressNodeId\":\"" << jsonEscape(ingressServerId) << "\",\"coldStart\":null"
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
@@ -2994,8 +3020,13 @@ private:
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
-    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps(),
-        durable == nullptr && slot ? slot->requestLease : nullptr);
+    auto token = capnp::Capability::Client(kj::heap<InvocationBudgetLifetime>(
+        [this, lifetime = std::weak_ptr<int>(executionLifetime), invocationId] {
+      if (!lifetime.expired()) releaseInvocationBudget(invocationId);
+    }));
+    leases.at(invocationId).budgetHeld = true;
+    auto opened = runtime.open(process, descriptor, version->definitionHash,
+        slot ? slot->nativeProps : NativeProps(), kj::mv(token), durable == nullptr && slot ? slot->requestLease : nullptr);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -3236,8 +3267,7 @@ public:
            << ",\"renewedLeases\":" << renewedLeases
            << ",\"leaseReaperIntervalMs\":" << LEASE_REAPER_INTERVAL_MS
            << ",\"leaseReaperRuns\":" << leaseReaperRuns
-           << ",\"rootBudget\":" << leaseConfig.rootBudget
-           << ",\"grantCap\":" << leaseConfig.grantCap
+           << ",\"defaultSubrequests\":" << leaseConfig.defaultSubrequests
            << ",\"budgetRejections\":" << budgetRejections
            << ",\"orderRejections\":" << orderRejections
            << ",\"forwardedInvocations\":" << forwardedInvocations
@@ -3287,8 +3317,9 @@ public:
         if (index > 0) output << ',';
         output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
              << "\",\"invocationId\":\"" << jsonEscape(invocationId)
-             << "\",\"grant\":" << lease.grant
-             << ",\"remainingSubrequests\":" << lease.remainingSubrequests
+             << "\",\"subrequestLimit\":" << lease.budget.subrequestLimit
+             << ",\"remainingSubrequests\":" << lease.budget.remaining
+             << ",\"remainingD1Queries\":" << lease.budget.d1Remaining
              << ",\"depth\":" << lease.depth
              << ",\"expiresAtMonotonicMs\":" << lease.expiresAtMonotonicMs << "}";
       }
@@ -3308,8 +3339,7 @@ public:
              << "\",\"target\":\"" << jsonEscape(record.target)
              << "\",\"targetNodeId\":\""
              << jsonEscape(record.targetServerId)
-             << "\",\"grant\":" << record.grant
-             << ",\"charged\":" << record.charged
+             << "\",\"charged\":" << record.charged
              << ",\"remainingAfter\":" << record.remainingAfter
              << ",\"depth\":" << record.depth
              << ",\"expiresAtMonotonicMs\":" << record.expiresAtMonotonicMs << "}";
@@ -3338,8 +3368,7 @@ public:
              << "\",\"parentInvocationId\":\"" << jsonEscape(record.parentInvocationId)
              << "\",\"callSequence\":" << record.callSequence
              << ",\"orderSequence\":" << record.orderSequence
-             << ",\"grant\":" << record.grant
-             << ",\"remainingAfter\":" << record.remainingAfter
+             << ",\"subrequestLimit\":" << record.subrequestLimit
              << ",\"depth\":" << record.depth
              << ",\"ingressNodeId\":\"" << jsonEscape(record.ingressServerId)
              << "\",\"coldStart\":" << (record.coldStart ? "true" : "false")
@@ -3468,7 +3497,7 @@ public:
   }
   OpenEvent openTrial(const VersionDefinition& version, const std::shared_ptr<coworkerd::ProcessCall>& process,
       const std::string& invocationId, double deadline, bool rootTrial = false) {
-    auto descriptor = encodeDescriptor(version, invocationId, invocationId, 0, 0, 0, 0, deadline,
+    auto descriptor = encodeDescriptor(version, invocationId, invocationId, 0, 0, 0, deadline,
         std::make_shared<const VersionPins>(), *process, serverConfig.serverId, "", true);
     if (rootTrial) {
       std::string encoded(descriptor.cStr()); encoded.pop_back(); encoded += ",\"rootTrial\":true}";
@@ -3511,8 +3540,7 @@ private:
       const VersionDefinition& version,
       const std::string& invocationId,
       const std::string& treeId,
-      uint16_t remainingSubrequests,
-      uint16_t grant,
+      uint32_t subrequestLimit,
       uint64_t orderSequence,
       uint16_t depth,
       double expiresAtMonotonicMs,
@@ -3592,8 +3620,8 @@ private:
     descriptor.setInvocationId(invocationId.c_str());
     descriptor.setTreeId(treeId.c_str());
     auto lease = descriptor.initLease();
-    lease.setRemainingSubrequests(remainingSubrequests);
-    lease.setGrant(grant);
+    lease.setRemainingSubrequests(subrequestLimit);
+    lease.setSubrequestLimit(subrequestLimit);
     lease.setExpiresAtMonotonicMs(expiresAtMonotonicMs);
     descriptor.setOrderSequence(orderSequence);
     descriptor.setDepth(depth);
@@ -3752,10 +3780,39 @@ private:
     KJ_ASSERT(inserted, "duplicate invocation lease");
     if (requestLease) {
       leaseCleanupTasks.add(requestLease->whenClosed().then([this, id = std::move(invocationId)]() {
-        expiredLeases += leases.erase(id);
+        auto found = leases.find(id);
+        if (found != leases.end() && !found->second.budgetHeld && !found->second.held) {
+          leases.erase(found);
+          ++expiredLeases;
+        }
       }));
     } else {
       leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
+    }
+  }
+
+  void releaseInvocationBudget(const std::string& invocationId) noexcept {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end()) return;
+    lease->second.budgetHeld = false;
+    if (!lease->second.held && !lease->second.live(monotonicTimeMs())) {
+      leases.erase(lease);
+      ++expiredLeases;
+    }
+  }
+
+  void debitBinding(coworkerd::InvocationBudget& budget, bool database,
+      const std::string& treeId, const std::string& invocationId) {
+    const auto debit = budget.debit(database, !leaseConfig.naive());
+    if (debit == coworkerd::BudgetDebit::d1Exhausted) {
+      lastRejection = "D1 query budget exhausted before execution (limit " + std::to_string(budget.d1Limit) + ")";
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+    if (debit == coworkerd::BudgetDebit::subrequestsExhausted) {
+      ++budgetRejections;
+      lastRejection = "subrequest budget exhausted before execution for parent=" + invocationId + " tree=" + treeId;
+      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
   }
 
@@ -3765,7 +3822,7 @@ private:
       auto expiry = leaseExpiries.top();
       leaseExpiries.pop();
       auto lease = leases.find(expiry.invocationId);
-      if (lease != leases.end() && !lease->second.held &&
+      if (lease != leases.end() && !lease->second.held && !lease->second.budgetHeld &&
           lease->second.expiresAtMonotonicMs == expiry.expiresAtMonotonicMs) {
         leases.erase(lease);
         ++expiredLeases;
@@ -4094,6 +4151,17 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
   return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
       factory, headerTable, status, std::move(statusText),
       rejectionJson(code, reason, expiresAtMonotonicMs), code));
+}
+
+rpc::EventDispatcher::Client makeD1BudgetRejection(
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, const char* code,
+    const std::string& reason) {
+  // Native D1 clients read the error field. The legacy shim also uses the structured code and reason.
+  const auto detail = jsonEscape(cleanReason(reason));
+  const auto body = "{\"success\":false,\"code\":\"" + std::string(code) + "\",\"reason\":\"" + detail +
+      "\",\"error\":\"" + code + ": " + detail + "\"}";
+  return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
+      factory, headerTable, 429, "Too Many Requests", body, code));
 }
 
 const char* statusText(uint status) {
@@ -4967,7 +5035,6 @@ struct RemoteInvocationData {
   std::string contentHash;
   std::string treeId;
   std::string parentInvocationId;
-  uint16_t subrequestGrant;
   double expiresAtMonotonicMs;
   uint16_t depth;
   uint8_t placementHops;
@@ -5511,7 +5578,6 @@ public:
     remote.setWorkerId(invocation.workerId.c_str()); remote.setVersionId(invocation.versionId.c_str());
     remote.setContentHash(invocation.contentHash.c_str()); remote.setDefinitionHash(invocation.definitionHash.c_str());
     remote.setTreeId(invocation.treeId.c_str()); remote.setParentInvocationId(invocation.parentInvocationId.c_str());
-    remote.setSubrequestGrant(invocation.subrequestGrant);
     remote.setDepth(invocation.depth); remote.setPlacementHops(invocation.placementHops);
     remote.setAlreadyPlaced(invocation.alreadyPlaced); remote.setOriginServerId(invocation.originServerId.c_str());
     remote.setIngressRoot(invocation.ingressRoot); remote.setIngressServerId(invocation.ingressServerId.c_str());
@@ -5613,7 +5679,6 @@ public:
       const auto& allocation = *invocation.allocation;
       remote.setTreeId(allocation.treeId.c_str());
       remote.setParentInvocationId(allocation.parentInvocationId.c_str());
-      remote.setSubrequestGrant(allocation.grant);
       remote.setDepth(allocation.depth);
       remote.setCallSequence(allocation.callSequence);
       remote.setOrderSequence(allocation.orderSequence);
@@ -5718,7 +5783,7 @@ public:
     rankedCandidates += ']';
     std::cout << "[allocation] {\"placementId\":\"" << placementId << "\",\"treeId\":\"" << allocation.treeId
               << "\",\"parentInvocationId\":\"" << allocation.parentInvocationId << "\",\"target\":\"" << version->key()
-              << "\",\"grant\":" << allocation.grant << ",\"charged\":" << allocation.charged
+              << "\",\"charged\":" << allocation.charged
               << ",\"remainingAfter\":" << allocation.remainingAfter << ",\"initialHops\":" << unsigned(config.initialPlacementHops)
               << ",\"kind\":\"" << (allocation.ingressRoot ? "ingress" : "binding") << "\",\"ingressNodeId\":\""
               << jsonEscape(allocation.ingressServerId) << "\""
@@ -5780,7 +5845,7 @@ public:
     auto invocationFor = [&](uint8_t remainingHops) {
       const auto& pin = allocation.pins->at(version->workerId);
       return RemoteInvocationData{version->workerId, pin.versionId, pin.contentHash,
-          allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
+          allocation.treeId, allocation.parentInvocationId, allocation.expiresAtMonotonicMs,
           allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint,
           allocation.nativeProps, allocation.requestLease};
@@ -5813,7 +5878,7 @@ public:
                 << "\",\"nodeId\":\"" << id << "\",\"home\":\"" << home << "\",\"attempt\":" << attempted + 1
                 << ",\"rank\":" << rank << ",\"hopsRemaining\":" << unsigned(hops)
                 << ",\"startedAtUnixMs\":" << startedAt << ",\"observedAtUnixMs\":" << wallTimeMsForTest()
-                << ",\"grant\":" << allocation.grant << ",\"definitionHash\":\"" << version->definitionHash
+                << ",\"definitionHash\":\"" << version->definitionHash
                 << "\",\"kind\":\"" << (allocation.ingressRoot ? "ingress" : "binding")
                 << "\",\"pinsSha256\":\"" << pinsHash(allocation.pins) << "\",\"expiresAtMonotonicMs\":" << std::setprecision(17) << allocation.expiresAtMonotonicMs
                 << ",\"retryable\":" << (result.retryable ? "true" : "false")
@@ -6224,7 +6289,6 @@ public:
       remote.getContentHash().cStr(),
       remote.getTreeId().cStr(),
       remote.getParentInvocationId().cStr(),
-      remote.getSubrequestGrant(),
       expiresAtMonotonicMs,
       remote.getDepth(),
       remote.getPlacementHops(),
@@ -6254,7 +6318,7 @@ public:
     std::cout << "[peer-open] {\"nodeId\":\"" << server.placementConfig().serverId
               << "\",\"treeId\":\"" << invocation.treeId << "\",\"remainingMs\":" << remainingMs
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << expiresAtMonotonicMs
-              << ",\"depth\":" << invocation.depth << ",\"grant\":" << invocation.subrequestGrant
+              << ",\"depth\":" << invocation.depth
               << ",\"ingressRoot\":" << (invocation.ingressRoot ? "true" : "false")
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
 
@@ -6307,7 +6371,7 @@ public:
       }
       auto target = server.targetServer(invocation.workerId);
       server.recordRelay(invocation.treeId, invocation.parentInvocationId, version->key(), target,
-          invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs);
+          invocation.depth, invocation.expiresAtMonotonicMs);
       --invocation.placementHops; invocation.alreadyPlaced = true;
       auto result = co_await peerForwarder.tryOpen(target, invocation);
       if (result.failure && result.retryable) reject(*result.failure);
@@ -6351,8 +6415,8 @@ public:
       co_return;
     }
     try {
-      auto opened = server.openGranted(std::move(version), invocation.treeId, invocation.parentInvocationId,
-          invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
+      auto opened = server.openForwarded(std::move(version), invocation.treeId, invocation.parentInvocationId,
+          invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
           invocation.orderSequence, invocation.pins, std::move(slot), invocation.ingressRoot, invocation.ingressServerId, check,
           invocation.requestLease);
       context.initResults().initResult().setAccepted(opened.dispatcher);
@@ -6919,7 +6983,6 @@ public:
           allocation.pins->at(workerId).contentHash,
           allocation.treeId,
           allocation.parentInvocationId,
-          allocation.grant,
           allocation.expiresAtMonotonicMs,
           allocation.depth,
           static_cast<uint8_t>(placementHops - 1),
@@ -7775,10 +7838,9 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
     KJ_REQUIRE(safeName(treeId) && safeName(parent) && (ingress.empty() || safeName(ingress)),
         "invalid remote Durable Object call: the caller's call tree");
     KJ_REQUIRE(remote.getCallerObjectId().size() == 0, "invalid remote Durable Object call: both a call tree and an object");
-    // A Binding call of the caller's tree, with its share of the budget and the time it had left; the lease's version pin
-    // is the object's version here.
-    ChildAllocation allocation{treeId, parent, remote.getCallSequence(), remote.getOrderSequence(), remote.getSubrequestGrant(), 0,
-        remote.getSubrequestGrant(), remote.getDepth(), receivedAtMonotonicMs + remainingMs, nullptr, false, ingress};
+    // The object inherits the caller's deadline and starts its own budget when dispatched.
+    ChildAllocation allocation{treeId, parent, remote.getCallSequence(), remote.getOrderSequence(), 0, 0,
+        remote.getDepth(), receivedAtMonotonicMs + remainingMs, nullptr, false, ingress};
     if (remote.hasCallerLease()) allocation.requestLease = watchCallerLease(server.clock(), remote.getCallerLease());
     request.allocation = std::move(allocation);
   } else {
@@ -8173,14 +8235,31 @@ public:
           coworkerd::environmentName(request.target.className), "invalid Durable Object call: namespace, object id or class");
       KJ_REQUIRE(!assetsCall && entrypoint.empty(), "a Durable Object call names no entrypoint");
       try {
-        if (callerObject.empty()) {
+        if (!callerObject.empty()) {
+          KJ_REQUIRE(validSha256(callerNamespace) && validSha256(callerObject), "invalid Durable Object call: the calling object");
+          if (!request.target.isDatabase()) {
+            request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
+          }
+          request.callerNamespaceId = callerNamespace;
+          request.callerObjectId = callerObject;
+        } else {
           KJ_REQUIRE(callerNamespace.empty(), "invalid Durable Object call: a caller namespace without an object");
-          KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
-              expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's call tree");
-          auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence, expiresAtMonotonicMs);
+        }
+        KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
+            expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's invocation");
+        if (!callerObject.empty()) {
+          // Use the same event the runtime selected for the debit, including
+          // a newer request that took over the actor's outstanding work.
+          server.debitObjectCall(treeId, parentInvocationId, expiresAtMonotonicMs, request.target.isDatabase());
+          request.allocation = server.inheritActorLease(parentInvocationId);
+          expiresAtMonotonicMs = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
+        } else {
+          auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence,
+              expiresAtMonotonicMs, request.target.isDatabase() ? SubrequestKind::d1 : SubrequestKind::object);
           expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
           allocation.timing = timing;
-          if (!server.perCallForTest() && !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
+          if (!server.perCallForTest() &&
+              !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
             auto reason = "Durable Object call: the calling version disagrees with its lease's version pins";
             server.rejectPinMismatch(reason);
             server.observeLocalRefusal(server.refusal("VERSION_PIN_MISMATCH", reason, 409), "durableObject");
@@ -8189,15 +8268,15 @@ public:
             co_return;
           }
           request.allocation = std::move(allocation);
-        } else {
-          KJ_REQUIRE(validSha256(callerNamespace) && validSha256(callerObject), "invalid Durable Object call: the calling object");
-          request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
-          request.callerNamespaceId = callerNamespace;
-          request.callerObjectId = callerObject;
-          request.allocation = server.inheritActorLease(parentInvocationId);
         }
       } catch (const kj::Exception& error) {
         std::string reason = error.getDescription().cStr();
+        if (reason.find("D1 query budget exhausted") != std::string::npos) {
+          auto detail = server.lastRejectionReason();
+          server.observeLocalRefusal(server.refusal("D1_QUERY_BUDGET_EXHAUSTED", detail, 429), "durableObject");
+          context.initResults().setDispatcher(makeD1BudgetRejection(factory, headerTable, "D1_QUERY_BUDGET_EXHAUSTED", detail));
+          co_return;
+        }
         const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
         const bool expired = reason.find("lease expired before execution") != std::string::npos;
         if (!budget && !expired) throw;
@@ -8205,8 +8284,10 @@ public:
         if (detail.empty()) detail = reason;
         const char* code = budget ? "SUBREQUEST_BUDGET_EXHAUSTED" : "LEASE_EXPIRED";
         server.observeLocalRefusal(server.refusal(code, detail, budget ? 429 : 410), "durableObject");
-        context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, budget ? 429 : 410,
-            budget ? "Too Many Requests" : "Gone", code, std::move(detail), expiresAtMonotonicMs));
+        context.initResults().setDispatcher(budget && request.target.isDatabase()
+            ? makeD1BudgetRejection(factory, headerTable, code, detail)
+            : makeRejectionDispatcher(factory, headerTable, budget ? 429 : 410,
+                budget ? "Too Many Requests" : "Gone", code, std::move(detail), expiresAtMonotonicMs));
         co_return;
       }
       auto dispatched = co_await durable.dispatch(std::move(request));
@@ -8308,6 +8389,13 @@ public:
       co_return;
     } catch (const kj::Exception& error) {
       std::string reason = error.getDescription().cStr();
+      if (reason.find("Binding call depth exceeds the hop limit") != std::string::npos) {
+        std::string detail = "more than " + std::to_string(MAX_BINDING_DEPTH) + " nested calls to a Worker in one tree";
+        server.observeLocalRefusal(server.refusal("BINDING_HOP_LIMIT", detail, 508), "localBinding");
+        context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, 508, "Loop Detected",
+            "BINDING_HOP_LIMIT", std::move(detail), expiresAtMonotonicMs));
+        co_return;
+      }
       const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
       const bool order = reason.find("Binding arrival out of order") != std::string::npos;
       const bool expired = reason.find("lease expired before execution") != std::string::npos;
@@ -10326,7 +10414,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"intervalSeconds\":" << c.ingressKeepalive.intervalSeconds << ",\"probes\":" << c.ingressKeepalive.probes << "}}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
-      << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
+      << ",\"defaultSubrequests\":" << lease.defaultSubrequests
       << "},\"logs\":{\"tenantBufferBytes\":" << c.logs.tenantBufferBytes << ",\"totalBufferBytes\":" << c.logs.totalBufferBytes
       << ",\"linesPerSecond\":" << c.logs.linesPerSecond << ",\"maxLineBytes\":" << c.logs.maxLineBytes
       << ",\"workerdLogMaxBytes\":" << c.logs.sinkMaxBytes << ",\"workerdLogFiles\":" << c.logs.sinkFiles
@@ -10698,6 +10786,7 @@ int run(Launch launch) {
         if (!found) return std::nullopt;
         return coworkerd::EgressSource{found->first, found->second};
       },
+      [&server](const std::string& invocationId) { return server.chargeEgress(invocationId); },
       // The tenant's hourly usage rows: egressBytes.
       [&tenantUsage](const std::string& tenant, uint64_t bytes) { tenantUsage.egress(tenant, bytes); });
   server.addStateSection("egress", [&egress]() { return egress.json(); });
