@@ -176,6 +176,106 @@ async function sqlAtomicity(cluster) {
   assert.deepEqual(await read(), rows, 'the failed transaction left the committed rows intact');
 }
 
+async function threadedDatabasePlacement(cluster) {
+  const [threaded, upstream] = cluster.nodes;
+  if (cluster.previousProduct) {
+    const version = node => cluster.compose(['exec', '-T', node, 'coworkerd', '--version']);
+    const [current, previous] = await Promise.all([version(threaded), version(upstream)]);
+    const source = output => output.match(/^source (.+)$/m)?.[1];
+    assert.ok(source(current) && source(previous), 'both node binaries report their source revision');
+    assert.notEqual(source(current), source(previous), 'the compatibility test uses different node builds');
+    console.log(`Database compatibility sources: upstream=${source(previous)}, threaded=${source(current)}`);
+  }
+  const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 48 });
+  const databases = new Map([[threaded, []], [upstream, []]]);
+  for (let i = 0; i < 36 && (databases.get(threaded).length < 2 || databases.get(upstream).length < 1); i++) {
+    const path = `${tenant.path}/databases/db-${i}`;
+    const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    // The first access uses the shard's rendezvous owner. Check the resulting owner in the dispatch log below.
+    const scores = cluster.nodes.map(node => [node, createHash('sha256')
+      .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
+    scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
+    const owner = scores[0][0];
+    const selected = databases.get(owner);
+    if (selected && selected.length < (owner === threaded ? 2 : 1)) selected.push({ ...database, path, owner });
+  }
+  assert.equal(databases.get(threaded).length, 2, 'two databases are assigned to the same threaded owner');
+  assert.equal(databases.get(upstream).length, 1, 'one database is assigned to the upstream owner');
+  const selected = [...databases.values()].flat();
+  const sqlAt = async (ingress, db, body) => json(await request(cluster.urls[ingress],
+    `/__coworkerd/databases/${tenant.name}/${db.name}/query`,
+    { method: 'POST', token: cluster.management, body, timeout: 15000 }), 200, `${ingress} SQL to ${db.name}`);
+  const publicSql = (db, body) => cluster.api(`${db.path}/query`, { method: 'POST', token: tenant.token, body });
+  const process = await durableGeneration(cluster, threaded);
+  assert.equal(process.lifecycle.durableServer, 'threaded');
+  assert.equal(process.lifecycle.durableAdmission.residentRoots, 0);
+  assert.equal(process.lifecycle.durableAdmission.homes, 0);
+  for (const db of selected) {
+    const ingress = db.owner === threaded ? upstream : threaded;
+    await eventually(`${ingress} can query ${db.name} on ${db.owner}`, async () => {
+      const result = await sqlAt(ingress, db, { sql: 'SELECT 1 AS ready' });
+      assert.deepEqual(result.results, [{ ready: 1 }]);
+    });
+    assert.equal((await sqlAt(ingress, db, { sql: 'CREATE TABLE records (value TEXT PRIMARY KEY)' })).success, true);
+    const ingest = await publicSql(db, { ingest: `INSERT INTO records VALUES ('${db.name}');` });
+    assert.equal(ingest.success, true, ingest.error);
+  }
+
+  await cluster.deploy(tenant, 'read', `export default { async fetch(request, env) {
+    const result = await env[new URL(request.url).searchParams.get('db')]
+      .prepare('SELECT value FROM records ORDER BY value').all();
+    return Response.json(result.results);
+  } };`, { wrangler: { d1_databases: selected.map((db, index) => ({
+    binding: `DB${index}`, database_name: db.name,
+  })) } });
+  for (const [index, db] of selected.entries()) {
+    const ingress = db.owner === threaded ? upstream : threaded;
+    await eventually(`${ingress} can bind ${db.name} on ${db.owner}`, async () => {
+      const response = await workerCall(cluster, ingress, tenant, `read?db=DB${index}`);
+      assert.deepEqual(json(response, 200, `${ingress} D1 to ${db.name}`), [{ value: db.name }]);
+    });
+    const rejected = await sqlAt(ingress, db, [
+      { sql: "INSERT INTO records VALUES ('partial')" }, { sql: 'INSERT INTO records VALUES (?)', params: [db.name] },
+    ]);
+    assert.match(rejected[0]?.error, /UNIQUE constraint failed/);
+    assert.deepEqual((await publicSql(db, { sql: 'SELECT value FROM records' })).results, [{ value: db.name }]);
+  }
+
+  await eventually('both threaded database roots occupy distinct warm homes in the original process', async () => {
+    const warm = await durableGeneration(cluster, threaded);
+    assert.equal(warm.pid, process.pid);
+    assert.equal(warm.generation, process.generation);
+    assert.equal(warm.lifecycle.durableAdmission.residentRoots, 2);
+    assert.equal(warm.lifecycle.durableAdmission.homes, 2);
+  });
+  for (const db of selected) {
+    const from = db.owner === threaded ? upstream : threaded;
+    await eventually(`both requests reached the local SqlDatabase on ${db.owner}`, async () => {
+      const logs = await cluster.compose(['logs', '--no-color', db.owner]);
+      const calls = logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
+        .filter(row => row.namespaceId === db.namespaceId.slice(0, 12) && row.route === 'received' &&
+          row.node === from && row.status === 200);
+      for (const caller of ['node', 'worker']) {
+        const call = calls.find(row => row.caller === caller);
+        assert.ok(call, `${from} forwarded ${caller} to ${db.owner}`);
+        assert.equal(call.workerId, db.owner === threaded ? `${tenant.name}/:platform` : `${tenant.name}/__databases`);
+        assert.equal(call.className, '__coworkerdSqlDatabase');
+        if (db.owner === threaded) {
+          assert.equal(call.processId, process.processId);
+          assert.equal(call.processGeneration, process.generation);
+        }
+      }
+    });
+  }
+  console.log(`Database placement in ${threaded}/${process.processId} generation ${process.generation}: 2 roots, 2 homes`);
+  await cluster.compose(['kill', '-s', 'SIGKILL', threaded]);
+  for (const db of databases.get(threaded)) {
+    await eventually(`${db.name} retains its confirmed value after the ${threaded} owner is killed`, async () => {
+      assert.deepEqual((await publicSql(db, { sql: 'SELECT value FROM records' })).results, [{ value: db.name }]);
+    }, { timeout: 45000 });
+  }
+}
+
 async function ordinaryProcess(cluster, node) {
   const { processes } = await cluster.state(node);
   const ordinary = processes.entries.filter(entry => entry.processClass === 'ordinary');
@@ -2213,6 +2313,10 @@ export const durableGatedCases = {
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
+  'durable-threaded-database-placement': {
+    test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {
     test: threadedPlatformDefinition, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,

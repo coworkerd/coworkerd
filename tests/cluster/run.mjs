@@ -68,10 +68,12 @@ async function main(args) {
       failed += await runSuite(webSockets, kernel, controller.signal, { webSocketsPerNode: 2 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      delayRecoveryPeers, platformFixture }] of gated) {
+      delayRecoveryPeers, platformFixture, databaseFixtureNode }] of gated) {
+      const previousProduct = databaseFixtureNode && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
-        controlDurableLifecycle, delayRecoveryPeers, platformFixture,
+        controlDurableLifecycle, delayRecoveryPeers, platformFixture, databaseFixtureNode,
+        previousProduct: previousProduct ? resolve(previousProduct) : undefined,
       });
     }
     console.log(`${regular.length + webSockets.length + gated.length} executed, ${failed} failed`);

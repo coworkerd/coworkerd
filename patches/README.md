@@ -64,6 +64,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patches 0150 and 0151 recognize the platform Durable Object definition on the threaded host. The host checks the
   tenant and local definition pin before the home uses the existing package compiler and actor path.
   Both patches use `threaded-server.c++` and `threaded-server-test.c++` in `src/workerd/threaded/`.
+  Patch 0170 validates an object-specific copy key for platform databases and permits the
+  built-in package's SQL compatibility flag. It uses the same two files.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
