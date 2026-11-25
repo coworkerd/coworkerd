@@ -226,7 +226,7 @@ export class Cluster {
         const target = '/tmp/coworkerd-platform-test';
         await mkdir(directory, { mode: 0o755 });
         await Promise.all([
-          writeFile(join(directory, 'config.json'), JSON.stringify({ release: node, classes: this.platformFixture })),
+          writeFile(join(directory, 'config.json'), JSON.stringify({ release: node, classes: this.platformFixture(node) })),
           writeFile(join(directory, 'platform.js'), `${platformSource}\nconst fixtureBuild = ${JSON.stringify(node)};\n`),
         ]);
         overrides[node].environment.COWORKERD_PLATFORM_FIXTURE = `${target}/config.json`;

@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 
 let copy;
 
-export class PlatformStore extends DurableObject {
+class PlatformStore extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.instance = crypto.randomUUID();
@@ -15,7 +15,8 @@ export class PlatformStore extends DurableObject {
     const action = new URL(request.url).searchParams.get('action');
     if (action === 'identity') {
       copy ??= crypto.randomUUID();
-      return Response.json({ copy, instance: this.instance, build: fixtureBuild, env: Object.keys(this.env) });
+      return Response.json({ copy, instance: this.instance, build: fixtureBuild,
+        implementation: this.constructor.name, env: Object.keys(this.env) });
     }
     if (action === 'alarm') {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
@@ -36,6 +37,10 @@ export class PlatformStore extends DurableObject {
     this.sql.exec('INSERT INTO alarm_status VALUES (1)');
   }
 }
+
+export class PlatformStore1 extends PlatformStore {}
+export class PlatformStore2 extends PlatformStore {}
+export class PlatformStore3 extends PlatformStore {}
 
 export class PlatformEcho extends DurableObject {
   fetch() {
