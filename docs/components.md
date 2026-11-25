@@ -108,13 +108,13 @@ Durable objects run in a separate category of workerd processes, `d0`, `d1`, …
 | `launcher/` | `coworkerd-launcher` and the description of its protocol with the node |
 | `cli/` | `cowctl` and the wrangler adapter |
 | `runtime/` | The runtime bridge, and a static example workerd configuration the node does not use |
-| `patches/` | The workerd patch series with its upstream tag, and the Cap'n Proto patches the build applies |
+| `patches/` | The workerd patch series with its upstream tag, and the Cap'n Proto change the build applies |
 | `docker/`, `examples/` | The image, the compose files and the example projects of the release package |
 | `scripts/` | Build, release, patch, allowlist and compatibility-flag tools, and the Linux toolchain image |
 | `docs/` | The user guide and these design documents |
 
 - **Building.** CMake (3.24 or newer) builds the static library `common` and the executables `coworkerd` and `coworkerd-apiserver`, plus two libraries from Cap'n Proto's own sources: `capnp-http-over`, which `common` links, and `kj-tls-local`, KJ's TLS layer against the system OpenSSL, which only `coworkerd` links, for egress. On Linux it also builds `coworkerd-launcher`, which `coworkerd` depends on. `scripts/build.sh` builds the two daemons, and through that dependency the launcher.
-- **Cap'n Proto.** CMake fetches the pinned commit from GitHub and applies `patches/kj-http-abort.diff` and `patches/kj-websocket-handshake-eof.diff`. `CMakeLists.txt` pins the commit aligned with workerd `v1.20260827.1`.
+- **Cap'n Proto** is not in the repository: CMake fetches it from GitHub at a pinned commit, which needs network access and Git, and applies `patches/kj-http-abort.diff` to it. `CMakeLists.txt` names the pin as aligned with workerd `v1.20260827.1`, not the `v1.20261012.1` the product ships.
 - **workerd** is not built here: build it from the tag in `patches/workerd/UPSTREAM` plus every patch in `patches/workerd/series`; and the release takes a prebuilt binary and refuses one whose SHA-256 is not the one pinned for its architecture. [patches/README.md](../patches/README.md) describes the series and how it follows upstream.
 
 ## 8. The release package

@@ -471,7 +471,7 @@ struct ServerConfig {
   }
 
   struct IngressConfig {
-    # A lower ceiling for all ingress WebSockets on this node. 0 uses the limit derived from the process's descriptors.
+    # Ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
     webSocketsPerNode @0 :UInt32;
   }
 

@@ -11,6 +11,7 @@
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
+#include "ingress-descriptors.h"
 #include "code-package.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
@@ -9921,11 +9922,6 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
-    // Include a replacement generation, private channels and prepared sockets;
-    // reject an insufficient host hard limit before starting any child process.
-    const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
-    const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
-    const auto required = std::max(childRequired, nodeRequired);
     const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
         (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
     uint64_t uidThreads = 0;
@@ -9973,14 +9969,6 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
-    rlimit inherited;
-    KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");
-    KJ_REQUIRE(inherited.rlim_max >= required, "insufficient host descriptor hard limit",
-        required, inherited.rlim_max, "missing", required > inherited.rlim_max ? required - inherited.rlim_max : 0);
-    if (inherited.rlim_cur < required) {
-      inherited.rlim_cur = required;
-      KJ_REQUIRE(setrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot set node descriptor soft limit", required);
-    }
   }
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
                              std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
@@ -10043,25 +10031,39 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   }
 }
 
-// Size ingress after the process pool has raised the soft limit for its own startup, if needed.
-uint32_t resolveWebSocketLimit(uint32_t configured) {
+// Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
+void applyNodeDescriptorLimit(ServerConfig& config) {
+  const auto& pool = config.processPool;
+  const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
+  const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
+  const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
+  const auto poolDescriptors = std::max(childRequired, nodeRequired);
   rlimit limits;
   KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &limits));
-  auto descriptors = limits.rlim_cur == RLIM_INFINITY ? limits.rlim_max : limits.rlim_cur;
+  auto soft = limits.rlim_cur == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_cur);
+  auto hard = limits.rlim_max == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_max);
 #ifdef __APPLE__
   int maxFilesPerProcess;
   size_t size = sizeof(maxFilesPerProcess);
   KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
-  descriptors = std::min(descriptors, static_cast<rlim_t>(maxFilesPerProcess));
+  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
+  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
+  soft = std::min(soft, hard);
 #endif
-  // Use the installation guide's finite descriptor limit when the OS reports no bound.
-  const uint64_t budget = descriptors == RLIM_INFINITY ? 65536 : descriptors;
-  // Preserve at least half (and at least 256) for HTTP, peer and child channels, storage and other files.
-  // An upgrade pins its client TCP socket. Charge two descriptors per place to leave room for an upstream socket,
-  // even when relaying over a shared RPC connection.
-  const auto reserve = std::max<uint64_t>(256, budget - budget / 2);
-  const auto automatic = (budget - std::min(budget, reserve)) / 2;
-  return static_cast<uint32_t>(std::min<uint64_t>(automatic, configured == 0 ? UINT32_MAX : configured));
+  const auto plan = coworkerd::planIngressDescriptors(soft, hard, poolDescriptors, config.webSocketsPerNode);
+  KJ_REQUIRE(plan.webSockets > 0, "insufficient host descriptor hard limit for the node and one ingress WebSocket",
+      "required", poolDescriptors + coworkerd::OTHER_INGRESS_DESCRIPTORS + coworkerd::DESCRIPTORS_PER_WEBSOCKET,
+      "hard limit", hard);
+  if (soft < plan.softLimit) {
+    limits.rlim_cur = static_cast<rlim_t>(plan.softLimit);
+    KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &limits), "cannot set node descriptor soft limit", plan.softLimit);
+  }
+  config.webSocketsPerNode = plan.webSockets;
+  if (plan.webSockets < plan.requested) {
+    std::cout << "[server] {\"event\":\"warning\",\"subject\":\"ingress-websocket-capacity\",\"requested\":" << plan.requested
+              << ",\"effective\":" << plan.webSockets << ",\"hardDescriptorLimit\":" << hard
+              << ",\"poolDescriptors\":" << poolDescriptors << '}' << std::endl;
+  }
 }
 
 // The shortest text that reads back as the same double (0.05, not 0.050000000000000003).
@@ -10230,7 +10232,7 @@ int run(Launch launch) {
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
   applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes, launch.workerd);
-  serverConfig.webSocketsPerNode = resolveWebSocketLimit(serverConfig.webSocketsPerNode);
+  applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) serverConfig.egress.defaultPolicy = policy;
@@ -10568,7 +10570,7 @@ int run(Launch launch) {
       });
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
-  kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway, .cancelWebSocketHandshakeOnEof = true});
+  kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, seedPeer);
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
@@ -10673,9 +10675,9 @@ int runSelfCheck(const std::vector<std::string>& args) {
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
     applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes, launch->workerd);
-    const auto webSocketLimit = resolveWebSocketLimit(launch->config.webSocketsPerNode);
+    applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
-        jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(webSocketLimit));
+        jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));
   } catch (const kj::Exception& error) {
     report("configuration", false, ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
     std::cout << "[check] {\"event\":\"result\",\"ok\":false}" << std::endl;

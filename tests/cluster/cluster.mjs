@@ -45,7 +45,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
-    controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode,
+    controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -72,6 +72,7 @@ export class Cluster {
     this.confirmTimeoutMs = confirmTimeoutMs;
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
     this.webSocketsPerNode = webSocketsPerNode;
+    this.configureNode = configureNode;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -150,9 +151,10 @@ export class Cluster {
         ...(this.recoveryRelayGate ? {
           durableObjects: { peerBufferBytes: 1048576, confirmTimeoutMs: 1000, recoverParallelism: 1 },
         } : {}),
+        ...this.configureNode?.(node),
       }));
       overrides[node] = {
-        ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 65536, hard: 65536 } } } : {}),
+        ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 1024, hard: 524288 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.
         restart: 'no',
         environment: { COWORKERD_CONFIG: target },

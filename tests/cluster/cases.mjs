@@ -26,14 +26,14 @@ async function deployment(cluster) {
   }
 }
 
-export async function webSocketAdmission(cluster) {
+async function webSocketAdmission(cluster) {
   const [node, otherNode] = cluster.nodes;
   const { WebSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
   const source = `export default { async fetch(request) {
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('ready');
     const path = new URL(request.url).pathname;
     if (path.endsWith('/pending')) {
-      await new Promise(resolve => setTimeout(resolve, 15000));
+      await new Promise(resolve => setTimeout(resolve, 6000));
       return new Response(null, { status: 403 });
     }
     if (path.endsWith('/decline')) {
@@ -75,22 +75,33 @@ export async function webSocketAdmission(cluster) {
     return socket;
   }
   const decline = () => new Promise((resolve, reject) => {
-    get(url(node, second, '/decline'), {
-      signal: AbortSignal.timeout(5000),
+    const request = get(url(node, second, '/decline'), {
       headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
         'Sec-WebSocket-Key': randomBytes(16).toString('base64') },
-    }, resolve).once('error', reject).once('upgrade', (_response, socket) => {
+    });
+    const timeout = setTimeout(() => request.destroy(new Error('upgrade response headers timed out')), 5000);
+    request.once('response', response => {
+      clearTimeout(timeout);
+      resolve(response);
+    }).once('error', error => {
+      clearTimeout(timeout);
+      reject(error);
+    }).once('upgrade', (_response, socket) => {
+      clearTimeout(timeout);
       socket.destroy();
       reject(new Error('the Worker should refuse the upgrade'));
     });
   });
   const state = async () => (await cluster.state(node)).webSockets;
-  const inUse = (count) => eventually(`node has ${count} WebSocket reservations`, async () => {
+  const inUse = (count, timeout = 5000) => eventually(`node has ${count} WebSocket reservations`, async () => {
     assert.equal((await state()).inUse, count);
-  }, { timeout: 5000 });
+  }, { timeout });
   try {
     assert.equal((await state()).limitPerNode, 2);
-    assert.equal((await cluster.state(otherNode)).webSockets.limitPerNode, 16384);
+    const otherState = await cluster.state(otherNode);
+    assert.equal(otherState.webSockets.limitPerNode, 2048);
+    const descriptors = await cluster.compose(['exec', '-T', otherNode, 'cat', `/proc/${otherState.server.pid}/limits`]);
+    assert.match(descriptors, /^Max open files\s+15488\s+524288\s/m);
     const a = await open(node, first);
     const b = await open(node, second);
     const full = await state();
@@ -115,13 +126,16 @@ export async function webSocketAdmission(cluster) {
     await inUse(2);
     assert.equal(pending.readyState, WebSocket.CONNECTING);
     pending.terminate();
-    await inUse(1);
+    assert.equal((await state()).inUse, 2, 'an abandoned handshake holds its place while waiting for the Worker');
+    await inUse(1, 15000);
 
     const declined = await decline();
+    declined.on('error', () => {});
     try {
       assert.equal(declined.statusCode, 403);
       await inUse(1);
       assert.equal(declined.complete, false, 'the upgrade place is free while the HTTP body is still streaming');
+      assert.equal(declined.destroyed, false);
       await open(node, first);
       await inUse(2);
     } finally {
@@ -2088,7 +2102,7 @@ async function threadedSocketRetirement(cluster) {
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
-export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
+export const cases = { deployment, 'websocket-admission': webSocketAdmission, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-takeover': durableTakeover };
 

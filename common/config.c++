@@ -163,8 +163,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   for (auto name : {"membership", "desiredState"})
     if (given({name, "backend"}) == std::optional<std::string>("etcd")) refuse(std::string(name) + ".backend must be file or objectStore");
   KJ_REQUIRE(!given({"ingress", "webSocketsPerTenant"}),
-      "ingress.webSocketsPerTenant was removed. Delete it to use the automatic node limit, "
-      "or set ingress.webSocketsPerNode to a lower shared limit.");
+      "ingress.webSocketsPerTenant was removed. Delete it to use the default node limit, "
+      "or set ingress.webSocketsPerNode to a shared limit.");
   capnp::MallocMessageBuilder message;
   auto root = message.initRoot<rpc::ServerConfig>();
   capnp::JsonCodec json;
