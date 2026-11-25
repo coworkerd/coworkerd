@@ -4,27 +4,24 @@
 #include <kj/compat/http.h>
 #include <kj/debug.h>
 
-#include <cerrno>
 #include <cstdint>
-#include <poll.h>
 #include <string_view>
-#include <sys/socket.h>
 
 namespace coworkerd {
 
 inline constexpr uint32_t SQL_DEADLINE_MS = 30000;
 inline constexpr auto SQL_DEADLINE_REASON = "SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded";
+inline constexpr auto SQL_RESET_REASON = "the database reset while the SQL request was queued";
 inline constexpr auto SQL_REMAINING_HEADER = "X-Coworkerd-Sql-Remaining-Ms";
 
-// A peer can finish uploading a SQL request and disconnect while the server
-// waits for the query. Watch incoming EOF so dropping the SQL handler also
-// releases its downstream connection.
+// A SQL caller can disconnect while the server is waiting for the query.
+// A read-side EOF is also how a caller half-closes while waiting for its reply.
 class SqlHttpCancellation final : public kj::HttpService {
 public:
-  enum class Route { CONTROL_PLANE, PEER, WORKER };
+  enum class Route { CONTROL_PLANE, PEER };
 
-  SqlHttpCancellation(kj::HttpService& service, kj::AsyncIoStream& connection, kj::Timer& timer, Route route)
-      : service(service), connection(connection), timer(timer), route(route) {}
+  SqlHttpCancellation(kj::HttpService& service, kj::AsyncIoStream& connection, Route route)
+      : service(service), connection(connection), route(route) {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& body, Response& response) override {
@@ -34,13 +31,10 @@ public:
         ? path.starts_with("/__coworkerd/databases/")
         : path.starts_with("/v1/tenants/") && path.find("/databases/") != std::string_view::npos);
     auto work = service.request(method, url, headers, body, response);
-    // A Worker's pending fetch can be waiting on a D1 Binding. Leave upgrades
-    // and management requests with their existing connection lifetimes.
-    const bool worker = route == Route::WORKER && !path.starts_with("/__coworkerd/") && !headers.isWebSocket();
-    if (worker || (method == kj::HttpMethod::POST && sql)) {
-      KJ_IF_SOME(fd, connection.getFd()) {
-        return work.exclusiveJoin(peerClosed(fd, worker ? 100 : 25));
-      }
+    if (method == kj::HttpMethod::POST && sql) {
+      return work.exclusiveJoin(connection.whenWriteDisconnected().then([] {
+        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "SQL HTTP client disconnected"));
+      }));
     }
     return work;
   }
@@ -53,25 +47,7 @@ public:
 private:
   kj::HttpService& service;
   kj::AsyncIoStream& connection;
-  kj::Timer& timer;
   Route route;
-
-  kj::Promise<void> peerClosed(int fd, uint32_t intervalMs) {
-    for (;;) {
-      co_await timer.afterDelay(intervalMs * kj::MILLISECONDS);
-#if defined(POLLRDHUP)
-      pollfd socket{fd, POLLRDHUP, 0};
-      const bool disconnected = poll(&socket, 1, 0) > 0 &&
-          (socket.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
-#else
-      char byte;
-      const auto result = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-      const bool disconnected = result == 0 ||
-          (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
-#endif
-      if (disconnected) kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "HTTP request client disconnected"));
-    }
-  }
 };
 
 }  // namespace coworkerd

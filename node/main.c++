@@ -4116,6 +4116,10 @@ private:
   std::string code;
 };
 
+bool isQueuedSqlReset(std::string_view code, std::string_view reason) {
+  return code == "DO_UNAVAILABLE" && reason.find("durable object reset is") != std::string_view::npos;
+}
+
 std::string rejectionJson(
     const std::string& code, const std::string& reason, double expiresAtMonotonicMs) {
   std::ostringstream body;
@@ -4123,7 +4127,8 @@ std::string rejectionJson(
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
-           code == "SQL_LIMIT_EXCEEDED" ? "SQL wall limit exceeded" :
+           code == "SQL_LIMIT_EXCEEDED" ? coworkerd::SQL_DEADLINE_REASON :
+           code == "DO_UNAVAILABLE" && reason == coworkerd::SQL_RESET_REASON ? "DO_UNAVAILABLE: database reset" :
            code == "NOT_SUPPORTED" ? "operation is not supported" :
            (code == "RESULT_UNCERTAIN" || code == "PROCESS_MEMORY_PRESSURE" ||
             code == "DO_CODE_UPDATED") ? "execution result uncertain" :
@@ -4880,6 +4885,20 @@ private:
   kj::Maybe<kj::ForkedPromise<void>> running;  // destroyed before the relayed response
 };
 
+// Keep the caller's upload promise on this side of the admission wrapper.
+// A shortened Cap'n Proto pipe would expose a queued event's native rejection
+// to the upload separately from the HTTP error response we send below.
+class SqlAdmissionBody final: public kj::AsyncInputStream {
+public:
+  explicit SqlAdmissionBody(kj::AsyncInputStream& inner): inner(inner) {}
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    return inner.tryRead(buffer, minBytes, maxBytes);
+  }
+  kj::Maybe<uint64_t> tryGetLength() override { return inner.tryGetLength(); }
+private:
+  kj::AsyncInputStream& inner;
+};
+
 class AdmissionHttpService final: public kj::HttpService {
 public:
   AdmissionHttpService(kj::Own<kj::HttpService> inner, std::shared_ptr<AdmissionSlot> slot,
@@ -4895,10 +4914,11 @@ public:
     std::string failure;
     std::string platformCode;
     bool answered = false;
+    SqlAdmissionBody sqlBody(body);
     KJ_DEFER(if (!answered && slot->threadedSql) slot->process->sqlClientDisconnected());
     try {
       pathMark(slot->timing, "http-dispatch");
-      auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      auto request = inner->request(method, url, requestHeaders, slot->threadedSql ? sqlBody : body, *tracked);
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
         return process->rejectAfterCrash(kj::mv(error));
@@ -4957,12 +4977,15 @@ private:
   kj::Promise<void> refuse(kj::HttpService::Response& tracked, const std::string& failure,
       const std::string& platformCode = "") {
     auto code = limitCode();
+    const bool sqlReset = slot->threadedSql && isQueuedSqlReset(platformCode, failure);
     if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE" ||
-        platformCode == "DO_CODE_UPDATED" || (slot->threadedSql && platformCode == "SQL_LIMIT_EXCEEDED")) code = platformCode;
+        platformCode == "DO_CODE_UPDATED" || sqlReset ||
+        (slot->threadedSql && platformCode == "SQL_LIMIT_EXCEEDED")) code = platformCode;
     const bool unsupported = code == "NOT_SUPPORTED";
     slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
     const auto reason = code == "DO_CODE_UPDATED" ? "Durable Object reset because its code was updated" :
-        code == "SQL_LIMIT_EXCEEDED" ? coworkerd::SQL_DEADLINE_REASON : failure;
+        code == "SQL_LIMIT_EXCEEDED" ? coworkerd::SQL_DEADLINE_REASON :
+        sqlReset ? coworkerd::SQL_RESET_REASON : failure;
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
         unsupported ? "Not Implemented" : "Service Unavailable",
         rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, reason, 0));
@@ -10799,15 +10822,11 @@ int run(Launch launch) {
       });
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
-  kj::HttpServer httpServer(timer, *headerTable,
-      [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
-    return kj::heap<coworkerd::SqlHttpCancellation>(
-        gateway, connection, timer, coworkerd::SqlHttpCancellation::Route::WORKER);
-  }, {.callbacks = gateway});
+  kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
     return kj::heap<coworkerd::SqlHttpCancellation>(
-        seedPeer, connection, timer, coworkerd::SqlHttpCancellation::Route::PEER);
+        seedPeer, connection, coworkerd::SqlHttpCancellation::Route::PEER);
   });
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
   kj::HttpServer egressServer(timer, *headerTable, egress);

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createRequire } from 'node:module';
+import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertStatus, eventually, json, request } from './cluster.mjs';
@@ -398,22 +400,15 @@ async function threadedSqlDeadline(cluster) {
   await cluster.deploy(tenant, 'probe', `export default { async fetch(request, env) {
     const { searchParams } = new URL(request.url);
     const db = env['DB' + searchParams.get('db')];
-    switch (searchParams.get('op')) {
-      case 'single':
-      case 'batch':
-      case 'cancel':
-        try {
-          let result;
-          switch (searchParams.get('op')) {
-            case 'single': result = await db.prepare(${JSON.stringify(select)}).all(); break;
-            case 'batch': result = await db.batch(${JSON.stringify(batch)}.map(q => db.prepare(q.sql).bind(...(q.params ?? [])))); break;
-            case 'cancel': result = await db.batch([db.prepare('INSERT INTO ledger VALUES (2)'), db.prepare(${JSON.stringify(insert)})]); break;
-          }
-          return Response.json(result);
-        } catch (e) {
-          return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 });
-        }
-      default: return Response.json((await db.prepare(${JSON.stringify(read.sql)}).all()).results);
+    try {
+      switch (searchParams.get('op')) {
+        case 'single': return Response.json(await db.prepare(${JSON.stringify(select)}).all());
+        case 'batch': return Response.json(await db.batch(${JSON.stringify(batch)}.map(q => db.prepare(q.sql).bind(...(q.params ?? [])))));
+        case 'write': return Response.json(await db.batch([db.prepare('INSERT INTO ledger VALUES (2)'), db.prepare(${JSON.stringify(insert)})]));
+        default: return Response.json((await db.prepare(${JSON.stringify(read.sql)}).all()).results);
+      }
+    } catch (e) {
+      return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 });
     }
   } };`, { wrangler: { d1_databases: databases.map((db, index) => ({ binding: `DB${index}`, database_name: db.name })) } });
   const bindingPath = (i, op = 'read') => `/${tenant.name}/probe?db=${i}&op=${op}`;
@@ -454,39 +449,99 @@ async function threadedSqlDeadline(cluster) {
     assert.deepEqual(json(await binding(i), 200, db.name), [{ id: 1 }]);
   }
 
-  const running = async expected => {
+  const activity = async (running, waiting = 0) => {
     const snapshot = await durableGeneration(cluster, owner);
     assert.equal(snapshot.pid, original.pid);
     assert.equal(snapshot.generation, original.generation);
-    assert.equal(snapshot.lifecycle.durableAdmission.running, expected);
+    assert.equal(snapshot.lifecycle.durableAdmission.running, running);
+    assert.equal(snapshot.lifecycle.durableAdmission.waiting, waiting);
   };
-  for (const [label, url, options] of [
-    ['HTTP', cluster.urls.apiserver + databases[0].path + '/query', {
-      method: 'POST', headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify([put(2), { sql: insert }]),
-    }],
-    ['D1', cluster.urls[ingress] + bindingPath(0, 'cancel'), {}],
-  ]) {
-    await eventually('the home is idle before cancellation', () => running(0));
-    const control = new AbortController();
-    let settled = false;
-    const pending = fetch(url, { ...options, signal: control.signal }).catch(error => error)
-      .finally(() => { settled = true; });
-    try {
-      await eventually(`${label} is running on the home`, () => running(1), { timeout: 3000, interval: 25 });
-      await delay(100);
-      assert.equal(settled, false, `${label} must still be executing when the client disconnects`);
-    } finally {
-      control.abort();
-    }
-    assert.equal((await pending).name, 'AbortError');
+  const sqlWire = (db, value) => {
+    const url = new URL(`${db.path}/query`, cluster.urls.apiserver);
+    const body = JSON.stringify(value);
+    return `POST ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${tenant.token}\r\n` +
+      `Content-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+  };
+  const apiserverUrl = new URL(cluster.urls.apiserver);
+  const halfClosed = createConnection({ host: apiserverUrl.hostname, port: Number(apiserverUrl.port) });
+  const chunks = [];
+  halfClosed.on('data', chunk => chunks.push(chunk));
+  try {
+    halfClosed.end(sqlWire(databases[0], { sql: medium }));
+    await once(halfClosed, 'end', { signal: AbortSignal.timeout(5000) });
+    const reply = Buffer.concat(chunks).toString();
+    assert.match(reply, /^HTTP\/1\.1 200 /, 'a SQL client can half-close its write side');
+    const body = JSON.parse(reply.slice(reply.indexOf('\r\n\r\n') + 4));
+    assert.deepEqual(body.results, [{ 'sum(n)': 2000001000000 }], 'a half-closed client receives the complete result');
+  } finally {
+    halfClosed.destroy();
+  }
+
+  const write = [put(2), { sql: insert }];
+  const checkQueuedHttp = result => {
+    const failure = json(result, 503, 'HTTP read queued when a write reset the database');
+    assert.equal(failure.code, 'DO_UNAVAILABLE', JSON.stringify(failure));
+  };
+  const checkQueuedBinding = result => {
+    const failure = json(result, 503, 'D1 read queued when a write reset the database');
+    assert.match(failure.message, /^D1_ERROR: .*DO_UNAVAILABLE/);
+    assert.match(failure.cause, /DO_UNAVAILABLE/);
+  };
+  const openSamples = async () => (await cluster.state(owner)).durableLog.threadedHomeIo.openSamples;
+  const reopened = async (db, label, run, results) => {
+    const before = await openSamples();
+    await eventually(`${label} reopens ${db.name} after its write was rolled back`, async () => {
+      assert.deepEqual(results(json(await run(), 200, label)), [{ id: 1 }]);
+    }, { timeout: 5000, interval: 50 });
+    assert.equal(await openSamples(), before + 1, `${label} needed a fresh SQLite open`);
+    await eventually(`${label} keeps the same process`, () => activity(0));
+  };
+
+  await eventually('SQL homes are idle before the live write deadlines', () => activity(0));
+  const timedWrites = Promise.all([
+    withTiming('HTTP write deadline', () => sql(databases[0], write), checkHttp),
+    withTiming('D1 write deadline', () => binding(2, 'write'), checkBinding),
+  ]);
+  void timedWrites.catch(() => {});
+  await eventually('both writes are running before requests queue behind them', () => activity(2));
+  const queued = Promise.all([sql(databases[0], read), binding(2, 'read')]);
+  void queued.catch(() => {});
+  await eventually('an HTTP and a D1 query are queued behind the writes', () => activity(2, 2));
+  await timedWrites;
+  const [queuedHttp, queuedBinding] = await queued;
+  checkQueuedBinding(queuedBinding);
+  checkQueuedHttp(queuedHttp);
+  await reopened(databases[0], 'HTTP after its write deadline', () => sql(databases[0], read, 1500), reply => reply.results);
+  await reopened(databases[2], 'D1 after its write deadline', () => binding(2, 'read'), reply => reply);
+
+  // Send the reset directly to the listener. A Docker port proxy can turn it into a FIN.
+  const apiserver = await cluster.compose(['ps', '-q', 'apiserver']);
+  const writer = spawn('docker', ['run', '--rm', '-i', '--network', `container:${apiserver}`,
+    'node:22-trixie', 'node', '-e', `
+      const { createConnection } = require('node:net');
+      const { createInterface } = require('node:readline');
+      const socket = createConnection({ host: '127.0.0.1', port: 8940 });
+      const input = createInterface({ input: process.stdin });
+      input.once('line', line => socket.write(JSON.parse(line)));
+      input.once('close', () => socket.resetAndDestroy());
+    `], { cwd: cluster.directory, env: cluster.env, stdio: ['pipe', 'ignore', 'inherit'], signal: cluster.signal });
+  const writerClosed = once(writer, 'close');
+  void writerClosed.catch(() => {});
+  writer.stdin.on('error', () => {});
+  try {
+    writer.stdin.write(`${JSON.stringify(sqlWire(databases[0], write))}\n`);
+    await eventually('the HTTP write is running before disconnect', () => activity(1));
+    const behindDisconnect = sql(databases[0], read, 5000);
+    void behindDisconnect.catch(() => {});
+    await eventually('the read is queued behind the HTTP write', () => activity(1, 1));
     const disconnectedAt = performance.now();
-    await eventually(`${label} frees the home well before the original deadline`, () => running(0), { timeout: 5000, interval: 50 });
-    const recovered = await eventually(`${label} rolled back its cancelled write`, async () =>
-      json(await sql(databases[0], read, 1500), 200, 'read after disconnect'), { timeout: 5000, interval: 50 });
-    assert.deepEqual(recovered.results, [{ id: 1 }]);
-    assert.deepEqual(json(await binding(0), 200, 'D1 after disconnect'), [{ id: 1 }]);
-    console.log(`${label} disconnect and recovery: ${(performance.now() - disconnectedAt).toFixed(1)} ms`);
+    writer.stdin.end();
+    assert.deepEqual(await writerClosed, [0, null], 'the TCP client sent its reset');
+    checkQueuedHttp(await behindDisconnect);
+    await reopened(databases[0], 'HTTP after disconnect', () => sql(databases[0], read, 1500), reply => reply.results);
+    console.log(`HTTP disconnect and recovery: ${(performance.now() - disconnectedAt).toFixed(1)} ms`);
+  } finally {
+    writer.stdin.end();
   }
 }
 
