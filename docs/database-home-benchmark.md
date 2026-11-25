@@ -361,6 +361,11 @@ on tree retirement. In this serial scan, earlier requests become eligible first.
 [Raw unpaced admission samples](database-home-benchmark/platform-database-admission-unpaced.jsonl) ·
 [Raw paced admission samples](database-home-benchmark/platform-database-admission-paced.jsonl)
 
+In a diagnostic on the same #90 kernel, a 2 ms common copy grace period let all 1,000 paced
+queries succeed with peak RSS of 592.27 MiB. The diagnostic elapsed time was 50.878 s.
+The paced baseline took 50.881 s and recorded 595 refusals. Both round to 50.88 s.
+[Raw short-timer diagnostic](database-home-benchmark/platform-database-admission-short-timer.jsonl)
+
 ### Reproduce the idle-window profile
 
 Run the Object-side driver with the placement test executable and the matching unpacked kernel.
@@ -379,6 +384,10 @@ unmodified baseline timer.
 Use `--idle-window-admission` and a new output filename to repeat the paced 1,000-query scan.
 This mode accepts either kernel with its matching product checkout. It writes the full scan
 before returning an error if any query fails or sampled RSS reaches the budget.
+
+Use `--idle-window-patched` on the kernel with 0174 to measure the released and warm paths
+with the default copy settings. The probe checks that all exclusive copies disappear within
+15 seconds of a cohort's last reply and records their observed retirement times.
 
 ## Reproduce
 

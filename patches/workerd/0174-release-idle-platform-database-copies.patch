@@ -5,20 +5,49 @@ Subject: [PATCH] Release exclusive database copies when idle roots retire
 
 Refs coworkerd/coworkerd#81
 
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index d706e00f8c866295dbd39e4363610f498065df6c..80030cfedf17f7a22997283e166fa7ec7d26604d 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -84,6 +84,16 @@ KJ_TEST("platform databases require a copy pinned to the specific object") {
+   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+ }
+ 
++KJ_TEST("an exclusive database copy keeps its isolate while the home has a reservation") {
++  const auto database = PLATFORM_DATABASE_COPY_PREFIX + std::string(64, 'a');
++  const auto tenant = std::string(64, 'a') + ":" + std::string(64, 'b');
++  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false));
++  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, false));
++  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, false));
++  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, false));
++  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
++}
++
+ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
+   int fds[2];
+   KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..cc490f6e1fd39bde18a4120d9a229a587ea24cb8 100644
+index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..2b77dfc427c8a370e76da497a6dfb020c3f8661d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2114,6 +2114,8 @@ bool productPlatformPlan(Json::Reader plan) {
+@@ -2114,6 +2114,16 @@ bool productPlatformPlan(Json::Reader plan) {
        name.isString() && name.getString() == "coworkerd:platform";
  }
  
 +constexpr char PLATFORM_DATABASE_COPY_PREFIX[] = "platform-object-v1:";
 +
++bool shouldReleaseDurableCopy(uint32_t reservedTrees, bool hasResidentRoots,
++    const std::string &definition, bool resettingOrExpired) {
++  // The catalog mints tenant fingerprints with a hexadecimal definition hash first.
++  // The platform copy key below is recomputed when the database route is validated.
++  return reservedTrees == 0 && !hasResidentRoots &&
++      (resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
++}
++
  std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
      const server::DurableAdmission::Key *object = nullptr) {
    auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
-@@ -2129,7 +2131,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
+@@ -2129,7 +2139,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
        namedLimit("memoryLimitMiB"));
    if (object != nullptr) {
      auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
@@ -27,16 +56,17 @@ index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..cc490f6e1fd39bde18a4120d9a229a58
    }
    return "platform-v1:" + digest(identity.asBytes());
  }
-@@ -3266,8 +3268,11 @@ struct ThreadedServer {
+@@ -3266,8 +3276,11 @@ struct ThreadedServer {
            home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
        const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
        const auto lastUse = state.durableSlot->lastUseNs.load();
+-      releaseCopy = home.reservedTrees == 0 && state.durableRoots.empty() &&
+-          (home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
 +      // An empty database copy still charges the process budget. Release it when its
 +      // tree retires so a new database can open on an unused home.
-+      const bool databaseCopy = state.durableSlot->planRevision.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
-       releaseCopy = home.reservedTrees == 0 && state.durableRoots.empty() &&
--          (home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
-+          (databaseCopy || home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
++      releaseCopy = shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
++          state.durableSlot->planRevision,
++          home.pressure.resetting() || (idleMs && nowNs() - lastUse >= idleMs * 1000000));
      }
      if (pressureAction == server::DurablePressure::Action::RESET) {
        for (auto &[tree, root]: state.durableRoots) {
