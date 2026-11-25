@@ -10,9 +10,10 @@ import { Cluster, eventually, json, request } from './cluster.mjs';
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
 const idleAdmission = mode === '--idle-window-admission';
 const defaultIdleWindow = mode === '--idle-window-default';
-const idleWindow = mode === '--idle-window' || defaultIdleWindow || idleAdmission;
+const patchedIdleWindow = mode === '--idle-window-patched';
+const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
-  '--idle-window', '--idle-window-default', '--idle-window-admission'];
+  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
     (mode !== undefined && !modes.includes(mode)) || (idleWindow && side !== 'object') || extra.length) {
   console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <kernel-directory> <new-report.jsonl> [' + modes.join('|') + ']');
@@ -48,7 +49,7 @@ const settings = {
 };
 const reopenRounds = defaultIdleWindow ? 1 : 4;
 // Shorten the copy's post-retirement grace period for the benchmark.
-const profileCopyIdleMs = idleAdmission || defaultIdleWindow ? 300000 : 12000;
+const profileCopyIdleMs = mode === '--idle-window' ? 12000 : 300000;
 const admissionDatabases = 1000;
 const admissionSpacingMs = 50;
 const controller = new AbortController();
@@ -636,7 +637,7 @@ async function waitForIdleRelease(lastReadCompleted, retiredWaves) {
     assert.equal(residentRoots + homes + homeSessions + entry.inFlight, 0);
     assert.equal(idleRetirements, retiredWaves * databases.length, 'every tree retired through the idle path');
     return afterLastReadMs;
-  }, { timeout: 30000, interval: 200 });
+  }, { timeout: patchedIdleWindow ? 15000 : 30000, interval: 200 });
   assert.ok(lastNonzeroMs > 0, 'observed residents before idle release');
   await record('idle-window-retirement', { retiredWaves, lastNonzeroMs, allClosedMs });
 }
@@ -669,22 +670,27 @@ async function measureReopen(round, homes, samples) {
 async function runIdleReopen(lastReadCompleted) {
   const retainedCopy = { reopened: [], warm: [], deltas: [] };
   const releasedCopy = { reopened: [], warm: [], deltas: [] };
+  const wavesPerRound = patchedIdleWindow ? 1 : 2;
   for (let round = 1; round <= reopenRounds; round++) {
-    await eventually('all trees retire with their copies still loaded', () => assertResident(0, databases.length));
-    if (round === 1) {
-      await record('idle-window-empty-copy-memory', { afterLastReadMs: performance.now() - lastReadCompleted,
-        ...await memoryWindow(0, databases.length) });
+    if (!patchedIdleWindow) {
+      await eventually('all trees retire with their copies still loaded', () => assertResident(0, databases.length));
+      if (round === 1) {
+        await record('idle-window-empty-copy-memory', { afterLastReadMs: performance.now() - lastReadCompleted,
+          ...await memoryWindow(0, databases.length) });
+      }
+      lastReadCompleted = await measureReopen(round, databases.length, retainedCopy);
     }
-    lastReadCompleted = await measureReopen(round, databases.length, retainedCopy);
-    await waitForIdleRelease(lastReadCompleted, 2 * round);
+    await waitForIdleRelease(lastReadCompleted, wavesPerRound * round);
     if (round === 1) await record('idle-window-released-memory', await memoryWindow(0));
     lastReadCompleted = await measureReopen(round, 0, releasedCopy);
   }
   if (!defaultIdleWindow) {
-    await waitForIdleRelease(lastReadCompleted, 2 * reopenRounds + 1);
+    await waitForIdleRelease(lastReadCompleted, wavesPerRound * reopenRounds + 1);
     await record('idle-window-released-memory', await memoryWindow(0));
   }
-  for (const [copy, { reopened, warm, deltas }] of [['retained', retainedCopy], ['released', releasedCopy]]) {
+  const conditions = patchedIdleWindow ? [['released', releasedCopy]]
+    : [['retained', retainedCopy], ['released', releasedCopy]];
+  for (const [copy, { reopened, warm, deltas }] of conditions) {
     await record('idle-window-reopen', { copy, ...times(reopened) });
     await record('idle-window-warm', { copy, ...times(warm) });
     await record('idle-window-paired-delta', { copy, ...times(deltas) });
