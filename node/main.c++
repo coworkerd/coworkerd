@@ -33,6 +33,7 @@
 #include "egress.h"
 #include "json.h"
 #include "peer-auth.h"
+#include "peer-liveness.h"
 #include "tenancy.h"
 #include "tenant-manifest.h"
 #include "tenants.h"
@@ -4934,8 +4935,15 @@ public:
   void setOwnerTailSupport(bool supported) { ownerTailSupport = supported; }
   bool supportsOwnerTail() const { return ownerTailSupport; }
 
-  void watchDisconnect(kj::Function<void()> observed) {
-    disconnectWatch = rpcSystem->onDisconnect().catch_([](kj::Exception&&) {}).then(
+  void watchDisconnect(kj::Timer& timer, kj::Function<void()> observed) {
+    auto keepalive = coworkerd::runPeerKeepalive(timer, [this]() {
+      return peer.keepAliveRequest().send().ignoreResult();
+    });
+    disconnectWatch = rpcSystem->onDisconnect().exclusiveJoin(kj::mv(keepalive)).catch_([this](kj::Exception&&) {
+      // An unresponsive peer can still have a seemingly open TCP stream.
+      kj::runCatchingExceptions([this]() { stream->abortRead(); });
+      kj::runCatchingExceptions([this]() { stream->shutdownWrite(); });
+    }).then(
         [this, observed = kj::mv(observed)]() mutable {
       if (markDisconnected()) observed();
     }).eagerlyEvaluate(nullptr);
@@ -5834,7 +5842,7 @@ private:
         found->second.connectingSettled = true;
         ++found->second.successfulConnections;
       }
-      connection->watchDisconnect([this, targetServerId]() {
+      connection->watchDisconnect(timer, [this, targetServerId]() {
         if (auto found = peerStates.find(targetServerId); found != peerStates.end()) ++found->second.disconnects;
       });
       return std::move(connection);
@@ -5865,6 +5873,7 @@ private:
       // The connection is signed for its target with the cluster key (peer-auth.h); every call it carries is
       // inside the authenticated session.
       kj::HttpHeaders connectHeaders(headerTable);
+      connectHeaders.addPtrPtr("X-Coworkerd-Peer-Protocol", "2");
       peerAuth.sign(connectHeaders, "CONNECT", "coworkerd-peer", targetServerId);
       auto tunnel = connector->connect(
           "coworkerd-peer", connectHeaders, {});
@@ -5883,6 +5892,8 @@ private:
           .then([connection = connection.addRef()](
                     kj::HttpClient::ConnectRequest::Status&& status) mutable {
         KJ_REQUIRE(status.statusCode == 200, "peer rejected Cap'n Proto CONNECT");
+        KJ_REQUIRE(headerValue(*status.headers, "x-coworkerd-peer-protocol") == "2",
+            "incompatible peer protocol revision");
         bool supported = false;
         status.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
           std::string key(name.cStr());
@@ -5988,13 +5999,19 @@ public:
       DurableDispatch& durable,
       coworkerd::DurableLog& durableLog,
       capnp::HttpOverCapnpFactory& factory,
-      const kj::HttpHeaderTable& headerTable)
+      const kj::HttpHeaderTable& headerTable,
+      std::shared_ptr<coworkerd::PeerReceiveLiveness> liveness)
       : server(server),
         peerForwarder(peerForwarder),
         durable(durable),
         durableLog(durableLog),
         factory(factory),
-        headerTable(headerTable) {}
+        headerTable(headerTable), liveness(std::move(liveness)) {}
+
+  kj::Promise<void> keepAlive(KeepAliveContext) override {
+    liveness->receivedPing();
+    return kj::READY_NOW;
+  }
 
   // A log stream another node opens here, and the tail this node holds of a previous owner's log for one shard.
   kj::Promise<void> openDurableLog(OpenDurableLogContext context) override {
@@ -6216,6 +6233,7 @@ private:
   coworkerd::DurableLog& durableLog;
   capnp::HttpOverCapnpFactory& factory;
   const kj::HttpHeaderTable& headerTable;
+  std::shared_ptr<coworkerd::PeerReceiveLiveness> liveness;
 };
 
 // The control plane's own addresses, as every control plane announces them to every member (POST
@@ -6426,9 +6444,8 @@ public:
       WorkerLogsEndpoint& logs, kj::Function<kj::Promise<std::string>()> state, coworkerd::PeerAuth& peerAuth,
       ControlPlaneAddresses& controlPlane)
       : server(server), headerTable(headerTable),
-        rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
-            server, peerForwarder, durable, durableLog, factory, headerTable))), trial(kj::mv(trial)), logs(logs), state(kj::mv(state)),
-        peerAuth(peerAuth), controlPlane(controlPlane), durable(durable), factory(factory) {}
+        trial(kj::mv(trial)), logs(logs), state(kj::mv(state)), peerAuth(peerAuth), controlPlane(controlPlane),
+        durable(durable), factory(factory), peerForwarder(peerForwarder), durableLog(durableLog) {}
 
   // Besides the Cap'n Proto CONNECT, the peer listener (the address a member
   // advertises) answers the deployment tool's trial loads, and the control
@@ -6567,19 +6584,27 @@ public:
       response.reject(401, "Unauthorized", kj::HttpHeaders(headerTable), uint64_t(0));
       return kj::READY_NOW;
     }
+    if (headerValue(headers, "x-coworkerd-peer-protocol") != "2") {
+      response.reject(409, "Incompatible peer protocol", kj::HttpHeaders(headerTable), uint64_t(0));
+      return kj::READY_NOW;
+    }
     kj::HttpHeaders accepted(headerTable);
     accepted.addPtrPtr("X-Coworkerd-Tail-Owner", "1");
+    accepted.addPtrPtr("X-Coworkerd-Peer-Protocol", "2");
     response.accept(200, "OK", accepted);
-    if (verdict.keyTag.empty()) return rpcServer.accept(connection);
+    auto liveness = std::make_shared<coworkerd::PeerReceiveLiveness>(server.clock());
+    coworkerd::CoarseTwoPartyServer rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
+        server, peerForwarder, durable, durableLog, factory, headerTable, liveness)));
+    auto session = rpcServer.accept(connection).exclusiveJoin(liveness->whenExpired());
+    if (verdict.keyTag.empty()) return kj::mv(session).attach(std::move(liveness));
     // A session accepted with a key that later leaves the key file ends windowMs after it left.
-    return rpcServer.accept(connection).exclusiveJoin(peerAuth.retired(verdict.keyTag).then(
-        [this, tag = verdict.keyTag]() { peerAuth.sessionRetired(tag); }));
+    return kj::mv(session).exclusiveJoin(peerAuth.retired(verdict.keyTag).then(
+        [this, tag = verdict.keyTag]() { peerAuth.sessionRetired(tag); })).attach(std::move(liveness));
   }
 
 private:
   ServerCore& server;
   const kj::HttpHeaderTable& headerTable;
-  coworkerd::CoarseTwoPartyServer rpcServer;
   kj::Function<kj::Promise<void>(kj::HttpMethod, kj::AsyncInputStream&, Response&)> trial;
   WorkerLogsEndpoint& logs;
   kj::Function<kj::Promise<std::string>()> state;
@@ -6587,6 +6612,8 @@ private:
   ControlPlaneAddresses& controlPlane;
   DurableDispatch& durable;
   capnp::HttpOverCapnpFactory& factory;
+  PeerForwarder& peerForwarder;
+  coworkerd::DurableLog& durableLog;
 };
 
 // The path of a request target, origin-form ("/a?b") or absolute
@@ -10570,7 +10597,8 @@ int run(Launch launch) {
       });
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
-  kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
+  kj::HttpServer httpServer(timer, *headerTable, gateway,
+      {.callbacks = gateway, .cancelWebSocketHandshakeOnEof = true});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, seedPeer);
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});

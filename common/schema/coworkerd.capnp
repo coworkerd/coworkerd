@@ -162,6 +162,8 @@ interface PeerServer @0xab4d6df924ec776f {
   # What this node still holds of a previous owner's log for one shard: a new owner asks for it after it has replayed
   # the object store, so that the writes the previous owner answered but did not get into a segment are not lost.
   fetchDurableTail @3 (request :DurableTailRequest) -> (result :DurableTailResult);
+  # One keepalive per authenticated session, regardless of the number of open calls.
+  keepAlive @4 () -> ();
 }
 
 struct DurableLogSession {

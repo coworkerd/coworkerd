@@ -4,7 +4,8 @@
 
 - **The daemons for the host** (macOS or Linux, with CMake 3.24 or newer, Ninja, OpenSSL, Git and a C++23 compiler):
   `bash scripts/build.sh` builds `build/coworkerd` and `build/coworkerd-apiserver`. It fetches Cap'n Proto from GitHub
-  and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff) to it. The launcher, `coworkerd-launcher`, is
+  and patches KJ's [HTTP write aborts](patches/kj-http-abort.diff) and
+  [peer half-close notification](patches/kj-peer-half-close.diff). The launcher, `coworkerd-launcher`, is
   Linux only: there `build.sh` builds it too, which takes a C compiler as well.
 - **cowctl**: `npm ci --prefix cli` installs its dependencies (Node.js 22.5 or newer: the wrangler and Miniflare it
   pins require Node.js 22, and its adapter uses `path.matchesGlob`); `node cli/bin/cowctl.mjs` runs it.

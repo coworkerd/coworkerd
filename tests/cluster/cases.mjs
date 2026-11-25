@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createRequire } from 'node:module';
+import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
@@ -122,12 +123,27 @@ async function webSocketAdmission(cluster) {
     assert.equal((await closed)[0], 1000);
     await inUse(1);
 
-    const pending = connect(node, first, '/pending');
-    await inUse(2);
-    assert.equal(pending.readyState, WebSocket.CONNECTING);
-    pending.terminate();
-    assert.equal((await state()).inUse, 2, 'an abandoned handshake holds its place while waiting for the Worker');
-    await inUse(1, 15000);
+    const target = url(node, first, '/pending');
+    const pending = createConnection({ host: target.hostname, port: Number(target.port), allowHalfOpen: true });
+    pending.on('error', () => {});
+    try {
+      await waitFor(pending, 'connect');
+      pending.write([
+        `GET ${target.pathname} HTTP/1.1`, `Host: ${target.host}`,
+        'Connection: Upgrade', 'Upgrade: websocket', 'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Key: ${randomBytes(16).toString('base64')}`, '', '',
+      ].join('\r\n'));
+      await inUse(2);
+      // A FIN from a pending upgrade cannot yield a bidirectional relay.
+      const disconnectedAt = performance.now();
+      pending.end();
+      await inUse(1, 1000);
+      const releasedIn = performance.now() - disconnectedAt;
+      assert.ok(releasedIn < 1000, `pending WebSocket place took ${releasedIn.toFixed(1)} ms to return`);
+      console.log(`Pending WebSocket place returned in ${releasedIn.toFixed(1)} ms`);
+    } finally {
+      pending.destroy();
+    }
 
     const declined = await decline();
     declined.on('error', () => {});

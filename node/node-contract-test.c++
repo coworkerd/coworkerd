@@ -2,6 +2,7 @@
 #include "config.h"
 #include "code-package.h"
 #include "invocation-contract.h"
+#include "peer-liveness.h"
 #include "ingress-descriptors.h"
 #include "event-loop.h"
 #include "memory-events.h"
@@ -24,6 +25,7 @@
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #ifdef __linux__
 #include <sched.h>
@@ -38,6 +40,71 @@ struct TempDir {
   ~TempDir() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
   std::filesystem::path operator/(const char* file) const { return std::filesystem::path(path) / file; }
 };
+
+void peerHalfClose() {
+  auto io = kj::setupAsyncIo();
+  int fds[2];
+  KJ_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  auto server = io.lowLevelProvider->wrapSocketFd(fds[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+  auto client = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+
+  auto halfClosed = server->whenPeerClosedWrite();
+  kj::byte request = 'q';
+  client->write(kj::arrayPtr(&request, 1)).wait(io.waitScope);
+  KJ_REQUIRE(!halfClosed.poll(io.waitScope), "readable data alone is not a half-close");
+  client->shutdownWrite();
+  io.provider->getTimer().timeoutAfter(2 * kj::SECONDS, kj::mv(halfClosed)).wait(io.waitScope);
+
+  kj::byte received = 0;
+  KJ_REQUIRE(server->tryRead(&received, 1, 1).wait(io.waitScope) == 1 && received == request,
+      "half-close notification must preserve unread input");
+  KJ_REQUIRE(server->whenPeerClosedWrite().poll(io.waitScope), "an observed half-close must stay visible");
+
+  kj::byte response = 'a';
+  server->write(kj::arrayPtr(&response, 1)).wait(io.waitScope);
+  KJ_REQUIRE(client->tryRead(&received, 1, 1).wait(io.waitScope) == 1 && received == response,
+      "the peer can still read after shutting down its writes");
+}
+
+void peerSessionLiveness() {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::origin<kj::TimePoint>();
+  kj::TimerImpl clock(start);
+  PeerReceiveLiveness receiver(clock);
+  auto expired = receiver.whenExpired();
+  unsigned sent = 0;
+  bool timedOut = false;
+  auto unanswered = kj::newPromiseAndFulfiller<void>();
+  auto active = runPeerKeepalive(clock, [&]() -> kj::Promise<void> {
+    ++sent;
+    if (sent == 1) {
+      receiver.receivedPing();
+      return kj::READY_NOW;
+    }
+    return kj::mv(unanswered.promise);
+  }).catch_([&](kj::Exception&&) { timedOut = true; });
+
+  clock.advanceTo(start + 1999 * kj::MILLISECONDS);
+  KJ_REQUIRE(!active.poll(waitScope) && sent == 0);
+  clock.advanceTo(start + 2 * kj::SECONDS);
+  KJ_REQUIRE(!active.poll(waitScope) && sent == 1);
+  clock.advanceTo(start + 4 * kj::SECONDS);
+  KJ_REQUIRE(!active.poll(waitScope) && sent == 2);
+  clock.advanceTo(start + 6999 * kj::MILLISECONDS);
+  KJ_REQUIRE(!expired.poll(waitScope) && !active.poll(waitScope) && sent == 2);
+  clock.advanceTo(start + 7 * kj::SECONDS);
+  const auto receiverExpired = expired.poll(waitScope);
+  const auto senderExpired = active.poll(waitScope);
+  KJ_REQUIRE(receiverExpired, "the receiving session expires five seconds after its last ping");
+  KJ_REQUIRE(senderExpired, "the outgoing session expires without an acknowledgement");
+  active.wait(waitScope);
+  KJ_REQUIRE(timedOut, "the outgoing session failed at its deadline");
+  KJ_REQUIRE(!unanswered.fulfiller->isWaiting(), "an expired session cancels its outstanding probe");
+  KJ_REQUIRE(kj::runCatchingExceptions([&]() { receiver.receivedPing(); }) != kj::none,
+      "a late ping cannot reopen a session");
+}
+
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
@@ -793,6 +860,8 @@ int main(int argc, char* argv[]) {
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
+  else if (name == "peer-half-close") peerHalfClose();
+  else if (name == "peer-session-liveness") peerSessionLiveness();
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();

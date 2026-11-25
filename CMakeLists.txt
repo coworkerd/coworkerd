@@ -21,16 +21,18 @@ FetchContent_MakeAvailable(capnproto)
 # KJ's HTTP entity writers must honor AsyncOutputStream::abortWrite(). Without
 # this, destroying a chunked writer after an upstream read failure sends EOF.
 find_package(Git REQUIRED)
-set(KJ_HTTP_ABORT_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/kj-http-abort.diff")
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${KJ_HTTP_ABORT_PATCH}"
-  WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
-  OUTPUT_QUIET ERROR_QUIET)
-if(NOT patch_check EQUAL 0)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-endif()
+foreach(patch IN ITEMS kj-http-abort.diff kj-peer-half-close.diff)
+  set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch_file}"
+    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT patch_check EQUAL 0)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+  endif()
+endforeach()
 
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
@@ -266,6 +268,8 @@ foreach(case native-config tenant-execution deadlines event-loop shutdown-signal
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
 add_test(NAME node-ingress-descriptor-plan COMMAND coworkerd-node-contract-test ingress-descriptor-plan)
+add_test(NAME node-peer-half-close COMMAND coworkerd-node-contract-test peer-half-close)
+add_test(NAME node-peer-session-liveness COMMAND coworkerd-node-contract-test peer-session-liveness)
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)
