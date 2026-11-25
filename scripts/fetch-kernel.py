@@ -57,7 +57,12 @@ def install(args, arch, expected, digest, asset, download_tag):
                 with tempfile.TemporaryDirectory(dir=cached.parent) as pending:
                     copy = shutil.copyfile(download, Path(pending) / asset)
                     copy.replace(cached)
-    print(destination)
+    if args.json:
+        print(json.dumps({"path": str(destination), "archive": {
+            "releaseTag": download_tag, "archiveAsset": asset, "archiveSha256": digest,
+        }}))
+    else:
+        print(destination)
 
 
 def fetch(args):
@@ -93,8 +98,12 @@ def main():
     mode.add_argument("--installed", action="store_true", help="print an existing verified install path without downloading")
     mode.add_argument("--sha256", action="store_true", help="print the pinned archive SHA-256")
     mode.add_argument("--release-tag", action="store_true", help="print the release tag for the current series")
+    parser.add_argument("--json", action="store_true", help="report the verified installation path and archive provenance as JSON")
+    args = parser.parse_args()
+    if args.json and (args.sha256 or args.release_tag):
+        parser.error("--json requires a verified installation")
     try:
-        fetch(parser.parse_args())
+        fetch(args)
     except (OSError, EOFError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"fetch-kernel: {error}\n")
 
