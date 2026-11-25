@@ -41,11 +41,6 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
-For a failed case, `build/cluster-diagnostics/<project>/<case>/` keeps the assertion (including the HTTP
-body for an unexpected status), Compose status and logs, and each node's workerd logs after teardown.
-On the hosted kernel archive job, download `cluster-failure-<arch>-<attempt>` from the workflow run to
-get those files and the cluster runner's combined output in `cluster.log`.
-
 To measure idle WebSocket memory on fresh clusters:
 
 ```sh
@@ -164,6 +159,15 @@ The five running containers used about 586 MiB combined in the sample just after
 tree, including the unpacked kernel and test binaries, occupied 470 MiB. Allow additional disk for the kernel
 archive, Docker images and temporary volumes. These are observed values from the
 [hosted run](https://github.com/coworkerd/coworkerd/actions/runs/44911045714/job/136866725293#step:14:15).
+
+## Failure diagnostics
+
+For a failed case, `build/cluster-diagnostics/<project>/<case>/` keeps the failure report, Compose status
+and logs, and each node's workerd logs after teardown. HTTP status checks and JSON parse failures include
+the response body in the failure report.
+
+On the hosted kernel archive job, download `cluster-failure-<arch>-<attempt>` from the workflow run to
+get those files and the cluster runner's combined output in `cluster.log`.
 
 ## Cases
 

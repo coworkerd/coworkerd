@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { copyFile, mkdir, open, rm, writeFile } from 'node:fs/promises';
+import { closeSync, openSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -294,17 +295,17 @@ export class Cluster {
         await writeFile(join(directory, 'compose-ps.txt'), `${status}\n`);
       }),
       capture('Compose logs', async () => {
-        const log = await open(composeLog, 'w');
+        const fd = openSync(composeLog, 'w');
         try {
           // Write both streams directly so the tail survives even if the log exceeds execFile's buffer.
           const child = spawn('docker', this.composeArgs(['logs', '--no-color']), {
-            cwd: this.directory, env: this.env, stdio: ['ignore', log.fd, log.fd],
+            cwd: this.directory, env: this.env, stdio: ['ignore', fd, fd],
             timeout: options.timeout, killSignal: 'SIGKILL',
           });
           const [code, signal] = await once(child, 'close');
           if (code !== 0) throw new Error(`docker compose logs exited with ${signal ?? code}`);
         } finally {
-          await log.close();
+          closeSync(fd);
         }
         console.error(await this.command('tail', ['-n', '40', composeLog], options));
       }),
