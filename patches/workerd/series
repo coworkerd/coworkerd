@@ -95,3 +95,4 @@
 0151-reserve-platform-execution-identity.patch
 0170-place-platform-databases-in-exclusive-copies.patch
 0171-bound-threaded-sql-wall-time.patch
+0172-time-wal-confirmation-after-threaded-sql.patch

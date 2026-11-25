@@ -370,8 +370,10 @@ The threaded object database test path starts one 30-second monotonic deadline a
 handler or D1 binding dispatch. Nodes forward the time remaining. Time spent receiving the HTTP
 body, waiting for placement or storage recovery, preparing and stepping SQLite, and encoding
 results counts against the same deadline. Every statement in a batch sees that deadline. The
-public timeout is `503 SQL_LIMIT_EXCEEDED` and a binding query or batch reports `D1_ERROR` with
-that code. WAL confirmation retains its separate deadline and error priority.
+home releases the prior database response before advancing its queue, so the next synchronous
+statement cannot delay delivery of an earlier result. The public timeout is `503 SQL_LIMIT_EXCEEDED` and a binding query or batch reports `D1_ERROR` with
+that code. WAL confirmation starts with a fresh clock after SQLite work and retains its error
+priority. The platform database's output gate allows time for both phases before its watchdog fires.
 
 A caller disconnect closes the write side of that event's dedicated kernel connection. The
 SQLite progress callback detects it during synchronous execution. The transaction rolls back on

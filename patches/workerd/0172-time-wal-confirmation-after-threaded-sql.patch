@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 22:10:03 +0800
+Subject: [PATCH] Separate threaded SQL reply and WAL confirmation timing
+
+
+diff --git a/src/workerd/io/worker.c++ b/src/workerd/io/worker.c++
+index 479dd3d07ed0ab56f5a08f7a796d0704025b39ec..1b5ba0670caea09ef844c3d3c3d2c5cda604e07f 100644
+--- a/src/workerd/io/worker.c++
++++ b/src/workerd/io/worker.c++
+@@ -4229,12 +4229,13 @@ struct Worker::Actor::Impl {
+     }
+     // Implements InputGate::Hooks.
+ 
++    kj::Duration outputGateTimeout = 30 * kj::SECONDS;
++
+     kj::Promise<void> makeTimeoutPromise() override {
+       // This really only protects against total hangs. Lowering the timeout drastically is risky,
+       // since low timeouts can spuriously fire when under heavy CPU load, failing requests that
+       // would otherwise succeed.
+-      auto timeout = 30 * kj::SECONDS;
+-      co_await timerChannel.afterLimitTimeout(timeout);
++      co_await timerChannel.afterLimitTimeout(outputGateTimeout);
+ 
+       auto e = KJ_EXCEPTION(OVERLOADED,
+           "broken.outputGateBroken; jsg.Error: Durable Object storage operation exceeded "
+@@ -4998,6 +4999,10 @@ OutputGate& Worker::Actor::getOutputGate() {
+   return impl->outputGate;
+ }
+ 
++void Worker::Actor::setOutputGateTimeout(kj::Duration timeout) {
++  impl->hooks.outputGateTimeout = timeout;
++}
++
+ kj::Maybe<IoContext&> Worker::Actor::getIoContext() {
+   return impl->ioContext.map([](kj::Own<IoContext>& rc) -> IoContext& { return *rc; });
+ }
+diff --git a/src/workerd/io/worker.h b/src/workerd/io/worker.h
+index 75d3a6a889bc937aa509c469f0987e5e862f7d60..cdb1d93af605d17cfe3031f3933d759d9c411128 100644
+--- a/src/workerd/io/worker.h
++++ b/src/workerd/io/worker.h
+@@ -1204,6 +1204,7 @@ class Worker::Actor final: public kj::Refcounted {
+ 
+   InputGate& getInputGate();
+   OutputGate& getOutputGate();
++  void setOutputGateTimeout(kj::Duration timeout);
+ 
+   // Get the IoContext which should be used for all activity in this Actor. Returns null if
+   // setIoContext() hasn't been called yet.
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index 31a48b9a464106fc3354040a749268e75d9a6e87..98500bb8037b0ba91a812470ede51e997f12f5d7 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -144,6 +144,13 @@ std::optional<DurableAdmission::Ticket> DurableAdmission::next(uint64_t tree) co
+   return Ticket{tree, pending->first};
+ }
+ 
++bool DurableAdmission::hasActiveEvent(uint64_t tree) const {
++  auto entry = trees.find(tree);
++  if (entry == trees.end()) return false;
++  const auto& events = entry->second.events;
++  return !events.empty() && events.begin()->second.phase != Phase::WAITING;
++}
++
+ DurableAdmission::Delivery DurableAdmission::begin(
+     Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now) {
+   auto entry = trees.find(ticket.tree);
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index 827381fb698b5ae11ffd4b5e30e17012b8948e1d..aa8797f2c2121581aaa333ad7074ba1559b4d10b 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -91,6 +91,7 @@ class DurableAdmission {
+   // Check the full descriptor and route the first live waiting event to an already published home.
+   // Starting an event returns waiting credit while retaining its execution reservation.
+   std::optional<Ticket> next(uint64_t tree) const;
++  bool hasActiveEvent(uint64_t tree) const;
+   Delivery begin(Ticket ticket, uint64_t home, const Key& key, const Open& open, Time now);
+   Cancellation cancel(Ticket ticket);
+   // Refuse a waiting call before acknowledging it, returning its event reservation.
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+index ae50d063ce51bc37cfed97d80a084940b60bf715..b573f48cebb25f2c31b94b3097b8e27c4743bb28 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+@@ -218,7 +218,7 @@ struct HomeSession {
+       kj::Function<void(uint64_t, CloseReason)> onClose = [](uint64_t, CloseReason) {
+         KJ_FAIL_EXPECT("unexpected close request");
+       }) {
+-    return kj::heap<Home>(shared, kj::mv(onClose));
++    return kj::heap<Home>(shared, kj::mv(onClose), clock);
+   }
+ 
+   void advance(kj::Duration duration) {
+@@ -289,6 +289,25 @@ KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller
+   test.link.receive(MSG_ALARM, root.id());
+ }
+ 
++KJ_TEST("threaded WAL starts confirmation after synchronous work with a stale home timer") {
++  HomeSession test;
++  kj::TimerImpl precise{test.clock.now()};
++  Home home(test.shared, [](uint64_t, CloseReason) { KJ_FAIL_EXPECT("unexpected close request"); },
++      precise);
++  TestRoot root(test, home, "namespace/after-sql/epoch"_kj);
++  acceptOpen(test, home, root);
++
++  // Model a turn that ran SQLite without polling the event port.
++  const auto synchronousTime = 30 * kj::SECONDS;
++  precise.advanceTo(precise.now() + synchronousTime);
++  const auto request = home.nextRequest();
++  auto caller = sendFrames(test, home, root, request);
++  test.advance(synchronousTime + JUST_BEFORE_TIMEOUT);
++  KJ_EXPECT(!caller.poll(test.link.io.waitScope));
++  test.link.ack(request);
++  test.link.wait(kj::mv(caller));
++}
++
+ KJ_TEST("threaded WAL home suppresses a timed-out give-up when the session receives a late ACK") {
+   HomeSession test(true);
+   auto close = kj::newPromiseAndFulfiller<void>();
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+index 13f59de48085428f098898f33f889f2017158b05..349b0ffe358d031ec5b12afcb2d10bd9cc5f315a 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -256,8 +256,10 @@ class Session {
+ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+  public:
+   Home(std::shared_ptr<Shared> shared,
+-      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose)
++      kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose,
++      const kj::MonotonicClock& clock)
+       : shared(kj::mv(shared)),
++        clock(clock),
+         inbox(std::make_shared<Inbox>()),
+         requestClose(kj::mv(requestClose)),
+         tasks(*this) {
+@@ -322,6 +324,7 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+     kj::ForkedPromise<void> ready;
+   };
+   std::shared_ptr<Shared> shared;
++  const kj::MonotonicClock& clock;
+   std::shared_ptr<Inbox> inbox;
+   std::map<uint64_t, Registration> shippers;
+   kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
+@@ -343,9 +346,11 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+ 
+   kj::Promise<void> waitForAck(uint64_t openId, uint64_t request, kj::String key,
+       kj::Timer& timer, kj::Promise<uint8_t> answer) {
++    // The home timer can still hold its pre-JavaScript time after synchronous SQL.
++    const auto deadline = kj::max(clock.now(), timer.now()) + shared->confirmationTimeout;
+     const auto status = co_await answer.catch_([](kj::Exception&&) {
+       return uint8_t(ACK_DISCONNECTED);
+-    }).exclusiveJoin(timer.afterDelay(shared->confirmationTimeout).then([] { return uint8_t(ACK_TIMEOUT); }));
++    }).exclusiveJoin(timer.atTime(deadline).then([] { return uint8_t(ACK_TIMEOUT); }));
+     const auto found = shippers.find(openId);
+     if (status != ACK_OK && found != shippers.end()) found->second.shipper->onRefused(request);
+     if (status == ACK_TIMEOUT) {
+@@ -447,9 +452,11 @@ ThreadedWalLog::~ThreadedWalLog() noexcept(false) = default;
+ 
+ bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
+ 
++kj::Duration ThreadedWalLog::confirmationTimeout() const { return impl->shared->confirmationTimeout; }
++
+ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+     kj::Function<void(uint64_t, CloseReason)> requestClose) {
+-  return kj::heap<Home>(impl->shared, kj::mv(requestClose));
++  return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
+ }
+ 
+ kj::Promise<DurableWalPosition> ThreadedWalLog::prepareOpen(
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
+index b73d509f45edd8d70201a8e35d49c92cfd3f0cee..b92c0b7377793841495b7122b078c0f8a66218d0 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.h
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
+@@ -13,6 +13,7 @@ class ThreadedWalLog {
+   KJ_DISALLOW_COPY_AND_MOVE(ThreadedWalLog);
+ 
+   bool ready() const;
++  kj::Duration confirmationTimeout() const;
+   enum class CloseReason { DRAIN, CODE_UPDATED };
+   kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
+   kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 2b91e5aaa0fd438353287efe92cf1eb81aef8e25..ef981161ed52f8f1f7d65ec6b6b896652c0c9c5c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1923,6 +1923,8 @@ struct JsonDoc {
+   }
+ };
+ 
++constexpr auto DATABASE_SQL_WALL_LIMIT = 30 * kj::SECONDS;
++
+ struct DurableRoute {
+   server::DurableAdmission::Key key;
+   server::DurableAdmission::Open open;
+@@ -2953,8 +2955,8 @@ struct ThreadedServer {
+     durableWaiters.erase(at);
+   }
+ 
+-  kj::Promise<void> admitDurableEvent(
+-      ThreadState &state, const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
++  kj::Promise<void> admitDurableEvent(ThreadState &state, const DurableRoute &route,
++      server::DurableAdmission::Ticket ticket, bool platformDatabase) {
+     using Admission = server::DurableAdmission;
+     for (;;) {
+       auto signal = kj::newPromiseAndCrossThreadFulfiller<void>();
+@@ -2965,7 +2967,9 @@ struct ThreadedServer {
+           kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+               KJ_EXCEPTION(OVERLOADED, "durable object reset is draining"), "DO_UNAVAILABLE"));
+         }
+-        if (first == ticket) {
++        // Let the previous database response leave its home before the next
++        // synchronous query can block that home's event loop.
++        if (first == ticket && !(platformDatabase && durableAdmission->hasActiveEvent(ticket.tree))) {
+           const auto delivery = durableAdmission->begin(
+               ticket, state.durableHome, route.key, route.open, Admission::Clock::now());
+           if (delivery == Admission::Delivery::EXPIRED) {
+@@ -6115,7 +6119,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+     std::shared_ptr<DurableFacetReservation> reservation = nullptr,
+     uint parentFacet = 0,
+     kj::StringPtr facetName = ""_kj,
+-    server::DurableWalPosition position = {});
++    server::DurableWalPosition position = {},
++    bool platformDatabase = false);
+ 
+ class LocalFacet final: public IoChannelFactory::ActorChannel {
+  public:
+@@ -6544,7 +6549,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+     std::shared_ptr<DurableFacetReservation> reservation,
+     uint parentFacet,
+     kj::StringPtr facetName,
+-    server::DurableWalPosition position) {
++    server::DurableWalPosition position,
++    bool platformDatabase) {
+   auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
+   auto *borrowedHooks = hooks.get();
+   auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
+@@ -6593,6 +6599,12 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+       className, kj::mv(props), kj::mv(makeStorage), kj::mv(hooks), tree->state.timer,
+       kj::mv(observer), kj::none, kj::none, kj::none, jsg::Dict<kj::String>{}, *borrowedHooks,
+       kj::none, kj::none, kj::heap<DurablePendingOperations>(tree->idle));
++  if (platformDatabase && tree->server.durableLog) {
++    // The output gate locks on the first write. Let both the SQL work and
++    // the subsequent WAL confirmation use their separate time windows.
++    actor->setOutputGateTimeout(
++        DATABASE_SQL_WALL_LIMIT + tree->server.durableLog->confirmationTimeout() + kj::SECONDS);
++  }
+   borrowedObserver->bind(*actor);
+   return {kj::mv(actor), borrowedHooks};
+ }
+@@ -6631,14 +6643,18 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+           str(plan, "versionFingerprint") == route.open.definition &&
+           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
+       "durable routing descriptor mismatch");
++  const bool platformDatabase = kind == "platformDurable" && productPlatformPlan(plan) &&
++      route.open.className == "SqlDatabase";
+   std::shared_ptr<SqlExecutionBudget> sqlDeadline;
++  kj::Maybe<kj::TimePoint> sqlExpires;
+   if (field(input, "sqlDeadlineMonotonicNs").isString()) {
+-    KJ_REQUIRE(kind == "platformDurable" && productPlatformPlan(plan) &&
+-        route.open.className == "SqlDatabase" && !field(input, "durableAlarm").isObject(),
++    KJ_REQUIRE(platformDatabase && !field(input, "durableAlarm").isObject(),
+         "SQL deadline requires a platform database query");
+-    constexpr uint64_t SQL_LIMIT_NS = 30000000000;
++    constexpr uint64_t SQL_LIMIT_NS = DATABASE_SQL_WALL_LIMIT / kj::NANOSECONDS;
+     const auto expires = durableNumber(input, "sqlDeadlineMonotonicNs");
+-    KJ_REQUIRE(expires <= nowNs() + SQL_LIMIT_NS, "invalid SQL deadline");
++    const auto now = nowNs();
++    KJ_REQUIRE(expires <= now + SQL_LIMIT_NS, "invalid SQL deadline");
++    sqlExpires = kj::systemPreciseMonotonicClock().now() + (expires > now ? expires - now : 0) * kj::NANOSECONDS;
+     sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
+         [expires, weak = std::weak_ptr(scope)]() noexcept {
+       const auto now = nowNs();
+@@ -6657,7 +6673,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+     }
+   };
+   checkSqlDeadline();
+-  co_await server.admitDurableEvent(state, route, ticket);
++  auto admission = server.admitDurableEvent(state, route, ticket, platformDatabase);
++  KJ_IF_SOME(expires, sqlExpires) {
++    admission = admission.exclusiveJoin(state.io.provider->getTimer().atTime(expires).then([] {
++      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++          KJ_EXCEPTION(OVERLOADED, "SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded"), "SQL_LIMIT_EXCEEDED"));
++    }));
++  }
++  co_await admission;
+   checkSqlDeadline();
+   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
+   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
+@@ -6688,7 +6711,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+     });
+     auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
+         Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
+-        nullptr, 0, ""_kj, position);
++        nullptr, 0, ""_kj, position, platformDatabase);
+     found = state.durableRoots
+                 .emplace(ticket.tree,
+                     ThreadState::DurableRoot{
+diff --git a/src/workerd/util/sqlite-test.c++ b/src/workerd/util/sqlite-test.c++
+index 075ffaa646179555cef644a0406c2cd3fa497f22..1daa4a94357740c2aca1b587616b0595967fbd98 100644
+--- a/src/workerd/util/sqlite-test.c++
++++ b/src/workerd/util/sqlite-test.c++
+@@ -169,6 +169,7 @@ KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cur
+    public:
+     mutable std::shared_ptr<SqlExecutionBudget> budget;
+     std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
++    bool isAllowedTrigger(kj::StringPtr name) const override { return name == "r"; }
+   } regulator;
+   KJ_DEFER(regulator.budget.reset());
+   auto dir = kj::newInMemoryDirectory(kj::nullClock());

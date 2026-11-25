@@ -69,6 +69,10 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0171 passes a per-request wall deadline and session disconnect check from the threaded
   database home into the existing SQLite execution scope. It extends the SQL API's experimental
   hooks for checking the same deadline from the platform class before returning results.
+  Patch 0172 starts the threaded WAL confirmation clock after the synchronous SQL turn and lets
+  the platform database's output-gate watchdog cover both windows. The `io/worker.{h,c++}` hook sets
+  that watchdog when the database home is created. The home finishes delivering a database reply
+  before it starts the next queued SQL event.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

@@ -309,9 +309,12 @@ async function threadedSqlDeadline(cluster) {
     assert.equal(json(await sql(db, { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' }), 200, db.name).success, true);
     assert.equal(json(await sql(db, put(1)), 200, db.name).success, true);
   }
-  const original = await durableGeneration(cluster, owner);
-  assert.equal(original.lifecycle.durableServer, 'threaded');
-  assert.equal(original.lifecycle.durableAdmission.residentRoots, databases.length);
+  const original = await eventually('four database homes are resident on the threaded owner', async () => {
+    const snapshot = await durableGeneration(cluster, owner);
+    assert.equal(snapshot.lifecycle.durableServer, 'threaded');
+    assert.equal(snapshot.lifecycle.durableAdmission.residentRoots, databases.length);
+    return snapshot;
+  });
 
   const measuredAt = performance.now();
   assert.equal(json(await sql(databases[0], { sql: medium }), 200, 'one short statement').success, true);
@@ -352,15 +355,15 @@ async function threadedSqlDeadline(cluster) {
     const result = json(await run(), 503, label);
     const elapsed = performance.now() - started;
     check(result);
-    assert.ok(elapsed >= 28500 && elapsed < 35000, `${label} took ${elapsed.toFixed(1)} ms`);
+    assert.ok(elapsed >= 28500 && elapsed < 32000, `${label} took ${elapsed.toFixed(1)} ms`);
     console.log(`${label}: ${elapsed.toFixed(1)} ms`);
   };
   const checkHttp = result => {
-    assert.equal(result.code, 'SQL_LIMIT_EXCEEDED');
+    assert.equal(result.code, 'SQL_LIMIT_EXCEEDED', JSON.stringify(result));
     assert.equal(result.reason, reason);
   };
   const checkBinding = result => {
-    assert.equal(result.message, `D1_ERROR: ${reason}`);
+    assert.equal(result.message, `D1_ERROR: ${reason}`, JSON.stringify(result));
     assert.equal(result.cause, reason);
   };
   await Promise.all([

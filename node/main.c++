@@ -4070,6 +4070,7 @@ std::string rejectionJson(
        << "{\"error\":\""
        << (code == "CPU_LIMIT_EXCEEDED" ? "CPU limit exceeded during execution" :
            code == "MEMORY_LIMIT_EXCEEDED" ? "Memory limit exceeded during execution" :
+           code == "SQL_LIMIT_EXCEEDED" ? "SQL wall limit exceeded" :
            code == "NOT_SUPPORTED" ? "operation is not supported" :
            (code == "RESULT_UNCERTAIN" || code == "PROCESS_MEMORY_PRESSURE" ||
             code == "DO_CODE_UPDATED") ? "execution result uncertain" :
