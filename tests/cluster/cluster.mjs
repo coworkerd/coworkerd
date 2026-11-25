@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNode, previousProduct,
+    databaseFixtureNode, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -94,6 +94,7 @@ export class Cluster {
     this.platformFixture = platformFixture;
     this.databaseFixtureNode = databaseFixtureNode;
     this.previousProduct = previousProduct;
+    this.previousKernel = previousKernel;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000,
@@ -211,6 +212,13 @@ export class Cluster {
           ['runtime/runtime.js', join(this.previousProduct, 'runtime/runtime.js')],
         ]) {
           overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/${file}`, read_only: true });
+        }
+        if (this.previousKernel) {
+          for (const file of ['workerd', 'coworkerd-threaded', 'coworkerd-syscalls-startup.txt', 'coworkerd-syscalls-steady.txt']) {
+            const source = file.endsWith('.txt')
+              ? join(this.previousKernel, 'allowlist', file) : join(this.previousKernel, file);
+            overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/bin/${file}`, read_only: true });
+          }
         }
       }
       if (platformSource) {
