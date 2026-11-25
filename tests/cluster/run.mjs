@@ -20,13 +20,13 @@ async function runSuite(selected, kernel, signal, options) {
       } catch (error) {
         ++failed;
         console.error(`FAIL ${name}\n${error.stack}`);
+        await cluster.diagnostics(name, error);
       }
     }
-    if (failed) await cluster.diagnostics();
     signal.throwIfAborted();
     return failed;
   } catch (error) {
-    await cluster.diagnostics();
+    await cluster.diagnostics('suite', error);
     throw error;
   } finally {
     await cluster.close();

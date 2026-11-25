@@ -176,6 +176,15 @@ tree, including the unpacked kernel and test binaries, occupied 470 MiB. Allow a
 archive, Docker images and temporary volumes. These are observed values from the
 [hosted run](https://github.com/coworkerd/coworkerd/actions/runs/44911045714/job/136866725293#step:14:15).
 
+## Failure diagnostics
+
+For a failed case, `build/cluster-diagnostics/<project>/<case>/` keeps the failure report, Compose status
+and logs, and each node's workerd logs after teardown. HTTP status checks and JSON parse failures include
+the response body in the failure report.
+
+On the hosted kernel archive job, download `cluster-failure-<arch>-<attempt>` from the workflow run to
+get those files and the cluster runner's combined output in `cluster.log`.
+
 ## Cases
 
 | Case | Product behavior whose regression fails the case |
