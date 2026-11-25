@@ -475,8 +475,9 @@ of a 90,672-byte WAL took 0.250 ms.
   instances and registration-only members without such a successor remain candidates; they can force a
   `tail-recovery-bounded` cut. Node-reported start times do not establish these windows.
   An uncached chain of S source epochs needs at most S serial immutable authority GETs. Concurrent recoveries
-  of the same shard share those reads by full object-store key. A read takes a waiting-recovery permit except
-  during preparation with a trusted original disk or replay. Each read has
+  of the same shard share those reads by full object-store key. Reads during the first shard epoch's
+  preparation, trusted original-disk preparation and replay use a rebuild slot. Reads for waiting
+  recovery use the waiting-recovery permit. Each read has
   max(`peerTimeoutMs`, `confirmTimeoutMs`) after admission (5 s by default). Failed reads can be retried.
   A request waits at most `durableObjects.recoverTimeoutMs` (30 s) before `503 DO_RECOVERING`,
   while the same rebuild continues. The receiving peer returns its dispatcher before this wait; peer-open retains

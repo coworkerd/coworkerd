@@ -1941,6 +1941,10 @@ struct DurableLogChannelTest {
         co_return;
       }
       if (method == kj::HttpMethod::GET) {
+        if (auto gate = reads.find(key); gate != reads.end()) {
+          heldReads.insert(key);
+          co_await gate->second.addBranch();
+        }
         if (unreadable.contains(key)) {
           co_await send(response, 503, "");
           co_return;
@@ -2074,6 +2078,26 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(log.activeRebuilds == active && log.activeBackgroundRebuilds == background &&
           background <= active && active <= settings.config.rebuildConcurrency);
     };
+
+    // A new shard reads its first epoch under the preparation slot even
+    // while both waiting-recovery metadata permits are occupied.
+    const std::string newNs(64, 'b');
+    const auto newEpoch = shardEpochKey(newNs, 0, 1);
+    store.objects[newEpoch] = shardEpochJson(
+        {newNs, "new", "first", "new-instance", "nonce", "", 0, 1, 9, 1, 1});
+    {
+      auto busyOne = log.recoveryMetadata.acquire().wait(io.waitScope);
+      auto busyTwo = log.recoveryMetadata.acquire().wait(io.waitScope);
+      auto heldEpoch = kj::newPromiseAndFulfiller<void>();
+      store.reads.emplace(newEpoch, heldEpoch.promise.fork());
+      auto firstAccess = log.openObject({newNs, std::string(64, '1'), "", 1, 1, 0}, false)
+          .eagerlyEvaluate(nullptr);
+      until("first epoch read", [&] { return store.heldReads.contains(newEpoch); });
+      check(1, 0);
+      heldEpoch.fulfiller->fulfill();
+      KJ_REQUIRE(firstAccess.wait(io.waitScope).ready && log.recoveryMetadata.started() == 2);
+      check(0, 0);
+    }
 
     auto first = holdManifest('1');
     KJ_REQUIRE(open('1', true).code == "DO_ALARM_REBUILDING");
