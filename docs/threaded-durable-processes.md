@@ -256,9 +256,8 @@ The owner can map a database namespace to the `SqlDatabase` export of `coworkerd
 Both backends use the same SQL module and address the stored data by the same namespace,
 object ID and data epoch. On the threaded host the platform copy key also binds the validated
 namespace and object IDs. Two open databases therefore have separate isolate copies even
-when their tenant, package and limits match. An idle copy can only be reused for the same
-database. The product definition enables the experimental SQLite methods used by the SQL
-class, with no change to the compatibility flags available to tenant Workers.
+when their tenant, package and limits match. The product definition enables the experimental
+SQLite methods used by the SQL class. Tenant Workers keep their existing compatibility flags.
 
 The threaded mapping is enabled by the cluster test executable. Production activation
 depends on the database deadline, cancellation, WAL, temporary-file and SQLite memory
@@ -323,6 +322,13 @@ transfer its transport state before closing the actor. An otherwise idle ineligi
 15 min from its start. Cancel expired work before final retirement and close non-hibernatable sockets when
 evicting. Active request wall limits and their invocation leases are separate. An event racing the retirement
 either saves the old actor before close begins or joins the next open, once.
+
+An eligible threaded platform database closes its tree and releases its exclusive copy about
+10 seconds after its last request finishes. Retaining empty copies exhausted the process
+admission budget in a serial scan of distinct databases. Releasing the copy with the tree
+returns that reservation. The first read after full release took an extra 9.86 ms p50 and
+14.45 ms p99 compared with its immediate warm repeat in the same-epoch D1 profile.
+[Idle-window measurements](database-home-benchmark.md#idle-window-for-exclusive-platform-database-copies)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the
 owner/shard epoch, object and attachment identity, ordered frame position, tags, serialized attachments and

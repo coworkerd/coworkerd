@@ -51,7 +51,7 @@ export default { async fetch(request, { DB, NOOP }) {
   const [sql] = statements[operation] ?? [];
   const params = operation === 'insert' ? [Number(url.searchParams.get('id'))] : [];
   const write = writes.has(operation);
-  if (native) {
+  if (useD1Binding) {
     if (empty) {
       // The pinned D1 HTTP wrapper sends [], decodes [] and dereferences the absent first result.
       try {
