@@ -150,14 +150,13 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability,
-                       lease :NativeLeaseControl, cancelOnIngressEnd :Bool)
+                       lease :NativeLeaseControl)
       -> (dispatcher :EventDispatcher);
   socketControl @1 () -> (control :ThreadedSocketControl);
 }
 
 interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
   whenEnded @0 () -> ();
-  whenIngressEnded @1 () -> ();
 }
 
 interface PeerServer @0xab4d6df924ec776f {

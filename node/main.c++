@@ -3022,8 +3022,7 @@ private:
     }));
     leases.at(invocationId).budgetHeld = true;
     auto opened = runtime.open(process, descriptor, version->definitionHash,
-        slot ? slot->nativeProps : NativeProps(), kj::mv(token), durable == nullptr && slot ? slot->requestLease : nullptr,
-        ingress);
+        slot ? slot->nativeProps : NativeProps(), kj::mv(token), durable == nullptr && slot ? slot->requestLease : nullptr);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -3792,10 +3791,10 @@ private:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     lease->second.budgetHeld = false;
-    const bool expired = !lease->second.live(monotonicTimeMs());
-    if (!lease->second.held && (lease->second.requestLease || expired)) {
+    // The shared lease may still authorize calls during the HTTP drain.
+    if (!lease->second.held && !lease->second.live(monotonicTimeMs())) {
       leases.erase(lease);
-      expiredLeases += expired;
+      ++expiredLeases;
     }
   }
 

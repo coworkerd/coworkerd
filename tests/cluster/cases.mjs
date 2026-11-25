@@ -473,9 +473,9 @@ async function invocationBudgetLifetime(cluster) {
   assert.equal(late.first, 'origin');
   assert.match(late.extraFetch, /^SUBREQUEST_BUDGET_EXHAUSTED:/);
   assert.ok(late.invocationId);
-  await eventually('the completed invocation releases its lease record', async () => {
+  await eventually('the completed invocation releases its lease record after the drain', async () => {
     assert.ok((await cluster.state(node)).leases.every(lease => lease.invocationId !== late.invocationId));
-  });
+  }, { timeout: 35_000 });
   await eventually('the alarm uses its budget after the HTTP preparation interval', async () => {
     const result = await call('result');
     assert.ok(result);

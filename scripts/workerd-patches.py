@@ -156,9 +156,6 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0162-alarm-limit-visibility.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
-                          name == '0163-cancel-native-ingress-at-drain.patch' and path in {
-                              'src/workerd/threaded/protocol.capnp',
-                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
