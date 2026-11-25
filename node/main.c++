@@ -1499,7 +1499,15 @@ public:
   // runtime was given at the start (presents()).
   void holdLease(const std::string& invocationId) {
     auto lease = leases.find(invocationId);
-    if (lease != leases.end()) lease->second.held = true;
+    if (lease == leases.end()) return;
+    auto& state = lease->second;
+    state.held = true;
+    if (state.requestLease) {
+      // The 101 ends the HTTP exchange. Later messages use the existing fixed, renewable lease.
+      state.requestLease.reset();
+      state.presentedExpiresAtMonotonicMs = state.expiresAtMonotonicMs;
+      state.expiresAtMonotonicMs = monotonicTimeMs() + static_cast<double>(leaseConfig.ttlMs);
+    }
   }
   void renewLease(const std::string& invocationId) {
     auto lease = leases.find(invocationId);
@@ -3752,7 +3760,11 @@ private:
     KJ_ASSERT(inserted, "duplicate invocation lease");
     if (requestLease) {
       leaseCleanupTasks.add(requestLease->whenClosed().then([this, id = std::move(invocationId)]() {
-        expiredLeases += leases.erase(id);
+        auto found = leases.find(id);
+        if (found != leases.end() && found->second.requestLease) {
+          leases.erase(found);
+          ++expiredLeases;
+        }
       }));
     } else {
       leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
@@ -4751,6 +4763,7 @@ public:
       if (strcasecmp(name.cStr(), MANAGED_SOCKET_HEADER) != 0) publicHeaders.addPtrPtr(name, value);
     });
     auto ingress = inner.acceptWebSocket(publicHeaders);
+    process->upgradedToWebSocket = true;
     started = true;
     WebSocketRelay::Identity identity;
     identity.nodeId = server.placementConfig().serverId;
@@ -4871,6 +4884,13 @@ private:
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      if (slot->requestLease) {
+        auto leaseEnd = slot->requestLease->whenClosed().then([response = tracked.get()]() -> kj::Promise<void> {
+          if (response->upgraded()) return kj::NEVER_DONE;
+          return KJ_EXCEPTION(DISCONNECTED, "caller lease ended during execution");
+        });
+        request = kj::mv(request).exclusiveJoin(kj::mv(leaseEnd));
+      }
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
         return process->rejectAfterCrash(kj::mv(error));
@@ -8658,6 +8678,7 @@ private:
 struct IngressWebSocket {
   WebSocketRegistry& registry;
   std::string tenant, workerId, versionId, treeId, executingNodeId;
+  std::shared_ptr<coworkerd::RequestLease> requestLease;
   bool forwarded = false;
   double receivedAtMonotonicMs = monotonicTimeMs();
   const bool reserved;
@@ -8750,6 +8771,7 @@ private:
       pathMark(timing, "response-headers");
       started = true;
       auto socket = client.acceptWebSocket(headers);
+      webSocket->requestLease->beginDrain();
       WebSocketRelay::Identity identity;
       identity.nodeId = server.placementConfig().serverId;
       identity.workerId = webSocket->workerId; identity.versionId = webSocket->versionId; identity.treeId = webSocket->treeId;
@@ -9497,8 +9519,9 @@ private:
       webSocket->workerId = selected.version->workerId;
       webSocket->versionId = selected.version->versionId;
     }
-    auto requestLease = webSocket ? nullptr : std::make_shared<coworkerd::RequestLease>(server.clock());
-    auto drainRequest = kj::defer([&requestLease]() { if (requestLease) requestLease->beginDrain(); });
+    auto requestLease = std::make_shared<coworkerd::RequestLease>(server.clock());
+    if (webSocket) webSocket->requestLease = requestLease;
+    auto drainRequest = kj::defer([&requestLease]() { requestLease->beginDrain(); });
     if (server.placementConfig().ingressPlacement && !server.placementConfig().hasPlacement(selected.version->workerId)) {
       auto allocation = server.allocateRoot(selected.pins, deadline);
       allocation.requestLease = requestLease;
