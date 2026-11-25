@@ -189,34 +189,44 @@ export async function connectedRequestLease(cluster) {
 
 export async function disconnectedRequestLease(cluster) {
   const { ingress, base, path } = await prepareLeaseWorker(cluster, 'live-request-disconnect');
+  // Use a client on the same network so a Docker port proxy cannot turn a reset into a FIN.
+  const network = `${cluster.project}_backend`;
+  const script = `
+    const client = require('node:http').get(process.argv[1], response => {
+      console.log('headers ' + response.statusCode);
+      response.on('error', () => {});
+      response.once('data', data => console.log(data.toString()));
+    });
+    client.on('error', () => {});
+    process.once('SIGUSR2', () => {
+      if (!client.socket || client.socket.destroyed) process.exit(1);
+      client.socket.resetAndDestroy();
+    });
+    setInterval(() => {}, 1000);
+  `;
   for (const mode of ['before-headers', 'during-body']) {
     const markers = async () => json(await request(base, path + '/markers'), 200, 'read disconnect markers')
       .filter(marker => marker.startsWith(mode + '/')).map(marker => marker.slice(mode.length + 1));
-    let receivedHeaders = false;
-    const first = Promise.withResolvers();
-    const client = get(base + path + '/' + mode, { agent: false, signal: cluster.signal }, response => {
-      receivedHeaders = true;
-      response.on('error', () => {});
-      response.once('data', value => first.resolve({ status: response.statusCode, text: value.toString() }));
-    });
-    client.on('error', () => {});
+    const client = `${cluster.project}-${mode}`;
+    await cluster.command('docker', ['run', '--rm', '--detach', '--network', network, '--name', client,
+      'node:22-trixie', 'node', '-e', script, `http://${ingress}-peer:8930${path}/${mode}`]);
     try {
       await eventually(`${mode} registered background work`, async () => {
         assert.deepEqual(await markers(), ['registered']);
       }, { timeout: 8000, interval: 100 });
       const registeredAt = performance.now();
       if (mode === 'during-body') {
-        const frame = await Promise.race([first.promise, delay(5000)]);
-        assert.deepEqual(frame, { status: 200, text: 'started' });
+        await eventually('the client received the start of the response', async () => {
+          assert.equal(await cluster.command('docker', ['logs', client]), 'headers 200\nstarted');
+        }, { timeout: 5000, interval: 100 });
       }
       // The background marker is scheduled after the original 30 s lease.
       // Give the request four seconds before starting the disconnect drain.
       await delay(4000, undefined, { signal: cluster.signal });
-      assert.equal(receivedHeaders, mode === 'during-body');
-      assert.ok(client.socket && !client.socket.destroyed);
+      if (mode === 'before-headers') assert.equal(await cluster.command('docker', ['logs', client]), '');
       assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 1);
       const resetAt = performance.now();
-      client.socket.resetAndDestroy();
+      await cluster.command('docker', ['kill', '--signal=SIGUSR2', client]);
       await eventually(`${mode} released the forwarding slot after reset`, async () => {
         assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 0);
       }, { timeout: 1000, interval: 25 });
@@ -228,7 +238,7 @@ export async function disconnectedRequestLease(cluster) {
       if (untilAfterDrain > 0) await delay(untilAfterDrain, undefined, { signal: cluster.signal });
       assert.deepEqual(await markers(), ['background', 'registered'], `${mode} ended all work after its one drain`);
     } finally {
-      client.destroy();
+      await cluster.command('docker', ['stop', '-t', '1', client], { cleanup: true });
     }
   }
 }
