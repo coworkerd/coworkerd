@@ -251,7 +251,7 @@ A node that receives SIGTERM or SIGINT, or `POST /__coworkerd/drain`:
 2. **drains**: it waits until its ingress requests, the calls admitted on it and its processes' work -- `waitUntil` included -- reach zero, for at most `drainTimeoutMs` (30 s); what is still running then is killed and ends as `RESULT_UNCERTAIN`.
 3. **leaves**: it closes its workerd processes, writes its last usage, removes its heartbeat and drain marker, retains its suspects object while it contains unexpired suspicions, closes its listeners and exits with 0 -- or with 3 when the drain began because another process took its identity (section 3).
 
-A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `0` turns the drain off: the node exits at once, without the announcement and without writing its last usage. Upgrading a cluster is draining one node at a time, replacing it, and waiting until it is registered and ready; measured with one node leaving under load, no request failed.
+A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `0` turns the drain off: the node exits at once, without the announcement and without writing its last usage. Upgrading a cluster is draining one node at a time, replacing it, and waiting until it is registered and ready; measured with one node leaving under load, no request failed. This procedure assumes compatible peer protocol revisions. Nodes using the HTTP request lease require peer protocol revision 2 and refuse a mismatched session before dispatch. During an upgrade across this change, forwarding and recovery from a surviving peer tail require peers on the same revision.
 
 ## 11. Durable Object shards
 
