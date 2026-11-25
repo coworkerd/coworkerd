@@ -2160,10 +2160,11 @@ async function threadedClassMigration(cluster) {
       }));
     } };
   `;
-  const deploy = (version, className, migrations) => cluster.deploy(tenant, name, source(className, version), {
-    version, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
+  const deploy = (version, className, migrations, activate = true) => cluster.deploy(tenant, name, source(className, version), {
+    version, activate, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
   });
   await deploy('v1', 'Record', [initial]);
+  await deploy('v2', 'RenamedRecord', [initial, renamed], false);
   const first = await eventually('v1 creates a threaded record', async () => {
     const value = json(await call('', { method: 'POST', body: 'retained' }), 200, 'write v1');
     assert.equal(value.version, 'v1');
@@ -2196,8 +2197,6 @@ async function threadedClassMigration(cluster) {
   await assertStreamingStatus(heldRpc, 200, 'retained RPC stream');
   const rpcReader = heldRpc.body.getReader();
   assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'retained:v1');
-  const due = Date.now() + 8000;
-  assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
   const waiting = call('/wait-for-headers', { timeout: 60000 }).then(
     value => ({ value }), error => ({ error }),
   );
@@ -2210,12 +2209,16 @@ async function threadedClassMigration(cluster) {
   try {
     const firstChunk = await reader.read();
     assert.equal(Buffer.from(firstChunk.value).toString(), 'entered:');
-    await deploy('v2', 'RenamedRecord', [initial, renamed]);
+    // v2 is already packaged and uploaded. The alarm is due within the ten-second version drain.
+    const due = Date.now() + 9000;
+    assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
+    await cluster.api(`${tenant.path}/workers/${name}/versions/v2:activate`, { method: 'POST', token: tenant.token });
     await eventually('the first v2 request is refused while v1 still holds the tree', async () => {
       const response = await call('');
       assertStatus(response, 503, 'the first v2 request while v1 still holds the tree');
       assert.match(response.text, /DO_VERSION_DRAINING/);
     });
+    assert.ok(Date.now() < due, 'the v2 version drain starts before the scheduled alarm is due');
     const oldChunk = await reader.read();
     assert.match(Buffer.from(oldChunk.value).toString(), /^(v1)+$/, 'an open stream keeps its code pin');
     await assert.rejects(async () => {
