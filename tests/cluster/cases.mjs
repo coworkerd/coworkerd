@@ -445,9 +445,11 @@ async function invocationBudgetLifetime(cluster) {
       if (action === 'late-fetch') {
         await scheduler.wait(waitMs);
         const reply = await env.OBJECT.getByName('past-deadline').fetch('https://object.test/?action=result');
-        const { code } = await reply.json();
-        return Response.json({ ...await spend({}), invocationId: request.cf.invocationId,
-          lateObject: { status: reply.status, code } });
+        const lateObject = { status: reply.status, value: await reply.json() };
+        const first = await (await fetch(origin)).text();
+        let extraFetch;
+        try { await fetch(origin); } catch (error) { extraFetch = error.message; }
+        return Response.json({ first, extraFetch, invocationId: request.cf.invocationId, lateObject });
       }
       const actor = action === 'schedule' || action === 'result' ? 'alarm' : 'background';
       return env.OBJECT.getByName(actor).fetch(request);
@@ -467,13 +469,14 @@ async function invocationBudgetLifetime(cluster) {
   };
   assert.equal(await call('schedule'), 'scheduled');
   const late = await call('late-fetch');
-  verify(late, false);
-  assert.deepEqual(late.lateObject, { status: 410, code: 'LEASE_EXPIRED' });
+  assert.deepEqual(late.lateObject, { status: 200, value: null });
+  assert.equal(late.first, 'origin');
+  assert.match(late.extraFetch, /^SUBREQUEST_BUDGET_EXHAUSTED:/);
   assert.ok(late.invocationId);
-  await eventually('the completed invocation releases its expired lease record', async () => {
+  await eventually('the completed invocation releases its lease record', async () => {
     assert.ok((await cluster.state(node)).leases.every(lease => lease.invocationId !== late.invocationId));
   });
-  await eventually('the alarm uses its budget after the lease expires', async () => {
+  await eventually('the alarm uses its budget after the HTTP preparation interval', async () => {
     const result = await call('result');
     assert.ok(result);
     verify(result);

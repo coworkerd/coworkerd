@@ -3795,7 +3795,7 @@ private:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     lease->second.budgetHeld = false;
-    if (!lease->second.held && !lease->second.live(monotonicTimeMs())) {
+    if (!lease->second.held && (lease->second.requestLease || !lease->second.live(monotonicTimeMs()))) {
       leases.erase(lease);
       ++expiredLeases;
     }

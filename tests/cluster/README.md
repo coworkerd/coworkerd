@@ -63,6 +63,10 @@ to accommodate all its invocation channels. It verifies the ingress and executio
 median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
 added connection for the daemon and ordinary workerd process on each measured node.
 
+The [database home benchmark](../../docs/database-home-benchmark.md) compares the published Object and native
+kernels through stateless Worker bindings. Its driver starts a single-node cluster for each side and records
+latency, throughput, CPU time, live database counts and idle memory.
+
 ### Fatal attribution with the test kernel
 
 In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused

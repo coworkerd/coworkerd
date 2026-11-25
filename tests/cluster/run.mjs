@@ -103,7 +103,7 @@ async function main(args) {
     }
     for (const [name, threadedNodes] of alarms) {
       failed += await runSuite([[name, alarmRequestLease]], kernel, controller.signal,
-        { threadedNodes, alarmWallTimeMs: 1000 });
+        { threadedNodes, nodeEnvironment: () => ({ COWORKERD_TEST_ALARM_WALL_MS: '1000' }) });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
       delayRecoveryPeers, budgetLifetime }] of gated) {
