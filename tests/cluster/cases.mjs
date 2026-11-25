@@ -224,7 +224,17 @@ async function invocationBudgets(cluster) {
 
   const wrangler = { services: bindings, limits: { subrequests: 10_000_000 } };
   await cluster.deploy(tenant, 'budget-wide', root, { wrangler });
-  assert.equal((await call('budget-wide', 0)).rootGrant, 10_000_000);
+  const wide = await call('budget-wide', 130);
+  assert.equal(wide.rootGrant, 10_000_000);
+  assert.equal(wide.grants.length, 130);
+  assert.equal(wide.refusal, undefined);
+
+  const loop = 'budget-loop';
+  await cluster.deploy(tenant, loop, 'export default { fetch(request, env) { return env.SELF.fetch(request); } };', {
+    wrangler: { services: [{ binding: 'SELF', service: loop }], limits: { subrequests: 10_000 } },
+  });
+  const loopReply = await workerCall(cluster, node, tenant, loop);
+  assert.equal(json(loopReply, 508, 'recursive binding hop limit').code, 'BINDING_HOP_LIMIT');
 
   await cluster.deploy(tenant, 'budget-egress', `export default { async fetch(request, env) {
     const reply = await env.CHILD.fetch('https://binding.test/');

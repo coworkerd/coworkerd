@@ -56,7 +56,7 @@ struct InvocationBudget {
   uint32_t childCap(bool root) const {
     // Keep room for wide root fan-out, and let children use most of their grant
     // on a deeper branch while still keeping some for siblings.
-    return std::max(1u, root ? grant / 128 : grant * 3 / 4);
+    return std::max(1u, root ? std::min(128u, grant / 128) : grant * 3 / 4);
   }
 
   void refill() {

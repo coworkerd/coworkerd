@@ -421,6 +421,8 @@ void budget() {
 
   const auto wide = childBudget(MAX_SUBREQUEST_LIMIT, MAX_SUBREQUEST_LIMIT, false);
   KJ_REQUIRE(wide.grant == 9'999'999 && wide.charged == 10'000'000 && wide.remaining == 0);
+  InvocationBudget largeRoot(MAX_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  KJ_REQUIRE(largeRoot.childCap(true) == 128);
   const auto last = childBudget(1, 4, false);
   KJ_REQUIRE(last.grant == 0 && last.charged == 1 && last.remaining == 0);
   KJ_REQUIRE(childBudget(0, 4, false).charged == 0);
