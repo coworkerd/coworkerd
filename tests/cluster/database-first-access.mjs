@@ -105,15 +105,21 @@ async function logs(node, since) {
   const output = await cluster.command('docker', ['logs', '--timestamps', '--since', since, container],
     { timeout: 30000, maxBuffer: 32 * 1024 * 1024 });
   const entries = [];
-  const kills = [];
+  const watchdog = new Map();
   for (const line of output.split('\n')) {
     const index = line.indexOf('[do-log] {');
     if (index >= 0) entries.push({ ...JSON.parse(line.slice(index + '[do-log] '.length)),
       loggedAtMs: Date.parse(line.slice(0, line.indexOf(' '))) });
-    const kill = line.indexOf('[process-kill] {');
-    if (kill >= 0) kills.push(JSON.parse(line.slice(kill + '[process-kill] '.length)));
+    for (const marker of ['[process-kill] ', '[process] ']) {
+      const index = line.indexOf(marker + '{');
+      if (index < 0) continue;
+      const event = JSON.parse(line.slice(index + marker.length));
+      if (event.processClass !== 'durable' || event.reason !== 'watchdog timeout') continue;
+      const key = `${event.processId}/${event.generation}`;
+      if (marker === '[process-kill] ' || (event.event === 'exit' && !watchdog.has(key))) watchdog.set(key, event);
+    }
   }
-  return { entries, kills };
+  return { entries, watchdog: [...watchdog.values()] };
 }
 
 async function measureLogs(node, since, selected) {
@@ -123,7 +129,7 @@ async function measureLogs(node, since, selected) {
   const starts = new Map();
   const rebuiltAt = [];
   let additionalRebuilds = 0;
-  const { entries, kills } = await logs(node, since);
+  const { entries, watchdog } = await logs(node, since);
   for (const entry of entries) {
     if (entry.event === 'rebuild-started') {
       const [namespace] = entry.object.split('/');
@@ -155,11 +161,10 @@ async function measureLogs(node, since, selected) {
     database.rebuiltAtMs = samples.get(database.namespace).loggedAtMs;
     database.epochGateWaitMs = waits.get(database.namespace);
   }
-  const watchdogKills = kills.filter(entry => entry.processClass === 'durable' && entry.reason === 'watchdog timeout');
   return { additionalRebuilds,
     additionalStarts: [...starts.values()].reduce((sum, count) => sum + count - 1, 0),
-    watchdogKills: watchdogKills.map(kill => ({ ...kill, databasesRebuiltDuringProbe: rebuiltAt.filter(at =>
-      at <= kill.observedAtUnixMs && at >= kill.observedAtUnixMs - kill.stuckDurationMs).length })) };
+    watchdogKills: watchdog.map(event => ({ ...event, databasesRebuiltInLast3s: rebuiltAt.filter(at =>
+      at <= event.observedAtUnixMs && at >= event.observedAtUnixMs - 3000).length })) };
 }
 
 async function runCold(databases, schedule) {

@@ -197,9 +197,11 @@ COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
   node tests/cluster/database-first-access.mjs "$kernel" cold | tee baseline-cold.log
 ```
 
-The recorded runs used the same ARM64 Docker Desktop VM (Apple M4 host, 10 CPUs and 7.75 GiB
+The original first-access runs used the same ARM64 Docker Desktop VM (Apple M4 host, 10 CPUs and 7.75 GiB
 assigned to the VM), SeaweedFS 4.48, default durable settings, release builds with Clang 19.1.7,
 and the pinned [ARM64 kernel archive](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-3aa588b669ff-run-45491272877-1).
+The progressive-recovery runs and the `5e8ae88` takeover baseline used the same setup with the
+[current pinned archive at that revision](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-f3e7281d2642-run-45616161948-1).
 The client ran on the host through Docker's loopback port forwarding. See the per-window VM pressure
 and client load samples in the output. The [installation guide](../../docs/guide/install.md#database-recovery-after-a-node-loss)
 lists the recovery results.

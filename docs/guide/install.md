@@ -621,7 +621,10 @@ See [cluster state, section 12](../cluster-state.md#12-durable-object-durability
 
 **Database recovery after a node loss.** A query to a database whose shard is in its first
 ownership epoch uses a rebuild slot for its initial epoch read and local tail collection.
-When a node takes over a shard it acquires a later epoch and uses the waiting-recovery gate.
+On takeover, the new owner can reuse the predecessor epoch it verified while acquiring the shard.
+Shared member discovery and owner checks can proceed while other databases queue their epoch reads.
+Each database becomes readable after its own evidence checks, replay, and publication. The missing-owner
+wait remains 25 s by default.
 
 In a three-node test with default recovery settings, one node held all databases and each database
 held one confirmed SQLite row on its own shard. After `SIGKILL`, both survivors detected the
@@ -630,16 +633,21 @@ it verified every row. Times are measured from the kill request, in seconds.
 
 | Databases on the lost node | Failure detected | First read | Median read | Last read | Last read after detection |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100 | 33.66 | 59.50 | 59.50 | 59.61 | 25.96 |
-| 500 | 26.38 | 59.45 | 59.91 | 59.93 | 33.55 |
-| 1,000 | 27.32 | 91.52 | 93.76 | 95.16 | 67.84 |
-| 2,000 | 33.99 | 198.92 | 208.60 | 240.52 | 206.53 |
+| 100 | 33.54 | 58.97 | 59.41 | 59.86 | 26.32 |
+| 500 | 34.74 | 60.59 | 62.30 | 64.25 | 29.51 |
+| 1,000 | 34.69 | 60.83 | 64.57 | 73.42 | 38.73 |
+| 2,000 | 22.24 | 47.88 | 61.11 | 105.79 | 83.54 |
 
-From 500 to 1,000 databases, the post-detection time doubled as each survivor queued two epoch reads
-per database at 16 metadata requests per second. In the 2,000-database run, the survivors issued
-2,646 and 3,236 waiting metadata requests. The latter also logged two durable process watchdog exits
-and 599 additional rebuilds. Failure detection, the number of surviving nodes, object-store latency
-and the size of snapshots and tails also affect recovery time.
+Each survivor allows 16 waiting-recovery metadata requests per second, with a burst of four, at most
+two in flight, and a 16 MiB rebuild metadata budget that reserves 4 MiB for foreground requests.
+Earlier runs saw a wave of cold database opens overwhelm the durable process's health probes. The
+watchdog killed processes whose probes went unanswered for 3 seconds, forcing some databases to rebuild
+again. Survivors now start at most 64 cut snapshot publications per second, with a burst of four, to
+spread the resulting cold opens. In the 2,000-database run, the first and median reads came 25.64 s
+and 38.87 s after detection. Both durable processes stayed up and all databases rebuilt once. The
+survivors issued 1,334 and 1,333 waiting-recovery metadata requests, with a peak of two in flight on each.
+Failure detection, the number of surviving nodes, object-store latency, and the size of snapshots and
+tails also affect recovery time.
 [Measurement commands and conditions](../../tests/cluster/README.md#database-first-access-and-node-loss)
 
 The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Each namespace stores object files by their hashed storage ids under `do/coworkerd-do-root-v1-<namespace>/`; facet zero is the root database. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
