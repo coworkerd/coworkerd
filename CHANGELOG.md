@@ -618,7 +618,8 @@ guide, section 9, "Upgrading from 0.3.x"); a configuration that names `etcdEndpo
   writers kept winning 409 by the failure's kind, never by its reason's words; the ingress's own refusals carry `error`
   like every call refusal; a call whose lease runs out during placement ends with `410 LEASE_EXPIRED`.
   `request.cf.serverId` stays a deprecated alias of `nodeId`, and is removed in 1.0.
-- **Supported versions**: 0.4.x only; 0.3.x is no longer fixed (SECURITY.md).
+- Security fixes for 0.3.x ended with this release. See the [security policy](SECURITY.md#supported-versions)
+  for current coverage.
 
 **Still open**: there is no mTLS between nodes; the system call allowlist still defaults to `observe`; the stream of
 `cowctl logs --follow` is filled by asking the nodes every 500 ms; some reasons the nodes and the control plane give
