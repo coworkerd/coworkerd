@@ -334,8 +334,9 @@ def allowed_path(name, path):
                                    '0170-place-platform-databases-in-exclusive-copies.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0174-release-idle-platform-database-copies.patch' and
-                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0174-release-idle-platform-database-copies.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

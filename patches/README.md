@@ -67,7 +67,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0170 validates an object-specific copy key for platform databases and permits the
   built-in package's SQL compatibility flag. It uses the same two files.
   Patch 0174 releases an empty platform database copy when the last root retires. It changes
-  only the threaded server.
+  the threaded server and tests the home-reservation guard.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
