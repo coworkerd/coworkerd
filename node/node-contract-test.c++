@@ -3,6 +3,7 @@
 #include "code-package.h"
 #include "invocation-contract.h"
 #include "peer-liveness.h"
+#include "request-lease.h"
 #include "ingress-descriptors.h"
 #include "event-loop.h"
 #include "memory-events.h"
@@ -105,6 +106,34 @@ void peerSessionLiveness() {
       "a late ping cannot reopen a session");
 }
 
+void liveRequestLease() {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::origin<kj::TimePoint>();
+  kj::TimerImpl clock(start);
+  RequestLease root(clock);
+  auto closing = root.whenClosing();
+  auto closed = root.whenClosed();
+  clock.advanceTo(start + 120 * kj::SECONDS);
+  KJ_REQUIRE(!closing.poll(waitScope) && !closed.poll(waitScope) && std::isinf(root.remainingMs()));
+  root.beginDrain();
+  KJ_REQUIRE(closing.poll(waitScope) && root.remainingMs() == 30'000);
+  clock.advanceTo(start + 140 * kj::SECONDS);
+  root.beginDrain();
+  KJ_REQUIRE(root.remainingMs() == 10'000, "a duplicate drain must keep the original deadline");
+  clock.advanceTo(start + 149999 * kj::MILLISECONDS);
+  KJ_REQUIRE(!closed.poll(waitScope));
+  clock.advanceTo(start + 150 * kj::SECONDS);
+  KJ_REQUIRE(closed.poll(waitScope) && root.isClosed() && root.remainingMs() == 0);
+
+  RequestLease alarm(clock);
+  alarm.startFixed(15 * kj::MINUTES);
+  alarm.beginDrain();
+  KJ_REQUIRE(alarm.remainingMs() == 900'000, "an alarm has a fixed wall limit");
+  alarm.close();
+  KJ_REQUIRE(alarm.whenClosing().poll(waitScope) && alarm.whenClosed().poll(waitScope));
+}
+
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
@@ -118,6 +147,8 @@ void nativeConfig() {
   for (const auto* config : {&direct, &decoded}) {
     KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
     KJ_REQUIRE(config->processPool.tenantInFlightLimit == 0);
+    KJ_REQUIRE(config->ingressKeepalive.idleSeconds == 30 && config->ingressKeepalive.intervalSeconds == 10 &&
+        config->ingressKeepalive.probes == 3);
     KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
     KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
   }
@@ -125,6 +156,11 @@ void nativeConfig() {
   const auto overridden = ServerConfig::load(directory / "limits.json");
   KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
       overridden.processPool.memoryLimitMiB == 64);
+  write(directory / "keepalive.json", R"({"ingress":{"tcpKeepalive":{"idleSeconds":2,"intervalSeconds":1,"probes":2}}})");
+  const auto keepalive = ServerConfig::load(directory / "keepalive.json").ingressKeepalive;
+  KJ_REQUIRE(keepalive.idleSeconds == 2 && keepalive.intervalSeconds == 1 && keepalive.probes == 2);
+  write(directory / "keepalive-invalid.json", R"({"ingress":{"tcpKeepalive":{"probes":0}}})");
+  KJ_REQUIRE(kj::runCatchingExceptions([&] { ServerConfig::load(directory / "keepalive-invalid.json"); }) != kj::none);
   write(directory / "disabled.json", "{\"processPool\":{\"tenantInFlightLimit\":0,\"tenantAdmissionWaitMs\":25}}");
   const auto disabled = ServerConfig::load(directory / "disabled.json");
   KJ_REQUIRE(disabled.processPool.tenantInFlightLimit == 0 && disabled.processPool.tenantAdmissionWaitMs == 25);
@@ -862,6 +898,7 @@ int main(int argc, char* argv[]) {
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
   else if (name == "peer-half-close") peerHalfClose();
   else if (name == "peer-session-liveness") peerSessionLiveness();
+  else if (name == "live-request-lease") liveRequestLease();
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();

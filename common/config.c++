@@ -286,6 +286,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
   result.webSocketsPerNode = root.getIngress().getWebSocketsPerNode();
+  const auto keepalive = root.getIngress().getTcpKeepalive().asReader();
+  KJ_REQUIRE(keepalive.getIdleSeconds() > 0 && keepalive.getIdleSeconds() <= 32767 &&
+      keepalive.getIntervalSeconds() > 0 && keepalive.getIntervalSeconds() <= 32767 &&
+      keepalive.getProbes() > 0 && keepalive.getProbes() <= 127, "invalid ingress.tcpKeepalive settings");
+  result.ingressKeepalive = {keepalive.getIdleSeconds(), keepalive.getIntervalSeconds(), keepalive.getProbes()};
   auto rotation = root.getRotation();
   result.processPool.rotationDrainTimeoutMs = rotation.getDrainTimeoutMs();
   result.processPool.rotationTermGraceMs = rotation.getTermGraceMs();

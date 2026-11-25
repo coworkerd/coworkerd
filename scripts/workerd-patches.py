@@ -143,6 +143,9 @@ def allowed_path(name, path):
     rust_path = (path.startswith(("src/workerd/server/server/", "src/workerd/server/cli/")) and
                  path in RUST_PATHS.get(name, frozenset()))
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
+                          name == '0140-alarm-wall-limit.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',

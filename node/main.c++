@@ -34,6 +34,7 @@
 #include "json.h"
 #include "peer-auth.h"
 #include "peer-liveness.h"
+#include "request-lease.h"
 #include "tenancy.h"
 #include "tenant-manifest.h"
 #include "tenants.h"
@@ -72,6 +73,8 @@
 #include <queue>
 #include <optional>
 #include <random>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <sys/resource.h>
 #ifdef __APPLE__
@@ -223,6 +226,7 @@ struct LeaseConfig {
   uint16_t rootBudget;
   uint16_t grantCap;
   uint64_t ttlMs;
+  uint64_t alarmWallMs;
 
   // The naive lease is a test-only counterexample: only the explicit command-line switch
   // --experimental-naive-lease selects it. COWORKERD_LEASE_MODE may still say "correct".
@@ -237,6 +241,9 @@ struct LeaseConfig {
     auto ttlMs = environmentUnsigned(
         "COWORKERD_LEASE_TTL_MS", 30'000, 86'400'000);
     KJ_REQUIRE(ttlMs > 0, "COWORKERD_LEASE_TTL_MS must be positive");
+    constexpr uint64_t ALARM_WALL_MS = 15 * 60 * 1000;
+    auto alarmWallMs = environmentUnsigned("COWORKERD_TEST_ALARM_WALL_MS", ALARM_WALL_MS, ALARM_WALL_MS);
+    KJ_REQUIRE(alarmWallMs > 0, "COWORKERD_TEST_ALARM_WALL_MS must be positive");
     return {
       experimentalNaive ? LeaseMode::NAIVE : LeaseMode::CORRECT,
       static_cast<uint16_t>(environmentUnsigned(
@@ -244,6 +251,7 @@ struct LeaseConfig {
       static_cast<uint16_t>(environmentUnsigned(
           "COWORKERD_SUBREQUEST_GRANT", 1, 65'535)),
       ttlMs,
+      alarmWallMs,
     };
   }
 
@@ -355,8 +363,15 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
+  std::shared_ptr<coworkerd::RequestLease> requestLease;
   bool presents(double value) const {
     return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
+  }
+  bool live(double now) const {
+    return requestLease ? requestLease->remainingMs() > 0 : expiresAtMonotonicMs > now;
+  }
+  double childDeadline(double now, double preparationLimitMs) const {
+    return requestLease ? now + std::min(preparationLimitMs, requestLease->remainingMs()) : expiresAtMonotonicMs;
   }
 };
 
@@ -384,6 +399,7 @@ struct ChildAllocation {
   SharedPathTiming timing;
   std::string entrypoint;
   NativeProps nativeProps;
+  std::shared_ptr<coworkerd::RequestLease> requestLease;
 };
 
 // A request to a Durable Object (docs/compatibility.md, section 7): the object's namespace, id and class, and how many
@@ -509,6 +525,8 @@ class ServerCore;
 struct AdmissionSlot {
   std::function<void()> release;
   std::shared_ptr<coworkerd::ProcessCall> process;
+  std::shared_ptr<coworkerd::RequestLease> requestLease;
+  bool closeLeaseOnFinish = false;
   SharedPathTiming timing;
   std::string entrypoint;
   // An ingress root's (here or forwarded from another ingress), and that ingress: its response may become a WebSocket
@@ -542,7 +560,12 @@ struct AdmissionSlot {
   void report(uint status, const std::string& code) { if (outcome) { auto callback = std::move(outcome); outcome = {}; callback(status, code); } }
   explicit AdmissionSlot(std::function<void()> release): release(std::move(release)) {}
   ~AdmissionSlot() { decide(!process || process->dispatched); finish(); report(0, ""); }
-  void finish() { decide(!process || process->dispatched); if (process) process->finish(); if (release) { auto callback = std::move(release); release = {}; callback(); } }
+  void finish() {
+    decide(!process || process->dispatched);
+    if (closeLeaseOnFinish && requestLease) requestLease->close();
+    if (process) process->finish();
+    if (release) { auto callback = std::move(release); release = {}; callback(); }
+  }
   NativeProps nativeProps;
 };
 
@@ -1322,7 +1345,7 @@ public:
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     auto parent = leases.find(parentInvocationId);
-    if (parent == leases.end() || parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
+    if (parent == leases.end() || !parent->second.live(nowMonotonicMs) ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
       ++expiredLeaseRejections;
       lastRejection = "lease expired before execution for parent=" + parentInvocationId + " tree=" + treeId +
@@ -1331,7 +1354,7 @@ public:
       std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
       KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
-    if (deadline) *deadline = parent->second.expiresAtMonotonicMs;
+    if (deadline) *deadline = parent->second.childDeadline(nowMonotonicMs, leaseConfig.ttlMs);
     return parent->second.pins;
   }
   kj::Promise<coworkerd::AssetRead> assetBytes(const coworkerd::CodeAsset& asset, double deadline) {
@@ -1414,11 +1437,19 @@ public:
   }
 
   // ---- JS RPC (docs/compatibility.md, section 7) ----
+  std::shared_ptr<coworkerd::RequestLease> requestLeaseFor(const std::string& invocationId) const {
+    auto found = leases.find(invocationId);
+    return found == leases.end() ? nullptr : found->second.requestLease;
+  }
+
   // The call tree's lease, as a promise that fails when it runs out: a capability this node handed a caller for a
   // method call is revoked with it, so a stub or a stream of the target cannot outlive the tree it was made in.
-  kj::Promise<void> whenLeaseExpires(double expiresAtMonotonicMs) {
+  kj::Promise<void> whenLeaseExpires(double expiresAtMonotonicMs,
+      std::shared_ptr<coworkerd::RequestLease> requestLease = {}) {
     const auto remaining = expiresAtMonotonicMs - monotonicTimeMs();
-    return timer.afterDelay(static_cast<int64_t>(remaining > 0 ? remaining : 0) * kj::MILLISECONDS)
+    auto ends = requestLease ? requestLease->whenClosed().attach(std::move(requestLease))
+        : timer.afterDelay(static_cast<int64_t>(remaining > 0 ? remaining : 0) * kj::MILLISECONDS);
+    return kj::mv(ends)
         .then([]() -> kj::Promise<void> {
       // A failure, not a disconnection: the caller is told why, and `jsg.` is what carries the message through
       // workerd rather than the "Network connection lost." a broken connection gives (docs/guide/errors.md).
@@ -2395,7 +2426,8 @@ public:
   }
 
   OpenEvent open(std::shared_ptr<const VersionDefinition> version, std::string kind,
-      SharedVersionPins pins, double deadline = 0, std::shared_ptr<AdmissionSlot> slot = {}, const LoadCheck& check = {}) {
+      SharedVersionPins pins, double deadline = 0, std::shared_ptr<AdmissionSlot> slot = {}, const LoadCheck& check = {},
+      std::shared_ptr<coworkerd::RequestLease> requestLease = {}) {
     auto process = selectProcess(version->workerId);
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
@@ -2403,7 +2435,9 @@ public:
     auto id = invocationId(sequence);
     auto expires = deadline > 0 ? deadline : nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     KJ_REQUIRE(std::isfinite(expires), "lease deadline overflow");
-    addLease(id, {id, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
+    InvocationLeaseState lease{id, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId};
+    lease.requestLease = std::move(requestLease);
+    addLease(id, std::move(lease));
     return execute(std::move(version), sequence, id, id, std::move(kind), {}, 0, 0,
         leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId,
         check.coldLoaded);
@@ -2573,17 +2607,26 @@ public:
     startObjectLogEvent(id, target.key());
     if (allocation) {
       if (slot) slot->timing = allocation->timing;
-      addLease(id, {allocation->treeId, allocation->grant, allocation->grant, allocation->depth, allocation->expiresAtMonotonicMs,
-          allocation->pins, allocation->ingressServerId});
+      InvocationLeaseState lease{allocation->treeId, allocation->grant, allocation->grant, allocation->depth,
+          allocation->expiresAtMonotonicMs, allocation->pins, allocation->ingressServerId};
+      lease.requestLease = allocation->requestLease;
+      addLease(id, std::move(lease));
       return execute(std::move(version), sequence, std::move(id), allocation->treeId, "durable", allocation->parentInvocationId,
           allocation->callSequence, allocation->orderSequence, allocation->grant, allocation->remainingAfter, allocation->depth,
           allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
           &*root);
     }
     auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
-    const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
+    const auto expires = nowMonotonicMs + static_cast<double>(
+        target.alarmAtUnixMs ? leaseConfig.alarmWallMs : leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
-    addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
+    InvocationLeaseState lease{tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId};
+    if (target.alarmAtUnixMs) {
+      lease.requestLease = std::make_shared<coworkerd::RequestLease>(timer);
+      lease.requestLease->startFixed(leaseConfig.alarmWallMs * kj::MILLISECONDS);
+      if (slot) slot->closeLeaseOnFinish = true;
+    }
+    addLease(id, std::move(lease));
     return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
         leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
         &*root);
@@ -2602,9 +2645,9 @@ public:
     // trust-domain boundary requires a new authentication and authorization design.
     auto parent = leases.find(parentInvocationId);
     if (parent == leases.end() ||
-        parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
+        !parent->second.live(nowMonotonicMs) ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
-      if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs && !parent->second.held) {
+      if (parent != leases.end() && !parent->second.live(nowMonotonicMs) && !parent->second.held) {
         leases.erase(parent);
       }
       ++expiredLeaseRejections;
@@ -2647,7 +2690,7 @@ public:
       ++expected;
     }
 
-    return {
+    ChildAllocation allocation{
       std::move(treeId),
       std::move(parentInvocationId),
       callSequence,
@@ -2656,11 +2699,27 @@ public:
       charged,
       remainingAfter,
       depth,
-      inherited.deadline,
+      parent->second.childDeadline(nowMonotonicMs, leaseConfig.ttlMs),
       parent->second.pins,
       false,
       inherited.ingressServerId,
     };
+    allocation.requestLease = parent->second.requestLease;
+    return allocation;
+  }
+
+  std::optional<ChildAllocation> inheritActorLease(const std::string& invocationId) {
+    auto found = leases.find(invocationId);
+    const auto now = monotonicTimeMs();
+    if (found == leases.end() || !found->second.requestLease || !found->second.live(now)) return std::nullopt;
+    const auto& parent = found->second;
+    // Actor-originated calls keep their own admission and quota accounting.
+    // When the runtime has a live event identity, its deadline still bounds the work.
+    ChildAllocation allocation{parent.treeId, invocationId, 0, 0, leaseConfig.rootBudget, 0, leaseConfig.rootBudget,
+        static_cast<uint16_t>(parent.depth + 1), parent.childDeadline(now, leaseConfig.ttlMs), nullptr, false,
+        parent.ingressServerId};
+    allocation.requestLease = parent.requestLease;
+    return allocation;
   }
 
   OpenEvent executeAllocated(
@@ -2672,7 +2731,7 @@ public:
     auto process = selectProcess(version->workerId);
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
-    addLease(invocationId, {
+    InvocationLeaseState lease{
       allocation.treeId,
       allocation.grant,
       allocation.grant,
@@ -2680,7 +2739,9 @@ public:
       allocation.expiresAtMonotonicMs,
       allocation.pins,
       allocation.ingressServerId,
-    });
+    };
+    lease.requestLease = allocation.requestLease;
+    addLease(invocationId, std::move(lease));
     return execute(
         std::move(version),
         sequence,
@@ -2707,7 +2768,8 @@ public:
       uint64_t callSequence,
       uint64_t orderSequence,
       SharedVersionPins pins, std::shared_ptr<AdmissionSlot> slot = {},
-      bool ingressRoot = false, std::string ingressServerId = {}, const LoadCheck& check = {}) {
+      bool ingressRoot = false, std::string ingressServerId = {}, const LoadCheck& check = {},
+      std::shared_ptr<coworkerd::RequestLease> requestLease = {}) {
     auto process = selectProcess(version->workerId);
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
@@ -2719,7 +2781,9 @@ public:
     }
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
-    addLease(invocationId, {treeId, grant, grant, depth, expiresAtMonotonicMs, pins, ingressServerId});
+    InvocationLeaseState lease{treeId, grant, grant, depth, expiresAtMonotonicMs, pins, ingressServerId};
+    lease.requestLease = std::move(requestLease);
+    addLease(invocationId, std::move(lease));
     return execute(
         std::move(version),
         sequence,
@@ -2826,6 +2890,7 @@ private:
       const coworkerd::RootDispatch* root = nullptr) {
 
     auto timing = slot ? slot->timing : nullptr;
+    if (slot) slot->requestLease = requestLeaseFor(invocationId);
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }
     pathMark(timing, "open-execution");
     if (slot && durable == nullptr) {
@@ -3677,9 +3742,16 @@ private:
 
   void addLease(std::string invocationId, InvocationLeaseState state) {
     auto expiresAtMonotonicMs = state.expiresAtMonotonicMs;
+    auto requestLease = state.requestLease;
     auto [_, inserted] = leases.emplace(invocationId, std::move(state));
     KJ_ASSERT(inserted, "duplicate invocation lease");
-    leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
+    if (requestLease) {
+      leaseCleanupTasks.add(requestLease->whenClosed().then([this, id = std::move(invocationId)]() {
+        expiredLeases += leases.erase(id);
+      }));
+    } else {
+      leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
+    }
   }
 
   void expireLeases(double nowMonotonicMs) {
@@ -3711,6 +3783,7 @@ private:
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
   std::deque<std::shared_ptr<DebitRecord>> debits;
   std::map<std::string, InvocationLeaseState> leases;
+  kj::TaskSet leaseCleanupTasks{preparationErrors};
   std::priority_queue<
       LeaseExpiry,
       std::vector<LeaseExpiry>,
@@ -4756,6 +4829,11 @@ public:
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
+      if (slot->requestLease && !slot->closeLeaseOnFinish) {
+        request = kj::mv(request).exclusiveJoin(slot->requestLease->whenClosed().then([]() -> kj::Promise<void> {
+          return KJ_EXCEPTION(DISCONNECTED, "caller lease ended during execution");
+        }));
+      }
       if (slot->process) request = kj::mv(request).exclusiveJoin(slot->process->onExit())
           .catch_([process = slot->process](kj::Exception&& error) -> kj::Promise<void> {
         return process->rejectAfterCrash(kj::mv(error));
@@ -4898,7 +4976,40 @@ struct RemoteInvocationData {
   std::string ingressServerId;
   std::string entrypoint;
   NativeProps nativeProps;
+  std::shared_ptr<coworkerd::RequestLease> requestLease;
 };
+
+class CallerLeaseServer final: public rpc::CallerLease::Server {
+public:
+  explicit CallerLeaseServer(std::shared_ptr<coworkerd::RequestLease> lease): lease(std::move(lease)) {}
+  kj::Promise<void> waitForDrain(WaitForDrainContext context) override {
+    return lease->whenClosing().then([context = kj::mv(context), lease = lease]() mutable {
+      context.getResults().setRemainingMs(lease->remainingMs());
+    });
+  }
+  kj::Promise<void> waitForEnd(WaitForEndContext) override { return lease->whenClosed(); }
+private:
+  std::shared_ptr<coworkerd::RequestLease> lease;
+};
+
+std::shared_ptr<coworkerd::RequestLease> watchCallerLease(kj::Timer& timer, rpc::CallerLease::Client caller) {
+  auto lease = std::make_shared<coworkerd::RequestLease>(timer);
+  std::weak_ptr<coworkerd::RequestLease> weak = lease;
+  auto drain = caller.waitForDrainRequest().send().then([weak](auto result) {
+    if (auto current = weak.lock()) {
+      const auto remaining = result.getRemainingMs();
+      KJ_REQUIRE(std::isfinite(remaining) && remaining >= 0 && remaining <= 30000, "invalid caller drain time");
+      current->beginDrain(static_cast<int64_t>(remaining * 1000000) * kj::NANOSECONDS);
+    }
+  });
+  auto ended = caller.waitForEndRequest().send().ignoreResult().then([weak]() {
+    if (auto current = weak.lock()) current->close();
+  });
+  lease->watchCaller(kj::joinPromisesFailFast(kj::arr(kj::mv(drain), kj::mv(ended))).catch_([weak](kj::Exception&&) {
+    if (auto current = weak.lock()) current->close();
+  }));
+  return lease;
+}
 
 // A request to a Durable Object sent to the owner of its shard (PeerServer.openObjectInvocation).
 struct ObjectInvocationData {
@@ -5122,6 +5233,12 @@ private:
 
 class PeerForwarder final {
 public:
+  coworkerd::RpcMessageCounts& messageCounts() { return rpcMessages; }
+  std::string messageCountsJson() const {
+    return "{\"sent\":" + std::to_string(rpcMessages.sent) + ",\"received\":" +
+        std::to_string(rpcMessages.received) + "}";
+  }
+
   PeerForwarder(
       ServerCore& server,
       kj::Network& network,
@@ -5394,6 +5511,7 @@ public:
     remote.setAlreadyPlaced(invocation.alreadyPlaced); remote.setOriginServerId(invocation.originServerId.c_str());
     remote.setIngressRoot(invocation.ingressRoot); remote.setIngressServerId(invocation.ingressServerId.c_str());
     remote.setEntrypoint(invocation.entrypoint.c_str());
+    if (invocation.requestLease) remote.setCallerLease(kj::heap<CallerLeaseServer>(invocation.requestLease));
     if (invocation.nativeProps) remote.getCoworkerdProps().set(invocation.nativeProps->getRoot<capnp::AnyPointer>());
     remote.setCallSequence(invocation.callSequence); remote.setOrderSequence(invocation.orderSequence);
     remote.setDestinationEpoch(epoch.c_str());
@@ -5495,6 +5613,7 @@ public:
       remote.setCallSequence(allocation.callSequence);
       remote.setOrderSequence(allocation.orderSequence);
       remote.setIngressServerId(allocation.ingressServerId.c_str());
+      if (allocation.requestLease) remote.setCallerLease(kj::heap<CallerLeaseServer>(allocation.requestLease));
     } else {
       remote.setCallerNamespaceId(invocation.callerNamespaceId.c_str());
       remote.setCallerObjectId(invocation.callerObjectId.c_str());
@@ -5654,7 +5773,8 @@ public:
       return RemoteInvocationData{version->workerId, pin.versionId, pin.contentHash,
           allocation.treeId, allocation.parentInvocationId, allocation.grant, allocation.expiresAtMonotonicMs,
           allocation.depth, remainingHops, true, config.serverId, allocation.callSequence, allocation.orderSequence,
-          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint, allocation.nativeProps};
+          allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint,
+          allocation.nativeProps, allocation.requestLease};
     };
     bool allPaused = true, allTenantLimited = true;
     bool allNotExecuted = true;
@@ -5878,7 +5998,7 @@ private:
       auto tunnel = connector->connect(
           "coworkerd-peer", connectHeaders, {});
       auto stream = std::move(tunnel.connection);
-      auto rpcSystem = kj::heap<coworkerd::CoarseTwoPartyClient>(*stream);
+      auto rpcSystem = kj::heap<coworkerd::CoarseTwoPartyClient>(*stream, rpcMessages);
       auto peerClient = rpcSystem->bootstrap().castAs<rpc::PeerServer>();
       auto connection = kj::rc<PeerConnection>(
           generation,
@@ -5931,6 +6051,7 @@ private:
   const kj::HttpHeaderTable& headerTable;
   capnp::HttpOverCapnpFactory& factory;
   coworkerd::PeerAuth& peerAuth;
+  coworkerd::RpcMessageCounts rpcMessages;
   coworkerd::RecoveryGate peerConnects{timer, 4};
   std::map<std::string, PeerState> peerStates;
   std::map<std::string, TailBatch> tailConnections;
@@ -6109,6 +6230,7 @@ public:
       remote.getEntrypoint().cStr(),
       copyNativeProps(remote.getCoworkerdProps()),
     };
+    if (remote.hasCallerLease()) invocation.requestLease = watchCallerLease(server.clock(), remote.getCallerLease());
     KJ_REQUIRE(coworkerd::workerFullName(invocation.workerId), "invalid remote workerId");
     KJ_REQUIRE(safeName(invocation.versionId), "invalid remote versionId");
     KJ_REQUIRE(validSha256(invocation.contentHash), "invalid remote contentHash");
@@ -6214,10 +6336,15 @@ public:
         invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
     if (current.refused) { reject(*current.refused); co_return; }
     slot->nativeProps = invocation.nativeProps;
+    if (invocation.requestLease && invocation.requestLease->remainingMs() == 0) {
+      reject(server.refusal("LEASE_EXPIRED", "the direct caller is gone", 410, invocation.ingressRoot));
+      co_return;
+    }
     try {
       auto opened = server.openGranted(std::move(version), invocation.treeId, invocation.parentInvocationId,
           invocation.subrequestGrant, invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
-          invocation.orderSequence, invocation.pins, std::move(slot), invocation.ingressRoot, invocation.ingressServerId, check);
+          invocation.orderSequence, invocation.pins, std::move(slot), invocation.ingressRoot, invocation.ingressServerId, check,
+          invocation.requestLease);
       context.initResults().initResult().setAccepted(opened.dispatcher);
       // Acceptance commits dispatch; later failures travel through AdmissionHttpService.
       co_return;
@@ -6595,7 +6722,7 @@ public:
     auto liveness = std::make_shared<coworkerd::PeerReceiveLiveness>(server.clock());
     coworkerd::CoarseTwoPartyServer rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
         server, peerForwarder, durable, durableLog, factory, headerTable, liveness)));
-    auto session = rpcServer.accept(connection).exclusiveJoin(liveness->whenExpired());
+    auto session = rpcServer.accept(connection, &peerForwarder.messageCounts()).exclusiveJoin(liveness->whenExpired());
     if (verdict.keyTag.empty()) return kj::mv(session).attach(std::move(liveness));
     // A session accepted with a key that later leaves the key file ends windowMs after it left.
     return kj::mv(session).exclusiveJoin(peerAuth.retired(verdict.keyTag).then(
@@ -6796,6 +6923,7 @@ public:
           allocation.ingressServerId,
           allocation.entrypoint,
           allocation.nativeProps,
+          allocation.requestLease,
         };
         co_return Dispatched{peerForwarder.open(targetServerId, std::move(invocation))};
       }
@@ -7631,6 +7759,7 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
     // is the object's version here.
     ChildAllocation allocation{treeId, parent, remote.getCallSequence(), remote.getOrderSequence(), remote.getSubrequestGrant(), 0,
         remote.getSubrequestGrant(), remote.getDepth(), receivedAtMonotonicMs + remainingMs, nullptr, false, ingress};
+    if (remote.hasCallerLease()) allocation.requestLease = watchCallerLease(server.clock(), remote.getCallerLease());
     request.allocation = std::move(allocation);
   } else {
     request.callerNamespaceId = remote.getCallerNamespaceId().cStr();
@@ -8045,6 +8174,7 @@ public:
           request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
           request.callerNamespaceId = callerNamespace;
           request.callerObjectId = callerObject;
+          request.allocation = server.inheritActorLease(parentInvocationId);
         }
       } catch (const kj::Exception& error) {
         std::string reason = error.getDescription().cStr();
@@ -8263,7 +8393,8 @@ public:
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
     // The lease: a capability the target returned is the caller's for as long as the call tree lives, and no longer.
     // The lease running out is a failure of this call tree's capabilities, counted once under its own code.
-    auto revoked = server.whenLeaseExpires(deadline).catch_([&server = server](kj::Exception&& error) -> kj::Promise<void> {
+    auto revoked = server.whenLeaseExpires(deadline, server.requestLeaseFor(descriptor.getParentInvocationId().cStr()))
+        .catch_([&server = server](kj::Exception&& error) -> kj::Promise<void> {
       server.observeRpcFailure(rpcFailureCode(error));
       return kj::Promise<void>(kj::mv(error));
     });
@@ -9346,8 +9477,11 @@ private:
       webSocket->workerId = selected.version->workerId;
       webSocket->versionId = selected.version->versionId;
     }
+    auto requestLease = webSocket ? nullptr : std::make_shared<coworkerd::RequestLease>(server.clock());
+    auto drainRequest = kj::defer([&requestLease]() { if (requestLease) requestLease->beginDrain(); });
     if (server.placementConfig().ingressPlacement && !server.placementConfig().hasPlacement(selected.version->workerId)) {
       auto allocation = server.allocateRoot(selected.pins, deadline);
+      allocation.requestLease = requestLease;
       allocation.timing = timing;
       pathMark(timing, "allocate-root");
       if (webSocket) webSocket->treeId = allocation.treeId;
@@ -9407,7 +9541,8 @@ private:
     try {
     auto targetKey = selected.version->key();
     auto opening = slot;
-    auto opened = server.open(std::move(selected.version), "ingress", std::move(selected.pins), deadline, std::move(slot), check);
+    auto opened = server.open(std::move(selected.version), "ingress", std::move(selected.pins), deadline,
+        std::move(slot), check, requestLease);
     if (webSocket && opening->process) webSocket->treeId = opening->process->treeId;
     auto forwardedUrl = kj::str("http://", host.c_str(), url);
     auto forwardedHeaders = headers.clone();
@@ -10166,7 +10301,9 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
       << ",\"probation\":" << b(c.suspectProbation)
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
-      << ",\"ingress\":{\"webSocketsPerNode\":" << c.webSocketsPerNode << "}"
+      << ",\"ingress\":{\"webSocketsPerNode\":" << c.webSocketsPerNode
+      << ",\"tcpKeepalive\":{\"idleSeconds\":" << c.ingressKeepalive.idleSeconds
+      << ",\"intervalSeconds\":" << c.ingressKeepalive.intervalSeconds << ",\"probes\":" << c.ingressKeepalive.probes << "}}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
       << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
@@ -10192,14 +10329,17 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
 
 class FairConnectionReceiver final: public kj::ConnectionReceiver {
 public:
-  explicit FairConnectionReceiver(kj::Own<kj::ConnectionReceiver> inner): inner(kj::mv(inner)) {}
+  FairConnectionReceiver(kj::Own<kj::ConnectionReceiver> inner, ServerConfig::TcpKeepalive keepalive)
+      : inner(kj::mv(inner)), keepalive(keepalive) {}
   kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override {
     auto connection = co_await inner->accept();
+    applyKeepalive(*connection);
     co_await kj::yieldUntilWouldSleep();
     co_return kj::mv(connection);
   }
   kj::Promise<kj::AuthenticatedStream> acceptAuthenticated() override {
     auto connection = co_await inner->acceptAuthenticated();
+    applyKeepalive(*connection.stream);
     co_await kj::yieldUntilWouldSleep();
     co_return kj::mv(connection);
   }
@@ -10208,7 +10348,24 @@ public:
   void setsockopt(int level, int option, const void* value, uint length) override { inner->setsockopt(level, option, value, length); }
   void getsockname(struct sockaddr* address, uint* length) override { inner->getsockname(address, length); }
 private:
+  void applyKeepalive(kj::AsyncIoStream& connection) const {
+    sockaddr_storage address;
+    uint size = sizeof(address);
+    connection.getsockname(reinterpret_cast<sockaddr*>(&address), &size);
+    if (address.ss_family != AF_INET && address.ss_family != AF_INET6) return;
+    const int enabled = 1;
+    connection.setsockopt(SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+#if defined(__APPLE__)
+    constexpr int idleOption = TCP_KEEPALIVE;
+#else
+    constexpr int idleOption = TCP_KEEPIDLE;
+#endif
+    connection.setsockopt(IPPROTO_TCP, idleOption, &keepalive.idleSeconds, sizeof(keepalive.idleSeconds));
+    connection.setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, &keepalive.intervalSeconds, sizeof(keepalive.intervalSeconds));
+    connection.setsockopt(IPPROTO_TCP, TCP_KEEPCNT, &keepalive.probes, sizeof(keepalive.probes));
+  }
   kj::Own<kj::ConnectionReceiver> inner;
+  ServerConfig::TcpKeepalive keepalive;
 };
 
 // SIGTERM and SIGINT (main() sets this before run()).
@@ -10526,6 +10683,7 @@ int run(Launch launch) {
   server.addStateSection("egress", [&egress]() { return egress.json(); });
   server.addStateSection("controlPlane", [&controlPlane]() { return controlPlane.json(); });
   server.addStateSection("peerAuth", [&peerAuth]() { return peerAuth.json(); });
+  server.addStateSection("peerTransport", [&peerForwarder]() { return peerForwarder.messageCountsJson(); });
   server.setDaemonMemory([&durableLog, &membership, &tenantUsage, &peerAuth, &runtime, &server, &timer]()
       -> kj::Promise<std::string> {
     std::string containers;
@@ -10598,7 +10756,7 @@ int run(Launch launch) {
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
   kj::HttpServer httpServer(timer, *headerTable, gateway,
-      {.callbacks = gateway, .cancelWebSocketHandshakeOnEof = true});
+      {.callbacks = gateway, .cancelWebSocketHandshakeOnEof = true, .cancelHttpOnWriteDisconnect = true});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, seedPeer);
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
@@ -10613,7 +10771,7 @@ int run(Launch launch) {
   auto peerAddress = io.provider->getNetwork()
       .parseAddress(peerAddressText.c_str()).wait(waitScope);
   auto httpListener = httpAddress->listen();
-  httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener));
+  httpListener = kj::heap<FairConnectionReceiver>(kj::mv(httpListener), server.placementConfig().ingressKeepalive);
   auto bindingListener = bindingAddress->listen();
   auto peerListener = peerAddress->listen();
   auto sourceListener = sourceAddress->listen();

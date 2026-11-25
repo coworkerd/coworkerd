@@ -270,6 +270,7 @@ endforeach()
 add_test(NAME node-ingress-descriptor-plan COMMAND coworkerd-node-contract-test ingress-descriptor-plan)
 add_test(NAME node-peer-half-close COMMAND coworkerd-node-contract-test peer-half-close)
 add_test(NAME node-peer-session-liveness COMMAND coworkerd-node-contract-test peer-session-liveness)
+add_test(NAME node-live-request-lease COMMAND coworkerd-node-contract-test live-request-lease)
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)

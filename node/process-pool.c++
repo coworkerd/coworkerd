@@ -122,7 +122,7 @@ bool workerdInherits(std::string_view name) {
   static constexpr std::string_view NAMES[] = {"PATH", "TZ", "LANG", "LANGUAGE", "TMPDIR", "NO_COLOR", "FORCE_COLOR",
       "KJ_CLEAN_SHUTDOWN", "WORKERD_ALL_AUTOGATES", "COWORKERD_SECCOMP_STEADY_PROBE_FOR_TEST",
       "COWORKERD_TRACE_DIR", "COWORKERD_TRACE_PROGRAM", "COWORKERD_TRACE_STACK", "COWORKERD_THREADED_TRACE_FOR_TEST",
-      "COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST"};
+      "COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST", "COWORKERD_TEST_ALARM_WALL_MS"};
   return name.starts_with("LC_") || std::find(std::begin(NAMES), std::end(NAMES), name) != std::end(NAMES);
 }
 // Descriptor numbers each workerd inherits (see process-pool.h); the launcher's own two, which it

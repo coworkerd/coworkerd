@@ -295,6 +295,11 @@ struct ServerConfig {
   bool loadCheck = true;
   // A ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
   uint32_t webSocketsPerNode = 0;
+  struct TcpKeepalive {
+    int idleSeconds = 30;
+    int intervalSeconds = 10;
+    int probes = 3;
+  } ingressKeepalive;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
   // The configuration file of `serve`. The four paths and addresses are serve only (the

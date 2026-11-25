@@ -227,6 +227,13 @@ struct InvocationOpenResult {
   }
 }
 
+# The direct caller's side of one open invocation. State is pushed once;
+# session keepalive detects silent partitions independently of invocation count.
+interface CallerLease $Cxx.allowCancellation {
+  waitForDrain @0 () -> (remainingMs :Float64);
+  waitForEnd @1 () -> ();
+}
+
 struct InvocationRejection {
   code @0 :Text;
   reason @1 :Text;
@@ -263,6 +270,7 @@ struct RemoteInvocation {
   entrypoint @18 :Text;
   # Opaque native loopback props, including its capability table. Nodes only copy it.
   coworkerdProps @19 :AnyPointer;
+  callerLease @20 :CallerLease;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
@@ -301,6 +309,7 @@ struct ObjectInvocation {
   alarmRetryCount @21 :UInt32;
   # Internal alarm routing; only the root object schedules alarms, always at facet 0.
   alarmFacetId @22 :UInt32 = 1;
+  callerLease @23 :CallerLease;
 }
 
 struct ServerConfig {
@@ -475,6 +484,13 @@ struct ServerConfig {
   struct IngressConfig {
     # Ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
     webSocketsPerNode @0 :UInt32;
+    tcpKeepalive @1 :TcpKeepalive;
+
+    struct TcpKeepalive {
+      idleSeconds @0 :UInt16 = 30;
+      intervalSeconds @1 :UInt16 = 10;
+      probes @2 :UInt8 = 3;
+    }
   }
 
   struct SecretsConfig {

@@ -3,6 +3,17 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
+import { alarmRequestLease, actorRequestLease, connectedRequestLease, disconnectedRequestLease, silentRequestLease }
+  from './live-request-lease.mjs';
+import { liveRequestCapacity } from './live-request-load.mjs';
+
+const leaseCases = {
+  'live-request-lease': connectedRequestLease,
+  'disconnected-request-lease': disconnectedRequestLease,
+  'silent-request-lease': silentRequestLease,
+  'actor-request-lease': actorRequestLease,
+};
+const alarmCases = { 'alarm-wall-time': [], 'threaded-alarm-wall-time': ['node-1', 'node-2', 'node-3'] };
 
 async function runSuite(selected, kernel, signal, options) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), kernel, signal, options);
@@ -34,7 +45,9 @@ async function runSuite(selected, kernel, signal, options) {
 }
 
 async function main(args) {
-  const all = { ...cases, ...webSocketCases, ...durableGatedCases, 'fatal-attribution': fatalAttribution };
+  const all = { ...cases, ...webSocketCases, ...durableGatedCases, ...leaseCases,
+    'alarm-wall-time': alarmRequestLease, 'threaded-alarm-wall-time': alarmRequestLease,
+    'live-request-lease-capacity': liveRequestCapacity, 'fatal-attribution': fatalAttribution };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
   if (args[0] === '--help' && args.length === 1) return console.log(help);
   if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(all, args[1]))) {
@@ -56,6 +69,9 @@ async function main(args) {
   const regular = fatalTest ? [['fatal-attribution', fatalAttribution]]
     : Object.entries(cases).filter(([name]) => !args[1] || args[1] === name);
   const webSockets = Object.entries(webSocketCases).filter(([name]) => !args[1] || args[1] === name);
+  const requestLeases = Object.entries(leaseCases).filter(([name]) => !args[1] || args[1] === name);
+  const capacity = args[1] === 'live-request-lease-capacity';
+  const alarms = Object.entries(alarmCases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
   let failed = 0;
   try {
@@ -67,6 +83,28 @@ async function main(args) {
     if (webSockets.length) {
       failed += await runSuite(webSockets, kernel, controller.signal, { webSocketsPerNode: 2 });
     }
+    if (requestLeases.length) {
+      failed += await runSuite(requestLeases, kernel, controller.signal, {
+        configureNode: () => ({
+          ingressPlacement: true, placement: { homeProbability: 1 },
+          ingress: { tcpKeepalive: { idleSeconds: 1, intervalSeconds: 1, probes: 2 } },
+        }),
+      });
+    }
+    if (capacity) {
+      failed += await runSuite([['live-request-lease-capacity', liveRequestCapacity]], kernel, controller.signal, {
+        configureNode: node => node === 'node-3' ? {} : ({
+          ingressPlacement: true,
+          placement: { homeProbability: 1, rootLimit: 5400, nestedLimit: 5500 },
+          processPool: { count: 1, inFlightLimit: 5400 },
+          quarantineProcesses: 0, durableObjects: { processes: 0 },
+        }),
+      });
+    }
+    for (const [name, threadedNodes] of alarms) {
+      failed += await runSuite([[name, alarmRequestLease]], kernel, controller.signal,
+        { threadedNodes, alarmWallTimeMs: 1000 });
+    }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
       delayRecoveryPeers }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
@@ -74,7 +112,8 @@ async function main(args) {
         controlDurableLifecycle, delayRecoveryPeers,
       });
     }
-    console.log(`${regular.length + webSockets.length + gated.length} executed, ${failed} failed`);
+    const executed = regular.length + webSockets.length + requestLeases.length + gated.length + alarms.length + Number(capacity);
+    console.log(`${executed} executed, ${failed} failed`);
   } finally {
     console.log(`Cluster run including setup and cleanup: ${((performance.now() - start) / 1000).toFixed(1)} s`);
   }

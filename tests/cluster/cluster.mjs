@@ -46,6 +46,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
+    alarmWallTimeMs,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -73,6 +74,7 @@ export class Cluster {
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
     this.webSocketsPerNode = webSocketsPerNode;
     this.configureNode = configureNode;
+    this.alarmWallTimeMs = alarmWallTimeMs;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -160,6 +162,7 @@ export class Cluster {
         environment: { COWORKERD_CONFIG: target },
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
+      if (this.alarmWallTimeMs) overrides[node].environment.COWORKERD_TEST_ALARM_WALL_MS = String(this.alarmWallTimeMs);
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
       if (this.durableLifecycleGate && this.threadedNodes.has(node)) {
         const gate = '/tmp/cluster-test-durable-lifecycle';

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { get } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 
@@ -25,6 +26,18 @@ const worker = `
         return this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
       }
       if (path === '/markers') return Response.json(Array.from((await this.ctx.storage.list()).keys()));
+      if (path === '/timer') {
+        setTimeout(async () => {
+          const leaf = await this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
+          await this.ctx.storage.put('timer', await leaf.text());
+        }, 32_000);
+        return new Response('scheduled');
+      }
+      if (path === '/take-over') {
+        await scheduler.wait(20_000);
+        return new Response(await this.ctx.storage.get('timer'));
+      }
+      if (path === '/timer-result') return new Response(await this.ctx.storage.get('timer'));
       if (request.method === 'PUT') {
         await this.ctx.storage.put(path.slice(1), true);
         return new Response(null, { status: 204 });
@@ -69,6 +82,15 @@ const worker = `
       const path = new URL(request.url).pathname.split('/').at(-1);
       if (path === 'before-headers' || path === 'during-body') return disconnect(env, ctx, path);
       if (path === 'markers') return env.OBJECT.getByName('disconnect-markers').fetch('https://object.test/markers');
+      if (path === 'timer' || path === 'take-over' || path === 'timer-result') {
+        const actor = new URL(request.url).searchParams.get('actor');
+        return env.OBJECT.getByName(actor).fetch('https://object.test/' + path);
+      }
+      if (path === 'silent') {
+        return new Response(new ReadableStream({ start(controller) {
+          controller.enqueue(new TextEncoder().encode('started'));
+        } }));
+      }
       if (path !== 'stream') return new Response('ready');
       const encoder = new TextEncoder();
       return new Response(new ReadableStream({
@@ -124,20 +146,26 @@ export async function connectedRequestLease(cluster) {
   const signal = AbortSignal.any([cluster.signal, controller.signal, AbortSignal.timeout(145_000)]);
   try {
     const sentAt = performance.now();
-    const response = await fetch(base + path + '/stream', { signal });
-    assert.equal(response.status, 200);
+    let halfClosed = false;
+    const response = await new Promise((resolve, reject) => {
+      const client = get(base + path + '/stream', { agent: false, signal }, resolve);
+      client.once('socket', socket => client.once('finish', () => socket.end(() => { halfClosed = true; })));
+      client.once('error', reject);
+    });
+    assert.equal(response.statusCode, 200);
     const expected = ['started', 'service', 'object', 'rpc', 'finished'];
     const observed = [];
     let pending = '';
     let startedAt;
-    for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
-      pending += chunk;
+    for await (const chunk of response) {
+      pending += chunk.toString();
       const lines = pending.split('\n');
       pending = lines.pop();
       for (const line of lines) {
         assert.equal(line, expected[observed.length]);
         observed.push(line);
         if (line === 'started') {
+          assert.ok(halfClosed, 'the client ended its write side before reading the response');
           startedAt = performance.now();
           const { placement } = await cluster.state(ingress);
           assert.equal(placement.proxyingIngress, 1, 'the streaming invocation runs on a peer');
@@ -151,7 +179,7 @@ export async function connectedRequestLease(cluster) {
     assert.deepEqual(observed, expected);
     const elapsed = performance.now() - sentAt;
     assert.ok(elapsed >= 120_000, 'the connected stream completed after 120 seconds');
-    console.log(`Connected stream completed in ${(elapsed / 1000).toFixed(1)} s with a 1500 ms CPU limit`);
+    console.log(`A half-closed HTTP client received the complete ${(elapsed / 1000).toFixed(1)} s stream`);
   } finally {
     controller.abort();
   }
@@ -162,35 +190,29 @@ export async function disconnectedRequestLease(cluster) {
   for (const mode of ['before-headers', 'during-body']) {
     const markers = async () => json(await request(base, path + '/markers'), 200, 'read disconnect markers')
       .filter(marker => marker.startsWith(mode + '/')).map(marker => marker.slice(mode.length + 1));
-    const client = new AbortController();
     let receivedHeaders = false;
-    const result = fetch(base + path + '/' + mode, { signal: AbortSignal.any([client.signal, cluster.signal]) })
-      .then(response => { receivedHeaders = true; return response; })
-      .catch(error => ({ error }));
+    const first = Promise.withResolvers();
+    const client = get(base + path + '/' + mode, { agent: false, signal: cluster.signal }, response => {
+      receivedHeaders = true;
+      response.on('error', () => {});
+      response.once('data', value => first.resolve({ status: response.statusCode, text: value.toString() }));
+    });
+    client.on('error', () => {});
     try {
       await eventually(`${mode} registered background work`, async () => {
         assert.deepEqual(await markers(), ['registered']);
       }, { timeout: 8000, interval: 100 });
       const registeredAt = performance.now();
-      let reader;
       if (mode === 'during-body') {
-        const response = await result;
-        assert.equal(response.status, 200);
-        reader = response.body.getReader();
-        const { value } = await reader.read();
-        assert.equal(new TextDecoder().decode(value), 'started');
+        const frame = await Promise.race([first.promise, delay(5000)]);
+        assert.deepEqual(frame, { status: 200, text: 'started' });
       }
       // The background marker is scheduled after the original 30 s lease.
       // Give the request four seconds before starting the disconnect drain.
       await delay(4000, undefined, { signal: cluster.signal });
       assert.equal(receivedHeaders, mode === 'during-body');
-      client.abort();
-      if (reader) {
-        await assert.rejects(reader.read(), { name: 'AbortError' });
-        reader.releaseLock();
-      } else {
-        assert.equal((await result).error?.name, 'AbortError');
-      }
+      assert.ok(client.socket && !client.socket.destroyed);
+      client.socket.resetAndDestroy();
       await eventually(`${mode} left only the registered work alive`, async () => {
         assert.deepEqual(await markers(), ['background', 'registered']);
       }, { timeout: 31_000, interval: 250 });
@@ -198,7 +220,102 @@ export async function disconnectedRequestLease(cluster) {
       if (untilAfterDrain > 0) await delay(untilAfterDrain, undefined, { signal: cluster.signal });
       assert.deepEqual(await markers(), ['background', 'registered'], `${mode} ended all work after its one drain`);
     } finally {
-      client.abort();
+      client.destroy();
     }
   }
+}
+
+export async function silentRequestLease(cluster) {
+  const { ingress, path } = await prepareLeaseWorker(cluster, 'live-request-silent');
+  const client = `${cluster.project}-silent-client`;
+  const network = `${cluster.project}_backend`;
+  const script = `
+    const http = require('node:http');
+    http.get(process.argv[1], response => {
+      response.once('data', chunk => {
+        if (response.statusCode !== 200 || chunk.toString() !== 'started') process.exit(1);
+        console.log('connected');
+      });
+      response.on('error', () => {});
+    }).on('error', () => {});
+    setInterval(() => {}, 1000);
+  `;
+  await cluster.command('docker', ['run', '--rm', '--detach', '--network', network, '--name', client,
+    'node:22-trixie', 'node', '-e', script, `http://${ingress}-peer:8930${path}/silent`]);
+  try {
+    await eventually('the client received the start of its silent response', async () => {
+      assert.equal(await cluster.command('docker', ['logs', client]), 'connected');
+      assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 1);
+    });
+    const lostAt = performance.now();
+    await cluster.command('docker', ['network', 'disconnect', network, client]);
+    await eventually('TCP keepalive closes a silent request after the client loses its network', async () => {
+      assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 0);
+    }, { timeout: 7000, interval: 50 });
+    console.log(`Silent HTTP client detected in ${(performance.now() - lostAt).toFixed(1)} ms`);
+  } finally {
+    await cluster.command('docker', ['stop', '-t', '1', client], { cleanup: true });
+  }
+}
+
+export async function actorRequestLease(cluster) {
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers');
+  const call = (event, actor, timeout = 5000) => request(base, `${path}/${event}?actor=${actor}`, { timeout });
+  for (const actor of ['idle', 'taken-over']) {
+    assert.deepEqual(await call('timer', actor), { status: 200, text: 'scheduled' });
+  }
+  await delay(16_000, undefined, { signal: cluster.signal });
+  const takeover = call('take-over', 'taken-over', 30_000);
+  assert.deepEqual(await takeover, { status: 200, text: 'object' }, 'the newer event can hold the timer work');
+  assert.deepEqual(await call('timer-result', 'idle'), { status: 200, text: 'object' },
+    'an actor timer can make a bounded call with no live ingress event');
+}
+
+export async function alarmRequestLease(cluster) {
+  const tenant = await cluster.tenant('alarm-wall-time');
+  await cluster.deploy(tenant, 'alarm', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Clock extends DurableObject {
+      async alarm(info) {
+        if (info.retryCount) return;
+        await this.ctx.storage.put('started', true);
+        const wait = await this.ctx.storage.get('wait');
+        await scheduler.wait(wait);
+        await this.ctx.storage.put('finished', true);
+      }
+      async fetch(request) {
+        if (request.method === 'POST') {
+          await this.ctx.storage.put('wait', await request.json());
+          await this.ctx.storage.setAlarm(Date.now() + 500);
+          return new Response('scheduled');
+        }
+        return Response.json({
+          started: await this.ctx.storage.get('started') ?? false,
+          finished: await this.ctx.storage.get('finished') ?? false,
+        });
+      }
+    }
+    export default { fetch(request, env) {
+      return env.CLOCK.getByName(new URL(request.url).pathname.split('/').at(-1)).fetch(request);
+    } };
+  `, { wrangler: {
+    durable_objects: { bindings: [{ name: 'CLOCK', class_name: 'Clock' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Clock'] }],
+  } });
+  const base = cluster.urls[cluster.nodes[0]];
+  const path = `/${tenant.name}/alarm`;
+  const read = async key => json(await request(base, `${path}/${key}`), 200, `read ${key} alarm`);
+  await eventually('the alarm Worker is ready', async () => {
+    assert.deepEqual(await read('short'), { started: false, finished: false });
+  });
+  for (const [key, duration] of [['short', 150], ['long', 3500]]) {
+    assert.deepEqual(await request(base, `${path}/${key}`, { method: 'POST', body: duration }),
+      { status: 200, text: 'scheduled' });
+  }
+  await eventually('both alarm handlers start', async () => {
+    assert.deepEqual(await read('short'), { started: true, finished: true });
+    assert.equal((await read('long')).started, true);
+  });
+  await delay(4000, undefined, { signal: cluster.signal });
+  assert.deepEqual(await read('long'), { started: true, finished: false }, 'the wall limit cancelled the long handler');
 }
