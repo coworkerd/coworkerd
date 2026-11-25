@@ -2,11 +2,12 @@
 
 ## Supported versions
 
-| Version | Supported |
+| Coworkerd version | Receives security fixes |
 | --- | --- |
-| 0.5.x | Yes |
-| 0.4.x | Yes |
-| 0.3.x and earlier | No (0.4 does not upgrade a 0.3 cluster in place: build it anew) |
+| [Latest release](https://github.com/coworkerd/coworkerd/releases/latest) | Yes |
+| All earlier releases | No |
+
+We publish security fixes in new releases and do not backport them or publish patch releases for older release lines.
 
 ## Reporting a vulnerability
 
