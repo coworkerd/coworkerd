@@ -3022,7 +3022,8 @@ private:
     }));
     leases.at(invocationId).budgetHeld = true;
     auto opened = runtime.open(process, descriptor, version->definitionHash,
-        slot ? slot->nativeProps : NativeProps(), kj::mv(token), durable == nullptr && slot ? slot->requestLease : nullptr);
+        slot ? slot->nativeProps : NativeProps(), kj::mv(token), durable == nullptr && slot ? slot->requestLease : nullptr,
+        ingress);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -4900,7 +4901,10 @@ public:
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
       if (slot->requestLease && !slot->closeLeaseOnFinish) {
-        request = kj::mv(request).exclusiveJoin(slot->requestLease->whenClosed().then([]() -> kj::Promise<void> {
+        // Once ingress starts its drain, the root has no response to produce.
+        // Child calls can still serve registered work until the cutoff.
+        auto ends = slot->root ? slot->requestLease->whenClosing() : slot->requestLease->whenClosed();
+        request = kj::mv(request).exclusiveJoin(ends.then([]() -> kj::Promise<void> {
           return KJ_EXCEPTION(DISCONNECTED, "caller lease ended during execution");
         }));
       }

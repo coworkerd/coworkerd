@@ -168,7 +168,7 @@ public:
       const std::string& definitionHash,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {},
       kj::Maybe<capnp::Capability::Client> budgetLifetime = kj::none,
-      std::shared_ptr<RequestLease> requestLease = {});
+      std::shared_ptr<RequestLease> requestLease = {}, bool cancelOnIngressEnd = false);
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);
