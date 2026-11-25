@@ -77,6 +77,58 @@ The [database home benchmark](../../docs/database-home-benchmark.md) compares th
 kernels through stateless Worker bindings. Its driver starts a single-node cluster for each side and records
 latency, throughput, CPU time, live database counts and idle memory.
 
+### Database throughput and CPU attribution
+
+The throughput mode of the database home benchmark runs the load generator inside the Compose frontend
+network. It uses one node, one ordinary workerd process and one threaded durable child. Each trial starts
+with a fresh cluster. Run the trial on an otherwise quiet Linux machine with the build tools above.
+The [Linux throughput report](../../docs/database-throughput.md) records the exact product revisions and raw runs.
+
+Build the current Object product and the two products from [the original comparison](../../docs/database-home-benchmark.md).
+The native SQLite experiment was built separately in #59. Its daemon and kernel pin come from that checkout.
+
+```sh
+# Run from the checkout containing this benchmark. Use absolute paths for the product checkouts.
+object_main=$PWD
+git fetch origin refs/pull/59/head
+git worktree add --detach ../object-84 3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd
+git worktree add --detach ../native-84 e88acea9a3630c67388dbccdd994b4d843a953eb
+
+measure() {
+  local side=$1 checkout=$2 report=$3 kernel
+  (cd "$checkout" && bash scripts/build.sh) || return
+  kernel=$(cd "$checkout" && python3 scripts/fetch-kernel.py) || return
+  COWORKERD_CLUSTER_BIN_DIR="$checkout/build" node tests/cluster/database-home-benchmark.mjs \
+    "$side" "$checkout" "$kernel" "$report" --throughput
+}
+
+measure object "$object_main" "$PWD/throughput-object-main.jsonl"
+measure object "$(cd ../object-84 && pwd)" "$PWD/throughput-object-84.jsonl"
+measure native "$(cd ../native-84 && pwd)" "$PWD/throughput-native-84.jsonl"
+```
+
+Finish builds and other CPU or I/O work before starting a timed trial. Use `--throughput-smoke` in place of
+`--throughput` for a short run through every cell. Each report needs a new filename. For hosted runs, repeat the
+matrix on independent instances and preserve all the JSONL recordings. Record the runner label, CPU model and
+vCPU count, memory, and any known competing load.
+
+Each client keeps a connection available and issues one call at a time. A window warms its own route for
+1.5 seconds, measures for 10 seconds and includes the final in-flight replies. One database gets 1, 8 or 32
+clients through one Worker. Eight databases each have a separate Worker and get 8 or 32 clients in total,
+divided equally. The benchmark allows 16 homes and gives each mailbox 64 events and 1 MiB to accommodate
+the offered concurrency. It raises the node placement limits to 512 root and 1,024 nested invocations
+and the process in-flight limit to 512 to give requests time to retire after their HTTP replies. The
+report counts warm-up failures separately and requires all timed requests and all warm-up inserts to
+succeed. The one-Worker controls return the same small body either directly or through a no-op Durable
+Object. A read selects a seeded primary-key row. An insert changes one row and waits for local WAL confirmation
+with zero configured remote peers. The driver verifies the confirmation counters and each affected table.
+
+The `throughput-window` records include successful replies per second, latency percentiles, failures, Linux CPU
+ticks for the four processes and their main and busiest threads, and aggregate Linux CPU activity including
+background processes. A process or thread at 100% uses one logical CPU. Compare the host's busy cores with its
+total logical CPUs, and check I/O wait, steal time, CPU pressure and any cgroup CPU limit when interpreting a
+plateau. The diagnostic output and per-window verification counts follow the same report.
+
 ### Fatal attribution with the test kernel
 
 In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
