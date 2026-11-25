@@ -70,8 +70,8 @@ event. It checks the four-event count limit separately using one-byte declaratio
 still admitted. This is a measurement before request bodies are read, not an actor execution or payload
 allocation workload. It records reservations, RSS, threads and descriptors, cancels the queued calls,
 and checks that reservations and descriptors return to baseline. The final argument varies the object count.
-The `queue-limit 4 64` mode must run with a descriptor limit of 512; the CTest wrapper sets that limit
-only for its own process tree. It asserts refusal at the reservation ceiling, continued control access,
+The `queue-limit 4 64` mode sets a descriptor limit of 512 on its durable child. It asserts refusal
+at the reservation ceiling, continued control access,
 256 descriptors of headroom and full credit return. `queue-memory 4 256` sets a 128 MiB process budget
 and checks refusal at its 16 MiB admission memory ceiling. These queue modes verify the original ready
 PID and generation after release. They do not execute Worker events or exercise V8 allocation failure.
@@ -80,11 +80,11 @@ PID and generation after release. They do not execute Worker events or exercise 
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
@@ -152,6 +152,8 @@ const env = {
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
+const threaded = resolve(dirname(workerd), 'coworkerd-threaded');
+const descriptorLimitedThreaded = join(fixture, 'threaded-fd-limit');
 const workerId = 'counter';
 const token = 'fixture-management-placeholder';
 const config = {
@@ -160,7 +162,8 @@ const config = {
   durableObjects: {
     processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
-  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8 },
+  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8,
+    ...(queueLimit ? { threadedExecutable: descriptorLimitedThreaded } : {}) },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
   peerListenAddress: '127.0.0.1:0',
@@ -258,6 +261,11 @@ let diagnostics = '';
 try {
   const modules = join(fixture, 'workers', workerId, 'v1');
   await mkdir(modules, { recursive: true });
+  if (queueLimit) {
+    await copyFile(new URL('./threaded-durable-fd-limit.test.sh', import.meta.url), descriptorLimitedThreaded);
+    await chmod(descriptorLimitedThreaded, 0o755);
+    await symlink(threaded, `${descriptorLimitedThreaded}.target`);
+  }
   await mkdir(join(fixture, 'runtime'));
   await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = exerciseEvents ? `
@@ -466,7 +474,6 @@ try {
   await refuseStart(/refuses an existing Durable Object storage directory/);
   await unlink(productionDirectory);
 
-  const threaded = join(dirname(workerd), 'coworkerd-threaded');
   await assert.rejects(exec(threaded, ['4', 'unused', 'd0:1', '1', '--durable-test-storage'], {
     env: { ...env, COWORKERD_DO_WAL_FD: '9' },
     timeout: 3000,
@@ -1193,7 +1200,10 @@ try {
       if (queueLimit) {
         assert.ok(refused, 'descriptor reservation ceiling was not reached');
         const limits = await readFile(`/proc/${processInfo.pid}/limits`, 'utf8');
-        const maxFiles = Number(limits.match(/^Max open files\s+(\d+)/m)[1]);
+        const [, soft, hard] = limits.match(/^Max open files\s+(\d+)\s+(\d+)/m);
+        const maxFiles = Number(soft);
+        assert.equal(maxFiles, 512);
+        assert.equal(Number(hard), 512);
         const remaining = maxFiles - 256 - homeCount * 5 - reserved.reservedDescriptors;
         assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 5 : 1));
         assert.ok(full.descriptors <= maxFiles - 256, 'fixed descriptor headroom consumed');
@@ -1519,7 +1529,8 @@ try {
       httpCancellation: httpIsolation, facetStatePreserved: true, sameHomeLifecycle: true, pid: sameChild.pid,
       generation: sameChild.generation, admission: counters}));
   }
-  assert.deepEqual((await readdir(fixture)).sort(), ['node.json', 'runtime', 'workers']);
+  assert.deepEqual((await readdir(fixture)).sort(),
+    ['node.json', 'runtime', ...(queueLimit ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
   child.kill('SIGTERM');
   await exited;
   assert.equal(child.exitCode, 0);

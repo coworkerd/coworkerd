@@ -162,6 +162,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
     if (given({name})) refuse(std::string(name) + " is not a setting any more");
   for (auto name : {"membership", "desiredState"})
     if (given({name, "backend"}) == std::optional<std::string>("etcd")) refuse(std::string(name) + ".backend must be file or objectStore");
+  KJ_REQUIRE(!given({"ingress", "webSocketsPerTenant"}),
+      "ingress.webSocketsPerTenant was removed. Delete it to use the default node limit, "
+      "or set ingress.webSocketsPerNode to a shared limit.");
   capnp::MallocMessageBuilder message;
   auto root = message.initRoot<rpc::ServerConfig>();
   capnp::JsonCodec json;
@@ -282,7 +285,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.suspectProbation = root.getSuspectProbation();
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
-  result.webSocketsPerTenant = root.getIngress().getWebSocketsPerTenant();
+  result.webSocketsPerNode = root.getIngress().getWebSocketsPerNode();
   auto rotation = root.getRotation();
   result.processPool.rotationDrainTimeoutMs = rotation.getDrainTimeoutMs();
   result.processPool.rotationTermGraceMs = rotation.getTermGraceMs();

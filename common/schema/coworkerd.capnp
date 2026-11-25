@@ -471,9 +471,8 @@ struct ServerConfig {
   }
 
   struct IngressConfig {
-    # The open WebSocket connections this node's ingress holds for one tenant: an upgrade beyond them is refused before
-    # the Worker runs, 429 WEBSOCKET_LIMIT, while other requests go on as usual. 0: no limit.
-    webSocketsPerTenant @0 :UInt32 = 1000;
+    # Ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
+    webSocketsPerNode @0 :UInt32;
   }
 
   struct SecretsConfig {
