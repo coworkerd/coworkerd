@@ -398,8 +398,7 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
     add_test(NAME node-threaded-durable-queues COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queues 4 64)
-    add_test(NAME node-threaded-durable-fd-limit COMMAND /bin/sh
-      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-fd-limit.test.sh" "${COWORKERD_TEST_NODE}"
+    add_test(NAME node-threaded-durable-fd-limit COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queue-limit 4 64)
     set_tests_properties(node-threaded-durable-queues node-threaded-durable-fd-limit PROPERTIES TIMEOUT 30)
