@@ -73,6 +73,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the platform database's output-gate watchdog cover both windows. The `io/worker.{h,c++}` hook sets
   that watchdog when the database home is created. The home finishes delivering a database reply
   before it starts the next queued SQL event.
+  Patch 0176 reserves `<tenant>/__databases` for the product SQL class's execution and metering
+  while the platform definition still supplies its code and isolate copy key.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
