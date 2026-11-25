@@ -2,6 +2,7 @@
 #include "config.h"
 #include "code-package.h"
 #include "invocation-contract.h"
+#include "ingress-descriptors.h"
 #include "event-loop.h"
 #include "memory-events.h"
 #include "tenant-line.h"
@@ -61,6 +62,31 @@ void nativeConfig() {
   const auto disabled = ServerConfig::load(directory / "disabled.json");
   KJ_REQUIRE(disabled.processPool.tenantInFlightLimit == 0 && disabled.processPool.tenantAdmissionWaitMs == 25);
   disabled.processPool.validate();
+}
+
+void ingressDescriptorPlan() {
+  // Default pool budget for one ordinary, two quarantine and one durable process plus a replacement.
+  constexpr uint64_t pool = 11136;
+  struct Case {
+    const char* name;
+    uint64_t soft, hard;
+    uint32_t configured, requested, sockets;
+    uint64_t effectiveSoft;
+  };
+  for (const auto& row : {
+      Case{"low inherited soft", 1024, 524288, 0, 2048, 2048, 15488},
+      Case{"service soft limit", 65536, 65536, 0, 2048, 2048, 65536},
+      Case{"unlimited", UINT64_MAX, UINT64_MAX, 0, 2048, 2048, UINT64_MAX},
+      Case{"one slot", 1024, 11395, 0, 2048, 1, 11394},
+      Case{"zero slots", 1024, 11393, 0, 2048, 0, 1024},
+      Case{"above hard limit", 1024, 65536, 30000, 30000, 27072, 65536},
+      Case{"above default", 1024, 65536, 20000, 20000, 20000, 51392},
+      Case{"small override", 1024, 524288, 2, 2, 2, 11396},
+  }) {
+    const auto plan = planIngressDescriptors(row.soft, row.hard, pool, row.configured);
+    KJ_REQUIRE(plan.requested == row.requested && plan.webSockets == row.sockets &&
+        plan.softLimit == row.effectiveSoft, row.name, plan.requested, plan.webSockets, plan.softLimit);
+  }
 }
 
 void tenantExecution() {
@@ -766,6 +792,7 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
+  else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
