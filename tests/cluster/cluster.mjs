@@ -307,7 +307,7 @@ export class Cluster {
     return { name, path, token };
   }
 
-  async deploy(tenant, name, source, { version = 'v1', wrangler = {} } = {}) {
+  async deploy(tenant, name, source, { version = 'v1', wrangler = {}, activate = true } = {}) {
     const cwd = join(this.directory, `${tenant.name}-${name}`);
     await mkdir(cwd, { recursive: true });
     await Promise.all([
@@ -319,7 +319,9 @@ export class Cluster {
         tenant: tenant.name, controlPlane: this.urls.apiserver, ingress: this.urls[nodes[0]], worker: name,
       })),
     ]);
-    console.log(await this.command(process.execPath, [join(root, 'cli/bin/cowctl.mjs'), 'deploy', '--version', version], {
+    const args = [join(root, 'cli/bin/cowctl.mjs'), 'deploy', '--version', version];
+    if (!activate) args.push('--no-activate');
+    console.log(await this.command(process.execPath, args, {
       cwd, token: tenant.token,
     }));
   }

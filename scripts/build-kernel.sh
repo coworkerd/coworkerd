@@ -34,6 +34,7 @@ bazel --output_user_root="$RUNNER_TEMP/kernel-bazel" test --config=release --job
   --build_tests_only --local_test_jobs=1 --cache_test_results=no --test_output=errors \
   //src/workerd/server/factory/... //src/workerd/threaded/... \
   //src/workerd/io:actor-sqlite-test@ //src/workerd/io:actor-sqlite-test@all-autogates \
+  //src/workerd/util:sqlite-test@ \
   //src/workerd/server:channel-token-test@ //src/workerd/server:channel-token-test@all-autogates \
   || test_status=$?
 printf '### Bazel kernel tests\n\nElapsed after the executable build: %d s. Bazel exit: %d.\n\n' \

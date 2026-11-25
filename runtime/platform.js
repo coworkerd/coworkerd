@@ -1,1 +1,5 @@
-export { SqlDatabase } from "./sql-database.js";
+import { SqlDatabase as SharedSqlDatabase } from "./sql-database.js";
+
+export class SqlDatabase extends SharedSqlDatabase {
+  static wallDeadline = true;
+}

@@ -310,8 +310,8 @@ public:
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-      std::function<void()> onDispatched,
-      std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready);
+      std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
+      kj::Own<kj::PromiseFulfiller<void>> ready, std::shared_ptr<ProcessCall> sqlCall);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
@@ -320,11 +320,12 @@ public:
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
-      std::function<void()> onCapacityRejected) {
+      std::function<void()> onCapacityRejected, std::shared_ptr<ProcessCall> sqlCall) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))),
+          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller),
+          std::move(sqlCall))),
           kj::mv(ready.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
@@ -365,8 +366,8 @@ private:
 
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-    std::function<void()> onDispatched,
-    std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready) {
+    std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
+    kj::Own<kj::PromiseFulfiller<void>> ready, std::shared_ptr<ProcessCall> sqlCall) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -378,6 +379,15 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     next.fulfiller->fulfill();
   });
   try {
+    if (sqlCall) {
+      // Outstanding capabilities can keep the RPC connection alive. Signal the
+      // home even when it is synchronously stepping SQLite and cannot drain RPC.
+      sqlCall->closeSqlInput = [weak = std::weak_ptr<RuntimeConnection>(connection)] {
+        if (auto active = weak.lock(); active && active->stream.get() != nullptr) {
+          KJ_IF_SOME(fd, active->stream->getFd()) { (void)::shutdown(fd, SHUT_WR); }
+        }
+      };
+    }
     // No Cap'n Proto bytes may precede this raw routing prefix.
     auto prefix = kj::str("T");
     if (threadedDurable) {
@@ -397,6 +407,8 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       if (idle.empty()) connection->stream = co_await address->connect();
       else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
       replenish();
+      if (sqlCall && sqlCall->sqlClientGone)
+        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "SQL client disconnected before dispatch"));
       co_await connection->stream->write(prefix.asBytes());
       char decision;
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
@@ -1406,6 +1418,10 @@ ProcessCall::ProcessCall(std::shared_ptr<ProcessGeneration> process, std::string
   if (!this->tenant.empty()) this->process->tenantExecution->enter(this->tenant);
 }
 ProcessCall::~ProcessCall() { finish(); }
+void ProcessCall::sqlClientDisconnected() noexcept {
+  sqlClientGone = true;
+  if (closeSqlInput) closeSqlInput();
+}
 void ProcessCall::snapshotAfterFailure() noexcept {
   if (process->crashInFlight) return;
   try {
@@ -4226,7 +4242,8 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
   return result;
 }
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
-    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime) {
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
+    bool threadedSql) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat.touch(hash, mono());
@@ -4242,7 +4259,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call] {
     call->capacityRejected = true;
     if (call->onCapacityRejected) call->onCapacityRejected();
-  });
+  }, threadedSql ? call : nullptr);
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     return call->rejectAfterCrash(kj::mv(error));
   }).attach(std::shared_ptr<ProcessCall>(call));

@@ -309,6 +309,8 @@ struct ObjectInvocation {
   # For platform namespaces the owner resolves this class reference against its own build.
   platformDefinition @23 :Text;
   platformClass @24 :Text;
+  # SQL wall time left at the sender. Older nodes omit the field.
+  sqlRemainingMs @25 :Float64 = -1;
 }
 
 struct ServerConfig {

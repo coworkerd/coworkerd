@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createRequire } from 'node:module';
+import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertStatus, eventually, json, request } from './cluster.mjs';
@@ -182,6 +184,33 @@ async function sqlAtomicity(cluster) {
   assert.deepEqual(await read(), rows, 'the failed transaction left the committed rows intact');
 }
 
+async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, successors } = {}) {
+  const databases = new Map([...counts.keys()].map(node => [node, []]));
+  let revision = 0;
+  for (let i = 0; i < limit && [...counts].some(([node, count]) => databases.get(node).length < count); i++) {
+    const path = `${tenant.path}/databases/db-${i}`;
+    const { database, revision: createdAt } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    revision = Math.max(revision, createdAt);
+    // Rendezvous order determines the first owner and the successor used in takeover tests.
+    const [owner, successor] = databaseOwnerOrder(cluster, database.namespaceId);
+    const selected = databases.get(owner);
+    const expectedSuccessor = successors?.get(owner);
+    if (selected && selected.length < counts.get(owner) && (!expectedSuccessor || expectedSuccessor === successor)) {
+      selected.push({ ...database, path, owner });
+    }
+  }
+  for (const [node, count] of counts) assert.equal(databases.get(node).length, count, `database placement on ${node}`);
+  assert.ok(revision > 0, 'database creation returns a catalog revision');
+  // Avoid opening a shard while its designated owner is still waiting for the namespace catalog.
+  await eventually('all peers have applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const state = await cluster.state(node);
+      assert.ok(Number(state.storage.appliedTenantsRevision) >= revision, `${node} has applied revision ${revision}`);
+    }));
+  });
+  return { databases, revision };
+}
+
 async function threadedDatabaseRelease(cluster) {
   const { path, token } = await cluster.tenant('sql-release');
   const database = `${path}/databases/ledger`;
@@ -289,30 +318,10 @@ async function threadedDatabasePlacement(cluster) {
     console.log(`Database compatibility binaries (SHA-256): upstream=${previous}, threaded=${current}`);
   }
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 128 });
-  const databases = new Map([[threaded, []], [upstream, []]]);
-  let revision = 0;
-  for (let i = 0; i < 96 && (databases.get(threaded).length < 2 || databases.get(upstream).length < 1); i++) {
-    const path = `${tenant.path}/databases/db-${i}`;
-    const created = await cluster.api(path, { method: 'POST', token: tenant.token });
-    const { database } = created;
-    revision = Math.max(revision, created.revision);
-    // Select shards whose first two rendezvous choices let us exercise takeover in both directions.
-    const [owner, successor] = databaseOwnerOrder(cluster, database.namespaceId);
-    const selected = databases.get(owner);
-    if (selected && successor === (owner === threaded ? upstream : threaded) &&
-        selected.length < (owner === threaded ? 2 : 1)) selected.push({ ...database, path, owner });
-  }
-  assert.equal(databases.get(threaded).length, 2, 'two databases are assigned to the same threaded owner');
-  assert.equal(databases.get(upstream).length, 1, 'one database is assigned to the upstream owner');
-  const selected = [...databases.values()].flat();
-  assert.ok(revision > 0, 'database creation returns a catalog revision');
-  // Avoid opening a shard while its designated owner is still waiting for the namespace catalog.
-  await eventually('all peers have applied the database catalog', async () => {
-    await Promise.all(cluster.nodes.map(async node => {
-      const state = await cluster.state(node);
-      assert.ok(Number(state.storage.appliedTenantsRevision) >= revision, `${node} has applied revision ${revision}`);
-    }));
+  const { databases, revision } = await createDatabaseHomes(cluster, tenant, new Map([[threaded, 2], [upstream, 1]]), {
+    limit: 96, successors: new Map([[threaded, upstream], [upstream, threaded]]),
   });
+  const selected = [...databases.values()].flat();
   const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
     const address = await cluster.compose(['port', node, '8934']);
     assert.match(address, /^127\.0\.0\.1:\d+$/);
@@ -435,6 +444,185 @@ async function threadedDatabasePlacement(cluster) {
     }));
   }, { timeout: 45000 });
   await takeOver(threaded, upstream);
+}
+
+async function threadedSqlDeadline(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-deadline', { durableObjectNamespaces: 48 });
+  const { databases: homes } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 4]]));
+  const databases = homes.get(owner);
+  const sql = (db, body, timeout = 40000) => request(cluster.urls.apiserver, `${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, timeout });
+  const read = { sql: 'SELECT id FROM ledger ORDER BY id' };
+  const put = id => ({ sql: 'INSERT INTO ledger VALUES (?)', params: [id] });
+  const long = 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000000)';
+  const select = `${long} SELECT sum(n) FROM r`;
+  const insert = `${long} INSERT INTO ledger SELECT sum(n) FROM r`;
+  const medium = select.replace('1000000000', '2000000');
+  for (const db of databases) {
+    await eventually(`${db.name} reaches its database home`, async () => {
+      assert.equal(json(await sql(db, { sql: 'SELECT 1' }), 200, db.name).success, true);
+    });
+    assert.equal(json(await sql(db, { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' }), 200, db.name).success, true);
+    assert.equal(json(await sql(db, put(1)), 200, db.name).success, true);
+  }
+  const original = await eventually('four database homes are resident on the threaded owner', async () => {
+    const snapshot = await durableGeneration(cluster, owner);
+    assert.equal(snapshot.lifecycle.durableServer, 'threaded');
+    assert.equal(snapshot.lifecycle.durableAdmission.residentRoots, databases.length);
+    return snapshot;
+  });
+
+  const measuredAt = performance.now();
+  assert.equal(json(await sql(databases[0], { sql: medium }), 200, 'one short statement').success, true);
+  const repeats = Math.max(180, Math.ceil(85000 / (performance.now() - measuredAt)));
+  const batch = [put(2), ...Array(repeats).fill({ sql: medium })];
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, env) {
+    const { searchParams } = new URL(request.url);
+    const db = env['DB' + searchParams.get('db')];
+    try {
+      switch (searchParams.get('op')) {
+        case 'single': return Response.json(await db.prepare(${JSON.stringify(select)}).all());
+        case 'batch': return Response.json(await db.batch(${JSON.stringify(batch)}.map(q => db.prepare(q.sql).bind(...(q.params ?? [])))));
+        case 'write': return Response.json(await db.batch([db.prepare('INSERT INTO ledger VALUES (2)'), db.prepare(${JSON.stringify(insert)})]));
+        default: return Response.json((await db.prepare(${JSON.stringify(read.sql)}).all()).results);
+      }
+    } catch (e) {
+      return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 });
+    }
+  } };`, { wrangler: { d1_databases: databases.map((db, index) => ({ binding: `DB${index}`, database_name: db.name })) } });
+  const bindingPath = (i, op = 'read') => `/${tenant.name}/probe?db=${i}&op=${op}`;
+  const binding = (i, op) => request(cluster.urls[ingress], bindingPath(i, op), { timeout: 40000 });
+  for (const [i, db] of databases.entries()) {
+    await eventually(`${db.name} is reachable by its D1 binding`, async () => {
+      assert.deepEqual(json(await binding(i), 200, db.name), [{ id: 1 }]);
+    });
+  }
+
+  const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
+  const withTiming = async (label, run, check) => {
+    const started = performance.now();
+    const result = json(await run(), 503, label);
+    const elapsed = performance.now() - started;
+    check(result);
+    assert.ok(elapsed >= 28500 && elapsed < 32000, `${label} took ${elapsed.toFixed(1)} ms`);
+    console.log(`${label}: ${elapsed.toFixed(1)} ms`);
+  };
+  const checkHttp = result => {
+    assert.equal(result.code, 'SQL_LIMIT_EXCEEDED', JSON.stringify(result));
+    assert.equal(result.reason, reason);
+  };
+  const checkBinding = result => {
+    assert.equal(result.message, `D1_ERROR: ${reason}`, JSON.stringify(result));
+    assert.equal(result.cause, reason);
+  };
+  await Promise.all([
+    withTiming('HTTP single deadline', () => sql(databases[0], { sql: select }), checkHttp),
+    withTiming('HTTP batch deadline', () => sql(databases[1], batch), checkHttp),
+    withTiming('D1 single deadline', () => binding(2, 'single'), checkBinding),
+    withTiming('D1 batch deadline', () => binding(3, 'batch'), checkBinding),
+    delay(2500).then(() => withTiming('HTTP deadline includes time queued behind another query',
+      () => sql(databases[0], { sql: select }), checkHttp)),
+  ]);
+  for (const [i, db] of databases.entries()) {
+    assert.deepEqual(json(await sql(db, read), 200, db.name).results, [{ id: 1 }]);
+    assert.deepEqual(json(await binding(i), 200, db.name), [{ id: 1 }]);
+  }
+
+  const activity = async (running, waiting = 0) => {
+    const snapshot = await durableGeneration(cluster, owner);
+    assert.equal(snapshot.pid, original.pid);
+    assert.equal(snapshot.generation, original.generation);
+    assert.equal(snapshot.lifecycle.durableAdmission.running, running);
+    assert.equal(snapshot.lifecycle.durableAdmission.waiting, waiting);
+  };
+  const sqlWire = (db, value) => {
+    const url = new URL(`${db.path}/query`, cluster.urls.apiserver);
+    const body = JSON.stringify(value);
+    return `POST ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${tenant.token}\r\n` +
+      `Content-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`;
+  };
+  const apiserverUrl = new URL(cluster.urls.apiserver);
+  const halfClosed = createConnection({ host: apiserverUrl.hostname, port: Number(apiserverUrl.port) });
+  const chunks = [];
+  halfClosed.on('data', chunk => chunks.push(chunk));
+  try {
+    halfClosed.end(sqlWire(databases[0], { sql: medium }));
+    await once(halfClosed, 'end', { signal: AbortSignal.timeout(5000) });
+    const reply = Buffer.concat(chunks).toString();
+    assert.match(reply, /^HTTP\/1\.1 200 /, 'a SQL client can half-close its write side');
+    const body = JSON.parse(reply.slice(reply.indexOf('\r\n\r\n') + 4));
+    assert.deepEqual(body.results, [{ 'sum(n)': 2000001000000 }], 'a half-closed client receives the complete result');
+  } finally {
+    halfClosed.destroy();
+  }
+
+  const write = [put(2), { sql: insert }];
+  const checkQueuedHttp = result => {
+    const failure = json(result, 503, 'HTTP read queued when a write reset the database');
+    assert.equal(failure.code, 'DO_UNAVAILABLE', JSON.stringify(failure));
+  };
+  const checkQueuedBinding = result => {
+    const failure = json(result, 503, 'D1 read queued when a write reset the database');
+    assert.match(failure.message, /^D1_ERROR: .*DO_UNAVAILABLE/);
+    assert.match(failure.cause, /DO_UNAVAILABLE/);
+  };
+  const openSamples = async () => (await cluster.state(owner)).durableLog.threadedHomeIo.openSamples;
+  const reopened = async (db, label, run, results) => {
+    const before = await openSamples();
+    await eventually(`${label} reopens ${db.name} after its write was rolled back`, async () => {
+      assert.deepEqual(results(json(await run(), 200, label)), [{ id: 1 }]);
+    }, { timeout: 5000, interval: 50 });
+    assert.equal(await openSamples(), before + 1, `${label} needed a fresh SQLite open`);
+    await eventually(`${label} keeps the same process`, () => activity(0));
+  };
+
+  await eventually('SQL homes are idle before the live write deadlines', () => activity(0));
+  const timedWrites = Promise.all([
+    withTiming('HTTP write deadline', () => sql(databases[0], write), checkHttp),
+    withTiming('D1 write deadline', () => binding(2, 'write'), checkBinding),
+  ]);
+  void timedWrites.catch(() => {});
+  await eventually('both writes are running before requests queue behind them', () => activity(2));
+  const queued = Promise.all([sql(databases[0], read), binding(2, 'read')]);
+  void queued.catch(() => {});
+  await eventually('an HTTP and a D1 query are queued behind the writes', () => activity(2, 2));
+  await timedWrites;
+  const [queuedHttp, queuedBinding] = await queued;
+  checkQueuedBinding(queuedBinding);
+  checkQueuedHttp(queuedHttp);
+  await reopened(databases[0], 'HTTP after its write deadline', () => sql(databases[0], read, 1500), reply => reply.results);
+  await reopened(databases[2], 'D1 after its write deadline', () => binding(2, 'read'), reply => reply);
+
+  // Send the reset directly to the listener. A Docker port proxy can turn it into a FIN.
+  const apiserver = await cluster.compose(['ps', '-q', 'apiserver']);
+  const writer = spawn('docker', ['run', '--rm', '-i', '--network', `container:${apiserver}`,
+    'node:22-trixie', 'node', '-e', `
+      const { createConnection } = require('node:net');
+      const { createInterface } = require('node:readline');
+      const socket = createConnection({ host: '127.0.0.1', port: 8940 });
+      const input = createInterface({ input: process.stdin });
+      input.once('line', line => socket.write(JSON.parse(line)));
+      input.once('close', () => socket.resetAndDestroy());
+    `], { cwd: cluster.directory, env: cluster.env, stdio: ['pipe', 'ignore', 'inherit'], signal: cluster.signal });
+  const writerClosed = once(writer, 'close');
+  void writerClosed.catch(() => {});
+  writer.stdin.on('error', () => {});
+  try {
+    writer.stdin.write(`${JSON.stringify(sqlWire(databases[0], write))}\n`);
+    await eventually('the HTTP write is running before disconnect', () => activity(1));
+    const behindDisconnect = sql(databases[0], read, 5000);
+    void behindDisconnect.catch(() => {});
+    await eventually('the read is queued behind the HTTP write', () => activity(1, 1));
+    const disconnectedAt = performance.now();
+    writer.stdin.end();
+    assert.deepEqual(await writerClosed, [0, null], 'the TCP client sent its reset');
+    checkQueuedHttp(await behindDisconnect);
+    await reopened(databases[0], 'HTTP after disconnect', () => sql(databases[0], read, 1500), reply => reply.results);
+    console.log(`HTTP disconnect and recovery: ${(performance.now() - disconnectedAt).toFixed(1)} ms`);
+  } finally {
+    writer.stdin.end();
+  }
 }
 
 async function invocationBudgets(cluster) {
@@ -2020,10 +2208,11 @@ async function threadedClassMigration(cluster) {
       }));
     } };
   `;
-  const deploy = (version, className, migrations) => cluster.deploy(tenant, name, source(className, version), {
-    version, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
+  const deploy = (version, className, migrations, activate = true) => cluster.deploy(tenant, name, source(className, version), {
+    version, activate, wrangler: { migrations, durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] } },
   });
   await deploy('v1', 'Record', [initial]);
+  await deploy('v2', 'RenamedRecord', [initial, renamed], false);
   const first = await eventually('v1 creates a threaded record', async () => {
     const value = json(await call('', { method: 'POST', body: 'retained' }), 200, 'write v1');
     assert.equal(value.version, 'v1');
@@ -2056,8 +2245,6 @@ async function threadedClassMigration(cluster) {
   await assertStreamingStatus(heldRpc, 200, 'retained RPC stream');
   const rpcReader = heldRpc.body.getReader();
   assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'retained:v1');
-  const due = Date.now() + 8000;
-  assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
   const waiting = call('/wait-for-headers', { timeout: 60000 }).then(
     value => ({ value }), error => ({ error }),
   );
@@ -2070,12 +2257,16 @@ async function threadedClassMigration(cluster) {
   try {
     const firstChunk = await reader.read();
     assert.equal(Buffer.from(firstChunk.value).toString(), 'entered:');
-    await deploy('v2', 'RenamedRecord', [initial, renamed]);
+    // v2 is already packaged and uploaded. The alarm is due within the ten-second version drain.
+    const due = Date.now() + 9000;
+    assert.equal(json(await call('/alarm', { method: 'POST', body: due }), 200, 'schedule v1 alarm'), due);
+    await cluster.api(`${tenant.path}/workers/${name}/versions/v2:activate`, { method: 'POST', token: tenant.token });
     await eventually('the first v2 request is refused while v1 still holds the tree', async () => {
       const response = await call('');
       assertStatus(response, 503, 'the first v2 request while v1 still holds the tree');
       assert.match(response.text, /DO_VERSION_DRAINING/);
     });
+    assert.ok(Date.now() < due, 'the v2 version drain starts before the scheduled alarm is due');
     const oldChunk = await reader.read();
     assert.match(Buffer.from(oldChunk.value).toString(), /^(v1)+$/, 'an open stream keeps its code pin');
     await assert.rejects(async () => {
@@ -2409,7 +2600,8 @@ async function threadedSocketHibernation(cluster) {
     assert.equal(treeLimit.status, 422, JSON.stringify(treeLimit.body));
     assert.equal(treeLimit.body.name, 'NotSupportedError');
     assert.match(treeLimit.body.message, /1 MiB/);
-    await Promise.all(largeSockets.map((socket, i) => closeFacet(socket, 'delete', `large-${i}`)));
+    // Each deletion also schedules a close event on this home.
+    for (const [i, socket] of largeSockets.entries()) await closeFacet(socket, 'delete', `large-${i}`);
 
     await closeFacet(await openFacet('idle-abort'), 'abort', 'idle-abort');
     const busy = await openFacet('busy-abort');
@@ -2827,6 +3019,9 @@ export const durableGatedCases = {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'threaded-sql-deadline': {
+    test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {

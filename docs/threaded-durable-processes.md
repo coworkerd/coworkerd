@@ -366,6 +366,30 @@ Preserve local filesystem bounds and declare
 any native operation without a proven interruption path a release blocker for that execution path.
 [Existing database API and error contract](guide/databases.md).
 
+The threaded object database test path starts one 30-second monotonic deadline at the HTTP SQL
+handler or D1 binding dispatch. Nodes forward the time remaining. Time spent receiving the HTTP
+body, waiting for placement or storage recovery, preparing and stepping SQLite, and encoding
+results counts against the same deadline. Every statement in a batch sees that deadline. The
+home releases the prior database response before advancing its queue, so the next synchronous
+statement cannot delay delivery of an earlier result. The public timeout is `503 SQL_LIMIT_EXCEEDED`.
+A binding query or batch reports `D1_ERROR` with that code. WAL confirmation starts with a fresh
+clock after SQLite work and retains its error priority. The platform database's output gate allows
+time for both phases before its watchdog fires.
+
+A detected full disconnect on the HTTP SQL route cancels the relay and closes the write side of
+the event's dedicated kernel connection. The SQLite progress callback detects it during synchronous
+execution. A client can shut down its TCP write side and still receive the complete SQL reply.
+A D1 call can continue to its SQL deadline after the Worker’s HTTP caller disconnects. Propagating
+that outer disconnect to the binding call depends on [#66](https://github.com/coworkerd/coworkerd/pull/66).
+
+If SQLite interrupts a write, it rolls back the transaction and the database resets in the current
+process. Queued HTTP SQL receives `503 DO_UNAVAILABLE`, and queued D1 reports `D1_ERROR` with
+that code. A later query opens the database again and sees the last confirmed rows. A deadline or
+disconnect at the commit check after response assembly can also reset the database, including
+after reads. Keeping the database open across these errors is a release prerequisite. SQLite
+functions and file operations without progress callbacks remain release blockers wherever they
+can outlast the deadline. The database placement fixture selects this behavior in the test build.
+
 ### Decisions taken in review
 
 The four points below were open when the design was written. Each ends with what the review of the design
