@@ -4071,6 +4071,17 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
       rejectionJson(code, reason, expiresAtMonotonicMs), code));
 }
 
+rpc::EventDispatcher::Client makeD1BudgetRejection(
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, const char* code,
+    const std::string& reason) {
+  // Native D1 clients read the error field. The legacy shim also uses the structured code and reason.
+  const auto detail = jsonEscape(cleanReason(reason));
+  const auto body = "{\"success\":false,\"code\":\"" + std::string(code) + "\",\"reason\":\"" + detail +
+      "\",\"error\":\"" + code + ": " + detail + "\"}";
+  return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
+      factory, headerTable, 429, "Too Many Requests", body, code));
+}
+
 const char* statusText(uint status) {
   switch (status) {
     case 200: return "OK";
@@ -8085,8 +8096,7 @@ public:
         if (reason.find("D1 query budget exhausted") != std::string::npos) {
           auto detail = server.lastRejectionReason();
           server.observeLocalRefusal(server.refusal("D1_QUERY_BUDGET_EXHAUSTED", detail, 429), "durableObject");
-          context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, 429, "Too Many Requests",
-              "D1_QUERY_BUDGET_EXHAUSTED", std::move(detail), expiresAtMonotonicMs));
+          context.initResults().setDispatcher(makeD1BudgetRejection(factory, headerTable, "D1_QUERY_BUDGET_EXHAUSTED", detail));
           co_return;
         }
         const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
@@ -8096,8 +8106,10 @@ public:
         if (detail.empty()) detail = reason;
         const char* code = budget ? "SUBREQUEST_BUDGET_EXHAUSTED" : "LEASE_EXPIRED";
         server.observeLocalRefusal(server.refusal(code, detail, budget ? 429 : 410), "durableObject");
-        context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, budget ? 429 : 410,
-            budget ? "Too Many Requests" : "Gone", code, std::move(detail), expiresAtMonotonicMs));
+        context.initResults().setDispatcher(budget && request.target.isDatabase()
+            ? makeD1BudgetRejection(factory, headerTable, code, detail)
+            : makeRejectionDispatcher(factory, headerTable, budget ? 429 : 410,
+                budget ? "Too Many Requests" : "Gone", code, std::move(detail), expiresAtMonotonicMs));
         co_return;
       }
       auto dispatched = co_await durable.dispatch(std::move(request));

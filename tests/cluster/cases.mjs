@@ -180,28 +180,38 @@ async function invocationBudgets(cluster) {
   const [node] = cluster.nodes;
   const tenant = await cluster.tenant('invocation-budget');
   const bindings = [{ binding: 'CHILD', service: 'budget-child' }];
-  const child = `export default { fetch(request) {
+  const child = `export default { async fetch(request, env) {
+    if (new URL(request.url).pathname === '/nested') {
+      const next = await env.CHILD.fetch('https://binding.test/');
+      return Response.json([request.cf.lease.grant, await next.json()]);
+    }
     return Response.json(request.cf.lease.grant);
   } };`;
   const root = `export default { async fetch(request, env) {
-    const count = Number(new URL(request.url).searchParams.get('count') ?? '0');
+    const params = new URL(request.url).searchParams;
+    const count = Number(params.get('count') ?? '0');
     const grants = [];
     let refusal;
     for (let i = 0; i < count; i++) {
-      const reply = await env.CHILD.fetch('https://binding.test/');
+      const reply = await env.CHILD.fetch(params.has('nested') ? 'https://binding.test/nested' : 'https://binding.test/');
       if (!reply.ok) { refusal = await reply.json(); break; }
       grants.push(await reply.json());
     }
     return Response.json({ rootGrant: request.cf.lease.grant, grants, refusal: refusal?.code });
   } };`;
-  await cluster.deploy(tenant, 'budget-child', child);
+  await cluster.deploy(tenant, 'budget-leaf', child);
+  await cluster.deploy(tenant, 'budget-child', child,
+    { wrangler: { services: [{ binding: 'CHILD', service: 'budget-leaf' }] } });
   await cluster.deploy(tenant, 'budget-root', root, { wrangler: { services: bindings } });
-  const call = async (worker, count) => json(await workerCall(cluster, node, tenant, worker + '?count=' + count),
+  const call = async (worker, count, nested = false) => json(
+    await workerCall(cluster, node, tenant, `${worker}?count=${count}${nested ? '&nested' : ''}`),
     200, 'the budget test Worker handled its request');
   const normal = await call('budget-root', 100);
   assert.equal(normal.rootGrant, 10_000);
   assert.deepEqual(normal.grants, Array(100).fill(78));
   assert.equal(normal.refusal, undefined);
+  const nested = await call('budget-root', 1, true);
+  assert.deepEqual(nested.grants, [[78, 58]]);
 
   await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { subrequests: 5, d1Queries: 2 } } });
   const lower = await eventually('tenant budget is visible', async () => {
@@ -218,6 +228,7 @@ async function invocationBudgets(cluster) {
 
   await cluster.deploy(tenant, 'budget-egress', `export default { async fetch(request, env) {
     const reply = await env.CHILD.fetch('https://binding.test/');
+    if (!reply.ok) return reply;
     await reply.text();
     try {
       await fetch('http://127.0.0.1/');
