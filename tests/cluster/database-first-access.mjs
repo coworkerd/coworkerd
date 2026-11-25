@@ -8,6 +8,7 @@ import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [kernel, mode, countArg, ...extra] = process.argv.slice(2);
 const count = mode === 'cold' ? 200 : Number(countArg);
+const measureBaseline = process.env.COWORKERD_RECOVERY_MEASURE_BASELINE === '1';
 if (!kernel || !['cold', 'loss'].includes(mode) || extra.length ||
     (mode === 'cold' ? countArg !== undefined : ![100, 500, 1000, 2000].includes(count))) {
   console.error('Usage: node tests/cluster/database-first-access.mjs <kernel> <cold | loss <100|500|1000|2000>>');
@@ -57,10 +58,19 @@ async function databases(tenant, total) {
   return selected;
 }
 
-async function query(node, database, sql, value) {
-  const response = await request(peerUrls[node], `/__coworkerd/databases/${tenantName}/${database.name}/query`,
-    { method: 'POST', token: cluster.management, timeout: 35000, body: { sql } });
-  const answer = json(response, 200, database.name);
+async function query(node, database, sql, retries = 0) {
+  const path = `/__coworkerd/databases/${tenantName}/${database.name}/query`;
+  const options = { method: 'POST', token: cluster.management, timeout: 35000, body: { sql } };
+  let response = await request(peerUrls[node], path, options);
+  for (let remaining = retries; remaining > 0 && response.status === 503; --remaining) {
+    write('seed-retry', { database: database.name, status: response.status, response: response.text });
+    await delay(250, undefined, { signal: controller.signal });
+    response = await request(peerUrls[node], path, options);
+  }
+  return json(response, 200, database.name);
+}
+
+function verifyRow(database, answer, value) {
   assert.equal(answer.success, true, JSON.stringify(answer).slice(0, 500));
   assert.deepEqual(answer.results, [{ value }], database.name);
 }
@@ -78,40 +88,62 @@ async function hostSample(node) {
 }
 
 async function scheduler(node) {
-  const { membership, durableLog, peerConnectBudget, processes } = await cluster.state(node);
+  const { membership, durableLog, durableShards, peerConnectBudget, processes } = await cluster.state(node);
   const { entries, ...metrics } = durableLog.recovery.scheduler;
   const durable = processes.entries.find(entry => entry.processClass === 'durable');
   return { ...metrics, leaseFences: membership.leaseFences, leaseLosses: durableLog.confirm.leaseLosses,
     peakPeerConnect: peerConnectBudget?.peak, activeRebuilds: durableLog.objects.activeRebuilds,
-    durableGeneration: durable?.generation, durableLastExit: durable?.lastExitCategory };
+    durableGeneration: durable?.generation, durableExitCount: durable?.exitCount,
+    durableLastExit: durable?.lastExitCategory, durableProbeFailures: durable?.probeFailures,
+    durablePeakProbeMs: Math.max(0, ...(durable?.probeDelayMs ?? [])),
+    store: { log: durableLog.storeClient, shards: durableShards.store, membership: membership.storeClient },
+    heartbeatPut: membership.heartbeatPut };
 }
 
 async function logs(node, since) {
   const container = await cluster.compose(['ps', '-a', '-q', node]);
-  const output = await cluster.command('docker', ['logs', '--since', since, container],
+  const output = await cluster.command('docker', ['logs', '--timestamps', '--since', since, container],
     { timeout: 30000, maxBuffer: 32 * 1024 * 1024 });
   const entries = [];
+  const watchdog = new Map();
   for (const line of output.split('\n')) {
     const index = line.indexOf('[do-log] {');
-    if (index >= 0) entries.push(JSON.parse(line.slice(index + '[do-log] '.length)));
+    if (index >= 0) entries.push({ ...JSON.parse(line.slice(index + '[do-log] '.length)),
+      loggedAtMs: Date.parse(line.slice(0, line.indexOf(' '))) });
+    for (const marker of ['[process-kill] ', '[process] ']) {
+      const index = line.indexOf(marker + '{');
+      if (index < 0) continue;
+      const event = JSON.parse(line.slice(index + marker.length));
+      if (event.processClass !== 'durable' || event.reason !== 'watchdog timeout') continue;
+      const key = `${event.processId}/${event.generation}`;
+      if (marker === '[process-kill] ' || (event.event === 'exit' && !watchdog.has(key))) watchdog.set(key, event);
+    }
   }
-  return entries;
+  return { entries, watchdog: [...watchdog.values()] };
 }
 
 async function measureLogs(node, since, selected) {
   const byNamespace = new Map(selected.map(database => [database.namespace, database]));
   const samples = new Map();
   const waits = new Map();
+  const starts = new Map();
+  const rebuiltAt = [];
   let additionalRebuilds = 0;
-  for (const entry of await logs(node, since)) {
+  const { entries, watchdog } = await logs(node, since);
+  for (const entry of entries) {
+    if (entry.event === 'rebuild-started') {
+      const [namespace] = entry.object.split('/');
+      if (byNamespace.has(namespace)) starts.set(namespace, (starts.get(namespace) ?? 0) + 1);
+    }
     if (entry.event === 'rebuilt') {
       const [namespace] = entry.object.split('/');
       if (!byNamespace.has(namespace)) continue;
+      rebuiltAt.push(entry.loggedAtMs);
       if (samples.has(namespace)) {
         assert.equal(mode, 'loss', `${node} repeated cold rebuild of ${namespace}`);
         ++additionalRebuilds;
       } else {
-        samples.set(namespace, entry.laps.tailWaitMs);
+        samples.set(namespace, entry);
       }
     }
     if (entry.event === 'measurement-epoch-gate') {
@@ -122,11 +154,17 @@ async function measureLogs(node, since, selected) {
     }
   }
   assert.equal(samples.size, selected.length, `${node} rebuilt all its assigned databases`);
+  assert.equal(starts.size, selected.length, `${node} started all its assigned rebuilds`);
   for (const database of selected) {
-    database.tailWaitMs = samples.get(database.namespace);
+    database.tailWaitMs = samples.get(database.namespace).laps.tailWaitMs;
+    database.rebuildLoopDelayMs = samples.get(database.namespace).loopDelayMs;
+    database.rebuiltAtMs = samples.get(database.namespace).loggedAtMs;
     database.epochGateWaitMs = waits.get(database.namespace);
   }
-  return additionalRebuilds;
+  return { additionalRebuilds,
+    additionalStarts: [...starts.values()].reduce((sum, count) => sum + count - 1, 0),
+    watchdogKills: watchdog.map(event => ({ ...event, databasesRebuiltInLast3s: rebuiltAt.filter(at =>
+      at <= event.observedAtUnixMs && at >= event.observedAtUnixMs - 3000).length })) };
 }
 
 async function runCold(databases, schedule) {
@@ -136,7 +174,7 @@ async function runCold(databases, schedule) {
   const start = performance.now();
   const read = async database => {
     const sent = performance.now();
-    await query(original, database, 'SELECT 1 AS value', 1);
+    verifyRow(database, await query(original, database, 'SELECT 1 AS value'), 1);
     database.elapsedMs = performance.now() - sent;
   };
   if (schedule === 'serial') {
@@ -159,7 +197,7 @@ async function runLoss(databases) {
   const beforeSeed = await cluster.state(original);
   for (let offset = 0; offset < databases.length; offset += 16) {
     await Promise.all(databases.slice(offset, offset + 16)
-      .map(db => query(original, db, sql(db.name), db.name)));
+      .map(async db => verifyRow(db, await query(original, db, sql(db.name), 2), db.name)));
   }
   const seeded = await cluster.state(original);
   assert.ok(seeded.durableLog.confirm.confirmations >= beforeSeed.durableLog.confirm.confirmations + count);
@@ -179,11 +217,12 @@ async function runLoss(databases) {
     // Give the client a short ramp at larger counts to avoid a connection burst.
     if (count > 500) await delay(Math.floor(index / 100) * 20, undefined, { signal: controller.signal });
     let attempts = 0;
-    await eventually(`read ${database.name}`, async () => {
+    const answer = await eventually(`read ${database.name}`, async () => {
       controller.signal.throwIfAborted();
       ++attempts;
-      await query(database.successor, database, 'SELECT value FROM sample', database.name);
+      return query(database.successor, database, 'SELECT value FROM sample');
     }, { timeout: count === 2000 ? 300000 : 180000, interval: 250 });
+    verifyRow(database, answer, database.name);
     return { ...database, elapsedMs: performance.now() - fault, attempts };
   }));
   reads.sort((left, right) => left.elapsedMs - right.elapsedMs);
@@ -191,17 +230,32 @@ async function runLoss(databases) {
   write('loss-readable', { count, detectionMs, reads: readTimes });
   const hostAfter = await hostSample(survivors[0]);
   const after = Object.fromEntries(await Promise.all(survivors.map(async node => [node, await scheduler(node)])));
-  const additionalRebuilds = {};
+  const rebuilds = {};
   for (const node of survivors) {
     assert.equal(after[node].leaseFences, before[node].leaseFences);
     assert.equal(after[node].leaseLosses, before[node].leaseLosses);
-    additionalRebuilds[node] = await measureLogs(node, since, reads.filter(db => db.successor === node));
+    rebuilds[node] = await measureLogs(node, since, reads.filter(db => db.successor === node));
   }
   for (const database of reads) write('loss-read', database);
   const gateTotals = reads.filter(db => db.epochGateWaitMs).map(db => db.epochGateWaitMs.reduce((sum, ms) => sum + ms, 0));
-  write('loss-summary', { count, detectionMs, reads: readTimes, additionalRebuilds,
+  write('loss-summary', { count, detectionMs, reads: readTimes, rebuilds,
     epochGateSamples: gateTotals.length, ...(gateTotals.length && { epochGateWait: summarize(gateTotals) }),
     before, after, hostBefore, hostAfter });
+  if (!measureBaseline) {
+    for (const node of survivors) {
+      assert.equal(after[node].durableGeneration, before[node].durableGeneration, `${node} durable generation changed`);
+      assert.equal(after[node].durableExitCount, before[node].durableExitCount, `${node} durable process exited`);
+      assert.equal(rebuilds[node].watchdogKills.length, 0, `${node} watchdog killed a durable process`);
+      assert.equal(rebuilds[node].additionalStarts, 0, `${node} started additional rebuilds`);
+      assert.equal(rebuilds[node].additionalRebuilds, 0, `${node} completed additional rebuilds`);
+      assert.ok(after[node].peakMetadataRequests <= 2, `${node} exceeded its metadata concurrency budget`);
+      assert.ok(after[node].peakMetadataBytes <= after[node].metadataLimitBytes, `${node} exceeded its metadata memory budget`);
+    }
+    if (count === 2000) {
+      assert.ok(readTimes.firstMs - detectionMs < 40000, 'first read exceeded 40 seconds after detection');
+      assert.ok(readTimes.lastMs - detectionMs < 100000, 'last read exceeded 100 seconds after detection');
+    }
+  }
 }
 
 try {

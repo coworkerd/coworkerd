@@ -27,8 +27,9 @@ struct PeerConnectionReuse {
   }
 };
 
-// A FIFO admission queue. A busy destination is skipped until its sole
-// permit returns. Untargeted work uses the same queue without that restriction.
+// FIFO within each class. Shared coordination can make progress during a bulk
+// read backlog, and the two classes alternate when both can run. A busy
+// destination is skipped until its sole permit returns.
 class RecoveryGate: private kj::TaskSet::ErrorHandler {
 public:
   class Permit {
@@ -48,10 +49,13 @@ public:
   ~RecoveryGate() noexcept(false) { stopping = true; }
 
   kj::Promise<kj::Own<Permit>> acquire(std::string target = {}) {
-    auto pending = kj::newPromiseAndFulfiller<kj::Own<Permit>>();
-    waiters.push_back({std::move(target), kj::mv(pending.fulfiller)});
-    pump();
-    return kj::mv(pending.promise);
+    return enqueue(waiters, std::move(target));
+  }
+
+  // Discovery and the heartbeat check unblock multiple already waiting
+  // recoveries. They use the same tokens and in-flight limit as epoch reads.
+  kj::Promise<kj::Own<Permit>> acquireCoordination() {
+    return enqueue(coordination, {});
   }
 
   unsigned active() const { return running; }
@@ -59,6 +63,18 @@ public:
   uint64_t started() const { return starts; }
 
 private:
+  struct Waiter {
+    std::string target;
+    kj::Own<kj::PromiseFulfiller<kj::Own<Permit>>> ready;
+  };
+
+  kj::Promise<kj::Own<Permit>> enqueue(std::list<Waiter>& queue, std::string target) {
+    auto pending = kj::newPromiseAndFulfiller<kj::Own<Permit>>();
+    queue.push_back({std::move(target), kj::mv(pending.fulfiller)});
+    pump();
+    return kj::mv(pending.promise);
+  }
+
   void release(const std::string& target) {
     --running;
     if (!target.empty()) destinations.erase(target);
@@ -66,17 +82,27 @@ private:
   }
 
   void pump() {
-    std::erase_if(waiters, [](auto& entry) { return !entry.ready->isWaiting(); });
-    if (waiters.empty() || running == limit) return;
+    if (running == limit) return;
     if (rate) {
       const auto now = timer.now();
       tokens = std::min(double(burst), tokens + rate * double((now - updatedAt) / kj::MICROSECONDS) / 1000000);
       updatedAt = now;
     }
-    for (auto it = waiters.begin(); it != waiters.end() && running < limit;) {
-      if (!it->target.empty() && destinations.contains(it->target)) {
-        ++it;
-        continue;
+    const auto candidate = [&](std::list<Waiter>& queue) {
+      for (auto it = queue.begin(); it != queue.end();) {
+        if (!it->ready->isWaiting()) it = queue.erase(it);
+        else if (it->target.empty() || !destinations.contains(it->target)) return it;
+        else ++it;
+      }
+      return queue.end();
+    };
+    while (running < limit) {
+      auto* queue = preferCoordination ? &coordination : &waiters;
+      auto it = candidate(*queue);
+      if (it == queue->end()) {
+        queue = preferCoordination ? &waiters : &coordination;
+        it = candidate(*queue);
+        if (it == queue->end()) return;
       }
       if (rate && tokens < 1) {
         if (!wakePending) {
@@ -91,7 +117,8 @@ private:
       }
       if (rate) --tokens;
       auto waiter = std::move(*it);
-      it = waiters.erase(it);
+      queue->erase(it);
+      preferCoordination = queue == &waiters;
       if (!waiter.target.empty()) destinations.insert(waiter.target);
       ++starts;
       peak = std::max(peak, ++running);
@@ -100,19 +127,15 @@ private:
   }
   void taskFailed(kj::Exception&& error) override { kj::throwRecoverableException(kj::mv(error)); }
 
-  struct Waiter {
-    std::string target;
-    kj::Own<kj::PromiseFulfiller<kj::Own<Permit>>> ready;
-  };
   kj::Timer& timer;
   const unsigned limit, rate, burst;
   unsigned running = 0, peak = 0;
   uint64_t starts = 0;
   double tokens;
   kj::TimePoint updatedAt;
-  bool wakePending = false, stopping = false;
+  bool wakePending = false, stopping = false, preferCoordination = true;
   std::set<std::string> destinations;
-  std::list<Waiter> waiters;
+  std::list<Waiter> waiters, coordination;
   kj::TaskSet wake{*this};
 };
 
