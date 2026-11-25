@@ -221,28 +221,31 @@ from the daemon that admitted it.
 
 A platform namespace records its tenant and a class reference consisting of the definition name
 and case-sensitive Durable Object export name. The namespace still has its own stable ID and
-shard count. The node resolves the reference through trusted namespace ownership and selects
-the code pin. A new pin leaves the namespace, object IDs and storage identities in place.
-Tenant catalog entries and package metadata continue to describe tenant Workers. Platform class
-references are supplied by the platform at the same dispatch boundary. The test fixture supplies
-those references for two configured Workers' existing namespaces and supplies its own package at
-node startup. Ordinary clients call the test objects through existing Durable Object bindings.
+shard count. The node resolves the reference through trusted namespace ownership. A new pin
+leaves the namespace, object IDs and storage identities in place. Only the platform can assign
+a platform class reference. Tenant deployment data can declare classes of its own Worker. A
+call needs authority for the exact namespace it targets, including a match with the namespace
+owner's tenant. A test-only node executable accepts fixture definitions and namespace mappings
+from its startup fixture. The released executable has no fixture injection path. Test Workers
+call the installed objects through existing Durable Object bindings.
 
 Placement and loaded-copy reuse use a definition key with separate fields for definition kind,
 tenant ID, definition name and pin, and the effective bindings and limits of the copy. The node
 gets the tenant from the validated namespace owner. The selected namespace and export identify
 an object and its class within the copy. This permits compatible objects of one tenant to share
 a copy. The loader verifies the namespace selection, the actor export and the copy identity
-before admitting the event to JavaScript.
+before admitting the event to JavaScript. Platform objects have an empty `env` and run under
+the usual tenant Durable Object event limits, using the node's defaults where the tenant has
+no override.
 
-The node pins the definition when it resolves the request and carries the pin when it forwards
-to the owner. The owner must have that exact pin before it admits the event. A queued or running
-event and its retained work keep the same definition and copy for their lifetime. When a new
-pin reaches an existing object, the usual version drain and generation fences let the old work
-complete or end at the configured drain deadline before the object reopens with the new pin.
-An owner that cannot serve the pinned release refuses before execution. A later event, including
-a scheduled alarm, resolves the current product definition. The node's durable log, confirmation,
-takeover, alarm and idle-release paths remain the common path for the object.
+The forwarding node sends the class reference. The shard owner selects its own build's pin
+when it admits the event, so either direction of forwarding works in a rolling upgrade. A queued
+or running event and its retained work use the pin and copy they acquired. The package stays fixed
+for the lifetime of the node daemon. The daemon alone holds each child's parent-liveness write
+end, and the threaded child exits on EOF. The sandbox launcher also sets a parent-death signal.
+Replacing the daemon therefore uses ordinary process shutdown and shard fencing. The next owner
+can reopen the same storage and fire later alarms under its own definition. The node's durable
+log, confirmation, takeover, alarm and idle-release paths remain the common path for the object.
 
 ### Databases: original native execution proposal
 
