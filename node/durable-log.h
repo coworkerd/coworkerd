@@ -396,6 +396,10 @@ public:
   void setOwnerFenceHook(std::function<void(const std::string&, uint32_t, uint64_t)> hook) {
     ownerFenceHook = std::move(hook);
   }
+  void setPredecessorEpochHook(std::function<std::shared_ptr<const ObjectResponse>(
+      const std::string&, uint32_t, uint64_t, uint64_t)> hook) {
+    predecessorEpochHook = std::move(hook);
+  }
   // The membership lease of this log's epoch. `check` judges it at a reading of
   // the lease clock: every record is judged as it is taken and again just before its confirmation is answered, after
   // any local flush, with nothing that waits in between. `lost` is called, synchronously and after the refused records
@@ -977,8 +981,8 @@ private:
   void promoteRebuild(const std::string&);
   kj::Promise<void> rebuildAttempt(std::string objectName, std::string reason, RebuildRun&);
   kj::Promise<std::optional<ObjectManifest>> readManifest(std::string namespaceId, std::string objectId);
-  kj::Promise<uint64_t> recoveryLowerBound(const std::string& objectName, const std::optional<ObjectManifest>& manifest,
-      bool preparingLocally = false);
+  kj::Promise<uint64_t> recoveryLowerBound(const ObjectIdentity&, const std::optional<ObjectManifest>&,
+      bool preparingLocally);
   kj::Promise<void> downloadSnapshot(const ObjectManifest& manifest, const RootStorageRef& ref,
       const std::string& staging, std::function<void()> check = {}, std::function<void(double)> observeFsync = {});
   kj::Promise<void> downloadSnapshotPart(const ObjectManifest& manifest, uint32_t facetId, uint64_t part, int fd,
@@ -999,6 +1003,8 @@ private:
   kj::Promise<std::shared_ptr<const TailDiscovery>> discoverTailTargets();
   kj::Promise<std::shared_ptr<const TailDiscovery>> tailTargets();
   kj::Promise<std::shared_ptr<const ObjectResponse>> readRecoveryEpoch(std::string key, bool preparingLocally = false);
+  kj::Promise<std::shared_ptr<const ObjectResponse>> readSourceEpoch(const ObjectIdentity&, uint64_t epoch,
+      bool preparingLocally);
   kj::Promise<ObjectResponse> readRecoveryMetadata(std::string key, uint32_t timeoutMs);
   kj::Promise<void> recoveryWake();
   kj::Promise<TailRecovery> fetchTails(ObjectIdentity identity, const std::optional<ObjectManifest>& manifest,
@@ -1151,6 +1157,9 @@ private:
   uint64_t threadedHomeCheckpointSamples = 0, threadedHomeCheckpointMaxNs = 0;
   uint64_t threadedHomeCheckpointMaxWalBytes = 0;
   RecoveryGate recoveryMetadata{timer, 2, 16, 4};
+  RecoveryGate waitingRecoveryPublication{timer, 1, 64, 4};
+  std::function<std::shared_ptr<const ObjectResponse>(const std::string&, uint32_t, uint64_t, uint64_t)> predecessorEpochHook;
+  uint64_t reusedPredecessorEpochs = 0;
   RecoveryGate tailPages{timer, settings.config.recoverParallelism};
   struct OwnerRead {
     kj::ForkedPromise<OwnerHeartbeat> answer;
