@@ -72,6 +72,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 `0140-invocation-budget-identity` carries the active event's trusted identity to the node's egress service and
 the legacy Durable Object binding shims. The threaded server also includes the calling object's identity on a
 Durable Object call so the node can count object hops. Its Rust paths are `server/root_loader.rs` and `server/bridge.rs`.
+`0142-hold-invocation-budget-through-drain` keeps the node's budget alive while the kernel holds the incoming
+request, including its existing background drain. An alarm carries its event identity, and the current incoming
+request inherits background work when the request that started it has drained.
 
 ## Working on the series
 

@@ -242,7 +242,7 @@ catch (error) { error.message; }     // "EGRESS_DENIED: private-network"
 | `EGRESS_FAILED: dns` | The node cannot resolve this name | Check the name |
 | `EGRESS_FAILED: connect`, `tls`, `timeout`, `protocol` | Cannot connect, the TLS handshake or the certificate check failed, a timeout (30 seconds by default), the other side's answer is not valid HTTP | Check the destination; certificates are verified by the node against the system's root certificates |
 | `SUBREQUEST_BUDGET_EXHAUSTED: ...` | The caller has no subrequests left | Make fewer subrequests in this invocation |
-| `LEASE_EXPIRED: ...` | The caller's lease has expired | Make the call while the invocation is live |
+| `LEASE_EXPIRED: ...` | The outgoing fetch has no live calling invocation | Make the call while the invocation is live |
 
 Redirects are followed by `fetch` itself, and each hop is checked again: a public address redirecting to an internal one is refused just the same. Every request the node's egress service handles (allowed, refused, failed) has a line in the node log -- with `egress.mode` `off` the runtime refuses without the node and no line is written --
 `[egress] {"tenant","workerId","host","port","address","result","rule","status","requestBytes","responseBytes","durationMs",...}`,

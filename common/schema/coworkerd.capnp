@@ -62,8 +62,13 @@ interface JsRpcSession @0xbbfec607777f1620 {
   # No methods: the session lasts as long as the capability is held.
 }
 
+interface InvocationBudgetLifetime {
+  # Opaque to workerd. Dropping this capability releases the live invocation budget.
+}
+
 interface WorkerdBootstrap @0x878048cda334ade3 {
-  startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool)
+  startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
+                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability)
       -> (dispatcher :EventDispatcher);
 }
 
@@ -144,7 +149,7 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
-  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer)
+  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability)
       -> (dispatcher :EventDispatcher);
   socketControl @1 () -> (control :ThreadedSocketControl);
 }

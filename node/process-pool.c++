@@ -299,7 +299,8 @@ public:
     if (!filling && !disconnected) tasks.add(fill());
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
-      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
+      std::function<void()> onDispatched,
       std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
@@ -308,16 +309,19 @@ public:
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
-      std::function<void()> onDispatched, std::function<void()> onCapacityRejected) {
+      kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
+      std::function<void()> onCapacityRejected) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))), kj::mv(ready.promise)};
+          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))),
+          kj::mv(ready.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
     onDispatched();
     auto request = bootstrap.startEventRequest();
     request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+    KJ_IF_SOME(token, budgetLifetime) { request.setBudgetLifetime(kj::mv(token)); }
     auto response = request.send();
     return {response.getDispatcher(), response.ignoreResult()};
   }
@@ -338,8 +342,20 @@ private:
   std::shared_ptr<RuntimeConnection> connection;
 };
 
+// A threaded invocation uses its own connection. Keep it open for the kernel's I/O context after an HTTP response.
+// Releasing the export or disconnecting drops the token and the connection reference together.
+class ThreadedBudgetLifetime final: public v1::rpc::InvocationBudgetLifetime::Server {
+public:
+  ThreadedBudgetLifetime(std::shared_ptr<RuntimeConnection> connection, capnp::Capability::Client token)
+      : connection(std::move(connection)), token(kj::mv(token)) {}
+private:
+  std::shared_ptr<RuntimeConnection> connection;
+  capnp::Capability::Client token;
+};
+
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
-    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
+    std::function<void()> onDispatched,
     std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
@@ -405,17 +421,21 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
+    capnp::Capability::Client budgetToken = nullptr;
+    KJ_IF_SOME(token, budgetLifetime) { budgetToken = kj::heap<ThreadedBudgetLifetime>(connection, kj::mv(token)); }
     v1::rpc::EventDispatcher::Client dispatcher = nullptr;
     if (nativeProps) {
       auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
       request.setCfBlobJson(descriptor);
       request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+      request.setBudgetLifetime(kj::mv(budgetToken));
       auto response = request.send();
       if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
       else dispatcher = response.getDispatcher();
     } else {
       auto request = connection->bootstrap.startEventRequest();
       request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+      request.setBudgetLifetime(kj::mv(budgetToken));
       auto response = request.send();
       if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
       else dispatcher = response.getDispatcher();
@@ -4119,7 +4139,7 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
   return result;
 }
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
-    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat.touch(hash, mono());
@@ -4132,7 +4152,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
   }
   // From this send onward, a lost connection or a dead child is never retried.
-  auto result = p->runtime->open(descriptor, std::move(nativeProps), [call] { call->dispatched = true; }, [call] {
+  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call] {
     call->capacityRejected = true;
     if (call->onCapacityRejected) call->onCapacityRejected();
   });

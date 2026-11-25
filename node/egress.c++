@@ -829,7 +829,7 @@ struct EgressService::Impl {
         co_return co_await refuse(response, ex, &counts, "SUBREQUEST_BUDGET_EXHAUSTED",
             "this invocation has no remaining subrequests", 429);
       case EgressDebit::expired:
-        co_return co_await refuse(response, ex, &counts, "LEASE_EXPIRED", "the caller's lease is no longer live", 410);
+        co_return co_await refuse(response, ex, &counts, "LEASE_EXPIRED", "the calling invocation has ended", 410);
     }
     const TenantRules* rules = nullptr;
     if (auto found = tenants.find(ex.tenant); found != tenants.end()) rules = &found->second;

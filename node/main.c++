@@ -351,9 +351,21 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
+  bool budgetHeld = false;
   bool presents(double value) const {
     return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
   }
+  bool hasActiveBudget(double now) const {
+    return budgetHeld || held || expiresAtMonotonicMs > now;
+  }
+};
+
+class InvocationBudgetLifetime final: public rpc::InvocationBudgetLifetime::Server {
+public:
+  explicit InvocationBudgetLifetime(std::function<void()> release): release(std::move(release)) {}
+  ~InvocationBudgetLifetime() noexcept { release(); }
+private:
+  std::function<void()> release;
 };
 
 using NativeProps = std::shared_ptr<capnp::MallocMessageBuilder>;
@@ -1032,7 +1044,7 @@ public:
   }
   coworkerd::EgressDebit chargeEgress(const std::string& invocationId) {
     auto lease = leases.find(invocationId);
-    if (lease == leases.end() || lease->second.expiresAtMonotonicMs <= monotonicTimeMs()) {
+    if (lease == leases.end() || !lease->second.hasActiveBudget(monotonicTimeMs())) {
       ++expiredLeaseRejections;
       return coworkerd::EgressDebit::expired;
     }
@@ -2617,7 +2629,8 @@ public:
     if (parent == leases.end() || parent->second.treeId != treeId ||
         parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
-      if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs && !parent->second.held) {
+      if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs &&
+          !parent->second.held && !parent->second.budgetHeld) {
         leases.erase(parent);
       }
       ++expiredLeaseRejections;
@@ -2634,7 +2647,6 @@ public:
     if (kind == SubrequestKind::worker && depth > MAX_BINDING_DEPTH) {
       KJ_FAIL_REQUIRE("Binding call depth exceeds the hop limit");
     }
-    const bool database = kind == SubrequestKind::d1;
     auto& budget = parent->second.budget;
     const auto parentRemainingBefore = budget.remaining;
     uint64_t* nextOrder = nullptr;
@@ -2653,18 +2665,7 @@ public:
       }
       nextOrder = &expected;
     }
-    const auto debit = budget.debit(database, !leaseConfig.naive());
-    if (debit == coworkerd::BudgetDebit::d1Exhausted) {
-      lastRejection = "D1 query budget exhausted before execution (limit " + std::to_string(budget.d1Limit) + ")";
-      KJ_FAIL_REQUIRE(lastRejection.c_str());
-    }
-    if (debit == coworkerd::BudgetDebit::subrequestsExhausted) {
-      ++budgetRejections;
-      lastRejection = "subrequest budget exhausted before execution for parent=" +
-          parentInvocationId + " tree=" + treeId;
-      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
-      KJ_FAIL_REQUIRE(lastRejection.c_str());
-    }
+    debitBinding(budget, kind == SubrequestKind::d1, treeId, parentInvocationId);
     if (nextOrder) ++*nextOrder;
 
     return {
@@ -2680,6 +2681,18 @@ public:
       false,
       inherited.ingressServerId,
     };
+  }
+
+  void debitObjectCall(const std::string& treeId, const std::string& invocationId,
+      double presentedDeadline, bool database) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end() || lease->second.treeId != treeId || !lease->second.presents(presentedDeadline) ||
+        !lease->second.hasActiveBudget(monotonicTimeMs())) {
+      ++expiredLeaseRejections;
+      lastRejection = "lease expired before execution for parent=" + invocationId + " tree=" + treeId;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+    debitBinding(lease->second.budget, database, treeId, invocationId);
   }
 
   OpenEvent executeAllocated(
@@ -2937,7 +2950,13 @@ private:
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
-    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
+    auto token = capnp::Capability::Client(kj::heap<InvocationBudgetLifetime>(
+        [this, lifetime = std::weak_ptr<int>(executionLifetime), invocationId] {
+      if (!lifetime.expired()) releaseInvocationBudget(invocationId);
+    }));
+    leases.at(invocationId).budgetHeld = true;
+    auto opened = runtime.open(process, descriptor, version->definitionHash,
+        slot ? slot->nativeProps : NativeProps(), kj::mv(token));
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -3691,13 +3710,38 @@ private:
     leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
   }
 
+  void releaseInvocationBudget(const std::string& invocationId) noexcept {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end()) return;
+    lease->second.budgetHeld = false;
+    if (!lease->second.held && lease->second.expiresAtMonotonicMs <= monotonicTimeMs()) {
+      leases.erase(lease);
+      ++expiredLeases;
+    }
+  }
+
+  void debitBinding(coworkerd::InvocationBudget& budget, bool database,
+      const std::string& treeId, const std::string& invocationId) {
+    const auto debit = budget.debit(database, !leaseConfig.naive());
+    if (debit == coworkerd::BudgetDebit::d1Exhausted) {
+      lastRejection = "D1 query budget exhausted before execution (limit " + std::to_string(budget.d1Limit) + ")";
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+    if (debit == coworkerd::BudgetDebit::subrequestsExhausted) {
+      ++budgetRejections;
+      lastRejection = "subrequest budget exhausted before execution for parent=" + invocationId + " tree=" + treeId;
+      std::cerr << "[server] reject " << cleanReason(lastRejection) << std::endl;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+  }
+
   void expireLeases(double nowMonotonicMs) {
     while (!leaseExpiries.empty() &&
         leaseExpiries.top().expiresAtMonotonicMs <= nowMonotonicMs) {
       auto expiry = leaseExpiries.top();
       leaseExpiries.pop();
       auto lease = leases.find(expiry.invocationId);
-      if (lease != leases.end() && !lease->second.held &&
+      if (lease != leases.end() && !lease->second.held && !lease->second.budgetHeld &&
           lease->second.expiresAtMonotonicMs == expiry.expiresAtMonotonicMs) {
         leases.erase(lease);
         ++expiredLeases;
@@ -8022,14 +8066,19 @@ public:
         } else {
           KJ_REQUIRE(callerNamespace.empty(), "invalid Durable Object call: a caller namespace without an object");
         }
-        if (!treeId.empty() || callerObject.empty()) {
-          KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
-              expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's call tree");
+        KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
+            expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's invocation");
+        if (!callerObject.empty()) {
+          // Object calls have always started a new tree. Charge the running event without inheriting its deadline.
+          const auto callerDeadline = expiresAtMonotonicMs;
+          expiresAtMonotonicMs = server.rootDeadline();
+          server.debitObjectCall(treeId, parentInvocationId, callerDeadline, request.target.isDatabase());
+        } else {
           auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence,
               expiresAtMonotonicMs, request.target.isDatabase() ? SubrequestKind::d1 : SubrequestKind::object);
           expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
           allocation.timing = timing;
-          if (callerObject.empty() && !server.perCallForTest() &&
+          if (!server.perCallForTest() &&
               !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
             auto reason = "Durable Object call: the calling version disagrees with its lease's version pins";
             server.rejectPinMismatch(reason);

@@ -280,6 +280,11 @@ async function d1InvocationBudgets(cluster) {
   const [node] = cluster.nodes;
   const tenant = await cluster.tenant('d1-budget');
   await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { subrequests: 5, d1Queries: 2 } } });
+  const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+  await eventually('the D1 budget is visible on every node', async () => {
+    const states = await Promise.all(cluster.nodes.map(id => cluster.state(id)));
+    assert.ok(states.every(state => BigInt(state.storage.appliedTenantsRevision) >= BigInt(tenantsRevision)));
+  });
   await cluster.api(`${tenant.path}/databases/budget-db`, { method: 'POST', token: tenant.token });
   await cluster.deploy(tenant, 'budget-child', respondWith('ok'));
   await cluster.deploy(tenant, 'd1-edge', `
@@ -363,6 +368,103 @@ async function d1InvocationBudgets(cluster) {
   assert.equal(object.query, 3);
   assert.match(object.refusal, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
   assert.deepEqual([object.child, object.status, object.code], ['child', 429, 'SUBREQUEST_BUDGET_EXHAUSTED']);
+}
+
+const budgetLifetime = { tenant: 'budget-lifetime', leaseMs: 5_000 };
+
+async function invocationBudgetLifetime(cluster) {
+  const [node] = cluster.nodes;
+  const tenant = await cluster.tenant(budgetLifetime.tenant);
+  const withD1 = cluster.threadedNodes.size === 0;
+  if (withD1) {
+    await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { d1Queries: 1 } } });
+    const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+    await eventually('the lifetime fixture has the new D1 limit', async () => {
+      const states = await Promise.all(cluster.nodes.map(id => cluster.state(id)));
+      assert.ok(states.every(state => BigInt(state.storage.appliedTenantsRevision) >= BigInt(tenantsRevision)));
+    });
+    await cluster.api(`${tenant.path}/databases/lifetime-db`, { method: 'POST', token: tenant.token });
+  }
+  await cluster.deploy(tenant, 'budget-lifetime', `
+    import { DurableObject } from 'cloudflare:workers';
+    const waitMs = ${budgetLifetime.leaseMs + 500};
+    const origin = 'http://budget-origin:8080/';
+    async function spend(env) {
+      const first = await (await fetch(origin)).text();
+      const second = env.DB ? await env.DB.prepare('SELECT 41 AS value').first('value') : await (await fetch(origin)).text();
+      let extraFetch, extraQuery;
+      try { await fetch(origin); } catch (error) { extraFetch = error.message; }
+      if (env.DB) {
+        try { await env.DB.prepare('SELECT 42').run(); } catch (error) { extraQuery = error.message; }
+      }
+      return { first, second, extraFetch, extraQuery };
+    }
+    export class BudgetLifetime extends DurableObject {
+      async fetch(request) {
+        const action = new URL(request.url).searchParams.get('action');
+        if (action === 'schedule') {
+          await this.ctx.storage.setAlarm(Date.now() + 50);
+          return Response.json('scheduled');
+        }
+        if (action === 'result') return Response.json((await this.ctx.storage.get('result')) ?? null);
+        if (action === 'start') {
+          const first = await spend(this.env);
+          const resumed = new Promise(resolve => { this.resumeBackground = resolve; });
+          this.background = resumed.then(() => spend(this.env)).catch(error => ({ unexpected: error.message }));
+          this.ctx.waitUntil(this.background);
+          return Response.json(first);
+        }
+        await scheduler.wait(50);
+        this.resumeBackground();
+        return Response.json(await this.background);
+      }
+      async alarm() {
+        await scheduler.wait(waitMs);
+        const result = await spend(this.env).catch(error => ({ unexpected: error.message }));
+        await this.ctx.storage.put('result', result);
+      }
+    }
+    export default { async fetch(request, env) {
+      const action = new URL(request.url).searchParams.get('action');
+      if (action === 'late-fetch') {
+        await scheduler.wait(waitMs);
+        const reply = await env.OBJECT.getByName('past-deadline').fetch('https://object.test/?action=result');
+        const { code } = await reply.json();
+        return Response.json({ ...await spend({}), invocationId: request.cf.invocationId,
+          lateObject: { status: reply.status, code } });
+      }
+      const actor = action === 'schedule' || action === 'result' ? 'alarm' : 'background';
+      return env.OBJECT.getByName(actor).fetch(request);
+    } };
+  `, { wrangler: { limits: { subrequests: 2 }, migrations: [{ tag: 'v1', new_sqlite_classes: ['BudgetLifetime'] }],
+    durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'BudgetLifetime' }] },
+    ...(withD1 ? { d1_databases: [{ binding: 'DB', database_name: 'lifetime-db' }] } : {}) } });
+
+  const call = async action => json(await workerCall(cluster, node, tenant, `budget-lifetime?action=${action}`, { timeout: 20_000 }),
+    200, `invocation budget lifetime ${action}`);
+  const verify = (value, checksD1 = withD1) => {
+    assert.equal(value.unexpected, undefined);
+    assert.equal(value.first, 'origin');
+    assert.equal(value.second, checksD1 ? 41 : 'origin');
+    assert.match(value.extraFetch, /^SUBREQUEST_BUDGET_EXHAUSTED:/);
+    if (checksD1) assert.match(value.extraQuery, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
+  };
+  assert.equal(await call('schedule'), 'scheduled');
+  const late = await call('late-fetch');
+  verify(late, false);
+  assert.deepEqual(late.lateObject, { status: 410, code: 'LEASE_EXPIRED' });
+  assert.ok(late.invocationId);
+  await eventually('the completed invocation releases its expired lease record', async () => {
+    assert.ok((await cluster.state(node)).leases.every(lease => lease.invocationId !== late.invocationId));
+  });
+  await eventually('the alarm uses its budget after the lease expires', async () => {
+    const result = await call('result');
+    assert.ok(result);
+    verify(result);
+  });
+  // The original event spends both subrequests. Its resumed callback uses the newer request's balance.
+  verify(await call('start'));
+  verify(await call('resume'));
 }
 
 async function ordinaryProcess(cluster, node) {
@@ -2299,6 +2401,10 @@ export const cases = { deployment, 'sql-atomicity': sqlAtomicity,
 export const webSocketCases = { 'websocket-admission': webSocketAdmission };
 
 export const durableGatedCases = {
+  'invocation-budget-lifetime': { test: invocationBudgetLifetime, budgetLifetime },
+  'invocation-budget-threaded-background': {
+    test: invocationBudgetLifetime, budgetLifetime, nodes: ['node-1', 'node-2', 'node-3'],
+  },
   'durable-peer-ack': { test: durablePeerAck },
   'durable-slow-holder': {
     test: durableSlowHolder, delayRecoveryPeers: true,

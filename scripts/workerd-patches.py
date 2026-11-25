@@ -297,6 +297,12 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++'} or
                           name in {'0140-invocation-budget-identity.patch', '0141-ordinary-binding-caller.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0142-hold-invocation-budget-through-drain.patch' and path in {
+                              'src/workerd/io/io-channels.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker-interface.capnp',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
