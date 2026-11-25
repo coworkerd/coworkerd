@@ -5,6 +5,7 @@
 #include "memory-events.h"
 #include "process-heat.h"
 #include "root-objects.h"
+#include "platform-source.h"
 #include "rpc-error.h"
 #include "memory-observation.h"
 #include "tenancy.h"
@@ -2415,7 +2416,8 @@ public:
       // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
       configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
           "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
-          << p->id << ".runtime.js\")], bindings = [\n"
+          << p->id << ".runtime.js\"), (name = \"sql-database.js\", esModule = \""
+          << escape(SQL_DATABASE_SOURCE) << "\")], bindings = [\n"
           "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
           "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
           << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +

@@ -112,13 +112,18 @@ async function provenance() {
 
 async function workerSource() {
   const runtime = await readFile(join(checkout, 'runtime/runtime.js'), 'utf8');
-  const start = runtime.indexOf('export class SqlDatabase extends DurableObject');
-  const end = runtime.indexOf('export class BoundWorker', start);
+  const shared = await readFile(join(checkout, 'runtime/sql-database.js'), 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const source = shared ?? runtime;
+  const start = source.indexOf('export class SqlDatabase extends DurableObject');
+  const end = shared ? source.length : source.indexOf('export class BoundWorker', start);
   assert.ok(start >= 0 && end > start, 'locate the pinned SqlDatabase class');
-  const alarmHeader = runtime.match(/^const DO_ALARM_HEADER = .*;$/m)?.[0];
+  const alarmHeader = source.match(/^(?:export )?(const DO_ALARM_HEADER = .*;)$/m)?.[1];
   assert.ok(alarmHeader);
   // The platform class can use the internal prepare API. A deployed class has the public exec API.
-  const database = runtime.slice(start, end)
+  const database = source.slice(start, end)
     .replace('const counters = sqlite.prepare(', 'const counters = () => sqlite.exec(')
     .replace('sqlite.prepare(sql)(...bindings)', 'sqlite.exec(sql, ...bindings)')
     .replace('this.ctx.storage.sql.abortExecutionLimit()', 'this.ctx.storage.sql.abortExecutionLimit?.()');
