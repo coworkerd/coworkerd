@@ -264,6 +264,10 @@ double remainingLeaseMs(double expiresAtMonotonicMs) {
   return coworkerd::remainingLeaseMs(expiresAtMonotonicMs, monotonicTimeMs());
 }
 
+bool requestLeaseEnded(const std::shared_ptr<coworkerd::RequestLease>& lease) {
+  return lease && lease->remainingMs() == 0;
+}
+
 using coworkerd::VersionDefinition;
 using coworkerd::VersionPin;
 using coworkerd::VersionPins;
@@ -5526,7 +5530,7 @@ public:
     // result arrives, so synchronous log flushing is not part of the wire delay.
     const auto remainingCapturedAtMonotonicMs = monotonicTimeMs();
     const auto remaining = std::max(0.0, deadline - remainingCapturedAtMonotonicMs);
-    if (remaining == 0) {
+    if (remaining == 0 || requestLeaseEnded(invocation.requestLease)) {
       server.rejectExpiredLease("lease expired before forwarding");
       co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before forwarding", 410), true};
     }
@@ -5626,7 +5630,7 @@ public:
     remote.setAlarmRetryCount(target.alarmRetryCount);
     remote.setAlarmFacetId(target.alarmFacetId);
     const auto remaining = std::max(0.0, deadline - monotonicTimeMs());
-    if (remaining == 0) {
+    if (remaining == 0 || (invocation.allocation && requestLeaseEnded(invocation.allocation->requestLease))) {
       server.rejectExpiredLease("lease expired before forwarding");
       co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before forwarding", 410), true};
     }
@@ -5756,6 +5760,10 @@ public:
           auto finalAdmission = co_await server.admit(version->workerId, version->definitionHash,
               allocation.ingressRoot, allocation.expiresAtMonotonicMs, false, false, nullptr, wait, slot);
           if (finalAdmission.refused) co_return InvocationAttempt{nullptr, std::move(finalAdmission.refused), true};
+          if (requestLeaseEnded(allocation.requestLease)) {
+            server.rejectExpiredLease("lease expired before execution");
+            co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before execution", 410), true};
+          }
           try {
             auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
             // Dispatch is committed. Pipeline HTTP now; its wrapper reports uncertainty.
@@ -6337,7 +6345,8 @@ public:
         invocation.expiresAtMonotonicMs, false, invocation.ingressRoot, nullptr, false, slot);
     if (current.refused) { reject(*current.refused); co_return; }
     slot->nativeProps = invocation.nativeProps;
-    if (invocation.requestLease && invocation.requestLease->remainingMs() == 0) {
+    if (requestLeaseEnded(invocation.requestLease)) {
+      server.rejectExpiredLease("the direct caller is gone");
       reject(server.refusal("LEASE_EXPIRED", "the direct caller is gone", 410, invocation.ingressRoot));
       co_return;
     }
@@ -6969,6 +6978,12 @@ public:
         server.observeStaticAttempt(targetServerId, current.refused);
         co_return Dispatched{rejectedDispatcher(factory, headerTable, *current.refused, expiresAtMonotonicMs)};
       }
+      if (requestLeaseEnded(allocation.requestLease)) {
+        server.rejectExpiredLease("lease expired before execution");
+        auto refusal = server.refusal("LEASE_EXPIRED", "lease expired before execution", 410);
+        server.observeStaticAttempt(targetServerId, refusal);
+        co_return Dispatched{rejectedDispatcher(factory, headerTable, refusal, expiresAtMonotonicMs)};
+      }
       auto opened = server.executeAllocated(std::move(version), "binding", std::move(allocation), std::move(slot), check);
       server.observeStaticAttempt(targetServerId, std::nullopt);
       pathMark(timing, "attempt-logs");
@@ -7404,6 +7419,10 @@ private:
     }
     if (!target.socketId.empty() && shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the socket shard changed before dispatch", 409));
+    if (request.allocation && requestLeaseEnded(request.allocation->requestLease)) {
+      server.rejectExpiredLease("lease expired before object execution");
+      co_return refused(server.refusal("LEASE_EXPIRED", "lease expired before object execution", 410));
+    }
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);

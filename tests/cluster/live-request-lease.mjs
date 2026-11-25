@@ -186,7 +186,7 @@ export async function connectedRequestLease(cluster) {
 }
 
 export async function disconnectedRequestLease(cluster) {
-  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-disconnect');
+  const { ingress, base, path } = await prepareLeaseWorker(cluster, 'live-request-disconnect');
   for (const mode of ['before-headers', 'during-body']) {
     const markers = async () => json(await request(base, path + '/markers'), 200, 'read disconnect markers')
       .filter(marker => marker.startsWith(mode + '/')).map(marker => marker.slice(mode.length + 1));
@@ -212,7 +212,13 @@ export async function disconnectedRequestLease(cluster) {
       await delay(4000, undefined, { signal: cluster.signal });
       assert.equal(receivedHeaders, mode === 'during-body');
       assert.ok(client.socket && !client.socket.destroyed);
+      assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 1);
+      const resetAt = performance.now();
       client.socket.resetAndDestroy();
+      await eventually(`${mode} released the forwarding slot after reset`, async () => {
+        assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 0);
+      }, { timeout: 1000, interval: 25 });
+      console.log(`HTTP reset ${mode} stopped ingress forwarding in ${(performance.now() - resetAt).toFixed(1)} ms`);
       await eventually(`${mode} left only the registered work alive`, async () => {
         assert.deepEqual(await markers(), ['background', 'registered']);
       }, { timeout: 31_000, interval: 250 });
