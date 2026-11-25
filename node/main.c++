@@ -1070,9 +1070,11 @@ public:
       tenant && tenant->defaultLimits.d1Queries ? tenant->defaultLimits.d1Queries : coworkerd::DEFAULT_D1_QUERY_LIMIT,
     };
   }
-  coworkerd::EgressDebit chargeEgress(const std::string& invocationId) {
+  coworkerd::EgressDebit chargeEgress(const std::string& invocationId, bool fromDurableProcess) {
     auto lease = leases.find(invocationId);
     if (lease == leases.end() || !lease->second.hasActiveBudget(monotonicTimeMs())) {
+      // Actor work between incoming events still uses the node's egress policy.
+      if (fromDurableProcess) return coworkerd::EgressDebit::charged;
       ++expiredLeaseRejections;
       return coworkerd::EgressDebit::expired;
     }
@@ -2733,30 +2735,24 @@ public:
     return allocation;
   }
 
-  std::optional<ChildAllocation> inheritActorLease(const std::string& invocationId) {
+  std::optional<ChildAllocation> allocateActorChild(const std::string& treeId, const std::string& invocationId,
+      double presentedDeadline, bool database) {
     auto found = leases.find(invocationId);
     const auto now = monotonicTimeMs();
-    if (found == leases.end() || !found->second.requestLease || !found->second.live(now)) return std::nullopt;
-    const auto& parent = found->second;
-    // Actor-originated calls keep their own admission and quota accounting.
-    // When the runtime has a live event identity, its deadline still bounds the work.
+    if (found == leases.end() || !found->second.hasActiveBudget(now)) return std::nullopt;
+    auto& parent = found->second;
+    if (parent.treeId != treeId || !parent.presents(presentedDeadline)) {
+      ++expiredLeaseRejections;
+      lastRejection = "lease expired before execution for parent=" + invocationId + " tree=" + treeId;
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
+    debitBinding(parent.budget, database, treeId, invocationId);
+    if (!parent.requestLease || !parent.live(now)) return std::nullopt;
     ChildAllocation allocation{parent.treeId, invocationId, 0, 0, 0, parent.budget.remaining,
         static_cast<uint16_t>(parent.depth + 1), parent.childDeadline(now, leaseConfig.ttlMs), nullptr, false,
         parent.ingressServerId};
     allocation.requestLease = parent.requestLease;
     return allocation;
-  }
-
-  void debitObjectCall(const std::string& treeId, const std::string& invocationId,
-      double presentedDeadline, bool database) {
-    auto lease = leases.find(invocationId);
-    if (lease == leases.end() || lease->second.treeId != treeId || !lease->second.presents(presentedDeadline) ||
-        !lease->second.hasActiveBudget(monotonicTimeMs())) {
-      ++expiredLeaseRejections;
-      lastRejection = "lease expired before execution for parent=" + invocationId + " tree=" + treeId;
-      KJ_FAIL_REQUIRE(lastRejection.c_str());
-    }
-    debitBinding(lease->second.budget, database, treeId, invocationId);
   }
 
   OpenEvent executeAllocated(
@@ -3795,9 +3791,10 @@ private:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     lease->second.budgetHeld = false;
-    if (!lease->second.held && (lease->second.requestLease || !lease->second.live(monotonicTimeMs()))) {
+    const bool expired = !lease->second.live(monotonicTimeMs());
+    if (!lease->second.held && (lease->second.requestLease || expired)) {
       leases.erase(lease);
-      ++expiredLeases;
+      expiredLeases += expired;
     }
   }
 
@@ -8245,13 +8242,18 @@ public:
         } else {
           KJ_REQUIRE(callerNamespace.empty(), "invalid Durable Object call: a caller namespace without an object");
         }
-        KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
-            expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's invocation");
-        if (!callerObject.empty()) {
+        const bool actor = !callerObject.empty();
+        const bool namesEvent = !treeId.empty() || !parentInvocationId.empty();
+        if (!actor || namesEvent) {
+          KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() &&
+              safeName(parentInvocationId) && expiresAtMonotonicMs > 0,
+              "invalid Durable Object call: the caller's invocation");
+        }
+        if (actor) {
           // Use the same event the runtime selected for the debit, including
           // a newer request that took over the actor's outstanding work.
-          server.debitObjectCall(treeId, parentInvocationId, expiresAtMonotonicMs, request.target.isDatabase());
-          request.allocation = server.inheritActorLease(parentInvocationId);
+          request.allocation = server.allocateActorChild(treeId, parentInvocationId,
+              expiresAtMonotonicMs, request.target.isDatabase());
           expiresAtMonotonicMs = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
         } else {
           auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence,
@@ -10781,12 +10783,10 @@ int run(Launch launch) {
         for (auto& address : controlPlane.endpoints()) endpoints.push_back(std::move(address));
         return endpoints;
       },
-      [&runtime](const std::string& token) -> std::optional<coworkerd::EgressSource> {
-        auto found = runtime.egressSource(token);
-        if (!found) return std::nullopt;
-        return coworkerd::EgressSource{found->first, found->second};
+      [&runtime](const std::string& token) { return runtime.egressSource(token); },
+      [&server](const std::string& invocationId, bool fromDurableProcess) {
+        return server.chargeEgress(invocationId, fromDurableProcess);
       },
-      [&server](const std::string& invocationId) { return server.chargeEgress(invocationId); },
       // The tenant's hourly usage rows: egressBytes.
       [&tenantUsage](const std::string& tenant, uint64_t bytes) { tenantUsage.egress(tenant, bytes); });
   server.addStateSection("egress", [&egress]() { return egress.json(); });

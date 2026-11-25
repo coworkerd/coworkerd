@@ -988,14 +988,14 @@ export class DurableNamespace extends WorkerEntrypoint {
         typeof objectId !== "string" || !SHA256_HEX.test(objectId)) {
       throw new Error("Invalid Durable Object call");
     }
-    if (caller && !callerInvocation?.invocationId)
-      throw new Error("LEASE_EXPIRED: the Durable Object has no active invocation");
-    const treeId = callerInvocation?.treeId ?? this.ctx.props.treeId;
-    const parentInvocationId = callerInvocation?.invocationId ?? this.ctx.props.parentInvocationId;
+    const detachedActor = caller && !callerInvocation?.invocationId;
+    const treeId = detachedActor ? "" : callerInvocation?.treeId ?? this.ctx.props.treeId;
+    const parentInvocationId = detachedActor ? "" : callerInvocation?.invocationId ?? this.ctx.props.parentInvocationId;
     const orderSequence = callerInvocation?.orderSequence ?? this.ctx.props.orderSequence;
-    const expiresAtMonotonicMs = callerInvocation?.leaseDeadline
+    const expiresAtMonotonicMs = detachedActor ? 0 : callerInvocation?.leaseDeadline
       ? Number(callerInvocation.leaseDeadline) : this.ctx.props.expiresAtMonotonicMs;
-    const requiresChildSequence = callerInvocation?.requiresChildSequence ?? this.ctx.props.requiresChildSequence;
+    const requiresChildSequence = !detachedActor &&
+      (callerInvocation?.requiresChildSequence ?? this.ctx.props.requiresChildSequence);
     const callSequence = requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
     return {
       workerId, versionId, contentHash, definitionHash, treeId, parentInvocationId, callSequence,

@@ -28,8 +28,18 @@ const worker = `
       if (path === '/markers') return Response.json(Array.from((await this.ctx.storage.list()).keys()));
       if (path === '/timer') {
         setTimeout(async () => {
-          const leaf = await this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
-          await this.ctx.storage.put('timer', await leaf.text());
+          let result;
+          try {
+            const response = await fetch('http://budget-origin:8080/');
+            if (await response.text() !== 'origin') throw new Error('unexpected timer egress response');
+            if (this.env.DB && await this.env.DB.prepare('SELECT 41 AS value').first('value') !== 41)
+              throw new Error('unexpected timer query result');
+            const leaf = await this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
+            result = await leaf.text();
+          } catch (error) {
+            result = error.message;
+          }
+          await this.ctx.storage.put('timer', result);
         }, 32_000);
         return new Response('scheduled');
       }
@@ -123,14 +133,16 @@ const worker = `
   };
 `;
 
-async function prepareLeaseWorker(cluster, tenantName) {
+async function prepareLeaseWorker(cluster, tenantName, withD1 = false) {
   const tenant = await cluster.tenant(tenantName);
+  if (withD1) await cluster.api(`${tenant.path}/databases/timer-db`, { method: 'POST', token: tenant.token });
   await cluster.deploy(tenant, 'lease-service', serviceWorker);
   await cluster.deploy(tenant, 'lease-stream', worker, { wrangler: {
     compatibility_flags: ['enable_request_signal'],
     services: [{ binding: 'SERVICE', service: 'lease-service' }],
     durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'LeaseObject' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['LeaseObject'] }],
+    ...(withD1 ? { d1_databases: [{ binding: 'DB', database_name: 'timer-db' }] } : {}),
   } });
   await cluster.api(`${tenant.path}/workers/lease-stream`, {
     token: tenant.token, method: 'PATCH', body: { limits: { cpuMs: 1500 } },
@@ -297,7 +309,7 @@ export async function silentRequestLease(cluster) {
 }
 
 export async function actorRequestLease(cluster) {
-  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers');
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers', cluster.threadedNodes.size === 0);
   const call = (event, actor, timeout = 5000) => request(base, `${path}/${event}?actor=${actor}`, { timeout });
   const executions = async () => (await Promise.all(cluster.nodes.map(node => cluster.state(node))))
     .flatMap(state => state.executions).filter(event => event.target === 'live-request-timers/lease-stream@v1');
@@ -315,10 +327,10 @@ export async function actorRequestLease(cluster) {
   assert.ok(actor, 'the newer request invokes the object');
   assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === actor.invocationId &&
     event.treeId === root.treeId), 'the timer inherits the newer event’s live lease');
-  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === '' &&
-    event.treeId !== root.treeId), 'the idle timer opens a fresh tree');
   assert.deepEqual(await call('timer-result', 'idle'), { status: 200, text: 'object' },
     'an actor timer can make a bounded call with no live ingress event');
+  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === '' &&
+    event.treeId !== root.treeId), 'the idle timer opens a fresh tree');
 }
 
 export async function alarmRequestLease(cluster) {

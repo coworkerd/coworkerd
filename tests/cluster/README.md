@@ -129,7 +129,7 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `live-request-lease` | An HTTP client half-closes its write side and keeps the exchange open for over two minutes, then receives results from a remote Service Binding, a nested Durable Object and a retained RPC target. |
 | `disconnected-request-lease` | A reset cancels foreground work when no `waitUntil` is registered, notifies `request.signal` before headers, and cancels a response body after headers. Registered work can still make a child call inside the single drain window. No work can produce a write after the cutoff. |
 | `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
-| `actor-request-lease` | An object timer can make a call between events, and a later event can supply the lease for a callback scheduled by an earlier event. |
+| `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The upstream role also exercises D1. A callback taken over by a newer event uses that event's lease. |
 | `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end an alarm at the same test-shortened wall limit and continue serving the object. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |

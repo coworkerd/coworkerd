@@ -11,9 +11,13 @@ const leaseCases = {
   'live-request-lease': connectedRequestLease,
   'disconnected-request-lease': disconnectedRequestLease,
   'silent-request-lease': silentRequestLease,
-  'actor-request-lease': actorRequestLease,
 };
+const actorLeaseCases = { 'actor-request-lease': [], 'threaded-actor-request-lease': ['node-1', 'node-2', 'node-3'] };
 const alarmCases = { 'alarm-wall-time': [], 'threaded-alarm-wall-time': ['node-1', 'node-2', 'node-3'] };
+const requestLeaseNode = () => ({
+  ingressPlacement: true, placement: { homeProbability: 1 },
+  ingress: { tcpKeepalive: { idleSeconds: 1, intervalSeconds: 1, probes: 2 } },
+});
 
 async function runSuite(selected, kernel, signal, options) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), kernel, signal, options);
@@ -46,6 +50,7 @@ async function runSuite(selected, kernel, signal, options) {
 
 async function main(args) {
   const all = { ...cases, ...webSocketCases, ...durableGatedCases, ...leaseCases,
+    'actor-request-lease': actorRequestLease, 'threaded-actor-request-lease': actorRequestLease,
     'alarm-wall-time': alarmRequestLease, 'threaded-alarm-wall-time': alarmRequestLease,
     'live-request-lease-capacity': liveRequestCapacity, 'fatal-attribution': fatalAttribution };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
@@ -70,6 +75,7 @@ async function main(args) {
     : Object.entries(cases).filter(([name]) => !args[1] || args[1] === name);
   const webSockets = Object.entries(webSocketCases).filter(([name]) => !args[1] || args[1] === name);
   const requestLeases = Object.entries(leaseCases).filter(([name]) => !args[1] || args[1] === name);
+  const actorLeases = Object.entries(actorLeaseCases).filter(([name]) => !args[1] || args[1] === name);
   const capacity = args[1] === 'live-request-lease-capacity';
   const alarms = Object.entries(alarmCases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
@@ -85,10 +91,13 @@ async function main(args) {
     }
     if (requestLeases.length) {
       failed += await runSuite(requestLeases, kernel, controller.signal, {
-        configureNode: () => ({
-          ingressPlacement: true, placement: { homeProbability: 1 },
-          ingress: { tcpKeepalive: { idleSeconds: 1, intervalSeconds: 1, probes: 2 } },
-        }),
+        configureNode: requestLeaseNode,
+      });
+    }
+    for (const [name, threadedNodes] of actorLeases) {
+      failed += await runSuite([[name, actorRequestLease]], kernel, controller.signal, {
+        threadedNodes, configureNode: requestLeaseNode,
+        budgetLifetime: { tenant: 'live-request-timers', leaseMs: 30_000 },
       });
     }
     if (capacity) {
@@ -112,7 +121,8 @@ async function main(args) {
         controlDurableLifecycle, delayRecoveryPeers, budgetLifetime,
       });
     }
-    const executed = regular.length + webSockets.length + requestLeases.length + gated.length + alarms.length + Number(capacity);
+    const executed = regular.length + webSockets.length + requestLeases.length + actorLeases.length + gated.length +
+      alarms.length + Number(capacity);
     console.log(`${executed} executed, ${failed} failed`);
   } finally {
     console.log(`Cluster run including setup and cleanup: ${((performance.now() - start) / 1000).toFixed(1)} s`);

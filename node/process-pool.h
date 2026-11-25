@@ -4,6 +4,7 @@
 
 #include "coworkerd.capnp.h"
 #include "config.h"
+#include "egress.h"
 #include "suspects.h"
 #include "tenancy.h"
 #include "tenant-execution.h"
@@ -187,7 +188,7 @@ public:
   // and its own egress token (EGRESS_TOKEN), which the runtime sends with each request and only the runtime holds.
   void enableEgress(std::string address);
   // The live generation (slot id, generation) a token belongs to, if any.
-  std::optional<std::pair<std::string, uint64_t>> egressSource(const std::string& token) const;
+  std::optional<EgressSource> egressSource(const std::string& token) const;
 
   // Server exit. beginShutdown(): no further rotation starts (one in progress
   // finishes). drainState(): the rotation's drain criterion over every live generation, with

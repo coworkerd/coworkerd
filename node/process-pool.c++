@@ -3950,14 +3950,16 @@ void ProcessPool::enableEgress(std::string address) {
   impl->egressAddress = std::move(address);
 }
 
-std::optional<std::pair<std::string, uint64_t>> ProcessPool::egressSource(const std::string& token) const {
+std::optional<EgressSource> ProcessPool::egressSource(const std::string& token) const {
   if (token.size() != 32) return std::nullopt;
   for (const auto& slot : impl->slots) {
     for (const auto* generation : {&slot.current, &slot.incoming}) {
-      if (*generation && (*generation)->egressToken == token) return std::pair{(*generation)->id, (*generation)->generation};
+      if (*generation && (*generation)->egressToken == token)
+        return EgressSource{(*generation)->id, (*generation)->generation, (*generation)->durable};
     }
     for (const auto& generation : slot.retiring)
-      if (generation && generation->egressToken == token) return std::pair{generation->id, generation->generation};
+      if (generation && generation->egressToken == token)
+        return EgressSource{generation->id, generation->generation, generation->durable};
   }
   return std::nullopt;
 }
