@@ -54,7 +54,7 @@ std::string PlatformDefinition::sourceJson(const VersionPin& pin) const {
 }
 
 PlatformDefinitions::PlatformDefinitions(): product("coworkerd:platform", COWORKERD_VERSION,
-    {{"platform.js", PLATFORM_SOURCE}, {"sql-database.js", SQL_DATABASE_SOURCE}}, {"experimental"}) {}
+    {{"platform.js", PLATFORM_SOURCE}, {"sql-database.js", sqlDatabaseSource()}}, {"experimental"}) {}
 
 const PlatformDefinition* PlatformDefinitions::definition(const std::string& name) const {
   if (product.name == name) return &product;

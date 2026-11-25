@@ -9,6 +9,7 @@ int main() {
   using namespace coworkerd;
   setenv("COWORKERD_PLATFORM_FIXTURE", "/unused-platform-fixture", 1);
   setenv("COWORKERD_TEST_THREADED_DATABASES", "1", 1);
+  setenv("COWORKERD_TEST_DATABASE_ALARM_FIXTURE", "/unused-database-alarm-fixture", 1);
   const auto installed = loadPlatformDefinitions();
   KJ_REQUIRE(!installed.fixture && installed.fixtureClasses.empty() && !installed.threadedDatabasesForTest,
       "production ignores the test definition and database switches");
