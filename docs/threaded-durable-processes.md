@@ -238,14 +238,32 @@ before admitting the event to JavaScript. Platform objects have an empty `env` a
 the usual tenant Durable Object event limits, using the node's defaults where the tenant has
 no override.
 
-The forwarding node sends the class reference. The shard owner selects its own build's pin
-when it admits the event, so either direction of forwarding works in a rolling upgrade. A queued
+The forwarding node sends the namespace and object IDs. The shard owner resolves the namespace
+against its local catalog and selects its own build's class and pin. A class reference carried by
+a peer is advisory. Database forwarders omit it so that nodes with the first version of the
+platform loader can continue to serve the upstream SQL class. Future namespace mappings must
+preserve the meaning of the namespace on owners that predate the mapping. A queued
 or running event and its retained work use the pin and copy they acquired. The package stays fixed
 for the lifetime of the node daemon. The daemon alone holds each child's parent-liveness write
 end, and the threaded child exits on EOF. The sandbox launcher also sets a parent-death signal.
 Replacing the daemon therefore uses ordinary process shutdown and shard fencing. The next owner
 can reopen the same storage and fire later alarms under its own definition. The node's durable
 log, confirmation, takeover, alarm and idle-release paths remain the common path for the object.
+
+### Database placement
+
+The owner can map a database namespace to the `SqlDatabase` export of `coworkerd:platform`.
+Both backends use the same SQL module and address the stored data by the same namespace,
+object ID and data epoch. On the threaded host the platform copy key also binds the validated
+namespace and object IDs. Two open databases therefore have separate isolate copies even
+when their tenant, package and limits match. An idle copy can only be reused for the same
+database. The product definition enables the experimental SQLite methods used by the SQL
+class, with no change to the compatibility flags available to tenant Workers.
+
+The threaded mapping is enabled by the cluster test executable. Production activation
+depends on the database deadline, cancellation, WAL, temporary-file and SQLite memory
+bounds required in [#81](https://github.com/coworkerd/coworkerd/issues/81). The upstream
+backend continues to serve databases during this stage.
 
 ### Databases: original native execution proposal
 

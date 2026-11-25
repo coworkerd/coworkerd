@@ -59,6 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
+    databaseFixtureNode, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -91,6 +92,9 @@ export class Cluster {
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
+    this.databaseFixtureNode = databaseFixtureNode;
+    this.previousProduct = previousProduct;
+    this.previousKernel = previousKernel;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000,
@@ -197,12 +201,32 @@ export class Cluster {
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
+      if (node === this.databaseFixtureNode) {
+        overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
+        overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
+          target: '/opt/coworkerd/bin/coworkerd', read_only: true });
+      }
+      if (node === nodes[1] && this.previousProduct) {
+        for (const [file, source] of [
+          ['bin/coworkerd', join(this.previousProduct, 'build/coworkerd')],
+          ['runtime/runtime.js', join(this.previousProduct, 'runtime/runtime.js')],
+        ]) {
+          overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/${file}`, read_only: true });
+        }
+        if (this.previousKernel) {
+          for (const file of ['workerd', 'coworkerd-threaded', 'coworkerd-syscalls-startup.txt', 'coworkerd-syscalls-steady.txt']) {
+            const source = file.endsWith('.txt')
+              ? join(this.previousKernel, 'allowlist', file) : join(this.previousKernel, file);
+            overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/bin/${file}`, read_only: true });
+          }
+        }
+      }
       if (platformSource) {
         const directory = join(this.directory, `${node}-platform`);
         const target = '/tmp/coworkerd-platform-test';
         await mkdir(directory, { mode: 0o755 });
         await Promise.all([
-          writeFile(join(directory, 'config.json'), JSON.stringify({ release: node, classes: this.platformFixture })),
+          writeFile(join(directory, 'config.json'), JSON.stringify({ release: node, classes: this.platformFixture(node) })),
           writeFile(join(directory, 'platform.js'), `${platformSource}\nconst fixtureBuild = ${JSON.stringify(node)};\n`),
         ]);
         overrides[node].environment.COWORKERD_PLATFORM_FIXTURE = `${target}/config.json`;

@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { DatabaseSync } from 'node:sqlite';
 
-const source = await readFile(new URL('../runtime.js', import.meta.url), 'utf8');
-const classSource = source.slice(source.indexOf('export class SqlDatabase extends'), source.indexOf('export class BoundWorker extends')).replace('export class', 'class');
+const source = await readFile(new URL('../sql-database.js', import.meta.url), 'utf8');
+const classSource = source.replace(/^import .*;$/m, '').replace(/^export /gm, '');
 function fixture() {
   const db = new DatabaseSync(':memory:');
   const sqlite = {
@@ -29,7 +29,7 @@ function fixture() {
   } };
   const C = vm.runInNewContext(classSource + '; SqlDatabase', {
     DurableObject: class { constructor(ctx) { this.ctx = ctx; } },
-    ArrayBuffer, Uint8Array, Request, Response, URL, TextEncoder, DO_ALARM_HEADER: 'x-test-alarm',
+    ArrayBuffer, Uint8Array, Request, Response, URL, TextEncoder,
   });
   const worker = new C({ storage });
   return { db, worker, close: () => db.close(), async query(body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') {
@@ -88,7 +88,7 @@ test('after overflow the cursor is exhausted without encoding subsequent rows',a
    for(let i=0;i<3;i++){drained++;yield[{toJSON(){encodedAfter=true;throw new Error('must not encode after overflow')}}]}
   }else yield[1];
  }})}};
- const C=vm.runInNewContext(classSource+'; SqlDatabase',{DurableObject:class{constructor(ctx){this.ctx=ctx}},ArrayBuffer,Uint8Array,Request,Response,URL,TextEncoder,DO_ALARM_HEADER:'x-test-alarm'});
+ const C=vm.runInNewContext(classSource+'; SqlDatabase',{DurableObject:class{constructor(ctx){this.ctx=ctx}},ArrayBuffer,Uint8Array,Request,Response,URL,TextEncoder});
  const worker=new C({storage:{sql:sqlite,transactionSync:fn=>fn()}});
  const request=sql=>new Request('http://sql/query',{method:'POST',body:JSON.stringify({sql})});
  const response=await worker.fetch(request('oversized')),answer=await response.json();

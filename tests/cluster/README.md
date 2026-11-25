@@ -42,6 +42,25 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+### Database placement across builds
+
+`durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
+database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
+same-tenant databases in separate isolate copies of the same threaded process generation before and after
+idle release, and acknowledged writes recovered at a later shard epoch after either build's owner is killed.
+`durable-threaded-database-release` checks that a public SQL query on a threaded owner returns the release
+executable's `501 NOT_SUPPORTED` response. To run the placement test with an actual older node build,
+point the runner at a checkout containing its built Linux `build/coworkerd` and its original `runtime/runtime.js`.
+
+```sh
+COWORKERD_CLUSTER_PREVIOUS_PRODUCT=/path/to/previous-checkout \
+  node tests/cluster/run.mjs "$kernel" durable-threaded-database-placement
+```
+
+The runner uses the older daemon and runtime on node 2 and records the SHA-256 of both node binaries.
+Set `COWORKERD_CLUSTER_PREVIOUS_KERNEL` to the older build's verified kernel directory when testing
+across a change to the node-to-kernel protocol.
+
 To measure idle WebSocket memory on fresh clusters:
 
 ```sh

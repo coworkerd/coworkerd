@@ -99,8 +99,9 @@ target_compile_features(common PUBLIC cxx_std_23)
 target_include_directories(common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/common" "${GENERATED_DIR}")
 target_link_libraries(common PUBLIC capnp-http-over OpenSSL::Crypto)
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "runtime/platform.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "runtime/platform.js" "runtime/sql-database.js")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform.js" COWORKERD_PLATFORM_SOURCE)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/sql-database.js" COWORKERD_SQL_DATABASE_SOURCE)
 configure_file(node/platform-source.h.in "${GENERATED_DIR}/platform-source.h" @ONLY)
 
 add_library(coworkerd-node OBJECT

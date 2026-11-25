@@ -8,8 +8,10 @@
 int main() {
   using namespace coworkerd;
   setenv("COWORKERD_PLATFORM_FIXTURE", "/unused-platform-fixture", 1);
+  setenv("COWORKERD_TEST_THREADED_DATABASES", "1", 1);
   const auto installed = loadPlatformDefinitions();
-  KJ_REQUIRE(!installed.fixture && installed.fixtureClasses.empty(), "production enables only built-in definitions");
+  KJ_REQUIRE(!installed.fixture && installed.fixtureClasses.empty() && !installed.threadedDatabasesForTest,
+      "production ignores the test definition and database switches");
 
   const PlatformClassRef reference{"coworkerd:platform-test", "PlatformStore"};
   const DeploymentState::NamespaceOwner owner{"alpha", "alpha/object", "Record", "", "active", 1024, reference};
@@ -33,6 +35,10 @@ int main() {
   KJ_REQUIRE(key != platformCopyKey("beta", first.name, beta, 500, 64));
   KJ_REQUIRE(key != platformCopyKey("alpha", first.name, upgrade.version("alpha"), 500, 64));
   KJ_REQUIRE(key != platformCopyKey("alpha", first.name, alpha, 501, 64));
+  const auto database = platformCopyKey("alpha", first.name, alpha, 500, 64, "namespace-one", "object-one");
+  KJ_REQUIRE(database != key);
+  KJ_REQUIRE(database != platformCopyKey("alpha", first.name, alpha, 500, 64, "namespace-two", "object-one"));
+  KJ_REQUIRE(database != platformCopyKey("alpha", first.name, alpha, 500, 64, "namespace-one", "object-two"));
   const auto payload = first.sourceJson(versionPin(alpha));
   KJ_REQUIRE(payload.find(alpha.contentHash) != std::string::npos);
   auto refusal = kj::runCatchingExceptions([&] { first.sourceJson(versionPin(changed.version("alpha"))); });

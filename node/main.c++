@@ -409,8 +409,7 @@ struct DurableTarget {
   uint16_t hops = 0;
   uint32_t shard = 0;
   uint64_t shardEpoch = 0, dataEpoch = 0;
-  // A tenant's database (the D1 shape): its tenant and name. The object's class is then the platform's own SQL
-  // Worker class, which the Host runs as the facet -- there is no tenant version and no code package.
+  // A tenant's database (the D1 shape): its tenant and name. Its owner's backend selects the local SQL class.
   std::string tenant, database;
   // This request is the object's alarm, scheduled for this time (Unix milliseconds); 0 otherwise, with how many
   // times its handler has already been tried.
@@ -2491,8 +2490,21 @@ public:
   // Whose namespace this is: a Worker's class, or a tenant's database (none when no key names it).
   std::optional<coworkerd::DeploymentState::NamespaceOwner> namespaceOwner(const std::string& namespaceId) const {
     auto owner = desiredState.state().namespaceOwner(namespaceId);
-    if (owner && !owner->platformClass && !platformDefinitions.fixtureClasses.empty())
+    if (!owner) return std::nullopt;
+    if (owner->isDatabase()) {
+      if (owner->active() && serverConfig.processPool.threadedDurableStorage && platformDefinitions.threadedDatabasesForTest)
+        owner->platformClass = coworkerd::PlatformClassRef{platformDefinitions.product.name, "SqlDatabase"};
+    } else if (!owner->platformClass && !platformDefinitions.fixtureClasses.empty()) {
       owner->platformClass = platformDefinitions.fixtureClassFor(*owner);
+    }
+    return owner;
+  }
+  std::optional<coworkerd::DeploymentState::NamespaceOwner> databaseNamespace(const DurableTarget& target) const {
+    auto owner = namespaceOwner(target.namespaceId);
+    if (!owner || !owner->active() || !owner->isDatabase() || owner->tenant != target.tenant ||
+        owner->database != target.database || owner->className != target.className ||
+        target.objectId != coworkerd::durableObjectIdFromName(target.namespaceId, coworkerd::DATABASE_OBJECT_NAME))
+      return std::nullopt;
     return owner;
   }
   // The tenant's quotas as its record holds them (the defaults when it has none).
@@ -2555,14 +2567,18 @@ public:
     auto process = runtime.selectDurable(target.key());
     if (!process) throw ProcessUnavailable{false};
     if (process->threadedDurableRole() &&
-        (target.isDatabase() || (process->threadedDurableTestRole() && target.alarmAtUnixMs))) {
+        ((target.isDatabase() && !target.platformClass) || (process->threadedDurableTestRole() && target.alarmAtUnixMs))) {
       throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", process->threadedDurableTestRole()
           ? "the durable test role supports object requests" : "the threaded durable role supports Worker object requests"}};
     }
     if (target.platformClass && !process->threadedDurableRole())
       throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", "platform objects require the threaded durable role"}};
     // These catalog checks must not leave an open marker when no facet will be started.
-    if (!target.isDatabase()) {
+    if (target.isDatabase()) {
+      const auto owner = databaseNamespace(target);
+      if (!owner || owner->platformClass != target.platformClass)
+        throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE", "the database namespace changed"}};
+    } else {
       if (target.platformClass) {
         const auto owner = namespaceOwner(target.namespaceId);
         std::string code, reason;
@@ -2584,7 +2600,7 @@ public:
     auto root = target.platformClass
         ? std::optional{coworkerd::preparePlatformRootDispatch(*target.platformClass, *version,
             std::min(limits.cpuMs, 30000u), limits.memoryMiB, target.namespaceId, target.objectId,
-            target.dataEpoch, target.alarmAtUnixMs, target.alarmFacetId)}
+            target.dataEpoch, target.alarmAtUnixMs, target.alarmFacetId, target.isDatabase())}
         : coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
         target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
         target.alarmFacetId);
@@ -5610,7 +5626,9 @@ public:
     remote.setAlarmAtUnixMs(target.alarmAtUnixMs);
     remote.setAlarmRetryCount(target.alarmRetryCount);
     remote.setAlarmFacetId(target.alarmFacetId);
-    if (target.platformClass) {
+    // A build with the original platform loader can reject a database hint. Its own database mapping needs
+    // only the stable namespace and object identifiers already on the wire.
+    if (target.platformClass && !target.isDatabase()) {
       remote.setPlatformDefinition(target.platformClass->definition.c_str());
       remote.setPlatformClass(target.platformClass->name.c_str());
     }
@@ -7208,7 +7226,7 @@ public:
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
     }
     std::string code, reason;
-    auto version = checked(request, line, code, reason, true);
+    auto version = checked(request, line, code, reason);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
     if (request.target.shard != shard)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the request names shard " + std::to_string(shard) +
@@ -7270,23 +7288,28 @@ private:
 
   // The checks before the shard: the hop limit, the version and its class's namespace, the tenant; the object's shard.
   std::shared_ptr<const VersionDefinition> checked(Request& request, Line& line, std::string& code,
-      std::string& reason, bool forwarded = false) {
+      std::string& reason) {
     auto& target = request.target;
     if (target.hops > MAX_DURABLE_HOPS) {
       code = "DO_HOP_LIMIT";
       reason = "more than " + std::to_string(MAX_DURABLE_HOPS) + " Durable Object calls in a row (an object calling an object, ...)";
       return nullptr;
     }
-    auto version = target.isDatabase() ? server.databaseVersion(target.tenant)
-                                       : server.durableVersion(request.workerId, target, code, reason);
-    if (!version) return nullptr;
-    const auto platformClass = target.isDatabase() ? std::nullopt : server.platformClassFor(request.workerId, target);
-    if (forwarded && target.platformClass != platformClass) {
-      code = "DO_NAMESPACE_UNAVAILABLE";
-      reason = "the forwarded platform class does not match the namespace";
-      return nullptr;
+    std::shared_ptr<const VersionDefinition> version;
+    if (target.isDatabase()) {
+      const auto owner = server.databaseNamespace(target);
+      if (!owner || owner->tenant != coworkerd::tenantOf(request.workerId)) {
+        code = "DO_NAMESPACE_UNAVAILABLE";
+        reason = "the database namespace is unavailable";
+        return nullptr;
+      }
+      target.platformClass = owner->platformClass;
+      version = server.databaseVersion(owner->tenant);
+    } else {
+      version = server.durableVersion(request.workerId, target, code, reason);
+      target.platformClass = server.platformClassFor(request.workerId, target);
     }
-    target.platformClass = platformClass;
+    if (!version) return nullptr;
     line.workerId = version->workerId;
     line.versionId = version->versionId;
     if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(version->workerId)); !unavailable.empty()) {
@@ -7355,8 +7378,8 @@ private:
         target.dataEpoch, target.shardEpoch, target.shard};
     if (!disposable) slot->durableLog = &durableLog;
     slot->timing = request.timing;
-    // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
-    // and no secret to look for.
+    // The durable host loads platform packages from its admitting daemon. The upstream database class
+    // comes from the static runtime.
     if (!target.isDatabase() && !target.platformClass) {
       auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
@@ -7519,7 +7542,7 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   auto owner = server.namespaceOwner(alarm.namespaceId);
   KJ_REQUIRE(owner.has_value());
   const auto threaded = server.placementConfig().processPool.threadedDurableStorage;
-  if (threaded && owner->isDatabase()) {
+  if (threaded && owner->isDatabase() && !owner->platformClass) {
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
         "NOT_SUPPORTED: database objects do not run on the threaded durable host"};
   }
@@ -7707,12 +7730,7 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   request.target.alarmAtUnixMs = remote.getAlarmAtUnixMs();
   request.target.alarmRetryCount = remote.getAlarmRetryCount();
   request.target.alarmFacetId = remote.getAlarmFacetId();
-  if (remote.getPlatformDefinition().size() || remote.getPlatformClass().size()) {
-    KJ_REQUIRE(remote.getPlatformDefinition().size() > 0 && remote.getPlatformDefinition().size() <= 128 &&
-        coworkerd::environmentName(remote.getPlatformClass().cStr()), "invalid remote platform class");
-    request.target.platformClass = coworkerd::PlatformClassRef{
-        remote.getPlatformDefinition().cStr(), remote.getPlatformClass().cStr()};
-  }
+  // The shard owner's catalog selects the class. This build can serve peers that send older class hints.
   if (!request.target.database.empty()) {
     request.target.tenant = coworkerd::tenantOf(request.workerId);
     KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&

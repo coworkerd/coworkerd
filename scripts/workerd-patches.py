@@ -330,7 +330,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0150-platform-durable-definition.patch',
-                                   '0151-reserve-platform-execution-identity.patch'} and path in {
+                                   '0151-reserve-platform-execution-identity.patch',
+                                   '0170-place-platform-databases-in-exclusive-copies.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
