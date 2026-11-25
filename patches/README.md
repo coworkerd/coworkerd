@@ -75,6 +75,9 @@ Durable Object call so the node can count object hops. Its Rust paths are `serve
 `0142-hold-invocation-budget-through-drain` keeps the node's budget alive while the kernel holds the incoming
 request, including its existing background drain. An alarm carries its event identity, and the current incoming
 request inherits background work when the request that started it has drained.
+`0143-release-durable-budgets-over-parent-socket` keeps the budget attachment on the incoming request's observer
+reference. The legacy root loader forwards that token from the platform wrapper to the selected root. Threaded
+Durable Object processes return finished budget tickets on their existing parent-liveness socket.
 
 ## Working on the series
 
