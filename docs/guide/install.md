@@ -600,6 +600,31 @@ for phases, holders, queue delays and budgets. `[do-log] tail-recovery-bounded` 
 Investigate `confirmed-tail-unaccounted` and preserve the old segments.
 See [cluster state, section 12](../cluster-state.md#12-durable-object-durability) for the recovery boundary.
 
+<a id="database-recovery-after-a-node-loss"></a>
+
+**Database recovery after a node loss.** A query to a database whose shard is in its first
+ownership epoch uses a rebuild slot for its initial epoch read and local tail collection.
+When a node takes over a shard it acquires a later epoch and uses the waiting-recovery gate.
+
+In a three-node test with default recovery settings, one node held all databases and each database
+held one confirmed SQLite row on its own shard. After `SIGKILL`, both survivors detected the
+failure and took half the shards each. The probe sent all reads after detection and retried until
+it verified every row. Times are measured from the kill request, in seconds.
+
+| Databases on the lost node | Failure detected | First read | Median read | Last read | Last read after detection |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 33.66 | 59.50 | 59.50 | 59.61 | 25.96 |
+| 500 | 26.38 | 59.45 | 59.91 | 59.93 | 33.55 |
+| 1,000 | 27.32 | 91.52 | 93.76 | 95.16 | 67.84 |
+| 2,000 | 33.99 | 198.92 | 208.60 | 240.52 | 206.53 |
+
+From 500 to 1,000 databases, the post-detection time doubled as each survivor queued two epoch reads
+per database at 16 metadata requests per second. In the 2,000-database run, the survivors issued
+2,646 and 3,236 waiting metadata requests. The latter also logged two durable process watchdog exits
+and 599 additional rebuilds. Failure detection, the number of surviving nodes, object-store latency
+and the size of snapshots and tails also affect recovery time.
+[Measurement commands and conditions](../../tests/cluster/README.md#database-first-access-and-node-loss)
+
 The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Each namespace stores object files by their hashed storage ids under `do/coworkerd-do-root-v1-<namespace>/`; facet zero is the root database. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
 
 Every daemon restart discards local Durable Object database, WAL, SHM, facet-index and staging files; no object reuses its database files, even within the same Linux boot. Each object is rebuilt from stored history and surviving logs at its first request. While the object store is unreachable, objects of a restarted node answer `503`. Startup first synchronizes `clean:false`; failure gates all DO/D1 service without changing object files. A trusted startup retains position files, while an untrusted startup removes them too. The boot identity still determines whether predecessor logs can prove that no records are missing; it never authorizes database reuse. Original log prefixes and persistent exclusions survive an untrusted startup; epochs crossed by power loss never become absence proofs on a later same-boot restart. Each handoff also needs a writable open marker, so disk exhaustion can refuse a first read. A durable process failure invalidates its open objects. Rebuilding an object with a live request or connection, including a hibernating WebSocket, first resets the node's durable processes and closes their connections. See [cluster state](../cluster-state.md), section 12.
