@@ -1023,9 +1023,7 @@ public:
   std::optional<coworkerd::PlatformClassRef> platformClassFor(const std::string& workerId,
       const DurableTarget& target) const {
     const auto owner = namespaceOwner(target.namespaceId);
-    if (!owner || !owner->active() || owner->workerId != workerId || owner->className != target.className ||
-        owner->tenant != coworkerd::tenantOf(workerId)) return std::nullopt;
-    return owner->platformClass;
+    return owner ? coworkerd::platformClassFor(*owner, workerId, target.className) : std::nullopt;
   }
 
   const coworkerd::PlatformDefinition* platformDefinition(const std::string& name) const {

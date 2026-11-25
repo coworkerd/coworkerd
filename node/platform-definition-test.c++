@@ -11,6 +11,15 @@ int main() {
   const auto installed = loadPlatformDefinitions();
   KJ_REQUIRE(!installed.fixture && installed.fixtureClasses.empty(), "production enables only built-in definitions");
 
+  const PlatformClassRef reference{"coworkerd:platform-test", "PlatformStore"};
+  const DeploymentState::NamespaceOwner owner{"alpha", "alpha/object", "Record", "", "active", 1024, reference};
+  KJ_REQUIRE(platformClassFor(owner, "alpha/object", "Record") == reference);
+  KJ_REQUIRE(!platformClassFor(owner, "beta/object", "Record"), "a different tenant cannot use the namespace");
+  KJ_REQUIRE(!platformClassFor(owner, "alpha/other", "Record"), "a different Worker cannot use the namespace");
+  auto otherTenant = owner;
+  otherTenant.tenant = "beta";
+  KJ_REQUIRE(!platformClassFor(otherTenant, "alpha/object", "Record"), "the namespace tenant must match the Worker");
+
   PlatformDefinition first("coworkerd:platform-test", "build-a", {{"platform.js", "export class Record {}"}});
   PlatformDefinition changed("coworkerd:platform-test", "build-a", {{"platform.js", "export class Other {}"}});
   PlatformDefinition upgrade("coworkerd:platform-test", "build-b", {{"platform.js", "export class Record {}"}});

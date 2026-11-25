@@ -60,6 +60,13 @@ std::optional<PlatformClassRef> PlatformDefinitions::fixtureClassFor(const Deplo
   return found->second;
 }
 
+std::optional<PlatformClassRef> platformClassFor(const DeploymentState::NamespaceOwner& owner,
+    const std::string& workerId, const std::string& className) {
+  if (!owner.active() || owner.workerId != workerId || owner.className != className ||
+      owner.tenant != tenantOf(workerId)) return std::nullopt;
+  return owner.platformClass;
+}
+
 std::string platformCopyKey(std::string_view tenant, const std::string& name,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib) {
   // The binding set is empty. Keep this encoding in step with the threaded host's admission check.
