@@ -90,6 +90,18 @@ void tenantBorrowConfiguration(Fixture& fixture) {
   KJ_REQUIRE(refusal.find("tenantBorrowBelowPercent") != std::string::npos);
 }
 
+void webSocketConfiguration(Fixture& fixture) {
+  KJ_REQUIRE(fixture.load("{}").webSocketsPerNode == 0);
+  KJ_REQUIRE(fixture.load(R"({"ingress":{"webSocketsPerNode":2}})").webSocketsPerNode == 2);
+  for (const auto* oldLimit : {"0", "1000"}) {
+    std::string refusal;
+    try { fixture.load(std::string("{\"ingress\":{\"webSocketsPerTenant\":") + oldLimit + "}}"); }
+    catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+    KJ_REQUIRE(refusal.find("ingress.webSocketsPerTenant was removed") != std::string::npos &&
+        refusal.find("ingress.webSocketsPerNode") != std::string::npos, refusal.c_str());
+  }
+}
+
 // With the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
 // refusal names every value. The defaults (15 s, 5 s, 10 s) and the small test configuration (5 s, 1 s, 3 s) start.
 void livenessGraceConfiguration(Fixture& fixture) {
@@ -144,6 +156,7 @@ int main(int argc, char** argv) {
     if (label == "idle") idleConfiguration(fixture);
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
+    else if (label == "websocket") webSocketConfiguration(fixture);
     else if (label == "liveness-grace") livenessGraceConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);
   } catch (const kj::Exception& error) {

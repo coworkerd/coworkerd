@@ -293,8 +293,8 @@ struct ServerConfig {
   uint32_t drainAnnounceDelayMsForTest = 0;
   // The load check before a version's first dispatch to a process; COWORKERD_LOAD_CHECK overrides it.
   bool loadCheck = true;
-  // ingress.webSocketsPerTenant: the open WebSocket connections the ingress holds for one tenant; 0, no limit.
-  uint32_t webSocketsPerTenant = 1000;
+  // A ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
+  uint32_t webSocketsPerNode = 0;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
   // The configuration file of `serve`. The four paths and addresses are serve only (the

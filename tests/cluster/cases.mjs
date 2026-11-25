@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { rename, unlink, writeFile } from 'node:fs/promises';
+import { get } from 'node:http';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -22,6 +23,131 @@ async function deployment(cluster) {
       assert.deepEqual(Object.fromEntries(cluster.nodes.map((node, i) => [node, observed[i]])),
         Object.fromEntries(cluster.nodes.map(node => [node, { status: 200, text: expected }])));
     });
+  }
+}
+
+async function webSocketAdmission(cluster) {
+  const [node, otherNode] = cluster.nodes;
+  const { WebSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const source = `export default { async fetch(request) {
+    if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('ready');
+    const path = new URL(request.url).pathname;
+    if (path.endsWith('/pending')) {
+      await new Promise(resolve => setTimeout(resolve, 6000));
+      return new Response(null, { status: 403 });
+    }
+    if (path.endsWith('/decline')) {
+      const body = new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('declined'));
+        setTimeout(() => controller.close(), 15000);
+      } });
+      return new Response(body, { status: 403 });
+    }
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.addEventListener('close', event => server.close(event.code, event.reason));
+    return new Response(null, { status: 101, webSocket: client });
+  } };`;
+  const first = await cluster.tenant('socket-first');
+  const second = await cluster.tenant('socket-second');
+  for (const tenant of [first, second]) {
+    await cluster.deploy(tenant, 'socket', source);
+    await eventually('Worker ready on both ingresses', async () => {
+      for (const ingress of [node, otherNode]) {
+        assert.deepEqual(await workerCall(cluster, ingress, tenant, 'socket'), { status: 200, text: 'ready' });
+      }
+    });
+  }
+  const sockets = [];
+  const url = (ingress, tenant, suffix = '') => new URL(`/${tenant.name}/socket${suffix}`, cluster.urls[ingress]);
+  const waitFor = (socket, event) => once(socket, event, { signal: AbortSignal.timeout(5000) });
+  function connect(ingress, tenant, suffix) {
+    const target = url(ingress, tenant, suffix);
+    target.protocol = 'ws:';
+    const socket = new WebSocket(target);
+    socket.on('error', () => {});
+    sockets.push(socket);
+    return socket;
+  }
+  async function open(ingress, tenant) {
+    const socket = connect(ingress, tenant);
+    await waitFor(socket, 'open');
+    return socket;
+  }
+  const decline = () => new Promise((resolve, reject) => {
+    const request = get(url(node, second, '/decline'), {
+      headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64') },
+    });
+    const timeout = setTimeout(() => request.destroy(new Error('upgrade response headers timed out')), 5000);
+    request.once('response', response => {
+      clearTimeout(timeout);
+      resolve(response);
+    }).once('error', error => {
+      clearTimeout(timeout);
+      reject(error);
+    }).once('upgrade', (_response, socket) => {
+      clearTimeout(timeout);
+      socket.destroy();
+      reject(new Error('the Worker should refuse the upgrade'));
+    });
+  });
+  const state = async () => (await cluster.state(node)).webSockets;
+  const inUse = (count, timeout = 5000) => eventually(`node has ${count} WebSocket reservations`, async () => {
+    assert.equal((await state()).inUse, count);
+  }, { timeout });
+  try {
+    assert.equal((await state()).limitPerNode, 2);
+    const otherState = await cluster.state(otherNode);
+    assert.equal(otherState.webSockets.limitPerNode, 2048);
+    const descriptors = await cluster.compose(['exec', '-T', otherNode, 'cat', `/proc/${otherState.server.pid}/limits`]);
+    assert.match(descriptors, /^Max open files\s+15488\s+524288\s/m);
+    const a = await open(node, first);
+    const b = await open(node, second);
+    const full = await state();
+    assert.equal(full.inUse, 2);
+    assert.deepEqual(full.places, { [first.name]: 1, [second.name]: 1 });
+    const denied = await decline();
+    assert.equal(denied.statusCode, 503);
+    let body = '';
+    for await (const chunk of denied) body += chunk;
+    const { code, limit, inFlight, dispatched, retryable } = JSON.parse(body);
+    assert.deepEqual({ code, limit, inFlight, dispatched, retryable },
+      { code: 'WEBSOCKET_NODE_CAPACITY', limit: 2, inFlight: 2, dispatched: false, retryable: true });
+    assert.deepEqual(await workerCall(cluster, node, second, 'socket'), { status: 200, text: 'ready' });
+    await open(otherNode, second);
+
+    const closed = waitFor(a, 'close');
+    a.close(1000, 'done');
+    assert.equal((await closed)[0], 1000);
+    await inUse(1);
+
+    const pending = connect(node, first, '/pending');
+    await inUse(2);
+    assert.equal(pending.readyState, WebSocket.CONNECTING);
+    pending.terminate();
+    assert.equal((await state()).inUse, 2, 'an abandoned handshake holds its place while waiting for the Worker');
+    await inUse(1, 15000);
+
+    const declined = await decline();
+    declined.on('error', () => {});
+    try {
+      assert.equal(declined.statusCode, 403);
+      await inUse(1);
+      assert.equal(declined.complete, false, 'the upgrade place is free while the HTTP body is still streaming');
+      assert.equal(declined.destroyed, false);
+      await open(node, first);
+      await inUse(2);
+    } finally {
+      declined.destroy();
+    }
+
+    b.terminate();
+    await inUse(1);
+    await open(node, second);
+    await inUse(2);
+  } finally {
+    for (const socket of sockets) socket.terminate();
   }
 }
 
@@ -1104,10 +1230,30 @@ async function threadedClassMigration(cluster) {
     class Retained extends RpcTarget {
       ping() { return '${version}'; }
     }
+    export class MigrationFacet extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        this.constructedWith = ctx.getWebSockets().length;
+      }
+      fetch(request) {
+        if (!request.headers.has('upgrade')) {
+          return Response.json({ constructedWith: this.constructedWith, version: this.ctx.props.version });
+        }
+        const [client, socket] = Object.values(new WebSocketPair());
+        this.ctx.acceptWebSocket(socket);
+        return new Response(null, { status: 101, webSocket: client });
+      }
+      webSocketMessage(socket, message) { socket.send(this.ctx.props.version + ':' + message); }
+    }
     export class ${className} extends DurableObject {
       retain() { return new Retained(); }
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path.endsWith('/facet-socket') || path.endsWith('/facet-status')) {
+          return this.ctx.facets.get('migration', () => ({
+            class: this.ctx.exports.MigrationFacet({ props: { version: '${version}' } }),
+          })).fetch(request);
+        }
         if (path.endsWith('/alarm')) {
           const at = await request.json();
           await this.ctx.storage.setAlarm(at);
@@ -1156,8 +1302,10 @@ async function threadedClassMigration(cluster) {
       async alarm() { await this.ctx.storage.put('alarm-version', '${version}'); }
     }
     export default { async fetch(request, env) {
-      const stub = env.OBJECT.getByName('stable');
-      if (!new URL(request.url).pathname.endsWith('/retain')) return stub.fetch(request);
+      const path = new URL(request.url).pathname;
+      const stub = env.OBJECT.getByName(path.endsWith('/facet-socket') || path.endsWith('/facet-status') ?
+        'parked' : 'stable');
+      if (!path.endsWith('/retain')) return stub.fetch(request);
       const retained = await stub.retain();
       const encoder = new TextEncoder();
       return new Response(new ReadableStream({
@@ -1196,6 +1344,14 @@ async function threadedClassMigration(cluster) {
     return socket;
   };
   const sockets = await Promise.all(['/socket', '/hibernatable'].map(openSocket));
+  const facetSocket = await openSocket('/facet-socket');
+  const facetClosed = once(facetSocket, 'close', { signal: AbortSignal.timeout(65000) });
+  void facetClosed.catch(() => {});
+  await eventually('the old definition has a parked facet WebSocket', async () => {
+    const statistics = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    assert.ok(statistics.some(state => state.webSockets.parked > 0));
+    assert.equal(facetSocket.readyState, TestSocket.OPEN);
+  }, { timeout: 25000 });
   const socketsClosed = sockets.map(socket => once(socket, 'close', { signal: AbortSignal.timeout(35000) }));
   for (const closing of socketsClosed) void closing.catch(() => {});
   const heldRpc = await fetch(cluster.urls[ingress] + url + '/retain', { signal: AbortSignal.timeout(45000) });
@@ -1239,6 +1395,15 @@ async function threadedClassMigration(cluster) {
   } finally {
     await reader.cancel().catch(() => {});
   }
+  const freshFacet = await eventually('the new definition opens without the old facet socket or props', async () => {
+    const response = await call('/facet-status');
+    assert.equal(response.status, 200, response.text);
+    return json(response, 200, 'new facet');
+  });
+  assert.deepEqual(freshFacet, { constructedWith: 0, version: 'v2' });
+  const [facetCode, facetReason] = await facetClosed;
+  assert.equal(facetCode, 1001);
+  assert.match(facetReason.toString(), /definition changed/i);
 
   await eventually('renamed class uses the existing threaded storage', async () => {
     assert.equal((await namespace('RenamedRecord')).namespaceId, identity);
@@ -1278,33 +1443,74 @@ async function threadedSocketHibernation(cluster) {
   const namespace = () => cluster.api(`${tenant.path}/workers/sleeper/namespaces/Sleeper`,
     { token: tenant.token });
   await cluster.deploy(tenant, 'sleeper', `
-    import { DurableObject } from 'cloudflare:workers';
-    export class Sleeper extends DurableObject {
+    import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
+    export class ServiceProbe extends WorkerEntrypoint {
+      async fetch() { return Response.json({ target: 'service', label: this.ctx.props.label }); }
+    }
+    export class ObjectProbe extends DurableObject {
+      async fetch() { return Response.json({ target: 'object', id: this.ctx.id.toString() }); }
+    }
+    class SocketActor extends DurableObject {
       constructor(ctx, env) {
         super(ctx, env);
-        this.constructedWith = ctx.getWebSockets('retained').length;
+        this.role = ctx.props?.role ?? 'root';
+        this.attachment = { field: 42, role: this.role };
+        this.autoRequest = this.role === 'root' ? 'tick' : 'facet-tick';
+        this.autoReply = this.role === 'root' ? 'tock' : 'facet-tock';
+        const retained = ctx.getWebSockets('retained');
+        const automatic = ctx.getWebSocketAutoResponse();
+        this.constructedWith = retained.length;
+        this.restored = retained.every(socket =>
+          ctx.getTags(socket).join(',') === 'retained,' + this.role &&
+          JSON.stringify(socket.deserializeAttachment()) === JSON.stringify(this.attachment)) &&
+          (retained.length === 0 || (automatic?.request === this.autoRequest &&
+            automatic.response === this.autoReply));
+        this.sequence = 0;
         ctx.blockConcurrencyWhile(async () => {
           this.instance = (await ctx.storage.get('constructors') ?? 0) + 1;
           await ctx.storage.put('constructors', this.instance);
         });
       }
       async fetch(request) {
-        if (new URL(request.url).pathname.endsWith('/terminal')) {
+        const route = new URL(request.url).pathname;
+        if (route.endsWith('/terminal')) {
           return Response.json(await this.ctx.storage.get('terminal') ?? null);
+        }
+        if (route.endsWith('/hold')) {
+          return new Response(new ReadableStream({
+            async start(controller) {
+              controller.enqueue(new TextEncoder().encode('entered'));
+              await scheduler.wait(20000);
+              controller.close();
+            },
+          }));
+        }
+        if (route.endsWith('/discarded')) {
+          return Response.json({ sockets: this.ctx.getWebSockets('retained').length,
+            state: this.lastSocket?.readyState });
         }
         if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
           const [client, socket] = Object.values(new WebSocketPair());
-          this.ctx.acceptWebSocket(socket, ['retained']);
-          socket.serializeAttachment({ field: 42 });
-          this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('tick', 'tock'));
+          this.ctx.acceptWebSocket(socket, ['retained', this.role]);
+          this.lastSocket = socket;
+          socket.serializeAttachment(this.attachment);
+          this.ctx.setWebSocketAutoResponse(
+            new WebSocketRequestResponsePair(this.autoRequest, this.autoReply));
           return new Response(null, { status: 101, webSocket: client });
         }
         return Response.json({ instance: this.instance, sockets: this.ctx.getWebSockets('retained').length,
-          constructedWith: this.constructedWith });
+          constructedWith: this.constructedWith, restored: this.restored, role: this.role });
       }
-      webSocketMessage(socket, message) {
+      async webSocketMessage(socket, message) {
+        if (message === 'binding targets') {
+          const { service, object } = this.ctx.props.bindings;
+          socket.send(JSON.stringify(await Promise.all([service, object].map(async binding =>
+            (await binding.fetch('http://binding/probe')).json()))));
+          return;
+        }
         socket.send(JSON.stringify({
-          instance: this.instance, constructedWith: this.constructedWith,
+          instance: this.instance, constructedWith: this.constructedWith, restored: this.restored,
+          role: this.role, sequence: ++this.sequence, id: this.ctx.id.toString(),
           message: typeof message === 'string' ? message : [...new Uint8Array(message)],
           attachment: socket.deserializeAttachment(),
           retained: this.ctx.getWebSockets('retained').length,
@@ -1319,15 +1525,77 @@ async function threadedSocketHibernation(cluster) {
         await this.ctx.storage.put('terminal', { error: String(error) });
       }
     }
+    export class SocketFacet extends SocketActor {}
+    export class Parent extends DurableObject {
+      fetch(request) {
+        return this.ctx.facets.get('leaf', () => {
+          if (new URL(request.url).pathname.endsWith('/status')) throw new Error('The saved facet must reopen.');
+          return {
+            class: this.ctx.exports.SocketFacet({ props: { role: 'leaf', bindings: {
+              service: this.ctx.exports.ServiceProbe({ props: { label: 'original' } }),
+              object: this.env.PROBE.getByName('original-object'),
+            } } }),
+            id: 'original-facet',
+          };
+        }).fetch(request);
+      }
+    }
+    export class Sleeper extends SocketActor {
+      async fetch(request) {
+        const route = new URL(request.url).pathname;
+        if (route.endsWith('/delete-facet')) {
+          this.ctx.facets.delete('parent');
+          return new Response(null, { status: 204 });
+        }
+        const parts = route.split('/');
+        const actionIndex = parts.findIndex(part => ['delete-facet', 'abort-facet', 'probe-facet'].includes(part));
+        const [action, child] = actionIndex === -1 ? [] : parts.slice(actionIndex);
+        if (action === 'delete-facet' || action === 'abort-facet') {
+          if (action === 'delete-facet') this.ctx.facets.delete(child);
+          else this.ctx.facets.abort(child, new Error('test abort'));
+          return new Response(null, { status: 204 });
+        }
+        if (action === 'probe-facet') {
+          const facet = this.ctx.facets.get(child, () => ({
+            id: child,
+            class: this.ctx.exports.SocketFacet({ props: {
+              role: 'leaf',
+              ...(child === 'too-large' || child.startsWith('large-') ?
+                { payload: 'x'.repeat(child === 'too-large' ? 70000 : 63000) } : {}),
+            } }),
+          }));
+          try {
+            const response = await facet.fetch(request);
+            if (child === 'discard' && response.status === 101) {
+              try { response.webSocket.accept(); } catch (error) {
+                if (route.endsWith('/throw')) throw new Error('Discarding the upgrade after a throw.');
+                return Response.json({ name: error.name });
+              }
+              throw new Error('Accepted an unforwarded facet peer.');
+            }
+            return response;
+          } catch (error) {
+            if (child === 'discard' && route.endsWith('/throw')) throw error;
+            return Response.json({ name: error.name, message: error.message }, { status: 422 });
+          }
+        }
+        if (route.includes('/facet/')) {
+          return this.ctx.facets.get('parent', () => ({ class: this.ctx.exports.Parent })).fetch(request);
+        }
+        return super.fetch(request);
+      }
+    }
     export default {
       fetch(request, env) { return env.TREE.getByName('parked').fetch(request); }
     };
-  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper'] }],
-    durable_objects: { bindings: [{ name: 'TREE', class_name: 'Sleeper' }] } } });
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Sleeper', 'ObjectProbe'] }],
+    durable_objects: { bindings: [
+      { name: 'TREE', class_name: 'Sleeper' }, { name: 'PROBE', class_name: 'ObjectProbe' },
+    ] } } });
 
   await eventually('the threaded object answers successfully', async () => {
     assert.deepEqual(json(await request(cluster.urls[ingress], path), 200, 'open sleeper'),
-      { instance: 1, sockets: 0, constructedWith: 0 });
+      { instance: 1, sockets: 0, constructedWith: 0, restored: true, role: 'root' });
   });
   const owner = (await namespace()).owners[0];
   assert.ok(owner && cluster.nodes.includes(owner.nodeId));
@@ -1345,7 +1613,8 @@ async function threadedSocketHibernation(cluster) {
   socketUrl.protocol = 'ws:';
   const first = new PingSocket(socketUrl);
   const second = new PingSocket(socketUrl);
-  const sockets = [first, second];
+  const facet = new PingSocket(new URL(socketUrl.pathname + '/facet/socket', socketUrl));
+  const sockets = [first, second, facet];
   const next = async (socket, event, timeout = 7000) => {
     const abort = new AbortController();
     const deadline = setTimeout(() => abort.abort(new Error(`WebSocket ${event} timed out`)), timeout);
@@ -1368,6 +1637,37 @@ async function threadedSocketHibernation(cluster) {
     socket.send(text);
     return (await answer)[0].toString();
   };
+  const facetPath = (name, operation = 'socket') => `/probe-facet/${name}/${operation}`;
+  const openFacet = async name => {
+    const socket = new PingSocket(new URL(path + facetPath(name), socketUrl));
+    sockets.push(socket);
+    await next(socket, 'open');
+    return socket;
+  };
+  const upgradeResponse = async (name, operation = 'socket') => {
+    const socket = new PingSocket(new URL(path + facetPath(name, operation), socketUrl));
+    sockets.push(socket);
+    const [, response] = await next(socket, 'unexpected-response');
+    try {
+      const chunks = [];
+      for await (const chunk of response) chunks.push(chunk);
+      const text = Buffer.concat(chunks).toString();
+      const body = response.headers['content-type']?.startsWith('application/json') ? JSON.parse(text) : text;
+      return { status: response.statusCode, body };
+    } finally {
+      socket.on('error', () => {});
+      socket.terminate();
+    }
+  };
+  const lookup = suffix => request(cluster.urls[owner.nodeId], path + suffix);
+  const closeFacet = async (socket, action, name) => {
+    const closed = next(socket, 'close');
+    void closed.catch(() => {});
+    assert.equal((await lookup(`/${action}-facet/${name}`)).status, 204);
+    const [code, reason] = await closed;
+    assert.equal(code, 1001);
+    assert.match(reason.toString(), new RegExp(action === 'abort' ? 'facet was aborted' : 'facet was deleted', 'i'));
+  };
   let paused = false;
   try {
     await Promise.all(sockets.map(socket => next(socket, 'open')));
@@ -1376,32 +1676,127 @@ async function threadedSocketHibernation(cluster) {
     const firstEvent = JSON.parse(await send(first, 'warm'));
     assert.equal(firstEvent.instance, 1);
     assert.equal(firstEvent.retained, 2);
-    assert.deepEqual(firstEvent.attachment, { field: 42 });
+    assert.deepEqual(firstEvent.attachment, { field: 42, role: 'root' });
     assert.ok(Number.isSafeInteger(firstEvent.automatic));
+    await ping(facet, 'facet before retirement');
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
+    const warmFacet = JSON.parse(await send(facet, 'warm facet'));
+    assert.equal(warmFacet.instance, 1);
+    assert.equal(warmFacet.id, 'original-facet');
+    assert.ok(Number.isSafeInteger(warmFacet.automatic));
+    const warmBindings = JSON.parse(await send(facet, 'binding targets'));
+    assert.deepEqual(warmBindings[0], { target: 'service', label: 'original' });
+    assert.equal(warmBindings[1].target, 'object');
+    assert.match(warmBindings[1].id, /^[0-9a-f]{64}$/);
+
+    for (const operation of ['socket', 'throw']) {
+      const discarded = await upgradeResponse('discard', operation);
+      if (operation === 'throw') assert.ok(discarded.status >= 500, JSON.stringify(discarded));
+      else assert.deepEqual(discarded, { status: 200, body: { name: 'NotSupportedError' } });
+      await eventually(`the unforwarded socket closes and leaves its manager after ${operation}`, async () => {
+        assert.deepEqual(json(await lookup(facetPath('discard', 'discarded')), 200, 'discarded socket'),
+          { sockets: 0, state: PingSocket.CLOSED });
+      }, { timeout: 7000 });
+    }
+
+    assert.equal((await lookup(facetPath('too-large', 'status'))).status, 200);
+    const rejected = await upgradeResponse('too-large');
+    assert.equal(rejected.status, 422, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.name, 'NotSupportedError');
+    assert.match(rejected.body.message, /startup options cannot be restored/i);
+    assert.deepEqual(json(await lookup(facetPath('too-large', 'discarded')), 200, 'rejected socket'),
+      { sockets: 0, state: PingSocket.CLOSED });
+
+    const largeSockets = [];
+    for (let i = 0; i < 16; ++i) largeSockets.push(await openFacet(`large-${i}`));
+    const treeLimit = await upgradeResponse('large-over-limit');
+    assert.equal(treeLimit.status, 422, JSON.stringify(treeLimit.body));
+    assert.equal(treeLimit.body.name, 'NotSupportedError');
+    assert.match(treeLimit.body.message, /1 MiB/);
+    await Promise.all(largeSockets.map((socket, i) => closeFacet(socket, 'delete', `large-${i}`)));
+
+    await closeFacet(await openFacet('idle-abort'), 'abort', 'idle-abort');
+    const busy = await openFacet('busy-abort');
+    const signal = AbortSignal.timeout(15000);
+    const streaming = await fetch(cluster.urls[owner.nodeId] + path + facetPath('busy-abort', 'hold'),
+      { signal });
+    assert.equal(streaming.status, 200);
+    const reader = streaming.body.getReader();
+    try {
+      assert.equal(Buffer.from((await reader.read()).value).toString(), 'entered');
+      await closeFacet(busy, 'abort', 'busy-abort');
+      const end = await reader.read().catch(() => ({ done: true }));
+      assert.equal(end.done, true);
+      assert.equal(signal.aborted, false, 'the facet abort cancels its running request');
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
 
     const firstRetirement = await retired(0);
     const parked = (await cluster.state(owner.nodeId)).webSockets;
-    assert.equal(parked.parked, 2);
+    assert.equal(parked.parked, 3);
     await ping(second, 'while parked');
     assert.equal(await send(second, 'tick'), 'tock');
+    await ping(facet, 'facet while parked');
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
     const afterAutomatic = await activity();
     assert.equal(afterAutomatic.residentRoots, 0);
     assert.equal(afterAutomatic.homeSessions, 0);
     assert.equal(afterAutomatic.idleRetirements, firstRetirement);
     assert.equal((await cluster.state(owner.nodeId)).webSockets.socketWakes, parked.socketWakes);
     assert.deepEqual(json(await request(cluster.urls[owner.nodeId], path), 200, 'normal HTTP wake'),
-      { instance: 2, sockets: 2, constructedWith: 2 }, 'a normal reopen restores both sockets before the constructor runs');
-
+      { instance: 2, sockets: 2, constructedWith: 2, restored: true, role: 'root' },
+      'a normal reopen restores the root sockets before the constructor runs');
     const secondRetirement = await retired(firstRetirement);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 3,
+      'the facet socket parks again even though only the root opened');
+    assert.equal(await send(facet, 'facet-tick'), 'facet-tock');
+    const burst = ['facet wake', Buffer.from([0, 128, 255]), 'last'];
+    const replies = [];
+    const onMessage = body => replies.push(JSON.parse(body.toString()));
+    facet.on('message', onMessage);
+    try {
+      const last = eventually('the sleeping facet receives all queued frames', () => {
+        assert.equal(replies.length, burst.length);
+      }, { timeout: 7000 });
+      for (const frame of burst) facet.send(frame);
+      await last;
+      const marker = next(facet, 'message');
+      facet.send('marker');
+      assert.equal(JSON.parse((await marker)[0].toString()).message, 'marker');
+    } finally {
+      facet.off('message', onMessage);
+    }
+    assert.deepEqual(replies.map(reply => [reply.sequence, reply.message]), [
+      [1, 'facet wake'], [2, [0, 128, 255]], [3, 'last'], [4, 'marker'],
+    ]);
+    for (const reply of replies) {
+      assert.equal(reply.id, 'original-facet');
+      assert.equal(reply.role, 'leaf');
+      assert.equal(reply.instance, 2);
+      assert.equal(reply.constructedWith, 1);
+      assert.equal(reply.retained, 1);
+      assert.equal(reply.restored, true);
+      assert.deepEqual(reply.attachment, { field: 42, role: 'leaf' });
+      assert.ok(reply.automatic > warmFacet.automatic);
+    }
+    assert.deepEqual(JSON.parse(await send(facet, 'binding targets')), warmBindings,
+      'the reopened facet reaches the original service binding and Durable Object stub');
+
     assert.equal(await send(first, 'tick'), 'tock');
     const wake = JSON.parse(await send(first, 'wake'));
     assert.equal(wake.instance, 3);
     assert.equal(wake.message, 'wake');
     assert.equal(wake.retained, 2);
     assert.equal(wake.constructedWith, 2);
-    assert.deepEqual(wake.attachment, { field: 42 });
+    assert.deepEqual(wake.attachment, { field: 42, role: 'root' });
     assert.ok(wake.automatic > firstEvent.automatic);
     assert.deepEqual(JSON.parse(await send(second, Buffer.from([0, 128, 255]))).message, [0, 128, 255]);
+
+    const thirdRetirement = await retired(secondRetirement);
+    assert.deepEqual(json(await lookup('/facet/status'), 200, 'facet HTTP wake'),
+      { instance: 3, sockets: 1, constructedWith: 1, restored: true, role: 'leaf' },
+      'a normal reopen restores the facet socket, tags, attachment and automatic reply before its constructor');
 
     const readTerminal = async () => json(await request(cluster.urls[owner.nodeId], path + '/terminal'),
       200, 'socket termination');
@@ -1422,16 +1817,25 @@ async function threadedSocketHibernation(cluster) {
       assert.equal(terminal?.code, 1006);
       assert.equal(terminal.wasClean, false);
     }, { timeout: 7000 });
-    await retired(secondRetirement);
+    const fourthRetirement = await retired(thirdRetirement);
+    assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 3);
+    const facetClosed = next(facet, 'close');
+    void facetClosed.catch(() => {});
+    assert.equal((await request(cluster.urls[owner.nodeId], path + '/delete-facet')).status, 204);
+    const [facetCloseCode, facetCloseReason] = await facetClosed;
+    assert.equal(facetCloseCode, 1001);
+    assert.match(facetCloseReason.toString(), /facet was deleted/i);
+    assert.equal(await send(first, 'tick'), 'tock');
+    await retired(fourthRetirement);
 
     const survivor = cluster.nodes.find(node => node !== owner.nodeId);
-    const closed = sockets.map(socket => next(socket, 'close', 45000));
+    const closed = [first, second].map(socket => next(socket, 'close', 45000));
     closed.forEach(promise => void promise.catch(() => {}));
     await cluster.compose(['pause', owner.nodeId]);
     paused = true;
     await eventually('a surviving node takes the parked socket shard', async () => {
       const read = json(await request(cluster.urls[survivor], path, { timeout: 7000 }), 200, 'takeover wake');
-      assert.deepEqual(read, { instance: 4, sockets: 0, constructedWith: 0 });
+      assert.deepEqual(read, { instance: 6, sockets: 0, constructedWith: 0, restored: true, role: 'root' });
       const nextOwner = (await namespace()).owners[0];
       assert.notEqual(nextOwner.nodeId, owner.nodeId);
       assert.ok(BigInt(nextOwner.epoch) > BigInt(owner.epoch));
@@ -1698,7 +2102,7 @@ async function threadedSocketRetirement(cluster) {
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
-export const cases = { deployment, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
+export const cases = { deployment, 'websocket-admission': webSocketAdmission, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-takeover': durableTakeover };
 

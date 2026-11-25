@@ -41,6 +41,18 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+To measure idle WebSocket memory on fresh clusters:
+
+```sh
+node tests/cluster/websocket-memory.mjs "$kernel" local 3072
+node tests/cluster/websocket-memory.mjs "$kernel" forwarded 3072
+```
+
+The probe sets the ingress ceiling to the requested sample size and raises the native process's in-flight limit
+to accommodate all its invocation channels. It verifies the ingress and execution relay counts. It compares
+median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
+added connection for the daemon and ordinary workerd process on each measured node.
+
 ### Fatal attribution with the test kernel
 
 In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
@@ -99,6 +111,7 @@ archive, Docker images and temporary volumes. These are observed values from the
 | Case | Product behavior whose regression fails the case |
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
+| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. An abandoned handshake releases its place when the Worker answers. Ordinary HTTP and another ingress keep serving. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
@@ -111,8 +124,8 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
 | `durable-threaded-alarm-fence` | A nonretrying abort clears its schedule, and a constructor exception consumes retries with backoff. When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. The successor stops dispatching a previously confirmed clear, and replacing an inherited schedule prevents it from firing at the old time. |
-| `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and both kinds of WebSocket close without replacing the durable process. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |
-| `durable-threaded-hibernation` | Two hibernatable connections stay live when the home releases the tree. Protocol pings and automatic replies work with zero actor sessions. An HTTP open restores both sockets, a message wakes them with tags and attachment intact, and a higher shard epoch closes both old connections. |
+| `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and WebSockets close, including a parked facet socket whose startup options are discarded across the definition change. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |
+| `durable-threaded-hibernation` | Two root connections and a nested facet connection park together and answer ping and automatic replies with zero actor sessions. The facet parks again after a root-only residency, then receives its frames in order and reaches the original bindings. An HTTP reopen verifies constructor-visible socket state. The case also checks startup option limits, unforwarded upgrades, facet abort and deletion, and fencing after a shard takeover. |
 | `durable-threaded-retirement` | A controllable home clock drives the ordinary socket deadline and the pending-work cutoff while a hibernatable transport survives with its attachment. The case exercises the HTTP-upgrade requirement, a send queued before the 101 response, a mutation during parking, and timeouts before and after park and adopt transfers. It also tests a reset while parked, a reset while attached, and a slow write before and during a park refusal. |
 
 Tests deploy code with `cowctl` and observe the product through ingress HTTP, `/v1` and documented management

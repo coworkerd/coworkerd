@@ -436,6 +436,9 @@ public:
   void setActorResetHook(std::function<void(const ObjectIdentity&, std::string_view)> hook) {
     actorResetHook = std::move(hook);
   }
+  void setFacetDeletedHook(std::function<void(const ObjectIdentity&, uint32_t)> hook) {
+    facetDeletedHook = std::move(hook);
+  }
   struct ObjectReady {
     bool ready = true;
     uint status = 503;
@@ -1107,6 +1110,7 @@ private:
   std::map<std::pair<std::string, uint32_t>, uint64_t> ownerFenceThrough;
   std::function<void(const std::string&, uint32_t, uint64_t)> ownerFenceHook;
   std::function<void(const ObjectIdentity&, std::string_view)> actorResetHook;
+  std::function<void(const ObjectIdentity&, uint32_t)> facetDeletedHook;
   uint64_t ownerFenceEvents = 0;
   std::map<std::string, AlarmState> alarms;      // "<objectName>/<facetId>" -> the alarm to fire
   std::set<std::string> activeThreadedAlarms;     // held even if the running handler deletes its schedule
