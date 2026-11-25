@@ -196,6 +196,89 @@ async function threadedDatabaseRelease(cluster) {
   });
 }
 
+function databaseOwnerOrder(cluster, namespaceId) {
+  const scores = cluster.nodes.map(node => [node, createHash('sha256')
+    .update(`${namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
+  scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
+  return scores.map(([node]) => node);
+}
+
+async function threadedDatabaseAlarm(cluster) {
+  const [threaded] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-alarm', { durableObjectNamespaces: 64 });
+  const databases = new Map();
+  let revision = 0;
+  for (let i = 0; i < 64 && databases.size < 2; i++) {
+    const path = `${tenant.path}/databases/db-${i}`;
+    const created = await cluster.api(path, { method: 'POST', token: tenant.token });
+    revision = Math.max(revision, created.revision);
+    const [owner] = databaseOwnerOrder(cluster, created.database.namespaceId);
+    const backend = owner === threaded ? 'threaded' : 'upstream';
+    if (!databases.has(backend)) databases.set(backend, { ...created.database, path, owner });
+  }
+  assert.equal(databases.size, 2, 'both backends have a database');
+  await eventually('each peer has the database catalog and full durable membership', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const state = await cluster.state(node);
+      assert.ok(Number(state.storage.appliedTenantsRevision) >= revision, `${node} has applied revision ${revision}`);
+      const candidates = state.membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
+      assert.deepEqual(candidates.map(member => member.nodeId).sort(), cluster.nodes, `${node} sees every candidate`);
+    }));
+  });
+
+  await Promise.all([...databases].map(async ([backend, db]) => {
+    const query = body => cluster.api(`${db.path}/query`, { method: 'POST', token: tenant.token, body });
+    const alarm = async () => {
+      const result = await query({ alarmForTest: true });
+      assert.equal(result.success, true, result.error);
+      return result.results[0].alarm;
+    };
+    const stats = async () => (await cluster.state(db.owner)).durableLog.alarms;
+    const process = await durableGeneration(cluster, db.owner);
+    if (backend === 'threaded') assert.equal(process.lifecycle.durableServer, 'threaded');
+    const before = await stats();
+    assert.equal(before.fireConcurrency === 0, backend === 'threaded',
+      `${backend} owner uses the expected alarm dispatcher`);
+    assert.equal(before.scheduled, 0);
+    const seed = await query([
+      { sql: 'CREATE TABLE records (value TEXT PRIMARY KEY)' },
+      { sql: 'INSERT INTO records VALUES (?)', params: [db.name] },
+    ]);
+    assert.deepEqual(seed.map(result => result.success), [true, true]);
+    const at = await alarm();
+    assert.ok(Number.isSafeInteger(at) && at > Date.now(), `${backend} database holds a pending alarm`);
+    await eventually(`${backend} owner observes the scheduled alarm`, async () => {
+      const pending = (await stats()).next.find(entry => entry.namespaceId === db.namespaceId.slice(0, 12));
+      assert.equal(pending?.atUnixMs, at);
+    });
+    const cleared = await eventually(`${backend} owner settles the database alarm`, async () => {
+      const current = await stats();
+      assert.equal(current.cleared, before.cleared + 1);
+      assert.equal(current.scheduled, 0);
+      assert.equal(current.inFlight, 0);
+      return current;
+    });
+    const attempts = cleared.dispatchAttempts - before.dispatchAttempts;
+    assert.ok(attempts >= 1, `${backend} dispatched the due alarm`);
+    assert.equal(cleared.retries, before.retries, `${backend} did not retry the alarm handler`);
+    assert.equal(cleared.fired - before.fired, backend === 'upstream' ? 1 : 0,
+      `${backend} uses its own missing-handler outcome`);
+    assert.equal(await alarm(), null, `${backend} cleared the alarm in storage`);
+
+    const rotation = await rotationRequest(cluster, db.owner, process.processId);
+    await waitForDurableRotation(cluster, db.owner, process, rotation, 'drained');
+    const read = await query({ sql: 'SELECT value FROM records' });
+    assert.deepEqual(read.results, [{ value: db.name }], `${backend} reopens with the saved row`);
+    assert.equal(await alarm(), null, `${backend} reopens with the alarm still cleared`);
+    // Let the scheduler pass the first alarm retry window with the database reopened.
+    await delay(2500);
+    const reopened = await stats();
+    assert.equal(reopened.scheduled, 0);
+    assert.equal(reopened.dispatchAttempts, cleared.dispatchAttempts, `${backend} did not dispatch the alarm again`);
+    console.log(`Database alarm on ${db.owner} (${backend}): ${attempts} dispatch attempt(s), cleared and reopened with saved row`);
+  }));
+}
+
 async function threadedDatabasePlacement(cluster) {
   const [threaded, upstream] = cluster.nodes;
   if (cluster.previousProduct) {
@@ -214,10 +297,7 @@ async function threadedDatabasePlacement(cluster) {
     const { database } = created;
     revision = Math.max(revision, created.revision);
     // Select shards whose first two rendezvous choices let us exercise takeover in both directions.
-    const scores = cluster.nodes.map(node => [node, createHash('sha256')
-      .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
-    scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
-    const [[owner], [successor]] = scores;
+    const [owner, successor] = databaseOwnerOrder(cluster, database.namespaceId);
     const selected = databases.get(owner);
     if (selected && successor === (owner === threaded ? upstream : threaded) &&
         selected.length < (owner === threaded ? 2 : 1)) selected.push({ ...database, path, owner });
@@ -2738,6 +2818,10 @@ export const durableGatedCases = {
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-database-release': {
     test: threadedDatabaseRelease, nodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
+  },
+  'durable-threaded-database-alarm': {
+    test: threadedDatabaseAlarm, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    databaseAlarmFixture: true, holdPeerAcks: false,
   },
   'durable-threaded-database-placement': {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',

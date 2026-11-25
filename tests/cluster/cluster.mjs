@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNode, previousProduct, previousKernel,
+    databaseFixtureNode, databaseAlarmFixture = false, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -93,6 +93,7 @@ export class Cluster {
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
     this.databaseFixtureNode = databaseFixtureNode;
+    this.databaseAlarmFixture = databaseAlarmFixture;
     this.previousProduct = previousProduct;
     this.previousKernel = previousKernel;
   }
@@ -127,7 +128,9 @@ export class Cluster {
     const binaries = process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
-    if (this.platformFixture) files['bin/coworkerd'] = join(binaries, 'coworkerd-platform-test');
+    if (this.platformFixture || this.databaseAlarmFixture) {
+      files['bin/coworkerd'] = join(binaries, 'coworkerd-platform-test');
+    }
     for (const file of ['workerd', 'coworkerd-threaded']) files[`bin/${file}`] = join(this.kernel, file);
     if (this.fatalTestBinary) files['bin/coworkerd-threaded'] = this.fatalTestBinary;
     for (const phase of ['startup', 'steady']) {
@@ -203,8 +206,16 @@ export class Cluster {
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
       if (node === this.databaseFixtureNode) {
         overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
-        overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
-          target: '/opt/coworkerd/bin/coworkerd', read_only: true });
+        if (!this.databaseAlarmFixture) {
+          overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
+            target: '/opt/coworkerd/bin/coworkerd', read_only: true });
+        }
+      }
+      if (this.databaseAlarmFixture) {
+        const target = '/tmp/coworkerd-database-alarm-fixture.js';
+        overrides[node].environment.COWORKERD_TEST_DATABASE_ALARM_FIXTURE = target;
+        overrides[node].volumes.push({ type: 'bind', source: join(root, 'tests/cluster/database-alarm-fixture.js'),
+          target, read_only: true });
       }
       if (node === nodes[1] && this.previousProduct) {
         for (const [file, source] of [

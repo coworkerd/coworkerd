@@ -30,6 +30,7 @@ struct PlatformDefinitions {
 };
 
 PlatformDefinitions loadPlatformDefinitions();
+const std::string& sqlDatabaseSource();
 inline constexpr std::string_view PLATFORM_WORKER_SUFFIX = "/:platform";
 std::optional<PlatformClassRef> platformClassFor(const DeploymentState::NamespaceOwner& owner,
     const std::string& workerId, const std::string& className);
