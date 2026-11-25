@@ -21,6 +21,9 @@ cd workerd
 export PATH="$tools:$PATH"
 time bazel --output_user_root="$RUNNER_TEMP/kernel-bazel" build --config=release --jobs=3 \
   //src/workerd/server:workerd //src/workerd/threaded:coworkerd-threaded
+# Reuse the production build outputs and measure the extra test executable build.
+time bazel --output_user_root="$RUNNER_TEMP/kernel-bazel" build --config=release --jobs=3 \
+  //src/workerd/threaded:coworkerd-threaded-fatal-test
 
 # Reuse the release build's outputs. Run one test at a time because the
 # threaded-server tests start children that allocate several GiB of heap.
