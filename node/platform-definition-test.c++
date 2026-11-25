@@ -1,5 +1,7 @@
 #include "platform-definition.h"
 
+#include "tenancy.h"
+
 #include <cstdlib>
 #include <kj/debug.h>
 
@@ -14,6 +16,8 @@ int main() {
   PlatformDefinition upgrade("coworkerd:platform-test", "build-b", {{"platform.js", "export class Record {}"}});
   const auto alpha = first.version("alpha");
   const auto beta = first.version("beta");
+  KJ_REQUIRE(tenantOf(alpha.workerId) == "alpha" && !workerFullName(alpha.workerId),
+      "platform execution identity stays outside tenant Worker names");
   KJ_REQUIRE(alpha.definitionHash == beta.definitionHash && alpha.contentHash == beta.contentHash);
   KJ_REQUIRE(alpha.definitionHash != changed.version("alpha").definitionHash);
   const auto key = platformCopyKey("alpha", first.name, alpha, 500, 64);

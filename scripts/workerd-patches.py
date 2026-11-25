@@ -309,7 +309,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/fatal-attribution-scope-test.c++',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0150-platform-durable-definition.patch' and path in {
+                          name in {'0150-platform-durable-definition.patch',
+                                   '0151-reserve-platform-execution-identity.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or

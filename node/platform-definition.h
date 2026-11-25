@@ -28,7 +28,7 @@ struct PlatformDefinitions {
 };
 
 PlatformDefinitions loadPlatformDefinitions();
-inline constexpr std::string_view PLATFORM_WORKER_SUFFIX = "/__platform";
+inline constexpr std::string_view PLATFORM_WORKER_SUFFIX = "/:platform";
 std::string platformCopyKey(std::string_view tenant, const std::string& name,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib);
 RootDispatch preparePlatformRootDispatch(const PlatformClassRef& target, const VersionDefinition& version,
