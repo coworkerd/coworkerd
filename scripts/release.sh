@@ -37,7 +37,7 @@ set -euo pipefail
 # Bare-metal Linux minimum documented in docs/guide/install.md, Requirements.
 GLIBC_FLOOR=2.38
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 VERSION=${1:?usage: scripts/release.sh <version> [--arch amd64|arm64] [--out DIR] [--kernel-dir DIR] [--no-image] [--check-only]}
 shift
 [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "invalid version: $VERSION" >&2; exit 2; }
@@ -73,21 +73,22 @@ if [[ -n ${COWORKERD_RELEASE_WORKERD:-} || -n ${COWORKERD_RELEASE_ALLOWLIST:-} ]
   log "use --kernel-dir for a local copy of the pinned kernel archive"
   exit 2
 fi
-KERNEL=$(python3 "$ROOT/scripts/fetch-kernel.py" --arch "$KERNEL_ARCH" ${KERNEL_SOURCE[@]+"${KERNEL_SOURCE[@]}"})
+KERNEL_INFO=$(python3 "$ROOT/scripts/fetch-kernel.py" --arch "$KERNEL_ARCH" --json ${KERNEL_SOURCE[@]+"${KERNEL_SOURCE[@]}"})
+KERNEL=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["path"])' <<<"$KERNEL_INFO")
 WORKERD="$KERNEL/workerd"
 THREADED="$KERNEL/coworkerd-threaded"
 ALLOWLIST="$KERNEL/allowlist"
-KERNEL_SHA256=$(basename "$KERNEL")
-metadata=$(python3 - "$KERNEL/kernel.json" <<'PY'
+metadata=$(python3 - "$KERNEL/kernel.json" "$KERNEL_INFO" <<'PY'
 import json, sys
 from pathlib import Path
 record = json.loads(Path(sys.argv[1]).read_text())
 series = ",".join(name.removesuffix(".patch") for name in record["patchSeries"])
 print(record["upstream"], record["upstreamCommit"], series, record["patchSeriesSha256"],
-      record["files"]["workerd"], record["files"]["coworkerd-threaded"], sep="\t")
+      record["files"]["workerd"], record["files"]["coworkerd-threaded"],
+      json.dumps(json.loads(sys.argv[2])["archive"]), sep="\t")
 PY
 )
-IFS=$'\t' read -r UPSTREAM_TAG UPSTREAM_COMMIT SERIES_NAMES SERIES_SHA256 WORKERD_SHA256 THREADED_SHA256 <<< "$metadata"
+IFS=$'\t' read -r UPSTREAM_TAG UPSTREAM_COMMIT SERIES_NAMES SERIES_SHA256 WORKERD_SHA256 THREADED_SHA256 KERNEL_ARCHIVE <<< "$metadata"
 ALLOWLIST_SUMMARY=$(python3 "$ROOT/scripts/syscall-allowlist-check.py" "$ALLOWLIST" "$WORKERD_SHA256") || exit 1
 log "system call allowlist: $ALLOWLIST_SUMMARY"
 
@@ -106,10 +107,10 @@ SOURCE=$COMMIT
 [[ $DIRTY == "$EMPTY" ]] || SOURCE="$COMMIT+$DIRTY"
 if $CHECK_ONLY; then
   python3 - "$VERSION" "$ARCH" "$SOURCE" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$SERIES_NAMES" "$SERIES_SHA256" \
-      "$WORKERD_SHA256" "$THREADED_SHA256" "$KERNEL_SHA256" "$ALLOWLIST" "$GLIBC_FLOOR" "$(node --version)" "$(npm --version)" <<'PY'
+      "$WORKERD_SHA256" "$THREADED_SHA256" "$KERNEL_ARCHIVE" "$ALLOWLIST" "$GLIBC_FLOOR" "$(node --version)" "$(npm --version)" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-(version, arch, source, tag, commit, series, series_sha, workerd_sha, threaded_sha, archive_sha,
+(version, arch, source, tag, commit, series, series_sha, workerd_sha, threaded_sha, archive,
  allowlist, floor, node, npm) = sys.argv[1:]
 directory = Path(allowlist)
 record = json.loads((directory / "allowlist.json").read_text())
@@ -120,7 +121,7 @@ syscalls["recordSha256"] = hashlib.sha256((directory / "allowlist.json").read_by
 print(json.dumps({"checkOnly": True, "version": version, "architecture": arch, "source": source,
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","),
                 "patchSeriesSha256": series_sha, "sha256": workerd_sha,
-                "threadedSha256": threaded_sha, "archiveSha256": archive_sha},
+                "threadedSha256": threaded_sha, **json.loads(archive)},
     "syscalls": syscalls, "GLIBC_FLOOR": floor,
     "checks": {"workerd": True, "allowlist": True,
                "guides": ["install", "quickstart", "compat", "errors", "databases", "durable-objects"],
@@ -240,9 +241,10 @@ printf '%s\n' "$VERSION_TEXT" >"$STAGE/VERSION"
 
 # A reproducible tar file: sorted entries, the source commit's time, no owner names.
 EPOCH=$(git -C "$ROOT" log -1 --format=%ct HEAD)
-python3 - "$OUT" "$NAME" "$EPOCH" <<'PY'
-import gzip, io, os, sys, tarfile
+python3 - "$OUT" "$NAME" "$EPOCH" "$ROOT" <<'PY'
+import gzip, io, mmap, os, sys, tarfile
 out, name, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+checkout = os.fsencode(sys.argv[4])
 root = os.path.join(out, name)
 paths = []
 for directory, dirs, files in os.walk(root):
@@ -260,8 +262,14 @@ with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
         info.mode = 0o755 if info.isdir() or (info.mode & 0o111) else 0o644
         if info.isfile():
             with open(path, "rb") as stream:
+                if info.size:
+                    with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+                        if contents.find(checkout) != -1:
+                            raise SystemExit(f"{info.name}: contains the absolute checkout path")
                 tar.addfile(info, stream)
         else:
+            if info.issym() and checkout in os.fsencode(info.linkname):
+                raise SystemExit(f"{info.name}: link target contains the absolute checkout path")
             tar.addfile(info)
 with open(os.path.join(out, name + ".tar.gz"), "wb") as target:
     with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=0, compresslevel=9) as stream:
@@ -287,10 +295,10 @@ fi
 
 # ---- The record and the sums --------------------------------------------------------------------------------
 python3 - "$OUT" "$NAME" "$ARCH" "$VERSION" "$SOURCE" "$SERIES_SHA256" "$SERIES_NAMES" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" \
-    "$WORKERD" "$KERNEL_SHA256" "$BUILD_SECONDS" "$IMAGE_ID" "$IMAGE_TAR" "${COWORKERD_IMAGE_BASE:-}" "$GLIBC" <<'PY'
+    "$KERNEL_ARCHIVE" "$BUILD_SECONDS" "$IMAGE_ID" "$IMAGE_TAR" "${COWORKERD_IMAGE_BASE:-}" "$GLIBC" "$ROOT" <<'PY'
 import hashlib, json, os, sys
-(out, name, arch, version, source, series_sha, series, tag, commit, workerd, kernel_sha,
- seconds, image_id, image_tar, image_base, glibc) = sys.argv[1:]
+(out, name, arch, version, source, series_sha, series, tag, commit, archive,
+ seconds, image_id, image_tar, image_base, glibc, checkout) = sys.argv[1:]
 def sha(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -302,7 +310,7 @@ record = {
     "version": version, "architecture": arch, "source": source,
     "glibc": json.loads(glibc),
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","), "patchSeriesSha256": series_sha,
-                "from": workerd, "sha256": sha(os.path.join(stage, "bin/workerd")), "archiveSha256": kernel_sha},
+                "sha256": sha(os.path.join(stage, "bin/workerd")), **json.loads(archive)},
     "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/workerd", "bin/coworkerd-threaded", "runtime/runtime.js",
                                                          "bin/cowctl", "lib/cowctl/bin/cowctl.mjs", "lib/cowctl/adapter.mjs",
                                                          "lib/cowctl/package-lock.json")},
@@ -324,9 +332,12 @@ record = {
                                          "file": os.path.basename(image_tar), "bytes": os.path.getsize(image_tar), "sha256": sha(image_tar)},
     "buildSeconds": int(seconds),
 }
+record_text = json.dumps(record, indent=2) + "\n"
+# Search for the JSON-escaped spelling of the checkout as it would appear in a field.
+if json.dumps(checkout)[1:-1] in record_text:
+    raise SystemExit(f"{name}.json: contains the absolute checkout path")
 with open(os.path.join(out, name + ".json"), "w") as stream:
-    json.dump(record, stream, indent=2)
-    stream.write("\n")
+    stream.write(record_text)
 assets = sorted(f for f in os.listdir(out) if f.startswith("coworkerd-" + version + "-linux-") and (f.endswith(".tar.gz") or f.endswith(".json")))
 with open(os.path.join(out, "SHA256SUMS"), "w") as stream:
     for asset in assets:

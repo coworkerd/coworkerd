@@ -182,6 +182,12 @@ class KernelArtifactsTest(unittest.TestCase):
         arch = "linux-arm64"
         installed = Path(self.fetch(arch, "--local-dir", str(self.out)).stdout.strip())
         self.assertEqual(installed.parent.parent.name, tag)
+        expected = {"path": str(installed), "archive": {
+            "releaseTag": tag, "archiveAsset": archive_name(arch), "archiveSha256": pins[arch],
+        }}
+        mirrored = self.fetch(arch, "--local-dir", str(self.out), "--json")
+        self.assertEqual(json.loads(mirrored.stdout), expected)
+        self.assertEqual(json.loads(self.fetch(arch, "--json").stdout), expected)
 
         record["profiles"].pop()
         allowlist.write_text(json.dumps(record))
