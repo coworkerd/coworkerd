@@ -15,6 +15,7 @@
 #include "code-package.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
+#include "sql-http-cancellation.h"
 #include "support.h"
 #include "membership.h"
 #include "durable-log.h"
@@ -414,6 +415,7 @@ struct DurableTarget {
   uint32_t socketFacet = 0;
   size_t socketBytes = 0;
   std::optional<coworkerd::PlatformClassRef> platformClass;
+  std::optional<double> sqlDeadline;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
@@ -528,6 +530,7 @@ struct AdmissionSlot {
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
   // -- the response's status, or the code of a failure before it -- goes to `outcome` once.
   bool durable = false;
+  bool threadedSql = false;
   coworkerd::DurableLog::ObjectIdentity durableObject;
   coworkerd::DurableLog* durableLog = nullptr;
   std::string durableDefinition;
@@ -2979,7 +2982,10 @@ private:
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
-    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
+    const bool threadedSql = durable && durable->sqlDeadline && durable->platformClass && process->threadedDurableRole();
+    if (slot) slot->threadedSql = threadedSql;
+    auto opened = runtime.open(process, descriptor, version->definitionHash,
+        slot ? slot->nativeProps : NativeProps(), threadedSql);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
@@ -3688,6 +3694,10 @@ private:
                 << "\",\"queuedBytes\":\"" << encoded.size() + durable->socketBytes << "\",\"expiresMonotonicNs\":\""
                 << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
           encoded.pop_back();
+          if (durable->sqlDeadline && durable->platformClass) {
+            encoded += ",\"sqlDeadlineMonotonicNs\":\"" +
+                std::to_string(uint64_t(*durable->sqlDeadline * 1000000)) + "\"";
+          }
           if (durable->alarmAtUnixMs) {
             encoded += ",\"durableAlarm\":{\"scheduledTime\":\"" + std::to_string(durable->alarmAtUnixMs) +
                 "\",\"retryCount\":\"" + std::to_string(durable->clearAlarm ? 0 : durable->alarmRetryCount) +
@@ -4819,6 +4829,8 @@ public:
     auto started = monotonicTimeMs();
     std::string failure;
     std::string platformCode;
+    bool answered = false;
+    KJ_DEFER(if (!answered && slot->threadedSql) slot->process->sqlClientDisconnected());
     try {
       pathMark(slot->timing, "http-dispatch");
       auto request = inner->request(method, url, requestHeaders, body, *tracked);
@@ -4827,6 +4839,7 @@ public:
         return process->rejectAfterCrash(kj::mv(error));
       });
       co_await kj::mv(request).attach(std::move(finish));
+      answered = true;
       phaseTiming("request-through-body", started, slot->process);
       pathMark(slot->timing, "workerd-end");
       if (slot->timing && slot->timing->kind == "binding") slot->timing->emit();
@@ -4835,6 +4848,7 @@ public:
       slot->report(tracked->status(), slot->outcome ? limitCode() : std::string());
       co_return;
     } catch (const kj::Exception& error) {
+      answered = true;
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
@@ -4879,10 +4893,11 @@ private:
       const std::string& platformCode = "") {
     auto code = limitCode();
     if (platformCode == "NOT_SUPPORTED" || platformCode == "PROCESS_MEMORY_PRESSURE" ||
-        platformCode == "DO_CODE_UPDATED") code = platformCode;
+        platformCode == "DO_CODE_UPDATED" || (slot->threadedSql && platformCode == "SQL_LIMIT_EXCEEDED")) code = platformCode;
     const bool unsupported = code == "NOT_SUPPORTED";
     slot->report(unsupported ? 501 : 503, code.empty() ? "RESULT_UNCERTAIN" : code);
-    const auto reason = code == "DO_CODE_UPDATED" ? "Durable Object reset because its code was updated" : failure;
+    const auto reason = code == "DO_CODE_UPDATED" ? "Durable Object reset because its code was updated" :
+        code == "SQL_LIMIT_EXCEEDED" ? coworkerd::SQL_DEADLINE_REASON : failure;
     auto rejection = kj::heap<LeaseRejectionHttpService>(headers, unsupported ? 501 : 503,
         unsupported ? "Not Implemented" : "Service Unavailable",
         rejectionJson(code.empty() ? "RESULT_UNCERTAIN" : code, reason, 0));
@@ -5576,6 +5591,8 @@ public:
       co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before forwarding", 410), true};
     }
     remote.setRemainingMs(remaining);
+    if (target.sqlDeadline)
+      remote.setSqlRemainingMs(std::max(0.0, *target.sqlDeadline - monotonicTimeMs()));
     try {
       // No capability is exposed to workerd until this explicit result arrives.
       auto response = co_await timer.timeoutAfter(config.peerTimeoutMs * kj::MILLISECONDS, request.send());
@@ -6484,7 +6501,7 @@ private:
 // One SQL statement on a tenant's database, defined with the other requests the node makes of an object (below).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body, std::string resultsFormat);
+    std::string database, std::string body, std::string resultsFormat, double sqlDeadline);
 
 class PeerRpcService final: public kj::HttpService {
 public:
@@ -6561,7 +6578,7 @@ public:
     // One SQL statement on a tenant's database, as the control plane forwards it (POST
     // /v1/tenants/{t}/databases/{d}/query): sent on to the shard's owner like any request to an object.
     if (std::string_view(url.cStr()).starts_with("/__coworkerd/databases/") && method == kj::HttpMethod::POST) {
-      return sqlQuery(url, body, response);
+      return sqlQuery(url, headers, body, response);
     }
     if (url == "/__coworkerd/state" && method == kj::HttpMethod::GET) {
       return state().then([this, &response](std::string result) {
@@ -6578,7 +6595,21 @@ public:
 
   // POST /__coworkerd/databases/<tenant>/<database>/query, with the management token: the statement's body goes to
   // the database's object (the control plane has already checked the caller's credential and the tenant).
-  kj::Promise<void> sqlQuery(kj::StringPtr url, kj::AsyncInputStream& body, Response& response) {
+  kj::Promise<void> sqlQuery(kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& body, Response& response) {
+    const auto started = monotonicTimeMs();
+    uint32_t remaining = coworkerd::SQL_DEADLINE_MS;
+    bool malformedDeadline = false;
+    headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+      if (strcasecmp(name.cStr(), coworkerd::SQL_REMAINING_HEADER) != 0) return;
+      const auto parsed = std::from_chars(value.begin(), value.end(), remaining);
+      malformedDeadline = parsed.ec != std::errc{} || parsed.ptr != value.end() ||
+          remaining > coworkerd::SQL_DEADLINE_MS;
+    });
+    if (malformedDeadline)
+      co_return co_await sendJson(response, 400, "Bad Request",
+          "{\"code\":\"INVALID_REQUEST\",\"reason\":\"invalid SQL forwarding deadline\"}");
+    const auto sqlDeadline = started + remaining;
     constexpr uint64_t LIMIT = 1u << 20;
     std::string path(url.cStr());
     std::string resultsFormat = "ARRAY_OF_OBJECTS";
@@ -6619,7 +6650,7 @@ public:
       co_return;
     }
     auto answer = co_await queryDatabase(durable, server, factory, headerTable, tenant, database,
-        std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat);
+        std::string(KJ_ASSERT_NONNULL(text).cStr(), KJ_ASSERT_NONNULL(text).size()), resultsFormat, sqlDeadline);
     co_await sendJson(response, answer.status ? answer.status : 503,
         answer.status == 200 ? "OK" : "Error",
         answer.body.empty() ? std::string("{\"code\":\"STORAGE_UNAVAILABLE\",\"reason\":\"the database answered nothing\"}")
@@ -7033,6 +7064,8 @@ public:
   // lost answer is RESULT_UNCERTAIN.
   kj::Promise<BindingDispatch::Dispatched> dispatch(Request request) {
     const auto started = monotonicTimeMs();
+    if (request.target.isDatabase() && !request.target.alarmAtUnixMs && !request.target.sqlDeadline)
+      request.target.sqlDeadline = started + coworkerd::SQL_DEADLINE_MS;
     const auto deadline = request.allocation ? request.allocation->expiresAtMonotonicMs : server.rootDeadline();
     const auto workerId = request.workerId;
     Line line{workerId, {}, request.allocation ? "worker" :
@@ -7304,6 +7337,8 @@ private:
       }
       if (ready.rebuilt) line.recovered = ready.elapsedMs;
     }
+    if (target.platformClass && target.sqlDeadline && monotonicTimeMs() >= *target.sqlDeadline)
+      co_return refused(server.refusal("SQL_LIMIT_EXCEEDED", coworkerd::SQL_DEADLINE_REASON));
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
@@ -7343,6 +7378,8 @@ private:
     if (!target.socketId.empty() && shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the socket shard changed before dispatch", 409));
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
+    if (target.platformClass && target.sqlDeadline && monotonicTimeMs() >= *target.sqlDeadline)
+      co_return refused(server.refusal("SQL_LIMIT_EXCEEDED", coworkerd::SQL_DEADLINE_REASON));
     try {
       auto opened = server.openDurable(version, target, std::move(request.allocation), slot, durableLog);
       if (!disposable) {
@@ -7635,7 +7672,7 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
 // plane to any node, which sends it on to the shard's owner).
 kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCore& server,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, std::string tenant,
-    std::string database, std::string body, std::string resultsFormat) {
+    std::string database, std::string body, std::string resultsFormat, double sqlDeadline) {
   CollectedResponse refusal;
   const auto* space = server.database(tenant, database);
   if (space == nullptr || space->status != "active") {
@@ -7651,6 +7688,7 @@ kj::Promise<CollectedResponse> queryDatabase(DurableDispatch& durable, ServerCor
   request.target.className = coworkerd::DATABASE_CLASS_NAME;
   request.target.tenant = tenant;
   request.target.database = database;
+  request.target.sqlDeadline = sqlDeadline;
   const auto path = "http://coworkerd-node/query?resultsFormat=" + resultsFormat;
   co_return co_await askObject(durable, factory, headerTable, std::move(request), path.c_str(), std::move(body));
 }
@@ -7676,6 +7714,13 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
     KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&
             request.target.className == coworkerd::DATABASE_CLASS_NAME,
         "invalid remote database call: the database's name or class");
+    if (request.target.alarmAtUnixMs == 0) {
+      const auto sqlRemaining = remote.getSqlRemainingMs();
+      KJ_REQUIRE(sqlRemaining == -1 || (sqlRemaining >= 0 && sqlRemaining <= coworkerd::SQL_DEADLINE_MS),
+          "invalid SQL wall time from peer");
+      request.target.sqlDeadline = receivedAtMonotonicMs +
+          (sqlRemaining == -1 ? coworkerd::SQL_DEADLINE_MS : sqlRemaining);
+    }
   }
   const std::string origin = remote.getOriginServerId().cStr(), treeId = remote.getTreeId().cStr();
   KJ_REQUIRE(coworkerd::workerFullName(request.workerId), "invalid remote Durable Object call: workerId");
@@ -10665,9 +10710,16 @@ int run(Launch launch) {
       });
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
-  kj::HttpServer httpServer(timer, *headerTable, gateway, {.callbacks = gateway});
+  kj::HttpServer httpServer(timer, *headerTable,
+      [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
+    return kj::heap<coworkerd::SqlHttpCancellation>(
+        gateway, connection, timer, coworkerd::SqlHttpCancellation::Route::WORKER);
+  }, {.callbacks = gateway});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
-  kj::HttpServer peerServer(timer, *headerTable, seedPeer);
+  kj::HttpServer peerServer(timer, *headerTable, [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
+    return kj::heap<coworkerd::SqlHttpCancellation>(
+        seedPeer, connection, timer, coworkerd::SqlHttpCancellation::Route::PEER);
+  });
   kj::HttpServer sourceServer(timer, *headerTable, source, {.callbacks = source});
   kj::HttpServer egressServer(timer, *headerTable, egress);
 

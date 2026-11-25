@@ -42,6 +42,14 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+### Threaded SQL deadline and disconnect
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
+kernel and product binaries. The case uses the `coworkerd-platform-test` executable from the
+database placement fixture on its threaded owner. It times HTTP and D1 statements and batches
+on four databases. It then disconnects an HTTP client and a Worker client during writes, and
+checks that the writes roll back and both interfaces read the earlier value in the same child.
+
 ### Database placement across builds
 
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream

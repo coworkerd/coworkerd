@@ -32,31 +32,40 @@ export class SqlDatabase extends DurableObject {
     const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
     const encoder = new TextEncoder();
     const budget = { bytes: Array.isArray(body) ? 2 : 0, size: text => encoder.encode(text).byteLength };
+    const deadline = this.constructor.wallDeadline;
     const failure = error => {
-      if (error?.code === "SQL_LIMIT_EXCEEDED") this.ctx.storage.sql.abortExecutionLimit();
-      return { success: false, error: String(error instanceof Error ? error.message : error) };
+      if (error?.code === "SQL_CLIENT_DISCONNECTED") throw error;
+      const message = String(error instanceof Error ? error.message : error);
+      if (error?.code === "SQL_LIMIT_EXCEEDED") {
+        if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
+        return { success: false, error: message, code: error.code, reason: message };
+      }
+      return { success: false, error: message };
+    };
+    const fail = (error, batch = false) => {
+      const answer = failure(error);
+      return Response.json(batch && !answer.code ? [answer] : answer, { status: answer.code ? 503 : 200 });
     };
     const one = (statement) => {
       try {
-        if (query && statement && Object.hasOwn(statement, "ingest")) {
-          const answer = this.runIngest(statement);
-          this.addResultBytes(budget, budget.size(JSON.stringify(answer)));
+        return deadline ? this.ctx.storage.transactionSync(() => {
+          const answer = this.runStatement(statement, resultsFormat, budget);
+          this.checkDeadline();
           return answer;
-        }
-        return this.runStatement(statement, resultsFormat, budget);
+        }) : this.runStatement(statement, resultsFormat, budget);
       } catch (error) {
         return failure(error);
       }
     };
     if (!Array.isArray(body)) {
       try {
-        // ingest already owns its transaction; execute keeps its sequential semantics.
-        if (query && !(body && Object.hasOwn(body, "ingest"))) {
+        if (query && body && Object.hasOwn(body, "ingest")) return this.runIngest(body, budget);
+        if (query || deadline) {
           return this.ctx.storage.transactionSync(() =>
             this.resultResponse(this.runStatement(body, resultsFormat, budget), budget));
         }
         return this.resultResponse(one(body), budget);
-      } catch (error) { return Response.json(failure(error)); }
+      } catch (error) { return fail(error); }
     }
     if (query) {
       // Include final serialization in the transaction: every quota error must roll the batch back.
@@ -68,7 +77,7 @@ export class SqlDatabase extends DurableObject {
           });
           return this.resultResponse(answers, budget);
         });
-      } catch (error) { return Response.json([failure(error)]); }
+      } catch (error) { return fail(error, true); }
     }
     // exec() keeps earlier writes. If its whole answer exceeds the cap, return only the error.
     const answers = [];
@@ -77,9 +86,14 @@ export class SqlDatabase extends DurableObject {
       const answer = one(statement);
       answers.push(answer);
       if (!answer.success) break;
+      if (deadline) await this.ctx.storage.sync();
     }
-    try { return this.resultResponse(answers, budget); }
-    catch (error) { return Response.json([failure(error)]); }
+    try { return this.resultResponse(answers, budget, answers.at(-1)?.code ? 503 : 200); }
+    catch (error) { return fail(error, true); }
+  }
+
+  checkDeadline() {
+    if (this.constructor.wallDeadline) this.ctx.storage.sql.checkExecutionDeadline();
   }
 
   resultTooLarge() {
@@ -91,13 +105,15 @@ export class SqlDatabase extends DurableObject {
     budget.bytes += bytes;
   }
 
-  resultResponse(answer, budget) {
+  resultResponse(answer, budget, status = 200) {
     const json = JSON.stringify(answer);
     if (budget.size(json) > SqlDatabase.MAX_RESULT_BYTES) throw this.resultTooLarge();
-    return new Response(json, { headers: { "content-type": "application/json" } });
+    const response = new Response(json, { status, headers: { "content-type": "application/json" } });
+    if (status === 200) this.checkDeadline();
+    return response;
   }
 
-  runIngest(statement) {
+  runIngest(statement, budget) {
     if (typeof statement.ingest !== "string" || Object.hasOwn(statement, "sql") || Object.hasOwn(statement, "params"))
       throw new Error("ingest must be a string, without sql or params, sent as a standalone /query object");
     return this.ctx.storage.transactionSync(() => {
@@ -106,15 +122,18 @@ export class SqlDatabase extends DurableObject {
       const before = counters(), sizeBefore = sqlite.databaseSize;
       const ingest = sqlite.ingest(statement.ingest);
       const after = counters(), sizeAfter = sqlite.databaseSize;
-      return { success: true, results: [], ingest, meta: {
+      const answer = { success: true, results: [], ingest, meta: {
         duration: 0, changes: after.changes - before.changes, last_row_id: after.last_row_id,
         changed_db: after.changes !== before.changes || after.last_row_id !== before.last_row_id || sizeAfter !== sizeBefore,
         size_after: sizeAfter, rows_read: ingest.rowsRead, rows_written: ingest.rowsWritten,
       } };
+      this.addResultBytes(budget, budget.size(JSON.stringify(answer)));
+      return this.resultResponse(answer, budget);
     });
   }
 
   runStatement(statement, resultsFormat, budget) {
+    this.checkDeadline();
     if (statement && Object.hasOwn(statement, "ingest"))
       throw new Error("ingest is only accepted as a standalone /query object");
     const { sql, params = [] } = statement ?? {};

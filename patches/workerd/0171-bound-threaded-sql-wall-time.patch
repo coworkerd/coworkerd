@@ -1,0 +1,406 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 21:10:19 +0800
+Subject: [PATCH] Bound threaded database queries by their wall deadline and
+ caller
+
+
+diff --git a/src/workerd/api/actor-state.c++ b/src/workerd/api/actor-state.c++
+index 669e42d94be9ca96f4eda31b8bacfeddf9264968..f1f5c0183dd9461f9bd52e11a868af53361dd765 100644
+--- a/src/workerd/api/actor-state.c++
++++ b/src/workerd/api/actor-state.c++
+@@ -768,7 +768,20 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+       JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
+           "Cannot commit transaction due to an earlier SQL critical error");
+ 
+-      sqlite.run("RELEASE _cf_sync_savepoint");
++      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
++      if (budget && budget->hasDeadline()) {
++        auto check = [budget = std::move(budget)] {
++          static constexpr SqlStorageRegulator regulator;
++          if (budget->checkDeadline()) {
++            kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
++          }
++        };
++        check();
++        sqlite.run("RELEASE _cf_sync_savepoint");
++        sqlite.setCommitCheck(kj::mv(check));
++      } else {
++        sqlite.run("RELEASE _cf_sync_savepoint");
++      }
+       syncExternalTxn.commit();
+       return kj::mv(result);
+     }, [&](jsg::Value exception) -> jsg::JsRef<jsg::JsValue> {
+diff --git a/src/workerd/api/sql.c++ b/src/workerd/api/sql.c++
+index f161e2fa9e9dca46e131d8d010f90a288ab42354..ca9f52ee706868b6168e6b8f7894d3454a01676d 100644
+--- a/src/workerd/api/sql.c++
++++ b/src/workerd/api/sql.c++
+@@ -157,10 +157,21 @@ std::shared_ptr<SqlExecutionBudget> SqlStorageRegulator::getSqlExecutionBudget()
+ 
+ kj::Exception SqlStorageRegulator::sqlExecutionLimitException(
+     const SqlExecutionBudget& budget) const {
++  if (budget.getCause() == SqlExecutionBudget::Cause::DISCONNECTED) {
++    return jsg::tagCoworkerdRpcError(KJ_EXCEPTION(DISCONNECTED, "jsg.Error: SQL client disconnected"),
++        "SQL_CLIENT_DISCONNECTED");
++  }
+   return jsg::tagCoworkerdRpcError(
+       KJ_EXCEPTION(OVERLOADED, kj::str("jsg.Error: ", budget.describe())), "SQL_LIMIT_EXCEEDED");
+ }
+ 
++void SqlStorage::checkExecutionDeadline() {
++  auto budget = regulator.getSqlExecutionBudget();
++  if (budget && budget->hasDeadline() && budget->checkDeadline()) {
++    kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
++  }
++}
++
+ void SqlStorage::abortExecutionLimit(jsg::Lock& js) {
+   auto& context = IoContext::current();
+   auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+diff --git a/src/workerd/api/sql.h b/src/workerd/api/sql.h
+index d47f36c691a4709b113aae6e7bd64de9dee3d22e..090c91902a3f48fa0717ffa822b5e0e862cd2943 100644
+--- a/src/workerd/api/sql.h
++++ b/src/workerd/api/sql.h
+@@ -43,6 +43,7 @@ class SqlStorage final: public jsg::Object {
+   jsg::Ref<Cursor> exec(jsg::Lock& js, jsg::JsString query, jsg::Arguments<BindingValue> bindings);
+   IngestResult ingest(jsg::Lock& js, kj::String query);
+   void abortExecutionLimit(jsg::Lock& js);
++  void checkExecutionDeadline();
+   void setMaxPageCountForTest(jsg::Lock& js, int count);
+ 
+   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
+@@ -54,6 +55,7 @@ class SqlStorage final: public jsg::Object {
+ 
+     if (flags.getWorkerdExperimental()) {
+       JSG_METHOD(abortExecutionLimit);
++      JSG_METHOD(checkExecutionDeadline);
+       // Prepared statement API is experimental-only and deprecated. exec() will automatically
+       // handle caching prepared statements, so apps don't need to worry about it.
+       JSG_METHOD(prepare);
+diff --git a/src/workerd/io/actor-sqlite.c++ b/src/workerd/io/actor-sqlite.c++
+index eb1afcf0087f3013226e09f9c8ffb8308cf6af6d..6d3ed006d4b839a2800768c69154eaffdebc92dc 100644
+--- a/src/workerd/io/actor-sqlite.c++
++++ b/src/workerd/io/actor-sqlite.c++
+@@ -72,6 +72,7 @@ ActorSqlite::ImplicitTxn::ImplicitTxn(ActorSqlite& parent): parent(parent) {
+ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
+   KJ_IF_SOME(c, parent.currentTxn.tryGet<ImplicitTxn*>()) {
+     if (c == this) {
++      parent.db->clearCommitCheck();
+       parent.currentTxn.init<NoTxn>();
+     }
+   }
+@@ -87,6 +88,7 @@ ActorSqlite::ImplicitTxn::~ImplicitTxn() noexcept(false) {
+ void ActorSqlite::ImplicitTxn::commit() {
+   // Ignore redundant commit()s.
+   if (!committed) {
++    parent.db->checkCommit();
+     parent.commitTxn.run();
+     committed = true;
+   }
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 2ef3792bd94d149aa868cb7344d8e60a3d93c7a1..2b91e5aaa0fd438353287efe92cf1eb81aef8e25 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1074,13 +1074,14 @@ class CpuWatchdog {
+     KJ_REQUIRE(found != entries.end());
+     entries.erase(found);
+   }
+-  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity) {
++  bool switchAccount(Entry &entry, uint64_t started, uint64_t used, kj::StringPtr identity,
++      bool sqlDeadline) {
+     std::lock_guard lock(mutex);
+     if (entry.cause.load() != LimitCause::NONE) return false;
+     const uint64_t maximum = uint64_t(entry.cpuMs) * 1000000;
+     entry.started = started;
+     entry.previousCpu = used;
+-    entry.allowance = maximum == 0 ? UINT64_MAX : maximum - std::min(maximum, used);
++    entry.allowance = maximum == 0 || sqlDeadline ? UINT64_MAX : maximum - std::min(maximum, used);
+     entry.due = nowNs() + (entry.allowance == UINT64_MAX ? 1000000 : entry.allowance);
+     entry.identity = identity;
+     changed.notify_one();
+@@ -1434,6 +1435,7 @@ struct DurableEventCpu {
+   kj::String identity, oomReport;
+   kj::Maybe<kj::Weak<IoContext::IncomingRequest>> request;
+   server::DurableCpuAccount account;
++  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
+ };
+ 
+ class DurableEventObserver final: public RequestObserver {
+@@ -1518,7 +1520,7 @@ struct RequestLimits final: LimitEnforcer {
+       auto &charged = account();
+       charged.charge(segmentStart, now);
+       const auto maximum = uint64_t(slot.limits->cpuMs) * 1000000;
+-      if ((maximum != 0 && charged.remaining(maximum) == 0) ||
++      if ((maximum != 0 && !(event && event->sqlDeadline) && charged.remaining(maximum) == 0) ||
+           (owner.sqlBudget && owner.sqlBudget->getCause() == SqlExecutionBudget::Cause::CPU)) {
+         auto expected = LimitCause::NONE;
+         measurement.limitCause.compare_exchange_strong(expected, LimitCause::CPU);
+@@ -1550,7 +1552,8 @@ struct RequestLimits final: LimitEnforcer {
+       const auto used = (next ? next->account : turnOverhead).consumed();
+       if (execution.registered &&
+           !CpuWatchdog::instance().switchAccount(
+-              execution.entry, now, used, next ? next->identity : owner.identity)) {
++              execution.entry, now, used, next ? next->identity : owner.identity,
++              next && next->sqlDeadline)) {
+         return;
+       }
+       currentOomReport = next ? next->oomReport.cStr() : owner.oomReport.cStr();
+@@ -1616,7 +1619,9 @@ struct RequestLimits final: LimitEnforcer {
+     return nullptr;
+   }
+   std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() override {
+-    if (!scope || slot.limits->cpuMs == 0) return {};
++    if (!scope) return {};
++    if (scope->event && scope->event->sqlDeadline) return scope->event->sqlDeadline;
++    if (slot.limits->cpuMs == 0) return {};
+     if (!sqlBudget) {
+       const uint64_t maximum = uint64_t(slot.limits->cpuMs) * 1000000;
+       const auto left = scope->account().remaining(maximum);
+@@ -2382,6 +2387,17 @@ struct DurableSessionScope {
+   kj::Canceler preparing;
+   kj::Canceler transport;
+   bool ended = false;
++  int socketFd = -1;
++  uint64_t nextSqlDisconnectCheck = 0;
++
++  bool sqlClientDisconnected(uint64_t now) noexcept {
++    if (ended) return true;
++    if (now < nextSqlDisconnectCheck) return false;
++    nextSqlDisconnectCheck = now + 1000000;
++    pollfd pending{socketFd, POLLRDHUP, 0};
++    return poll(&pending, 1, 0) > 0 &&
++        (pending.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
++  }
+ };
+ 
+ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2987,6 +3003,7 @@ struct ThreadedServer {
+     // Runs before the release above: an event this session was still preparing ends here,
+     // and with it the waiter it has on a cold load.
+     auto scope = std::make_shared<DurableSessionScope>();
++    scope->socketFd = call.socket.get();
+     auto &sessions = state.durableSessions[call.ticket.tree];
+     KJ_ASSERT(sessions.emplace(call.ticket.event, scope).second);
+     KJ_DEFER({
+@@ -5638,7 +5655,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     std::shared_ptr<TenantPermit> tenant,
+     kj::Own<RequestObserver> observer = kj::refcounted<RequestObserver>(),
+     kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none,
+-    kj::Maybe<kj::StringPtr> localActorClass = kj::none) {
++    kj::Maybe<kj::StringPtr> localActorClass = kj::none,
++    std::shared_ptr<SqlExecutionBudget> sqlDeadline = {}) {
+   if (!preparation) preparation = server.prepareSlot(slot);
+   auto invocation = kj::refcounted<InvocationState>(slot, std::move(tenant));
+   invocation->measurement.preparation = std::move(preparation);
+@@ -5667,8 +5685,9 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+       ",\"invocationId\":", encode(field(input, "invocationId")), ",\"isolate\":\"",
+       slot->isolateLabel.c_str(), "\",");
+   if (slot->resetDurableRoot) {
+-    observer = kj::refcounted<DurableEventObserver>(
+-        std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
++    auto event = std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB);
++    event->sqlDeadline = std::move(sqlDeadline);
++    observer = kj::refcounted<DurableEventObserver>(std::move(event));
+   }
+   auto limits =
+       kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
+@@ -6612,7 +6631,34 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+           str(plan, "versionFingerprint") == route.open.definition &&
+           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
+       "durable routing descriptor mismatch");
++  std::shared_ptr<SqlExecutionBudget> sqlDeadline;
++  if (field(input, "sqlDeadlineMonotonicNs").isString()) {
++    KJ_REQUIRE(kind == "platformDurable" && productPlatformPlan(plan) &&
++        route.open.className == "SqlDatabase" && !field(input, "durableAlarm").isObject(),
++        "SQL deadline requires a platform database query");
++    constexpr uint64_t SQL_LIMIT_NS = 30000000000;
++    const auto expires = durableNumber(input, "sqlDeadlineMonotonicNs");
++    KJ_REQUIRE(expires <= nowNs() + SQL_LIMIT_NS, "invalid SQL deadline");
++    sqlDeadline = std::make_shared<SqlExecutionBudget>(SQL_LIMIT_NS,
++        [expires, weak = std::weak_ptr(scope)]() noexcept {
++      const auto now = nowNs();
++      if (const auto session = weak.lock(); !session || session->sqlClientDisconnected(now))
++        return SqlExecutionBudget::Cause::DISCONNECTED;
++      if (now >= expires) return SqlExecutionBudget::Cause::WALL;
++      return SqlExecutionBudget::Cause::NONE;
++    });
++  }
++  auto checkSqlDeadline = [&]() {
++    if (sqlDeadline && sqlDeadline->checkDeadline()) {
++      if (sqlDeadline->getCause() == SqlExecutionBudget::Cause::DISCONNECTED)
++        kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "SQL client disconnected before execution"));
++      kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++          KJ_EXCEPTION(OVERLOADED, sqlDeadline->describe()), "SQL_LIMIT_EXCEEDED"));
++    }
++  };
++  checkSqlDeadline();
+   co_await server.admitDurableEvent(state, route, ticket);
++  checkSqlDeadline();
+   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
+   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
+       "durable class missing from pinned Worker");
+@@ -6785,8 +6831,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
+   }
+   if (entry.get() == nullptr) {
++    checkSqlDeadline();
+     entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
+-        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
++        nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor), kj::none, std::move(sqlDeadline))
+                 .entry;
+   }
+   auto identity = invocationIdentity(*slot, input);
+diff --git a/src/workerd/util/sqlite-test.c++ b/src/workerd/util/sqlite-test.c++
+index 50fa308a11d3c5382fe6711902974f898c37d196..075ffaa646179555cef644a0406c2cd3fa497f22 100644
+--- a/src/workerd/util/sqlite-test.c++
++++ b/src/workerd/util/sqlite-test.c++
+@@ -163,6 +163,35 @@ class DefaultRegulatorForTest: public SqliteDatabase::Regulator {
+ };
+ static constexpr DefaultRegulatorForTest DEFAULT_REGULATOR_FOR_TEST;
+ 
++KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cursor") {
++  using Cause = SqlExecutionBudget::Cause;
++  static const class DeadlineRegulator final: public SqliteDatabase::Regulator {
++   public:
++    mutable std::shared_ptr<SqlExecutionBudget> budget;
++    std::shared_ptr<SqlExecutionBudget> getSqlExecutionBudget() const override { return budget; }
++  } regulator;
++  KJ_DEFER(regulator.budget.reset());
++  auto dir = kj::newInMemoryDirectory(kj::nullClock());
++  SqliteDatabase::Vfs vfs(*dir);
++  SqliteDatabase db(vfs, kj::Path({"deadline"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
++  const SqliteDatabase::QueryOptions options{.regulator = regulator};
++
++  Cause stop = Cause::NONE;
++  regulator.budget = std::make_shared<SqlExecutionBudget>(30000000000, [&]() { return stop; });
++  KJ_EXPECT(db.run(options, "SELECT 1").getInt(0) == 1);
++  stop = Cause::WALL;
++  KJ_EXPECT_THROW_MESSAGE("SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded", db.run(options, "SELECT 2"));
++
++  uint32_t checks = 0;
++  regulator.budget = std::make_shared<SqlExecutionBudget>(30000000000,
++      [&]() { return ++checks >= 25 ? Cause::DISCONNECTED : Cause::NONE; });
++  KJ_EXPECT_THROW_MESSAGE("SQL client disconnected", db.run(options,
++      "WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000) SELECT sum(n) FROM r"));
++  KJ_EXPECT(checks == 25);
++  regulator.budget.reset();
++  KJ_EXPECT(db.run(options, "SELECT 3").getInt(0) == 3);
++}
++
+ KJ_TEST("SQLite backed by in-memory directory") {
+   auto dir = kj::newInMemoryDirectory(kj::nullClock());
+   SqliteDatabase::Vfs vfs(*dir);
+diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
+index fcc6c70a221affe2481fcfb203641dfe0655d3ff..e9317161bb371e374f61359d635978b6a13838ef 100644
+--- a/src/workerd/util/sqlite.c++
++++ b/src/workerd/util/sqlite.c++
+@@ -85,7 +85,14 @@ SqlExecutionBudget::SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t thread
+     : cpuLimitNs(eventCpuLimitNs),
+       wallLimitNs(kj::maxValue),
+       threadCpuDeadline(threadCpuDeadlineNs) {}
++SqlExecutionBudget::SqlExecutionBudget(uint64_t wallLimitNs, std::function<Cause()> checkDeadline)
++    : cpuLimitNs(0), wallLimitNs(wallLimitNs), deadlineCheck(std::move(checkDeadline)) {}
++bool SqlExecutionBudget::checkDeadline() noexcept {
++  if (cause == Cause::NONE && deadlineCheck) cause = deadlineCheck();
++  return cause != Cause::NONE;
++}
+ kj::String SqlExecutionBudget::describe() const {
++  if (cause == Cause::DISCONNECTED) return kj::str("SQL client disconnected");
+   const bool cpu = cause == Cause::CPU;
+   return kj::str("SQL_LIMIT_EXCEEDED: ", cpu ? "cpu" : "wall", " limit ",
+       (cpu ? cpuLimitNs : wallLimitNs) / 1000000, "ms exceeded",
+@@ -122,7 +129,8 @@ struct SqliteDatabase::ExecutionScope {
+         previous(database.activeExecutionScope) {
+     // Acquire entropy before installing this stack scope: the random source may throw.
+     const bool enter = budget && !check(CheckMode::BOUNDARY);
+-    if (enter && budget->threadCpuDeadline == kj::none) sampled = database.sampleSqlExecution();
++    if (enter && !budget->hasDeadline() && budget->threadCpuDeadline == kj::none)
++      sampled = database.sampleSqlExecution();
+     if (previous != nullptr) previous->pause();
+     database.activeExecutionScope = this;
+     if (enter && !check(CheckMode::BOUNDARY)) resume();
+@@ -142,7 +150,7 @@ struct SqliteDatabase::ExecutionScope {
+     if (previous != nullptr) previous->resume();
+   }
+   void resume() noexcept {
+-    if (!budget) return;
++    if (!budget || budget->hasDeadline()) return;
+     wallStarted = lastCpuSampleWall = sqlWallNow();
+     cpuStarted = sampled || sawCallback ? sqlCpuNow() : 0;
+     running = true;
+@@ -159,6 +167,7 @@ struct SqliteDatabase::ExecutionScope {
+   }
+   bool check(CheckMode mode = CheckMode::PROGRESS) noexcept {
+     if (!budget) return false;
++    if (budget->hasDeadline()) return budget->checkDeadline();
+     if (budget->cause != SqlExecutionBudget::Cause::NONE) return true;
+     KJ_IF_SOME(deadline, budget->threadCpuDeadline) {
+       const auto wall = sqlWallNow();
+@@ -191,7 +200,7 @@ struct SqliteDatabase::ExecutionScope {
+   }
+   bool progress() noexcept {
+     if (!budget) return false;
+-    if (budget->threadCpuDeadline != kj::none) return check();
++    if (budget->hasDeadline() || budget->threadCpuDeadline != kj::none) return check();
+     if (!sawCallback) {
+       sawCallback = true;
+       if (!sampled) {
+diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
+index e1689e3b9c0e9c58c14efd17a85a373c19a8cab8..dc7ec891418e2b1ba11e701042d9558d75a0543a 100644
+--- a/src/workerd/util/sqlite.h
++++ b/src/workerd/util/sqlite.h
+@@ -14,6 +14,7 @@
+ #include <kj/string.h>
+ 
+ #include <utility>
++#include <functional>
+ #include <memory>
+ 
+ struct sqlite3;
+@@ -35,16 +36,20 @@ using SqliteQueryId = uint64_t;
+ // Owned by an event, shared by all of its tenant SQL calls. Internal SQL never acquires it.
+ class SqlExecutionBudget {
+  public:
+-  enum class Cause { NONE, CPU, WALL };
++  enum class Cause { NONE, CPU, WALL, DISCONNECTED };
+   static bool isEnabled();
+   SqlExecutionBudget();
+   SqlExecutionBudget(uint64_t eventCpuLimitNs, uint64_t threadCpuDeadlineNs);
++  SqlExecutionBudget(uint64_t wallLimitNs, std::function<Cause()> checkDeadline);
++  bool hasDeadline() const { return bool(deadlineCheck); }
++  bool checkDeadline() noexcept;
+   Cause getCause() const { return cause; }
+   kj::String describe() const;
+ 
+  private:
+   uint64_t cpuLimitNs, wallLimitNs;
+   kj::Maybe<uint64_t> threadCpuDeadline;
++  std::function<Cause()> deadlineCheck;
+   uint64_t cpuUsedNs = 0, wallUsedNs = 0;
+   Cause cause = Cause::NONE;
+   friend class SqliteDatabase;
+@@ -269,6 +274,16 @@ class SqliteDatabase {
+   //
+   // Note that the write callback is NOT called before (or at any point during) a reset(). Use the
+   // `ResetListener` mechanism or `afterReset()` instead for that case.
++  // The actor's implicit transaction can commit after the JavaScript turn.
++  // A platform query may install its final check before that point.
++  void setCommitCheck(kj::Function<void()> check) { commitCheck = kj::mv(check); }
++  void clearCommitCheck() { commitCheck = kj::none; }
++  void checkCommit() {
++    auto check = kj::mv(commitCheck);
++    clearCommitCheck();
++    KJ_IF_SOME(run, check) { run(); }
++  }
++
+   void onWrite(kj::Function<void(bool allowUnconfirmed)> callback) {
+     onWriteCallback = kj::mv(callback);
+   }
+@@ -464,6 +479,7 @@ class SqliteDatabase {
+   ExecutionScope* activeExecutionScope = nullptr;
+   uint64_t executionRandomState = 0;
+   bool sampleSqlExecution();
++  kj::Maybe<kj::Function<void()>> commitCheck;
+   static int progressCallback(void* database) noexcept;
+   void handleExecutionLimit(kj::Maybe<int> errorCode, StaticRegulator regulator);
+ 

@@ -182,6 +182,23 @@ async function sqlAtomicity(cluster) {
   assert.deepEqual(await read(), rows, 'the failed transaction left the committed rows intact');
 }
 
+async function createDatabaseHomes(cluster, tenant, counts) {
+  const databases = new Map([...counts.keys()].map(node => [node, []]));
+  for (let i = 0; i < 36 && [...counts].some(([node, count]) => databases.get(node).length < count); i++) {
+    const path = `${tenant.path}/databases/db-${i}`;
+    const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    // The first access uses the shard's rendezvous owner. Check the resulting owner in the dispatch log below.
+    const scores = cluster.nodes.map(node => [node, createHash('sha256')
+      .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
+    scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
+    const owner = scores[0][0];
+    const selected = databases.get(owner);
+    if (selected && selected.length < counts.get(owner)) selected.push({ ...database, path, owner });
+  }
+  for (const [node, count] of counts) assert.equal(databases.get(node).length, count, `database placement on ${node}`);
+  return databases;
+}
+
 async function threadedDatabasePlacement(cluster) {
   const [threaded, upstream] = cluster.nodes;
   if (cluster.previousProduct) {
@@ -192,20 +209,7 @@ async function threadedDatabasePlacement(cluster) {
     console.log(`Database compatibility binaries (SHA-256): upstream=${previous}, threaded=${current}`);
   }
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 48 });
-  const databases = new Map([[threaded, []], [upstream, []]]);
-  for (let i = 0; i < 36 && (databases.get(threaded).length < 2 || databases.get(upstream).length < 1); i++) {
-    const path = `${tenant.path}/databases/db-${i}`;
-    const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
-    // The first access uses the shard's rendezvous owner. Check the resulting owner in the dispatch log below.
-    const scores = cluster.nodes.map(node => [node, createHash('sha256')
-      .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
-    scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
-    const owner = scores[0][0];
-    const selected = databases.get(owner);
-    if (selected && selected.length < (owner === threaded ? 2 : 1)) selected.push({ ...database, path, owner });
-  }
-  assert.equal(databases.get(threaded).length, 2, 'two databases are assigned to the same threaded owner');
-  assert.equal(databases.get(upstream).length, 1, 'one database is assigned to the upstream owner');
+  const databases = await createDatabaseHomes(cluster, tenant, new Map([[threaded, 2], [upstream, 1]]));
   const selected = [...databases.values()].flat();
   const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
     const address = await cluster.compose(['port', node, '8934']);
@@ -283,6 +287,128 @@ async function threadedDatabasePlacement(cluster) {
     await eventually(`${db.name} retains its confirmed value after the ${threaded} owner is killed`, async () => {
       assert.deepEqual((await publicSql(db, { sql: 'SELECT value FROM records' })).results, [{ value: db.name }]);
     }, { timeout: 45000 });
+  }
+}
+
+async function threadedSqlDeadline(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-deadline', { durableObjectNamespaces: 48 });
+  const databases = (await createDatabaseHomes(cluster, tenant, new Map([[owner, 4]]))).get(owner);
+  const sql = (db, body, timeout = 40000) => request(cluster.urls.apiserver, `${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, timeout });
+  const read = { sql: 'SELECT id FROM ledger ORDER BY id' };
+  const put = id => ({ sql: 'INSERT INTO ledger VALUES (?)', params: [id] });
+  const long = 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000000)';
+  const select = `${long} SELECT sum(n) FROM r`;
+  const insert = `${long} INSERT INTO ledger SELECT sum(n) FROM r`;
+  const medium = select.replace('1000000000', '2000000');
+  for (const db of databases) {
+    await eventually(`${db.name} reaches its database home`, async () => {
+      assert.equal(json(await sql(db, { sql: 'SELECT 1' }), 200, db.name).success, true);
+    });
+    assert.equal(json(await sql(db, { sql: 'CREATE TABLE ledger(id INTEGER PRIMARY KEY)' }), 200, db.name).success, true);
+    assert.equal(json(await sql(db, put(1)), 200, db.name).success, true);
+  }
+  const original = await durableGeneration(cluster, owner);
+  assert.equal(original.lifecycle.durableServer, 'threaded');
+  assert.equal(original.lifecycle.durableAdmission.residentRoots, databases.length);
+
+  const measuredAt = performance.now();
+  assert.equal(json(await sql(databases[0], { sql: medium }), 200, 'one short statement').success, true);
+  const repeats = Math.max(180, Math.ceil(85000 / (performance.now() - measuredAt)));
+  const batch = [put(2), ...Array(repeats).fill({ sql: medium })];
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, env) {
+    const { searchParams } = new URL(request.url);
+    const db = env['DB' + searchParams.get('db')];
+    switch (searchParams.get('op')) {
+      case 'single':
+      case 'batch':
+      case 'cancel':
+        try {
+          let result;
+          switch (searchParams.get('op')) {
+            case 'single': result = await db.prepare(${JSON.stringify(select)}).all(); break;
+            case 'batch': result = await db.batch(${JSON.stringify(batch)}.map(q => db.prepare(q.sql).bind(...(q.params ?? [])))); break;
+            case 'cancel': result = await db.batch([db.prepare('INSERT INTO ledger VALUES (2)'), db.prepare(${JSON.stringify(insert)})]); break;
+          }
+          return Response.json(result);
+        } catch (e) {
+          return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 });
+        }
+      default: return Response.json((await db.prepare(${JSON.stringify(read.sql)}).all()).results);
+    }
+  } };`, { wrangler: { d1_databases: databases.map((db, index) => ({ binding: `DB${index}`, database_name: db.name })) } });
+  const bindingPath = (i, op = 'read') => `/${tenant.name}/probe?db=${i}&op=${op}`;
+  const binding = (i, op) => request(cluster.urls[ingress], bindingPath(i, op), { timeout: 40000 });
+  for (const [i, db] of databases.entries()) {
+    await eventually(`${db.name} is reachable by its D1 binding`, async () => {
+      assert.deepEqual(json(await binding(i), 200, db.name), [{ id: 1 }]);
+    });
+  }
+
+  const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
+  const withTiming = async (label, run, check) => {
+    const started = performance.now();
+    const result = json(await run(), 503, label);
+    const elapsed = performance.now() - started;
+    check(result);
+    assert.ok(elapsed >= 28500 && elapsed < 35000, `${label} took ${elapsed.toFixed(1)} ms`);
+    console.log(`${label}: ${elapsed.toFixed(1)} ms`);
+  };
+  const checkHttp = result => {
+    assert.equal(result.code, 'SQL_LIMIT_EXCEEDED');
+    assert.equal(result.reason, reason);
+  };
+  const checkBinding = result => {
+    assert.equal(result.message, `D1_ERROR: ${reason}`);
+    assert.equal(result.cause, reason);
+  };
+  await Promise.all([
+    withTiming('HTTP single deadline', () => sql(databases[0], { sql: select }), checkHttp),
+    withTiming('HTTP batch deadline', () => sql(databases[1], batch), checkHttp),
+    withTiming('D1 single deadline', () => binding(2, 'single'), checkBinding),
+    withTiming('D1 batch deadline', () => binding(3, 'batch'), checkBinding),
+    delay(2500).then(() => withTiming('HTTP deadline includes time queued behind another query',
+      () => sql(databases[0], { sql: select }), checkHttp)),
+  ]);
+  for (const [i, db] of databases.entries()) {
+    assert.deepEqual(json(await sql(db, read), 200, db.name).results, [{ id: 1 }]);
+    assert.deepEqual(json(await binding(i), 200, db.name), [{ id: 1 }]);
+  }
+
+  const running = async expected => {
+    const snapshot = await durableGeneration(cluster, owner);
+    assert.equal(snapshot.pid, original.pid);
+    assert.equal(snapshot.generation, original.generation);
+    assert.equal(snapshot.lifecycle.durableAdmission.running, expected);
+  };
+  for (const [label, url, options] of [
+    ['HTTP', cluster.urls.apiserver + databases[0].path + '/query', {
+      method: 'POST', headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify([put(2), { sql: insert }]),
+    }],
+    ['D1', cluster.urls[ingress] + bindingPath(0, 'cancel'), {}],
+  ]) {
+    await eventually('the home is idle before cancellation', () => running(0));
+    const control = new AbortController();
+    let settled = false;
+    const pending = fetch(url, { ...options, signal: control.signal }).catch(error => error)
+      .finally(() => { settled = true; });
+    try {
+      await eventually(`${label} is running on the home`, () => running(1), { timeout: 3000, interval: 25 });
+      await delay(100);
+      assert.equal(settled, false, `${label} must still be executing when the client disconnects`);
+    } finally {
+      control.abort();
+    }
+    assert.equal((await pending).name, 'AbortError');
+    const disconnectedAt = performance.now();
+    await eventually(`${label} frees the home well before the original deadline`, () => running(0), { timeout: 5000, interval: 50 });
+    const recovered = await eventually(`${label} rolled back its cancelled write`, async () =>
+      json(await sql(databases[0], read, 1500), 200, 'read after disconnect'), { timeout: 5000, interval: 50 });
+    assert.deepEqual(recovered.results, [{ id: 1 }]);
+    assert.deepEqual(json(await binding(0), 200, 'D1 after disconnect'), [{ id: 1 }]);
+    console.log(`${label} disconnect and recovery: ${(performance.now() - disconnectedAt).toFixed(1)} ms`);
   }
 }
 
@@ -2325,6 +2451,9 @@ export const durableGatedCases = {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
     publishPeerPorts: true,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'threaded-sql-deadline': {
+    test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {

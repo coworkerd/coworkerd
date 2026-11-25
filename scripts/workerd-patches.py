@@ -314,6 +314,12 @@ def allowed_path(name, path):
                                    '0170-place-platform-databases-in-exclusive-copies.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0171-bound-threaded-sql-wall-time.patch' and path in {
+                              'src/workerd/api/sql.c++', 'src/workerd/api/sql.h',
+                              'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

@@ -366,6 +366,19 @@ Preserve local filesystem bounds and declare
 any native operation without a proven interruption path a release blocker for that execution path.
 [Existing database API and error contract](guide/databases.md).
 
+The threaded object database test path starts one 30-second monotonic deadline at the HTTP SQL
+handler or D1 binding dispatch. Nodes forward the time remaining. Time spent receiving the HTTP
+body, waiting for placement or storage recovery, preparing and stepping SQLite, and encoding
+results counts against the same deadline. Every statement in a batch sees that deadline. The
+public timeout is `503 SQL_LIMIT_EXCEEDED` and a binding query or batch reports `D1_ERROR` with
+that code. WAL confirmation retains its separate deadline and error priority.
+
+A caller disconnect closes the write side of that event's dedicated kernel connection. The
+SQLite progress callback detects it during synchronous execution. The transaction rolls back on
+interruption and the next query can use the database. SQLite functions and file operations without
+progress callbacks remain release blockers wherever they can outlast the deadline. The database
+placement fixture selects this behavior in the test build.
+
 ### Decisions taken in review
 
 The four points below were open when the design was written. Each ends with what the review of the design

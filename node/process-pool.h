@@ -35,6 +35,9 @@ public:
   void finish();
   // Exceptional completion only: capture a dying generation before its calls are released.
   void snapshotAfterFailure() noexcept;
+  void sqlClientDisconnected() noexcept;
+  bool sqlClientGone = false;
+  std::function<void()> closeSqlInput;
   kj::Promise<void> rejectAfterCrash(kj::Exception&& error);
   kj::Promise<void> onExit();
   bool threadedServer() const;
@@ -164,7 +167,7 @@ public:
   std::string quarantineShard(const std::string& tenant) const;
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash,
-      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {});
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {}, bool threadedSql = false);
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);

@@ -66,6 +66,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Both patches use `threaded-server.c++` and `threaded-server-test.c++` in `src/workerd/threaded/`.
   Patch 0170 validates an object-specific copy key for platform databases and permits the
   built-in package's SQL compatibility flag. It uses the same two files.
+  Patch 0171 passes a per-request wall deadline and session disconnect check from the threaded
+  database home into the existing SQLite execution scope. It extends the SQL API's experimental
+  hooks for checking the same deadline from the platform class before returning results.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
