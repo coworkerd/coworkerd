@@ -54,9 +54,9 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
 if missing or failed or skipped:
     raise SystemExit(f"Expected all unit tests to pass with zero skips. Missing tests: {sorted(missing)}")
 PY
-node tests/cluster/run.mjs "$kernel" | tee "$stage/cluster.log"
+node tests/cluster/run.mjs "$kernel" 2>&1 | tee "$stage/cluster.log"
 COWORKERD_CLUSTER_FATAL_TEST_BINARY="$fatal_test" \
-  node tests/cluster/run.mjs "$kernel" fatal-attribution | tee -a "$stage/cluster.log"
+  node tests/cluster/run.mjs "$kernel" fatal-attribution 2>&1 | tee -a "$stage/cluster.log"
 
 {
   printf '### Cluster workloads\n\n'

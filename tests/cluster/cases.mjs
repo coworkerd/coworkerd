@@ -6,10 +6,16 @@ import { get } from 'node:http';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { eventually, json, request } from './cluster.mjs';
+import { assertStatus, eventually, json, request } from './cluster.mjs';
 
 function respondWith(value) {
   return `export default { fetch() { return new Response(${JSON.stringify(value)}); } };`;
+}
+
+async function assertStreamingStatus(response, status, description) {
+  if (response.status === status) return;
+  const text = await response.text().catch(error => `Could not read response body: ${error.message}`);
+  assertStatus({ status: response.status, text }, status, description);
 }
 
 async function deployment(cluster) {
@@ -257,7 +263,7 @@ async function processReplacement(cluster) {
     assert.notEqual(after.pid, before.pid);
     assert.ok(after.generation > before.generation, `generation is still ${after.generation}`);
     assert.equal(after.state, 'ready');
-    assert.equal((await request(cluster.urls[node], '/__coworkerd/ready')).status, 200);
+    assertStatus(await request(cluster.urls[node], '/__coworkerd/ready'), 200, `${node} readiness`);
   });
   const { processes } = await cluster.state(node);
   const exit = processes.recentFatalExits.find(entry => entry.pid === before.pid && entry.generation === before.generation);
@@ -1355,7 +1361,7 @@ async function threadedClassMigration(cluster) {
   const socketsClosed = sockets.map(socket => once(socket, 'close', { signal: AbortSignal.timeout(35000) }));
   for (const closing of socketsClosed) void closing.catch(() => {});
   const heldRpc = await fetch(cluster.urls[ingress] + url + '/retain', { signal: AbortSignal.timeout(45000) });
-  assert.equal(heldRpc.status, 200);
+  await assertStreamingStatus(heldRpc, 200, 'retained RPC stream');
   const rpcReader = heldRpc.body.getReader();
   assert.equal(Buffer.from((await rpcReader.read()).value).toString(), 'retained:v1');
   const due = Date.now() + 8000;
@@ -1367,7 +1373,7 @@ async function threadedClassMigration(cluster) {
     assert.equal(json(await call('/waiting'), 200, 'v1 handler entered'), true);
   });
   const held = await fetch(cluster.urls[ingress] + url + '/held', { signal: AbortSignal.timeout(30000) });
-  assert.equal(held.status, 200);
+  await assertStreamingStatus(held, 200, 'held v1 stream');
   const reader = held.body.getReader();
   try {
     const firstChunk = await reader.read();
@@ -1375,7 +1381,7 @@ async function threadedClassMigration(cluster) {
     await deploy('v2', 'RenamedRecord', [initial, renamed]);
     await eventually('the first v2 request is refused while v1 still holds the tree', async () => {
       const response = await call('');
-      assert.equal(response.status, 503);
+      assertStatus(response, 503, 'the first v2 request while v1 still holds the tree');
       assert.match(response.text, /DO_VERSION_DRAINING/);
     });
     const oldChunk = await reader.read();
@@ -1388,7 +1394,7 @@ async function threadedClassMigration(cluster) {
     }, /terminated|closed|reset|aborted/i, 'the new definition cuts the old stream at the drain bound');
     const pending = await waiting;
     if (pending.error) throw pending.error;
-    assert.equal(pending.value.status, 503, 'an old call without response headers has an uncertain result');
+    assertStatus(pending.value, 503, 'an old call without response headers has an uncertain result');
     assert.match(pending.value.text, /DO_CODE_UPDATED/);
     assert.match(pending.value.text, /Durable Object reset because its code was updated/);
     assert.match(pending.value.text, /execution result uncertain/);
@@ -1396,9 +1402,7 @@ async function threadedClassMigration(cluster) {
     await reader.cancel().catch(() => {});
   }
   const freshFacet = await eventually('the new definition opens without the old facet socket or props', async () => {
-    const response = await call('/facet-status');
-    assert.equal(response.status, 200, response.text);
-    return json(response, 200, 'new facet');
+    return json(await call('/facet-status'), 200, 'new facet');
   });
   assert.deepEqual(freshFacet, { constructedWith: 0, version: 'v2' });
   const [facetCode, facetReason] = await facetClosed;
@@ -1430,7 +1434,7 @@ async function threadedClassMigration(cluster) {
       assert.equal(record.namespaceId, identity);
       assert.ok(record.status === 'deleting' || record.status === 'deleted');
     } else {
-      assert.equal(gone.status, 404);
+      assertStatus(gone, 404, 'renamed namespace after deletion');
     }
   });
 }
@@ -1663,7 +1667,7 @@ async function threadedSocketHibernation(cluster) {
   const closeFacet = async (socket, action, name) => {
     const closed = next(socket, 'close');
     void closed.catch(() => {});
-    assert.equal((await lookup(`/${action}-facet/${name}`)).status, 204);
+    assertStatus(await lookup(`/${action}-facet/${name}`), 204, `${action} facet ${name}`);
     const [code, reason] = await closed;
     assert.equal(code, 1001);
     assert.match(reason.toString(), new RegExp(action === 'abort' ? 'facet was aborted' : 'facet was deleted', 'i'));
@@ -1699,7 +1703,7 @@ async function threadedSocketHibernation(cluster) {
       }, { timeout: 7000 });
     }
 
-    assert.equal((await lookup(facetPath('too-large', 'status'))).status, 200);
+    assertStatus(await lookup(facetPath('too-large', 'status')), 200, 'large facet status');
     const rejected = await upgradeResponse('too-large');
     assert.equal(rejected.status, 422, JSON.stringify(rejected.body));
     assert.equal(rejected.body.name, 'NotSupportedError');
@@ -1720,7 +1724,7 @@ async function threadedSocketHibernation(cluster) {
     const signal = AbortSignal.timeout(15000);
     const streaming = await fetch(cluster.urls[owner.nodeId] + path + facetPath('busy-abort', 'hold'),
       { signal });
-    assert.equal(streaming.status, 200);
+    await assertStreamingStatus(streaming, 200, 'busy facet stream');
     const reader = streaming.body.getReader();
     try {
       assert.equal(Buffer.from((await reader.read()).value).toString(), 'entered');
@@ -1821,7 +1825,7 @@ async function threadedSocketHibernation(cluster) {
     assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 3);
     const facetClosed = next(facet, 'close');
     void facetClosed.catch(() => {});
-    assert.equal((await request(cluster.urls[owner.nodeId], path + '/delete-facet')).status, 204);
+    assertStatus(await lookup('/delete-facet'), 204, 'delete parent facet');
     const [facetCloseCode, facetCloseReason] = await facetClosed;
     assert.equal(facetCloseCode, 1001);
     assert.match(facetCloseReason.toString(), /facet was deleted/i);
@@ -1997,7 +2001,7 @@ async function threadedSocketRetirement(cluster) {
 
     await writeFile(control('hold-socket-adopt'), '');
     const stalled = await call('/status', { timeout: 7500 }).catch(() => null);
-    assert.ok(stalled == null || stalled.status === 503, 'no request starts before adoption succeeds');
+    if (stalled) assertStatus(stalled, 503, 'no request starts before adoption succeeds');
     assert.equal((await cluster.state(owner.nodeId)).webSockets.parked, 1);
     await unlink(control('hold-socket-adopt'));
     await writeFile(control('hold-socket-adopt-reply'), '');

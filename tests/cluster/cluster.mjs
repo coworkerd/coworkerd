@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { copyFile, mkdir, open, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -21,9 +22,20 @@ export async function request(base, path, { method = 'GET', token, body, timeout
   return { status: response.status, text };
 }
 
+export function assertStatus(response, status, description) {
+  if (response.status !== status) {
+    assert.equal(response.status, status, `${description}: HTTP ${response.status}\n${response.text}`);
+  }
+}
+
 export function json(response, status, description) {
-  assert.equal(response.status, status, `${description}: HTTP ${response.status} ${response.text.slice(0, 500)}`);
-  return JSON.parse(response.text);
+  assertStatus(response, status, description);
+  try {
+    return JSON.parse(response.text);
+  } catch (error) {
+    throw new Error(`${description}: HTTP ${status} response could not be parsed as JSON (${error.message})\n${response.text}`,
+      { cause: error });
+  }
 }
 
 // Poll only observations which can legitimately lag. Assertions outside this helper fail immediately.
@@ -90,12 +102,16 @@ export class Cluster {
     }
   }
 
-  compose(args, options) {
-    return this.command('docker', [
+  composeArgs(args) {
+    return [
       'compose', '--env-file', '/dev/null', '--project-name', this.project,
       ...(this.nodes.length > 1 ? ['--profile', 'cluster'] : []),
       '-f', join(this.productRoot, 'docker/docker-compose.yml'), '-f', this.override, ...args,
-    ], options);
+    ];
+  }
+
+  compose(args, options) {
+    return this.command('docker', this.composeArgs(args), options);
   }
 
   async start() {
@@ -248,15 +264,55 @@ export class Cluster {
     }));
   }
 
-  async diagnostics() {
-    if (!this.started) return;
-    for (const args of [['ps', '-a'], ['logs', '--no-color', '--tail', '40']]) {
-      try {
-        console.error(await this.compose(args, { cleanup: true, timeout: 10000 }));
-      } catch (error) {
-        console.error(error.message);
-      }
+  async diagnostics(name = 'suite', failure) {
+    const directory = join(root, 'build', 'cluster-diagnostics', this.project, name);
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      console.error(`Could not create ${directory}: ${error.message}`);
+      return;
     }
+    console.error(`Cluster failure diagnostics: ${directory}`);
+    const capture = async (label, collect) => {
+      try {
+        await collect();
+      } catch (error) {
+        console.error(`Could not collect ${label} for ${this.project}/${name}: ${error.message}`);
+      }
+    };
+    if (failure) {
+      await capture('failure report', () => writeFile(join(directory, 'failure.txt'), `${failure.stack ?? failure}\n`));
+    }
+    if (!this.started) return;
+
+    const options = { cleanup: true, timeout: 10000 };
+    const composeLog = join(directory, 'compose.log');
+    await Promise.all([
+      capture('Compose status', async () => {
+        const status = await this.compose(['ps', '-a'], options);
+        console.error(status);
+        await writeFile(join(directory, 'compose-ps.txt'), `${status}\n`);
+      }),
+      capture('Compose logs', async () => {
+        const log = await open(composeLog, 'w');
+        try {
+          // Write both streams directly so the tail survives even if the log exceeds execFile's buffer.
+          const child = spawn('docker', this.composeArgs(['logs', '--no-color']), {
+            cwd: this.directory, env: this.env, stdio: ['ignore', log.fd, log.fd],
+            timeout: options.timeout, killSignal: 'SIGKILL',
+          });
+          const [code, signal] = await once(child, 'close');
+          if (code !== 0) throw new Error(`docker compose logs exited with ${signal ?? code}`);
+        } finally {
+          await log.close();
+        }
+        console.error(await this.command('tail', ['-n', '40', composeLog], options));
+      }),
+      // Copy the log directories, including rotations, even if a test stopped a node.
+      ...this.nodes.map(node => capture(`${node} child logs`, () => this.compose([
+        'cp', `${node}:/var/lib/coworkerd/logs`, join(directory, node),
+      ], options))),
+    ]);
   }
 
   async reportMemory() {

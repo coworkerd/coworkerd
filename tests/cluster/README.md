@@ -41,6 +41,11 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+For a failed case, `build/cluster-diagnostics/<project>/<case>/` keeps the assertion (including the HTTP
+body for an unexpected status), Compose status and logs, and each node's workerd logs after teardown.
+On the hosted kernel archive job, download `cluster-failure-<arch>-<attempt>` from the workflow run to
+get those files and the cluster runner's combined output in `cluster.log`.
+
 To measure idle WebSocket memory on fresh clusters:
 
 ```sh
