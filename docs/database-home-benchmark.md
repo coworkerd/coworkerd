@@ -444,10 +444,13 @@ The memory probe runs 125 queries with a 448 MiB process budget and 192 homes. I
 that a new copy can reclaim a memory reservation while unused homes are still available.
 The busy probes hold a long SQL read on each default home, observe the running count
 per process, and submit one additional query per process to verify its capacity refusal.
+The mixed probe runs the same admission path with six competing tenant definitions arriving
+as the SQL scan opens distinct databases. Before the freed-home preference, four tenant
+definitions filled all four homes and only one of the 116 subsequent SQL reads succeeded.
 
 ```sh
 export COWORKERD_CLUSTER_BIN_DIR="$PWD/build"
-for mode in unpaced memory busy-one busy-two; do
+for mode in unpaced memory mixed busy-one busy-two; do
   node tests/cluster/database-home-benchmark.mjs \
     object "$PWD" "$KERNEL_DIR" "$PWD/admission-$mode.jsonl" "--idle-admission-$mode"
 done

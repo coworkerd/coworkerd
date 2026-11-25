@@ -593,7 +593,7 @@ async function threadedDatabaseAdmission(cluster) {
     await sample({ admissionRetirements: 1, idleRetirements: 0 });
     assert.deepEqual(await read(oldestIdle), [{ id: 1 }], 'reopen the reclaimed database with its confirmed row');
     await observe('reopening needed a second retirement', {
-      admissionRetirements: 2, idleRetirements: 0, residentRoots: 3,
+      admissionRetirements: 2, idleRetirements: 0, residentRoots: 3, overloaded: 0,
     });
 
     trackWrite(first);
