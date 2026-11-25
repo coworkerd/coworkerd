@@ -55,7 +55,7 @@ COWORKERD_CLUSTER_PREVIOUS_PRODUCT=/path/to/previous-checkout \
   node tests/cluster/run.mjs "$kernel" durable-threaded-database-placement
 ```
 
-The runner uses the older daemon and runtime on node 2 and checks both daemons' reported source revisions.
+The runner uses the older daemon and runtime on node 2 and records the SHA-256 of both node binaries.
 
 To measure idle WebSocket memory on fresh clusters:
 

@@ -179,12 +179,11 @@ async function sqlAtomicity(cluster) {
 async function threadedDatabasePlacement(cluster) {
   const [threaded, upstream] = cluster.nodes;
   if (cluster.previousProduct) {
-    const version = node => cluster.compose(['exec', '-T', node, 'coworkerd', '--version']);
-    const [current, previous] = await Promise.all([version(threaded), version(upstream)]);
-    const source = output => output.match(/^source (.+)$/m)?.[1];
-    assert.ok(source(current) && source(previous), 'both node binaries report their source revision');
-    assert.notEqual(source(current), source(previous), 'the compatibility test uses different node builds');
-    console.log(`Database compatibility sources: upstream=${source(previous)}, threaded=${source(current)}`);
+    const digest = async node => (await cluster.compose(
+      ['exec', '-T', node, 'sha256sum', '/opt/coworkerd/bin/coworkerd'])).split(' ')[0];
+    const [current, previous] = await Promise.all([digest(threaded), digest(upstream)]);
+    assert.notEqual(current, previous, 'the compatibility test uses different node binaries');
+    console.log(`Database compatibility binaries (SHA-256): upstream=${previous}, threaded=${current}`);
   }
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 48 });
   const databases = new Map([[threaded, []], [upstream, []]]);
