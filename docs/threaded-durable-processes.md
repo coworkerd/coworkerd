@@ -326,9 +326,10 @@ either saves the old actor before close begins or joins the next open, once.
 An eligible threaded platform database closes its tree and releases its exclusive copy about
 10 seconds after its last request finishes. Retaining empty copies exhausted the process
 admission budget in a serial scan of distinct databases. Releasing the copy with the tree
-returns that reservation. The first read after full release took an extra 9.86 ms p50 and
-14.45 ms p99 compared with its immediate warm repeat in the same-epoch D1 profile.
-[Idle-window measurements](database-home-benchmark.md#idle-window-for-exclusive-platform-database-copies)
+returns that reservation. With timed release enabled, the first read after full release
+took an extra 9.46 ms at p50 and 14.38 ms at p99 compared with its immediate warm repeat
+in the same-epoch D1 profile.
+[Idle-window measurements](database-home-benchmark.md#verification-with-patch-0174)
 
 A threaded database can also retire under admission pressure before its idle timer fires.
 The process ranks eligible database trees across its homes by the last completed call.
