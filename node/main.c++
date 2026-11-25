@@ -10565,6 +10565,9 @@ int run(Launch launch) {
   durableLog.setOwnerFenceHook([&shards](const std::string& namespaceId, uint32_t shard, uint64_t through) {
     shards.fenceOwner(namespaceId, shard, through);
   });
+  durableLog.setPredecessorEpochHook([&shards](const std::string& ns, uint32_t shard, uint64_t held, uint64_t source) {
+    return shards.heldPredecessor(ns, shard, held, source);
+  });
   durableLog.setActorResetHook([&server](const auto& object, std::string_view code) {
     for (auto* candidate : server.webSockets().managedObject(object.namespaceId, object.objectId)) {
       auto& relay = static_cast<WebSocketRelay&>(*candidate);

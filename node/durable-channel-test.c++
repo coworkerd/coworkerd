@@ -46,6 +46,28 @@ struct DurableLogChannelTest {
     for (int i = 0; i != 4; ++i) metadata.acquire().wait(io.waitScope) = nullptr;
     KJ_REQUIRE(!metadata.acquire().poll(io.waitScope), "an idle bucket refills to four tokens");
 
+    RecoveryGate sharedMetadata(clock, 1, 16, 1);
+    auto held = sharedMetadata.acquire().wait(io.waitScope);
+    auto canceled = sharedMetadata.acquireCoordination();
+    auto bulkFirst = sharedMetadata.acquire();
+    auto bulkSecond = sharedMetadata.acquire();
+    auto discovery = sharedMetadata.acquireCoordination();
+    auto heartbeat = sharedMetadata.acquireCoordination();
+    canceled = nullptr;
+    held = nullptr;
+    KJ_REQUIRE(!discovery.poll(io.waitScope), "coordination waits for the same token bucket");
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(discovery.poll(io.waitScope) && !bulkFirst.poll(io.waitScope));
+    discovery = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(bulkFirst.poll(io.waitScope) && !bulkSecond.poll(io.waitScope) && !heartbeat.poll(io.waitScope));
+    bulkFirst = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(heartbeat.poll(io.waitScope) && !bulkSecond.poll(io.waitScope));
+    heartbeat = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(bulkSecond.poll(io.waitScope) && sharedMetadata.started() == 5 && sharedMetadata.peakActive() == 1);
+
     RecoveryGate connections(clock, 4);
     std::vector<kj::Own<RecoveryGate::Permit>> connecting;
     for (const char* target : {"one", "two", "three", "four"})
@@ -2189,6 +2211,35 @@ struct DurableLogChannelTest {
     log.rebuildCancelers.at(foreignName)->cancel("fixture cancellation");
     heldDiscovery.fulfiller->fulfill();
     KJ_REQUIRE(!foreignAccess.wait(io.waitScope).ready);
+    busyTwo = nullptr;
+
+    // Exercise a real acquisition and reuse only the authority it read from
+    // the store for that shard and ownership epoch.
+    membership.epoch = "9";
+    membership.conditionalPutAtomic = "true";
+    DurableShards shards({"new"}, config, io.provider->getNetwork(), timer, membership, [] { return false; });
+    const std::string reusedNs(64, 'd');
+    const auto predecessorKey = shardEpochKey(reusedNs, 0, 1);
+    const auto predecessor = shardEpochJson(
+        {reusedNs, "old", "first", "old-instance", "nonce", "", 0, 1, 7, 1, 1});
+    store.objects[predecessorKey] = predecessor;
+    store.objects[shardReleasedKey(reusedNs, 0, 1)] = "";
+    store.sendStoreTimes = true;
+    const auto acquired = shards.accept(reusedNs, 0, 0, "peer").wait(io.waitScope);
+    KJ_REQUIRE(acquired.kind == ShardRoute::Kind::LOCAL && acquired.epoch == 2);
+    KJ_REQUIRE(!shards.heldPredecessor(reusedNs, 0, 2, 2) && !shards.heldPredecessor(reusedNs, 0, 3, 1) &&
+        !shards.heldPredecessor(reusedNs, 1, 2, 1));
+    log.setPredecessorEpochHook([&](const std::string& ns, uint32_t shard, uint64_t held, uint64_t source) {
+      return shards.heldPredecessor(ns, shard, held, source);
+    });
+    const DurableLog::ObjectIdentity reused{reusedNs, std::string(64, '1'), "", 2, 2, 0};
+    store.unreadable.insert(predecessorKey);
+    const auto started = log.recoveryMetadata.started();
+    const auto response = log.readSourceEpoch(reused, 1, false).wait(io.waitScope);
+    KJ_REQUIRE(response->bytes == predecessor && response->lastModifiedUnixMs > 0 &&
+        log.recoveryMetadata.started() == started && log.reusedPredecessorEpochs == 1);
+    shards.dropAll("fixture");
+    KJ_REQUIRE(!shards.heldPredecessor(reusedNs, 0, 2, 1));
   }
 
   static LogRecord recoveryPage(const std::string& name, const std::string& page) {

@@ -175,8 +175,11 @@ and then evenly to the two survivors. It sends `SIGKILL`, waits for both survivo
 lost owner, and issues all reads. The 1,000- and 2,000-database workloads start 100 clients every
 20 ms. The probe retries at 250 ms after unsuccessful responses. It checks every saved value and
 rebuild on its expected successor. The probe records additional rebuilds and the durable process
-generation and last exit category at each end of the run. Read times start at the kill request.
-Percentiles use nearest rank.
+generation and exit count at each end of the run, along with watchdog details, rebuild loop delay,
+and the durable log, shard, and membership clients' object-store counters. Read times start at the kill
+request. Percentiles use nearest rank. The loss probe requires zero extra rebuilds and zero durable process
+exits. At 2,000 databases it requires the first read within 40 seconds and the last within 100 seconds of
+detection. Set `COWORKERD_RECOVERY_MEASURE_BASELINE=1` to collect these observations on an earlier build.
 
 The pre-change measurement used `c5e8524` with a timing-only patch that logs the wait from requesting
 an epoch metadata permit until it is granted. Apply the patch in a separate baseline checkout. The
@@ -188,7 +191,7 @@ baseline="$PWD/../coworkerd-db-first-access-baseline"
 git worktree add --detach "$baseline" c5e8524
 git -C "$baseline" apply "$PWD/tests/cluster/database-epoch-gate-baseline.patch"
 (cd "$baseline" && bash scripts/build.sh && cmake --build build --target coworkerd-launcher)
-COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
+COWORKERD_RECOVERY_MEASURE_BASELINE=1 COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
   node tests/cluster/database-first-access.mjs "$kernel" loss 500 | tee baseline-loss-500.log
 COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
   node tests/cluster/database-first-access.mjs "$kernel" cold | tee baseline-cold.log

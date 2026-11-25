@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <set>
@@ -38,6 +39,7 @@ std::string shardEpochsPrefix(const std::string& namespaceId, uint32_t shard);  
 std::string shardEpochKey(const std::string& namespaceId, uint32_t shard, uint64_t epoch);
 std::string shardReleasedKey(const std::string& namespaceId, uint32_t shard, uint64_t epoch);
 std::string shardOwnerKey(const std::string& namespaceId, uint32_t shard);
+inline constexpr size_t MAX_RECOVERY_EPOCH_BYTES = 4096;
 
 // One ownership of a shard: who took it -- the node and its membership epoch --, when, why ("first", "timeout",
 // "released", "restart"), and who wrote it, the process's instance and a random value of the write (a create whose answer
@@ -143,6 +145,10 @@ public:
   uint64_t heldShardEpoch(const std::string& ns, uint32_t shard) const {
     auto it = held.find({ns, shard});return it == held.end() ? 0 : it->second.epoch;
   }
+  // The exact predecessor GET that led to acquiring this local ownership
+  // epoch. Neither the owner hint nor a route to another node can supply it.
+  std::shared_ptr<const ObjectResponse> heldPredecessor(const std::string& ns, uint32_t shard,
+      uint64_t heldEpoch, uint64_t sourceEpoch) const;
   size_t heldCount() const { return held.size(); }
   bool holds(const std::string& namespaceId, uint32_t shard) const { return held.contains({namespaceId, shard}); }
   // The state endpoint's section: the shards held, by namespace, the takeovers by reason, the releases, the refusals
@@ -154,6 +160,7 @@ private:
   struct Held {
     uint64_t epoch = 0, dataEpoch = 0, nodeEpoch = 0, acquiredAtUnixMs = 0;
     std::string reason;
+    std::shared_ptr<const ObjectResponse> predecessor;
   };
   struct Cached {
     ShardEpoch record;
@@ -166,6 +173,7 @@ private:
     std::optional<ShardEpoch> record;
     bool released = false, listed = false;
     std::string source;
+    std::shared_ptr<const ObjectResponse> evidence;
   };
   enum class Owner { ALIVE, DRAINING, GONE, SELF };
 
