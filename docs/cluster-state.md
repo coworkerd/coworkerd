@@ -436,9 +436,9 @@ of a 90,672-byte WAL took 0.250 ms.
   metadata requests per second, with a burst of four and two in flight. Shared member discovery and owner heartbeat
   reads alternate with shard epoch reads when both have work queued. This lets earlier recoveries reach the final
   holder round while other shards still load their epochs. Membership heartbeat writes use their own lane.
-  After replay, a bounded cut takes a publication permit before starting the snapshot upload and manifest update.
-  The node starts at most 64 cut publications per second, with a burst of four. This spreads the cold opens of
-  newly recovered databases across the durable process's health probes. The permit wait shares the replay slots.
+  After replay, a recovery that waited for evidence takes a publication permit, including when a returning holder
+  supplies a complete tail. The node starts at most 64 such publications per second, with a burst of four. This
+  spreads cold opens across the durable process's health probes. The permit wait shares the replay slots.
   A node admits at most four peer connection attempts concurrently. Ordinary rounds reuse healthy connections.
   A final round refreshes a matching cached connection once per target and shared wake tick. A transport failure
   or page timeout marks the matching connection generation stale for reuse. Replication and forwarding calls

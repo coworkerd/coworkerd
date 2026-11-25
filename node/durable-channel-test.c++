@@ -2117,7 +2117,8 @@ struct DurableLogChannelTest {
       until("first epoch read", [&] { return store.heldReads.contains(newEpoch); });
       check(1, 0);
       heldEpoch.fulfiller->fulfill();
-      KJ_REQUIRE(firstAccess.wait(io.waitScope).ready && log.recoveryMetadata.started() == 2);
+      KJ_REQUIRE(firstAccess.wait(io.waitScope).ready && log.recoveryMetadata.started() == 2 &&
+          log.waitingRecoveryPublication.started() == 0);
       check(0, 0);
     }
 
@@ -2158,6 +2159,15 @@ struct DurableLogChannelTest {
     cancel('4');
     check(0, 0);
     KJ_REQUIRE(log.rebuildMetadataBytes == 0 && log.backgroundRebuildMetadataBytes == 0);
+
+    // A returning owner can release a waiting recovery with a complete proof.
+    // Its publication takes the same permit as a bounded cut.
+    const auto publications = log.waitingRecoveryPublication.started();
+    auto returning = log.openObject(id('b'), false).eagerlyEvaluate(nullptr);
+    until("waiting for the returning owner", [&] { return ownerCalls == 3 && log.rebuildRuns.at(name('b'))->parkedAtMs != 0; });
+    owner.fulfiller->fulfill();
+    KJ_REQUIRE(returning.wait(io.waitScope).ready && log.waitingRecoveryPublication.started() == publications + 1);
+    check(0, 0);
 
     // Hold/cancel a real preparation after filling the background share with
     // queued jobs. A request can still enter the foreground queue.
@@ -2361,6 +2371,7 @@ struct DurableLogChannelTest {
     timer.timeoutAfter(5 * kj::SECONDS, kj::mv(bothBorrowed.promise)).wait(io.waitScope);
     KJ_REQUIRE(!failed && log.tailPages.active() == 1, "both objects borrow the same connection before its failure");
     KJ_REQUIRE(a.wait(io.waitScope).ready && b.wait(io.waitScope).ready);
+    KJ_REQUIRE(log.waitingRecoveryPublication.started() == 2, "each cut takes a publication permit");
     KJ_REQUIRE(failed && replacements == 1 && healthyPages == 1, "the queued object gets its own final page");
     const auto* image = log.objectOf(durableHostName(ns, healthy, 2));
     std::ifstream file(log.databasePath(*image, 0), std::ios::binary);

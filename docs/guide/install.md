@@ -642,8 +642,9 @@ Each survivor allows 16 waiting-recovery metadata requests per second, with a bu
 two in flight, and a 16 MiB rebuild metadata budget that reserves 4 MiB for foreground requests.
 Earlier runs saw a wave of cold database opens overwhelm the durable process's health probes. The
 watchdog killed processes whose probes went unanswered for 3 seconds, forcing some databases to rebuild
-again. Survivors now start at most 64 cut snapshot publications per second, with a burst of four, to
-spread the resulting cold opens. In the 2,000-database run, the first and median reads came 25.64 s
+again. Survivors start at most 64 publications per second for recoveries that waited for evidence, with
+a burst of four. At 2,000 databases, this reduced peak first rebuild completions in one second from 236
+to 68 and the longest observed probe from 2.58 s to 1.41 s. The first and median reads came 25.64 s
 and 38.87 s after detection. Both durable processes stayed up and all databases rebuilt once. The
 survivors issued 1,334 and 1,333 waiting-recovery metadata requests, with a peak of two in flight on each.
 Failure detection, the number of surviving nodes, object-store latency, and the size of snapshots and

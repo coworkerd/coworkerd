@@ -5460,16 +5460,16 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   dirtyCacheSizes.insert(objectName);
   lap(laps.files);
   const auto publishingStarted = monotonicTimeMs();
-  if (tails.cut) {
-    // Many missing owners can reach the cut in the same wake tick. Pace the
-    // start of their snapshot publications so the durable process gets time
-    // to answer probes between the resulting cold opens.
-    co_await cutPublication.acquire().ignoreResult();
+  if (!localProof) {
+    // A missing-owner deadline or a returning holder can release many waits
+    // together. In the 2,000-database fixture, 64 publication starts per second
+    // reduced peak first rebuild completions from 236 to 68 in one second and
+    // the longest observed probe from 2.58 s to 1.41 s (3 s watchdog).
+    co_await waitingRecoveryPublication.acquire().ignoreResult();
     check();
-    co_await forceRecoverySnapshot(objectName);
-  } else {
-    co_await publishRecovery(objectName, adopted);
   }
+  if (tails.cut) co_await forceRecoverySnapshot(objectName);
+  else co_await publishRecovery(objectName, adopted);
   check();
   lap(laps.publish);
   std::vector<RecoveryEvent> completed;
@@ -8228,7 +8228,7 @@ std::string DurableLog::recoverySchedulerJson(double now) const {
       << ",\"metadataRequests\":" << recoveryMetadata.started() << ",\"activeMetadataRequests\":" << recoveryMetadata.active()
       << ",\"peakMetadataRequests\":" << recoveryMetadata.peakActive()
       << ",\"reusedPredecessorEpochs\":" << reusedPredecessorEpochs
-      << ",\"cutPublicationsAdmitted\":" << cutPublication.started()
+      << ",\"waitingPublicationsAdmitted\":" << waitingRecoveryPublication.started()
       << ",\"activeTailTransfers\":" << tailPages.active() << ",\"peakTailTransfers\":" << tailPages.peakActive()
       << ",\"entries\":[";
   bool first = true;
