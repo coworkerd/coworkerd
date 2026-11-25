@@ -433,7 +433,12 @@ of a 90,672-byte WAL took 0.250 ms.
 
   The 25 s clock limits retries for absent evidence, not whether to ask a known holder. Every attempt, including
   one beginning after that clock expires, gives every known holder a turn. A node starts at most 16 waiting-recovery
-  metadata requests per second, with a burst of four and two in flight. Membership heartbeat writes use their own lane.
+  metadata requests per second, with a burst of four and two in flight. Shared member discovery and owner heartbeat
+  reads alternate with shard epoch reads when both have work queued. This lets earlier recoveries reach the final
+  holder round while other shards still load their epochs. Membership heartbeat writes use their own lane.
+  After replay, a recovery that waited for evidence takes a publication permit, including when a returning holder
+  supplies a complete tail. The node starts at most 64 such publications per second, with a burst of four. This
+  spreads cold opens across the durable process's health probes. The permit wait shares the replay slots.
   A node admits at most four peer connection attempts concurrently. Ordinary rounds reuse healthy connections.
   A final round refreshes a matching cached connection once per target and shared wake tick. A transport failure
   or page timeout marks the matching connection generation stale for reuse. Replication and forwarding calls
@@ -474,8 +479,10 @@ of a 90,672-byte WAL took 0.250 ms.
   needs a verified newer registration for a different instance before that margin. Missing dates, ambiguous
   instances and registration-only members without such a successor remain candidates; they can force a
   `tail-recovery-bounded` cut. Node-reported start times do not establish these windows.
-  An uncached chain of S source epochs needs at most S serial immutable authority GETs. Concurrent recoveries
-  of the same shard share those reads by full object-store key. Reads during the first shard epoch's
+  An uncached chain of S source epochs needs at most S serial immutable authority GETs. While a node holds its
+  acquired epoch, it can reuse the verified GET for its immediate predecessor, including the store's original
+  LastModified time. Concurrent recoveries of the same shard share the other reads by full object-store key.
+  Reads during the first shard epoch's
   preparation, trusted original-disk preparation and replay use a rebuild slot. Reads for waiting
   recovery use the waiting-recovery permit. Each read has
   max(`peerTimeoutMs`, `confirmTimeoutMs`) after admission (5 s by default). Failed reads can be retried.

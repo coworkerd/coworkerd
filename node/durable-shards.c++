@@ -503,6 +503,10 @@ kj::Promise<DurableShards::Latest> DurableShards::readLatest(std::string namespa
     writeHint(namespaceId, shard, *record, latest.released);
   }
   latest.record = std::move(record);
+  // The recovery reader uses the original GET's store timestamp and applies
+  // the same size limit to a reused answer as to a fresh GET.
+  if (object.bytes.size() <= MAX_RECOVERY_EPOCH_BYTES)
+    latest.evidence = std::make_shared<const ObjectResponse>(std::move(object));
   co_return latest;
 }
 
@@ -664,7 +668,8 @@ kj::Promise<ShardRoute> DurableShards::acquireNow(std::string namespaceId, uint3
             ? ShardRoute::refuse(503, "DO_OWNER_EXPIRED", "this node's membership expired while it took the shard")
             : ShardRoute::refuse(503, "DO_OWNER_DRAINING", "this node began draining while it took the shard");
       }
-      held[key] = {record.epoch, record.dataEpoch, record.nodeEpoch, record.acquiredAtUnixMs, reason};
+      held[key] = {record.epoch, record.dataEpoch, record.nodeEpoch, record.acquiredAtUnixMs, reason,
+        std::move(latest.evidence)};
       cache.erase(key);
       ++takeovers[reason];
       if (created.readBack) ++acquiredAfterReadBack;
@@ -754,6 +759,14 @@ void DurableShards::forwarded(bool designated, const std::string& outcome) {
 }
 
 void DurableShards::countRefusal(const std::string& code) { ++refusals[code]; }
+
+std::shared_ptr<const ObjectResponse> DurableShards::heldPredecessor(const std::string& ns, uint32_t shard,
+    uint64_t heldEpoch, uint64_t sourceEpoch) const {
+  auto found = held.find({ns, shard});
+  if (found == held.end() || found->second.epoch != heldEpoch || heldEpoch <= 1 || sourceEpoch != heldEpoch - 1)
+    return {};
+  return found->second.predecessor;
+}
 
 uint64_t DurableShards::knownShardEpoch(const std::string& namespaceId, uint32_t shard) const {
   const Key key{namespaceId, shard};
