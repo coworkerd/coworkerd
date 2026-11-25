@@ -97,7 +97,9 @@ Each client keeps a connection available and issues one call at a time. A window
 clients through one Worker. Eight databases each have a separate Worker and get 8 or 32 clients in total,
 divided equally. The benchmark allows 16 homes and gives each mailbox 64 events and 1 MiB to accommodate
 the offered concurrency. It raises the node placement limits to 512 root and 1,024 nested invocations
-to give requests time to retire after their HTTP replies. The one-Worker controls return the same small body either directly or through a no-op Durable
+and the process in-flight limit to 512 to give requests time to retire after their HTTP replies. The
+report counts warm-up failures separately and requires all timed requests and all warm-up inserts to
+succeed. The one-Worker controls return the same small body either directly or through a no-op Durable
 Object. A read selects a seeded primary-key row. An insert changes one row and waits for local WAL confirmation
 with zero configured remote peers. The driver verifies the confirmation counters and each affected table.
 
