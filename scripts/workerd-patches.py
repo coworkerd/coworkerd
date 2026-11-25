@@ -143,14 +143,14 @@ def allowed_path(name, path):
     rust_path = (path.startswith(("src/workerd/server/server/", "src/workerd/server/cli/")) and
                  path in RUST_PATHS.get(name, frozenset()))
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
-                          name == '0140-alarm-wall-limit.patch' and path in {
+                          name == '0160-alarm-wall-limit.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++'} or
-                          name == '0141-threaded-request-lease-drain.patch' and path in {
+                          name == '0161-threaded-request-lease-drain.patch' and path in {
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0142-alarm-limit-visibility.patch' and
+                          name == '0162-alarm-limit-visibility.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
