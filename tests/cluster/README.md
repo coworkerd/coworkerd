@@ -41,6 +41,16 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+To measure the transport cost of 10,000 idle, open HTTP requests across two execution nodes:
+
+```sh
+node tests/cluster/run.mjs "$kernel" live-request-lease-capacity
+```
+
+Run the capacity case explicitly on a Linux Docker host that can sustain 5,000 concurrent invocations on each
+execution node. It verifies both the forwarded and executing counts, then compares peer RPC messages per second
+and Linux main-thread CPU for each node before and during the held requests.
+
 To measure idle WebSocket memory on fresh clusters:
 
 ```sh
@@ -111,7 +121,12 @@ archive, Docker images and temporary volumes. These are observed values from the
 | Case | Product behavior whose regression fails the case |
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
-| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. An abandoned handshake releases its place when the Worker answers. Ordinary HTTP and another ingress keep serving. |
+| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. A FIN during a pending upgrade returns its place promptly. Ordinary HTTP and another ingress keep serving. |
+| `live-request-lease` | An HTTP client half-closes its write side and keeps the exchange open for over two minutes, then receives results from a remote Service Binding, a nested Durable Object and a retained RPC target. |
+| `disconnected-request-lease` | A reset before headers or during a response stream starts the same drain window. A background child call within that window succeeds and one after the cutoff cannot produce a confirmed write. |
+| `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
+| `actor-request-lease` | An object timer can make a call between events, and a later event can supply the lease for a callback scheduled by an earlier event. |
+| `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end an alarm at the same test-shortened wall limit and continue serving the object. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |

@@ -2990,7 +2990,8 @@ private:
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
-    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps());
+    auto opened = runtime.open(process, descriptor, version->definitionHash, slot ? slot->nativeProps : NativeProps(),
+        durable == nullptr && slot ? slot->requestLease : nullptr);
     // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
     // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(

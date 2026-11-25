@@ -146,6 +146,12 @@ def allowed_path(name, path):
                           name == '0140-alarm-wall-limit.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0141-threaded-request-lease-drain.patch' and path in {
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0142-alarm-limit-visibility.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',

@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 15:17:30 +0800
+Subject: [PATCH] End nested Worker background work with the ingress lease
+
+
+diff --git a/src/workerd/threaded/protocol.capnp b/src/workerd/threaded/protocol.capnp
+index be4772b1936089b2d8326fae2ecf5c859a5f2430..229c1b025400958b79aa3487ed5cd6a889992e1a 100644
+--- a/src/workerd/threaded/protocol.capnp
++++ b/src/workerd/threaded/protocol.capnp
+@@ -100,4 +100,10 @@ interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
+   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props)
+       -> (dispatcher :Worker.EventDispatcher);
+   socketControl @1 () -> (control :ThreadedSocketControl);
++  startLeasedEvent @2 (cfBlobJson :Text, coworkerdProps :Props, lease :NativeLeaseControl)
++      -> (dispatcher :Worker.EventDispatcher);
++}
++
++interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
++  whenEnded @0 () -> ();
+ }
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..9d001eafc0af2a944b0bb28b827b508cf7f029a1 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -1623,6 +1623,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
+   if (ended) drain.wait(waitScope);
+ }
+ 
++KJ_TEST("a nested Worker drain ends when the ingress lease ends") {
++  initializeV8();
++  kj::EventLoop loop;
++  kj::WaitScope waitScope(loop);
++  const auto start = kj::systemPreciseMonotonicClock().now();
++  kj::TimerImpl clock(start);
++  Timer timer(clock);
++  IsolateLimits isolateLimits(100, 32, kj::str("\"workerId\":\"a/nested\","), nullptr, newGroup());
++  Slot slot;
++  slot.limits = &isolateLimits;
++  Measurement measurement;
++  auto caller = kj::newPromiseAndFulfiller<void>();
++  measurement.requestLeaseEnded = caller.promise.fork();
++  RequestLimits limits(slot, measurement, timer, kj::str("\"workerId\":\"a/nested\","));
++  auto drain = limits.limitDrain();
++  clock.advanceTo(start + 5 * kj::SECONDS);
++  KJ_EXPECT(!drain.poll(waitScope));
++  caller.fulfiller->fulfill();
++  KJ_EXPECT(drain.poll(waitScope), "the nested invocation must not get a new 30-second drain");
++}
++
+ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
+   kj::EventLoop loop;
+   kj::WaitScope waitScope(loop);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index d4e25ce3a279612b199fe70dded87b1eb1576cc3..27b2c59658de3f9863f9ef70f766c5cd11c13828 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1424,8 +1424,16 @@ struct Measurement {
+   // An HTTP call's response end: its body sent to the end, or the client gone
+   // (Invocation::request). Without it the drain limit runs from its call.
+   kj::Maybe<kj::ForkedPromise<void>> responseEnded;
++  kj::Maybe<kj::ForkedPromise<void>> requestLeaseEnded;
+ };
+ 
++void watchRequestLease(Measurement &measurement, kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease) {
++  KJ_IF_SOME(control, lease) {
++    auto ended = control.whenEndedRequest().send().ignoreResult().catch_([](kj::Exception &&) {});
++    measurement.requestLeaseEnded = ended.attach(kj::mv(control)).fork();
++  }
++}
++
+ struct DurableEventCpu {
+   DurableEventCpu(kj::String identity, uint32_t memoryMiB)
+       : identity(kj::mv(identity)),
+@@ -1645,10 +1653,12 @@ struct RequestLimits final: LimitEnforcer {
+     auto deadline = [this]() {
+       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
+     };
+-    KJ_IF_SOME(ended, measurement.responseEnded) {
+-      return ended.addBranch().then(kj::mv(deadline));
++    auto wait = measurement.responseEnded.map([&](auto &ended) { return ended.addBranch().then(deadline); })
++        .orDefault([&]() { return deadline(); });
++    KJ_IF_SOME(ended, measurement.requestLeaseEnded) {
++      return kj::mv(wait).exclusiveJoin(ended.addBranch());
+     }
+-    return deadline();
++    return wait;
+   }
+   kj::Promise<void> limitScheduled() override {
+     return kj::NEVER_DONE;
+@@ -2256,11 +2266,12 @@ struct InvocationState: kj::Refcounted {
+ 
+ class Invocation final: public kj::HttpService {
+  public:
+-  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
++  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
++      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease)
+       : server(server),
+         state(state),
+         descriptor(kj::mv(descriptor)),
+-        props(kj::mv(props)) {}
++        props(kj::mv(props)), lease(kj::mv(lease)) {}
+   kj::Promise<void> request(kj::HttpMethod method,
+       kj::StringPtr url,
+       const kj::HttpHeaders &headers,
+@@ -2272,21 +2283,23 @@ class Invocation final: public kj::HttpService {
+   ThreadState &state;
+   kj::String descriptor;
+   Frankenvalue props;
++  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
+   bool used = false;
+ };
+ 
+ class Dispatcher final: public rpc::EventDispatcher::Server {
+  public:
+-  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
++  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
++      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease = kj::none)
+       : server(server),
+         state(state),
+         descriptor(kj::mv(descriptor)),
+-        props(kj::mv(props)) {}
++        props(kj::mv(props)), lease(kj::mv(lease)) {}
+   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+     KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
+     used = true;
+     context.initResults().setHttp(state.http.kjToCapnp(
+-        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props))));
++        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(lease))));
+     return kj::READY_NOW;
+   }
+   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
+@@ -2296,6 +2309,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
+   ThreadState &state;
+   kj::String descriptor;
+   Frankenvalue props;
++  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
+   bool used = false;
+ };
+ 
+@@ -2322,6 +2336,16 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+     return kj::READY_NOW;
+   }
+ 
++  kj::Promise<void> startLeasedEvent(StartLeasedEventContext context) override {
++    KJ_REQUIRE(!used, "one startEvent per connection");
++    used = true;
++    auto params = context.getParams();
++    KJ_REQUIRE(params.hasLease(), "a leased event needs its caller's authority");
++    context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
++        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()), params.getLease()));
++    return kj::READY_NOW;
++  }
++
+  private:
+   ThreadedServer &server;
+   ThreadState &state;
+@@ -6826,6 +6850,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+   }
+   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
+       std::move(preparation), std::move(tenant));
++  watchRequestLease(prepared.invocation->measurement, kj::mv(lease));
+   auto identity = invocationIdentity(*slot, input);
+   startBoundRpcSession(context.getResults(),
+       kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
+@@ -6970,6 +6995,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+       httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
+   auto &invocation = prepared.invocation;
+   auto &entry = prepared.entry;
++  watchRequestLease(invocation->measurement, kj::mv(lease));
+   kj::Maybe<kj::Exception> failure;
+   LimitedResponse checkedResponse(response, *invocation);
+   // workerd's request() returns once the response body is sent; a client that
