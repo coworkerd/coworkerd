@@ -5052,16 +5052,13 @@ kj::Promise<void> DurableLog::rebuild(std::string objectName, std::string reason
   failConflict("the recovery manifest kept changing during replay");
 }
 
-kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const std::string& objectName,
+kj::Promise<uint64_t> DurableLog::recoveryLowerBound(const ObjectIdentity& identity,
     const std::optional<ObjectManifest>& manifest, bool preparingLocally) {
   if (!manifest) co_return 0;
-  auto* object = objectOf(objectName);
-  KJ_REQUIRE(object != nullptr, "the recovery object disappeared before its lower-bound check");
-  const auto namespaceId = object->namespaceId;
-  const auto shard = object->shard;
-  const auto response = co_await readRecoveryEpoch(shardEpochKey(namespaceId, shard, manifest->shardEpoch), preparingLocally);
+  const auto response = co_await readSourceEpoch(identity, manifest->shardEpoch, preparingLocally);
   const auto epoch = parseShardEpoch(response->bytes);
-  requireStorage(epoch && epoch->epoch == manifest->shardEpoch && epoch->namespaceId == namespaceId && epoch->shard == shard,
+  requireStorage(epoch && epoch->epoch == manifest->shardEpoch &&
+      epoch->namespaceId == identity.namespaceId && epoch->shard == identity.shard,
       "the latest manifest's ownership origin is unavailable");
   co_return std::max(manifest->snapshotShardEpoch, epoch->dataEpoch);
 }
@@ -5250,9 +5247,9 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     preparedLocally = kj::mv(prepared.promise);
     localPreparation = kj::mv(prepared.fulfiller);
   }
-  auto collecting = fetchTails(ObjectIdentity{object->namespaceId, object->objectId, object->tenant,
-      object->dataEpoch, object->shardEpoch, object->shard},
-      manifest, tailStart, run, kj::mv(localPreparation)).eagerlyEvaluate(nullptr);
+  const ObjectIdentity identity{object->namespaceId, object->objectId, object->tenant,
+      object->dataEpoch, object->shardEpoch, object->shard};
+  auto collecting = fetchTails(identity, manifest, tailStart, run, kj::mv(localPreparation)).eagerlyEvaluate(nullptr);
   if (manifest) {
     if (manifest->shardEpoch > object->shardEpoch) {
       object->state = ObjectState::GONE;
@@ -5367,7 +5364,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   lap(laps.latest);
   object = objectOf(objectName);
   KJ_REQUIRE(object != nullptr, "an object being rebuilt is gone");
-  const auto lowerBound = co_await recoveryLowerBound(objectName, manifest, true);
+  const auto lowerBound = co_await recoveryLowerBound(identity, manifest, true);
   check();
   std::set<std::pair<uint64_t, uint64_t>> drop;
   uint64_t snapshotShardEpoch = 0;
@@ -5463,6 +5460,14 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   dirtyCacheSizes.insert(objectName);
   lap(laps.files);
   const auto publishingStarted = monotonicTimeMs();
+  if (!localProof) {
+    // A missing-owner deadline or a returning holder can release many waits
+    // together. In the 2,000-database fixture, 64 publication starts per second
+    // reduced peak first rebuild completions from 236 to 68 in one second and
+    // the longest observed probe from 2.58 s to 1.41 s (3 s watchdog).
+    co_await waitingRecoveryPublication.acquire().ignoreResult();
+    check();
+  }
   if (tails.cut) co_await forceRecoverySnapshot(objectName);
   else co_await publishRecovery(objectName, adopted);
   check();
@@ -5579,8 +5584,20 @@ void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& re
 // Collect each source epoch from its original owner and all known holder addresses.
 // Only the original process can prove completeness; otherwise publish a cut at the deadline.
 kj::Promise<ObjectResponse> DurableLog::readRecoveryMetadata(std::string key, uint32_t timeoutMs) {
-  auto permit = co_await recoveryMetadata.acquire();
+  auto permit = co_await recoveryMetadata.acquireCoordination();
   co_return co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, store->get(std::move(key)));
+}
+
+kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readSourceEpoch(const ObjectIdentity& identity,
+    uint64_t epoch, bool preparingLocally) {
+  if (predecessorEpochHook) {
+    auto response = predecessorEpochHook(identity.namespaceId, identity.shard, identity.shardEpoch, epoch);
+    if (response) {
+      ++reusedPredecessorEpochs;
+      return kj::mv(response);
+    }
+  }
+  return readRecoveryEpoch(shardEpochKey(identity.namespaceId, identity.shard, epoch), preparingLocally);
 }
 
 kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch(std::string key, bool preparingLocally) {
@@ -5603,13 +5620,11 @@ kj::Promise<std::shared_ptr<const ObjectResponse>> DurableLog::readRecoveryEpoch
       if (*freshUntil == 0) *freshUntil = monotonicTimeMs() + RECOVERY_WAKE_INTERVAL / kj::MILLISECONDS;
     });
     const auto limit = std::max(self.settings.peerTimeoutMs, self.settings.config.confirmTimeoutMs);
-    ObjectResponse result;
-    if (preparingLocally) {
-      result = co_await self.timer.timeoutAfter(limit * kj::MILLISECONDS, self.store->get(std::move(key)));
-    } else {
-      result = co_await self.readRecoveryMetadata(std::move(key), limit);
-    }
-    requireStorage(result.status == 200 && result.bytes.size() <= 4096, "a source shard epoch is unavailable");
+    kj::Own<RecoveryGate::Permit> permit;
+    if (!preparingLocally) permit = co_await self.recoveryMetadata.acquire();
+    auto result = co_await self.timer.timeoutAfter(limit * kj::MILLISECONDS, self.store->get(std::move(key)));
+    requireStorage(result.status == 200 && result.bytes.size() <= MAX_RECOVERY_EPOCH_BYTES,
+        "a source shard epoch is unavailable");
     *freshUntil = monotonicTimeMs() + 60000;
     co_return std::make_shared<const ObjectResponse>(std::move(result));
   };
@@ -5653,7 +5668,7 @@ kj::Promise<std::shared_ptr<const DurableLog::TailDiscovery>> DurableLog::discov
     ObjectListing listing;
     std::string token;
     do {
-      auto permit = co_await recoveryMetadata.acquire();
+      auto permit = co_await recoveryMetadata.acquireCoordination();
       auto page = co_await timer.timeoutAfter(budget * kj::MILLISECONDS, store->listPage(MEMBERS_PREFIX, 1000, token));
       if (++listing.pages == 1) listing.dateUnixMs = page.dateUnixMs;
       for (auto& entry : page.objects) listing.objects.push_back(std::move(entry));
@@ -5744,7 +5759,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
         "the object changed ownership during tail recovery");
   };
   if (!run.reserved) setRebuildPhase(run, RebuildPhase::TAILS);
-  const auto snapshotShardEpoch = co_await recoveryLowerBound(name, manifest, localPreparation.get() != nullptr);
+  const auto snapshotShardEpoch = co_await recoveryLowerBound(identity, manifest, localPreparation.get() != nullptr);
   checkIdentity();
   const auto deadline = startedMs + settings.tailWaitMs;
   const auto wanted = identity.namespaceId + "/" + identity.objectId;
@@ -5772,8 +5787,7 @@ kj::Promise<DurableLog::TailRecovery> DurableLog::fetchTails(
   std::set<uint64_t> visited;
   while (epoch && (!snapshotShardEpoch || epoch >= snapshotShardEpoch)) {
     KJ_REQUIRE(visited.insert(epoch).second, "a shard's previous-epoch chain cycles");
-    const auto response = co_await readRecoveryEpoch(shardEpochKey(identity.namespaceId, identity.shard, epoch),
-        localPreparation.get() != nullptr);
+    const auto response = co_await readSourceEpoch(identity, epoch, localPreparation.get() != nullptr);
     checkIdentity();
     auto record = parseShardEpoch(response->bytes);
     requireStorage(record && record->epoch == epoch && record->namespaceId == identity.namespaceId &&
@@ -8213,6 +8227,8 @@ std::string DurableLog::recoverySchedulerJson(double now) const {
       << ",\"foregroundReservedBytes\":" << rebuildMetadataLimit / 4 << ",\"metadataRefusals\":" << rebuildMetadataRefusals
       << ",\"metadataRequests\":" << recoveryMetadata.started() << ",\"activeMetadataRequests\":" << recoveryMetadata.active()
       << ",\"peakMetadataRequests\":" << recoveryMetadata.peakActive()
+      << ",\"reusedPredecessorEpochs\":" << reusedPredecessorEpochs
+      << ",\"waitingPublicationsAdmitted\":" << waitingRecoveryPublication.started()
       << ",\"activeTailTransfers\":" << tailPages.active() << ",\"peakTailTransfers\":" << tailPages.peakActive()
       << ",\"entries\":[";
   bool first = true;
