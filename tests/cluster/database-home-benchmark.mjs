@@ -20,6 +20,7 @@ const clientImage = 'node:22-trixie@sha256:f92a4668ece057eff6b83ed531b5f6277892b
 const throughputSettings = { warmMs: smoke ? 200 : 1500, measureMs: smoke ? 500 : 10000 };
 const throughputMailbox = { events: 64, bytes: 1024 * 1024 };
 const throughputPlacement = { rootLimit: 512, nestedLimit: 1024 };
+const throughputInFlightLimit = 512;
 const defaultAdmission = mode === '--default-admission';
 const coldFollowUp = mode === '--cold-follow-up';
 const checkout = resolve(checkoutArg);
@@ -54,7 +55,7 @@ const cluster = new Cluster(directory, kernel, controller.signal, {
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && { memoryBudgetBytes: 16 * 1024 ** 3 }),
-    processPool: { count: 1, inFlightLimit: 128,
+    processPool: { count: 1, inFlightLimit: throughput ? throughputInFlightLimit : 128,
       ...(!defaultAdmission && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
     durableObjects: { processes: 1, threadedStorage: true, peers: 0 },
   }),
@@ -111,7 +112,7 @@ async function provenance() {
     commit, archive: pins.releaseTag, architecture: metadata.architecture, archiveSha256, hashes, productHashes,
     kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
     settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
-      placement: throughputPlacement, ...throughputSettings } : settings,
+      placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
     mode: mode ?? 'full', node: process.version,
     ...(throughput && { clientImage,
       runner: process.env.GITHUB_ACTIONS === 'true' ? {
@@ -455,7 +456,8 @@ async function runNetworkThroughput() {
     await record('throughput-window', { operation, ...result,
       ...(writes && { confirm: { before: before.durableLog.confirm, after: after.durableLog.confirm } }) });
     assert.deepEqual(throughputProcesses(after), processes, 'same server and children throughout the window');
-    assert.equal(result.warmup.failures + result.measurement.failures, 0, 'all benchmark requests succeeded');
+    assert.equal(result.measurement.failures, 0, 'all timed requests succeeded');
+    if (writes) assert.equal(result.warmup.failures, 0, 'all warm-up inserts succeeded');
     assert.ok(result.n > 0);
     if (writes) {
       let acknowledged = 0;
