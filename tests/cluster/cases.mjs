@@ -697,7 +697,7 @@ async function durableTakeover(cluster, platformTenant) {
 
 async function threadedPlatformDefinition(cluster) {
   const tenants = await Promise.all(['platform-first', 'platform-second'].map(name => cluster.tenant(name)));
-  const classNames = ['Record', 'Probe'];
+  const classNames = ['Record', 'Probe', 'Echo'];
   const wrangler = {
     durable_objects: { bindings: classNames.map(name => ({ name: name.toUpperCase(), class_name: name })) },
     migrations: [{ tag: 'v1', new_sqlite_classes: classNames }],
@@ -706,8 +706,11 @@ async function threadedPlatformDefinition(cluster) {
     import { DurableObject } from 'cloudflare:workers';
     export class Record extends DurableObject { fetch() { return new Response('tenant Record ran', { status: 500 }); } }
     export class Probe extends DurableObject { fetch() { return new Response('tenant Probe ran', { status: 500 }); } }
+    export class Echo extends DurableObject { fetch() { return new Response('tenant Echo ran', { status: 500 }); } }
     export default { fetch(request, env) {
-      const probe = new URL(request.url).searchParams.get('probe');
+      const params = new URL(request.url).searchParams;
+      if (params.has('echo')) return env.ECHO.getByName('echo').fetch(request);
+      const probe = params.get('probe');
       return probe === null ? env.RECORD.getByName('takeover').fetch(request) : env.PROBE.getByName(probe).fetch(request);
     } };
   `;
@@ -719,6 +722,11 @@ async function threadedPlatformDefinition(cluster) {
     const entries = await Promise.all(cluster.nodes.map(async node => [node, await durableGeneration(cluster, node)]));
     for (const [, generation] of entries) assert.equal(generation.lifecycle.durableServer, 'threaded');
     return new Map(entries);
+  });
+  await eventually('the second class loads through the same definition', async () => {
+    const echo = json(await workerCall(cluster, ingress, tenants[0], 'object?echo'), 200, 'second platform class');
+    assert.equal(echo.service, 'echo');
+    assert.ok(cluster.nodes.includes(echo.build));
   });
 
   const observations = tenants.map(() => new Map());
@@ -2209,8 +2217,10 @@ export const durableGatedCases = {
   'durable-platform-definition': {
     test: threadedPlatformDefinition, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
-    platformFixture: ['platform-first/object', 'platform-second/object'].flatMap(worker =>
-      ['Record', 'Probe'].map(bindingClass => ({ worker, bindingClass, className: 'PlatformStore' }))),
+    platformFixture: ['platform-first/object', 'platform-second/object'].flatMap(worker => [
+      ...['Record', 'Probe'].map(bindingClass => ({ worker, bindingClass, className: 'PlatformStore' })),
+      { worker, bindingClass: 'Echo', className: 'PlatformEcho' },
+    ]),
   },
   'durable-threaded-fence': {
     test: durableThreadedFence, nodes: ['node-1', 'node-2', 'node-3'],
