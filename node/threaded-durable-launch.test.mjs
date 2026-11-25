@@ -243,15 +243,17 @@ function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hr
   }) + '\n';
 }
 
-async function waitForAdmission(path, waiting, homeSessions = 0) {
+async function waitForAdmission(path, waiting, homeSessions = 0, { running } = {}) {
   let state;
   const until = performance.now() + 2000;
   do {
     state = await readAdmission(path);
-    if (state.waiting === waiting && state.homeSessions === homeSessions) return state;
+    if (state.waiting === waiting && state.homeSessions === homeSessions &&
+        (running === undefined || state.running === running)) return state;
     await delay(20);
   } while (performance.now() < until);
-  assert.fail(`Admission counters did not reach ${waiting} waiting and ${homeSessions} home sessions: ${JSON.stringify(state)}`);
+  const expected = JSON.stringify({ waiting, homeSessions, running });
+  assert.fail(`Admission counters did not reach ${expected}: ${JSON.stringify(state)}`);
 }
 
 let child, exited;
@@ -1373,8 +1375,8 @@ try {
 
     if (httpIsolation) {
       for (let attempt = 0; attempt < 3; ++attempt) {
-        const before = await waitForAdmission(socketPath, 0);
-        assert.equal(before.running, 0);
+        // The HTTP response can arrive before its event finishes retiring.
+        const before = await waitForAdmission(socketPath, 0, 0, { running: 0 });
         let caller;
         const aborted = new Promise((resolve, reject) => {
           caller = get(`http://127.0.0.1:${port}/first?hold&cancelable`, response => {
@@ -1398,8 +1400,7 @@ try {
         // Aborting fetch alone may close only its write side, which still permits a response.
         caller.socket.resetAndDestroy();
         assert.equal((await aborted).code, 'ECONNRESET');
-        const drained = await waitForAdmission(socketPath, 0);
-        assert.equal(drained.running, 0);
+        const drained = await waitForAdmission(socketPath, 0, 0, { running: 0 });
         for (const field of ['reservedBytes', 'reservedDescriptors', 'residentRoots',
           'actorResets', 'isolateResets']) assert.equal(drained[field], before[field], field);
         assert.equal(await request('/first?aborts'), attempt + 1);
