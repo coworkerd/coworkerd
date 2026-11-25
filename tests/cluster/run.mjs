@@ -70,10 +70,12 @@ async function main(args) {
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
       delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts }] of gated) {
       const previousProduct = name === 'durable-threaded-database-placement' && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
+      const previousKernel = previousProduct && process.env.COWORKERD_CLUSTER_PREVIOUS_KERNEL;
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
         controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts,
         previousProduct: previousProduct ? resolve(previousProduct) : undefined,
+        previousKernel: previousKernel ? resolve(previousKernel) : undefined,
       });
     }
     console.log(`${regular.length + webSockets.length + gated.length} executed, ${failed} failed`);

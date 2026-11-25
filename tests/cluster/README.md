@@ -64,6 +64,8 @@ COWORKERD_CLUSTER_PREVIOUS_PRODUCT=/path/to/previous-checkout \
 ```
 
 The runner uses the older daemon and runtime on node 2 and records the SHA-256 of both node binaries.
+Set `COWORKERD_CLUSTER_PREVIOUS_KERNEL` to the older build's verified kernel directory when testing
+across a change to the node-to-kernel protocol.
 
 To measure idle WebSocket memory on fresh clusters:
 
