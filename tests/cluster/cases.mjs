@@ -320,9 +320,12 @@ async function threadedDatabasePlacement(cluster) {
   const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(advance, '180000');
   await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
-  await eventually('idle databases release both threaded roots', async () => {
+  await eventually('idle databases release both threaded roots and their copies', async () => {
     const idle = await durableGeneration(cluster, threaded);
+    assert.equal(idle.pid, process.pid);
+    assert.equal(idle.generation, process.generation);
     assert.equal(idle.lifecycle.durableAdmission.residentRoots, 0);
+    assert.equal(idle.lifecycle.durableAdmission.homes, 0);
   });
   for (const db of databases.get(threaded)) await read(db);
   await eventually('reopened databases retain two exclusive homes in the same generation', assertWarmCopies);
