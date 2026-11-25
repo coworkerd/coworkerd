@@ -228,6 +228,8 @@ try { await fetch("http://10.0.0.5/"); }
 catch (error) { error.message; }     // "EGRESS_DENIED: private-network"
 ```
 
+An attempted fetch that reaches the node's egress service and gets `EGRESS_DENIED` costs one subrequest.
+
 | `message` | Meaning | What to do |
 | --- | --- | --- |
 | `EGRESS_DENIED: cluster` | The destination is one of the cluster's own addresses: a node, a peer, object storage, the control plane (it announces its addresses to the nodes; others in `egress.clusterAddresses`), on any port | Cannot be allowed |

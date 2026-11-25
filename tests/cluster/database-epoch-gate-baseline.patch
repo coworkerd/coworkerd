@@ -1,0 +1,15 @@
+diff --git a/node/durable-log.c++ b/node/durable-log.c++
+index b46a39c..3366c0a 100644
+--- a/node/durable-log.c++
++++ b/node/durable-log.c++
+@@ -5578,6 +5578,10 @@ void DurableLog::noteLateTail(const std::string& objectName, const LogRecord& re
+ // Collect each source epoch from its original owner and all known holder addresses.
+ // Only the original process can prove completeness; otherwise publish a cut at the deadline.
+ kj::Promise<ObjectResponse> DurableLog::readRecoveryMetadata(std::string key, uint32_t timeoutMs) {
++  const auto queued = monotonicTimeMs();
+   auto permit = co_await recoveryMetadata.acquire();
++  if (key.starts_with("do/"))
++    log("measurement-epoch-gate", "\"key\":" + quote(key) + ",\"waitMs\":" +
++        std::to_string(monotonicTimeMs() - queued));
+   co_return co_await timer.timeoutAfter(timeoutMs * kj::MILLISECONDS, store->get(std::move(key)));
+ }

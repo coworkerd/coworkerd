@@ -17,10 +17,10 @@ index dd7b77dfa8ee69123ce699b9744e7ebfbf1185de..4c2a6ca7b72093d6b23a39f61e177832
  )
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 2dbc2aa71d9a34c9d35bd3b7f991a90537786a00..46e750c57dd969128b34ce501879a1006229ddc2 100644
+index 86bc682cb1d67e05d2b92ecb6a4c8162f2ec3e8a..a6a236dca3dd5126cd6eab8d0bd2d1f1b1f02c75 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1640,15 +1640,11 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1641,15 +1641,11 @@ struct RequestLimits final: LimitEnforcer {
      unsupported("analytics");
    }
    kj::Promise<void> limitDrain() override {

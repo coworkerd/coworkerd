@@ -68,8 +68,8 @@ interface InvocationBudgetLifetime {
 
 interface WorkerdBootstrap @0x878048cda334ade3 {
   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
-                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability)
-      -> (dispatcher :EventDispatcher);
+                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability, budgetTicket :UInt64)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
 }
 
 # Native ordinary-process loopback props. The wire type and method are private
@@ -150,8 +150,8 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability,
-                       lease :NativeLeaseControl)
-      -> (dispatcher :EventDispatcher);
+                       budgetTicket :UInt64, lease :NativeLeaseControl)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
   socketControl @1 () -> (control :ThreadedSocketControl);
 }
 

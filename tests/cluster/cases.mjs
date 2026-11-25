@@ -423,6 +423,22 @@ async function invocationBudgetLifetime(cluster) {
           return Response.json('scheduled');
         }
         if (action === 'result') return Response.json((await this.ctx.storage.get('result')) ?? null);
+        if (action === 'alarm-started') return Response.json(this.alarmDone !== undefined);
+        if (action === 'interleave') {
+          const result = await spend(this.env).finally(() => this.interleavedSpend());
+          await this.alarmDone;
+          return Response.json(result);
+        }
+        if (action === 'timer') {
+          const { invocationId, nodeId } = request.cf;
+          setTimeout(() => {
+            this.ctx.waitUntil(spend(this.env).then(
+              result => console.log('budget-timer:' + JSON.stringify({ ...result, invocationId })),
+              error => console.log('budget-timer:' + JSON.stringify({ unexpected: error.message, invocationId })),
+            ));
+          }, waitMs);
+          return Response.json({ invocationId, nodeId });
+        }
         if (action === 'start') {
           const first = await spend(this.env);
           const resumed = new Promise(resolve => { this.resumeBackground = resolve; });
@@ -435,9 +451,17 @@ async function invocationBudgetLifetime(cluster) {
         return Response.json(await this.background);
       }
       async alarm() {
-        await scheduler.wait(waitMs);
-        const result = await spend(this.env).catch(error => ({ unexpected: error.message }));
-        await this.ctx.storage.put('result', result);
+        const done = Promise.withResolvers();
+        const interleaved = Promise.withResolvers();
+        this.alarmDone = done.promise;
+        this.interleavedSpend = interleaved.resolve;
+        try {
+          await Promise.all([scheduler.wait(waitMs), interleaved.promise]);
+          const result = await spend(this.env).catch(error => ({ unexpected: error.message }));
+          await this.ctx.storage.put('result', result);
+        } finally {
+          done.resolve();
+        }
       }
     }
     export default { async fetch(request, env) {
@@ -451,7 +475,8 @@ async function invocationBudgetLifetime(cluster) {
         try { await fetch(origin); } catch (error) { extraFetch = error.message; }
         return Response.json({ first, extraFetch, invocationId: request.cf.invocationId, lateObject });
       }
-      const actor = action === 'schedule' || action === 'result' ? 'alarm' : 'background';
+      const actor = action === 'timer' ? 'timer' :
+        action === 'start' || action === 'resume' ? 'background' : 'alarm';
       return env.OBJECT.getByName(actor).fetch(request);
     } };
   `, { wrangler: { limits: { subrequests: 2 }, migrations: [{ tag: 'v1', new_sqlite_classes: ['BudgetLifetime'] }],
@@ -468,7 +493,14 @@ async function invocationBudgetLifetime(cluster) {
     if (checksD1) assert.match(value.extraQuery, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
   };
   assert.equal(await call('schedule'), 'scheduled');
-  const late = await call('late-fetch');
+  const timer = await call('timer');
+  assert.ok(timer.invocationId && cluster.nodes.includes(timer.nodeId));
+  await eventually('the alarm is waiting before the interleaved request', async () => {
+    assert.equal(await call('alarm-started'), true);
+  });
+  // Exhaust a newer request's allowance while the alarm is waiting, and keep it live until the alarm calls out.
+  const [late, interleaved] = await Promise.all([call('late-fetch'), call('interleave')]);
+  verify(interleaved);
   assert.deepEqual(late.lateObject, { status: 200, value: null });
   assert.equal(late.first, 'origin');
   assert.match(late.extraFetch, /^SUBREQUEST_BUDGET_EXHAUSTED:/);
@@ -480,6 +512,18 @@ async function invocationBudgetLifetime(cluster) {
     const result = await call('result');
     assert.ok(result);
     verify(result);
+  });
+  // Read the result out of band so the timer object receives no newer request.
+  const timerResult = await eventually('the timer logs its result after the HTTP preparation interval', async () => {
+    const { lines } = await cluster.api(`${tenant.path}/workers/budget-lifetime/logs`, { token: tenant.token });
+    const marker = lines.find(line => line.message?.startsWith('budget-timer:'));
+    assert.ok(marker);
+    return JSON.parse(marker.message.slice('budget-timer:'.length));
+  });
+  assert.equal(timerResult.invocationId, timer.invocationId);
+  verify(timerResult);
+  await eventually('the drained timer releases its budget on the owning node', async () => {
+    assert.ok((await cluster.state(timer.nodeId)).leases.every(lease => lease.invocationId !== timer.invocationId));
   });
   // The original event spends both subrequests. Its resumed callback uses the newer request's balance.
   verify(await call('start'));

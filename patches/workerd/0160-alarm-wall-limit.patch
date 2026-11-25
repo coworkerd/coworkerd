@@ -62,7 +62,7 @@ index 0000000000000000000000000000000000000000..b73bb25da064dfbe9d4bfb934cc40ef3
 +
 +}  // namespace workerd
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 35de0cf5fa454c85146d31388eec241fa7495d24..0628a1f333e53c5ef56baf35314c60992ed19c7e 100644
+index 07b2b49119784dc6a8d210fb3b3a72ea114f6e78..a0760cbdddb59298b737203d83e276666ffd10de 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -4,6 +4,7 @@
@@ -95,7 +95,7 @@ index e05a3275d2077123fecb09891f9578d2708c66b4..faed397abb8133b5dd652fc6cbcb6bd4
      "//src/workerd/server/factory:coworkerd-durable-cpu",
      "//src/workerd/server/factory:coworkerd-durable-placement",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 39de789e08ca274a53e810cecc72267da806eaa7..1c96ec1b3cf3d2fab4af2d7a37f11a68e4fef990 100644
+index a13cfcbf22db2f5c9ae47b3a15d7bda235afe636..a62edc9e3595a93bb6b1e96b75ec8fcb90956f97 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -24,6 +24,7 @@
@@ -106,7 +106,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..1c96ec1b3cf3d2fab4af2d7a37f11a68
  #include <workerd/server/factory/coworkerd-durable-admission.h>
  #include <workerd/server/factory/coworkerd-durable-cpu.h>
  #include <workerd/server/factory/coworkerd-durable-placement.h>
-@@ -1653,7 +1654,7 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1654,7 +1655,7 @@ struct RequestLimits final: LimitEnforcer {
      return kj::NEVER_DONE;
    }
    kj::Duration getAlarmLimit() override {
