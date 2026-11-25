@@ -184,9 +184,11 @@ async function sqlAtomicity(cluster) {
 
 async function createDatabaseHomes(cluster, tenant, counts) {
   const databases = new Map([...counts.keys()].map(node => [node, []]));
+  let revision = 0;
   for (let i = 0; i < 36 && [...counts].some(([node, count]) => databases.get(node).length < count); i++) {
     const path = `${tenant.path}/databases/db-${i}`;
-    const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    const { database, revision: createdAt } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    revision = Math.max(revision, createdAt);
     // The first access uses the shard's rendezvous owner. Check the resulting owner in the dispatch log below.
     const scores = cluster.nodes.map(node => [node, createHash('sha256')
       .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
@@ -196,6 +198,14 @@ async function createDatabaseHomes(cluster, tenant, counts) {
     if (selected && selected.length < counts.get(owner)) selected.push({ ...database, path, owner });
   }
   for (const [node, count] of counts) assert.equal(databases.get(node).length, count, `database placement on ${node}`);
+  assert.ok(revision > 0, 'database creation returns a catalog revision');
+  // Avoid opening a shard while its designated owner is still waiting for the namespace catalog.
+  await eventually('all peers have applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const state = await cluster.state(node);
+      assert.ok(Number(state.storage.appliedTenantsRevision) >= revision, `${node} has applied revision ${revision}`);
+    }));
+  });
   return databases;
 }
 
