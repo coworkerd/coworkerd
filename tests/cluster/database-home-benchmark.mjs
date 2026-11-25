@@ -19,6 +19,7 @@ const smoke = mode === '--smoke' || mode === '--throughput-smoke';
 const clientImage = 'node:22-trixie@sha256:f92a4668ece057eff6b83ed531b5f6277892b5c8fa8c1df4ea4ef470bf92b91e';
 const throughputSettings = { warmMs: smoke ? 200 : 1500, measureMs: smoke ? 500 : 10000 };
 const throughputMailbox = { events: 64, bytes: 1024 * 1024 };
+const throughputPlacement = { rootLimit: 512, nestedLimit: 1024 };
 const defaultAdmission = mode === '--default-admission';
 const coldFollowUp = mode === '--cold-follow-up';
 const checkout = resolve(checkoutArg);
@@ -48,6 +49,8 @@ const cluster = new Cluster(directory, kernel, controller.signal, {
   productRoot: checkout,
   configureNode: () => ({
     quarantineProcesses: 1,
+    // A completed HTTP reply can precede retirement of its invocation.
+    ...(throughput && { placement: throughputPlacement }),
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && { memoryBudgetBytes: 16 * 1024 ** 3 }),
@@ -107,7 +110,8 @@ async function provenance() {
   await record('provenance', {
     commit, archive: pins.releaseTag, architecture: metadata.architecture, archiveSha256, hashes, productHashes,
     kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
-    settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox, ...throughputSettings } : settings,
+    settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
+      placement: throughputPlacement, ...throughputSettings } : settings,
     mode: mode ?? 'full', node: process.version,
     ...(throughput && { clientImage,
       runner: process.env.GITHUB_ACTIONS === 'true' ? {
