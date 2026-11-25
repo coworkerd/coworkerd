@@ -4,16 +4,23 @@ import { appendFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promise
 import { arch, cpus, freemem, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
-const modes = ['--smoke', '--default-admission', '--cold-follow-up'];
+const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
     (mode !== undefined && !modes.includes(mode)) || extra.length) {
-  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <pinned-kernel-directory> <new-report.jsonl> [--smoke|--default-admission|--cold-follow-up]');
+  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <pinned-kernel-directory> <new-report.jsonl> [--smoke|--default-admission|--cold-follow-up|--throughput|--throughput-smoke]');
   process.exit(2);
 }
-const smoke = mode === '--smoke';
+const throughput = mode === '--throughput' || mode === '--throughput-smoke';
+const smoke = mode === '--smoke' || mode === '--throughput-smoke';
+const clientImage = 'node:22-trixie@sha256:f92a4668ece057eff6b83ed531b5f6277892b5c8fa8c1df4ea4ef470bf92b91e';
+const throughputSettings = { warmMs: smoke ? 200 : 1500, measureMs: smoke ? 500 : 10000 };
+const throughputMailbox = { events: 64, bytes: 1024 * 1024 };
+const throughputPlacement = { rootLimit: 512, nestedLimit: 1024 };
+const throughputInFlightLimit = 512;
 const defaultAdmission = mode === '--default-admission';
 const coldFollowUp = mode === '--cold-follow-up';
 const checkout = resolve(checkoutArg);
@@ -21,7 +28,7 @@ const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
 const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(checkout, 'build'));
 const settings = {
-  homes: smoke ? 16 : 520,
+  homes: smoke || throughput ? 16 : 520,
   density: smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
@@ -43,23 +50,26 @@ const cluster = new Cluster(directory, kernel, controller.signal, {
   productRoot: checkout,
   configureNode: () => ({
     quarantineProcesses: 1,
+    // A completed HTTP reply can precede retirement of its invocation.
+    ...(throughput && { placement: throughputPlacement }),
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && { memoryBudgetBytes: 16 * 1024 ** 3 }),
-    processPool: { count: 1, inFlightLimit: 128,
+    processPool: { count: 1, inFlightLimit: throughput ? throughputInFlightLimit : 128,
       ...(!defaultAdmission && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
     durableObjects: { processes: 1, threadedStorage: true, peers: 0 },
   }),
   nodeEnvironment: () => ({
     COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes),
-    // The normal cluster fixture also uses 32 so eight clients can queue at the same home.
-    COWORKERD_DO_TEST_MAILBOX_EVENTS: '32',
+    // Keep both mailbox limits above the offered concurrency and its routing bytes.
+    COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
   }),
 });
 const [owner] = cluster.nodes;
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databases = Array.from({ length: defaultAdmission ? settings.homes + 1 : settings.density.at(-1) },
+const databases = Array.from({ length: throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1) },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
 let nextId = 1;
 let child;
@@ -101,7 +111,15 @@ async function provenance() {
   await record('provenance', {
     commit, archive: pins.releaseTag, architecture: metadata.architecture, archiveSha256, hashes, productHashes,
     kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
-    settings, mode: mode ?? 'full', node: process.version,
+    settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
+      placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
+    mode: mode ?? 'full', node: process.version,
+    ...(throughput && { clientImage,
+      runner: process.env.GITHUB_ACTIONS === 'true' ? {
+        runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+        image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
+        instance: process.env.RUNNER_NAME,
+      } : null }),
     clientHost: { platform: platform(), arch: arch(), release: release(), model: cpus()[0].model,
       cpus: cpus().length, memoryBytes: totalmem() },
     docker: await cluster.command('docker', ['info', '--format',
@@ -130,7 +148,8 @@ async function workerSource() {
 
 async function setup() {
   const targets = [workload, ...databases];
-  const tenant = await cluster.tenant(tenantName, { workers: targets.length, durableObjectNamespaces: targets.length });
+  const tenant = await cluster.tenant(tenantName, { workers: targets.length,
+    durableObjectNamespaces: targets.length + Number(throughput) });
   if (native) {
     for (const name of targets) {
       await cluster.api(tenant.path + '/databases/' + name, { method: 'POST', token: tenant.token });
@@ -153,9 +172,14 @@ async function setup() {
     const durableObjects = native
       ? [{ binding: 'DB', className: '__coworkerdSqlDatabase', database: name }]
       : [{ binding: 'DB', className: 'BenchmarkDatabase' }];
+    const classes = native ? [] : ['BenchmarkDatabase'];
+    if (throughput && name === workload) {
+      durableObjects.push({ binding: 'NOOP', className: 'BenchmarkNoop' });
+      classes.push('BenchmarkNoop');
+    }
     workers.push({ workerId: name, activeVersion: 'v1', versions: [{ versionId: 'v1', format: 'v2',
       compatibilityDate: '2026-10-01', mainModule: 'index.js', contentHash, durableObjects,
-      ...(!native && { classes: { declared: ['BenchmarkDatabase'] } }) }] });
+      ...(classes.length > 0 && { classes: { declared: classes } }) }] });
     routes.push({ host: '*', pathPrefix: '/' + tenantName + '/' + name, workerId: name });
   }
   await writeFile(join(packageDir, 'manifest.json'),
@@ -384,6 +408,76 @@ async function runThroughput() {
   await record('confirmation', { acknowledgedRows: nextId, confirm: log.confirm });
 }
 
+function throughputProcesses(state) {
+  const snapshot = role => {
+    const entries = state.processes.entries.filter(entry => entry.processClass === role);
+    assert.equal(entries.length, 1, 'one ' + role + ' process on the node');
+    const { pid, processId, generation } = entries[0];
+    assert.ok(pid > 0);
+    return { pid, processId, generation };
+  };
+  assert.ok(state.server.pid > 0);
+  return { node: { pid: state.server.pid }, worker: snapshot('ordinary'), durable: snapshot('durable') };
+}
+
+async function runNetworkThroughput() {
+  const container = await cluster.compose(['ps', '-q', owner]);
+  assert.match(container, /^[0-9a-f]{12,64}$/);
+  const base = 'http://' + owner + ':8930/' + tenantName;
+  const source = fileURLToPath(new URL('./database-throughput-client.mjs', import.meta.url));
+  await cluster.command('docker', ['pull', clientImage], { timeout: 240000 });
+  const nodeCpuMax = await execOwner('if test -r /sys/fs/cgroup/cpu.max; then cat /sys/fs/cgroup/cpu.max; fi');
+  await seed([workload, ...databases]);
+  const rows = new Map([workload, ...databases].map(name => [name, 1]));
+  const cells = [];
+  for (const operation of ['worker-only', 'object-noop', 'read', 'insert']) {
+    for (const clients of [1, 8, 32]) cells.push({ operation, clients, targets: [workload] });
+    if (operation === 'read' || operation === 'insert') {
+      for (const clients of [8, 32]) cells.push({ operation, clients, targets: databases });
+    }
+  }
+
+  const processes = throughputProcesses(await cluster.state(owner));
+  assert.deepEqual(processes.durable, child);
+  const pids = Object.fromEntries(Object.entries(processes).map(([role, entry]) => [role, entry.pid]));
+  await record('throughput-processes', { processes, nodeCpuMax: nodeCpuMax || null });
+  for (const { operation, clients, targets } of cells) {
+    const ids = targets.map(name => rows.get(name));
+    const args = JSON.stringify({ operation, clients, targets, ids, ...throughputSettings, pids });
+    const writes = operation === 'insert';
+    const before = await cluster.state(owner);
+    assert.deepEqual(throughputProcesses(before), processes);
+    const result = JSON.parse(await cluster.command('docker', [
+      'run', '--rm', '--network', cluster.project + '_frontend', '--pid', 'container:' + container,
+      '--mount', 'type=bind,src=' + source + ',dst=/client.mjs,readonly',
+      clientImage, 'node', '/client.mjs', base, args,
+    ], { timeout: throughputSettings.measureMs + throughputSettings.warmMs + 45000 }));
+    const after = await cluster.state(owner);
+    await record('throughput-window', { operation, ...result,
+      ...(writes && { confirm: { before: before.durableLog.confirm, after: after.durableLog.confirm } }) });
+    assert.deepEqual(throughputProcesses(after), processes, 'same server and children throughout the window');
+    assert.equal(result.measurement.failures, 0, 'all timed requests succeeded');
+    if (writes) assert.equal(result.warmup.failures, 0, 'all warm-up inserts succeeded');
+    assert.ok(result.n > 0);
+    if (writes) {
+      let acknowledged = 0;
+      for (const [index, name] of targets.entries()) {
+        const inserted = result.warmup.completed[index] + result.measurement.completed[index];
+        acknowledged += inserted;
+        rows.set(name, rows.get(name) + inserted);
+        assert.deepEqual((await query(name, 'count')).body, [{ value: rows.get(name) }],
+          'every acknowledged row is present in ' + name);
+      }
+      assert.equal(after.durableLog.peers.want, 0);
+      assert.equal(after.durableLog.confirm.failures, 0);
+      assert.equal(after.durableLog.confirm.unconfirmed, 0);
+      const confirmations = after.durableLog.confirm.confirmations - before.durableLog.confirm.confirmations;
+      assert.ok(confirmations >= acknowledged, 'local WAL confirmed every acknowledged insert');
+      await record('throughput-confirmation', { clients, targets, acknowledged, confirmations });
+    }
+  }
+}
+
 async function memorySample() {
   const output = await execOwner("awk '/^(Rss|Pss):/ {print $2}' \"/proc/$1/smaps_rollup\"", child.pid);
   const [rssKiB, pssKiB] = output.split('\n').map(Number);
@@ -503,7 +597,9 @@ try {
   await cluster.start();
   await setup();
   await identify(kernelHash);
-  if (defaultAdmission) {
+  if (throughput) {
+    await runNetworkThroughput();
+  } else if (defaultAdmission) {
     await runDefaultAdmission(kernelHash);
   } else if (coldFollowUp) {
     await validateConfirmation();

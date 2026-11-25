@@ -12,6 +12,7 @@ eight-client read cells reached about 1,300 requests/s on both sides. Multiplyin
 the separate serial CPU measurements estimates 0.74 of a logical CPU in the Object durable child
 and 0.42 in the Native child. Both estimates are below one core. The records leave the shared
 limiting stage unresolved among host-to-VM forwarding, the caller Worker and the node. [#85](https://github.com/coworkerd/coworkerd/issues/85)
+The [Linux follow-up](database-throughput.md) splits out the CPU of each process and measures eight databases on the same node.
 
 | Operation | Clients | Object completions | Object /s | Native completions | Native /s | Native ÷ Object |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
