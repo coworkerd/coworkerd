@@ -22,7 +22,7 @@ export function canonical(value) {
 const supported = new Set(["$schema", "name", "main", "compatibility_date", "compatibility_flags", "vars", "services",
   "build", "base_dir", "rules", "no_bundle", "find_additional_modules", "preserve_file_names", "minify", "tsconfig",
   "jsx_factory", "jsx_fragment", "alias", "define", "keep_names", "upload_source_maps", "send_metrics", "assets",
-  "durable_objects", "migrations", "d1_databases"]);
+  "durable_objects", "migrations", "d1_databases", "limits"]);
 // Static assets: the directory, Cloudflare's not-found handling, the ASSETS binding (the Worker's own asset layer) and
 // run_worker_first (true, or Cloudflare's path rules); html_handling only at its default.
 const assetKeys = new Set(["directory", "html_handling", "not_found_handling", "binding", "run_worker_first"]);
@@ -76,6 +76,10 @@ export function unsupportedKeys(raw) {
     for (const key of Object.keys(binding)) if (!["binding", "service", "entrypoint"].includes(key)) found.push(`services[${index}].${key}`);
   }
   for (const key of Object.keys(raw.build ?? {})) if (!["command", "cwd", "watch_dir"].includes(key)) found.push(`build.${key}`);
+  if (raw.limits !== undefined && raw.limits !== null) {
+    if (typeof raw.limits !== "object" || Array.isArray(raw.limits)) found.push("limits");
+    else for (const key of Object.keys(raw.limits)) if (key !== "subrequests") found.push(`limits.${key}`);
+  }
   // Durable Objects: a namespace Binding names a class of this Worker; migrations declare, delete and rename classes.
   for (const key of Object.keys(raw.durable_objects ?? {})) if (key !== "bindings") found.push(`durable_objects.${key}`);
   // d1_databases: the Binding and the database it names (database_id is Cloudflare's account-scoped id; here a
@@ -106,7 +110,8 @@ export function classify(raw, { redirected = false } = {}) {
   for (const key of unsupportedKeys(raw)) {
     const service = /^services\[(\d+)\]\.(.+)$/.exec(key), build = /^build\.(.+)$/.exec(key), asset = /^assets\.(.+)$/.exec(key);
     // Durable Object keys outside the supported shape are refused whatever their value.
-    if (key.startsWith("durable_objects.") || key.startsWith("migrations[") || key.startsWith("d1_databases[")) { rejected.push(key); continue; }
+    if (key.startsWith("durable_objects.") || key.startsWith("migrations[") || key.startsWith("d1_databases[") ||
+        key === "limits" || key.startsWith("limits.")) { rejected.push(key); continue; }
     const topLevel = !service && !build && !asset;
     const value = service ? raw.services[Number(service[1])][service[2]] : build ? raw.build[build[1]] : asset ? raw.assets[asset[1]] : raw[key];
     const reason = topLevel && Object.hasOwn(platform, key) ? ["platform", platform[key]]
@@ -302,11 +307,14 @@ export async function adapt({ config: userConfigPath, output, workerId, versionI
   const projectDir = dirname(resolve(userConfigPath));
   const redirected = redirect(projectDir);
   const configPath = redirected ? redirected.target : resolve(userConfigPath);
-  const config = unstable_readConfig({ config: configPath });
   const { rawConfig } = experimental_readRawConfig({ config: configPath });
   const { rejected, ignored } = classify(rawConfig, { redirected: !!redirected });
   for (const item of ignored) onIgnored(item);
   if (rejected.length) throw new Error(`Unsupported Wrangler configuration: ${rejected.join(", ")}`);
+  const subrequests = rawConfig.limits?.subrequests;
+  if (subrequests !== undefined && (!Number.isInteger(subrequests) || subrequests < 1 || subrequests > 10_000_000))
+    throw new Error("limits.subrequests must be a whole number between 1 and 10,000,000");
+  const config = unstable_readConfig({ config: configPath });
   // A site of static assets alone has no main module.
   const assetsConfig = config.assets;
   if ((!config.main && !assetsConfig) || !config.compatibility_date) throw new Error("Worker main and compatibility_date are required");
@@ -385,6 +393,7 @@ export async function adapt({ config: userConfigPath, output, workerId, versionI
       ({ name, type: typeof value === "string" ? "text" : "json", value: typeof value === "string" ? value : canonical(value) }));
     const version = { versionId, format: "v2", compatibilityDate: config.compatibility_date,
       compatibilityFlags: config.compatibility_flags ?? [], mainModule, contentHash: sha256(manifestBytes), variables,
+      ...(subrequests !== undefined ? { limits: { subrequests } } : {}),
       ...(secretNames.length ? { secrets: secretNames } : {}),
       ...(durable ? durable : {}),
       bindings: [...(config.services ?? []).map(s => ({ name: s.binding, workerId: s.service, entrypoint: s.entrypoint ?? "default" })),

@@ -401,11 +401,32 @@ void treeLease() {
 }
 
 void budget() {
-  auto child = childBudget(8, 3, false);
-  KJ_REQUIRE(child.grant == 3 && child.charged == 4 && child.remaining == 4);
-  KJ_REQUIRE(childBudget(1, 3, false).remaining == 0);
-  auto naive = childBudget(8, 3, true);
-  KJ_REQUIRE(naive.grant == 8 && naive.charged == 0 && naive.remaining == 8);
+  InvocationBudget root(DEFAULT_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  for (unsigned call = 0; call < 100; ++call) {
+    KJ_REQUIRE(root.debit(false) == BudgetDebit::charged);
+  }
+  InvocationBudget child(2, DEFAULT_D1_QUERY_LIMIT);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::charged);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::charged);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::subrequestsExhausted);
+  KJ_REQUIRE(child.remaining == 0 && child.d1Remaining == 1'000);
+  KJ_REQUIRE(root.remaining == 9'900 && root.d1Remaining == 1'000);
+
+  InvocationBudget wide(MAX_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  KJ_REQUIRE(wide.subrequestLimit == 10'000'000);
+  KJ_REQUIRE(wide.debit(false) == BudgetDebit::charged && wide.remaining == 9'999'999);
+
+  InvocationBudget database(3, 1);
+  KJ_REQUIRE(database.debit(true) == BudgetDebit::charged);
+  KJ_REQUIRE(database.remaining == 2 && database.d1Remaining == 0);
+  KJ_REQUIRE(database.debit(true) == BudgetDebit::d1Exhausted && database.remaining == 2);
+  KJ_REQUIRE(child.debit(true) == BudgetDebit::subrequestsExhausted && child.d1Remaining == 1'000);
+
+  InvocationBudget socket(2, 50);
+  KJ_REQUIRE(socket.debit(true) == BudgetDebit::charged);
+  KJ_REQUIRE(socket.debit(false) == BudgetDebit::charged);
+  socket.refill();
+  KJ_REQUIRE(socket.remaining == 2 && socket.d1Remaining == 50);
 }
 void identity() {
   KJ_REQUIRE(invocationName("n1", "epoch-9", "-tree-", 12) == "n1.epoch-9-tree-12");

@@ -26,16 +26,21 @@ std::string tenantOf(const std::string& fullName);      // "" when the value is 
 std::string workerNameOf(const std::string& fullName);  // the part after the tenant, else the value itself
 std::string workerFullId(const std::string& tenant, const std::string& worker);
 
-// A Worker's own CPU and memory limits (the active pointer's `limits`); 0 means unset.
+inline constexpr uint32_t DEFAULT_SUBREQUEST_LIMIT = 10'000;
+inline constexpr uint32_t MAX_SUBREQUEST_LIMIT = 10'000'000;
+inline constexpr uint32_t DEFAULT_D1_QUERY_LIMIT = 1'000;
+
+// A Worker's own CPU and memory limits or a tenant's defaults. Zero means unset.
 struct WorkerLimits {
   uint32_t cpuMs = 0, memoryMiB = 0;
-  bool empty() const { return !cpuMs && !memoryMiB; }
+  uint32_t subrequests = 0, d1Queries = 0;
+  bool empty() const { return !cpuMs && !memoryMiB && !subrequests && !d1Queries; }
   bool operator==(const WorkerLimits&) const = default;
 };
-// {"cpuMs":..,"memoryMiB":..}, the set fields only ("{}" when none).
+// Serialize the set fields only ("{}" when none).
 std::string workerLimitsJson(const WorkerLimits& limits);
-// The fields of a JSON object: cpuMs and memoryMiB, positive integers (or null: unset). Throws with the field's name.
-WorkerLimits readWorkerLimits(json::Json::Reader object);
+// Positive integers (or null: unset). Invocation defaults can only be set by the tenant administrator.
+WorkerLimits readWorkerLimits(json::Json::Reader object, bool tenantDefaults = false);
 
 // A tenant's quotas. The control plane refuses what would exceed one (QUOTA_EXCEEDED, the reason names it); the logs'
 // two are enforced by the nodes; the Worker limits' ceilings bound what a Worker may set.

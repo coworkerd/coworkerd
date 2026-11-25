@@ -171,13 +171,15 @@ std::pair<int, int> eventPipe() {
   fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
   return {raised(fds[0]), raised(fds[1])};
 }
-// The workerd I/O provider wraps sockets, so its one-way parent pipe uses a UNIX socket pair.
-std::pair<int, int> parentPipe() {
+// Threaded durable generations return budget releases over their existing parent liveness socket.
+std::pair<int, int> parentPipe(bool returnsBudgets) {
   int fds[2];
   KJ_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "cannot create the parent pipe");
   closeOnExec(fds[0]); closeOnExec(fds[1]);
-  KJ_REQUIRE(shutdown(fds[1], SHUT_RD) == 0 && shutdown(fds[0], SHUT_WR) == 0,
-      "cannot make the parent pipe one-way");
+  if (!returnsBudgets) {
+    KJ_REQUIRE(shutdown(fds[1], SHUT_RD) == 0 && shutdown(fds[0], SHUT_WR) == 0,
+        "cannot make the parent pipe one-way");
+  }
   return {raised(fds[0]), raised(fds[1])};
 }
 // Anonymous shared memory: a memfd on Linux, an unlinked POSIX shared memory object elsewhere.
@@ -279,6 +281,12 @@ std::string hex(const unsigned char* bytes, unsigned int length) {
   for (unsigned int i = 0; i < length; ++i) out << std::hex << std::setw(2) << std::setfill('0') << int(bytes[i]);
   return out.str();
 }
+struct DurableBudgetRegistry {
+  uint64_t nextTicket = 1;
+  bool connected = true;
+  std::map<uint64_t, capnp::Capability::Client> tokens;
+};
+
 class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
     public std::enable_shared_from_this<RuntimeConnection> {
 public:
@@ -287,6 +295,7 @@ public:
   bool threadedDurable = false;
   uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
+  std::shared_ptr<DurableBudgetRegistry> durableBudgets;
   kj::Timer* timer = nullptr;
   static constexpr size_t IDLE_CONNECTIONS = 32;
   std::vector<kj::Own<kj::AsyncIoStream>> idle;
@@ -300,7 +309,8 @@ public:
     if (!filling && !disconnected) tasks.add(fill());
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
-      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+      std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
+      std::function<void()> onDispatched,
       std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
@@ -309,16 +319,19 @@ public:
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
-      std::function<void()> onDispatched, std::function<void()> onCapacityRejected) {
+      kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
+      std::function<void()> onCapacityRejected) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))), kj::mv(ready.promise)};
+          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller))),
+          kj::mv(ready.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
     onDispatched();
     auto request = bootstrap.startEventRequest();
     request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+    KJ_IF_SOME(token, budgetLifetime) { request.setBudgetLifetime(kj::mv(token)); }
     auto response = request.send();
     return {response.getDispatcher(), response.ignoreResult()};
   }
@@ -339,8 +352,20 @@ private:
   std::shared_ptr<RuntimeConnection> connection;
 };
 
+// An ordinary invocation's RPC export keeps its connection alive through its existing drain.
+// Durable objects report drain independently over the generation's parent socket.
+class ThreadedBudgetLifetime final: public v1::rpc::InvocationBudgetLifetime::Server {
+public:
+  ThreadedBudgetLifetime(std::shared_ptr<RuntimeConnection> connection, capnp::Capability::Client token)
+      : connection(std::move(connection)), token(kj::mv(token)) {}
+private:
+  std::shared_ptr<RuntimeConnection> connection;
+  capnp::Capability::Client token;
+};
+
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
-    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, std::function<void()> onDispatched,
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
+    std::function<void()> onDispatched,
     std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
@@ -406,23 +431,50 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
+    capnp::Capability::Client budgetToken = nullptr;
+    uint64_t budgetTicket = 0;
+    auto cancelBudget = kj::defer([&] {
+      if (budgetTicket != 0) durableBudgets->tokens.erase(budgetTicket);
+    });
+    KJ_IF_SOME(token, budgetLifetime) {
+      if (threadedDurable) {
+        KJ_REQUIRE(durableBudgets != nullptr && durableBudgets->connected, "durable budget channel disconnected");
+        KJ_REQUIRE(durableBudgets->nextTicket != 0, "durable budget ticket overflow");
+        budgetTicket = durableBudgets->nextTicket++;
+        KJ_ASSERT(durableBudgets->tokens.emplace(budgetTicket, kj::mv(token)).second);
+      } else {
+        budgetToken = kj::heap<ThreadedBudgetLifetime>(connection, kj::mv(token));
+      }
+    }
     v1::rpc::EventDispatcher::Client dispatcher = nullptr;
     if (nativeProps) {
       auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
       request.setCfBlobJson(descriptor);
       request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+      request.setBudgetLifetime(kj::mv(budgetToken));
+      request.setBudgetTicket(budgetTicket);
       auto response = request.send();
-      if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
-      else dispatcher = response.getDispatcher();
+      if (threadedDurable) {
+        auto result = co_await kj::mv(response);
+        KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
+        dispatcher = result.getDispatcher();
+      } else dispatcher = response.getDispatcher();
     } else {
       auto request = connection->bootstrap.startEventRequest();
       request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
+      request.setBudgetLifetime(kj::mv(budgetToken));
+      request.setBudgetTicket(budgetTicket);
       auto response = request.send();
-      if (threadedDurable) dispatcher = (co_await kj::mv(response)).getDispatcher();
-      else dispatcher = response.getDispatcher();
+      if (threadedDurable) {
+        auto result = co_await kj::mv(response);
+        KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
+        dispatcher = result.getDispatcher();
+      } else dispatcher = response.getDispatcher();
     }
+    auto result = capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
     if (threadedDurable) ready->fulfill();
-    co_return capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
+    cancelBudget.cancel();
+    co_return result;
   } catch (const kj::Exception& error) {
     if (threadedDurable && ready->isWaiting()) ready->reject(error.clone());
     throw;
@@ -972,8 +1024,9 @@ struct ProcessGeneration {
   // Its listening socket in the run directory: <slot>-<generation>.sock.
   std::string socketName, socketPath;
   pid_t pid = 0;
-  // Only this node holds this generation's parent-liveness write end.
+  // Only this node holds this generation's parent-liveness socket.
   int parentWrite = -1;
+  std::shared_ptr<DurableBudgetRegistry> durableBudgets;
   std::string state = "starting", lastReason;
   // Rotation: spawned as a slot's next generation; switched away from (takes no new calls);
   // closing (connections closed, SIGTERM sent); and whether the exit was the rotation's own doing.
@@ -2461,7 +2514,9 @@ public:
       KJ_REQUIRE(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600) == 0);
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) == 0);
     }
-    auto parent = parentPipe();
+    const bool returnsBudgets = p->threaded && p->durable;
+    auto parent = parentPipe(returnsBudgets);
+    if (returnsBudgets) p->durableBudgets = std::make_shared<DurableBudgetRegistry>();
     const int parentRead = parent.first;
     p->parentWrite = parent.second;
     auto closeParentRead = kj::defer([parentRead] { ::close(parentRead); });
@@ -2649,6 +2704,7 @@ public:
     }
     event(*p, "spawn", rotation ? "rotation" : "");
     tasks.add(watchEvents(p));
+    if (p->durableBudgets) tasks.add(watchDurableBudgets(p));
 #ifdef __linux__
     // The launcher's records are read as they arrive, not only at readiness: in the observe mode its first
     // record carries the notification listener, and until this Server holds it a call outside the
@@ -2734,6 +2790,53 @@ public:
       p->drainEvents();
     }
   }
+  kj::Promise<void> watchDurableBudgets(std::shared_ptr<ProcessGeneration> p) {
+    auto& registry = *p->durableBudgets;
+    KJ_DEFER({ registry.connected = false; registry.tokens.clear(); });
+    kj::UnixEventPort::FdObserver observer(eventPort, p->parentWrite, kj::UnixEventPort::FdObserver::OBSERVE_READ);
+    const char* testEofTrigger = p->durableTestStorage ? std::getenv("COWORKERD_DURABLE_BUDGET_EOF_FOR_TEST") : nullptr;
+    std::array<char, 128 * sizeof(uint64_t)> bytes;
+    size_t partial = 0;
+    for (;;) {
+      const auto received = recv(p->parentWrite, bytes.data() + partial, bytes.size() - partial, MSG_DONTWAIT);
+      if (received == 0) break;
+      if (received < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          co_await observer.whenBecomesReadable();
+          // One-shot receive EOF on a live child in the disposable-storage restart fixture.
+          if (testEofTrigger && ::unlink(testEofTrigger) == 0) {
+            KJ_SYSCALL(::shutdown(p->parentWrite, SHUT_RD));
+          }
+          continue;
+        }
+        KJ_LOG(WARNING, "cannot read a durable budget release", p->id.c_str(), p->generation, strerror(errno));
+        break;
+      }
+      const size_t available = partial + received;
+      size_t consumed = 0;
+      while (available - consumed >= sizeof(uint64_t)) {
+        uint64_t ticket;
+        std::memcpy(&ticket, bytes.data() + consumed, sizeof(ticket));
+        registry.tokens.erase(ticket);
+        consumed += sizeof(ticket);
+      }
+      partial = available - consumed;
+      std::memmove(bytes.data(), bytes.data() + consumed, partial);
+      // A burst of releases may keep the socket continuously readable.
+      co_await provider.getTimer().afterDelay(1 * kj::MICROSECONDS);
+    }
+    registry.connected = false;
+    registry.tokens.clear();
+    if (p->pid > 0 && !p->closing && !p->plannedExit && !closingAll) {
+      // Normal child exits also close this socket. Give waitpid a chance to record the actual exit.
+      co_await provider.getTimer().afterDelay(20 * kj::MILLISECONDS);
+      refresh();
+      if (!p->closing && !p->plannedExit && !closingAll) {
+        killProcess(*p, "durable budget channel disconnected", 0);
+      }
+    }
+  }
   kj::Promise<void> initialize(std::shared_ptr<ProcessGeneration> p) {
     const auto until = mono() + 15000;
     auto text = "unix:" + p->socketPath;
@@ -2793,6 +2896,7 @@ public:
         if (p->threaded) {
           r->threaded = true;
           r->threadedDurable = p->durable;
+          r->durableBudgets = p->durableBudgets;
           r->threadedProtocol = p->threadedProtocol;
           r->deferredDeletes = &tasks;
           co_await r->fill();
@@ -3233,7 +3337,8 @@ public:
     });
   }
   bool admitted(const ProcessGeneration& p) const {
-    return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected && p.inFlight < config.inFlightLimit;
+    return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
+        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimit;
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
@@ -4121,7 +4226,7 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
   return result;
 }
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
-    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps) {
+    std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat.touch(hash, mono());
@@ -4134,7 +4239,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
   }
   // From this send onward, a lost connection or a dead child is never retried.
-  auto result = p->runtime->open(descriptor, std::move(nativeProps), [call] { call->dispatched = true; }, [call] {
+  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call] {
     call->capacityRejected = true;
     if (call->onCapacityRejected) call->onCapacityRejected();
   });
