@@ -249,6 +249,189 @@ Latency reductions are Object minus Native, with percentage relative to Object.
 - **Density threshold unmet.** The Object slope exceeded Native by 2.258 MiB per database.
   The paced Object minus Native cold-new p50 was +2.176 ms. Both 4 MiB and 20 ms are required.
 
+## Idle window for exclusive platform database copies
+
+Release the exclusive isolate copy when its database tree retires, about 10 seconds after the last
+request finishes on a quiet database. On the #90 baseline, keeping empty copies for the common
+five-minute grace period exhausted the process admission budget during a serial scan of distinct
+databases. Releasing a database copy with its tree gives new databases access to that budget.
+
+Reopening SQLite in a retained copy saved 9.50 ms at p50 and 12.80 ms at p99 compared with reopening
+after full copy release. Closing all 64 already-empty copies recovered 24.73 MiB of RSS at the first
+post-release sample, or 0.39 MiB per database. The retained copy avoids module and isolate setup for
+reuse during the grace period. The policy pays the full reopen cost after idle retirement to
+prevent empty copies from blocking new opens. These latency results cover one small,
+already-confirmed database per isolate and one serial caller. The frequency of revisits to idle
+databases in production remains unmeasured.
+
+### Measurement
+
+The benchmark ran on November 26, 2026, from 02:22:01 to 02:25:23 (UTC+8) on an Apple M4 Mac with
+10 logical CPUs and 24 GiB RAM, on battery power. The Linux ARM64 Docker Desktop VM had 10 vCPUs
+and 7.75 GiB RAM. Docker Engine was 29.5.3 and the Node.js 26.2.0 client used loopback HTTP. The
+phase samples showed 5.70–5.89 GiB of guest RAM available and 7.4% aggregate guest CPU busy time.
+The two other running containers were idle at preflight. The run reused the daemons and the hosted
+ARM64 artifact from [#90](https://github.com/coworkerd/coworkerd/pull/90).
+
+- Product source `de8d51814b1b558447ee4ece6c3f8be0342a6da0`, built for ARM64 Linux with Clang 19
+  in Release mode. Only the cluster test executable exposes the threaded database mapping.
+- Kernel artifact from [run 45638096483, attempt 1](https://github.com/coworkerd/coworkerd/actions/runs/45638096483/attempts/1).
+  Archive SHA-256 `d3ed82446c09aa602387a2f033f2a387fee5da5497598b66f8816b4d5f985de2`.
+  The ordered patch series SHA-256 was `2db2b5d643b55d5a493509cc192748c12dbea5c15b6a955f2d4616c49a1fd64d`.
+  The patched workerd tree was `f5c0caf5d5023a29e792f4a4fbe649905adcf630`.
+- One node and one threaded durable child, with 80 test home threads, a 1.55 GiB child admission
+  budget and local WAL confirmation. The driver created 64 databases and confirmed 128 writes
+  to make a small SQLite table with one row in each database. It rotated the child once before
+  sampling. All rows below use the same durable PID and generation after that rotation.
+- Five idle samples from `/proc/PID/smaps_rollup` per row, with medians in MiB. The driver checked
+  root and home counts, zero in-flight work, and zero pressure retirements around each window.
+  The 1–64 slope excludes the first database's process warm-up. For comparison, #84's stand-in
+  measured a 0–500 RSS slope of 2.49 MiB per open database.
+
+| Sample | Resident roots | Loaded homes | RSS (MiB) | PSS (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| After child rotation | 0 | 0 | 27.60 | 17.50 |
+| First database open | 1 | 1 | 59.75 | 37.15 |
+| Open cohort | 32 | 32 | 145.05 | 122.45 |
+| Open cohort | 64 | 64 | 232.47 | 209.87 |
+| Trees retired, copies retained | 0 | 64 | 230.54 | 207.94 |
+| Copies released, first wave | 0 | 0 | 205.80 | 183.11 |
+| Copies released, final wave | 0 | 0 | 215.04 | 192.34 |
+
+The marginal cost from 1 to 64 open databases was 2.74 MiB per database for both RSS and PSS.
+The 0–64 slopes were 3.20 MiB RSS and 3.01 MiB PSS. The process returned only 0.39 MiB of the
+2.74 MiB per database at the first release. Its RSS still reflected most of the high-water footprint
+after all copies were gone. Copy release returns the isolate's admission reservation while the
+operating system's resident-memory observation can stay elevated.
+
+The timed profile set a 12-second copy grace period to reach both idle states repeatedly. Across
+four rounds, it waited first for zero trees with 64 loaded copies and then for zero trees and
+zero loaded copies. The benchmark warmed the ordinary calling Workers with a request that did
+no SQL before each serial sweep. For each database it timed the first primary-key read and
+the immediate repeat, from starting host HTTP to reading the full response past the real D1
+binding parse. It checked the saved row on every reply. Each sweep added exactly 64 SQLite home
+opens and zero rebuilds. Both conditions include 256 pairs. Percentiles use nearest rank.
+
+| Read path | First read p50 / p99 (ms) | Immediate repeat p50 / p99 (ms) | Paired first-minus-repeat p50 / p99 (ms) |
+| --- | ---: | ---: | ---: |
+| SQLite reopen in retained copy | 3.68 / 5.95 | 2.92 / 4.71 | +0.75 / +2.55 |
+| SQLite reopen after full copy release | 13.17 / 18.75 | 3.27 / 9.57 | +9.86 / +14.45 |
+
+With the shortened timer, all 64 copies were gone 22.53–22.71 seconds after the last response.
+The time includes tree retirement, the copy grace period and the polling interval. The first
+requests to new data epochs in #84 also ran through shard-tail recovery, which is a separate
+path from these reopens of confirmed local data in the same generation.
+
+A separate probe left the #90 timer at its 300,000 ms default. It observed all 64 trees retired and
+all 64 copies loaded around 10.56 seconds after the last read. In the subsequent wave it still
+observed loaded copies 310.49 seconds after the last read and saw them all gone at 310.71 seconds.
+The home starts the copy timer when the last tree closes.
+
+[Raw idle-window samples](database-home-benchmark/platform-database-idle-window.jsonl) ·
+[Raw default-timer samples](database-home-benchmark/platform-database-idle-default.jsonl)
+
+### Admission with the default budget
+
+The admission probe created 1,000 distinct database namespaces and waited for the owner to
+apply their catalog revision. It sent `SELECT 1` once to each database through the public
+SQL route, with one query in flight and no client retries. It kept the 1.55 GiB child admission
+budget and the default idle timers and used the same 520-home test setting as #84. The driver
+recorded the durable PID and generation, sampled RSS and checked the home and root counts
+every 25 queries and at the first refusal. The paced run spaced starts by at least 50 ms so
+earlier roots could retire before the active cohort reached the previously observed ceiling.
+
+| #90 baseline | Duration | Successful queries | Peak sampled roots | Final roots / homes | Peak sampled RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Serial, unpaced | 15.44 s | 405 / 1,000 | 396 | 210 / 406 | 1,060.44 MiB |
+| Serial, 50 ms between starts | 50.88 s | 405 / 1,000 | 202 | 0 / 405 | 1,011.27 MiB |
+
+Both runs first refused query 406. Each of the remaining 595 returned HTTP 400 on this
+route with `OVERLOADED: process admission budget is full` in the reason. In the paced run
+there were 201 live roots and 405 occupied homes at the first refusal. At the end all
+405 successful queries' trees had retired and their copies were still loaded. No pressure
+retirements or isolate resets were recorded. RSS stayed below the nominal admission budget
+while copy reservations exhausted it. The home picker preferred unused homes and could
+reuse an empty home once no unused home remained. The retained copies consumed the
+admission budget before reaching that reuse path.
+
+The policy returns an exclusive database copy's reservation on the same home when the
+last tree closes, after queued and active reservations clear. Copies therefore give way
+on tree retirement. In this serial scan, earlier requests become eligible first.
+
+[Raw unpaced admission samples](database-home-benchmark/platform-database-admission-unpaced.jsonl) ·
+[Raw paced admission samples](database-home-benchmark/platform-database-admission-paced.jsonl)
+
+In a diagnostic on the same #90 kernel, a 2 ms common copy grace period let all 1,000 paced
+queries succeed with peak RSS of 592.27 MiB. The diagnostic elapsed time was 50.878 s.
+The paced baseline took 50.881 s and recorded 595 refusals. Both round to 50.88 s.
+[Raw short-timer diagnostic](database-home-benchmark/platform-database-admission-short-timer.jsonl)
+
+### Verification with patch 0174
+
+On November 26, 2026, from 05:57:31 to 06:00:46 (UTC+8), the same ARM64 Linux VM ran the paced
+scan and the idle profile with the reviewed combined kernel. The kernel came from product
+`383b811df13db3893857c234f61697e703604575` and workerd tree
+`58412bd065cd24df493e0aad6e72e5733bce90cb`. The ARM64 archive SHA-256 was
+`286a42c05d043fb81a3b390f8a867c928102b7c0ea7f43e77d60a4ab4b285e53`.
+The Linux daemons were built at `4c33e3b872e2b063bfc58b3010d82c655b7833ba` with
+the same daemon and runtime sources. [Hosted ARM64 build](https://github.com/coworkerd/coworkerd/actions/runs/45688983959/job/139469141727)
+
+All **1,000 / 1,000** paced SQL queries succeeded in **51.016 s** with the default
+1.55 GiB admission budget and both idle timers at their defaults. Peak sampled RSS was
+571.47 MiB. The scan saw at most 202 live roots and 203 occupied homes, and 797 idle
+retirements by the final sample. The durable child kept its PID and generation.
+
+The default-settings D1 profile reopened 64 databases in four rounds. All copies
+were gone **10.39–10.60 s** after the last reply of each wave, including the polling
+interval. A complete reopen added **9.46 ms at p50** and **14.38 ms at p99** over the
+immediate warm repeat. Each condition had 256 samples. Each pair reopened one
+SQLite home and read the confirmed row. The profile recorded zero rebuilds.
+
+| Read path | p50 / p99 (ms) |
+| --- | ---: |
+| First read after copy release | 12.68 / 18.15 |
+| Immediate warm repeat | 3.24 / 9.78 |
+| Paired first-minus-repeat | +9.46 / +14.38 |
+
+| Sample | Resident roots / loaded homes | RSS (MiB) | PSS (MiB) |
+| --- | ---: | ---: | ---: |
+| After child rotation | 0 / 0 | 24.27 | 14.29 |
+| First database open | 1 / 1 | 57.31 | 34.87 |
+| Open cohort | 32 / 32 | 144.82 | 122.38 |
+| Open cohort | 64 / 64 | 238.73 | 216.29 |
+| After first release wave | 0 / 0 | 208.46 | 186.02 |
+| After final release wave | 0 / 0 | 167.52 | 145.08 |
+
+In the patched profile, the 1–64 marginal slope was 2.88 MiB per open database for both
+RSS and PSS. The first release lowered cohort RSS by 30.27 MiB, approximately 0.47 MiB
+per database. RSS after release stayed above the pre-open sample.
+
+[Patched paced scan samples](database-home-benchmark/platform-database-admission-patched.jsonl) ·
+[Patched default-settings profile](database-home-benchmark/platform-database-idle-window-patched.jsonl)
+
+### Reproduce the idle-window profile
+
+Run the Object-side driver with the placement test executable and the matching unpacked kernel.
+Build `coworkerd-platform-test` alongside the other Linux daemon targets from the #90 baseline
+above. The profile runs on the baseline that retains an empty copy. Finish builds before starting
+the timed run.
+
+```sh
+COWORKERD_CLUSTER_BIN_DIR="$PLACEMENT/build" node tests/cluster/database-home-benchmark.mjs \
+  object "$PLACEMENT" "$KERNEL_DIR" "$PWD/platform-database-idle-window.jsonl" --idle-window
+```
+
+Use `--idle-window-default` and a new output filename to repeat the single-round probe with the
+unmodified baseline timer.
+
+Use `--idle-window-admission` and a new output filename to repeat the paced 1,000-query scan.
+This mode accepts either kernel with its matching product checkout. It writes the full scan
+before returning an error if any query fails or sampled RSS reaches the budget.
+
+Use `--idle-window-patched` on the kernel with 0174 to measure the released and warm paths
+with the default copy settings. The probe checks that all exclusive copies disappear within
+15 seconds of a cohort's last reply and records their observed retirement times.
+
 ## Reproduce
 
 Run from a checkout containing the benchmark. Make two checkouts at the exact daemon source commits above. On

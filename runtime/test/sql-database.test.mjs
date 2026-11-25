@@ -41,6 +41,27 @@ function fixture({ wallDeadline = false } = {}) {
   } };
 }
 
+test('threaded SQL waits for a pending metadata write before entering its transaction', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    f.db.exec('CREATE TABLE ledger (value); BEGIN; INSERT INTO ledger VALUES (1)');
+    let metadataCommitted = false;
+    f.storage.sync = async () => {
+      await Promise.resolve();
+      f.db.exec('COMMIT');
+      metadataCommitted = true;
+    };
+    const transactionSync = f.storage.transactionSync;
+    f.storage.transactionSync = (fn) => {
+      assert.ok(metadataCommitted);
+      return transactionSync(fn);
+    };
+    const answer = await f.query({ sql: 'SELECT value FROM ledger' });
+    assert.equal(answer.success, true, answer.error);
+    assert.deepEqual(answer.results, [{ value: 1 }]);
+  } finally { f.close(); }
+});
+
 test('byte parameters including empty and all byte values round trip in both result formats', async () => {
   const f = fixture();
   try {
@@ -105,7 +126,7 @@ test('threaded execute syncs each successful statement before executing the next
     const answers = await response.json();
     assert.deepEqual(answers.map(answer => answer.success), [true, true, false]);
     assert.match(answers[2].error, /UNIQUE constraint failed/);
-    assert.deepEqual(synced, [[1], [1, 2]]);
+    assert.deepEqual(synced, [[], [1], [1, 2]]);
     assert.deepEqual(ids(), [1, 2]);
   } finally { f.close(); }
 });

@@ -334,6 +334,19 @@ Interruption is cooperative. A single costly function or blocking I/O without SQ
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
+On threaded database homes, currently enabled in the test executable, one transaction must fit in one
+recoverable WAL record. With default node settings, the encoded record can hold 67,104,768 bytes.
+The frame budget reserves the record's identity fields, length fields, checksum and WAL generation
+header. Each SQLite frame counts its page and its 24-byte frame header. Lowering
+`durableObjects.peerBufferBytes` can lower the cap. For changes that exceed this limit, write smaller
+transactions. An index build must fit in one transaction. Replicating a larger transaction across
+multiple records is tracked in [#71](https://github.com/coworkerd/coworkerd/issues/71).
+
+HTTP SQL returns `422 SQL_TRANSACTION_TOO_LARGE` and rolls back the entire request. A D1 batch
+rejects with `D1_ERROR: SQL_TRANSACTION_TOO_LARGE: …` and rolls back the entire batch.
+`exec()` reports the failing line as a `D1_EXEC_ERROR` and keeps the earlier confirmed lines.
+The same open database can serve another request after the rollback.
+
 Database names follow `[a-z0-9][a-z0-9-]{0,62}`: hyphens and a leading digit are supported. A malformed entry in the deployment's database or namespace table is skipped independently; `deployment.invalidNamespaceEntryCount` at the node's state endpoint counts skipped entries.
 
 
