@@ -1494,10 +1494,9 @@ public:
   // A connection's lease, on the node that executes it: held while the connection is open, and renewed at each message
   // toward the Worker -- an event of the call tree, as workerd tops up the request's CPU for it -- as a new root's would
   // be: the deadline becomes now plus the lease time, and the budget of subrequests starts again from the root's own
-  // (its grant), so that the message's Binding calls are neither refused as expired however long the connection has
-  // lasted nor limited by the calls of earlier messages. The budget is conserved per message: its Binding calls and
-  // their own share it, a child never getting more than its parent has left. Its Binding calls present the deadline the
-  // runtime was given at the start (presents()).
+  // (its grant). Binding calls charge the current balance on the connection's lease, including when callbacks for
+  // different messages overlap. A child never gets more than its parent has left. Binding calls present the deadline
+  // the runtime was given at the start (presents()).
   void holdLease(const std::string& invocationId) {
     auto lease = leases.find(invocationId);
     if (lease != leases.end()) lease->second.held = true;
