@@ -19,7 +19,7 @@
 | Module types | ES modules, CommonJS, text, binary data and WebAssembly (wrangler's module rules); JSON a Worker imports is bundled into its JavaScript by wrangler |
 | Entry points | A default export of an object with `fetch`, or a class extending `WorkerEntrypoint`; a named entry point (the `entrypoint` of a Service Binding) serves `fetch` and the class's methods. A plain object entry point has `fetch` only |
 | HTTP event duration | A connected HTTP client can receive a streamed response of any duration. The Worker's CPU limit still applies. |
-| `ctx.waitUntil` | After the response completes or ingress observes a disconnect, registered work and the Binding calls it needs share one 30-second drain. |
+| `ctx.waitUntil` | After the response completes or ingress observes a disconnect, registered work and its Binding calls share one 30-second drain. After a client leaves, code that ignores `request.signal` can keep running for up to 30 seconds while `waitUntil` work is alive. |
 | Durable Object alarms | Each alarm attempt has a 15-minute wall limit. The usual alarm retry rules apply. |
 | `import { env } from "cloudflare:workers"` at the module's top level | Gets the variables and secrets |
 | Inbound WebSocket | A `fetch` handler answers an upgrade with `new Response(null, { status: 101, webSocket })`: the client end of a `WebSocketPair` whose other end the Worker accepted, or a WebSocket it opened with `fetch()` (outgoing, through the node's egress); text and binary messages up to 32 MiB and close frames with their code and reason pass both ways, and the subprotocol the Worker names (`Sec-WebSocket-Protocol`) reaches the client; section 3 has the limits |
