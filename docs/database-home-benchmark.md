@@ -366,6 +366,49 @@ queries succeed with peak RSS of 592.27 MiB. The diagnostic elapsed time was 50.
 The paced baseline took 50.881 s and recorded 595 refusals. Both round to 50.88 s.
 [Raw short-timer diagnostic](database-home-benchmark/platform-database-admission-short-timer.jsonl)
 
+### Verification with patch 0174
+
+On November 26, 2026, from 05:57:31 to 06:00:46 (UTC+8), the same ARM64 Linux VM ran the paced
+scan and the idle profile with the reviewed combined kernel. The kernel came from product
+`383b811df13db3893857c234f61697e703604575` and workerd tree
+`58412bd065cd24df493e0aad6e72e5733bce90cb`. The ARM64 archive SHA-256 was
+`286a42c05d043fb81a3b390f8a867c928102b7c0ea7f43e77d60a4ab4b285e53`.
+The Linux daemons were built at `4c33e3b872e2b063bfc58b3010d82c655b7833ba` with
+the same daemon and runtime sources. [Hosted ARM64 build](https://github.com/coworkerd/coworkerd/actions/runs/45688983959/job/139469141727)
+
+All **1,000 / 1,000** paced SQL queries succeeded in **51.016 s** with the default
+1.55 GiB admission budget and both idle timers at their defaults. Peak sampled RSS was
+571.47 MiB. The scan saw at most 202 live roots and 203 occupied homes, and 797 idle
+retirements by the final sample. The durable child kept its PID and generation.
+
+The default-settings D1 profile reopened 64 databases in four rounds. All copies
+were gone **10.39–10.60 s** after the last reply of each wave, including the polling
+interval. A complete reopen added **9.46 ms at p50** and **14.38 ms at p99** over the
+immediate warm repeat. Each condition had 256 samples. Each pair reopened one
+SQLite home and read the confirmed row. The profile recorded zero rebuilds.
+
+| Read path | p50 / p99 (ms) |
+| --- | ---: |
+| First read after copy release | 12.68 / 18.15 |
+| Immediate warm repeat | 3.24 / 9.78 |
+| Paired first-minus-repeat | +9.46 / +14.38 |
+
+| Sample | Resident roots / loaded homes | RSS (MiB) | PSS (MiB) |
+| --- | ---: | ---: | ---: |
+| After child rotation | 0 / 0 | 24.27 | 14.29 |
+| First database open | 1 / 1 | 57.31 | 34.87 |
+| Open cohort | 32 / 32 | 144.82 | 122.38 |
+| Open cohort | 64 / 64 | 238.73 | 216.29 |
+| After first release wave | 0 / 0 | 208.46 | 186.02 |
+| After final release wave | 0 / 0 | 167.52 | 145.08 |
+
+In the patched profile, the 1–64 marginal slope was 2.88 MiB per open database for both
+RSS and PSS. The first release lowered cohort RSS by 30.27 MiB, approximately 0.47 MiB
+per database. RSS after release stayed above the pre-open sample.
+
+[Patched paced scan samples](database-home-benchmark/platform-database-admission-patched.jsonl) ·
+[Patched default-settings profile](database-home-benchmark/platform-database-idle-window-patched.jsonl)
+
 ### Reproduce the idle-window profile
 
 Run the Object-side driver with the placement test executable and the matching unpacked kernel.
