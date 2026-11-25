@@ -14,8 +14,10 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-storage-lifecycle-'));
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
+const budgetEofTrigger = join(scratch, 'disconnect-budget-reader');
 const env = {...Object.fromEntries(Object.entries(process.env)
-  .filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))), TMPDIR: scratch};
+  .filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))), TMPDIR: scratch,
+  COWORKERD_DURABLE_BUDGET_EOF_FOR_TEST: budgetEofTrigger};
 const token = 'fixture-management-placeholder';
 const hash = value => createHash('sha256').update(value).digest('hex');
 let child, closed, diagnostics = '';
@@ -140,6 +142,26 @@ try {
   assert.equal(emptyChild.id, first.id);
   assert.notEqual(emptyChild.instance, first.instance);
   assert.equal(emptyChild.value, null, 'a new child generation must not recover disposable data');
+
+  // Only the node's receive half closes. The selected child stays alive until the supervisor retires it.
+  process.kill(replacement.pid, 0);
+  await writeFile(budgetEofTrigger, '');
+  const triggeringResponse = await fetch(`http://127.0.0.1:${port}/same-object`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  await triggeringResponse.text();
+  const recovered = await ready(replacement);
+  assert.notEqual(recovered.pid, replacement.pid);
+  assert.equal(child.pid, firstNode);
+  const budgetKill = diagnostics.split('\n').filter(line => line.startsWith('[process-kill] '))
+    .map(line => JSON.parse(line.slice('[process-kill] '.length)))
+    .find(kill => kill.pid === replacement.pid && kill.generation === replacement.generation);
+  assert.equal(budgetKill?.reason, 'durable budget channel disconnected', diagnostics);
+  const afterEof = await request();
+  assert.equal(afterEof.id, first.id);
+  assert.notEqual(afterEof.instance, emptyChild.instance);
+  assert.equal(afterEof.value, null);
+
   const second = await request('before node restart');
   assert.deepEqual(await request(), second);
   await stop();
@@ -149,7 +171,7 @@ try {
   assert.equal(await readFile(manifestPath, 'utf8'), manifest);
   const restarted = await start();
   assert.notEqual(child.pid, firstNode);
-  assert.notEqual(restarted.pid, replacement.pid);
+  assert.notEqual(restarted.pid, recovered.pid);
   const emptyNode = await request();
   assert.equal(emptyNode.id, first.id);
   assert.notEqual(emptyNode.instance, second.instance);
@@ -160,8 +182,8 @@ try {
   await stop();
   console.log(JSON.stringify({event: 'disposable-storage-restarts', sameObject: first.id,
     configSha256: hash(config), manifestSha256: hash(manifest),
-    childGenerations: [firstChild.generation, replacement.generation, restarted.generation],
-    childRestartEmpty: true, nodeRestartEmpty: true, writesAndReads: true}));
+    childGenerations: [firstChild.generation, replacement.generation, recovered.generation, restarted.generation],
+    childRestartEmpty: true, budgetEofRecovered: true, nodeRestartEmpty: true, writesAndReads: true}));
 } finally {
   if (child?.pid && child.exitCode === null && child.signalCode === null) {
     try { process.kill(-child.pid, 'SIGTERM'); } catch {}

@@ -2792,24 +2792,46 @@ public:
     auto& registry = *p->durableBudgets;
     KJ_DEFER({ registry.connected = false; registry.tokens.clear(); });
     kj::UnixEventPort::FdObserver observer(eventPort, p->parentWrite, kj::UnixEventPort::FdObserver::OBSERVE_READ);
-    uint64_t ticket = 0;
-    auto bytes = kj::arrayPtr(reinterpret_cast<char*>(&ticket), sizeof(ticket));
-    size_t offset = 0;
+    const char* testEofTrigger = p->durableTestStorage ? std::getenv("COWORKERD_DURABLE_BUDGET_EOF_FOR_TEST") : nullptr;
+    std::array<char, 128 * sizeof(uint64_t)> bytes;
+    size_t partial = 0;
     for (;;) {
-      co_await observer.whenBecomesReadable();
-      for (;;) {
-        const auto received = recv(p->parentWrite, bytes.begin() + offset, bytes.size() - offset, MSG_DONTWAIT);
-        if (received == 0) co_return;
-        if (received < 0) {
-          if (errno == EINTR) continue;
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          KJ_FAIL_REQUIRE("cannot read a durable budget release", strerror(errno));
+      const auto received = recv(p->parentWrite, bytes.data() + partial, bytes.size() - partial, MSG_DONTWAIT);
+      if (received == 0) break;
+      if (received < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          co_await observer.whenBecomesReadable();
+          // One-shot receive EOF on a live child in the disposable-storage restart fixture.
+          if (testEofTrigger && ::unlink(testEofTrigger) == 0) {
+            KJ_SYSCALL(::shutdown(p->parentWrite, SHUT_RD));
+          }
+          continue;
         }
-        offset += received;
-        if (offset == bytes.size()) {
-          registry.tokens.erase(ticket);
-          offset = 0;
-        }
+        KJ_LOG(WARNING, "cannot read a durable budget release", p->id.c_str(), p->generation, strerror(errno));
+        break;
+      }
+      const size_t available = partial + received;
+      size_t consumed = 0;
+      while (available - consumed >= sizeof(uint64_t)) {
+        uint64_t ticket;
+        std::memcpy(&ticket, bytes.data() + consumed, sizeof(ticket));
+        registry.tokens.erase(ticket);
+        consumed += sizeof(ticket);
+      }
+      partial = available - consumed;
+      std::memmove(bytes.data(), bytes.data() + consumed, partial);
+      // A burst of releases may keep the socket continuously readable.
+      co_await provider.getTimer().afterDelay(1 * kj::MICROSECONDS);
+    }
+    registry.connected = false;
+    registry.tokens.clear();
+    if (p->pid > 0 && !p->closing && !p->plannedExit && !closingAll) {
+      // Normal child exits also close this socket. Give waitpid a chance to record the actual exit.
+      co_await provider.getTimer().afterDelay(20 * kj::MILLISECONDS);
+      refresh();
+      if (!p->closing && !p->plannedExit && !closingAll) {
+        killProcess(*p, "durable budget channel disconnected", 0);
       }
     }
   }
@@ -3313,7 +3335,8 @@ public:
     });
   }
   bool admitted(const ProcessGeneration& p) const {
-    return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected && p.inFlight < config.inFlightLimit;
+    return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
+        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimit;
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;

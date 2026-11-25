@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 20:27:48 +0800
+Subject: [PATCH] Retry transient errors on the durable budget release socket
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index a13cfcbf22db2f5c9ae47b3a15d7bda235afe636..2390fd4b3ac0415110b2f88c04bdcc96eb025268 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2816,6 +2816,7 @@ struct ThreadedServer {
+     size_t offset = 0;
+     for (;;) {
+       bool pending;
++      bool retry = false;
+       {
+         std::lock_guard lock(budgetReleaseMutex);
+         while (!budgetReleases.empty()) {
+@@ -2825,9 +2826,9 @@ struct ThreadedServer {
+           if (written < 0 && errno == EINTR) continue;
+           if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+           if (written <= 0) {
+-            // EOF tells the node to drop all tickets for this generation.
+-            (void)shutdown(parent, SHUT_WR);
+-            return;
++            if (written < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) return;
++            retry = true;
++            break;
+           }
+           offset += written;
+           if (offset == sizeof(uint64_t)) {
+@@ -2837,15 +2838,18 @@ struct ThreadedServer {
+         }
+         pending = !budgetReleases.empty();
+       }
++      // Keep a partially sent ticket at the front until the parent receives it.
++      if (retry) {
++        (void)poll(nullptr, 0, 10);
++        continue;
++      }
+       pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
+       int result;
+       do {
+         result = poll(waits, 2, -1);
+       } while (result < 0 && errno == EINTR);
+-      if (result < 0 || (waits[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+-        (void)shutdown(parent, SHUT_WR);
+-        return;
+-      }
++      if (result >= 0 && (waits[1].revents & POLLHUP)) return;
++      if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
+       uint64_t count;
+       while (read(managerWake, &count, sizeof(count)) > 0) {}
+     }
