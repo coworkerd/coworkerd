@@ -13,6 +13,18 @@ takes the shard over rebuilds it from that history. One database holds at most 1
 one of the tenant's 16 namespaces (`durableObjectNamespaces`); what all of a tenant's objects hold together is bounded
 by `durableObjectBytes` (10 GiB by default).
 
+### Threaded database capacity
+
+The threaded database test build keeps each open database on its own home. At the default
+home count, one durable process handled four busy databases at once. Two processes handled
+eight when the database keys were distributed across both. Each process receives a share
+of the node's memory budget, and a smaller resource budget can lower capacity.
+
+When a new database needs room, the process releases its least recently used eligible idle
+database. An active call, queued call, or pending storage confirmation keeps its database
+resident. A later call reopens the released database with its confirmed data.
+[Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)
+
 ## 2. Make one
 
 From a directory with `cowctl.json` initialized for your tenant (see the [quickstart](quickstart.md)):

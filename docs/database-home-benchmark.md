@@ -432,6 +432,28 @@ Use `--idle-window-patched` on the kernel with 0174 to measure the released and 
 with the default copy settings. The probe checks that all exclusive copies disappear within
 15 seconds of a cohort's last reply and records their observed retirement times.
 
+## Database admission at the ceiling
+
+The unpaced workload issues a public SQL read against each of 1,000 distinct databases.
+It waits for each reply before sending the next query. It uses the default home count,
+memory budget and idle timers, records admission retirements, and checks that all queries
+succeed in the same durable process generation. The process budget is derived from the
+test node's memory budget.
+
+The memory probe runs 125 queries with a 448 MiB process budget and 192 homes. It checks
+that a new copy can reclaim a memory reservation while unused homes are still available.
+The busy probes hold a long SQL read on each default home, observe the running count
+per process, and submit one additional query per process to verify its capacity refusal.
+
+```sh
+export COWORKERD_CLUSTER_BIN_DIR="$PWD/build"
+for mode in unpaced memory busy-one busy-two; do
+  node tests/cluster/database-home-benchmark.mjs \
+    object "$PWD" "$KERNEL_DIR" "$PWD/admission-$mode.jsonl" "--idle-admission-$mode"
+done
+node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission
+```
+
 ## Reproduce
 
 Run from a checkout containing the benchmark. Make two checkouts at the exact daemon source commits above. On

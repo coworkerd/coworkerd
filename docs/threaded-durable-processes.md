@@ -330,6 +330,12 @@ returns that reservation. The first read after full release took an extra 9.86 m
 14.45 ms p99 compared with its immediate warm repeat in the same-epoch D1 profile.
 [Idle-window measurements](database-home-benchmark.md#idle-window-for-exclusive-platform-database-copies)
 
+A threaded database can also retire under admission pressure before its idle timer fires.
+The process ranks eligible database trees across its homes by the last completed call.
+The selected home rechecks the mailbox, active calls, tracked background work and WAL
+confirmation before closing the tree. The admission retry follows the normal close and
+copy release. [Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
+
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the
 owner/shard epoch, object and attachment identity, ordered frame position, tags, serialized attachments and
 the auto-response pair/timestamp. Node-side ping and exact-match auto-response update transport state without

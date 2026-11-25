@@ -8,7 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
-const unpacedAdmission = mode === '--idle-admission-unpaced' || mode === '--idle-admission-memory';
+const memoryAdmission = mode === '--idle-admission-memory';
+const unpacedAdmission = mode === '--idle-admission-unpaced' || memoryAdmission;
 const busyProcesses = { '--idle-admission-busy-one': 1, '--idle-admission-busy-two': 2 }[mode];
 const idleAdmission = mode === '--idle-window-admission' || unpacedAdmission || Boolean(busyProcesses);
 const defaultHomes = mode === '--idle-admission-unpaced' || Boolean(busyProcesses);
@@ -43,7 +44,8 @@ const BenchmarkCluster = idleWindow
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
-  homes: defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
+  homes: memoryAdmission ? 192
+    : defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
   density: idleWindow ? [0, 1, 32, 64] : smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
@@ -79,6 +81,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     processPool: { count: 1, ...(!unpacedAdmission && !busyProcesses && {
       inFlightLimit: throughput ? throughputInFlightLimit : 128,
     }),
+      ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
     durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0 },
   }),
@@ -95,7 +98,7 @@ const [owner] = cluster.nodes;
 if (idleWindow) assert.equal(cluster.databaseFixtureNode, owner, 'supply a database placement checkout');
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databaseCount = busyProcesses ? 64 : idleAdmission ? admissionDatabases
+const databaseCount = memoryAdmission ? 125 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
   : throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1);
 const databases = Array.from({ length: databaseCount },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
@@ -741,6 +744,7 @@ async function runIdleAdmission() {
   const start = performance.now();
   let succeeded = 0;
   let peakRssBytes = 0;
+  let peakHomes = 0;
   const { processPool } = await durable();
   const memoryBudgetBytes = processPool.threadedMemoryBytes;
   const failures = [];
@@ -762,6 +766,7 @@ async function runIdleAdmission() {
       assert.equal(entry.pid, child.pid);
       assert.equal(entry.generation, child.generation);
       peakRssBytes = Math.max(peakRssBytes, entry.residentBytes);
+      peakHomes = Math.max(peakHomes, entry.lifecycle.durableAdmission.homes);
       await record('idle-admission-sample', { tried, succeeded, elapsedMs: performance.now() - start,
         rssBytes: entry.residentBytes, memoryBudgetBytes,
         firstFailure: failures[0], residency: entry.lifecycle.durableAdmission });
@@ -775,10 +780,13 @@ async function runIdleAdmission() {
   const { entry } = await durable();
   const admissionRetirements = entry.lifecycle.durableAdmission.admissionRetirements;
   await record('idle-admission-result', { tried: databases.length, succeeded, elapsedMs, peakRssBytes,
-    memoryBudgetBytes, admissionRetirements, failures, guest: await hostSample() });
+    memoryBudgetBytes, peakHomes, admissionRetirements, failures, guest: await hostSample() });
   assert.equal(failures.length, 0, 'every idle-admission query succeeded');
   assert.ok(peakRssBytes < memoryBudgetBytes, 'sampled RSS remains below the child memory budget');
-  if (defaultHomes) assert.ok(admissionRetirements > 0, 'the scan exercised admission-time retirement');
+  if (unpacedAdmission) assert.ok(admissionRetirements > 0, 'the scan exercised admission-time retirement');
+  // Every database in the probe could fit into an unused home. The lower process
+  // reservation, rather than the number of homes, must have triggered retirement.
+  if (memoryAdmission) assert.ok(databases.length < settings.homes && peakHomes < settings.homes);
 }
 
 async function runBusyAdmission() {
