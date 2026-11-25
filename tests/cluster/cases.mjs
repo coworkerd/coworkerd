@@ -2462,7 +2462,8 @@ async function threadedSocketHibernation(cluster) {
     assert.equal(treeLimit.status, 422, JSON.stringify(treeLimit.body));
     assert.equal(treeLimit.body.name, 'NotSupportedError');
     assert.match(treeLimit.body.message, /1 MiB/);
-    await Promise.all(largeSockets.map((socket, i) => closeFacet(socket, 'delete', `large-${i}`)));
+    // Each deletion also schedules a close event on this home.
+    for (const [i, socket] of largeSockets.entries()) await closeFacet(socket, 'delete', `large-${i}`);
 
     await closeFacet(await openFacet('idle-abort'), 'abort', 'idle-abort');
     const busy = await openFacet('busy-abort');
