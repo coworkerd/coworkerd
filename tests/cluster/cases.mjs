@@ -364,6 +364,93 @@ async function threadedDatabasePlacement(cluster) {
   await takeOver(threaded, upstream);
 }
 
+// One leaf, page 1 and 252 overflow pages. Each overflow page holds 4092
+// bytes of a blob on the fixture's 4096-byte SQLite pages.
+const sqlWalFrames = 254;
+const sqlWalFrameBytes = 4096 + 24;
+const sqlWalHeaderBytes = 32;
+const sqlWalRecordBytes = sqlWalFrames * sqlWalFrameBytes + 116 + 129 + 64 + sqlWalHeaderBytes;
+const sqlWalPeerBufferBytes = sqlWalRecordBytes + 4096; // Peer RPC headroom.
+
+async function threadedSqlTransactionLimit(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-record-limit', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
+  const [db] = databases.get(owner);
+  const query = (body, status = 200) => cluster.api(`${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, status });
+  const log = async () => (await cluster.state(owner)).durableLog;
+  await eventually('the owner sees both durable peers', async () => {
+    const { membership } = await cluster.state(owner);
+    for (const node of cluster.nodes.slice(1)) {
+      assert.ok(membership.members.some(member => member.nodeId === node && member.durableProcesses > 0), node);
+    }
+  });
+  assert.equal(Number((await log()).settings.recordLimitBytes), sqlWalRecordBytes);
+  const insert = 'INSERT INTO ledger VALUES (?, zeroblob(?))';
+  const fill = (id, pages) => ({ sql: insert, params: [id, pages * 4092] });
+  const read = { sql: 'SELECT id, length(value) AS bytes FROM ledger ORDER BY id' };
+  await query([
+    { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value BLOB)' },
+    { sql: 'INSERT INTO ledger VALUES (1, x\'01\')' },
+  ]);
+  const before = await log();
+  assert.equal(before.threadedHomeIo.openSamples, 1);
+  assert.equal((await query(fill(2, 252))).success, true);
+  const atLimit = await log();
+  assert.equal(atLimit.log.records - before.log.records, 1);
+  assert.equal(atLimit.log.frames - before.log.frames, sqlWalFrames);
+  // The first record already sent the generation header. Its reserved 32 bytes
+  // still count against the transaction capacity.
+  assert.equal(Number(atLimit.log.bytes) - Number(before.log.bytes) + sqlWalHeaderBytes, sqlWalRecordBytes);
+  assert.equal(atLimit.confirm.confirmations - before.confirm.confirmations, 1);
+  assert.ok(atLimit.peers.streams.some(stream => stream.open &&
+    BigInt(stream.ackedSeq) >= BigInt(atLimit.log.nextSeq)), 'a peer acknowledged the boundary record');
+
+  const reason = 'the transaction exceeds one recoverable WAL record';
+  const code = 'SQL_TRANSACTION_TOO_LARGE';
+  const failure = `${code}: ${reason}`;
+  const refused = await query(fill(3, 253), 422);
+  assert.deepEqual(refused, { success: false, error: failure, reason, code });
+  const after = await log();
+  assert.equal(after.log.records, atLimit.log.records, 'the refused transaction never entered the node log');
+  assert.equal(after.recovery.recordLimitRefusals, before.recovery.recordLimitRefusals,
+    'the node did not have to refuse a locally committed record');
+  const committed = [{ id: 1, bytes: 1 }, { id: 2, bytes: 252 * 4092 }];
+  assert.deepEqual((await query(read)).results, committed);
+
+  const oversizedInsert = `INSERT INTO ledger VALUES (6, zeroblob(${253 * 4092}))`;
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
+    try {
+      if (new URL(request.url).searchParams.has('exec')) {
+        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
+          ${JSON.stringify(oversizedInsert + '\n')} +
+          "INSERT INTO ledger VALUES (7, x'07')");
+      } else {
+        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"),
+          DB.prepare(${JSON.stringify(insert)}).bind(6, ${253 * 4092})]);
+      }
+      return Response.json({ success: true });
+    } catch (error) {
+      return Response.json({ message: error.message, cause: error.cause?.message });
+    }
+  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
+  const binding = async (suffix = '') => json(await request(cluster.urls[ingress],
+    `/${tenant.name}/probe${suffix}`), 200, 'D1 transaction limit');
+  assert.deepEqual(await binding(), { message: `D1_ERROR: ${failure}`, cause: failure });
+  assert.deepEqual((await query(read)).results, committed, 'the earlier D1 batch statement was rolled back');
+  const execFailure = `Error in line 2: ${oversizedInsert}: ${failure}`;
+  assert.deepEqual(await binding('?exec'), { message: `D1_EXEC_ERROR: ${execFailure}`, cause: execFailure });
+  assert.deepEqual((await query(read)).results, [...committed, { id: 5, bytes: 1 }],
+    'exec keeps its confirmed prefix and skips the rest');
+  assert.equal((await query({ sql: 'INSERT INTO ledger VALUES (3, x\'03\')' })).success, true);
+  assert.deepEqual((await query(read)).results,
+    [...committed, { id: 3, bytes: 1 }, { id: 5, bytes: 1 }]);
+  const final = await log();
+  assert.equal(final.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples, 'the same database stayed open');
+  assert.equal(final.objects.repairs, before.objects.repairs, 'the connection needed no repair');
+}
+
 async function threadedSqlDeadline(cluster) {
   const [owner, ingress] = cluster.nodes;
   const tenant = await cluster.tenant('sql-deadline', { durableObjectNamespaces: 48 });
@@ -2879,6 +2966,15 @@ export const durableGatedCases = {
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+  },
+  'threaded-sql-transaction-limit': {
+    test: threadedSqlTransactionLimit, nodes: ['node-1'], databaseFixtureNode: 'node-1', holdPeerAcks: false,
+    // Only the owner uses the small record cap. Its two peers need room to
+    // hold the schema record and the boundary record together.
+    configureNode: node => node === 'node-1' ? ({
+      durableObjects: { threadedStorage: true, peerBufferBytes: sqlWalPeerBufferBytes,
+        checkpointBytes: 8 * 1024 * 1024 },
+    }) : ({}),
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {

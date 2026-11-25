@@ -459,6 +459,7 @@ public:
   // After selecting a durable generation, before any request is sent or accounted for.
   ObjectReady checkObjectDispatch(const ObjectIdentity& identity, const std::string& processId,
       uint64_t generation, std::string_view definition = {});
+  uint64_t sqlWalFrameLimitBytes(const RootStorageRef& storage) const;
   struct SocketTransition {
     uint64_t attempt = 0;
     bool accepted = false;

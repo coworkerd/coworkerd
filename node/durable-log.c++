@@ -2455,6 +2455,19 @@ uint64_t DurableLog::recordLimitBytes() const {
   return rawLimit > TAIL_RPC_HEADROOM_BYTES ? rawLimit - TAIL_RPC_HEADROOM_BYTES : 0;
 }
 
+uint64_t DurableLog::sqlWalFrameLimitBytes(const RootStorageRef& storage) const {
+  // takeRecord() encodes the canonical object identity, with an empty root facet
+  // name. Reserve the WAL generation header that can accompany the first commit.
+  LogRecord root;
+  root.objectName = storage.namespaceId + "/" + storage.objectId;
+  root.storageId = storage.storageId;
+  root.header.resize(32);
+  const auto overhead = encodedLogRecordSize(root);
+  const auto limit = recordLimitBytes();
+  KJ_REQUIRE(limit > overhead, "the recoverable record limit cannot fit a SQL WAL record");
+  return limit - overhead;
+}
+
 // One record of this node's log: it goes to the peers of its object's shard, and the answer to the request that
 // carried it waits for them. Nothing here touches the disk or the object store (experiment 25, D.2).
 void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t request) {

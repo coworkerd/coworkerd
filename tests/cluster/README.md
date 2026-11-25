@@ -52,6 +52,11 @@ checks that the writes roll back and both interfaces read the earlier value in t
 
 ### Database placement across builds
 
+`threaded-sql-transaction-limit` uses the test executable on the threaded owner. It sets the peer
+buffer to allow a 254-frame SQL transaction including the record envelope and RPC headroom. It
+checks peer confirmation at the limit, HTTP 422 one frame over the limit, D1 batch rollback and the
+confirmed `exec()` prefix. A follow-up write and read run on the same open database.
+
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
 same-tenant databases in separate isolate copies of the same threaded process generation before and after

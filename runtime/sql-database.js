@@ -40,11 +40,16 @@ export class SqlDatabase extends DurableObject {
         if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
         return { success: false, error: message, code: error.code, reason: message };
       }
+      if (error?.code === "SQL_TRANSACTION_TOO_LARGE") {
+        // D1 reads the error string and can discard the structured fields.
+        return { success: false, error: `${error.code}: ${message}`, code: error.code, reason: message };
+      }
       return { success: false, error: message };
     };
+    const failureStatus = answer => answer?.code === "SQL_TRANSACTION_TOO_LARGE" ? 422 : answer?.code ? 503 : 200;
     const fail = (error, batch = false) => {
       const answer = failure(error);
-      return Response.json(batch && !answer.code ? [answer] : answer, { status: answer.code ? 503 : 200 });
+      return Response.json(batch && !answer.code ? [answer] : answer, { status: failureStatus(answer) });
     };
     const one = (statement) => {
       try {
@@ -88,7 +93,7 @@ export class SqlDatabase extends DurableObject {
       if (!answer.success) break;
       if (deadline) await this.ctx.storage.sync();
     }
-    try { return this.resultResponse(answers, budget, answers.at(-1)?.code ? 503 : 200); }
+    try { return this.resultResponse(answers, budget, failureStatus(answers.at(-1))); }
     catch (error) { return fail(error, true); }
   }
 
