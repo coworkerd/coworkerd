@@ -36,3 +36,9 @@ export class PlatformStore extends DurableObject {
     this.sql.exec('INSERT INTO alarm_status VALUES (1)');
   }
 }
+
+export class PlatformEcho extends DurableObject {
+  fetch() {
+    return Response.json({ service: 'echo', build: fixtureBuild });
+  }
+}
