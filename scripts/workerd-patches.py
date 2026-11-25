@@ -281,6 +281,16 @@ def allowed_path(name, path):
                               'src/workerd/io/worker.h',
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0108-park-threaded-facet-websockets.patch' and path in {
+                              'src/workerd/api/hibernatable-web-socket.c++',
+                              'src/workerd/api/http.c++',
+                              'src/workerd/api/web-socket.c++',
+                              'src/workerd/api/web-socket.h',
+                              'src/workerd/io/legacy-hibernation-manager.c++',
+                              'src/workerd/io/legacy-hibernation-manager.h',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0111-threaded-database-homes.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++'} or

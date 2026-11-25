@@ -295,10 +295,10 @@ index b1f971e7bb2008020c538415e28ca393253e2f8f..13e8ab9bec5392a4a9d2c6e046340159
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a0ee5ac68 100644
+index 1d600b8435316d84933d9934256195225b9dd883..8e877cc599528caad45e70c65a5c3b33b3236aa1 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1938,6 +1938,7 @@ struct DurableIncoming {
+@@ -1943,6 +1943,7 @@ struct DurableIncoming {
    DurableRoute route;
    server::DurableAdmission::Ticket ticket;
    server::DurableAdmission::Time deadline;
@@ -306,7 +306,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
  };
  
  uint64_t boundedDurableSetting(const char *name, uint64_t fallback, uint64_t maximum) {
-@@ -2351,6 +2352,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2356,6 +2357,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
        DurableRoute route,
        server::DurableAdmission::Ticket ticket,
        int connectionFd,
@@ -314,7 +314,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
        kj::Own<kj::PromiseFulfiller<void>> accepted,
        std::shared_ptr<DurableSessionScope> scope)
        : server(server),
-@@ -2358,6 +2360,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2363,6 +2365,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
          route(std::move(route)),
          ticket(ticket),
          connectionFd(connectionFd),
@@ -322,7 +322,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
          accepted(kj::mv(accepted)),
          scope(std::move(scope)) {}
  
-@@ -2370,6 +2373,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2375,6 +2378,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
    DurableRoute route;
    server::DurableAdmission::Ticket ticket;
    int connectionFd;
@@ -330,7 +330,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
    kj::Own<kj::PromiseFulfiller<void>> accepted;
    std::shared_ptr<DurableSessionScope> scope;
    bool used = false;
-@@ -2800,10 +2804,12 @@ struct ThreadedServer {
+@@ -2805,10 +2809,12 @@ struct ThreadedServer {
      if (!assigned) {
        std::vector<server::DurableCopyCandidate> candidates;
        size_t spare = 0;
@@ -343,7 +343,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
          // An empty copy keeps its definition until its isolate is released.
          // Prefer a matching warm copy, then an unused home, then a different empty copy.
          if (home.reservedTrees == 0 && !home.pressure.resetting() &&
-@@ -2817,6 +2823,14 @@ struct ThreadedServer {
+@@ -2822,6 +2828,14 @@ struct ThreadedServer {
        }
        auto choice = server::chooseDurableCopy(candidates, route.open.definition, durablePlacement);
        if (!choice && spare == 0) return false;
@@ -358,7 +358,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
        assigned = choice.value_or(spare);
        auto &home = *threads[*assigned - 1]->home;
        if (!choice) {
-@@ -2849,7 +2863,8 @@ struct ThreadedServer {
+@@ -2854,7 +2868,8 @@ struct ThreadedServer {
    bool handoffDurable(int fd,
        DurableRoute &route,
        server::DurableAdmission::Ticket ticket,
@@ -368,7 +368,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      if (!ready.load(std::memory_order_acquire)) return false;
      std::lock_guard lock(durableRoutingMutex);
      if (deadline <= server::DurableAdmission::Clock::now()) return false;
-@@ -2857,7 +2872,7 @@ struct ThreadedServer {
+@@ -2862,7 +2877,7 @@ struct ThreadedServer {
      if (!assigned) return false;
      auto &thread = *threads[*assigned - 1];
      if (thread.home->pressure.resetting()) return false;
@@ -377,7 +377,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      wake(thread.wake);
      return true;
    }
-@@ -2877,6 +2892,22 @@ struct ThreadedServer {
+@@ -2882,6 +2897,22 @@ struct ThreadedServer {
      root.idle->eventFinished(durableIdleNow());
    }
  
@@ -400,7 +400,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
    bool finishDurable(server::DurableAdmission::Ticket ticket) {
      std::lock_guard lock(durableRoutingMutex);
      durableAdmission->cancel(ticket);
-@@ -2897,7 +2928,7 @@ struct ThreadedServer {
+@@ -2902,7 +2933,7 @@ struct ThreadedServer {
      KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
      if (--home.reservedTrees == 0) {
        home.definition = home.warmDefinition;
@@ -409,7 +409,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      }
      return finished;
    }
-@@ -2987,7 +3018,8 @@ struct ThreadedServer {
+@@ -2992,7 +3023,8 @@ struct ThreadedServer {
      auto stream = state.io.lowLevelProvider->wrapSocketFd(kj::mv(call.socket));
      auto accepted = kj::newPromiseAndFulfiller<void>();
      capnp::TwoPartyServer session(kj::heap<DurableBootstrap>(
@@ -419,7 +419,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      auto disconnected = session.accept(*stream).fork();
      try {
        auto serving =
-@@ -3061,7 +3093,7 @@ struct ThreadedServer {
+@@ -3066,7 +3098,7 @@ struct ThreadedServer {
      home.resident.erase(tree);
      KJ_ASSERT(--home.reservedTrees == 0);
      home.definition.clear();
@@ -428,7 +428,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
    }
  
    void retireIdleDurableRoots(ThreadState &state) {
-@@ -3256,6 +3288,8 @@ struct ThreadedServer {
+@@ -3261,6 +3293,8 @@ struct ThreadedServer {
      auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
          ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
          ",\"databaseHomes\":" + std::to_string(databaseHomes) +
@@ -437,7 +437,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
          ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
          ",\"resettingHomes\":" + std::to_string(resettingHomes) +
          ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
-@@ -6201,9 +6235,10 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+@@ -6621,9 +6655,10 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
  class NativeDatabaseHttp final: public kj::HttpService {
   public:
    NativeDatabaseHttp(ThreadedServer& server, ThreadState& state, DurableRoute route,
@@ -450,7 +450,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
  
    kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders&,
        kj::AsyncInputStream& body, Response& response) override {
-@@ -6216,12 +6251,52 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6636,12 +6671,52 @@ class NativeDatabaseHttp final: public kj::HttpService {
      if (alarm == kj::none && (method != kj::HttpMethod::POST || (!query && !execute))) {
        co_return co_await send(response, {404, "{\"error\":\"Not found\"}"});
      }
@@ -506,7 +506,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      }
      if (reply.status != 0) co_return co_await send(response, std::move(reply));
      auto& database = *state.nativeDatabase;
-@@ -6244,12 +6319,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6664,12 +6739,13 @@ class NativeDatabaseHttp final: public kj::HttpService {
          const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
              ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
          reply = server::runNativeSql(connection, input, query, format,
@@ -521,7 +521,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      // A canceled client must not cancel acknowledgement of already committed WAL.
      // Keep the admitted connection alive until the outstanding confirmation settles.
      if (connection.observedCriticalError() || reply.status == 0 || reply.status == 503) {
-@@ -6282,8 +6358,17 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6702,8 +6778,17 @@ class NativeDatabaseHttp final: public kj::HttpService {
    uint64_t tree;
    int connectionFd;
    kj::Maybe<uint64_t> alarm;
@@ -539,7 +539,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
    static server::NativeSqlReply storageFailure(const kj::Exception& error) {
      auto reason = error.getDescription();
      if (reason.startsWith("jsg.Error: ")) reason = reason.slice(sizeof("jsg.Error: ") - 1);
-@@ -6326,7 +6411,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6746,7 +6831,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
          home.memory = 0;
        }
        const auto openStarted = nowNs();
@@ -549,7 +549,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
        kj::Own<server::DurableLogShipper> shipper;
        if (state.wal) {
          shipper = server.durableStorage->ship(route.uniqueKey.c_str(),
-@@ -6339,6 +6425,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6759,6 +6845,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
          tree, server::DurableAdmission::Clock::now(), kj::mv(connection), kj::mv(shipper)
        });
        server.publishDurableRoot(state.durableHome, tree);
@@ -558,7 +558,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      }
      auto& database = *state.nativeDatabase;
      KJ_REQUIRE(database.tree == tree, "mismatched native database home");
-@@ -6425,7 +6513,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6845,7 +6933,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        alarm = time;
      }
      auto service = kj::heap<NativeDatabaseHttp>(server, state, std::move(route), ticket.tree,
@@ -567,7 +567,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
      co_return rpc::EventDispatcher::Client(
          kj::heap<NativeDatabaseDispatcher>(state, kj::mv(service)));
    }
-@@ -6877,6 +6965,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7314,6 +7402,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
      std::optional<Admission::Ticket> durableCredit;
      std::optional<DurableRoute> durableRoute;
      Admission::Time durableDeadline{};
@@ -575,7 +575,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
    };
    std::map<int, Connection> connections;
    std::map<uint64_t, int> durableWaiting;
-@@ -6943,7 +7032,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7380,7 +7469,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
          const auto size = recv(fd, &discarded, 1, MSG_DONTWAIT | MSG_PEEK);
          if (size > 0 &&
              server.handoffDurable(fd, *connection.durableRoute, *connection.durableCredit,
@@ -584,7 +584,7 @@ index 07993d6ae86eae623231cfb724b720be99fea0d8..5f17d2676a8dc6493092a7f318f6c67a
            epoll_ctl(epoll, EPOLL_CTL_DEL, fd, nullptr);
            durableWaiting.erase(connection.durableCredit->event);
            connections.erase(found);
-@@ -6992,12 +7081,14 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7429,12 +7518,14 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                  "invalid durable routing deadline");
              auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
                  std::chrono::nanoseconds(deadlineNs)));

@@ -538,7 +538,7 @@ index f49268a48222ee29dd41f0e5aab49b6d4b4169fb..9311bc4eafdd42d14740add3ecf5af97
    uint64_t walBytes();
    uint64_t databaseBytes();
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5ccaf3a14d46 100644
+index 313e4736d4f056d67a97ed05b070780b8468274a..f4af50218418a4b46f623932eb0711d117669352 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -425,15 +425,25 @@ class NativeSqlReservation final: public SqliteMemoryBudget {
@@ -588,7 +588,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
  };
  
  struct ResourceReservation {
-@@ -2490,6 +2498,7 @@ struct ThreadedServer {
+@@ -2495,6 +2503,7 @@ struct ThreadedServer {
    std::atomic<bool> refuseDurableGroupForTest{false};
    const uint64_t durableCommitDelayMs;
    const uint64_t nativeSqlDatabaseSpillBytes = configuredCount("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES", 1ull << 30);
@@ -596,7 +596,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
    const std::string bindingAddress = getenv("COWORKERD_THREADED_BINDING_ADDRESS") == nullptr
        ? ""
        : getenv("COWORKERD_THREADED_BINDING_ADDRESS");
-@@ -6403,6 +6412,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6823,6 +6832,9 @@ class NativeDatabaseHttp final: public kj::HttpService {
          const auto format = resource == "?resultsFormat=ROWS_AND_COLUMNS"
              ? server::NativeSqlResults::COLUMNS : server::NativeSqlResults::OBJECTS;
          auto sql = inputSize == 0 ? ""_kj : kj::StringPtr(input.begin(), inputSize);
@@ -606,7 +606,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
          reply = server::runNativeSql(connection, sql, query, format,
              sqlDeadline, connectionFd, database.spill.get(), &requestMemory);
        }
-@@ -6413,7 +6425,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6833,7 +6845,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
      server.reportNativeDatabaseMemory(state.durableHome, connection.getSqliteMemoryBytes());
      // A canceled client must not cancel acknowledgement of already committed WAL.
      // Keep the admitted connection alive until the outstanding confirmation settles.
@@ -616,7 +616,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
        server.closeNativeDatabase(state);
      }
      database.confirming = true;
-@@ -6452,7 +6465,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6872,7 +6885,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
      constexpr size_t MAX_BODY = 40ull << 20;
      if (body.tryGetLength().orDefault(0) > MAX_BODY) co_return requestTooLarge();
      char chunk[8192];
@@ -626,7 +626,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
      KJ_DEFER(memory.release(sizeof(chunk)));
      for (;;) {
        auto bytes = co_await body.tryRead(chunk, 1, sizeof(chunk));
-@@ -6460,13 +6474,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6880,13 +6894,8 @@ class NativeDatabaseHttp final: public kj::HttpService {
        if (bytes > MAX_BODY - size) co_return requestTooLarge();
        if (size + bytes + 1 > input.size()) {
          auto capacity = std::min(MAX_BODY + 1, std::max(size + bytes + 1, input.size() * 2));
@@ -642,7 +642,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
          const auto previous = input.size();
          auto next = kj::heapArray<char>(capacity);
          if (size != 0) memcpy(next.begin(), input.begin(), size);
-@@ -6480,24 +6489,22 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6900,24 +6909,22 @@ class NativeDatabaseHttp final: public kj::HttpService {
      co_return server::NativeSqlReply{0, {}};
    }
  
@@ -673,7 +673,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
    static server::NativeSqlReply storageFailure(const kj::Exception& error) {
      auto reason = error.getDescription();
      if (reason.startsWith("jsg.Error: ")) reason = reason.slice(sizeof("jsg.Error: ") - 1);
-@@ -6550,10 +6557,12 @@ class NativeDatabaseHttp final: public kj::HttpService {
+@@ -6970,10 +6977,12 @@ class NativeDatabaseHttp final: public kj::HttpService {
            route.uniqueKey.c_str(), route.storageId.c_str(), *vfs);
        kj::Own<server::DurableLogShipper> shipper;
        if (state.wal) {
@@ -687,7 +687,7 @@ index abc8ee53b80ce33fe0183f9e820e2a43800cd50d..af3cd79f88cf4cae4f08acc2e15d5cca
          shipper->reportAlarm(server::readDurableAlarm(*connection));
        }
        state.nativeDatabase.emplace(ThreadState::NativeDatabase{
-@@ -7429,7 +7438,11 @@ int main(int argc, char **argv) {
+@@ -7866,7 +7875,11 @@ int main(int argc, char **argv) {
    const int listener = strtol(argv[1], nullptr, 10);
    ThreadedServer *server;
    try {
