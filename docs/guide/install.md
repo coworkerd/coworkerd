@@ -487,7 +487,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `hostCheck.sampleMiB` | `16` | Fresh anonymous memory touched per round, `1` to `4096` MiB; larger samples increase both detection probability and cost. A failed helper is reported in `state.host` and retried at the next interval; service continues |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off (a drain closes the node's WebSocket connections with `1001` at its start) |
-| `ingress.webSocketsPerTenant` | `1000` | The open WebSocket connections this node's ingress holds for one tenant: an upgrade beyond them is refused before the Worker runs, `429 WEBSOCKET_LIMIT`, and other requests are not affected; `0`: no limit |
+| `ingress.webSocketsPerNode` | `0` (automatic) | Optional lower ceiling shared by all tenants on this ingress node. See [inbound WebSocket capacity](#inbound-websocket-capacity) |
 | `rotation.*` | see the schema | Process rotation, which replaces a process by a new generation with in-flight requests completing in the old one: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `residentBytes` (rotate a process whose resident memory reaches it; left out, 70% of the node's memory -- its container's `memory.max`, else `memoryBudgetBytes`, else the machine's), `maxAgeMs` (default `0`, off; a value replaces every process after that long, as releases before 0.4.1 did every hour), `maxRequests`, `drainTimeoutMs` and others |
 | `gc.*` | see the schema | Garbage collection in the workerd processes ([process isolation](../process-isolation.md), section 4): `budgetMs` / `refillMsPerSecond` (`2000` / `100`: each Worker's budget of full-collection CPU the CPU limit does not charge to the request it runs in; `0` charges every collection), `longPauseMs` (`100`: a collection that pauses a process that long is named in `logs/workerd.log`; `0`: none), `idleCollectAfterMs` / `idleCollectMinGrowthMiB` (`50` / `4`: an idle Worker's isolate is collected between its requests; `0` turns it off), `initialOldSpaceMiB` (`8`: V8's initial old generation), `runtimeHeapMiB` (`128`: the runtime's heap; `0` leaves V8's own) |
 | `sandbox.mode` | `auto` | The least-privilege environment of workerd ("Sandbox" in section 4): `auto` turns it on when the prerequisites are met, otherwise runs without it and warns; `launcher` refuses to start without them; `off` turns it off |
@@ -539,6 +539,18 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PEER_KEY_FILE` (by default `cluster-key.json` there, used when present), `COWORKERD_PEER_ADDRESS`, `COWORKERD_LISTEN_ADDRESS`, `COWORKERD_PEER_LISTEN_ADDRESS`,
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
+
+### Inbound WebSocket capacity
+
+The ingress node counts pending upgrades and open WebSockets together across all tenants. When the ceiling is full, the node sends `503 WEBSOCKET_NODE_CAPACITY` before dispatch. Ordinary HTTP requests use their own admission rules.
+
+At startup the node reads its effective soft `RLIMIT_NOFILE` after process-pool setup, capped by `kern.maxfilesperproc` on macOS. An unlimited soft limit uses the hard limit, and a platform that reports both as unlimited uses a budget of 65,536 descriptors. The node sets aside at least half of that budget, rounded up, or 256 descriptors, whichever is greater. This leaves room for ordinary HTTP, listeners, peer and child channels, storage and other files. Each WebSocket place accounts for two of the remaining descriptors, allowing for the client socket and an upstream socket. The node rounds down to a whole number of places. For example, a soft limit of 65,536 gives 16,384 places.
+
+A positive `ingress.webSocketsPerNode` can lower this ceiling. It is capped at the automatic value. The node reports the effective ceiling in its startup configuration and in `webSockets.limitPerNode` on `/__coworkerd/state`. The same state section reports `inUse` for the number of held places and `places` and `refused` for the per-tenant counts.
+
+Worker and workerd process memory limits still apply. The descriptor calculation does not reserve aggregate memory for socket and relay buffers. Use a lower ceiling when memory is the tighter constraint for a deployment.
+
+Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration file that sets it, including files that set it to zero. The loader rejects the old field so an operator cannot mistake its value for a node limit. Leaving out the new field uses automatic sizing. Set `ingress.webSocketsPerNode` only when the node needs a lower shared ceiling.
 
 ## 6. Tenants and deployments
 

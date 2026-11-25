@@ -106,7 +106,7 @@ webSocketError(ws, error) { console.error(String(error)); }
 
 Use `ctx.getWebSockets(tag?)`, `ctx.getTags(ws)` and `ctx.setWebSocketAutoResponse()` to manage accepted connections. An idle object's eviction leaves hibernatable connections open; the next delivered message constructs the object again with those connections and the same storage. Reconstruct in-memory state from storage in the constructor. Calling `ws.accept()` instead uses the ordinary WebSocket API and does not opt into this hibernation path.
 
-The upstream host keeps connections in its durable process. Process rotation, node drain and node exit end those connections. Incoming messages are at most 32 MiB and the ingress default is 1000 open connections per tenant per node (`429 WEBSOCKET_LIMIT` beyond it). Compression is disabled. CPU is charged as message handlers execute.
+The upstream host keeps connections in its durable process. Process rotation, node drain and node exit end those connections. Incoming messages are at most 32 MiB. Inbound upgrades use the [WebSocket ceiling shared by all tenants on the ingress node](install.md#inbound-websocket-capacity). Compression is disabled. CPU is charged as message handlers execute.
 
 On the experimental threaded host, an eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
 

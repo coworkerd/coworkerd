@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { rename, unlink, writeFile } from 'node:fs/promises';
+import { get } from 'node:http';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -22,6 +23,117 @@ async function deployment(cluster) {
       assert.deepEqual(Object.fromEntries(cluster.nodes.map((node, i) => [node, observed[i]])),
         Object.fromEntries(cluster.nodes.map(node => [node, { status: 200, text: expected }])));
     });
+  }
+}
+
+export async function webSocketAdmission(cluster) {
+  const [node, otherNode] = cluster.nodes;
+  const { WebSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const source = `export default { async fetch(request) {
+    if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('ready');
+    const path = new URL(request.url).pathname;
+    if (path.endsWith('/pending')) {
+      await new Promise(resolve => setTimeout(resolve, 15000));
+      return new Response(null, { status: 403 });
+    }
+    if (path.endsWith('/decline')) {
+      const body = new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('declined'));
+        setTimeout(() => controller.close(), 15000);
+      } });
+      return new Response(body, { status: 403 });
+    }
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.addEventListener('close', event => server.close(event.code, event.reason));
+    return new Response(null, { status: 101, webSocket: client });
+  } };`;
+  const first = await cluster.tenant('socket-first');
+  const second = await cluster.tenant('socket-second');
+  for (const tenant of [first, second]) {
+    await cluster.deploy(tenant, 'socket', source);
+    await eventually('Worker ready on both ingresses', async () => {
+      for (const ingress of [node, otherNode]) {
+        assert.deepEqual(await workerCall(cluster, ingress, tenant, 'socket'), { status: 200, text: 'ready' });
+      }
+    });
+  }
+  const sockets = [];
+  const url = (ingress, tenant, suffix = '') => new URL(`/${tenant.name}/socket${suffix}`, cluster.urls[ingress]);
+  const waitFor = (socket, event) => once(socket, event, { signal: AbortSignal.timeout(5000) });
+  function connect(ingress, tenant, suffix) {
+    const target = url(ingress, tenant, suffix);
+    target.protocol = 'ws:';
+    const socket = new WebSocket(target);
+    socket.on('error', () => {});
+    sockets.push(socket);
+    return socket;
+  }
+  async function open(ingress, tenant) {
+    const socket = connect(ingress, tenant);
+    await waitFor(socket, 'open');
+    return socket;
+  }
+  const decline = () => new Promise((resolve, reject) => {
+    get(url(node, second, '/decline'), {
+      signal: AbortSignal.timeout(5000),
+      headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64') },
+    }, resolve).once('error', reject).once('upgrade', (_response, socket) => {
+      socket.destroy();
+      reject(new Error('the Worker should refuse the upgrade'));
+    });
+  });
+  const state = async () => (await cluster.state(node)).webSockets;
+  const inUse = (count) => eventually(`node has ${count} WebSocket reservations`, async () => {
+    assert.equal((await state()).inUse, count);
+  }, { timeout: 5000 });
+  try {
+    assert.equal((await state()).limitPerNode, 2);
+    assert.equal((await cluster.state(otherNode)).webSockets.limitPerNode, 16384);
+    const a = await open(node, first);
+    const b = await open(node, second);
+    const full = await state();
+    assert.equal(full.inUse, 2);
+    assert.deepEqual(full.places, { [first.name]: 1, [second.name]: 1 });
+    const denied = await decline();
+    assert.equal(denied.statusCode, 503);
+    let body = '';
+    for await (const chunk of denied) body += chunk;
+    const { code, limit, inFlight, dispatched, retryable } = JSON.parse(body);
+    assert.deepEqual({ code, limit, inFlight, dispatched, retryable },
+      { code: 'WEBSOCKET_NODE_CAPACITY', limit: 2, inFlight: 2, dispatched: false, retryable: true });
+    assert.deepEqual(await workerCall(cluster, node, second, 'socket'), { status: 200, text: 'ready' });
+    await open(otherNode, second);
+
+    const closed = waitFor(a, 'close');
+    a.close(1000, 'done');
+    assert.equal((await closed)[0], 1000);
+    await inUse(1);
+
+    const pending = connect(node, first, '/pending');
+    await inUse(2);
+    assert.equal(pending.readyState, WebSocket.CONNECTING);
+    pending.terminate();
+    await inUse(1);
+
+    const declined = await decline();
+    try {
+      assert.equal(declined.statusCode, 403);
+      await inUse(1);
+      assert.equal(declined.complete, false, 'the upgrade place is free while the HTTP body is still streaming');
+      await open(node, first);
+      await inUse(2);
+    } finally {
+      declined.destroy();
+    }
+
+    b.terminate();
+    await inUse(1);
+    await open(node, second);
+    await inUse(2);
+  } finally {
+    for (const socket of sockets) socket.terminate();
   }
 }
 

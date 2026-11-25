@@ -20,17 +20,20 @@ FetchContent_MakeAvailable(capnproto)
 
 # KJ's HTTP entity writers must honor AsyncOutputStream::abortWrite(). Without
 # this, destroying a chunked writer after an upstream read failure sends EOF.
+# Also let ingress cancel a pending WebSocket handshake after a client sends TCP FIN.
 find_package(Git REQUIRED)
-set(KJ_HTTP_ABORT_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/kj-http-abort.diff")
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${KJ_HTTP_ABORT_PATCH}"
-  WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
-  OUTPUT_QUIET ERROR_QUIET)
-if(NOT patch_check EQUAL 0)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-endif()
+foreach(patch IN ITEMS kj-http-abort.diff kj-websocket-handshake-eof.diff)
+  set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch_file}"
+    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT patch_check EQUAL 0)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+  endif()
+endforeach()
 
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
@@ -278,6 +281,7 @@ target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
 add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
+add_test(NAME node-config-websocket COMMAND coworkerd-config-test websocket)
 add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
 add_executable(coworkerd-v8-sandbox-test EXCLUDE_FROM_ALL node/v8-sandbox-test.c++ node/v8-sandbox.c++)
 target_include_directories(coworkerd-v8-sandbox-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")

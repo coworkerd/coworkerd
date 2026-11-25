@@ -1,7 +1,7 @@
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { cases, durableGatedCases, fatalAttribution } from './cases.mjs';
+import { cases, durableGatedCases, fatalAttribution, webSocketAdmission } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
@@ -34,7 +34,7 @@ async function runSuite(selected, kernel, signal, options) {
 }
 
 async function main(args) {
-  const all = { ...cases, ...durableGatedCases, 'fatal-attribution': fatalAttribution };
+  const all = { ...cases, ...durableGatedCases, 'fatal-attribution': fatalAttribution, 'websocket-admission': webSocketAdmission };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
   if (args[0] === '--help' && args.length === 1) return console.log(help);
   if (args.length !== 1 && (args.length !== 2 || !Object.hasOwn(all, args[1]))) {
@@ -56,12 +56,16 @@ async function main(args) {
   const regular = fatalTest ? [['fatal-attribution', fatalAttribution]]
     : Object.entries(cases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
+  const testWebSockets = !args[1] || args[1] === 'websocket-admission';
   let failed = 0;
   try {
     if (regular.length) {
       failed += await runSuite(regular, kernel, controller.signal, {
         fatalTestBinary: fatalTest ? resolve(testBinary) : undefined,
       });
+    }
+    if (testWebSockets) {
+      failed += await runSuite([['websocket-admission', webSocketAdmission]], kernel, controller.signal, { webSocketsPerNode: 2 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
       delayRecoveryPeers }] of gated) {
@@ -70,7 +74,7 @@ async function main(args) {
         controlDurableLifecycle, delayRecoveryPeers,
       });
     }
-    console.log(`${regular.length + gated.length} executed, ${failed} failed`);
+    console.log(`${regular.length + gated.length + Number(testWebSockets)} executed, ${failed} failed`);
   } finally {
     console.log(`Cluster run including setup and cleanup: ${((performance.now() - start) / 1000).toFixed(1)} s`);
   }

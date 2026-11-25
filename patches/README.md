@@ -8,6 +8,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 | `workerd/series` | The order of the patches |
 | `workerd/0001-native-binding.patch` ... | One patch per file; the header of each states its purpose |
 | `kj-http-abort.diff` | A change to Cap'n Proto's KJ that `CMakeLists.txt` applies when it builds the daemons: KJ's HTTP entity writers honor `abortWrite()`, so a response that fails midway ends with an error instead of looking complete |
+| `kj-websocket-handshake-eof.diff` | Lets the ingress cancel pending WebSocket upgrades on a client TCP half-close so it can return their connection places promptly |
 
 ## How the series is maintained
 

@@ -45,7 +45,7 @@ export async function eventually(description, probe, { timeout = 30000, interval
 export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
-    controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary,
+    controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -71,6 +71,7 @@ export class Cluster {
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
+    this.webSocketsPerNode = webSocketsPerNode;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
@@ -136,6 +137,7 @@ export class Cluster {
         egress: { clusterAddresses: ['apiserver:8940'] },
         // Pin stateless ingress to the receiving node and its sole ordinary process.
         ingressPlacement: false, processPool: { count: 1 },
+        ...(node === nodes[0] && this.webSocketsPerNode ? { ingress: { webSocketsPerNode: this.webSocketsPerNode } } : {}),
         ...(this.fatalControl ? { quarantineProcesses: 1 } : {}),
         membership: this.membership,
         ...(this.threadedNodes.has(node) ? {
@@ -150,6 +152,7 @@ export class Cluster {
         } : {}),
       }));
       overrides[node] = {
+        ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 65536, hard: 65536 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.
         restart: 'no',
         environment: { COWORKERD_CONFIG: target },
