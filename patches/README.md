@@ -61,6 +61,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
   WebSocket hooks carry a native upgrade through local facet fetches. The legacy hibernation manager
   and the threaded host validate the upgrade against the tree that staged it.
+  Patch 0150 recognizes the platform Durable Object definition on the threaded host. It checks the
+  tenant and local definition pin before the home uses the existing package compiler and actor path.
+  Its two paths are `threaded-server.c++` and `threaded-server-test.c++` in `src/workerd/threaded/`.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

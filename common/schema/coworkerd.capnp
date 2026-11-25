@@ -299,6 +299,9 @@ struct ObjectInvocation {
   alarmRetryCount @21 :UInt32;
   # Internal alarm routing; only the root object schedules alarms, always at facet 0.
   alarmFacetId @22 :UInt32 = 1;
+  # For platform namespaces the owner resolves this class reference against its own build.
+  platformDefinition @23 :Text;
+  platformClass @24 :Text;
 }
 
 struct ServerConfig {

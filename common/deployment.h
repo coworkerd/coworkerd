@@ -194,6 +194,11 @@ struct DurableObjectNamespace {
   uint32_t shards = 1024;
   bool operator==(const DurableObjectNamespace&) const = default;
 };
+
+struct PlatformClassRef {
+  std::string definition, name;
+  bool operator==(const PlatformClassRef&) const = default;
+};
 std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces);
 std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes,
     bool databases = false, size_t* invalidEntries = nullptr);
@@ -340,6 +345,7 @@ public:
   struct NamespaceOwner {
     std::string tenant, workerId, className, database, status;
     uint32_t shards = 1024;
+    std::optional<PlatformClassRef> platformClass;
     bool isDatabase() const { return !database.empty(); }
     bool active() const { return status == "active"; }
   };

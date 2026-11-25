@@ -201,13 +201,13 @@ Cloudflare. Two things therefore go with this choice: another copy is used when 
 only when the copy is full, and the guide tells authors that objects of one class may share an isolate and
 that synchronous work should be short.
 
-### Platform Durable Object definitions (proposal for #82)
+### Platform Durable Object definitions
 
-The threaded durable host will load the product's own Durable Object classes from the
-`coworkerd:platform` definition. Its entry module exports the classes. The node daemon will
-carry an immutable ES module package built with the product. The private source service gives
+The threaded durable host loads the product's own Durable Object classes from the
+`coworkerd:platform` definition. Its entry module exports the classes. The node daemon
+carries an immutable ES module package built with the product. The private source service gives
 the durable host the package for the admitted invocation, using the existing module manifest
-and hash checks. The host will compile the package on a durable home with the same compiler
+and hash checks. The host compiles the package on a durable home with the same compiler
 and exported-class checks as a Worker's package. `runtime.js` continues to provide the process
 entrypoint and its runtime services. Adding a class consists of exporting it from the platform
 entry module, with its module included in the package when it lives in a separate file.

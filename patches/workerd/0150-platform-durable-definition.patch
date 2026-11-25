@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 16:04:14 +0800
+Subject: [PATCH] Load product Durable Object packages on threaded homes
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..aaf24cdd0d4e58fc2d959afd20e04b619cef87cb 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -40,6 +40,31 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
+   limits.customizeIsolate(isolate);
+ }
+ 
++KJ_TEST("platform durable plans pin the class and copy to the tenant") {
++  JsonDoc input(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
++      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
++  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/__platform","format":"v2","versionId":"build-a",
++      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
++  JsonDoc bound(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
++      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
++      "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
++  JsonDoc alpha(kj::str(R"({"tenant":"alpha","definitionName":"coworkerd:platform-test"})"));
++  JsonDoc beta(kj::str(R"({"tenant":"beta","definitionName":"coworkerd:platform-test"})"));
++  JsonDoc selection(kj::str(R"({"className":"Store"})"));
++  JsonDoc otherClass(kj::str(R"({"className":"Other"})"));
++  DurableRoute route{};
++  route.open.className = "Store";
++  route.open.definition = platformCopyKey(input.get(), alpha.get());
++  KJ_EXPECT(platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
++  KJ_EXPECT(platformCopyKey(otherTenant.get(), beta.get()) != route.open.definition);
++  KJ_EXPECT(!platformDurablePlan(otherTenant.get(), beta.get(), selection.get(), route));
++  KJ_EXPECT(!platformDurablePlan(input.get(), beta.get(), selection.get(), route));
++  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), otherClass.get(), route));
++  KJ_EXPECT(!platformDurablePlan(bound.get(), alpha.get(), selection.get(), route));
++  route.open.definition = "wrong pin";
++  KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
++}
++
+ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
+   int fds[2];
+   KJ_SYSCALL(pipe(fds));
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 7f355641445dd2329a222cf84eedeaf028c1b154..178f4c0f1455ead73382f19fe5c5b5430fc7646c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -75,6 +75,7 @@
+ #include <cerrno>
+ #include <charconv>
+ #include <chrono>
++#include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -2101,6 +2102,35 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
+   SHA256(value.begin(), value.size(), result);
+   return kj::encodeHex(result).cStr();
+ }
++
++std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
++  auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
++    auto value = field(descriptor, name);
++    if (value.isNull()) return 0;
++    KJ_REQUIRE(value.isNumber() && value.getNumber() >= 0 && value.getNumber() <= UINT32_MAX &&
++        std::floor(value.getNumber()) == value.getNumber(), "invalid platform object limit", name);
++    return uint32_t(value.getNumber());
++  };
++  auto identity = kj::str(text(plan, "tenant"), "\n", text(plan, "definitionName"), "\n",
++      text(descriptor, "versionId"), "\n", text(descriptor, "definitionHash"), "\n",
++      text(descriptor, "contentHash"), "\n", namedLimit("cpuLimitMs"), "\n",
++      namedLimit("memoryLimitMiB"));
++  return "platform-v1:" + digest(identity.asBytes());
++}
++
++bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
++    const DurableRoute &route) {
++  const auto tenant = text(plan, "tenant");
++  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/__platform") ||
++      text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
++      platformCopyKey(input, plan) != route.open.definition) return false;
++  auto empty = [](Json::Reader value) {
++    return value.isNull() || (value.isArray() && value.getArray().size() == 0);
++  };
++  return empty(field(input, "variables")) && empty(field(input, "secrets")) &&
++      empty(field(input, "nativeNamespaces")) && empty(field(plan, "serviceBindings")) &&
++      empty(field(plan, "durableObjects"));
++}
+ std::string decode64(kj::StringPtr input) {
+   KJ_REQUIRE(input.size() % 4 == 0, "invalid module encoding");
+   std::string value(input.size() / 4 * 3, '\0');
+@@ -6551,12 +6581,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+   auto input = full.get();
+   auto selection = field(input, "rootSelection");
+   auto plan = field(input, "rootPlan");
++  const auto kind = text(plan, "kind");
+   KJ_REQUIRE(readDurableRoute(field(input, "durableTestRoute")) == route &&
+           flag(selection, "dispatchChecked") &&
+           str(selection, "namespaceId") == route.key.namespaceId &&
+           str(selection, "objectId") == route.key.objectId &&
+           durableNumber(selection, "dataEpoch") == route.open.dataEpoch &&
+-          text(plan, "kind") == "tenant" &&
++          (kind == "tenant" || (kind == "platformDurable" &&
++              platformDurablePlan(input, plan, selection, route))) &&
+           str(plan, "versionFingerprint") == route.open.definition &&
+           route.uniqueKey == "coworkerd-do-root-v1-" + route.key.namespaceId,
+       "durable routing descriptor mismatch");
