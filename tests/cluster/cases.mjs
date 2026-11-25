@@ -297,6 +297,38 @@ async function d1InvocationBudgets(cluster) {
   } finally {
     socket.terminate();
   }
+
+  await cluster.deploy(tenant, 'd1-actor', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class BudgetActor extends DurableObject {
+      async fetch(request) {
+        if (new URL(request.url).pathname === '/child') return new Response('child');
+        const statement = n => this.env.DB.prepare('SELECT ? AS value').bind(n);
+        const batch = await this.env.DB.batch([statement(1), statement(2)]);
+        const query = await statement(3).first('value');
+        let refusal;
+        try { await statement(4).run(); } catch (error) { refusal = error.message; }
+        const child = this.env.OBJECT.getByName('child');
+        const ran = await child.fetch('https://object.test/child');
+        const denied = await child.fetch('https://object.test/child');
+        return Response.json({ batch: batch.map(result => result.results[0].value), query, refusal,
+          child: await ran.text(), status: denied.status, code: (await denied.json()).code });
+      }
+    }
+    export default {
+      fetch(_request, env) {
+        return env.OBJECT.getByName('parent').fetch('https://object.test/parent');
+      }
+    };
+  `, { wrangler: { limits: { subrequests: 500 },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['BudgetActor'] }],
+    durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'BudgetActor' }] },
+    d1_databases: [{ binding: 'DB', database_name: 'budget-db' }] } });
+  const object = json(await workerCall(cluster, node, tenant, 'd1-actor'), 200, 'D1 budget from a Durable Object');
+  assert.deepEqual(object.batch, [1, 2]);
+  assert.equal(object.query, 3);
+  assert.match(object.refusal, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
+  assert.deepEqual([object.child, object.status, object.code], ['child', 429, 'SUBREQUEST_BUDGET_EXHAUSTED']);
 }
 
 async function ordinaryProcess(cluster, node) {
