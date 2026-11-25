@@ -9,6 +9,8 @@ bash "$control/build-kernel.sh"
 
 stage=build/kernel-ci
 raw="$stage/raw"
+fatal_test="$PWD/workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded-fatal-test"
+test -x "$fatal_test"
 mkdir -p "$raw/allowlist"
 install -m 0755 workerd/bazel-bin/src/workerd/server/workerd "$raw/workerd"
 install -m 0755 workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded "$raw/coworkerd-threaded"
@@ -53,6 +55,8 @@ if missing or failed or skipped:
     raise SystemExit(f"Expected all unit tests to pass with zero skips. Missing tests: {sorted(missing)}")
 PY
 node tests/cluster/run.mjs "$kernel" | tee "$stage/cluster.log"
+COWORKERD_CLUSTER_FATAL_TEST_BINARY="$fatal_test" \
+  node tests/cluster/run.mjs "$kernel" fatal-attribution | tee -a "$stage/cluster.log"
 
 {
   printf '### Cluster workloads\n\n'

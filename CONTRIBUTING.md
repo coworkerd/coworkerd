@@ -76,7 +76,9 @@ from `main` with the run ID, attempt number, and source SHA in the build summary
 
 On both Linux architectures the hosted build runs the factory and threaded Bazel tests and the upstream test files
 extended by our patches. The tests reuse the release build's outputs. A test failure stops that architecture job
-before packaging. The build summary records the elapsed time of the Bazel test invocation.
+before packaging. The build summary records the elapsed time of the Bazel test invocation. The hosted build also
+builds `coworkerd-threaded-fatal-test` for the `fatal-attribution` cluster case. This executable is used only by
+that case. The archive and the regular cluster suite use the production binaries.
 
 Use the series tag printed by `package-kernel.py` for a local publication. When adding an architecture to a
 local release, update `SHA256SUMS` to include every published archive. For hosted builds, record the published
