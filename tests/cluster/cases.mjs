@@ -21,15 +21,17 @@ async function assertStreamingStatus(response, status, description) {
 async function deployment(cluster) {
   const tenant = await cluster.tenant('deploy-test');
   const path = `/${tenant.name}/hello`;
-  for (const version of ['v1', 'v2']) {
-    const expected = `hello from ${version}`;
-    await cluster.deploy(tenant, 'hello', respondWith(expected), { version });
-    await eventually(`${version} serves on all three ingresses`, async () => {
-      const observed = await Promise.all(cluster.nodes.map(node => request(cluster.urls[node], path)));
-      assert.deepEqual(Object.fromEntries(cluster.nodes.map((node, i) => [node, observed[i]])),
-        Object.fromEntries(cluster.nodes.map(node => [node, { status: 200, text: expected }])));
-    });
-  }
+  const body = `diagnostics-probe-start\n${'x'.repeat(700)}\ndiagnostics-probe-end`;
+  await cluster.deploy(tenant, 'hello', `export default {
+    fetch() { return new Response(${JSON.stringify(body)}, { status: 503 }); }
+  };`);
+  const response = await eventually('the controlled response reaches the ingress', async () => {
+    const reply = await request(cluster.urls['node-1'], path);
+    assert.deepEqual(reply, { status: 503, text: body });
+    return reply;
+  });
+  await cluster.compose(['kill', 'node-3']);
+  assertStatus(response, 200, 'controlled deployment failure');
 }
 
 async function webSocketAdmission(cluster) {

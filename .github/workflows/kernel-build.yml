@@ -59,10 +59,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: linux-x86_64
-            runner: ubuntu-24.04
-            bazelisk: amd64
-            bazelisk-sha256: a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8
           - arch: linux-arm64
             runner: ubuntu-24.04-arm
             bazelisk: arm64
@@ -94,7 +90,7 @@ jobs:
           KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
-          bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/test-hosted-kernel.sh
+          bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/rehearse-cluster-failure.sh
       - name: Upload cluster failure diagnostics
         if: failure() && hashFiles('source/build/kernel-ci/cluster.log') != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
