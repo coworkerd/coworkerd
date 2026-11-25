@@ -542,7 +542,7 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ### Invocation budgets
 
-Each root starts with 10,000 subrequests by default. Set `limits.subrequests` in a Worker's Wrangler configuration to give that version a limit from 1 through 10,000,000. An administrator can set a lower tenant default for versions that omit the field.
+Each invocation starts with 10,000 subrequests by default, including invocations through Service Bindings and Durable Object calls. Set `limits.subrequests` in a Worker's Wrangler configuration to give that version a limit from 1 through 10,000,000. An administrator can set a lower tenant default for versions that omit the field.
 
 ```toml
 [limits]
@@ -555,7 +555,7 @@ cowctl tenant update T --default-subrequests 50 --default-d1-queries 50
 
 `defaultLimits.subrequests` accepts 1 through 10,000. `defaultLimits.d1Queries` accepts 1 through 1,000 and applies across the tenant's database bindings. Each invocation gets its own D1 allowance. A query, a `batch()`, or an `exec()` spends a single D1 request and one subrequest. The administrator sets the full `defaultLimits` object in one update. Include any CPU and memory defaults you want to keep.
 
-Existing Worker versions inherit the tenant or platform default. Existing `COWORKERD_SUBREQUEST_BUDGET` and `COWORKERD_SUBREQUEST_GRANT` values are still read. The former supplies the node's fallback in lieu of 10,000. The latter fixes the maximum child grant in lieu of the proportional rule. Remove those environment overrides to adopt the new defaults. Upgrade the nodes, control plane and kernel together before deploying versions with `limits.subrequests`. See [the call lease](../architecture.md#3-the-path-of-one-call) for counted operations and [error codes](errors.md) for quota refusals.
+Existing Worker versions inherit the tenant or node default. `COWORKERD_SUBREQUEST_BUDGET` still supplies the node's fallback in lieu of 10,000. An existing `COWORKERD_SUBREQUEST_GRANT` setting is accepted with a startup warning. Each callee resolves its own limit. Upgrade the nodes, control plane and kernel together before deploying versions with `limits.subrequests`. See [the call lease](../architecture.md#3-the-path-of-one-call) for counted operations and [error codes](errors.md) for quota refusals.
 
 ### Inbound WebSocket capacity
 

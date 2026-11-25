@@ -686,7 +686,7 @@ function durableFieldsValid(value) {
 function descriptorFrom(request) {
   const value = request.cf;
   const remainingSubrequests = Number(value?.lease?.remainingSubrequests);
-  const grant = Number(value?.lease?.grant);
+  const subrequestLimit = Number(value?.lease?.subrequestLimit ?? value?.lease?.grant);
   const orderSequence = Number(value?.orderSequence);
   const depth = Number(value?.depth);
   const expiresAtMonotonicMs = Number(value?.lease?.expiresAtMonotonicMs);
@@ -709,9 +709,9 @@ function descriptorFrom(request) {
     !Number.isInteger(remainingSubrequests) ||
     remainingSubrequests < 0 ||
     remainingSubrequests > 10_000_000 ||
-    !Number.isInteger(grant) ||
-    grant < 0 ||
-    grant > 10_000_000 ||
+    !Number.isInteger(subrequestLimit) ||
+    subrequestLimit < 0 ||
+    subrequestLimit > 10_000_000 ||
     !Number.isFinite(expiresAtMonotonicMs) ||
     expiresAtMonotonicMs <= 0 ||
     !Number.isInteger(orderSequence) ||
@@ -731,7 +731,7 @@ function descriptorFrom(request) {
   }
   return {
     ...value,
-    lease: { ...value.lease, remainingSubrequests, grant, expiresAtMonotonicMs },
+    lease: { ...value.lease, remainingSubrequests, subrequestLimit, grant: subrequestLimit, expiresAtMonotonicMs },
     orderSequence,
     depth,
   };

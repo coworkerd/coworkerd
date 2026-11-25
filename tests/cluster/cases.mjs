@@ -180,53 +180,77 @@ async function invocationBudgets(cluster) {
   const [node] = cluster.nodes;
   const tenant = await cluster.tenant('invocation-budget');
   const bindings = [{ binding: 'CHILD', service: 'budget-child' }];
-  const child = `export default { async fetch(request, env) {
-    if (new URL(request.url).pathname === '/nested') {
-      const next = await env.CHILD.fetch('https://binding.test/');
-      return Response.json([request.cf.lease.grant, await next.json()]);
-    }
-    return Response.json(request.cf.lease.grant);
-  } };`;
-  const root = `export default { async fetch(request, env) {
+  const runner = `export default { async fetch(request, env) {
     const params = new URL(request.url).searchParams;
-    const count = Number(params.get('count') ?? '0');
-    const grants = [];
-    let refusal;
-    for (let i = 0; i < count; i++) {
-      const reply = await env.CHILD.fetch(params.has('nested') ? 'https://binding.test/nested' : 'https://binding.test/');
-      if (!reply.ok) { refusal = await reply.json(); break; }
-      grants.push(await reply.json());
+    const count = Number(params.get('count') ?? '1');
+    const binding = params.has('lowerChild') ? env.LOWER_CHILD : env.CHILD;
+    const target = new URL('https://binding.test/');
+    if (params.has('childCalls')) target.searchParams.set('count', params.get('childCalls'));
+    const limit = request.cf.lease.subrequestLimit;
+    let result;
+    for (let completed = 0; completed < count; ++completed) {
+      const reply = await binding.fetch(target);
+      const value = await reply.json();
+      if (!reply.ok) return Response.json({ limit, completed, refusal: { status: reply.status, code: value.code } });
+      result = value;
     }
-    return Response.json({ rootGrant: request.cf.lease.grant, grants, refusal: refusal?.code });
+    return Response.json({ limit, completed: count, result });
   } };`;
-  await cluster.deploy(tenant, 'budget-leaf', child);
-  await cluster.deploy(tenant, 'budget-child', child,
-    { wrangler: { services: [{ binding: 'CHILD', service: 'budget-leaf' }] } });
-  await cluster.deploy(tenant, 'budget-root', root, { wrangler: { services: bindings } });
-  const call = async (worker, count, nested = false) => json(
-    await workerCall(cluster, node, tenant, `${worker}?count=${count}${nested ? '&nested' : ''}`),
+  const leaf = [{ binding: 'CHILD', service: 'budget-leaf' }];
+  await cluster.deploy(tenant, 'budget-leaf', 'export default { fetch() { return Response.json("ok"); } };');
+  await cluster.deploy(tenant, 'budget-child', runner, { wrangler: { services: leaf } });
+  await cluster.deploy(tenant, 'budget-small-child', runner,
+    { wrangler: { services: leaf, limits: { subrequests: 2 } } });
+  await cluster.deploy(tenant, 'budget-root', runner,
+    { wrangler: { services: [...bindings, { binding: 'LOWER_CHILD', service: 'budget-small-child' }] } });
+  await cluster.deploy(tenant, 'budget-one', runner,
+    { wrangler: { services: bindings, limits: { subrequests: 1 } } });
+  const call = async (worker, query) => json(
+    await workerCall(cluster, node, tenant, `${worker}?${query}`),
     200, 'the budget test Worker handled its request');
-  const normal = await call('budget-root', 100);
-  assert.equal(normal.rootGrant, 10_000);
-  assert.deepEqual(normal.grants, Array(100).fill(78));
-  assert.equal(normal.refusal, undefined);
-  const nested = await call('budget-root', 1, true);
-  assert.deepEqual(nested.grants, [[78, 58]]);
+  const normal = await call('budget-root', 'count=100');
+  assert.deepEqual(normal, { limit: 10_000, completed: 100, result: { limit: 10_000, completed: 1, result: 'ok' } });
+  const nested = await call('budget-one', 'childCalls=200');
+  assert.deepEqual(nested, { limit: 1, completed: 1, result: { limit: 10_000, completed: 200, result: 'ok' } });
+  const exhausted = { status: 429, code: 'SUBREQUEST_BUDGET_EXHAUSTED' };
+  const lowerChild = await call('budget-root', 'childCalls=3&lowerChild');
+  assert.deepEqual(lowerChild, { limit: 10_000, completed: 1, result: { limit: 2, completed: 2, refusal: exhausted } });
+
+  await cluster.deploy(tenant, 'budget-object', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class BudgetActor extends DurableObject {
+      async fetch(request) {
+        if (new URL(request.url).pathname === '/leaf') return new Response('ok');
+        const leaf = this.env.OBJECT.getByName('leaf');
+        for (let completed = 0; completed < 200; ++completed) {
+          const reply = await leaf.fetch('https://object.test/leaf');
+          if (!reply.ok) return reply;
+          await reply.text();
+        }
+        return Response.json({ completed: 200 });
+      }
+    }
+    export default {
+      fetch(_request, env) { return env.OBJECT.getByName('parent').fetch('https://object.test/parent'); }
+    };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['BudgetActor'] }],
+    durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'BudgetActor' }] } } });
+  assert.deepEqual(json(await workerCall(cluster, node, tenant, 'budget-object'), 200, 'Durable Object subrequest budget'),
+    { completed: 200 });
 
   await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { subrequests: 5, d1Queries: 2 } } });
   const lower = await eventually('tenant budget is visible', async () => {
-    const value = await call('budget-root', 4);
-    assert.equal(value.rootGrant, 5);
+    const value = await call('budget-root', 'count=6');
+    assert.equal(value.limit, 5);
     return value;
   });
-  assert.deepEqual(lower.grants, [1, 1, 0]);
-  assert.equal(lower.refusal, 'SUBREQUEST_BUDGET_EXHAUSTED');
+  assert.deepEqual(lower, { limit: 5, completed: 5, refusal: exhausted });
 
   const wrangler = { services: bindings, limits: { subrequests: 10_000_000 } };
-  await cluster.deploy(tenant, 'budget-wide', root, { wrangler });
-  const wide = await call('budget-wide', 130);
-  assert.equal(wide.rootGrant, 10_000_000);
-  assert.equal(wide.grants.length, 130);
+  await cluster.deploy(tenant, 'budget-wide', runner, { wrangler });
+  const wide = await call('budget-wide', 'count=10');
+  assert.equal(wide.limit, 10_000_000);
+  assert.equal(wide.completed, 10);
   assert.equal(wide.refusal, undefined);
 
   const loop = 'budget-loop';
@@ -266,7 +290,7 @@ async function d1InvocationBudgets(cluster) {
       let refusal;
       try { await statement(4).run(); } catch (error) { refusal = error.message; }
       const bindings = [];
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 4; i++) {
         const reply = await env.CHILD.fetch('https://binding.test/');
         bindings.push(reply.ok ? await reply.text() : (await reply.json()).code);
       }
@@ -289,7 +313,7 @@ async function d1InvocationBudgets(cluster) {
     assert.deepEqual(batch, [1, 2]);
     assert.equal(query, 3);
     assert.match(refusal, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
-    assert.deepEqual(bindings, ['ok', 'ok', 'SUBREQUEST_BUDGET_EXHAUSTED']);
+    assert.deepEqual(bindings, ['ok', 'ok', 'ok', 'SUBREQUEST_BUDGET_EXHAUSTED']);
   };
   verify(json(await workerCall(cluster, node, tenant, 'd1-edge'), 200, 'D1 budget over HTTP'));
   const { WebSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
@@ -330,7 +354,7 @@ async function d1InvocationBudgets(cluster) {
         return env.OBJECT.getByName('parent').fetch('https://object.test/parent');
       }
     };
-  `, { wrangler: { limits: { subrequests: 500 },
+  `, { wrangler: { limits: { subrequests: 3 },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['BudgetActor'] }],
     durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'BudgetActor' }] },
     d1_databases: [{ binding: 'DB', database_name: 'budget-db' }] } });

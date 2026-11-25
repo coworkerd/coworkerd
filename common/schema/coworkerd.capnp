@@ -245,6 +245,7 @@ struct RemoteInvocation {
   contentHash @2 :Text;
   treeId @3 :Text;
   parentInvocationId @4 :Text;
+  # Reserved for the former sender-assigned allowance. Executing nodes now resolve their own limit.
   subrequestGrant @5 :UInt16;
   remainingMs @6 :Float64;
   depth @7 :UInt16;
@@ -261,8 +262,6 @@ struct RemoteInvocation {
   entrypoint @18 :Text;
   # Opaque native loopback props, including its capability table. Nodes only copy it.
   coworkerdProps @19 :AnyPointer;
-  # Older peers read the capped UInt16 grant at @5.
-  wideSubrequestGrant @20 :UInt32;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
@@ -286,6 +285,7 @@ struct ObjectInvocation {
   originServerId @8 :Text;
   treeId @9 :Text;
   parentInvocationId @10 :Text;
+  # Reserved for the former sender-assigned allowance.
   subrequestGrant @11 :UInt16;
   depth @12 :UInt16;
   remainingMs @13 :Float64;
@@ -301,8 +301,6 @@ struct ObjectInvocation {
   alarmRetryCount @21 :UInt32;
   # Internal alarm routing; only the root object schedules alarms, always at facet 0.
   alarmFacetId @22 :UInt32 = 1;
-  # Older peers read the capped UInt16 grant at @11.
-  wideSubrequestGrant @23 :UInt32;
 }
 
 struct ServerConfig {
@@ -1131,7 +1129,7 @@ struct InvocationDescriptor {
 
 struct InvocationLease {
   remainingSubrequests @0 :UInt32;
-  grant @1 :UInt32;
+  subrequestLimit @1 :UInt32;
   expiresAtMonotonicMs @2 :Float64;
 }
 
