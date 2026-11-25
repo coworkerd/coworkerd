@@ -22,6 +22,7 @@ export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
 npm ci --prefix cli --registry=https://registry.npmjs.org
 kernel="${KERNEL_DIR:-$(python3 scripts/fetch-kernel.py)}"
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd"
+cmake --build build --target coworkerd-platform-test
 node tests/cluster/run.mjs "$kernel"
 ```
 
@@ -176,6 +177,7 @@ archive, Docker images and temporary volumes. These are observed values from the
 | `durable-slow-holder` | A TCP relay delays the previous holder's peer replies past the recovery deadline while the holder keeps its lease. The successor reports the waiting object and holder, then reads the confirmed value after the relay releases the replies. |
 | `durable-threaded-mixed` | HTTP and RPC replies on a threaded owner wait for upstream peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives the threaded node's drain and fires upstream. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
 | `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
+| `durable-platform-definition` | A separate node executable installs fixture definitions for two tenants. Ordinary bindings reach the shard owner's build across two builds. Copy tokens show warm reuse within a tenant and isolation across tenants. A platform object runs an alarm, reopens after idle release, and recovers every acknowledged SQL write after owner loss. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
 | `durable-threaded-alarm-fence` | A nonretrying abort clears its schedule, and a constructor exception consumes retries with backoff. When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. The successor stops dispatching a previously confirmed clear, and replacing an inherited schedule prevents it from firing at the old time. |
 | `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and WebSockets close, including a parked facet socket whose startup options are discarded across the definition change. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |

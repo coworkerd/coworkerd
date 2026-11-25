@@ -99,7 +99,11 @@ target_compile_features(common PUBLIC cxx_std_23)
 target_include_directories(common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/common" "${GENERATED_DIR}")
 target_link_libraries(common PUBLIC capnp-http-over OpenSSL::Crypto)
 
-add_executable(coworkerd
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "runtime/platform.js")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform.js" COWORKERD_PLATFORM_SOURCE)
+configure_file(node/platform-source.h.in "${GENERATED_DIR}/platform-source.h" @ONLY)
+
+add_library(coworkerd-node OBJECT
   node/main.c++
   node/process-pool.c++
   node/secret-dictionary.c++
@@ -115,6 +119,7 @@ add_executable(coworkerd
   node/recovery-history.c++
   node/database-seed.c++
   node/root-objects.c++
+  node/platform-definition.c++
   node/bundle-cache.c++
   node/desired-state.c++
   node/desired-state-store.c++
@@ -126,8 +131,20 @@ add_executable(coworkerd
   node/blob-store.c++
   node/v8-sandbox.c++
 )
-target_include_directories(coworkerd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
-target_link_libraries(coworkerd PRIVATE common kj-tls-local)
+target_include_directories(coworkerd-node PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
+target_link_libraries(coworkerd-node PUBLIC common kj-tls-local)
+
+add_executable(coworkerd node/platform-fixture.c++)
+target_link_libraries(coworkerd PRIVATE coworkerd-node)
+
+add_executable(coworkerd-platform-test EXCLUDE_FROM_ALL node/platform-fixture.c++)
+target_compile_definitions(coworkerd-platform-test PRIVATE COWORKERD_PLATFORM_FIXTURE)
+target_link_libraries(coworkerd-platform-test PRIVATE coworkerd-node)
+
+add_executable(coworkerd-platform-definition-test EXCLUDE_FROM_ALL
+  node/platform-definition-test.c++ node/platform-definition.c++ node/platform-fixture.c++)
+target_link_libraries(coworkerd-platform-definition-test PRIVATE common)
+add_test(NAME node-platform-definition COMMAND coworkerd-platform-definition-test)
 
 add_executable(coworkerd-apiserver
   apiserver/main.c++
@@ -295,7 +312,7 @@ endif()
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
   DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test coworkerd-config-test
-    coworkerd-object-store-test coworkerd-v8-sandbox-test
+    coworkerd-object-store-test coworkerd-v8-sandbox-test coworkerd-platform-definition-test coworkerd-platform-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.

@@ -201,7 +201,57 @@ Cloudflare. Two things therefore go with this choice: another copy is used when 
 only when the copy is full, and the guide tells authors that objects of one class may share an isolate and
 that synchronous work should be short.
 
-### Databases: native execution, not an isolate per database
+### Platform Durable Object definitions
+
+The threaded durable host loads the product's own Durable Object classes from the
+`coworkerd:platform` definition. Its entry module exports the classes. The node daemon
+carries an immutable ES module package built with the product. The private source service gives
+the durable host the package for the admitted invocation, using the existing module manifest
+and hash checks. The host compiles the package on a durable home with the same compiler
+and exported-class checks as a Worker's package. `runtime.js` continues to provide the process
+entrypoint and its runtime services. Adding a class consists of exporting it from the platform
+entry module, with its module included in the package when it lives in a separate file.
+
+The definition pin is the product release version and a SHA-256 of the canonical definition.
+The digest covers the definition name, entry module, ordered module manifest and content
+hashes, and the compatibility date and flags. The digest distinguishes development builds
+with the same version label. The source service matches the complete pin and process generation
+to the admitted invocation before returning the immutable package. A platform package comes
+from the daemon that admitted it.
+
+A platform namespace records its tenant and a class reference consisting of the definition name
+and case-sensitive Durable Object export name. The namespace still has its own stable ID and
+shard count. The node resolves the reference through trusted namespace ownership. A new pin
+leaves the namespace, object IDs and storage identities in place. Only the platform can assign
+a platform class reference. Tenant deployment data can declare classes of its own Worker. A
+call needs authority for the exact namespace it targets, including a match with the namespace
+owner's tenant. A test-only node executable accepts fixture definitions and namespace mappings
+from its startup fixture. The released executable has no fixture injection path. Test Workers
+call the installed objects through existing Durable Object bindings.
+
+Placement and loaded-copy reuse use a definition key with separate fields for definition kind,
+tenant ID, definition name and pin, and the effective bindings and limits of the copy. The node
+gets the tenant from the validated namespace owner. The selected namespace and export identify
+an object and its class within the copy. This permits compatible objects of one tenant to share
+a copy. The loader verifies the namespace selection, the actor export and the copy identity
+before admitting the event to JavaScript. Platform objects have an empty `env` and run under
+the usual tenant Durable Object event limits, using the node's defaults where the tenant has
+no override.
+
+The forwarding node sends the class reference. The shard owner selects its own build's pin
+when it admits the event, so either direction of forwarding works in a rolling upgrade. A queued
+or running event and its retained work use the pin and copy they acquired. The package stays fixed
+for the lifetime of the node daemon. The daemon alone holds each child's parent-liveness write
+end, and the threaded child exits on EOF. The sandbox launcher also sets a parent-death signal.
+Replacing the daemon therefore uses ordinary process shutdown and shard fencing. The next owner
+can reopen the same storage and fire later alarms under its own definition. The node's durable
+log, confirmation, takeover, alarm and idle-release paths remain the common path for the object.
+
+### Databases: original native execution proposal
+
+The comparison in [#79](https://github.com/coworkerd/coworkerd/issues/79#issuecomment-7155649275)
+selected the Durable Object path for databases. The original proposal below records the reasons
+for evaluating native execution.
 
 A database could instead stay a Durable Object of the JavaScript `SqlDatabase` class with an isolate copy, and
 so a home, of its own. That would reuse steps 1 to 3, and Cloudflare describes D1 as built on SQLite in Durable
@@ -235,12 +285,11 @@ Not measured yet: how long a native database takes to open, against a new isolat
 (about 70 ms p50 against 15 ms with the isolate warm) restarted the whole durable process, so it is not the
 cost of creating one isolate.
 
-**Fallback.** Once step 4 lands, the JavaScript class runs only on the upstream backend, so until step 5 the
-fallback is the whole old backend. An isolate per database on threaded homes does not exist. It would need `SqlDatabase` moved
-out of the runtime isolate, which is also the process's entry and hosts `Egress`, `TenantLog` and
-`DurableNamespace`, into a platform definition of its own; a placement rule of one database per copy, or a
-pool of copies reused one database at a time; and the 30 s wall deadline on that path. That is about one step
-of work. Step 5 deletes the JavaScript class only under the conditions it lists.
+**Fallback.** Databases use `SqlDatabase` in the runtime isolate on the upstream backend today.
+[#82](https://github.com/coworkerd/coworkerd/issues/82) provides the shared platform definition and
+loader for threaded homes. [#81](https://github.com/coworkerd/coworkerd/issues/81) will move
+`SqlDatabase` to that definition, give each open database its own copy, and enforce the 30 s
+wall deadline on the object path.
 
 ### Lifecycle and alarms
 

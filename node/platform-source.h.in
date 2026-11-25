@@ -1,0 +1,5 @@
+#pragma once
+
+namespace coworkerd {
+inline constexpr char PLATFORM_SOURCE[] = R"COWORKERD_ESM(@COWORKERD_PLATFORM_SOURCE@)COWORKERD_ESM";
+}

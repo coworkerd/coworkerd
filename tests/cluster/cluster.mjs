@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -45,7 +45,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root,
+    budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -77,6 +77,7 @@ export class Cluster {
     this.nodeEnvironment = nodeEnvironment;
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
+    this.platformFixture = platformFixture;
   }
 
   async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000,
@@ -105,6 +106,7 @@ export class Cluster {
     const binaries = process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
+    if (this.platformFixture) files['bin/coworkerd'] = join(binaries, 'coworkerd-platform-test');
     for (const file of ['workerd', 'coworkerd-threaded']) files[`bin/${file}`] = join(this.kernel, file);
     if (this.fatalTestBinary) files['bin/coworkerd-threaded'] = this.fatalTestBinary;
     for (const phase of ['startup', 'steady']) {
@@ -123,6 +125,7 @@ export class Cluster {
         command: ['node', '-e', 'require("node:http").createServer((_, res) => res.end("origin")).listen(8080, "0.0.0.0")'],
       };
     }
+    const platformSource = this.platformFixture && await readFile(join(this.productRoot, 'tests/cluster/platform.js'), 'utf8');
     if (this.recoveryRelayGate) {
       await mkdir(this.recoveryRelayGate, { mode: 0o755 });
       overrides['recovery-relay'] = {
@@ -177,6 +180,17 @@ export class Cluster {
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
+      if (platformSource) {
+        const directory = join(this.directory, `${node}-platform`);
+        const target = '/tmp/coworkerd-platform-test';
+        await mkdir(directory, { mode: 0o755 });
+        await Promise.all([
+          writeFile(join(directory, 'config.json'), JSON.stringify({ release: node, classes: this.platformFixture })),
+          writeFile(join(directory, 'platform.js'), `${platformSource}\nconst fixtureBuild = ${JSON.stringify(node)};\n`),
+        ]);
+        overrides[node].environment.COWORKERD_PLATFORM_FIXTURE = `${target}/config.json`;
+        overrides[node].volumes.push({ type: 'bind', source: directory, target, read_only: true });
+      }
       if (this.durableLifecycleGate && this.threadedNodes.has(node)) {
         const gate = '/tmp/cluster-test-durable-lifecycle';
         overrides[node].environment.COWORKERD_DO_TEST_LIFECYCLE_DIR = gate;
