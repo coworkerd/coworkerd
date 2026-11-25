@@ -4,6 +4,34 @@ The benchmark measures two threaded durable paths. Both use a stateless Worker b
 machine. One node owns all sampled databases and confirms writes by flushing its local WAL. The
 comparison uses the predeclared thresholds. [#79](https://github.com/coworkerd/coworkerd/issues/79)
 
+## What the throughput measures
+
+The throughput driver sends HTTP from the Mac through Docker's published port and one stateless
+Worker to one database on one node. It counts successful replies over that complete route. The
+eight-client read cells reached about 1,300 requests/s on both sides. Multiplying those rates by
+the separate serial CPU measurements estimates 0.74 of a logical CPU in the Object durable child
+and 0.42 in the Native child. Both estimates are below one core. The records leave the shared
+limiting stage unresolved among host-to-VM forwarding, the caller Worker and the node. [#85](https://github.com/coworkerd/coworkerd/issues/85)
+
+| Operation | Clients | Object completions | Object /s | Native completions | Native /s | Native ÷ Object |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| One-row read | 1 | 4,623 | 462.22 | 7,088 | 708.72 | 1.533× |
+| One-row read | 8 | 13,005 | 1,299.99 | 12,666 | 1,266.10 | 0.974× |
+| Confirmed insert | 1 | 4,618 | 461.71 | 5,248 | 524.47 | 1.136× |
+| Confirmed insert | 8 | 7,183 | 717.89 | 7,415 | 740.74 | 1.032× |
+
+The Object and Native traffic tables contained all 12,844 and 13,706 expected confirmed rows,
+respectively, including warm-ups. The measured windows completed with zero request failures.
+
+The original one-client read cell ran immediately after the 1 MiB read latency cell. Its time per
+completed request was 2.163 ms on Object versus that side's 1.617 ms mean serial read latency
+(34% higher). Native was 1.411 versus 1.349 ms (5% higher). The mean serial latency ratio was
+1.199×. The placement of the original 1.533× cell is a potential contributor to the gap.
+
+A separate one-client control ran before the large-read and cold-open workloads in both runs. Over
+10 seconds it completed **554.47 reads/s** on Object (5,545 replies) and **747.75
+reads/s** on Native (7,478 replies), or **1.349×** Native to Object.
+
 ## Builds and paths
 
 | Side | Daemon source | Published ARM64 kernel archive | Archive SHA-256 |
@@ -24,8 +52,10 @@ comparison uses the predeclared thresholds. [#79](https://github.com/coworkerd/c
   Docker files are byte-identical across these checkouts.
 - **Confirmation.** Both inserts wait for the node's WAL confirmation. The driver verifies a one-row
   insert advances the node's confirmation counter, validates every successful insert and checks the
-  final count. The sample uses Linux `fdatasync` on a Docker named volume. Network replication and peer
-  acknowledgements may change write latency and throughput.
+  final count. Object handles `/execute` by running the INSERT directly. Native wraps each
+  `/execute` statement in a SQLite transaction. Both replies wait for WAL confirmation. The sample uses
+  Linux `fdatasync` on a Docker named volume. Network replication and peer acknowledgements may change
+  write latency and throughput.
 - **Baselines.** An empty SQL batch traverses the real binding and returns an empty batch without a user
   statement. The pinned native D1 wrapper decodes the response and throws a `TypeError` when it accesses
   the absent first result. The Worker validates and handles that error. The successful `SELECT NULL AS
@@ -88,7 +118,7 @@ generation. Memory uses a later generation of the same durable slot.
 
 [Object raw samples](database-home-benchmark/object.jsonl) · [Native raw samples](database-home-benchmark/native.jsonl)
 
-### End-to-end latency
+### End-to-end latency in the original pair
 
 | Operation | Samples per side | Object p50 / p99 (ms) | Native p50 / p99 (ms) |
 | --- | ---: | ---: | ---: |
@@ -104,17 +134,44 @@ The read p50 minus the successful no-op p50 was -0.003 ms on Object and -0.026 m
 The insert differences were +0.473 and +0.429 ms. These are differences between cell medians.
 The thresholds use full end-to-end latency.
 
-### Throughput and durable-child CPU
+### Cold-open follow-up
 
-| Operation | Clients | Object completions | Object /s | Native completions | Native /s | Native ÷ Object |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| One-row read | 1 | 4,623 | 462.22 | 7,088 | 708.72 | 1.533× |
-| One-row read | 8 | 13,005 | 1,299.99 | 12,666 | 1,266.10 | 0.974× |
-| Confirmed insert | 1 | 4,618 | 461.71 | 5,248 | 524.47 | 1.136× |
-| Confirmed insert | 8 | 7,183 | 717.89 | 7,415 | 740.74 | 1.032× |
+First access at a new data epoch runs the shared WAL-tail recovery path before dispatching to
+the durable child. The node checks the shard epoch through the recovery metadata gate. The gate
+allows two outstanding reads, refills at 16 reads/s, and starts with four tokens. Unpaced cold
+requests consume that burst and queue for the next token. At steady state one token arrives
+every 62.5 ms. The node logs put most of the added time in the tail-wait lap before durable
+dispatch. An initial path trace showed 51.8 ms in that lap and 4.2 ms for the following
+durable-child open response on one warm-copy request.
+[Recovery metadata gate](https://github.com/coworkerd/coworkerd/blob/3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd/node/durable-log.h#L1149-L1153) ·
+[Epoch read](https://github.com/coworkerd/coworkerd/blob/3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd/node/durable-log.c%2B%2B#L5577-L5614) ·
+[Token refill](https://github.com/coworkerd/coworkerd/blob/3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd/node/recovery-gate.h#L70-L90)
 
-The Object and Native traffic tables contained all 12,844 and 13,706 expected confirmed rows,
-respectively, including warm-ups. The measured windows completed with zero request failures.
+The follow-up kept the same pins, host, VM, Worker paths and 3 GiB process cap. It ran Native
+first from 15:18:58 to 15:20:09, then Object from 15:22:55 to 15:24:45 UTC+8.
+Both sides repeated the unpaced sweep and used distinct untouched database IDs for the next
+sweep. The paced sweep waited 100 ms after each completed query, outside the request timer.
+That kept submissions below the metadata refill rate. These remain full host-to-Worker
+measurements and include the metadata check and rebuild itself.
+
+| Cold case | E2E n per schedule | Unpaced E2E p50 / p99 (ms) | Paced E2E p50 / p99 (ms) | Unpaced tail wait p50 / p99 (ms) | Paced tail wait p50 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Object, new copy | 200 | 62.447 / 70.503 | 26.173 / 87.876 | 44.361 / 49.295 | 0.773 / 3.417 |
+| Object, warm copy | 200 | 62.130 / 72.266 | 24.069 / 34.277 | 49.323 / 55.436 | 1.158 / 3.148 |
+| Native | 200 | 62.333 / 68.142 | 23.997 / 32.279 | 48.944 / 55.267 | 1.027 / 2.256 |
+
+Each tail-wait cell contains 200 logged rebuild laps. The process monitor saw one active host
+compiler during part of the accepted Object paced-new window. That cell had wider tails than the
+Native run. In an earlier Object replay, the complete paced-new cell was 26.206 / 38.131 ms
+(200 opens), and the monitor sampled no active compiler in that paced-new window. The earlier
+run stopped when the collection check found 199 warm-copy rebuild log entries. Both paced-new
+cells give a similar p50, while the p99 varies across windows.
+[Earlier Object paced-new samples](database-home-benchmark/object-cold-follow-up-preflight.jsonl)
+
+[Object follow-up samples](database-home-benchmark/object-cold-follow-up.jsonl) ·
+[Native follow-up samples](database-home-benchmark/native-cold-follow-up.jsonl)
+
+### Durable-child CPU
 
 | Operation | Samples per side | Object CPU ms/query (ticks) | Native CPU ms/query (ticks) |
 | --- | ---: | ---: | ---: |
@@ -146,18 +203,22 @@ Both runs seeded the tables in two batches and rotated the durable child between
 child reopened the stored rows in under two seconds. This let the probes reach admission pressure
 before the ten-second idle retirement window.
 
-| Side | Simultaneous live roots / homes | Validated reads / attempts | What happened at capacity | Reservation per home or root | Matched warm RSS slope above |
+| Side | Simultaneous live roots / homes | Validated reads / attempts | What happened at capacity | Default-budget bound or measured reservation per live root | Matched warm RSS slope above |
 | --- | ---: | ---: | --- | --- | ---: |
-| Object | 372 / 372 | 365 / 388 | 23 reads in the first refused batch returned HTTP 503 with `OVERLOADED: process admission budget is full` | 16 KiB metered per live root, plus a 2.50 MiB initial isolate charge before source bytes and later heap and external allocations | 2.491 MiB |
-| Native | 519 / 519 | 521 / 521 | The final two opens succeeded and the database-home count stayed at 519. The kernel reclaims idle native homes and reserves one of the 520 places for Durable Objects. | 224.30 KiB measured SQLite plus native home overhead, and 16 KiB metered per live root | 0.233 MiB |
+| Object | 372 / 372 | 365 / 388 | 23 reads in the first refused batch returned HTTP 503 with `OVERLOADED: process admission budget is full` | ≤4.267 MiB from total process budget divided by 372 observed roots | 2.491 MiB |
+| Native | 519 / 519 | 521 / 521 | The final two opens succeeded. The observed database-home count stayed at 519. | 0.235 MiB measured (224.30 KiB native home and SQLite plus 16 KiB live-root charge) | 0.233 MiB |
 
 The Object side's live root count includes roots whose read was refused after placement. The
-365 successful reads establish a lower bound on usable open databases in that run. The 2.50 MiB
-initial isolate charge is the source's 2 MiB heap seed plus 512 KiB fixed native overhead. Source
+365 successful reads establish a lower bound on usable open databases in that run. Dividing
+1,664,303,104 bytes by 372 gives the aggregate budget upper bound, including shared charges.
+The 2.50 MiB initial isolate charge is the source's 2 MiB heap seed plus 512 KiB fixed native overhead. Source
 bytes and observed heap, external allocations and logs update the process charge. The published
 Object lifecycle exposes the 16 KiB tree charge and live roots without exposing the full per-isolate
 process charge. The Native lifecycle reported 119,203,920 bytes reserved across 519 database homes,
-or 229,680 bytes per native home, in addition to the same tree charge.
+or 229,680 bytes per native home, in addition to the same tree charge. The reported native
+idle and pressure retirement counters stayed at zero. The measurements establish the load and
+plateau. The mechanism by which slots became available remains unobserved. The source reserves
+one of the 520 places for Durable Objects.
 [Object isolate accounting](https://github.com/coworkerd/coworkerd/blob/3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd/patches/workerd/0042-threaded-server-s1a.patch#L1898-L1924) ·
 [Tree charge](https://github.com/coworkerd/coworkerd/blob/3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd/patches/workerd/0047-durable-test-events.patch#L350-L357) ·
 [Native admission](https://github.com/coworkerd/coworkerd/blob/e88acea9a3630c67388dbccdd994b4d843a953eb/patches/workerd/0114-native-sql-spill-and-idle-homes.patch#L805-L836) ·
@@ -185,7 +246,7 @@ Latency reductions are Object minus Native, with percentage relative to Object.
 - **Latency threshold unmet.** The eligible cells are shown above. The large read is reported separately.
 - **Throughput threshold unmet.** The best Native-to-Object ratio was 1.533×. The threshold is 2×.
 - **Density threshold unmet.** The Object slope exceeded Native by 2.258 MiB per database.
-  The Object minus Native cold-new p50 was -0.068 ms. Both 4 MiB and 20 ms are required.
+  The paced Object minus Native cold-new p50 was +2.176 ms. Both 4 MiB and 20 ms are required.
 
 ## Reproduce
 
@@ -212,3 +273,7 @@ counts.
 Append `--default-admission` and use a new output filename for the default-budget pair. The memory
 planning override is omitted for that mode. The daemon uses a hard cgroup memory limit in preference
 to the planning budget when one is configured.
+
+Use `--cold-follow-up` for the one-client read control before any large or cold queries, then
+the unpaced and paced cold cells on distinct database IDs. The raw follow-up files include
+rebuild and tail-wait durations from the node for each cold cell.

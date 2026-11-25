@@ -7,13 +7,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
+const modes = ['--smoke', '--default-admission', '--cold-follow-up'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
-    (mode !== undefined && !['--smoke', '--default-admission'].includes(mode)) || extra.length) {
-  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <pinned-kernel-directory> <new-report.jsonl> [--smoke|--default-admission]');
+    (mode !== undefined && !modes.includes(mode)) || extra.length) {
+  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <pinned-kernel-directory> <new-report.jsonl> [--smoke|--default-admission|--cold-follow-up]');
   process.exit(2);
 }
 const smoke = mode === '--smoke';
 const defaultAdmission = mode === '--default-admission';
+const coldFollowUp = mode === '--cold-follow-up';
 const checkout = resolve(checkoutArg);
 const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
@@ -23,6 +25,7 @@ const settings = {
   density: smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
+  pacedColdDelayMs: 100,
   throughputMs: smoke ? 500 : 10000,
   densityClients: smoke ? 4 : 24,
 };
@@ -268,10 +271,29 @@ async function cpuSample() {
   return { ticks: Number(fields[11]) + Number(fields[12]), start: fields[19] };
 }
 
-async function runCold() {
-  const selected = databases.slice(0, settings.coldSamples);
+async function recoveryLaps(since, expected) {
+  const output = await cluster.compose(['logs', '--no-color', '--since', since, owner], { timeout: 30000 });
+  const prefix = '[do-log] {"event":"rebuilt"';
+  const rebuilds = [];
+  for (const line of output.split('\n')) {
+    const start = line.indexOf(prefix);
+    if (start >= 0) rebuilds.push(JSON.parse(line.slice(start + '[do-log] '.length)));
+  }
+  assert.ok(rebuilds.length > 0 && rebuilds.length <= expected, 'rebuild telemetry belongs to this cold window');
+  return {
+    rebuild: times(rebuilds.map(event => event.ms)),
+    tailWait: times(rebuilds.map(event => event.laps.tailWaitMs)),
+  };
+}
+
+async function runCold({ paced = false, offset = 0 } = {}) {
+  const selected = databases.slice(offset, offset + settings.coldSamples);
+  const paceMs = paced ? settings.pacedColdDelayMs : 0;
+  const pace = () => delay(paceMs, undefined, { signal: controller.signal });
   await parallel(selected, 16, name => query(name, 'ping'));
   const before = await hostSample();
+  const recoveryStart = () => coldFollowUp ? execOwner('date -u +%Y-%m-%dT%H:%M:%S.%NZ') : undefined;
+  let since = await recoveryStart();
   const samples = [], copies = new Set();
   for (const name of selected) {
     const { elapsed, copy } = await query(name, 'cold');
@@ -280,12 +302,16 @@ async function runCold() {
       assert.ok(copy && !copies.has(copy), 'each cold object uses a distinct isolate copy');
       copies.add(copy);
     }
+    if (paced) await pace();
   }
-  await record('cold-new', { ...times(samples), distinctCopyIds: copies.size, before, after: await hostSample() });
+  await record('cold-new', { ...times(samples), distinctCopyIds: copies.size, paceMs, before, after: await hostSample(),
+    ...(coldFollowUp && { recovery: await recoveryLaps(since, samples.length) }) });
   if (native) return;
 
   // One copy admits up to 64 trees by default. Seed a matching copy for each group of 50 opens.
   samples.length = 0;
+  const warmBefore = await hostSample();
+  since = await recoveryStart();
   const warmCopies = new Set();
   for (let start = 0; start < selected.length; start += 50) {
     const name = selected[start];
@@ -296,9 +322,12 @@ async function runCold() {
       const result = await query(name, 'cold', '?key=fresh-' + index);
       assert.equal(result.copy, copy, 'new SQLite object used the existing copy of its class');
       samples.push(result.elapsed);
+      if (paced) await pace();
     }
   }
-  await record('cold-warm-copy', { ...times(samples), seededCopies: warmCopies.size, after: await hostSample() });
+  await record('cold-warm-copy', { ...times(samples), seededCopies: warmCopies.size, paceMs,
+    before: warmBefore, after: await hostSample(),
+    ...(coldFollowUp && { recovery: await recoveryLaps(since, samples.length) }) });
 }
 
 async function runWarm() {
@@ -324,24 +353,25 @@ async function runWarm() {
   }
 }
 
+async function runThroughputCell(operation, clients, metric = 'throughput-' + operation) {
+  const run = () => operation === 'insert' ? insert(workload) : query(workload, operation);
+  await Promise.all(Array.from({ length: clients }, run));
+  const before = await hostSample();
+  const start = performance.now();
+  let n = 0;
+  await Promise.all(Array.from({ length: clients }, async () => {
+    while (performance.now() - start < settings.throughputMs) {
+      await run();
+      ++n;
+    }
+  }));
+  const elapsedMs = performance.now() - start;
+  await record(metric, { clients, n, elapsedMs, perSecond: n * 1000 / elapsedMs, before, after: await hostSample() });
+}
+
 async function runThroughput() {
   for (const operation of ['read', 'insert']) {
-    for (const clients of [1, 8]) {
-      const run = () => operation === 'insert' ? insert(workload) : query(workload, operation);
-      await Promise.all(Array.from({ length: clients }, run));
-      const before = await hostSample();
-      const start = performance.now();
-      let n = 0;
-      await Promise.all(Array.from({ length: clients }, async () => {
-        while (performance.now() - start < settings.throughputMs) {
-          await run();
-          ++n;
-        }
-      }));
-      const elapsedMs = performance.now() - start;
-      await record('throughput-' + operation, { clients, n, elapsedMs, perSecond: n * 1000 / elapsedMs,
-        before, after: await hostSample() });
-    }
+    for (const clients of [1, 8]) await runThroughputCell(operation, clients);
   }
   assert.deepEqual((await query(workload, 'count')).body, [{ value: nextId }], 'all acknowledged inserts are present');
   const { entry, log } = await durable();
@@ -475,6 +505,12 @@ try {
   await identify(kernelHash);
   if (defaultAdmission) {
     await runDefaultAdmission(kernelHash);
+  } else if (coldFollowUp) {
+    await validateConfirmation();
+    for (let i = 0; i < 32; ++i) await query(workload, 'read');
+    await runThroughputCell('read', 1, 'throughput-read-control');
+    await runCold();
+    await runCold({ paced: true, offset: settings.coldSamples });
   } else {
     hz = Number(await execOwner('getconf CLK_TCK'));
     assert.ok(hz > 0);
