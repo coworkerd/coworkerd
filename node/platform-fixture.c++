@@ -1,4 +1,5 @@
 #include "platform-definition.h"
+#include "platform-source.h"
 
 #ifdef COWORKERD_PLATFORM_FIXTURE
 #include "json.h"
@@ -10,6 +11,21 @@
 #endif
 
 namespace coworkerd {
+
+const std::string& sqlDatabaseSource() {
+  static const auto source = []() {
+    std::string module = SQL_DATABASE_SOURCE;
+#ifdef COWORKERD_PLATFORM_FIXTURE
+    // Both database hosts use the same module. Only the fixture executable can append test code.
+    if (const auto* path = std::getenv("COWORKERD_TEST_DATABASE_ALARM_FIXTURE")) {
+      module += '\n';
+      module += readFile(path);
+    }
+#endif
+    return module;
+  }();
+  return source;
+}
 
 PlatformDefinitions loadPlatformDefinitions() {
   PlatformDefinitions result;

@@ -68,12 +68,14 @@ async function main(args) {
       failed += await runSuite(webSockets, kernel, controller.signal, { webSocketsPerNode: 2 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts, holdPeerAcks = true }] of gated) {
-      const previousProduct = databaseFixtureNode && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
+      delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, databaseAlarmFixture,
+      publishPeerPorts, holdPeerAcks = true }] of gated) {
+      const previousProduct = databaseFixtureNode && !databaseAlarmFixture && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
       const previousKernel = previousProduct && process.env.COWORKERD_CLUSTER_PREVIOUS_KERNEL;
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks, membership, confirmTimeoutMs, versionDrainTimeoutMs,
-        controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode, publishPeerPorts,
+        controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseFixtureNode,
+        databaseAlarmFixture, publishPeerPorts,
         previousProduct: previousProduct ? resolve(previousProduct) : undefined,
         previousKernel: previousKernel ? resolve(previousKernel) : undefined,
       });
