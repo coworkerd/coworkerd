@@ -21,6 +21,7 @@
 #include "database-seed.h"
 #include "durable-shards.h"
 #include "parked-websocket.h"
+#include "platform-definition.h"
 #include "object-state.h"
 #include "deployment.h"
 #include "desired-state.h"
@@ -354,6 +355,12 @@ struct InvocationLeaseState {
   // that its expiry refuses the calls of its handlers until the next message renews it but does not remove it.
   double presentedExpiresAtMonotonicMs = 0;
   bool held = false;
+  struct PlatformSource {
+    const coworkerd::PlatformDefinition* definition;
+    VersionPin pin;
+    std::string processId, generation;
+  };
+  std::optional<PlatformSource> platformSource;
   bool presents(double value) const {
     return coworkerd::presentsLease(value, expiresAtMonotonicMs, presentedExpiresAtMonotonicMs);
   }
@@ -407,6 +414,7 @@ struct DurableTarget {
   uint64_t socketFrame = 0;
   uint32_t socketFacet = 0;
   size_t socketBytes = 0;
+  std::optional<coworkerd::PlatformClassRef> platformClass;
   bool isDatabase() const { return !database.empty(); }
   std::string key() const { return namespaceId + "/" + objectId; }
 };
@@ -1010,6 +1018,16 @@ public:
               << " membership=" << membership.view().backend
               << " epoch=" << membership.view().epoch
               << " load-check=" << (this->serverConfig.loadCheck ? "on" : "off") << std::endl;
+  }
+
+  std::optional<coworkerd::PlatformClassRef> platformClassFor(const std::string& workerId,
+      const DurableTarget& target) const {
+    const auto owner = namespaceOwner(target.namespaceId);
+    return owner ? coworkerd::platformClassFor(*owner, workerId, target.className) : std::nullopt;
+  }
+
+  const coworkerd::PlatformDefinition* platformDefinition(const std::string& name) const {
+    return platformDefinitions.definition(name);
   }
   ~ServerCore() noexcept(false) {
     executionLifetime.reset();
@@ -2446,7 +2464,10 @@ public:
   }
   // Whose namespace this is: a Worker's class, or a tenant's database (none when no key names it).
   std::optional<coworkerd::DeploymentState::NamespaceOwner> namespaceOwner(const std::string& namespaceId) const {
-    return desiredState.state().namespaceOwner(namespaceId);
+    auto owner = desiredState.state().namespaceOwner(namespaceId);
+    if (owner && !owner->platformClass && !platformDefinitions.fixtureClasses.empty())
+      owner->platformClass = platformDefinitions.fixtureClassFor(*owner);
+    return owner;
   }
   // The tenant's quotas as its record holds them (the defaults when it has none).
   coworkerd::TenantQuotas tenantQuotas(const std::string& tenant) const {
@@ -2513,9 +2534,17 @@ public:
       throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", process->threadedDurableTestRole()
           ? "the durable test role supports object requests" : "the threaded durable role supports Worker object requests"}};
     }
+    if (target.platformClass && !process->threadedDurableRole())
+      throw DurableDispatchRefused{{false, 501, "NOT_SUPPORTED", "platform objects require the threaded durable role"}};
     // These catalog checks must not leave an open marker when no facet will be started.
     if (!target.isDatabase()) {
-      if (process->threadedDurableRole()) {
+      if (target.platformClass) {
+        const auto owner = namespaceOwner(target.namespaceId);
+        std::string code, reason;
+        if (!owner || platformClassFor(owner->workerId, target) != target.platformClass ||
+            !durableVersion(owner->workerId, target, code, reason))
+          throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE", "the platform namespace changed"}};
+      } else if (process->threadedDurableRole()) {
         std::string code, reason;
         const auto active = durableVersion(version->workerId, target, code, reason);
         if (!active) throw DurableDispatchRefused{{false, 409, code, reason}};
@@ -2527,7 +2556,11 @@ public:
         throw DurableDispatchRefused{{false, missing->status, missing->code, missing->reason}};
     }
     const auto limits = namedLimits(version->workerId);
-    auto root = coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
+    auto root = target.platformClass
+        ? std::optional{coworkerd::preparePlatformRootDispatch(*target.platformClass, *version,
+            std::min(limits.cpuMs, 30000u), limits.memoryMiB, target.namespaceId, target.objectId,
+            target.dataEpoch, target.alarmAtUnixMs, target.alarmFacetId)}
+        : coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
         target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
@@ -2834,6 +2867,12 @@ private:
       for (auto byte : receipt) { slot->dispatchReceipt += HEX[byte >> 4]; slot->dispatchReceipt += HEX[byte & 15]; }
       slot->deadline = expiresAtMonotonicMs;
     }
+    if (durable && durable->platformClass) {
+      const auto* definition = platformDefinition(durable->platformClass->definition);
+      KJ_REQUIRE(definition != nullptr, "the platform definition is unavailable");
+      leases.at(invocationId).platformSource = InvocationLeaseState::PlatformSource{
+          definition, coworkerd::versionPin(*version), process->processId, std::to_string(process->generation)};
+    }
     auto descriptor = encodeDescriptor(
         *version,
         invocationId,
@@ -3059,6 +3098,16 @@ public:
       const std::string& expectedHash,
       const std::string& invocationId = {}, const std::string& processId = {},
       const std::string& generation = {}, const std::string& definitionHash = {}) {
+    if (workerId.ends_with(coworkerd::PLATFORM_WORKER_SUFFIX)) {
+      const auto found = leases.find(invocationId);
+      const VersionPin requested{workerId, versionId, expectedHash, definitionHash};
+      KJ_REQUIRE(found != leases.end() && found->second.platformSource, "platform source requires an admitted event");
+      const auto& authority = *found->second.platformSource;
+      KJ_REQUIRE(authority.pin == requested && authority.processId == processId && authority.generation == generation,
+          "platform source authority mismatch");
+      ++sourceFetches;
+      co_return authority.definition->sourceJson(requested);
+    }
     KJ_REQUIRE(coworkerd::workerFullName(workerId), "invalid source workerId");
     KJ_REQUIRE(safeName(versionId), "invalid source versionId");
     KJ_REQUIRE(validSha256(expectedHash), "invalid source contentHash");
@@ -3436,6 +3485,7 @@ public:
   }
 
 private:
+  const coworkerd::PlatformDefinitions platformDefinitions = coworkerd::loadPlatformDefinitions();
   kj::String encodeDescriptor(
       const VersionDefinition& version,
       const std::string& invocationId,
@@ -3592,7 +3642,8 @@ private:
       auto target = descriptor.initDurableObject();
       target.setNamespaceId(durable->namespaceId.c_str());
       target.setObjectId(durable->objectId.c_str());
-      target.setClassName(durable->className.c_str());
+      const auto& className = durable->platformClass ? durable->platformClass->name : durable->className;
+      target.setClassName(className.c_str());
       target.setHops(durable->hops);
       target.setShard(durable->shard);
       target.setShardEpoch(durable->shardEpoch);
@@ -3614,7 +3665,7 @@ private:
           std::ostringstream route;
           route << ",\"durableTestRoute\":{\"namespaceId\":\"" << jsonEscape(durable->namespaceId)
                 << "\",\"objectId\":\"" << jsonEscape(durable->objectId) << "\",\"className\":\""
-                << jsonEscape(durable->className) << "\",\"definition\":\"" << jsonEscape(root->fingerprint)
+                << jsonEscape(className) << "\",\"definition\":\"" << jsonEscape(root->fingerprint)
                 << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
                 << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
                 << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
@@ -5497,6 +5548,10 @@ public:
     remote.setAlarmAtUnixMs(target.alarmAtUnixMs);
     remote.setAlarmRetryCount(target.alarmRetryCount);
     remote.setAlarmFacetId(target.alarmFacetId);
+    if (target.platformClass) {
+      remote.setPlatformDefinition(target.platformClass->definition.c_str());
+      remote.setPlatformClass(target.platformClass->name.c_str());
+    }
     const auto remaining = std::max(0.0, deadline - monotonicTimeMs());
     if (remaining == 0) {
       server.rejectExpiredLease("lease expired before forwarding");
@@ -7093,7 +7148,7 @@ public:
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
     }
     std::string code, reason;
-    auto version = checked(request, line, code, reason);
+    auto version = checked(request, line, code, reason, true);
     if (!version) co_return refused(server.refusal(code, reason, code == "DO_HOP_LIMIT" ? 508 : code == "DO_NAMESPACE_UNAVAILABLE" ? 409 : 503));
     if (request.target.shard != shard)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the request names shard " + std::to_string(shard) +
@@ -7154,7 +7209,8 @@ private:
   };
 
   // The checks before the shard: the hop limit, the version and its class's namespace, the tenant; the object's shard.
-  std::shared_ptr<const VersionDefinition> checked(Request& request, Line& line, std::string& code, std::string& reason) {
+  std::shared_ptr<const VersionDefinition> checked(Request& request, Line& line, std::string& code,
+      std::string& reason, bool forwarded = false) {
     auto& target = request.target;
     if (target.hops > MAX_DURABLE_HOPS) {
       code = "DO_HOP_LIMIT";
@@ -7164,6 +7220,13 @@ private:
     auto version = target.isDatabase() ? server.databaseVersion(target.tenant)
                                        : server.durableVersion(request.workerId, target, code, reason);
     if (!version) return nullptr;
+    const auto platformClass = target.isDatabase() ? std::nullopt : server.platformClassFor(request.workerId, target);
+    if (forwarded && target.platformClass != platformClass) {
+      code = "DO_NAMESPACE_UNAVAILABLE";
+      reason = "the forwarded platform class does not match the namespace";
+      return nullptr;
+    }
+    target.platformClass = platformClass;
     line.workerId = version->workerId;
     line.versionId = version->versionId;
     if (const auto unavailable = server.tenantUnavailable(coworkerd::tenantOf(version->workerId)); !unavailable.empty()) {
@@ -7188,6 +7251,14 @@ private:
       log(line, target, nullptr, refusal.status, refusal.code, started);
       return Ran{refusal};
     };
+    if (target.platformClass) {
+      const auto* definition = server.platformDefinition(target.platformClass->definition);
+      if (definition == nullptr)
+        co_return refused(server.refusal("DO_NAMESPACE_UNAVAILABLE", "the platform definition is unavailable", 409));
+      version = std::make_shared<const VersionDefinition>(definition->version(coworkerd::tenantOf(request.workerId)));
+      line.workerId = version->workerId;
+      line.versionId = version->versionId;
+    }
     if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(
             server.placementConfig().processPool.threadedDurableStorage, target.alarmAtUnixMs)) {
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
@@ -7226,7 +7297,7 @@ private:
     slot->timing = request.timing;
     // A database runs the platform's own SQL Worker class out of the static runtime: there is no package to fetch
     // and no secret to look for.
-    if (!target.isDatabase()) {
+    if (!target.isDatabase() && !target.platformClass) {
       auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
         server.rejectVersionUnavailable(unavailable);
@@ -7576,6 +7647,12 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
   request.target.alarmAtUnixMs = remote.getAlarmAtUnixMs();
   request.target.alarmRetryCount = remote.getAlarmRetryCount();
   request.target.alarmFacetId = remote.getAlarmFacetId();
+  if (remote.getPlatformDefinition().size() || remote.getPlatformClass().size()) {
+    KJ_REQUIRE(remote.getPlatformDefinition().size() > 0 && remote.getPlatformDefinition().size() <= 128 &&
+        coworkerd::environmentName(remote.getPlatformClass().cStr()), "invalid remote platform class");
+    request.target.platformClass = coworkerd::PlatformClassRef{
+        remote.getPlatformDefinition().cStr(), remote.getPlatformClass().cStr()};
+  }
   if (!request.target.database.empty()) {
     request.target.tenant = coworkerd::tenantOf(request.workerId);
     KJ_REQUIRE(coworkerd::tenantName(request.target.database) &&

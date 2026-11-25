@@ -592,8 +592,8 @@ async function takeoverWriter(cluster, tenantName) {
   return tenant;
 }
 
-async function durableTakeover(cluster) {
-  const tenant = await takeoverWriter(cluster, 'durable-test');
+async function durableTakeover(cluster, platformTenant) {
+  const tenant = platformTenant ?? await takeoverWriter(cluster, 'durable-test');
   const [node] = cluster.nodes;
   const namespace = () => cluster.api(`${tenant.path}/workers/object/namespaces/Record`, { token: tenant.token });
   await eventually('object and its shard are ready', async () => {
@@ -693,6 +693,104 @@ async function durableTakeover(cluster) {
     assert.ok(owner && !owner.released && owner.nodeId !== original.nodeId && cluster.nodes.includes(owner.nodeId));
     assert.ok(BigInt(owner.epoch) > BigInt(original.epoch));
   });
+}
+
+async function threadedPlatformDefinition(cluster) {
+  const tenants = await Promise.all(['platform-first', 'platform-second'].map(name => cluster.tenant(name)));
+  const classNames = ['Record', 'Probe', 'Echo'];
+  const wrangler = {
+    durable_objects: { bindings: classNames.map(name => ({ name: name.toUpperCase(), class_name: name })) },
+    migrations: [{ tag: 'v1', new_sqlite_classes: classNames }],
+  };
+  const worker = `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Record extends DurableObject { fetch() { return new Response('tenant Record ran', { status: 500 }); } }
+    export class Probe extends DurableObject { fetch() { return new Response('tenant Probe ran', { status: 500 }); } }
+    export class Echo extends DurableObject { fetch() { return new Response('tenant Echo ran', { status: 500 }); } }
+    export default { fetch(request, env) {
+      const params = new URL(request.url).searchParams;
+      if (params.has('echo')) return env.ECHO.getByName('echo').fetch(request);
+      const probe = params.get('probe');
+      return probe === null ? env.RECORD.getByName('takeover').fetch(request) : env.PROBE.getByName(probe).fetch(request);
+    } };
+  `;
+  for (const tenant of tenants) await cluster.deploy(tenant, 'object', worker, { wrangler });
+  const [ingress] = cluster.nodes;
+  const call = (tenant, name, node = ingress, action = 'identity') => workerCall(cluster, node, tenant,
+    `object?${new URLSearchParams({ probe: name, action })}`);
+  const generations = await eventually('all fixture nodes have a ready threaded durable generation', async () => {
+    const entries = await Promise.all(cluster.nodes.map(async node => [node, await durableGeneration(cluster, node)]));
+    for (const [, generation] of entries) assert.equal(generation.lifecycle.durableServer, 'threaded');
+    return new Map(entries);
+  });
+  await eventually('the second class loads through the same definition', async () => {
+    const echo = json(await workerCall(cluster, ingress, tenants[0], 'object?echo'), 200, 'second platform class');
+    assert.equal(echo.service, 'echo');
+    assert.ok(cluster.nodes.includes(echo.build));
+  });
+
+  const observations = tenants.map(() => new Map());
+  let sameOwner;
+  for (let attempt = 0; attempt < 24; ++attempt) {
+    for (const [index, tenant] of tenants.entries()) {
+      const name = `copy-${attempt}`;
+      const identity = await eventually(`${tenant.name}/${name} runs the platform class`, async () =>
+        json(await call(tenant, name), 200, 'platform copy identity'));
+      assert.ok(cluster.nodes.includes(identity.build));
+      assert.deepEqual(identity.env, []);
+      const seen = observations[index];
+      if (!seen.has(identity.build)) seen.set(identity.build, []);
+      seen.get(identity.build).push({ name, ...identity });
+    }
+    sameOwner = cluster.nodes.find(node => observations.every(seen => seen.get(node)?.length >= 2));
+    if (sameOwner && observations[0].size >= 2) break;
+  }
+  assert.ok(sameOwner, 'two objects of each tenant run in the same durable process');
+  const [first, second] = observations.map(seen => seen.get(sameOwner).slice(0, 2));
+  for (const [one, two] of [first, second]) {
+    assert.equal(one.copy, two.copy, 'objects of the same tenant reuse the warm copy');
+    assert.notEqual(one.instance, two.instance, 'the calls reached different objects');
+  }
+  assert.notEqual(first[0].copy, second[0].copy, 'different tenants never share the warm copy');
+  const process = await durableGeneration(cluster, sameOwner);
+  assert.equal(process.pid, generations.get(sameOwner).pid);
+  assert.equal(process.generation, generations.get(sameOwner).generation);
+
+  const otherOwner = [...observations[0].keys()].find(node => node !== sameOwner);
+  assert.ok(otherOwner, 'the namespace placed objects on two fixture builds');
+  const [other] = observations[0].get(otherOwner);
+  assert.equal(json(await call(tenants[0], other.name, sameOwner), 200, 'cross-build call').build, otherOwner);
+  assert.equal(json(await call(tenants[0], first[0].name, otherOwner), 200, 'reverse cross-build call').build, sameOwner);
+
+  const deniedTenant = await cluster.tenant('platform-denied');
+  await assert.rejects(cluster.deploy(deniedTenant, 'object', 'export default { fetch() {} };', { wrangler: {
+    durable_objects: { bindings: [{ name: 'STORE', class_name: 'PlatformStore' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['PlatformStore'] }],
+  } }), /PlatformStore|class export/i);
+  await assert.rejects(cluster.deploy(deniedTenant, 'object', worker, { wrangler: {
+    durable_objects: { bindings: [{ name: 'PROBE', class_name: 'Probe', script_name: 'platform-first/object' }] },
+  } }), /script_name names Worker/);
+  const crossTenant = await request(cluster.urls.apiserver, `${tenants[0].path}/workers/object/namespaces/Probe`, {
+    token: tenants[1].token,
+  });
+  assert.ok(crossTenant.status === 403 || crossTenant.status === 404, 'another tenant cannot access the platform namespace');
+
+  const { name, instance } = first[0];
+  assert.equal(json(await call(tenants[0], name, ingress, 'alarm'), 200, 'set platform alarm'), true);
+  await eventually('the platform alarm commits on the owner', async () => {
+    assert.equal(json(await call(tenants[0], name, ingress, 'alarmed'), 200, 'platform alarm result'), 1);
+  });
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(advance, '180000');
+  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+  await eventually('idle platform objects release their home sessions', async () => {
+    const { durableAdmission } = (await durableGeneration(cluster, sameOwner)).lifecycle;
+    assert.equal(durableAdmission.residentRoots, 0);
+  });
+  assert.notEqual(json(await call(tenants[0], name), 200, 'reopen platform object').instance, instance);
+  assert.equal(json(await call(tenants[0], name, ingress, 'alarmed'), 200, 'reopen persisted alarm result'), 1);
+
+  await durableTakeover(cluster, tenants[0]);
 }
 
 async function durableSlowHolder(cluster) {
@@ -2116,6 +2214,14 @@ export const durableGatedCases = {
   },
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
+  'durable-platform-definition': {
+    test: threadedPlatformDefinition, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,
+    membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+    platformFixture: ['platform-first/object', 'platform-second/object'].flatMap(worker => [
+      ...['Record', 'Probe'].map(bindingClass => ({ worker, bindingClass, className: 'PlatformStore' })),
+      { worker, bindingClass: 'Echo', className: 'PlatformEcho' },
+    ]),
+  },
   'durable-threaded-fence': {
     test: durableThreadedFence, nodes: ['node-1', 'node-2', 'node-3'],
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
