@@ -331,7 +331,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0150-platform-durable-definition.patch',
                                    '0151-reserve-platform-execution-identity.patch',
-                                   '0170-place-platform-databases-in-exclusive-copies.patch'} and path in {
+                                   '0170-place-platform-databases-in-exclusive-copies.patch',
+                                   '0176-attribute-platform-databases-to-database-worker.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0171-bound-threaded-sql-wall-time.patch' and path in {

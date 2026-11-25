@@ -3151,7 +3151,8 @@ public:
       const std::string& expectedHash,
       const std::string& invocationId = {}, const std::string& processId = {},
       const std::string& generation = {}, const std::string& definitionHash = {}) {
-    if (workerId.ends_with(coworkerd::PLATFORM_WORKER_SUFFIX)) {
+    if (workerId.ends_with(coworkerd::PLATFORM_WORKER_SUFFIX) ||
+        coworkerd::workerNameOf(workerId) == coworkerd::DATABASE_WORKER_NAME) {
       const auto found = leases.find(invocationId);
       const VersionPin requested{workerId, versionId, expectedHash, definitionHash};
       KJ_REQUIRE(found != leases.end() && found->second.platformSource, "platform source requires an admitted event");
@@ -7394,7 +7395,10 @@ private:
       const auto* definition = server.platformDefinition(target.platformClass->definition);
       if (definition == nullptr)
         co_return refused(server.refusal("DO_NAMESPACE_UNAVAILABLE", "the platform definition is unavailable", 409));
-      version = std::make_shared<const VersionDefinition>(definition->version(coworkerd::tenantOf(request.workerId)));
+      auto platformVersion = definition->version(coworkerd::tenantOf(version->workerId));
+      // The owner selected the database's accounting identity. The platform supplies its code and copy fingerprint.
+      if (target.isDatabase()) platformVersion.workerId = version->workerId;
+      version = std::make_shared<const VersionDefinition>(std::move(platformVersion));
       line.workerId = version->workerId;
       line.versionId = version->versionId;
     }
