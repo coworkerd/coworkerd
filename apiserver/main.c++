@@ -926,6 +926,14 @@ private:
         auto target = co_await network.parseAddress(address.c_str());
         auto stream = co_await target->connect();
         if (timer.now() >= sqlDeadline) co_return;
+        // An abandoned SQL relay must signal a full disconnect to its peer.
+        // A normal TCP FIN would let the peer continue writing its reply.
+        auto reset = kj::defer([&] {
+          KJ_IF_SOME(fd, stream->getFd()) {
+            const linger resetOnClose{1, 0};
+            (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &resetOnClose, sizeof(resetOnClose));
+          }
+        });
         const auto remaining = (sqlDeadline - timer.now()) / kj::MILLISECONDS;
         result.connected = true;
         auto client = kj::newHttpClient(headerTable, *stream);
@@ -942,6 +950,7 @@ private:
         auto text = co_await answer.body->readAllText(8 << 20);
         result.status = answer.statusCode;
         result.body = text.cStr();
+        reset.cancel();
       };
       co_await timer.timeoutAt(sqlDeadline + settings.sqlReplyGraceMs * kj::MILLISECONDS, work());
       result.ok = result.status != 0;
@@ -1199,15 +1208,18 @@ private:
       auto answer = co_await ask(member.address, "/__coworkerd/databases/" + tenant + "/" + database +
           "/query?resultsFormat=" + format, *text, deadline);
       if (answer.ok) {
-        std::string code;
+        std::string code, reason;
         try {
           capnp::MallocMessageBuilder message;
           auto value = message.initRoot<capnp::JsonValue>();
           capnp::JsonCodec().decodeRaw(kj::arrayPtr(answer.body.data(), answer.body.size()), value);
           code = coworkerd::json::text(value.asReader(), "code");
+          reason = coworkerd::json::text(value.asReader(), "reason");
         } catch (const kj::Exception&) {}
+        // Return the owner's refusal of a queued SQL request to the caller for retry.
         const bool notExecuted = code == "PEER_UNAVAILABLE" || code == "SERVER_DRAINING" ||
-            code == "DO_UNAVAILABLE" || code == "DO_OWNER_EXPIRED" || code == "DO_OWNER_DRAINING" ||
+            (code == "DO_UNAVAILABLE" && reason != coworkerd::SQL_RESET_REASON) ||
+            code == "DO_OWNER_EXPIRED" || code == "DO_OWNER_DRAINING" ||
             code == "DO_SHARD_EPOCH_MISMATCH";
         if (!notExecuted || answer.status < 400)
           co_return co_await sendJson(response, answer.status, answer.body);
@@ -1680,7 +1692,7 @@ int runControlPlane(const std::vector<std::string>& args) {
   ControlService service(settings, storage, state, timer, io.provider->getNetwork(), *headerTable);
   kj::HttpServer server(timer, *headerTable, [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
     return kj::heap<coworkerd::SqlHttpCancellation>(
-        service, connection, timer, coworkerd::SqlHttpCancellation::Route::CONTROL_PLANE);
+        service, connection, coworkerd::SqlHttpCancellation::Route::CONTROL_PLANE);
   });
   auto address = io.provider->getNetwork().parseAddress(settings.listenAddress.c_str()).wait(io.waitScope);
   auto listener = address->listen();
