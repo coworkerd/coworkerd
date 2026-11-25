@@ -2106,10 +2106,12 @@ async function threadedSocketRetirement(cluster) {
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
-export const cases = { deployment, 'websocket-admission': webSocketAdmission, 'sql-atomicity': sqlAtomicity,
+export const cases = { deployment, 'sql-atomicity': sqlAtomicity,
   'sql-protocol': sqlProtocol, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-takeover': durableTakeover };
+
+export const webSocketCases = { 'websocket-admission': webSocketAdmission };
 
 export const durableGatedCases = {
   'durable-peer-ack': { test: durablePeerAck },
