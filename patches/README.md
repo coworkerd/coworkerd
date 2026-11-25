@@ -78,6 +78,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   The storage actor still owns confirmation of successful commits.
   Patch 0175 keeps WAL cleanup out of exception unwinding and tests a group of individually
   valid SQL transactions whose frames require more than one record.
+  Patch 0174 releases an empty platform database copy when the last root retires. It changes
+  the threaded server and tests the home-reservation guard.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
